@@ -1179,12 +1179,12 @@ fn legacy_transport_response(
     }
 }
 
-pub fn broadcast(state: &State, event: &crate::generated_wire::SubscriptionEvent) {
+fn legacy_subscription_event(event: &crate::generated_wire::SubscriptionEvent) -> Value {
     use crate::generated_wire::{EdgePhase, SubscriptionEvent};
     // The newline listener is still the active outer projection until the
     // coordinated client/server cutover. Event meaning is already closed and
     // typed here; this projection is deleted with that listener.
-    let value = match event {
+    match event {
         SubscriptionEvent::BoxAdded { r#box, name, parent } => json!({
             "type": "session_added", "sid": r#box.to_string(),
             "name": name.as_ref().map(|value| value.as_str()), "parent": parent,
@@ -1197,12 +1197,12 @@ pub fn broadcast(state: &State, event: &crate::generated_wire::SubscriptionEvent
             "name": name.as_str(),
         }),
         SubscriptionEvent::OverlayChanged { r#box, count, latest_path } => json!({
-            "type": "changes", "session_id": r#box.to_string(), "count": count,
-            "path": latest_path.as_ref().map(|path|
+            "type": "overlay", "sid": r#box.to_string(), "n": count,
+            "rel": latest_path.as_ref().map(|path|
                 String::from_utf8_lossy(path.as_slice()).into_owned()),
         }),
         SubscriptionEvent::ProcessAdded { r#box, count } => json!({
-            "type": "process_added", "session_id": r#box.to_string(), "count": count,
+            "type": "process_added", "sid": r#box.to_string(), "n": count,
         }),
         SubscriptionEvent::BrushProvenanceAdded { r#box, row } => json!({
             "type": "brush_prov", "session_id": r#box.to_string(),
@@ -1222,7 +1222,11 @@ pub fn broadcast(state: &State, event: &crate::generated_wire::SubscriptionEvent
             "type": "webcap_added", "sid": r#box.to_string(),
         }),
         SubscriptionEvent::Pong => json!({"type": "pong"}),
-    };
+    }
+}
+
+pub fn broadcast(state: &State, event: &crate::generated_wire::SubscriptionEvent) {
+    let value = legacy_subscription_event(event);
     let data = format!("{value}\n");
     let mut s = lock(state);
     s.subscribers.retain(|conn| {
@@ -8337,6 +8341,28 @@ fn send_frame_with_fd(channel: &std::sync::Arc<Mutex<UnixStream>>, frame: &[u8],
 #[cfg(test)]
 mod verb_tests {
     use super::*;
+
+    #[test]
+    fn typed_capture_events_preserve_the_live_ui_projection() {
+        use crate::generated_wire::SubscriptionEvent;
+
+        let path = crate::wire::BoundedBytes::new(b"tmp/result".to_vec()).unwrap();
+        assert_eq!(
+            legacy_subscription_event(&SubscriptionEvent::OverlayChanged {
+                r#box: 42,
+                count: 3,
+                latest_path: Some(path),
+            }),
+            json!({"type": "overlay", "sid": "42", "n": 3, "rel": "tmp/result"})
+        );
+        assert_eq!(
+            legacy_subscription_event(&SubscriptionEvent::ProcessAdded {
+                r#box: 42,
+                count: 2,
+            }),
+            json!({"type": "process_added", "sid": "42", "n": 2})
+        );
+    }
 
     #[test]
     fn qemu_architecture_is_required_and_backend_scoped() {

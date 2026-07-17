@@ -75,10 +75,10 @@ as executable mappings and mmap that genuinely need a host fd.
           directory cookies, copy-up reads, and statfs to upstream passthrough.
           Native paths remain only at explicit direct-write and negotiated
           kernel-passthrough acceleration boundaries.
-  - [ ] Isolate capture/provenance mutation from protocol callbacks.
+  - [x] Isolate capture/provenance mutation from protocol callbacks.
     - [x] Give filesystem mutations and process-provenance insertions one
           bounded journal owned outside the overlay/protocol adapters.
-    - [ ] Move depot mutations, copy-up attribution, and finalization behind a
+    - [x] Move depot mutations, copy-up attribution, and finalization behind a
           capture service rather than calling `BoxState` throughout policy.
   - [ ] Isolate synthetic projections, sinks, jobserver, and nested-box nodes.
     - [x] Define every reserved per-box name, kind, attribute, and sink stream
@@ -173,7 +173,7 @@ holding hours of work only in the worktree.
 
 ## Known baseline failures
 
-- The 2026-07-17 full static aarch64 unit run passed 370 tests, ignored one,
+- The 2026-07-17 full static aarch64 unit run passed 374 tests, ignored one,
   and exposed two pre-existing Brush/editor semantic-completion assertions:
   `production_brush_document_propagates_later_find_type_constraint` and
   `bash_editor_uses_relation_for_backward_completion_and_insertion`.  The

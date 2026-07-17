@@ -996,10 +996,12 @@ impl SarunFs {
         f.write_all(bytes)?;
         f.flush()?;
         let sz = bytes.len() as i64;
-        let writer = b.writer_for(0);
         let mtime_ns = SystemTime::now().duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos() as i64).unwrap_or(0);
-        b.finalize_file(rel, sz, mtime_ns, writer);
+        self.inner
+            .mutations
+            .writer(&b, 0)
+            .finalize_file(rel, sz, mtime_ns);
         Ok(())
     }
 
@@ -1480,7 +1482,7 @@ impl SarunFs {
         if flags & replace != 0 && !exists {
             return Err(Errno::ENODATA);
         }
-        b.set_xattr(&rel, name, value);
+        self.inner.mutations.set_xattr(&b, &rel, name, value);
         Ok(())
     }
 
@@ -1512,7 +1514,11 @@ impl SarunFs {
             return Err(Errno::EROFS);
         }
         let name = name.to_str().ok_or(Errno::EINVAL)?;
-        b.remove_xattr(&rel, name).then_some(()).ok_or(Errno::ENODATA)
+        self.inner
+            .mutations
+            .remove_xattr(&b, &rel, name)
+            .then_some(())
+            .ok_or(Errno::ENODATA)
     }
 
     fn open_node(
@@ -1779,8 +1785,11 @@ impl SarunFs {
             });
             (attr, handle)
         } else {
-            let writer = b.writer_for(pid);
-            let rowid = b.ensure_file_row(&rel, mode | libc::S_IFREG, writer);
+            let rowid = self
+                .inner
+                .mutations
+                .writer(&b, pid)
+                .ensure_file(&rel, mode | libc::S_IFREG);
             let path = blob_path(bid, rowid);
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent).map_err(Errno::from)?;
@@ -1800,7 +1809,7 @@ impl SarunFs {
                 .unwrap_or_else(|| self.synth_file_attr(inode));
             attr.kind = NodeKind::RegularFile;
             attr.perm = (mode & 0o7777) as u16;
-self.inner.mutations.record(bid, rel.clone(), "create");
+            self.inner.mutations.record(bid, rel.clone(), "create");
             let handle = self.reg_fh(FhInner {
                 box_id: bid,
                 rel,
@@ -1852,9 +1861,9 @@ self.inner.mutations.record(bid, rel.clone(), "create");
         if !matches!(self.resolve(box_id, &rel), Layer::Absent) {
             return Err(Errno::EEXIST);
         }
-        b.set_dir(&rel, mode, b.writer_for(pid));
+        self.inner.mutations.writer(&b, pid).set_dir(&rel, mode);
         let inode = self.ino_for(&(box_id, rel.clone()));
-self.inner.mutations.record(box_id, rel, "mkdir");
+        self.inner.mutations.record(box_id, rel, "mkdir");
         let attr = self.synth_dir_attr(inode, mode | libc::S_IFDIR, 0);
         self.inner.inodes.acquire(inode, 1);
         Ok(attr)
@@ -1872,9 +1881,12 @@ self.inner.mutations.record(box_id, rel, "mkdir");
         if self.ro_denied(box_id, &rel) {
             return Err(Errno::EROFS);
         }
-        b.set_symlink(&rel, target, b.writer_for(pid));
+        self.inner
+            .mutations
+            .writer(&b, pid)
+            .set_symlink(&rel, target);
         let inode = self.ino_for(&(box_id, rel.clone()));
-self.inner.mutations.record(box_id, rel, "symlink");
+        self.inner.mutations.record(box_id, rel, "symlink");
         let attr = self.synth_link_attr(
             inode,
             target.as_os_str().as_encoded_bytes().len() as u64,
@@ -1896,9 +1908,8 @@ self.inner.mutations.record(box_id, rel, "symlink");
         }
         self.inner.inodes.detach(&(box_id, rel.clone()));
         self.inner.detached_attrs.write().unwrap().insert(inode, attr);
-        b.drop_row(&rel);
-        b.set_whiteout(&rel, b.writer_for(pid));
-self.inner.mutations.record(box_id, rel, "unlink");
+        self.inner.mutations.writer(&b, pid).delete(&rel);
+        self.inner.mutations.record(box_id, rel, "unlink");
         Ok(())
     }
 
@@ -1918,9 +1929,8 @@ self.inner.mutations.record(box_id, rel, "unlink");
         }
         self.inner.inodes.detach(&(box_id, rel.clone()));
         self.inner.detached_attrs.write().unwrap().insert(inode, attr);
-        b.drop_row(&rel);
-        b.set_whiteout(&rel, b.writer_for(pid));
-self.inner.mutations.record(box_id, rel, "rmdir");
+        self.inner.mutations.writer(&b, pid).delete(&rel);
+        self.inner.mutations.record(box_id, rel, "rmdir");
         Ok(())
     }
 
@@ -1962,35 +1972,35 @@ self.inner.mutations.record(box_id, rel, "rmdir");
         {
             return Err(Errno::EEXIST);
         }
-        let writer = b.writer_for(pid);
+        let capture = self.inner.mutations.writer(&b, pid);
         let lower_attr = self.inner.backing.attr(&old_rel).ok();
         let lower_old = lower_attr.is_some();
         match self.layer(&b, &old_rel) {
             Layer::Absent => return Err(Errno::ENOENT),
             Layer::UpperDir { .. } => {
-                b.reparent(&old_rel, &new_rel);
+                capture.reparent(&old_rel, &new_rel);
                 if lower_attr.is_some_and(|attr| attr.kind == NodeKind::Directory) {
-                    b.set_whiteout(&old_rel, writer);
+                    capture.whiteout(&old_rel);
                 }
             }
             Layer::Lower => {
                 self.copy_up(&b, &old_rel, pid).map_err(|_| Errno::EIO)?;
-                b.rename_row(&old_rel, &new_rel);
-                b.set_whiteout(&old_rel, writer);
+                capture.rename(&old_rel, &new_rel);
+                capture.whiteout(&old_rel);
             }
             Layer::UpperFile { .. }
             | Layer::UpperSymlink { .. }
             | Layer::UpperSpecial { .. } => {
-                b.rename_row(&old_rel, &new_rel);
+                capture.rename(&old_rel, &new_rel);
                 if lower_old {
-                    b.set_whiteout(&old_rel, writer);
+                    capture.whiteout(&old_rel);
                 }
             }
             Layer::ExtFile { .. } => return Err(Errno::EROFS),
         }
         self.remap_inode_subtree(box_id, &old_rel, &new_rel);
-self.inner.mutations.record(box_id, old_rel, "rename_src");
-self.inner.mutations.record(box_id, new_rel, "rename_dst");
+        self.inner.mutations.record(box_id, old_rel, "rename_src");
+        self.inner.mutations.record(box_id, new_rel, "rename_dst");
         Ok(())
     }
 
@@ -2009,7 +2019,7 @@ self.inner.mutations.record(box_id, new_rel, "rename_dst");
         }
         match mode & libc::S_IFMT {
             libc::S_IFREG => {
-                let rowid = b.ensure_file_row(&rel, mode, b.writer_for(pid));
+                let rowid = self.inner.mutations.writer(&b, pid).ensure_file(&rel, mode);
                 let path = blob_path(box_id, rowid);
                 if let Some(parent) = path.parent() {
                     std::fs::create_dir_all(parent).map_err(Errno::from)?;
@@ -2017,11 +2027,14 @@ self.inner.mutations.record(box_id, new_rel, "rename_dst");
                 File::create(path).map_err(Errno::from)?;
             }
             libc::S_IFIFO | libc::S_IFCHR | libc::S_IFBLK | libc::S_IFSOCK => {
-                b.set_special(&rel, mode, rdev as u64, b.writer_for(pid));
+                self.inner
+                    .mutations
+                    .writer(&b, pid)
+                    .set_special(&rel, mode, rdev as u64);
             }
             _ => return Err(Errno::EINVAL),
         }
-self.inner.mutations.record(box_id, rel.clone(), "mknod");
+        self.inner.mutations.record(box_id, rel.clone(), "mknod");
         let inode = self.ino_for(&(box_id, rel.clone()));
         let attr = self.attr_of(&b, inode, &rel).ok_or(Errno::EIO)?;
         self.inner.inodes.acquire(inode, 1);
@@ -2054,7 +2067,11 @@ self.inner.mutations.record(box_id, rel.clone(), "mknod");
             Layer::UpperFile { rowid, mode, .. } => (rowid, mode),
             _ => return Err(Errno::EPERM),
         };
-        let new_rowid = b.ensure_file_row(&new_rel, source_mode, b.writer_for(pid));
+        let new_rowid = self
+            .inner
+            .mutations
+            .writer(&b, pid)
+            .ensure_file(&new_rel, source_mode);
         let destination = blob_path(box_id, new_rowid);
         if let Some(parent) = destination.parent() {
             std::fs::create_dir_all(parent).map_err(Errno::from)?;
@@ -2064,7 +2081,7 @@ self.inner.mutations.record(box_id, rel.clone(), "mknod");
         let new_inode = self.ino_for(&(box_id, new_rel.clone()));
         let attr = self.attr_of(&b, new_inode, &new_rel).ok_or(Errno::EIO)?;
         self.inner.inodes.acquire(new_inode, 1);
-self.inner.mutations.record(box_id, new_rel, "link");
+        self.inner.mutations.record(box_id, new_rel, "link");
         Ok(attr)
     }
 
@@ -2164,20 +2181,22 @@ self.inner.mutations.record(box_id, new_rel, "link");
         }
         if let Some(mode) = request.mode {
             let permissions = mode & 0o7777;
-            let writer = b.writer_for(pid);
+            let capture = self.inner.mutations.writer(&b, pid);
             match self.layer(&b, &rel) {
-                Layer::UpperFile { .. } => b.set_mode(&rel, libc::S_IFREG | permissions),
-                Layer::UpperDir { .. } => b.set_mode(&rel, libc::S_IFDIR | permissions),
+                Layer::UpperFile { .. } => capture.set_mode(&rel, libc::S_IFREG | permissions),
+                Layer::UpperDir { .. } => capture.set_mode(&rel, libc::S_IFDIR | permissions),
                 Layer::UpperSymlink { .. } => {}
                 Layer::Lower if self.inner.backing.attr(&rel).is_ok_and(|attr| {
                     attr.kind == NodeKind::Directory
-                }) => b.set_dir(&rel, permissions, writer),
+                }) => capture.set_dir(&rel, permissions),
                 Layer::Lower => {
                     self.copy_up(&b, &rel, pid).map_err(|_| Errno::EIO)?;
-                    b.set_mode(&rel, libc::S_IFREG | permissions);
+                    capture.set_mode(&rel, libc::S_IFREG | permissions);
                 }
                 Layer::Absent => return Err(Errno::ENOENT),
-                Layer::UpperSpecial { mode, .. } => b.set_mode(&rel, (mode & libc::S_IFMT) | permissions),
+                Layer::UpperSpecial { mode, .. } => {
+                    capture.set_mode(&rel, (mode & libc::S_IFMT) | permissions)
+                }
                 Layer::ExtFile { .. } => return Err(Errno::EROFS),
             }
         }
@@ -2202,7 +2221,10 @@ self.inner.mutations.record(box_id, new_rel, "link");
             } else if matches!(self.layer(&b, &rel), Layer::Absent) {
                 return Err(Errno::ENOENT);
             }
-            b.set_owner(&rel, uid, gid);
+            self.inner
+                .mutations
+                .writer(&b, pid)
+                .set_owner(&rel, uid, gid);
         }
         if let Some(mtime) = request.mtime {
             if matches!(self.layer(&b, &rel), Layer::Lower)
@@ -2216,7 +2238,10 @@ self.inner.mutations.record(box_id, new_rel, "link");
                 .duration_since(UNIX_EPOCH)
                 .map(|duration| duration.as_nanos() as i64)
                 .unwrap_or(0);
-            b.set_mtime(&rel, nanos);
+            self.inner
+                .mutations
+                .writer(&b, pid)
+                .set_mtime(&rel, nanos);
             if let Layer::UpperFile { rowid, .. } = self.layer(&b, &rel) {
                 self.ensure_upper_blob(box_id, rowid, &rel);
                 OpenOptions::new()
@@ -2302,7 +2327,9 @@ self.inner.mutations.record(box_id, new_rel, "link");
         if pid != handle.inner.last_pid || handle.inner.last_tgid == 0 {
             handle.inner.last_tgid = tgid_of(pid);
             if let Some(b) = self.box_of(handle.inner.box_id) {
-                b.writer_for(handle.inner.last_tgid);
+                self.inner
+                    .mutations
+                    .observe_writer(&b, handle.inner.last_tgid);
             }
         }
         handle.inner.last_pid = pid;
@@ -2318,7 +2345,7 @@ self.inner.mutations.record(box_id, new_rel, "link");
     }
 
     fn finish_file_write(&self, box_id: i64, rel: String) {
-self.inner.mutations.record(box_id, rel, "write");
+        self.inner.mutations.record(box_id, rel, "write");
     }
 
     fn write_sink_node(&self, pid: u32, box_id: i64, stream: i32, data: &[u8]) {
@@ -2361,16 +2388,17 @@ self.inner.mutations.record(box_id, rel, "write");
                 } else {
                     handle.inner.last_pid
                 };
-                let writer = b.writer_for(writer_id);
                 if let FileData::Native(file) = &handle.inner.data {
                     let metadata = file.metadata().ok();
                     if let Some(metadata) = metadata {
-                        b.finalize_file(
-                            &handle.inner.rel,
-                            metadata.size() as i64,
-                            metadata.mtime() * 1_000_000_000 + metadata.mtime_nsec(),
-                            writer,
-                        );
+                        self.inner
+                            .mutations
+                            .writer(&b, writer_id)
+                            .finalize_file(
+                                &handle.inner.rel,
+                                metadata.size() as i64,
+                                metadata.mtime() * 1_000_000_000 + metadata.mtime_nsec(),
+                            );
                     }
                 }
             }
@@ -2423,7 +2451,7 @@ self.inner.mutations.record(box_id, rel, "write");
         if self.ro_denied(b.id, rel) {
             return Err(std::io::Error::from_raw_os_error(libc::EROFS));
         }
-        let writer = b.writer_for(pid);
+        let capture = self.inner.mutations.writer(b, pid);
         // Source the lower bytes + mode from the parent-chain resolution.
         let (src, mode, lower_source): (Option<PathBuf>, u32, bool) =
             match self.resolve(b.id, rel) {
@@ -2446,7 +2474,7 @@ self.inner.mutations.record(box_id, rel, "write");
                 return Err(std::io::Error::from_raw_os_error(libc::EROFS)),
             _ => (None, 0o100644, false),
         };
-        let rowid = b.ensure_file_row(rel, mode, writer);
+        let rowid = capture.ensure_file(rel, mode);
         let bp = blob_path(b.id, rowid);
         if let Some(parent) = bp.parent() {
             std::fs::create_dir_all(parent)?;

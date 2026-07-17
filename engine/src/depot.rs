@@ -241,6 +241,22 @@ pub trait BoxDepot {
     fn reload_entry(&self, rel: &str);
 }
 
+fn clear_node_metadata(conn: &Connection, rel: &str) {
+    for table in ["ownership", "rdev", "xattr"] {
+        let _ = conn.execute(&format!("DELETE FROM {table} WHERE name=?1"), [rel]);
+    }
+}
+
+fn move_node_metadata(conn: &Connection, old: &str, new: &str) {
+    clear_node_metadata(conn, new);
+    for table in ["ownership", "rdev", "xattr"] {
+        let _ = conn.execute(
+            &format!("UPDATE {table} SET name=?2 WHERE name=?1"),
+            params![old, new],
+        );
+    }
+}
+
 impl BoxDepot for BoxState {
 
     /// Upsert the file row for `rel` (data stays NULL — D4) and return its
@@ -250,6 +266,7 @@ impl BoxDepot for BoxState {
             return *rowid;
         }
         let conn = self.conn.lock().unwrap();
+        clear_node_metadata(&conn, rel);
         let _ = conn.execute(
             "INSERT INTO sqlar(name,mode,mtime,sz,data,writer,last_writer)
              VALUES(?1,?2,?3,0,NULL,?4,?4)
@@ -514,6 +531,7 @@ impl BoxDepot for BoxState {
             _ => None,
         };
         let conn = self.conn.lock().unwrap();
+        clear_node_metadata(&conn, rel);
         let _ = conn.execute(
             "INSERT INTO sqlar(name,mode,mtime,sz,data,writer,last_writer)
              VALUES(?1,?2,0,0,NULL,?3,?3)
@@ -541,6 +559,7 @@ impl BoxDepot for BoxState {
         {
             let conn = self.conn.lock().unwrap();
             let _ = conn.execute("DELETE FROM sqlar WHERE name=?1", [new]);
+            move_node_metadata(&conn, old, new);
             let _ = conn.execute("UPDATE sqlar SET name=?2 WHERE name=?1",
                                  params![old, new]);
         }
@@ -574,6 +593,7 @@ impl BoxDepot for BoxState {
                 let _ = std::fs::remove_file(blob_path(self.id, *rowid));
             }
             let _ = conn.execute("DELETE FROM sqlar WHERE name=?1", [&nn]);
+            move_node_metadata(&conn, name, &nn);
             let _ = conn.execute("UPDATE sqlar SET name=?2 WHERE name=?1",
                                  params![name, nn]);
         }
@@ -597,6 +617,7 @@ impl BoxDepot for BoxState {
             _ => None,
         };
         let conn = self.conn.lock().unwrap();
+        clear_node_metadata(&conn, rel);
         let _ = conn.execute("DELETE FROM sqlar WHERE name=?1", [rel]);
         drop(conn);
         if let Some(rid) = rowid {
