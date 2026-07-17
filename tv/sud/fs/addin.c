@@ -118,6 +118,36 @@ static int dispatch_fcntl(struct sud_syscall_ctx *ctx)
     }
 }
 
+static int setattr_mode(struct sud_syscall_ctx *ctx, int dirfd,
+                        const char *path, int follow, uint32_t mode)
+{
+    struct fuse_setattr_in request;
+    memset(&request, 0, sizeof(request));
+    request.valid = FATTR_MODE;
+    request.mode = mode;
+    return handled(ctx, sud_vfs_setattrat(dirfd, path, follow, &request));
+}
+
+static int setattr_owner(struct sud_syscall_ctx *ctx, int dirfd,
+                         const char *path, int follow, long uid, long gid)
+{
+    struct fuse_setattr_in request;
+    memset(&request, 0, sizeof(request));
+    if (uid != -1) { request.valid |= FATTR_UID; request.uid = (uint32_t)uid; }
+    if (gid != -1) { request.valid |= FATTR_GID; request.gid = (uint32_t)gid; }
+    return handled(ctx, sud_vfs_setattrat(dirfd, path, follow, &request));
+}
+
+static int setattr_size(struct sud_syscall_ctx *ctx, int dirfd,
+                        const char *path, uint64_t size)
+{
+    struct fuse_setattr_in request;
+    memset(&request, 0, sizeof(request));
+    request.valid = FATTR_SIZE;
+    request.size = size;
+    return handled(ctx, sud_vfs_setattrat(dirfd, path, 1, &request));
+}
+
 static int fs_pre_syscall(struct sud_syscall_ctx *ctx)
 {
     long nr = ctx->nr;
@@ -224,6 +254,64 @@ static int fs_pre_syscall(struct sud_syscall_ctx *ctx)
         return handled(ctx, sud_vfs_getdents64((int)ctx->args[0],
                          (void *)ctx->args[1], (size_t)ctx->args[2]));
 #endif
+#ifdef SYS_stat
+    if (nr == SYS_stat)
+        return handled(ctx, sud_vfs_statat(AT_FDCWD,
+                         (const char *)ctx->args[0], 1,
+                         (void *)ctx->args[1]));
+#endif
+#ifdef SYS_lstat
+    if (nr == SYS_lstat)
+        return handled(ctx, sud_vfs_statat(AT_FDCWD,
+                         (const char *)ctx->args[0], 0,
+                         (void *)ctx->args[1]));
+#endif
+#ifdef SYS_stat64
+    if (nr == SYS_stat64)
+        return handled(ctx, sud_vfs_statat(AT_FDCWD,
+                         (const char *)ctx->args[0], 1,
+                         (void *)ctx->args[1]));
+#endif
+#ifdef SYS_lstat64
+    if (nr == SYS_lstat64)
+        return handled(ctx, sud_vfs_statat(AT_FDCWD,
+                         (const char *)ctx->args[0], 0,
+                         (void *)ctx->args[1]));
+#endif
+#ifdef SYS_newfstatat
+    if (nr == SYS_newfstatat) {
+        int flags = (int)ctx->args[3];
+        const char *path = (const char *)ctx->args[1];
+        if ((!path || !path[0]) && !(flags & AT_EMPTY_PATH))
+            return handled(ctx, -ENOENT);
+        return handled(ctx, sud_vfs_statat((int)ctx->args[0], path,
+                         !(flags & AT_SYMLINK_NOFOLLOW),
+                         (void *)ctx->args[2]));
+    }
+#endif
+#ifdef SYS_fstatat64
+    if (nr == SYS_fstatat64) {
+        int flags = (int)ctx->args[3];
+        const char *path = (const char *)ctx->args[1];
+        if ((!path || !path[0]) && !(flags & AT_EMPTY_PATH))
+            return handled(ctx, -ENOENT);
+        return handled(ctx, sud_vfs_statat((int)ctx->args[0], path,
+                         !(flags & AT_SYMLINK_NOFOLLOW),
+                         (void *)ctx->args[2]));
+    }
+#endif
+#ifdef SYS_statx
+    if (nr == SYS_statx) {
+        int flags = (int)ctx->args[2];
+        const char *path = (const char *)ctx->args[1];
+        if ((!path || !path[0]) && !(flags & AT_EMPTY_PATH))
+            return handled(ctx, -ENOENT);
+        return handled(ctx, sud_vfs_statx((int)ctx->args[0], path,
+                         !(flags & AT_SYMLINK_NOFOLLOW),
+                         (unsigned int)ctx->args[3],
+                         (struct statx *)ctx->args[4]));
+    }
+#endif
     if (nr == SYS_readlinkat)
         return handled(ctx, sud_vfs_readlinkat((int)ctx->args[0],
                          (const char *)ctx->args[1], (char *)ctx->args[2],
@@ -249,6 +337,94 @@ static int fs_pre_syscall(struct sud_syscall_ctx *ctx)
         g_fs_umask = (unsigned int)ctx->args[0] & 0777u;
         return handled(ctx, previous);
     }
+#endif
+#ifdef SYS_access
+    if (nr == SYS_access)
+        return handled(ctx, sud_vfs_accessat(AT_FDCWD,
+                         (const char *)ctx->args[0],
+                         (unsigned int)ctx->args[1]));
+#endif
+#ifdef SYS_faccessat
+    if (nr == SYS_faccessat)
+        return handled(ctx, sud_vfs_accessat((int)ctx->args[0],
+                         (const char *)ctx->args[1],
+                         (unsigned int)ctx->args[2]));
+#endif
+#ifdef SYS_faccessat2
+    if (nr == SYS_faccessat2)
+        return handled(ctx, sud_vfs_accessat((int)ctx->args[0],
+                         (const char *)ctx->args[1],
+                         (unsigned int)ctx->args[2]));
+#endif
+#ifdef SYS_chmod
+    if (nr == SYS_chmod)
+        return setattr_mode(ctx, AT_FDCWD, (const char *)ctx->args[0],
+                            1, (uint32_t)ctx->args[1]);
+#endif
+#ifdef SYS_fchmodat
+    if (nr == SYS_fchmodat)
+        return setattr_mode(ctx, (int)ctx->args[0],
+                            (const char *)ctx->args[1], 1,
+                            (uint32_t)ctx->args[2]);
+#endif
+#ifdef SYS_fchmod
+    if (nr == SYS_fchmod && sud_vfs_owns_fd((int)ctx->args[0])) {
+        struct fuse_setattr_in request;
+        memset(&request, 0, sizeof(request));
+        request.valid = FATTR_MODE;
+        request.mode = (uint32_t)ctx->args[1];
+        return handled(ctx, sud_vfs_fsetattr((int)ctx->args[0], &request));
+    }
+#endif
+#ifdef SYS_chown
+    if (nr == SYS_chown)
+        return setattr_owner(ctx, AT_FDCWD, (const char *)ctx->args[0], 1,
+                             ctx->args[1], ctx->args[2]);
+#endif
+#ifdef SYS_lchown
+    if (nr == SYS_lchown)
+        return setattr_owner(ctx, AT_FDCWD, (const char *)ctx->args[0], 0,
+                             ctx->args[1], ctx->args[2]);
+#endif
+#ifdef SYS_fchownat
+    if (nr == SYS_fchownat)
+        return setattr_owner(ctx, (int)ctx->args[0],
+                             (const char *)ctx->args[1],
+                             !((int)ctx->args[4] & AT_SYMLINK_NOFOLLOW),
+                             ctx->args[2], ctx->args[3]);
+#endif
+#ifdef SYS_fchown
+    if (nr == SYS_fchown && sud_vfs_owns_fd((int)ctx->args[0])) {
+        struct fuse_setattr_in request;
+        memset(&request, 0, sizeof(request));
+        if (ctx->args[1] != -1) {
+            request.valid |= FATTR_UID;
+            request.uid = (uint32_t)ctx->args[1];
+        }
+        if (ctx->args[2] != -1) {
+            request.valid |= FATTR_GID;
+            request.gid = (uint32_t)ctx->args[2];
+        }
+        return handled(ctx, sud_vfs_fsetattr((int)ctx->args[0], &request));
+    }
+#endif
+#ifdef SYS_truncate
+    if (nr == SYS_truncate)
+        return setattr_size(ctx, AT_FDCWD, (const char *)ctx->args[0],
+                            (uint64_t)ctx->args[1]);
+#endif
+#ifdef SYS_truncate64
+    if (nr == SYS_truncate64)
+        return setattr_size(ctx, AT_FDCWD, (const char *)ctx->args[0],
+                            split_offset(ctx->args, 1));
+#endif
+#ifdef SYS_fsync
+    if (nr == SYS_fsync && sud_vfs_owns_fd((int)ctx->args[0]))
+        return handled(ctx, sud_vfs_fsync((int)ctx->args[0], 0));
+#endif
+#ifdef SYS_fdatasync
+    if (nr == SYS_fdatasync && sud_vfs_owns_fd((int)ctx->args[0]))
+        return handled(ctx, sud_vfs_fsync((int)ctx->args[0], 1));
 #endif
 #ifdef SYS_mkdir
     if (nr == SYS_mkdir)

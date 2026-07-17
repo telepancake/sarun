@@ -25,8 +25,8 @@ static int call_begin(struct fuse_call *call, uint32_t opcode,
     call->input->opcode = opcode;
     call->input->unique = call->transaction.request_id;
     call->input->nodeid = inode;
-    call->input->uid = (uint32_t)raw_syscall6(SYS_getuid, 0, 0, 0, 0, 0, 0);
-    call->input->gid = (uint32_t)raw_syscall6(SYS_getgid, 0, 0, 0, 0, 0, 0);
+    call->input->uid = (uint32_t)raw_syscall6(SYS_geteuid, 0, 0, 0, 0, 0, 0);
+    call->input->gid = (uint32_t)raw_syscall6(SYS_getegid, 0, 0, 0, 0, 0, 0);
     call->input->pid = (uint32_t)raw_getpid();
     return 0;
 }
@@ -439,4 +439,34 @@ int sud_fuse_setattr(uint64_t inode, const struct fuse_setattr_in *request,
     if (result != 0) return result;
     memcpy(call_input_payload(&call), request, sizeof(*request));
     return copy_fixed_reply(&call, attributes, sizeof(*attributes));
+}
+
+int sud_fuse_access(uint64_t inode, uint32_t mask)
+{
+    struct fuse_call call;
+    int result = call_begin(&call, FUSE_ACCESS, inode,
+                            sizeof(struct fuse_access_in));
+    if (result != 0) return result;
+    struct fuse_access_in *input = call_input_payload(&call);
+    input->mask = mask;
+    input->padding = 0;
+    result = call_submit(&call);
+    call_end(&call);
+    return result;
+}
+
+int sud_fuse_fsync(uint64_t inode, uint64_t handle, int directory,
+                   int datasync)
+{
+    struct fuse_call call;
+    int result = call_begin(&call, directory ? FUSE_FSYNCDIR : FUSE_FSYNC,
+                            inode, sizeof(struct fuse_fsync_in));
+    if (result != 0) return result;
+    struct fuse_fsync_in *input = call_input_payload(&call);
+    input->fh = handle;
+    input->fsync_flags = datasync ? 1u : 0u;
+    input->padding = 0;
+    result = call_submit(&call);
+    call_end(&call);
+    return result;
 }

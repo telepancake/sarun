@@ -1,8 +1,8 @@
 #ifndef SUD_FS_VFS_H
 #define SUD_FS_VFS_H
 
-#include <stddef.h>
-#include <stdint.h>
+#include "libc-fs/libc.h"
+#include <linux/fuse.h>
 
 int sud_vfs_init(const char *initial_cwd);
 int sud_vfs_openat(int dirfd, const char *path, int flags,
@@ -35,6 +35,14 @@ int sud_vfs_renameat2(int old_dirfd, const char *old_path,
 int sud_vfs_symlinkat(const char *target, int dirfd, const char *path);
 int sud_vfs_linkat(int old_dirfd, const char *old_path,
                    int new_dirfd, const char *new_path, int follow);
+int sud_vfs_statat(int dirfd, const char *path, int follow, void *stat_buffer);
+int sud_vfs_statx(int dirfd, const char *path, int follow,
+                  unsigned int mask, struct statx *stat_buffer);
+int sud_vfs_accessat(int dirfd, const char *path, unsigned int mask);
+int sud_vfs_fsync(int fd, int datasync);
+int sud_vfs_setattrat(int dirfd, const char *path, int follow,
+                      const struct fuse_setattr_in *request);
+int sud_vfs_fsetattr(int fd, const struct fuse_setattr_in *request);
 void sud_vfs_fork_child(void);
 void sud_vfs_process_exit(void);
 

@@ -716,6 +716,120 @@ int sud_vfs_fstat(int fd, void *stat_buffer)
     return result;
 }
 
+static void fill_statx(struct statx *st, const struct fuse_attr *attr)
+{
+    memset(st, 0, sizeof(*st));
+    st->stx_mask = STATX_BASIC_STATS;
+    st->stx_blksize = attr->blksize;
+    st->stx_nlink = attr->nlink;
+    st->stx_uid = attr->uid;
+    st->stx_gid = attr->gid;
+    st->stx_mode = (uint16_t)attr->mode;
+    st->stx_ino = attr->ino;
+    st->stx_size = attr->size;
+    st->stx_blocks = attr->blocks;
+    st->stx_atime.tv_sec = attr->atime;
+    st->stx_atime.tv_nsec = attr->atimensec;
+    st->stx_mtime.tv_sec = attr->mtime;
+    st->stx_mtime.tv_nsec = attr->mtimensec;
+    st->stx_ctime.tv_sec = attr->ctime;
+    st->stx_ctime.tv_nsec = attr->ctimensec;
+    st->stx_rdev_major = (uint32_t)(attr->rdev >> 8);
+    st->stx_rdev_minor = (uint32_t)(attr->rdev & 0xff);
+}
+
+int sud_vfs_statat(int dirfd, const char *path, int follow, void *stat_buffer)
+{
+    if (!path || !stat_buffer) return -EFAULT;
+    if (!path[0]) return sud_vfs_fstat(dirfd, stat_buffer);
+    char absolute[PATH_MAX];
+    int result = absolute_at(dirfd, path, absolute, sizeof(absolute));
+    if (result != 0) return result;
+    struct resolved_node node;
+    memset(&node, 0, sizeof(node));
+    result = resolve_absolute_full(absolute, &node, follow, 0);
+    if (result == 0) fill_stat(stat_buffer, &node.attr);
+    resolved_forget(&node);
+    return result;
+}
+
+int sud_vfs_statx(int dirfd, const char *path, int follow,
+                  unsigned int mask, struct statx *stat_buffer)
+{
+    (void)mask;
+    if (!path || !stat_buffer) return -EFAULT;
+    struct fuse_attr attributes;
+    int result;
+    if (!path[0]) {
+        struct sud_remote_ofd *description = description_for(dirfd);
+        if (!description) return -EBADF;
+        struct fuse_attr_out output;
+        result = sud_fuse_getattr(description->inode, description->handle,
+                                  1, &output);
+        attributes = output.attr;
+    } else {
+        char absolute[PATH_MAX];
+        result = absolute_at(dirfd, path, absolute, sizeof(absolute));
+        if (result != 0) return result;
+        struct resolved_node node;
+        memset(&node, 0, sizeof(node));
+        result = resolve_absolute_full(absolute, &node, follow, 0);
+        if (result == 0) attributes = node.attr;
+        resolved_forget(&node);
+    }
+    if (result == 0) fill_statx(stat_buffer, &attributes);
+    return result;
+}
+
+int sud_vfs_accessat(int dirfd, const char *path, unsigned int mask)
+{
+    char absolute[PATH_MAX];
+    int result = absolute_at(dirfd, path, absolute, sizeof(absolute));
+    if (result != 0) return result;
+    struct resolved_node node;
+    memset(&node, 0, sizeof(node));
+    result = resolve_absolute_full(absolute, &node, 1, 0);
+    if (result == 0 && mask) result = sud_fuse_access(node.inode, mask);
+    resolved_forget(&node);
+    return result;
+}
+
+int sud_vfs_fsync(int fd, int datasync)
+{
+    struct sud_remote_ofd *description = description_for(fd);
+    if (!description) return -EBADF;
+    return sud_fuse_fsync(description->inode, description->handle,
+                          (description->mode & S_IFMT) == S_IFDIR, datasync);
+}
+
+int sud_vfs_setattrat(int dirfd, const char *path, int follow,
+                      const struct fuse_setattr_in *request)
+{
+    char absolute[PATH_MAX];
+    int result = absolute_at(dirfd, path, absolute, sizeof(absolute));
+    if (result != 0) return result;
+    struct resolved_node node;
+    memset(&node, 0, sizeof(node));
+    result = resolve_absolute_full(absolute, &node, follow, 0);
+    if (result == 0) {
+        struct fuse_attr_out attributes;
+        result = sud_fuse_setattr(node.inode, request, &attributes);
+    }
+    resolved_forget(&node);
+    return result;
+}
+
+int sud_vfs_fsetattr(int fd, const struct fuse_setattr_in *request)
+{
+    struct sud_remote_ofd *description = description_for(fd);
+    if (!description) return -EBADF;
+    struct fuse_setattr_in input = *request;
+    input.valid |= FATTR_FH;
+    input.fh = description->handle;
+    struct fuse_attr_out attributes;
+    return sud_fuse_setattr(description->inode, &input, &attributes);
+}
+
 int sud_vfs_getfl(int fd)
 {
     struct sud_remote_ofd *description = description_for(fd);

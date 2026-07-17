@@ -44,6 +44,9 @@ long sud_fuse_readdir(uint64_t inode, uint64_t handle, uint64_t offset,
 int sud_fuse_releasedir(uint64_t inode, uint64_t handle, uint32_t flags);
 int sud_fuse_setattr(uint64_t inode, const struct fuse_setattr_in *input,
                      struct fuse_attr_out *attributes);
+int sud_fuse_access(uint64_t inode, uint32_t mask);
+int sud_fuse_fsync(uint64_t inode, uint64_t handle, int directory,
+                   int datasync);
 
 size_t sud_fuse_max_read(void);
 size_t sud_fuse_max_write(void);

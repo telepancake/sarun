@@ -70,6 +70,8 @@
 #define SYS_wait4          __NR_wait4
 #define SYS_exit           __NR_exit
 #define SYS_getpid         __NR_getpid
+#define SYS_geteuid        __NR_geteuid
+#define SYS_getegid        __NR_getegid
 #define SYS_kill           __NR_kill
 #define SYS_gettid         __NR_gettid
 #define SYS_clock_gettime  __NR_clock_gettime
