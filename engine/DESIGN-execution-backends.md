@@ -104,6 +104,10 @@ as executable mappings and mmap that genuinely need a host fd.
         locks and flush-time release, fsync, sparse seek, truncation, hardlink
         counts, statfs, stable directory cookies, and concurrent canonical
         requests through the public virtiofsd `FileSystem` trait.
+  - [x] Implement `O_TRUNC` in the canonical open path and finalize sqlar size
+        metadata for path-based truncate. A live QEMU client exposed both gaps:
+        raw open flags had left a lower-file tail in place, while both FUSE and
+        QEMU had changed the blob length without updating its capture row.
 
 ### 2. FUSE cutover
 
@@ -232,6 +236,12 @@ as executable mappings and mmap that genuinely need a host fd.
         FUSE box; GNU hello completes archive extraction, Autoconf configure,
         GNU make and execution, and a CMake/Unix Makefiles project compiles and
         executes. The SUD/QEMU and remaining tool/backend legs stay open.
+  - [x] Add a portable live backend-equivalence gate. On aarch64, FUSE and the
+        paired QEMU/TCG appliance now produce identical captured content and
+        metadata for lower copy-up, chmod, hardlinks, nested rename,
+        rename-over with an open destination fd, unlink with an open lower fd,
+        sparse truncation, execution of a newly created script, tombstones,
+        and host non-escape. The gate automatically adds native SUD on x86_64.
 - [ ] Stress concurrency and forced termination; prove no write escapes to the
       host and no ring waiter remains stuck.
 - [ ] Record comparable filesystem benchmarks.  Do not delete a displaced
@@ -267,6 +277,13 @@ as executable mappings and mmap that genuinely need a host fd.
 - `/dev/kvm` is absent, so the TCG legs are proven here and both KVM legs remain
   open. The broad real-project/benchmark matrix in section 5 also remains open;
   it must not be represented as complete from smoke tests.
+- `make test-backends` passes live FUSE/QEMU equivalence on aarch64. The first
+  architecture-correct run of the broader historical Python suite collected
+  53 tests and produced 10 pass, 1 skip, 42 fail; most failures are explicit
+  legacy harness assumptions (`/root` fixtures as uid 501 and default Tap on a
+  host whose kernel rejects unprivileged user namespaces), with additional
+  stale API/baseline cases. Those are recorded work, not treated as backend
+  failures or silently converted to green skips.
 
 ## Commit gates
 

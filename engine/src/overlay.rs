@@ -1766,6 +1766,7 @@ impl SarunFs {
                 .read(true)
                 .write(true)
                 .create(true)
+                .truncate(flags & libc::O_TRUNC as u32 != 0)
                 .open(&host)
                 .map_err(Errno::from)?;
             let handle = self.reg_fh(FhInner {
@@ -1826,7 +1827,7 @@ impl SarunFs {
             && !want_write
             && flags & FMODE_EXEC == 0
             && (b.direct() || self.is_passthrough_read(&rel));
-        let (data, upper) = match self.resolve(bid, &rel) {
+        let (mut data, mut upper) = match self.resolve(bid, &rel) {
             Layer::UpperFile { owner, rowid, .. } => {
                 self.ensure_upper_blob(owner, rowid, &rel);
                 let own = owner == bid;
@@ -1878,13 +1879,26 @@ impl SarunFs {
             }
             _ => return Err(Errno::ENOENT),
         };
+        let truncated = want_write && flags & libc::O_TRUNC as u32 != 0;
+        if truncated {
+            if !upper {
+                data = FileData::Native(
+                    self.copy_up(&b, &rel, pid).map_err(Errno::from)?,
+                );
+                upper = true;
+            }
+            let FileData::Native(file) = &data else {
+                return Err(Errno::EBADF);
+            };
+            file.set_len(0).map_err(Errno::from)?;
+        }
         let handle = self.reg_fh(FhInner {
             box_id: bid,
             rel,
             linked: true,
             data,
             upper,
-            dirty: false,
+            dirty: truncated,
             last_pid: pid,
             last_tgid: 0,
             passthrough: false,
@@ -2423,6 +2437,15 @@ impl SarunFs {
             }
             .ok_or(Errno::EIO)?;
             file.set_len(size).map_err(Errno::from)?;
+            let metadata = file.metadata().map_err(Errno::from)?;
+            self.inner
+                .mutations
+                .writer(&b, pid)
+                .finalize_file(
+                    &rel,
+                    metadata.size() as i64,
+                    metadata.mtime() * 1_000_000_000 + metadata.mtime_nsec(),
+                );
         }
         if let Some(mode) = request.mode {
             let permissions = mode & 0o7777;
@@ -3795,6 +3818,7 @@ mod chain_tests {
         ));
         std::fs::create_dir_all(&tmp).unwrap();
         std::fs::write(tmp.join("hello"), b"canonical bytes").unwrap();
+        std::fs::write(tmp.join("truncate-open"), b"tail must disappear").unwrap();
         // SAFETY: TEST_STATE_HOME_LOCK serializes state-home tests.
         unsafe { std::env::set_var("XDG_STATE_HOME", &tmp); }
         std::fs::create_dir_all(crate::paths::state_home()).unwrap();
@@ -3920,6 +3944,51 @@ mod chain_tests {
             .raw_os_error(),
             Some(libc::ENODATA),
         );
+
+        // Some clients express shell `>` solely as OPEN(O_TRUNC), while a
+        // Linux FUSE client may additionally emit SETATTR(size=0). The shared
+        // core must implement the open flag itself so transports agree.
+        let truncate_name = CString::new("truncate-open").unwrap();
+        let truncate_entry = <SarunFs as virtiofsd::filesystem::FileSystem>::lookup(
+            &fs, ctx, entry.inode, &truncate_name,
+        )
+        .unwrap();
+        let (truncate_handle, _) = <SarunFs as virtiofsd::filesystem::FileSystem>::open(
+            &fs,
+            ctx,
+            truncate_entry.inode,
+            false,
+            (libc::O_WRONLY | libc::O_TRUNC) as u32,
+        )
+        .unwrap();
+        <SarunFs as virtiofsd::filesystem::FileSystem>::release(
+            &fs,
+            ctx,
+            truncate_entry.inode,
+            0,
+            truncate_handle.unwrap(),
+            false,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            <SarunFs as virtiofsd::filesystem::FileSystem>::getattr(
+                &fs, ctx, truncate_entry.inode, None,
+            )
+            .unwrap()
+            .0
+            .size,
+            0,
+        );
+        assert_eq!(
+            std::fs::read(tmp.join("truncate-open")).unwrap(),
+            b"tail must disappear",
+        );
+        let Layer::UpperFile { owner, rowid, .. } = fs.resolve(id, "truncate-open") else {
+            panic!("O_TRUNC did not copy up the lower file");
+        };
+        assert_eq!(blob_path(owner, rowid).metadata().unwrap().len(), 0);
 
         let filename = CString::new("hello").unwrap();
         let file_entry = <SarunFs as virtiofsd::filesystem::FileSystem>::lookup(
@@ -4226,6 +4295,19 @@ mod chain_tests {
         assert_eq!(allocated_attr.uid.into_inner(), unsafe { libc::geteuid() });
         assert_eq!(allocated_attr.gid.into_inner(), unsafe { libc::getegid() });
         assert_eq!(blob_path(owner, rowid).metadata().unwrap().len(), 128);
+        let allocated_sqlar_size: i64 = fs
+            .box_of(id)
+            .unwrap()
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT sz FROM sqlar WHERE name='allocated'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(allocated_sqlar_size, 128);
         let directory_name = CString::new("directory").unwrap();
         let directory = <SarunFs as virtiofsd::filesystem::FileSystem>::mkdir(
             &fs,

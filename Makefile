@@ -153,6 +153,11 @@ test-sud: ## sud vs FUSE equivalence + sud exec capabilities (needs `make engine
 	cd prototype && uv run --with "wcmatch>=8.4" --with "python-magic>=0.4" \
 	  python test_sud_concurrent_rs.py
 
+.PHONY: test-backends
+test-backends: ## Portable live SarunFs equivalence (FUSE, host QEMU, and native SUD where supported)
+	cd prototype && uv run --with "wcmatch>=8.4" --with "python-magic>=0.4" \
+	  python test_backend_equiv_rs.py
+
 # ---- Housekeeping ---------------------------------------------------------
 
 .PHONY: clean
