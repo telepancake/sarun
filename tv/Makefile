@@ -8,7 +8,7 @@ MOK_CER ?= $(PWD)/MOK.der
 all: tv sudtrace upttrace sud-bins mod-bins
 
 .PHONY: sud-bins mod-bins
-sud-bins: path-remap-test dispatcher-test inramfs-test fake-exec-test cmd-rewrite-test
+sud-bins: fs-ring-test path-remap-test dispatcher-test inramfs-test fake-exec-test cmd-rewrite-test
 	$(MAKE) sud64 sud32
 
 mod-bins:
@@ -48,6 +48,7 @@ clean:
 	rm -f build/inramfs_test32 build/inramfs_test64
 	rm -f build/fake_exec_test32 build/fake_exec_test64
 	rm -f build/cmd_rewrite_test64
+	rm -f build/fs_ring_abi32.o build/fs_ring_abi64.o
 
 install:
 	$(MAKE) -C $(MOD_DIR) install
@@ -224,6 +225,17 @@ sud64: $(SUD_SRCS) $(SUD_HDRS) sudtrace.lds
 
 sud32: $(SUD_SRCS) $(SUD_HDRS) sudtrace.lds
 	$(SUD_CC32) $(SUD_CFLAGS) $(SUD_LDFLAGS) $(SUD_BASE32) -T sudtrace.lds -o sud32 $(SUD_SRCS)
+
+.PHONY: fs-ring-test
+fs-ring-test: build/fs_ring_abi64.o build/fs_ring_abi32.o
+
+build/fs_ring_abi64.o: sud/fs/tests/ring_abi.c sud/fs/ring.h
+	@mkdir -p build
+	$(SUD_CC64) $(SUD_CFLAGS) -c -o $@ $<
+
+build/fs_ring_abi32.o: sud/fs/tests/ring_abi.c sud/fs/ring.h
+	@mkdir -p build
+	$(SUD_CC32) $(SUD_CFLAGS) -c -o $@ $<
 
 .PHONY: libc-fs-test
 libc-fs-test:

@@ -118,10 +118,23 @@ as executable mappings and mmap that genuinely need a host fd.
 
 ### 3. SUD cutover
 
-- [ ] Implement bounded multi-producer shared request/completion rings with
-      futex/eventfd wakeups and crash-safe cancellation.
+- [x] Implement the bounded multi-producer shared request/completion transport.
+  - [x] Pin one 32/64-bit-stable freestanding ABI: a sealed memfd inherited as
+        fd 1021, 32 independently reclaimable request/reply mailboxes, 32 KiB
+        raw-FUSE payloads, futex wakeups, explicit shutdown, and dead-owner
+        reclamation. Independent slots avoid an enqueue hole when a tracee dies.
+  - [x] Pass the ring as the fourth ordered registration fd and own its worker
+        lifecycle with the box; feed every request through the same virtiofsd
+        decoder and scoped `SarunFs` used by FUSE and QEMU.
+  - [ ] Add the freestanding SUD client and split large reads/writes so no
+        request exceeds the negotiated slot payload.
 - [ ] Translate intercepted syscalls and fd operations to canonical FUSE
       requests without resolving paths or applying overlay policy in SUD.
+  - [ ] Implement LOOKUP/GETATTR/OPEN/CREATE/READ/WRITE/FLUSH/RELEASE and a
+        virtual-fd table, then directory, link/rename, xattr, statfs, locking,
+        sparse/truncate, and executable-mapping operations.
+  - [ ] Replace the path-remap and inramfs addins in the production wrapper in
+        one cutover; do not retain an old/new runtime mode.
 - [ ] Add the exceptional SCM_RIGHTS fd lane for exec/mmap backing objects.
 - [ ] Retain trace/provenance independently of the filesystem transport.
 - [ ] Reach FUSE/SUD equivalence for visible trees, metadata, sqlar, output,
@@ -188,7 +201,7 @@ holding hours of work only in the worktree.
 
 ## Known baseline failures
 
-- The 2026-07-17 full static aarch64 unit run passed 377 tests, ignored one,
+- The 2026-07-17 full static aarch64 unit run now passes 383 tests, ignores one,
   and exposed two pre-existing Brush/editor semantic-completion assertions:
   `production_brush_document_propagates_later_find_type_constraint` and
   `bash_editor_uses_relation_for_backward_completion_and_insertion`.  The

@@ -114,29 +114,38 @@ pub fn runner_broker_handoff_pub(fd: i32) { runner_broker_handoff(fd) }
 /// runners, where our own getpid() is a parent-namespace pid the engine can't
 /// use. Returns false on write error.
 fn send_register(conn: &UnixStream, line: &[u8], pidfd: i32, tap_fd: Option<i32>) -> bool {
-    send_register_fds(conn, line, pidfd, tap_fd, None)
+    send_register_fds(conn, line, pidfd, tap_fd, None, None)
 }
 
 /// Like send_register but with an ORDERED extra-fd tail after the pidfd:
-/// fd[0] = pidfd, then the TAP fd (tap boxes), then the sud trace-pipe fd
+/// fd[0] = pidfd, then the TAP fd (tap boxes), then the sud trace-pipe fd,
+/// then the SUD filesystem ring
 /// (sud boxes). The engine (recv_first_fd + register) assigns roles from the
 /// same want_sud/net_mode it reads out of `line`, so the order must match:
-/// [pidfd, tap?, trace?].
+/// [pidfd, tap?, trace?, ring?].
 fn send_register_fds(conn: &UnixStream, line: &[u8], pidfd: i32,
-                     tap_fd: Option<i32>, trace_fd: Option<i32>) -> bool {
-    let mut fds: Vec<i32> = Vec::with_capacity(3);
+                     tap_fd: Option<i32>, trace_fd: Option<i32>,
+                     ring_fd: Option<i32>) -> bool {
+    let mut fds: Vec<i32> = Vec::with_capacity(4);
     if pidfd >= 0 { fds.push(pidfd); }
     if let Some(t) = tap_fd { fds.push(t); }
     if let Some(t) = trace_fd { fds.push(t); }
+    if let Some(r) = ring_fd { fds.push(r); }
     if fds.is_empty() {
         return conn_write_all(conn, line);
+    }
+    // Every ancillary layout is positional and begins with a pidfd. Omitting
+    // a failed pidfd would silently shift TAP/trace/ring descriptors into the
+    // wrong roles at the receiver.
+    if pidfd < 0 {
+        return false;
     }
     let nbytes = (fds.len() * std::mem::size_of::<i32>()) as u32;
     let mut iov = libc::iovec {
         iov_base: line.as_ptr() as *mut libc::c_void,
         iov_len: line.len(),
     };
-    let mut cmsg = [0u8; 64]; // CMSG_SPACE(3 * sizeof(i32)) rounded up
+    let mut cmsg = [0u8; 64]; // CMSG_SPACE(4 * sizeof(i32)) rounded up
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
@@ -833,6 +842,7 @@ pub fn run_qemu(
         pidfd,
         engine_network.as_ref().map(std::os::fd::AsRawFd::as_raw_fd),
         None,
+        None,
     ) {
         eprintln!("sarun-engine run --qemu: register write failed");
         return 1;
@@ -1014,9 +1024,21 @@ pub fn run_sud(name: Option<String>, env: bool, chdir: Option<String>,
         return 1;
     }
     let (trace_r, trace_w) = (pfd[0], pfd[1]);
-    // Register (consumes tap_fd + trace_r as SCM_RIGHTS fds) and validate ack.
+    let fs_ring = match crate::sud_ring::RingMapping::create() {
+        Ok(ring) => ring,
+        Err(error) => {
+            eprintln!("sarun-engine: SUD filesystem ring: {error}");
+            unsafe {
+                libc::close(trace_r);
+                libc::close(trace_w);
+            }
+            return 1;
+        }
+    };
+    // Register (consumes duplicates of tap_fd, trace_r, and the ring fd) and
+    // validate the ack. The runner keeps its mapping through child spawn.
     let ack = match sud_register(&conn, &cmd, env, &name, net_mode,
-                                 tap_fd, trace_r) {
+                                 tap_fd, trace_r, fs_ring.as_raw_fd()) {
         Ok(a) => a,
         Err(code) => { unsafe { libc::close(trace_w); } return code; }
     };
@@ -1163,7 +1185,7 @@ pub fn run_sud(name: Option<String>, env: bool, chdir: Option<String>,
         });
     }
     // Launch under the wrapper contract and wait for the traced tree.
-    let code = sud_launcher_exec(sc, wrapper, trace_w);
+    let code = sud_launcher_exec(sc, wrapper, trace_w, fs_ring);
     // Sweep the upper into the box's sqlar on a FRESH conn (the register conn
     // is the box channel; a verb on it would desync teardown).
     sud_request_sweep(&sock, &sid);
@@ -1215,12 +1237,13 @@ fn sud_netns_setup(net_mode: crate::net::NetMode)
 }
 
 /// Send the sud register line with the ordered SCM_RIGHTS fd tail
-/// [pidfd, tap?, trace_r], drop our copies of the fds the engine dup'd
+/// [pidfd, tap?, trace_r, ring], drop our copies of the fds the engine dup'd
 /// (`tap_fd` + `trace_r` are consumed here), read the ack, and return it once
 /// validated. `Err(code)` carries the process exit code on any failure.
 fn sud_register(conn: &UnixStream, cmd: &[String], env: bool,
                 name: &Option<String>, net_mode: crate::net::NetMode,
-                tap_fd: Option<std::os::fd::OwnedFd>, trace_r: i32)
+                tap_fd: Option<std::os::fd::OwnedFd>, trace_r: i32,
+                ring_fd: i32)
                 -> Result<Value, i32> {
     let reg = json!({"type": "register",
                      "cmd": cmd, "prov": provenance(cmd, env),
@@ -1234,8 +1257,10 @@ fn sud_register(conn: &UnixStream, cmd: &[String], env: bool,
     let pidfd = pidfd_open(std::process::id() as i32);
     let tap_raw = tap_fd.as_ref().map(|f| f.as_raw_fd());
     if !send_register_fds(conn, format!("{reg}\n").as_bytes(), pidfd,
-                          tap_raw, Some(trace_r)) {
+                          tap_raw, Some(trace_r), Some(ring_fd)) {
         eprintln!("sarun-engine: register write failed");
+        if pidfd >= 0 { unsafe { libc::close(pidfd); } }
+        unsafe { libc::close(trace_r); }
         return Err(1);
     }
     if pidfd >= 0 { unsafe { libc::close(pidfd); } }
@@ -1550,7 +1575,8 @@ unsafe fn wire_unlock(word: *mut u32) {
     }
 }
 
-fn sud_launcher_exec(mut sc: Command, wrapper: &str, trace_w: i32) -> i32 {
+fn sud_launcher_exec(mut sc: Command, wrapper: &str, trace_w: i32,
+                     fs_ring: crate::sud_ring::RingMapping) -> i32 {
     let stream_id: u32;
     let state_page: *mut u32;
     let mfd: i32;
@@ -1596,7 +1622,8 @@ fn sud_launcher_exec(mut sc: Command, wrapper: &str, trace_w: i32) -> i32 {
                 return Err(std::io::Error::last_os_error());
             }
             if libc::dup2(trace_w, SUD_OUTPUT_FD) < 0
-                || libc::dup2(mfd, SUD_STATE_FD) < 0 {
+                || libc::dup2(mfd, SUD_STATE_FD) < 0
+                || libc::dup2(fs_ring.as_raw_fd(), crate::sud_ring::RING_FD) < 0 {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(())
