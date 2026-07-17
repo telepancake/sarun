@@ -231,6 +231,16 @@ fn read_bootstrap_makefile(
         bootstrap.put_slice(b"\t$(COMPILE.C) $(OUTPUT_OPTION) $<\n");
         bootstrap.put_slice(b".S.o:\n");
         bootstrap.put_slice(b"\t$(COMPILE.S) $(OUTPUT_OPTION) $<\n");
+        bootstrap.put_slice(b".o:\n");
+        bootstrap.put_slice(b"\t$(LINK.o) $^ $(LOADLIBES) $(LDLIBS) -o $@\n");
+        bootstrap.put_slice(b".c:\n");
+        bootstrap.put_slice(b"\t$(LINK.c) $^ $(LOADLIBES) $(LDLIBS) -o $@\n");
+        bootstrap.put_slice(b".cc:\n");
+        bootstrap.put_slice(b"\t$(LINK.cc) $^ $(LOADLIBES) $(LDLIBS) -o $@\n");
+        bootstrap.put_slice(b".cpp:\n");
+        bootstrap.put_slice(b"\t$(LINK.cpp) $^ $(LOADLIBES) $(LDLIBS) -o $@\n");
+        bootstrap.put_slice(b".C:\n");
+        bootstrap.put_slice(b"\t$(LINK.C) $^ $(LOADLIBES) $(LDLIBS) -o $@\n");
     }
     // sarun: GNU make's $(MAKE) is the name make was invoked as (argv[0]) — no
     // -jN appended. Parallelism propagates via MAKEFLAGS, not MAKE itself.

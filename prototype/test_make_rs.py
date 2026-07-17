@@ -1504,6 +1504,49 @@ printf preserved > result.txt
               and preserved == b"preserved",
               f"case43: generated command retains quote escapes and reparses; "
               f"generated={generated!r} result={preserved!r}")
+        # ── CASE 44: core implicit link rules produce executables ───────────
+        # ELFkickers uses both GNU forms: an explicit target with object
+        # prerequisites but no recipe (`objres: objres.o ...`) and one with a
+        # source prerequisite (`elfls: elfls.c ...`). COMPILE/LINK variables
+        # alone are insufficient unless the standard pattern relations connect
+        # those declarations to executable-producing recipes.
+        lr = work / "implicit-link"
+        shutil.rmtree(lr, ignore_errors=True)
+        lr.mkdir(parents=True, exist_ok=True)
+        (lr / "object_tool.c").write_text(
+            '#include <stdio.h>\nint main(void) { puts("object"); return 0; }\n')
+        (lr / "direct_tool.c").write_text(
+            '#include <stdio.h>\nint main(void) { puts("direct"); return 0; }\n')
+        (lr / "Makefile").write_text(
+            ".PHONY: all\n"
+            "all: object_tool direct_tool\n"
+            "\t@./object_tool > result.txt\n"
+            "\t@./direct_tool >> result.txt\n"
+            "object_tool: object_tool.o\n"
+            "direct_tool: direct_tool.c\n")
+        r = run_make("MAKE44", lr, "-j10", "all")
+        check(r.returncode == 0,
+              f"case44: standard object/source implicit links execute "
+              f"(got {r.returncode}: {(r.stdout+r.stderr)[-700:]})")
+        object_link_lines = [
+            line for line in (r.stdout + r.stderr).splitlines()
+            if line.rstrip().endswith("-o object_tool")
+        ]
+        check(any("object_tool.o" in line and "object_tool.c" not in line
+                  for line in object_link_lines),
+              f"case44: declared object prerequisite selects the object-link "
+              f"relation; lines={object_link_lines!r}")
+        sp44 = latest_sqlar(m)
+        linked = m.sqlar_content(
+            sp44, str((lr / "result.txt").resolve()).lstrip("/"))
+        object_tool = m.sqlar_content(
+            sp44, str((lr / "object_tool").resolve()).lstrip("/"))
+        direct_tool = m.sqlar_content(
+            sp44, str((lr / "direct_tool").resolve()).lstrip("/"))
+        check(linked == b"object\ndirect\n" and bool(object_tool)
+              and bool(direct_tool),
+              f"case44: both linked binaries ran; result={linked!r} "
+              f"sizes={(len(object_tool) if object_tool else None, len(direct_tool) if direct_tool else None)}")
     finally:
         if eng is not None and eng.poll() is None:
             eng.terminate()

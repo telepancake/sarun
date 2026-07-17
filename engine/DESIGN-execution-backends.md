@@ -543,7 +543,19 @@ as executable mappings and mmap that genuinely need a host fd.
           script. The parser now performs the POSIX two-to-one reduction. Its
           focused parser test and the real libtool fragment in Make/Brush case
           43 both pass; the generated assignment retains escapes and reparses.
-          The next boundary is resuming the clean `world` build past xz.
+          A second clean run passed xz and progressed for 8m31s through 20,550
+          recorded build edges before ELFkickers exposed missing GNU built-in
+          executable-link relations: its makefiles intentionally declare an
+          object prerequisite but rely on `.o:` to supply the recipe. Kati's
+          bootstrap now defines the bounded `.o`, `.c`, `.cc`, `.cpp`, and `.C`
+          single-suffix link rules instead of an unbounded match-anything
+          workaround. Its selector treats an explicitly declared prerequisite
+          as immediately applicable even before that file has been built, so
+          `tool: tool.o` selects object linking while a plain `tool.c` still
+          selects direct source linking. Case 44 verifies both executable paths,
+          including the actual selected object-link command. The complete 44
+          case suite passes on native aarch64. The next boundary is resuming a
+          clean `world` build past ELFkickers/sstrip.
     - [x] Complete the native-aarch64 FUSE Brush gate from a clean output tree.
           Linux 6.18 builds 823 objects with `-j10` (11 observed overlapping
           clang processes), takes 162 s wall / 143 s compile, and records 2,797

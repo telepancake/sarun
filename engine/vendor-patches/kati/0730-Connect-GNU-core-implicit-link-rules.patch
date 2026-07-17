@@ -1,0 +1,54 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Fri, 17 Jul 2026 23:37:32 +0000
+Subject: [PATCH] Connect GNU core implicit link rules
+
+Use the standard LINK.o, LINK.c, and C++ link relations to produce executables for recipe-less targets with matching object or source prerequisites.
+
+---
+diff --git a/src-rs/dep.rs b/src-rs/dep.rs
+index 1fa3007..85394f1 100644
+--- a/src-rs/dep.rs
++++ b/src-rs/dep.rs
+@@ -1311,7 +1311,19 @@ impl<'a> DepBuilder<'a> {
+                 b.put_u8(b'.');
+                 b.put_slice(&suf);
+                 let input = intern(b.freeze());
+-                if self.exists(input) || self.vpath_resolve(input).is_some() {
++                // An explicit prerequisite of the target is an immediately
++                // applicable implicit-rule input even when it still needs to
++                // be built.  GNU uses `%: %.o` for `tool: tool.o` before its
++                // later `%: %.c` shortcut; requiring tool.o to exist at plan
++                // time instead picked tool.c and linked the wrong relation.
++                let declared_input = rule_merger.as_ref().is_some_and(|merger| {
++                    merger
++                        .lock()
++                        .rules
++                        .iter()
++                        .any(|rule| rule.inputs.contains(&input))
++                });
++                if declared_input || self.exists(input) || self.vpath_resolve(input).is_some() {
+                     return Some(irule.clone());
+                 }
+             }
+diff --git a/src-rs/main.rs b/src-rs/main.rs
+index 374b23b..7ff537e 100644
+--- a/src-rs/main.rs
++++ b/src-rs/main.rs
+@@ -117,6 +117,16 @@ fn read_bootstrap_makefile(targets: &[Symbol]) -> Result<Arc<Mutex<Vec<Stmt>>>>
+         bootstrap.put_slice(b"\t$(COMPILE.C) $(OUTPUT_OPTION) $<\n");
+         bootstrap.put_slice(b".S.o:\n");
+         bootstrap.put_slice(b"\t$(COMPILE.S) $(OUTPUT_OPTION) $<\n");
++        bootstrap.put_slice(b".o:\n");
++        bootstrap.put_slice(b"\t$(LINK.o) $^ $(LOADLIBES) $(LDLIBS) -o $@\n");
++        bootstrap.put_slice(b".c:\n");
++        bootstrap.put_slice(b"\t$(LINK.c) $^ $(LOADLIBES) $(LDLIBS) -o $@\n");
++        bootstrap.put_slice(b".cc:\n");
++        bootstrap.put_slice(b"\t$(LINK.cc) $^ $(LOADLIBES) $(LDLIBS) -o $@\n");
++        bootstrap.put_slice(b".cpp:\n");
++        bootstrap.put_slice(b"\t$(LINK.cpp) $^ $(LOADLIBES) $(LDLIBS) -o $@\n");
++        bootstrap.put_slice(b".C:\n");
++        bootstrap.put_slice(b"\t$(LINK.C) $^ $(LOADLIBES) $(LDLIBS) -o $@\n");
+     }
+     if FLAGS.generate_ninja {
+         bootstrap.put_slice(format!("MAKE?=make -j{}\n", FLAGS.num_jobs.max(1)).as_bytes());

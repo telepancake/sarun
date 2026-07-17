@@ -70,3 +70,4 @@
 0700-Do-not-hold-parser-locks-while-evaluating-statements.patch
 0710-Accept-inherited-GNU-jobserver-transport-options.patch
 0720-Provide-GNU-core-compile-and-link-variables.patch
+0730-Connect-GNU-core-implicit-link-rules.patch
