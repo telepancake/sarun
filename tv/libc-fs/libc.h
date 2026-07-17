@@ -80,6 +80,9 @@
 #define SYS_sched_yield    __NR_sched_yield
 #define SYS_sigaltstack    __NR_sigaltstack
 #define SYS_umask          __NR_umask
+#define SYS_sendmsg        __NR_sendmsg
+#define SYS_recvmsg        __NR_recvmsg
+#define SYS_socketpair     __NR_socketpair
 
 #ifdef __NR_exit_group
 #define SYS_exit_group     __NR_exit_group

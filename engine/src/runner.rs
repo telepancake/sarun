@@ -114,23 +114,24 @@ pub fn runner_broker_handoff_pub(fd: i32) { runner_broker_handoff(fd) }
 /// runners, where our own getpid() is a parent-namespace pid the engine can't
 /// use. Returns false on write error.
 fn send_register(conn: &UnixStream, line: &[u8], pidfd: i32, tap_fd: Option<i32>) -> bool {
-    send_register_fds(conn, line, pidfd, tap_fd, None, None)
+    send_register_fds(conn, line, pidfd, tap_fd, None, None, None)
 }
 
 /// Like send_register but with an ORDERED extra-fd tail after the pidfd:
 /// fd[0] = pidfd, then the TAP fd (tap boxes), then the sud trace-pipe fd,
-/// then the SUD filesystem ring
+/// then the SUD filesystem ring and exceptional descriptor lane
 /// (sud boxes). The engine (recv_first_fd + register) assigns roles from the
 /// same want_sud/net_mode it reads out of `line`, so the order must match:
-/// [pidfd, tap?, trace?, ring?].
+/// [pidfd, tap?, trace?, ring?, lane?].
 fn send_register_fds(conn: &UnixStream, line: &[u8], pidfd: i32,
                      tap_fd: Option<i32>, trace_fd: Option<i32>,
-                     ring_fd: Option<i32>) -> bool {
-    let mut fds: Vec<i32> = Vec::with_capacity(4);
+                     ring_fd: Option<i32>, lane_fd: Option<i32>) -> bool {
+    let mut fds: Vec<i32> = Vec::with_capacity(5);
     if pidfd >= 0 { fds.push(pidfd); }
     if let Some(t) = tap_fd { fds.push(t); }
     if let Some(t) = trace_fd { fds.push(t); }
     if let Some(r) = ring_fd { fds.push(r); }
+    if let Some(l) = lane_fd { fds.push(l); }
     if fds.is_empty() {
         return conn_write_all(conn, line);
     }
@@ -145,7 +146,7 @@ fn send_register_fds(conn: &UnixStream, line: &[u8], pidfd: i32,
         iov_base: line.as_ptr() as *mut libc::c_void,
         iov_len: line.len(),
     };
-    let mut cmsg = [0u8; 64]; // CMSG_SPACE(4 * sizeof(i32)) rounded up
+    let mut cmsg = [0u8; 128];
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
@@ -843,6 +844,7 @@ pub fn run_qemu(
         engine_network.as_ref().map(std::os::fd::AsRawFd::as_raw_fd),
         None,
         None,
+        None,
     ) {
         eprintln!("sarun-engine run --qemu: register write failed");
         return 1;
@@ -1035,12 +1037,26 @@ pub fn run_sud(name: Option<String>, env: bool, chdir: Option<String>,
             return 1;
         }
     };
+    let mut lane = [-1i32; 2];
+    if unsafe { libc::socketpair(libc::AF_UNIX,
+                                 libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+                                 0, lane.as_mut_ptr()) } < 0 {
+        eprintln!("sarun-engine: SUD descriptor lane: {}",
+                  std::io::Error::last_os_error());
+        unsafe { libc::close(trace_r); libc::close(trace_w); }
+        return 1;
+    }
+    let (lane_engine, lane_client) = (lane[0], lane[1]);
     // Register (consumes duplicates of tap_fd, trace_r, and the ring fd) and
     // validate the ack. The runner keeps its mapping through child spawn.
     let ack = match sud_register(&conn, &cmd, env, &name, net_mode,
-                                 tap_fd, trace_r, fs_ring.as_raw_fd()) {
+                                 tap_fd, trace_r, fs_ring.as_raw_fd(),
+                                 lane_engine) {
         Ok(a) => a,
-        Err(code) => { unsafe { libc::close(trace_w); } return code; }
+        Err(code) => {
+            unsafe { libc::close(trace_w); libc::close(lane_client); }
+            return code;
+        }
     };
     let sid = ack.get("session_id").and_then(Value::as_str)
         .unwrap_or("?").to_string();
@@ -1057,7 +1073,7 @@ pub fn run_sud(name: Option<String>, env: bool, chdir: Option<String>,
     if upper.is_empty() {
         eprintln!("sarun-engine: engine did not allocate a sud upper \
                    (engine older than this runner?)");
-        unsafe { libc::close(trace_w); }
+        unsafe { libc::close(trace_w); libc::close(lane_client); }
         return 1;
     }
     eprintln!("sarun-engine: box {sid}  (sud upper: {upper})");
@@ -1085,7 +1101,7 @@ pub fn run_sud(name: Option<String>, env: bool, chdir: Option<String>,
     let cmd = if brush {
         let Some(exe) = self_exe.as_deref() else {
             eprintln!("sarun-engine run --sud: -b needs current_exe()");
-            unsafe { libc::close(trace_w); }
+            unsafe { libc::close(trace_w); libc::close(lane_client); }
             return 1;
         };
         sud_brush_cmd(exe, &cmd)
@@ -1113,12 +1129,12 @@ pub fn run_sud(name: Option<String>, env: bool, chdir: Option<String>,
         let exe = self_exe.as_deref().unwrap_or_default();
         if let Err(e) = sud_shadow_rules(&mut sc, &upper, exe) {
             eprintln!("sarun-engine run --sud: {e}");
-            unsafe { libc::close(trace_w); }
+            unsafe { libc::close(trace_w); libc::close(lane_client); }
             return 1;
         }
     }
     if let Err(code) = sud_overlay_rule(&mut sc, &upper, &lowers) {
-        unsafe { libc::close(trace_w); }
+        unsafe { libc::close(trace_w); libc::close(lane_client); }
         return code;
     }
     match &shebang {
@@ -1185,7 +1201,7 @@ pub fn run_sud(name: Option<String>, env: bool, chdir: Option<String>,
         });
     }
     // Launch under the wrapper contract and wait for the traced tree.
-    let code = sud_launcher_exec(sc, wrapper, trace_w, fs_ring);
+    let code = sud_launcher_exec(sc, wrapper, trace_w, fs_ring, lane_client);
     // Sweep the upper into the box's sqlar on a FRESH conn (the register conn
     // is the box channel; a verb on it would desync teardown).
     sud_request_sweep(&sock, &sid);
@@ -1237,13 +1253,13 @@ fn sud_netns_setup(net_mode: crate::net::NetMode)
 }
 
 /// Send the sud register line with the ordered SCM_RIGHTS fd tail
-/// [pidfd, tap?, trace_r, ring], drop our copies of the fds the engine dup'd
+/// [pidfd, tap?, trace_r, ring, lane], drop our copies of the fds the engine dup'd
 /// (`tap_fd` + `trace_r` are consumed here), read the ack, and return it once
 /// validated. `Err(code)` carries the process exit code on any failure.
 fn sud_register(conn: &UnixStream, cmd: &[String], env: bool,
                 name: &Option<String>, net_mode: crate::net::NetMode,
                 tap_fd: Option<std::os::fd::OwnedFd>, trace_r: i32,
-                ring_fd: i32)
+                ring_fd: i32, lane_fd: i32)
                 -> Result<Value, i32> {
     let reg = json!({"type": "register",
                      "cmd": cmd, "prov": provenance(cmd, env),
@@ -1257,15 +1273,17 @@ fn sud_register(conn: &UnixStream, cmd: &[String], env: bool,
     let pidfd = pidfd_open(std::process::id() as i32);
     let tap_raw = tap_fd.as_ref().map(|f| f.as_raw_fd());
     if !send_register_fds(conn, format!("{reg}\n").as_bytes(), pidfd,
-                          tap_raw, Some(trace_r), Some(ring_fd)) {
+                          tap_raw, Some(trace_r), Some(ring_fd), Some(lane_fd)) {
         eprintln!("sarun-engine: register write failed");
         if pidfd >= 0 { unsafe { libc::close(pidfd); } }
         unsafe { libc::close(trace_r); }
+        unsafe { libc::close(lane_fd); }
         return Err(1);
     }
     if pidfd >= 0 { unsafe { libc::close(pidfd); } }
     drop(tap_fd); // engine dup'd it; device stays alive on its fd + our netns
     unsafe { libc::close(trace_r); } // engine holds its dup now
+    unsafe { libc::close(lane_fd); } // engine holds its dup now
     let mut line = String::new();
     if BufReader::new(conn).read_line(&mut line).is_err() {
         eprintln!("sarun-engine: register read failed");
@@ -1576,7 +1594,8 @@ unsafe fn wire_unlock(word: *mut u32) {
 }
 
 fn sud_launcher_exec(mut sc: Command, wrapper: &str, trace_w: i32,
-                     fs_ring: crate::sud_ring::RingMapping) -> i32 {
+                     fs_ring: crate::sud_ring::RingMapping,
+                     fd_lane: i32) -> i32 {
     let stream_id: u32;
     let state_page: *mut u32;
     let mfd: i32;
@@ -1587,6 +1606,7 @@ fn sud_launcher_exec(mut sc: Command, wrapper: &str, trace_w: i32,
             eprintln!("sarun-engine: wire state page: {}",
                       std::io::Error::last_os_error());
             libc::close(trace_w);
+            libc::close(fd_lane);
             return 1;
         }
         let p = libc::mmap(std::ptr::null_mut(), 4096,
@@ -1597,6 +1617,7 @@ fn sud_launcher_exec(mut sc: Command, wrapper: &str, trace_w: i32,
                       std::io::Error::last_os_error());
             libc::close(mfd);
             libc::close(trace_w);
+            libc::close(fd_lane);
             return 1;
         }
         state_page = p.cast();
@@ -1623,7 +1644,8 @@ fn sud_launcher_exec(mut sc: Command, wrapper: &str, trace_w: i32,
             }
             if libc::dup2(trace_w, SUD_OUTPUT_FD) < 0
                 || libc::dup2(mfd, SUD_STATE_FD) < 0
-                || libc::dup2(fs_ring.as_raw_fd(), crate::sud_ring::RING_FD) < 0 {
+                || libc::dup2(fs_ring.as_raw_fd(), crate::sud_ring::RING_FD) < 0
+                || libc::dup2(fd_lane, crate::sud_ring::FD_LANE_FD) < 0 {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(())
@@ -1641,10 +1663,12 @@ fn sud_launcher_exec(mut sc: Command, wrapper: &str, trace_w: i32,
                 libc::munmap(state_page.cast(), 4096);
                 libc::close(mfd);
                 libc::close(trace_w);
+                libc::close(fd_lane);
             }
             return 127;
         }
     };
+    unsafe { libc::close(fd_lane); }
     // Launcher wait loop (sudtrace's): reap every descendant that lands on us,
     // emit an EV_EXIT per real termination of a thread-group leader, stop when
     // the wrapper child itself is done.

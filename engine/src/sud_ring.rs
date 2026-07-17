@@ -5,6 +5,7 @@
 //! global enqueue cursor.  Filesystem semantics remain in the shared
 //! `virtiofsd::server::Server`; this module only owns byte movement and waits.
 
+use std::fs::File;
 use std::io;
 use std::mem::size_of;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -15,6 +16,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 pub(crate) const RING_MAGIC: u32 = 0x5346_5247;
 pub(crate) const RING_VERSION: u32 = 1;
 pub(crate) const RING_FD: RawFd = 1021;
+pub(crate) const FD_LANE_FD: RawFd = 1020;
 pub(crate) const SLOT_COUNT: usize = 32;
 pub(crate) const SLOT_DATA: usize = 32 * 1024;
 
@@ -24,6 +26,37 @@ const SLOT_REQUEST: u32 = 2;
 const SLOT_PROCESSING: u32 = 3;
 const SLOT_RESPONSE: u32 = 4;
 const SLOT_CANCELLED: u32 = 5;
+
+const FD_MAGIC: u32 = 0x5346_4644;
+const FD_VERSION: u16 = 1;
+const FD_EXPORT: u16 = 1;
+const FD_EXPORT_WRITE: u32 = 1;
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct FdRequest {
+    magic: u32,
+    version: u16,
+    operation: u16,
+    request_id: u64,
+    handle: u64,
+    flags: u32,
+    caller_pid: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct FdResponse {
+    magic: u32,
+    version: u16,
+    operation: u16,
+    request_id: u64,
+    error: i32,
+    reserved: u32,
+}
+
+const _: () = assert!(size_of::<FdRequest>() == 32);
+const _: () = assert!(size_of::<FdResponse>() == 24);
 
 #[repr(C)]
 struct RingHeader {
@@ -35,7 +68,10 @@ struct RingHeader {
     shutdown: u32,
     request_wake: u32,
     next_id: u32,
-    reserved: [u32; 8],
+    fd_lane_lock: u32,
+    fd_lane_owner: u32,
+    fd_lane_next: u32,
+    reserved: [u32; 5],
 }
 
 #[repr(C, align(64))]
@@ -112,7 +148,10 @@ impl RingMapping {
                     shutdown: 0,
                     request_wake: 0,
                     next_id: 0,
-                    reserved: [0; 8],
+                    fd_lane_lock: 0,
+                    fd_lane_owner: 0,
+                    fd_lane_next: 0,
+                    reserved: [0; 5],
                 },
             );
         }
@@ -374,15 +413,24 @@ pub(crate) struct RingServer {
 pub(crate) struct SudFsSession {
     mapping: Arc<RingMapping>,
     workers: Vec<std::thread::JoinHandle<io::Result<()>>>,
+    lane_shutdown: Option<OwnedFd>,
 }
 
 impl SudFsSession {
     pub(crate) fn start(
         filesystem: crate::sarunfs::SarunFs,
         fd: OwnedFd,
+        lane_fd: OwnedFd,
         worker_count: usize,
     ) -> io::Result<Self> {
-        Self::start_with(filesystem, fd, worker_count)
+        let lane_shutdown = duplicate_fd(&lane_fd)?;
+        let lane_filesystem = filesystem.clone();
+        let mut session = Self::start_with(filesystem, fd, worker_count)?;
+        session.workers.push(std::thread::spawn(move || {
+            serve_fd_lane(lane_filesystem, lane_fd)
+        }));
+        session.lane_shutdown = Some(lane_shutdown);
+        Ok(session)
     }
 
     #[cfg(test)]
@@ -426,11 +474,12 @@ impl SudFsSession {
                 Ok(())
             }));
         }
-        Ok(Self { mapping, workers })
+        Ok(Self { mapping, workers, lane_shutdown: None })
     }
 
     pub(crate) fn stop(mut self) -> io::Result<()> {
         self.mapping.shutdown();
+        self.shutdown_lane();
         let mut first_error = None;
         for worker in self.workers.drain(..) {
             match worker.join() {
@@ -449,9 +498,115 @@ impl SudFsSession {
 impl Drop for SudFsSession {
     fn drop(&mut self) {
         self.mapping.shutdown();
+        self.shutdown_lane();
         for worker in self.workers.drain(..) {
             let _ = worker.join();
         }
+    }
+}
+
+impl SudFsSession {
+    fn shutdown_lane(&mut self) {
+        if let Some(fd) = self.lane_shutdown.take() {
+            unsafe { libc::shutdown(fd.as_raw_fd(), libc::SHUT_RDWR); }
+        }
+    }
+}
+
+fn duplicate_fd(fd: &OwnedFd) -> io::Result<OwnedFd> {
+    let raw = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+    if raw < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        // SAFETY: F_DUPFD_CLOEXEC returned a new descriptor.
+        Ok(unsafe { OwnedFd::from_raw_fd(raw) })
+    }
+}
+
+fn serve_fd_lane(filesystem: crate::sarunfs::SarunFs, fd: OwnedFd) -> io::Result<()> {
+    loop {
+        let mut request = FdRequest::default();
+        let received = loop {
+            let result = unsafe {
+                libc::recv(fd.as_raw_fd(), std::ptr::addr_of_mut!(request).cast(),
+                           size_of::<FdRequest>(), 0)
+            };
+            if result < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            break result;
+        };
+        if received == 0 { return Ok(()); }
+        if received < 0 {
+            let error = io::Error::last_os_error();
+            if matches!(error.raw_os_error(), Some(libc::ECONNRESET) | Some(libc::ENOTCONN)) {
+                return Ok(());
+            }
+            return Err(error);
+        }
+
+        let valid = received as usize == size_of::<FdRequest>()
+            && request.magic == FD_MAGIC
+            && request.version == FD_VERSION
+            && request.operation == FD_EXPORT
+            && request.flags & !FD_EXPORT_WRITE == 0;
+        let exported = if valid {
+            filesystem.export_handle(
+                request.handle,
+                request.flags & FD_EXPORT_WRITE != 0,
+                request.caller_pid,
+            )
+        } else {
+            Err(io::Error::from_raw_os_error(libc::EPROTO))
+        };
+        let response = FdResponse {
+            magic: FD_MAGIC,
+            version: FD_VERSION,
+            operation: FD_EXPORT,
+            request_id: request.request_id,
+            error: exported.as_ref().err()
+                .map(|error| -error.raw_os_error().unwrap_or(libc::EIO).abs())
+                .unwrap_or(0),
+            reserved: 0,
+        };
+        send_fd_response(fd.as_raw_fd(), &response, exported.as_ref().ok())?;
+    }
+}
+
+fn send_fd_response(fd: RawFd, response: &FdResponse, exported: Option<&File>) -> io::Result<()> {
+    let mut iov = libc::iovec {
+        iov_base: std::ptr::from_ref(response).cast_mut().cast(),
+        iov_len: size_of::<FdResponse>(),
+    };
+    let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+    message.msg_iov = &mut iov;
+    message.msg_iovlen = 1;
+    let mut control = [0u8; 64];
+    if let Some(exported) = exported {
+        message.msg_control = control.as_mut_ptr().cast();
+        message.msg_controllen = unsafe { libc::CMSG_SPACE(size_of::<RawFd>() as u32) } as _;
+        unsafe {
+            let header = libc::CMSG_FIRSTHDR(&message);
+            (*header).cmsg_level = libc::SOL_SOCKET;
+            (*header).cmsg_type = libc::SCM_RIGHTS;
+            (*header).cmsg_len = libc::CMSG_LEN(size_of::<RawFd>() as u32) as _;
+            std::ptr::write_unaligned(libc::CMSG_DATA(header).cast::<RawFd>(),
+                                      exported.as_raw_fd());
+        }
+    }
+    let sent = unsafe { libc::sendmsg(fd, &message, libc::MSG_NOSIGNAL) };
+    if sent == size_of::<FdResponse>() as isize {
+        Ok(())
+    } else if sent < 0 {
+        let error = io::Error::last_os_error();
+        if matches!(error.raw_os_error(), Some(libc::EPIPE) | Some(libc::ECONNRESET)) {
+            Ok(())
+        } else {
+            Err(error)
+        }
+    } else {
+        Err(io::Error::new(io::ErrorKind::WriteZero,
+                           "short SUD fd-lane response"))
     }
 }
 
@@ -823,5 +978,49 @@ mod tests {
         let output = unsafe { std::ptr::read_unaligned(response.as_ptr().cast::<OutHeader>()) };
         assert_eq!((output.unique, output.error), (77, 0));
         session.stop().unwrap();
+    }
+
+    #[test]
+    fn descriptor_lane_validates_and_correlates_requests() {
+        let _guard = crate::depot::TEST_STATE_HOME_LOCK.lock().unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "sarun-fd-lane-{}-{:?}", std::process::id(),
+            std::thread::current().id()));
+        std::fs::create_dir_all(&root).unwrap();
+        unsafe { std::env::set_var("XDG_STATE_HOME", &root); }
+        std::fs::create_dir_all(crate::paths::state_home()).unwrap();
+        let filesystem = crate::sarunfs::SarunFs::new(root.clone());
+        let mut sockets = [-1; 2];
+        assert_eq!(unsafe {
+            libc::socketpair(libc::AF_UNIX,
+                             libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+                             0, sockets.as_mut_ptr())
+        }, 0);
+        let server = unsafe { OwnedFd::from_raw_fd(sockets[0]) };
+        let client = unsafe { OwnedFd::from_raw_fd(sockets[1]) };
+        let worker = std::thread::spawn(move || serve_fd_lane(filesystem, server));
+        let request = FdRequest {
+            magic: FD_MAGIC,
+            version: FD_VERSION,
+            operation: FD_EXPORT,
+            request_id: 44,
+            handle: u64::MAX,
+            flags: 0,
+            caller_pid: std::process::id(),
+        };
+        assert_eq!(unsafe {
+            libc::send(client.as_raw_fd(), std::ptr::from_ref(&request).cast(),
+                       size_of::<FdRequest>(), 0)
+        }, size_of::<FdRequest>() as isize);
+        let mut response = FdResponse::default();
+        assert_eq!(unsafe {
+            libc::recv(client.as_raw_fd(), std::ptr::addr_of_mut!(response).cast(),
+                       size_of::<FdResponse>(), 0)
+        }, size_of::<FdResponse>() as isize);
+        assert_eq!(response.request_id, 44);
+        assert_eq!(response.error, -libc::EBADF);
+        drop(client);
+        worker.join().unwrap().unwrap();
+        let _ = std::fs::remove_dir_all(root);
     }
 }

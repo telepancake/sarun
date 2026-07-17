@@ -481,6 +481,59 @@ impl SarunFs {
         })
     }
 
+    /// Export an already-open protocol handle as a kernel descriptor. This is
+    /// deliberately narrower than a second filesystem API: path resolution,
+    /// open policy, and capture have already happened through canonical FUSE.
+    /// Linux consumers such as exec and mmap receive only the resulting
+    /// backing object.
+    pub(crate) fn export_handle(
+        &self,
+        handle: u64,
+        writable: bool,
+        caller_pid: u32,
+    ) -> std::io::Result<File> {
+        if writable {
+            return match self.prepare_write_node(caller_pid, handle).map_err(virtio_error)? {
+                WriteTarget::File { file, .. } => Ok(file),
+                WriteTarget::Jobserver { .. } | WriteTarget::Sink { .. } =>
+                    Err(std::io::Error::from_raw_os_error(libc::ENODEV)),
+            };
+        }
+
+        let handle = self.inner.handles.get(handle)
+            .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EBADF))?;
+        let Handle::File(handle) = &*handle else {
+            return Err(std::io::Error::from_raw_os_error(libc::EBADF));
+        };
+        let handle = handle.lock().unwrap();
+        match &handle.inner.data {
+            FileData::Native(file) => file.try_clone(),
+            FileData::Lower(lower) => {
+                let staging = staging_file()?;
+                let mut offset = 0u64;
+                let mut buffer = vec![0u8; 1024 * 1024];
+                loop {
+                    let read = lower.read_at(&mut buffer, offset)?;
+                    if read == 0 { break; }
+                    let mut written = 0;
+                    while written < read {
+                        let count = staging.write_at(&buffer[written..read],
+                                                     offset + written as u64)?;
+                        if count == 0 {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::WriteZero,
+                                "cannot materialize SUD backing object"));
+                        }
+                        written += count;
+                    }
+                    offset += read as u64;
+                }
+                Ok(staging)
+            }
+            FileData::Sink(_) => Err(std::io::Error::from_raw_os_error(libc::ENODEV)),
+        }
+    }
+
 
     /// Reload the shadow_sh / shadow_make / shadow_ninja globs from
     /// disk. Called by the `reload_rules` control verb (so the user
@@ -3423,6 +3476,10 @@ mod chain_tests {
         .unwrap();
         assert_eq!(read, b"canonical bytes".len());
         assert_eq!(&*captured.lock().unwrap(), b"canonical bytes");
+        let exported = fs.export_handle(file_handle, false, ctx.pid as u32).unwrap();
+        let mut exported_bytes = [0u8; 32];
+        let exported_len = exported.read_at(&mut exported_bytes, 0).unwrap();
+        assert_eq!(&exported_bytes[..exported_len], b"canonical bytes");
         <SarunFs as virtiofsd::filesystem::FileSystem>::release(
             &fs,
             ctx,
@@ -3444,6 +3501,8 @@ mod chain_tests {
         )
         .unwrap();
         let write_handle = write_handle.unwrap();
+        let mapped = fs.export_handle(write_handle, true, ctx.pid as u32).unwrap();
+        assert_eq!(mapped.write_at(b"MAP", 0).unwrap(), 3);
         let written = <SarunFs as virtiofsd::filesystem::FileSystem>::write(
             &fs,
             ctx,

@@ -57,6 +57,48 @@ void sud_fs_client_fork_child(void)
     __atomic_store_n(&g_cursor, 0u, __ATOMIC_RELAXED);
 }
 
+int sud_fs_fd_lane_begin(uint64_t *request_id)
+{
+    if (!g_ring || !request_id) return -ENODEV;
+    uint32_t me = (uint32_t)raw_gettid();
+    for (;;) {
+        uint32_t expected = 0;
+        if (__atomic_compare_exchange_n(&g_ring->header.fd_lane_lock,
+                                        &expected, me, 0,
+                                        __ATOMIC_ACQUIRE,
+                                        __ATOMIC_RELAXED)) {
+            __atomic_store_n(&g_ring->header.fd_lane_owner, me,
+                             __ATOMIC_RELEASE);
+            *request_id = (uint64_t)__atomic_add_fetch(
+                &g_ring->header.fd_lane_next, 1u, __ATOMIC_RELAXED);
+            return 0;
+        }
+        struct timespec timeout = { 1, 0 };
+        (void)raw_syscall6(SYS_futex,
+                           (long)&g_ring->header.fd_lane_lock,
+                           FUTEX_WAIT, expected, (long)&timeout, 0, 0);
+        uint32_t owner_tid = __atomic_load_n(&g_ring->header.fd_lane_owner,
+                                             __ATOMIC_ACQUIRE);
+        char proc[32];
+        snprintf(proc, sizeof(proc), "/proc/%u", owner_tid);
+        if (owner_tid && owner_tid == expected && raw_access(proc, 0) != 0) {
+            uint32_t dead = expected;
+            (void)__atomic_compare_exchange_n(&g_ring->header.fd_lane_lock,
+                                              &dead, 0u, 0,
+                                              __ATOMIC_ACQ_REL,
+                                              __ATOMIC_RELAXED);
+        }
+    }
+}
+
+void sud_fs_fd_lane_end(void)
+{
+    if (!g_ring) return;
+    __atomic_store_n(&g_ring->header.fd_lane_owner, 0u, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_ring->header.fd_lane_lock, 0u, __ATOMIC_RELEASE);
+    (void)fs_futex(&g_ring->header.fd_lane_lock, FUTEX_WAKE, 1);
+}
+
 int sud_fs_transaction_begin(struct sud_fs_transaction *tx, size_t request_len)
 {
     if (!tx || !g_ring) return -ENODEV;

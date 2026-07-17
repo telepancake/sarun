@@ -44,7 +44,10 @@ struct sud_fs_ring_header {
     uint32_t shutdown;
     uint32_t request_wake;
     uint32_t next_id;
-    uint32_t reserved[8];
+    uint32_t fd_lane_lock;
+    uint32_t fd_lane_owner;
+    uint32_t fd_lane_next;
+    uint32_t reserved[5];
 };
 
 struct __attribute__((aligned(64))) sud_fs_slot {

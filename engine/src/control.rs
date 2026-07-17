@@ -1246,11 +1246,12 @@ pub fn broadcast(state: &State, event: &crate::generated_wire::SubscriptionEvent
 
 /// Peek the SCM_RIGHTS fds sent with the connection's first bytes (the register
 /// handshake carries the runner's pidfd, and for a `tap` box ALSO the runner's
-/// optional transport descriptors after it). Keep the first four in order and
+/// optional transport descriptors after it). Keep the first five in order and
 /// close any extras.
 /// MSG_PEEK leaves the data bytes queued for the BufReader, and the real
 /// (no-ancillary) read later discards the duplicate fd delivery.
-fn recv_first_fd(conn: &UnixStream) -> (Option<i32>, Option<i32>, Option<i32>, Option<i32>) {
+fn recv_first_fd(conn: &UnixStream) ->
+    (Option<i32>, Option<i32>, Option<i32>, Option<i32>, Option<i32>) {
     // Wait (bounded) for the first bytes to arrive before peeking: the runner's
     // sendmsg may still be in flight when we accept, and a non-blocking peek
     // that races ahead of it would miss the pidfd — dropping a nested box's
@@ -1263,7 +1264,7 @@ fn recv_first_fd(conn: &UnixStream) -> (Option<i32>, Option<i32>, Option<i32>, O
     };
     let pr = unsafe { libc::poll(&mut pfd, 1, 30_000) };
     if pr <= 0 {
-        return (None, None, None, None);
+        return (None, None, None, None, None);
     }
     let mut fdbuf = [0i32; 8];
     let mut io = [0u8; 1];
@@ -1281,16 +1282,18 @@ fn recv_first_fd(conn: &UnixStream) -> (Option<i32>, Option<i32>, Option<i32>, O
     msg.msg_controllen = cmsg.len() as _;
     let n = unsafe { libc::recvmsg(fd, &mut msg, libc::MSG_PEEK) };
     if n < 0 {
-        return (None, None, None, None);
+        return (None, None, None, None, None);
     }
-    // Keep up to FOUR fds in order: [pidfd, then optionally a TAP fd, then
-    // optionally a sud trace-pipe fd, then a SUD filesystem ring]. The runner sends them in that fixed
+    // Keep up to FIVE fds in order: [pidfd, then optionally a TAP fd, then
+    // optionally a sud trace-pipe fd, a SUD filesystem ring, and its narrow
+    // descriptor lane]. The runner sends them in that fixed
     // order; `register` assigns roles from want_sud + net_mode (a sud+tap
     // box sends all four; a fuse+tap box sends two; a plain box sends one).
     let mut first: Option<i32> = None;
     let mut second: Option<i32> = None;
     let mut third: Option<i32> = None;
     let mut fourth: Option<i32> = None;
+    let mut fifth: Option<i32> = None;
     unsafe {
         let mut c = libc::CMSG_FIRSTHDR(&msg);
         while !c.is_null() {
@@ -1312,6 +1315,8 @@ fn recv_first_fd(conn: &UnixStream) -> (Option<i32>, Option<i32>, Option<i32>, O
                         third = Some(fdbuf[i]);
                     } else if fourth.is_none() {
                         fourth = Some(fdbuf[i]);
+                    } else if fifth.is_none() {
+                        fifth = Some(fdbuf[i]);
                     } else {
                         libc::close(fdbuf[i]);
                     }
@@ -1320,7 +1325,7 @@ fn recv_first_fd(conn: &UnixStream) -> (Option<i32>, Option<i32>, Option<i32>, O
             c = libc::CMSG_NXTHDR(&msg, c);
         }
     }
-    (first, second, third, fourth)
+    (first, second, third, fourth, fifth)
 }
 
 fn first_data_byte(conn: &UnixStream) -> Option<u8> {
@@ -1359,6 +1364,7 @@ fn handle_binary_registration(
     fd2: Option<std::os::fd::OwnedFd>,
     fd3: Option<std::os::fd::OwnedFd>,
     fd4: Option<std::os::fd::OwnedFd>,
+    fd5: Option<std::os::fd::OwnedFd>,
 ) {
     use crate::generated_wire::{ConnectionMode, RequestEnvelope, RunBackend, TransportRequest};
     let request = match crate::socket_wire::read_request(&mut conn) {
@@ -1388,6 +1394,7 @@ fn handle_binary_registration(
         fd2.map(std::os::fd::IntoRawFd::into_raw_fd),
         fd3.map(std::os::fd::IntoRawFd::into_raw_fd),
         fd4.map(std::os::fd::IntoRawFd::into_raw_fd),
+        fd5.map(std::os::fd::IntoRawFd::into_raw_fd),
     );
     let registration = match result {
         Ok(registration) => registration,
@@ -1446,7 +1453,8 @@ fn dispatch(state: &State, msg: &Value) -> Value {
     match t {
         "subscribe" => json!({"ok": true, "_subscribe": true}),
         "register" => match legacy_register_request(msg) {
-            Ok(request) => legacy_register_reply(register(state, &request, None, None, None, None)),
+            Ok(request) => legacy_register_reply(register(
+                state, &request, None, None, None, None, None)),
             Err(error) => json!({"ok": false, "error": error}),
         },
         "select" => {
@@ -4262,6 +4270,7 @@ fn register(
     fd2_raw: Option<i32>,
     fd3_raw: Option<i32>,
     fd4_raw: Option<i32>,
+    fd5_raw: Option<i32>,
 ) -> Result<crate::generated_wire::RegisterReply, String> {
     use crate::generated_wire::{NetMode, RegistrationName, RunBackend, TransportRequest};
     let TransportRequest::Register {
@@ -4284,20 +4293,20 @@ fn register(
     // the success path.
     let want_sud_fd = *backend == RunBackend::Sud;
     let has_network_fd = *net_mode == NetMode::Tap;
-    let (network_raw, trace_raw, ring_raw) = match (want_sud_fd, has_network_fd) {
-        (true, true) => (fd2_raw, fd3_raw, fd4_raw),
-        (true, false) => (None, fd2_raw, fd3_raw),
-        (false, _) => (fd2_raw, None, None),
+    let (network_raw, trace_raw, ring_raw, lane_raw) = match (want_sud_fd, has_network_fd) {
+        (true, true) => (fd2_raw, fd3_raw, fd4_raw, fd5_raw),
+        (true, false) => (None, fd2_raw, fd3_raw, fd4_raw),
+        (false, _) => (fd2_raw, None, None, None),
     };
     // Close any fd that didn't get a role (shouldn't happen in normal flow).
     if want_sud_fd && !has_network_fd {
-        if let Some(fd) = fd4_raw {
+        if let Some(fd) = fd5_raw {
             unsafe {
                 libc::close(fd);
             }
         }
     } else if !want_sud_fd {
-        for fd in [fd3_raw, fd4_raw].into_iter().flatten() {
+        for fd in [fd3_raw, fd4_raw, fd5_raw].into_iter().flatten() {
             unsafe { libc::close(fd); }
         }
     }
@@ -4307,11 +4316,13 @@ fn register(
         .map(|fd| unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) });
     let sud_ring_owned: Option<std::os::fd::OwnedFd> = ring_raw
         .map(|fd| unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) });
-    if want_sud_fd && sud_ring_owned.is_none() {
+    let sud_lane_owned: Option<std::os::fd::OwnedFd> = lane_raw
+        .map(|fd| unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) });
+    if want_sud_fd && (sud_ring_owned.is_none() || sud_lane_owned.is_none()) {
         if let Some(fd) = peer_pidfd {
             unsafe { libc::close(fd); }
         }
-        return Err("SUD registration requires its filesystem ring fd".into());
+        return Err("SUD registration requires its filesystem ring and descriptor lane fds".into());
     }
     let ov = lock(state).overlay.clone();
     let Some(ov) = ov else {
@@ -4691,6 +4702,7 @@ fn register(
         let filesystem = match crate::sud_ring::SudFsSession::start(
             scoped,
             sud_ring_owned.expect("SUD ring checked above"),
+            sud_lane_owned.expect("SUD descriptor lane checked above"),
             workers,
         ) {
             Ok(filesystem) => filesystem,
@@ -6617,7 +6629,8 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
     // The register handshake carries the runner's pidfd as the connection's
     // first SCM_RIGHTS fd; keep it for host-pid derivation + kill. It belongs
     // to the FIRST message only (a register); close it if that never comes.
-    let (mut peer_pidfd, peer_tapfd_raw, peer_thirdfd_raw, peer_fourthfd_raw) =
+    let (mut peer_pidfd, peer_tapfd_raw, peer_thirdfd_raw, peer_fourthfd_raw,
+         peer_fifthfd_raw) =
         recv_first_fd(&conn);
     // The TAP fd (tap boxes) and the sud trace-pipe fd (sud boxes) ride the
     // register message's SCM_RIGHTS after the pidfd. Own both so every
@@ -6628,6 +6641,8 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
     let mut peer_thirdfd: Option<std::os::fd::OwnedFd> = peer_thirdfd_raw
         .map(|fd| unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) });
     let mut peer_fourthfd: Option<std::os::fd::OwnedFd> = peer_fourthfd_raw
+        .map(|fd| unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) });
+    let mut peer_fifthfd: Option<std::os::fd::OwnedFd> = peer_fifthfd_raw
         .map(|fd| unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) });
     // Canonical tv atoms start with the small integer protocol version; JSON
     // requests start with `{`.  Branch before BufReader so a binary atom is
@@ -6642,6 +6657,7 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
             peer_tapfd.take(),
             peer_thirdfd.take(),
             peer_fourthfd.take(),
+            peer_fifthfd.take(),
         );
         return;
     }
@@ -7033,6 +7049,8 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
                     peer_thirdfd.take().map(|fd|
                         <std::os::fd::OwnedFd as std::os::fd::IntoRawFd>::into_raw_fd(fd)),
                     peer_fourthfd.take().map(|fd|
+                        <std::os::fd::OwnedFd as std::os::fd::IntoRawFd>::into_raw_fd(fd)),
+                    peer_fifthfd.take().map(|fd|
                         <std::os::fd::OwnedFd as std::os::fd::IntoRawFd>::into_raw_fd(fd)),
                 )),
                 Err(error) => json!({"ok": false, "error": error}),
@@ -8443,7 +8461,7 @@ mod verb_tests {
         let (server, mut client) = UnixStream::pair().unwrap();
         let state: State = Default::default();
         let thread = std::thread::spawn(move || {
-            handle_binary_registration(state, server, None, None, None, None)
+            handle_binary_registration(state, server, None, None, None, None, None)
         });
         crate::socket_wire::write_request(
             &mut client,

@@ -50,9 +50,11 @@ clean:
 	rm -f build/cmd_rewrite_test64
 	rm -f build/fs_ring_abi32.o build/fs_ring_abi64.o
 	rm -f build/fs_ring_client32.o build/fs_ring_client64.o
+	rm -f build/fs_fd_lane32.o build/fs_fd_lane64.o
 	rm -f build/fs_fuse_client32.o build/fs_fuse_client64.o
 	rm -f build/fs_vfs_client32.o build/fs_vfs_client64.o
 	rm -f build/fs_client_test32 build/fs_client_test64
+	rm -f build/fs_fd_lane_test32 build/fs_fd_lane_test64
 	rm -f build/fs_fuse_client_test32 build/fs_fuse_client_test64
 	rm -f build/fs_vfs_test32 build/fs_vfs_test64
 
@@ -129,7 +131,7 @@ ifneq ($(filter sud/path_remap sud/inramfs,$(SUD_ADDINS)),)
 $(error sud/fs replaces sud/path_remap and sud/inramfs; they cannot be built together)
 endif
 SUD_CFLAGS  += -DSUD_ADDIN_FS
-SUD_SRCS    += sud/fs/addin.c sud/fs/vfs.c sud/fs/fuse_client.c sud/fs/client.c
+SUD_SRCS    += sud/fs/addin.c sud/fs/vfs.c sud/fs/fuse_client.c sud/fs/client.c sud/fs/fd_lane.c
 endif
 ifneq ($(filter sud/path_remap,$(SUD_ADDINS)),)
 SUD_CFLAGS  += -DSUD_ADDIN_PATH_REMAP
@@ -242,13 +244,17 @@ sud32: $(SUD_SRCS) $(SUD_HDRS) sudtrace.lds
 .PHONY: fs-ring-test
 fs-ring-test: build/fs_ring_abi64.o build/fs_ring_abi32.o \
               build/fs_ring_client64.o build/fs_ring_client32.o \
+              build/fs_fd_lane64.o build/fs_fd_lane32.o \
               build/fs_fuse_client64.o build/fs_fuse_client32.o \
               build/fs_vfs_client64.o build/fs_vfs_client32.o \
               build/fs_client_test64 build/fs_client_test32 \
+              build/fs_fd_lane_test64 build/fs_fd_lane_test32 \
               build/fs_fuse_client_test64 build/fs_fuse_client_test32 \
               build/fs_vfs_test64 build/fs_vfs_test32
 	./build/fs_client_test64
 	./build/fs_client_test32
+	./build/fs_fd_lane_test64
+	./build/fs_fd_lane_test32
 	./build/fs_fuse_client_test64
 	./build/fs_fuse_client_test32
 	./build/fs_vfs_test64
@@ -267,6 +273,14 @@ build/fs_ring_client64.o: sud/fs/client.c sud/fs/client.h sud/fs/ring.h
 	$(SUD_CC64) $(SUD_CFLAGS) -c -o $@ $<
 
 build/fs_ring_client32.o: sud/fs/client.c sud/fs/client.h sud/fs/ring.h
+	@mkdir -p build
+	$(SUD_CC32) $(SUD_CFLAGS) -c -o $@ $<
+
+build/fs_fd_lane64.o: sud/fs/fd_lane.c sud/fs/fd_lane.h sud/fs/client.h sud/fs/ring.h
+	@mkdir -p build
+	$(SUD_CC64) $(SUD_CFLAGS) -c -o $@ $<
+
+build/fs_fd_lane32.o: sud/fs/fd_lane.c sud/fs/fd_lane.h sud/fs/client.h sud/fs/ring.h
 	@mkdir -p build
 	$(SUD_CC32) $(SUD_CFLAGS) -c -o $@ $<
 
@@ -297,6 +311,18 @@ build/fs_client_test64: $(FS_CLIENT_TEST_SRCS) sud/fs/client.h sud/fs/ring.h
 build/fs_client_test32: $(FS_CLIENT_TEST_SRCS) sud/fs/client.h sud/fs/ring.h
 	@mkdir -p build
 	$(SUD_CC32) $(SUD_CFLAGS) $(SUD_LDFLAGS) -o $@ $(FS_CLIENT_TEST_SRCS)
+
+FS_FD_LANE_TEST_SRCS := sud/fs/tests/test_fd_lane.c sud/fs/fd_lane.c \
+                        sud/fs/client.c libc-fs/libc.c \
+                        libc-fs/deps/printf/printf.c libc-fs/divdi3.c
+
+build/fs_fd_lane_test64: $(FS_FD_LANE_TEST_SRCS) sud/fs/fd_lane.h sud/fs/client.h sud/fs/ring.h
+	@mkdir -p build
+	$(SUD_CC64) $(SUD_CFLAGS) $(SUD_LDFLAGS) -o $@ $(FS_FD_LANE_TEST_SRCS)
+
+build/fs_fd_lane_test32: $(FS_FD_LANE_TEST_SRCS) sud/fs/fd_lane.h sud/fs/client.h sud/fs/ring.h
+	@mkdir -p build
+	$(SUD_CC32) $(SUD_CFLAGS) $(SUD_LDFLAGS) -o $@ $(FS_FD_LANE_TEST_SRCS)
 
 FS_FUSE_CLIENT_TEST_SRCS := sud/fs/tests/test_fuse_client.c \
                             sud/fs/fuse_client.c sud/fs/client.c \

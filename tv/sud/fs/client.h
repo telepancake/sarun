@@ -38,5 +38,7 @@ void sud_fs_transaction_end(struct sud_fs_transaction *tx);
  * so every thread and CLONE_VM task can share one mapping. */
 int sud_fs_client_bind(struct sud_fs_ring *ring);
 void sud_fs_client_fork_child(void);
+int sud_fs_fd_lane_begin(uint64_t *request_id);
+void sud_fs_fd_lane_end(void);
 
 #endif /* SUD_FS_CLIENT_H */

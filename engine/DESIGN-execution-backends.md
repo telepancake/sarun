@@ -131,11 +131,18 @@ as executable mappings and mmap that genuinely need a host fd.
 - [ ] Translate intercepted syscalls and fd operations to canonical FUSE
       requests without resolving paths or applying overlay policy in SUD.
   - [x] Implement LOOKUP/GETATTR/OPEN/CREATE/READ/WRITE/FLUSH/RELEASE and a
-        virtual-fd table, then directory, link/rename, xattr, statfs, locking,
-        sparse/truncate, and executable-mapping operations.
+        virtual-fd table, directory descriptors, symlink-aware traversal,
+        link/rename/mutation operations, metadata, sync, and truncate.
+  - [ ] Add xattr, statfs, locking, sparse/time, mmap, and executable-loading
+        syscall translations on top of the same protocol handles.
   - [ ] Replace the path-remap and inramfs addins in the production wrapper in
         one cutover; do not retain an old/new runtime mode.
-- [ ] Add the exceptional SCM_RIGHTS fd lane for exec/mmap backing objects.
+- [x] Add the exceptional SCM_RIGHTS fd lane for exec/mmap backing objects.
+      It exports only an already-open canonical handle, is serialized across
+      forked tracees with dead-thread reclamation, owns deterministic session
+      shutdown, preserves writable copy-up/capture, and has behavioral tests
+      for the Rust endpoint plus both freestanding x86 ABIs on this aarch64
+      host. Path and policy operations remain exclusively in `SarunFs`.
 - [ ] Retain trace/provenance independently of the filesystem transport.
 - [ ] Reach FUSE/SUD equivalence for visible trees, metadata, sqlar, output,
       provenance, networking, nesting, OCI, brush, and termination.
