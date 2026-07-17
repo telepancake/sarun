@@ -470,3 +470,138 @@ int sud_fuse_fsync(uint64_t inode, uint64_t handle, int directory,
     call_end(&call);
     return result;
 }
+
+int sud_fuse_statfs(uint64_t inode, struct fuse_kstatfs *statistics)
+{
+    struct fuse_call call;
+    int result = call_begin(&call, FUSE_STATFS, inode, 0);
+    if (result != 0) return result;
+    return copy_fixed_reply(&call, statistics, sizeof(*statistics));
+}
+
+/* FUSE_SETXATTR_EXT was not negotiated by sud_fuse_init(), so the wire
+ * prefix is the original eight-byte structure even when the build host's
+ * linux/fuse.h exposes the extended structure. */
+struct sud_fuse_setxattr_compat {
+    uint32_t size;
+    uint32_t flags;
+};
+
+int sud_fuse_setxattr(uint64_t inode, const char *name, const void *value,
+                      size_t size, uint32_t flags)
+{
+    if (!name || (!value && size)) return -EFAULT;
+    size_t name_len = strlen(name) + 1;
+    size_t fixed = sizeof(struct sud_fuse_setxattr_compat);
+    if (name_len <= 1 || size > UINT32_MAX
+        || fixed + name_len + size > SUD_FS_SLOT_DATA
+                                    - sizeof(struct fuse_in_header))
+        return -ERANGE;
+    struct fuse_call call;
+    int result = call_begin(&call, FUSE_SETXATTR, inode,
+                            fixed + name_len + size);
+    if (result != 0) return result;
+    struct sud_fuse_setxattr_compat *input = call_input_payload(&call);
+    input->size = (uint32_t)size;
+    input->flags = flags;
+    unsigned char *payload = (unsigned char *)(input + 1);
+    memcpy(payload, name, name_len);
+    if (size) memcpy(payload + name_len, value, size);
+    result = call_submit(&call);
+    call_end(&call);
+    return result;
+}
+
+static long getxattr_call(uint32_t opcode, uint64_t inode, const char *name,
+                          void *buffer, size_t size)
+{
+    if ((!buffer && size) || size > UINT32_MAX) return -EFAULT;
+    size_t name_len = name ? strlen(name) + 1 : 0;
+    struct fuse_call call;
+    int result = call_begin(&call, opcode, inode,
+                            sizeof(struct fuse_getxattr_in) + name_len);
+    if (result != 0) return result;
+    struct fuse_getxattr_in *input = call_input_payload(&call);
+    input->size = (uint32_t)size;
+    input->padding = 0;
+    if (name_len) memcpy(input + 1, name, name_len);
+    result = call_submit(&call);
+    long count = result;
+    if (result == 0) {
+        if (size == 0) {
+            if (call.payload_len < sizeof(struct fuse_getxattr_out))
+                count = -EPROTO;
+            else
+                count = ((const struct fuse_getxattr_out *)call.payload)->size;
+        } else if (call.payload_len > size) {
+            count = -EPROTO;
+        } else {
+            memcpy(buffer, call.payload, call.payload_len);
+            count = (long)call.payload_len;
+        }
+    }
+    call_end(&call);
+    return count;
+}
+
+long sud_fuse_getxattr(uint64_t inode, const char *name,
+                       void *value, size_t size)
+{
+    if (!name || !name[0]) return -EINVAL;
+    return getxattr_call(FUSE_GETXATTR, inode, name, value, size);
+}
+
+long sud_fuse_listxattr(uint64_t inode, char *names, size_t size)
+{
+    return getxattr_call(FUSE_LISTXATTR, inode, 0, names, size);
+}
+
+int sud_fuse_removexattr(uint64_t inode, const char *name)
+{
+    if (!name || !name[0]) return -EINVAL;
+    size_t name_len = strlen(name) + 1;
+    struct fuse_call call;
+    int result = call_begin(&call, FUSE_REMOVEXATTR, inode, name_len);
+    if (result != 0) return result;
+    memcpy(call_input_payload(&call), name, name_len);
+    result = call_submit(&call);
+    call_end(&call);
+    return result;
+}
+
+int sud_fuse_fallocate(uint64_t inode, uint64_t handle, uint32_t mode,
+                       uint64_t offset, uint64_t length)
+{
+    struct fuse_call call;
+    int result = call_begin(&call, FUSE_FALLOCATE, inode,
+                            sizeof(struct fuse_fallocate_in));
+    if (result != 0) return result;
+    struct fuse_fallocate_in *input = call_input_payload(&call);
+    memset(input, 0, sizeof(*input));
+    input->fh = handle;
+    input->offset = offset;
+    input->length = length;
+    input->mode = mode;
+    result = call_submit(&call);
+    call_end(&call);
+    return result;
+}
+
+long sud_fuse_lseek(uint64_t inode, uint64_t handle, uint64_t offset,
+                    uint32_t whence)
+{
+    struct fuse_call call;
+    int result = call_begin(&call, FUSE_LSEEK, inode,
+                            sizeof(struct fuse_lseek_in));
+    if (result != 0) return result;
+    struct fuse_lseek_in *input = call_input_payload(&call);
+    memset(input, 0, sizeof(*input));
+    input->fh = handle;
+    input->offset = offset;
+    input->whence = whence;
+    struct fuse_lseek_out output;
+    result = copy_fixed_reply(&call, &output, sizeof(output));
+    if (result != 0) return result;
+    if (output.offset > INT64_MAX) return -EOVERFLOW;
+    return (long)output.offset;
+}

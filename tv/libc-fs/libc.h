@@ -343,6 +343,30 @@
 #if !defined(SYS_lremovexattr) && defined(__NR_lremovexattr)
 #define SYS_lremovexattr   __NR_lremovexattr
 #endif
+#if !defined(SYS_fgetxattr) && defined(__NR_fgetxattr)
+#define SYS_fgetxattr      __NR_fgetxattr
+#endif
+#if !defined(SYS_flistxattr) && defined(__NR_flistxattr)
+#define SYS_flistxattr     __NR_flistxattr
+#endif
+#if !defined(SYS_fsetxattr) && defined(__NR_fsetxattr)
+#define SYS_fsetxattr      __NR_fsetxattr
+#endif
+#if !defined(SYS_fremovexattr) && defined(__NR_fremovexattr)
+#define SYS_fremovexattr   __NR_fremovexattr
+#endif
+#if !defined(SYS_statfs) && defined(__NR_statfs)
+#define SYS_statfs         __NR_statfs
+#endif
+#if !defined(SYS_fstatfs) && defined(__NR_fstatfs)
+#define SYS_fstatfs        __NR_fstatfs
+#endif
+#if !defined(SYS_statfs64) && defined(__NR_statfs64)
+#define SYS_statfs64       __NR_statfs64
+#endif
+#if !defined(SYS_fstatfs64) && defined(__NR_fstatfs64)
+#define SYS_fstatfs64      __NR_fstatfs64
+#endif
 
 /* ----------------------------------------------------------------
  * In-RAM filesystem add-in needs futex (cross-process locking),
@@ -661,6 +685,12 @@ typedef struct ucontext_t {
 #endif
 #ifndef SEEK_END
 #define SEEK_END 2
+#endif
+#ifndef SEEK_DATA
+#define SEEK_DATA 3
+#endif
+#ifndef SEEK_HOLE
+#define SEEK_HOLE 4
 #endif
 
 extern int g_errno_value;

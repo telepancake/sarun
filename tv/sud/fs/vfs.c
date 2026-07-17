@@ -5,6 +5,7 @@
 #include "sud/fs/fuse_client.h"
 #include "sud/fs/fd_lane.h"
 #include "sud/fs/vfs.h"
+#include <asm/statfs.h>
 
 #define SUD_OFD_MAGIC UINT32_C(0x53464f44) /* "SFOD" */
 #define SUD_OFD_VERSION 1u
@@ -636,6 +637,17 @@ long sud_vfs_lseek(int fd, int64_t offset, int whence)
                                       1, &attributes);
         if (result != 0) { ofd_unlock(description); return result; }
         base = (int64_t)attributes.attr.size;
+    } else if (whence == SEEK_DATA || whence == SEEK_HOLE) {
+        if (offset < 0) {
+            ofd_unlock(description);
+            return -EINVAL;
+        }
+        long result = sud_fuse_lseek(description->inode,
+                                     description->handle,
+                                     (uint64_t)offset, (uint32_t)whence);
+        if (result >= 0) description->offset = (uint64_t)result;
+        ofd_unlock(description);
+        return result;
     } else {
         ofd_unlock(description);
         return -EINVAL;
@@ -846,6 +858,164 @@ int sud_vfs_fsetattr(int fd, const struct fuse_setattr_in *request)
     input.fh = description->handle;
     struct fuse_attr_out attributes;
     return sud_fuse_setattr(description->inode, &input, &attributes);
+}
+
+static void fill_statfs(void *buffer, int wide_counts,
+                        const struct fuse_kstatfs *source)
+{
+    /* The kernel supplies this around an ordinary FUSE mount.  The SUD
+     * adapter has no kernel mount layer, so provide the same public magic. */
+    const unsigned long fuse_magic = 0x65735546u;
+    if (wide_counts) {
+        struct statfs64 *output = buffer;
+        memset(output, 0, sizeof(*output));
+        output->f_type = fuse_magic;
+        output->f_bsize = source->bsize;
+        output->f_blocks = source->blocks;
+        output->f_bfree = source->bfree;
+        output->f_bavail = source->bavail;
+        output->f_files = source->files;
+        output->f_ffree = source->ffree;
+        output->f_namelen = source->namelen;
+        output->f_frsize = source->frsize;
+    } else {
+        struct statfs *output = buffer;
+        memset(output, 0, sizeof(*output));
+        output->f_type = fuse_magic;
+        output->f_bsize = source->bsize;
+        output->f_blocks = source->blocks;
+        output->f_bfree = source->bfree;
+        output->f_bavail = source->bavail;
+        output->f_files = source->files;
+        output->f_ffree = source->ffree;
+        output->f_namelen = source->namelen;
+        output->f_frsize = source->frsize;
+    }
+}
+
+int sud_vfs_statfsat(int dirfd, const char *path, void *statistics,
+                     int wide_counts)
+{
+    if (!path || !statistics) return -EFAULT;
+    char absolute[PATH_MAX];
+    int result = absolute_at(dirfd, path, absolute, sizeof(absolute));
+    if (result != 0) return result;
+    struct resolved_node node;
+    memset(&node, 0, sizeof(node));
+    result = resolve_absolute_full(absolute, &node, 1, 0);
+    if (result == 0) {
+        struct fuse_kstatfs fuse_statistics;
+        result = sud_fuse_statfs(node.inode, &fuse_statistics);
+        if (result == 0)
+            fill_statfs(statistics, wide_counts, &fuse_statistics);
+    }
+    resolved_forget(&node);
+    return result;
+}
+
+int sud_vfs_fstatfs(int fd, void *statistics, int wide_counts)
+{
+    struct sud_remote_ofd *description = description_for(fd);
+    if (!description) return -EBADF;
+    if (!statistics) return -EFAULT;
+    struct fuse_kstatfs fuse_statistics;
+    int result = sud_fuse_statfs(description->inode, &fuse_statistics);
+    if (result == 0) fill_statfs(statistics, wide_counts, &fuse_statistics);
+    return result;
+}
+
+static int resolve_xattr_node(int dirfd, const char *path, int follow,
+                              struct resolved_node *node)
+{
+    if (!path) return -EFAULT;
+    char absolute[PATH_MAX];
+    int result = absolute_at(dirfd, path, absolute, sizeof(absolute));
+    if (result != 0) return result;
+    memset(node, 0, sizeof(*node));
+    return resolve_absolute_full(absolute, node, follow, 0);
+}
+
+long sud_vfs_getxattrat(int dirfd, const char *path, int follow,
+                        const char *name, void *value, size_t size)
+{
+    struct resolved_node node;
+    int result = resolve_xattr_node(dirfd, path, follow, &node);
+    long count = result;
+    if (result == 0) count = sud_fuse_getxattr(node.inode, name, value, size);
+    resolved_forget(&node);
+    return count;
+}
+
+long sud_vfs_fgetxattr(int fd, const char *name, void *value, size_t size)
+{
+    struct sud_remote_ofd *description = description_for(fd);
+    if (!description) return -EBADF;
+    return sud_fuse_getxattr(description->inode, name, value, size);
+}
+
+long sud_vfs_listxattrat(int dirfd, const char *path, int follow,
+                         char *names, size_t size)
+{
+    struct resolved_node node;
+    int result = resolve_xattr_node(dirfd, path, follow, &node);
+    long count = result;
+    if (result == 0) count = sud_fuse_listxattr(node.inode, names, size);
+    resolved_forget(&node);
+    return count;
+}
+
+long sud_vfs_flistxattr(int fd, char *names, size_t size)
+{
+    struct sud_remote_ofd *description = description_for(fd);
+    if (!description) return -EBADF;
+    return sud_fuse_listxattr(description->inode, names, size);
+}
+
+int sud_vfs_setxattrat(int dirfd, const char *path, int follow,
+                       const char *name, const void *value, size_t size,
+                       unsigned int flags)
+{
+    struct resolved_node node;
+    int result = resolve_xattr_node(dirfd, path, follow, &node);
+    if (result == 0)
+        result = sud_fuse_setxattr(node.inode, name, value, size, flags);
+    resolved_forget(&node);
+    return result;
+}
+
+int sud_vfs_fsetxattr(int fd, const char *name, const void *value,
+                      size_t size, unsigned int flags)
+{
+    struct sud_remote_ofd *description = description_for(fd);
+    if (!description) return -EBADF;
+    return sud_fuse_setxattr(description->inode, name, value, size, flags);
+}
+
+int sud_vfs_removexattrat(int dirfd, const char *path, int follow,
+                          const char *name)
+{
+    struct resolved_node node;
+    int result = resolve_xattr_node(dirfd, path, follow, &node);
+    if (result == 0) result = sud_fuse_removexattr(node.inode, name);
+    resolved_forget(&node);
+    return result;
+}
+
+int sud_vfs_fremovexattr(int fd, const char *name)
+{
+    struct sud_remote_ofd *description = description_for(fd);
+    if (!description) return -EBADF;
+    return sud_fuse_removexattr(description->inode, name);
+}
+
+int sud_vfs_fallocate(int fd, unsigned int mode, uint64_t offset,
+                      uint64_t length)
+{
+    struct sud_remote_ofd *description = description_for(fd);
+    if (!description) return -EBADF;
+    if ((description->flags & O_ACCMODE) == O_RDONLY) return -EBADF;
+    return sud_fuse_fallocate(description->inode, description->handle,
+                              mode, offset, length);
 }
 
 int sud_vfs_getfl(int fd)

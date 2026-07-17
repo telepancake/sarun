@@ -47,6 +47,17 @@ int sud_fuse_setattr(uint64_t inode, const struct fuse_setattr_in *input,
 int sud_fuse_access(uint64_t inode, uint32_t mask);
 int sud_fuse_fsync(uint64_t inode, uint64_t handle, int directory,
                    int datasync);
+int sud_fuse_statfs(uint64_t inode, struct fuse_kstatfs *statistics);
+int sud_fuse_setxattr(uint64_t inode, const char *name, const void *value,
+                      size_t size, uint32_t flags);
+long sud_fuse_getxattr(uint64_t inode, const char *name,
+                       void *value, size_t size);
+long sud_fuse_listxattr(uint64_t inode, char *names, size_t size);
+int sud_fuse_removexattr(uint64_t inode, const char *name);
+int sud_fuse_fallocate(uint64_t inode, uint64_t handle, uint32_t mode,
+                       uint64_t offset, uint64_t length);
+long sud_fuse_lseek(uint64_t inode, uint64_t handle, uint64_t offset,
+                    uint32_t whence);
 
 size_t sud_fuse_max_read(void);
 size_t sud_fuse_max_write(void);

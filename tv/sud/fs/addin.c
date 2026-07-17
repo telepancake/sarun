@@ -4,6 +4,7 @@
 #include "sud/runtime_config.h"
 #include "sud/fs/client.h"
 #include "sud/fs/vfs.h"
+#include <asm/statfs.h>
 
 static unsigned int g_fs_umask;
 
@@ -281,6 +282,20 @@ static int fs_pre_syscall(struct sud_syscall_ctx *ctx)
         return handled(ctx, sud_vfs_ftruncate((int)ctx->args[0],
                          split_offset(ctx->args, 1)));
 #endif
+#ifdef SYS_fallocate
+    if (nr == SYS_fallocate && sud_vfs_owns_fd((int)ctx->args[0])) {
+#if defined(__x86_64__)
+        return handled(ctx, sud_vfs_fallocate((int)ctx->args[0],
+                         (unsigned int)ctx->args[1],
+                         (uint64_t)ctx->args[2], (uint64_t)ctx->args[3]));
+#else
+        return handled(ctx, sud_vfs_fallocate((int)ctx->args[0],
+                         (unsigned int)ctx->args[1],
+                         split_offset(ctx->args, 2),
+                         split_offset(ctx->args, 4)));
+#endif
+    }
+#endif
 #ifdef SYS_getdents64
     if (nr == SYS_getdents64 && sud_vfs_owns_fd((int)ctx->args[0]))
         return handled(ctx, sud_vfs_getdents64((int)ctx->args[0],
@@ -343,6 +358,111 @@ static int fs_pre_syscall(struct sud_syscall_ctx *ctx)
                          (unsigned int)ctx->args[3],
                          (struct statx *)ctx->args[4]));
     }
+#endif
+#ifdef SYS_statfs
+    if (nr == SYS_statfs)
+        return handled(ctx, sud_vfs_statfsat(AT_FDCWD,
+                         (const char *)ctx->args[0],
+                         (void *)ctx->args[1], 0));
+#endif
+#ifdef SYS_fstatfs
+    if (nr == SYS_fstatfs && sud_vfs_owns_fd((int)ctx->args[0]))
+        return handled(ctx, sud_vfs_fstatfs((int)ctx->args[0],
+                         (void *)ctx->args[1], 0));
+#endif
+#ifdef SYS_statfs64
+    if (nr == SYS_statfs64) {
+        if ((size_t)ctx->args[1] != sizeof(struct statfs64))
+            return handled(ctx, -EINVAL);
+        return handled(ctx, sud_vfs_statfsat(AT_FDCWD,
+                         (const char *)ctx->args[0],
+                         (void *)ctx->args[2], 1));
+    }
+#endif
+#ifdef SYS_fstatfs64
+    if (nr == SYS_fstatfs64 && sud_vfs_owns_fd((int)ctx->args[0])) {
+        if ((size_t)ctx->args[1] != sizeof(struct statfs64))
+            return handled(ctx, -EINVAL);
+        return handled(ctx, sud_vfs_fstatfs((int)ctx->args[0],
+                         (void *)ctx->args[2], 1));
+    }
+#endif
+#ifdef SYS_getxattr
+    if (nr == SYS_getxattr)
+        return handled(ctx, sud_vfs_getxattrat(AT_FDCWD,
+                         (const char *)ctx->args[0], 1,
+                         (const char *)ctx->args[1], (void *)ctx->args[2],
+                         (size_t)ctx->args[3]));
+#endif
+#ifdef SYS_lgetxattr
+    if (nr == SYS_lgetxattr)
+        return handled(ctx, sud_vfs_getxattrat(AT_FDCWD,
+                         (const char *)ctx->args[0], 0,
+                         (const char *)ctx->args[1], (void *)ctx->args[2],
+                         (size_t)ctx->args[3]));
+#endif
+#ifdef SYS_fgetxattr
+    if (nr == SYS_fgetxattr && sud_vfs_owns_fd((int)ctx->args[0]))
+        return handled(ctx, sud_vfs_fgetxattr((int)ctx->args[0],
+                         (const char *)ctx->args[1], (void *)ctx->args[2],
+                         (size_t)ctx->args[3]));
+#endif
+#ifdef SYS_listxattr
+    if (nr == SYS_listxattr)
+        return handled(ctx, sud_vfs_listxattrat(AT_FDCWD,
+                         (const char *)ctx->args[0], 1,
+                         (char *)ctx->args[1], (size_t)ctx->args[2]));
+#endif
+#ifdef SYS_llistxattr
+    if (nr == SYS_llistxattr)
+        return handled(ctx, sud_vfs_listxattrat(AT_FDCWD,
+                         (const char *)ctx->args[0], 0,
+                         (char *)ctx->args[1], (size_t)ctx->args[2]));
+#endif
+#ifdef SYS_flistxattr
+    if (nr == SYS_flistxattr && sud_vfs_owns_fd((int)ctx->args[0]))
+        return handled(ctx, sud_vfs_flistxattr((int)ctx->args[0],
+                         (char *)ctx->args[1], (size_t)ctx->args[2]));
+#endif
+#ifdef SYS_setxattr
+    if (nr == SYS_setxattr)
+        return handled(ctx, sud_vfs_setxattrat(AT_FDCWD,
+                         (const char *)ctx->args[0], 1,
+                         (const char *)ctx->args[1],
+                         (const void *)ctx->args[2], (size_t)ctx->args[3],
+                         (unsigned int)ctx->args[4]));
+#endif
+#ifdef SYS_lsetxattr
+    if (nr == SYS_lsetxattr)
+        return handled(ctx, sud_vfs_setxattrat(AT_FDCWD,
+                         (const char *)ctx->args[0], 0,
+                         (const char *)ctx->args[1],
+                         (const void *)ctx->args[2], (size_t)ctx->args[3],
+                         (unsigned int)ctx->args[4]));
+#endif
+#ifdef SYS_fsetxattr
+    if (nr == SYS_fsetxattr && sud_vfs_owns_fd((int)ctx->args[0]))
+        return handled(ctx, sud_vfs_fsetxattr((int)ctx->args[0],
+                         (const char *)ctx->args[1],
+                         (const void *)ctx->args[2], (size_t)ctx->args[3],
+                         (unsigned int)ctx->args[4]));
+#endif
+#ifdef SYS_removexattr
+    if (nr == SYS_removexattr)
+        return handled(ctx, sud_vfs_removexattrat(AT_FDCWD,
+                         (const char *)ctx->args[0], 1,
+                         (const char *)ctx->args[1]));
+#endif
+#ifdef SYS_lremovexattr
+    if (nr == SYS_lremovexattr)
+        return handled(ctx, sud_vfs_removexattrat(AT_FDCWD,
+                         (const char *)ctx->args[0], 0,
+                         (const char *)ctx->args[1]));
+#endif
+#ifdef SYS_fremovexattr
+    if (nr == SYS_fremovexattr && sud_vfs_owns_fd((int)ctx->args[0]))
+        return handled(ctx, sud_vfs_fremovexattr((int)ctx->args[0],
+                         (const char *)ctx->args[1]));
 #endif
     if (nr == SYS_readlinkat)
         return handled(ctx, sud_vfs_readlinkat((int)ctx->args[0],

@@ -55,8 +55,24 @@ static int child_calls(struct sud_fs_ring *ring)
     if (sud_fuse_read(2, 9, 0, O_RDWR, data, sizeof(data)) != 5
         || memcmp(data, "hello", 5) != 0) return 14;
     if (sud_fuse_write(2, 9, 5, O_RDWR, "new", 3) != 3) return 15;
-    if (sud_fuse_flush(2, 9, O_RDWR) != 0) return 16;
-    if (sud_fuse_release(2, 9, O_RDWR) != 0) return 17;
+    struct fuse_kstatfs statistics;
+    if (sud_fuse_statfs(2, &statistics) != 0
+        || statistics.bsize != 4096 || statistics.namelen != 255) return 16;
+    if (sud_fuse_setxattr(2, "user.test", "value", 5, 0) != 0) return 17;
+    if (sud_fuse_getxattr(2, "user.test", 0, 0) != 5) return 18;
+    memset(data, 0, sizeof(data));
+    if (sud_fuse_getxattr(2, "user.test", data, sizeof(data)) != 5
+        || memcmp(data, "value", 5) != 0) return 19;
+    if (sud_fuse_listxattr(2, 0, 0) != 10) return 20;
+    char names[16] = {0};
+    if (sud_fuse_listxattr(2, names, sizeof(names)) != 10
+        || strcmp(names, "user.test") != 0) return 21;
+    if (sud_fuse_removexattr(2, "user.test") != 0) return 22;
+    if (sud_fuse_fallocate(2, 9, FALLOC_FL_KEEP_SIZE, 4096, 8192) != 0)
+        return 23;
+    if (sud_fuse_lseek(2, 9, 0, SEEK_DATA) != 4096) return 24;
+    if (sud_fuse_flush(2, 9, O_RDWR) != 0) return 25;
+    if (sud_fuse_release(2, 9, O_RDWR) != 0) return 26;
     return 0;
 }
 
@@ -105,10 +121,65 @@ static int serve_calls(struct sud_fs_ring *ring)
     reply(slot, &written, sizeof(written));
 
     slot = take_request(ring); header = (struct fuse_in_header *)slot->request;
-    if (header->opcode != FUSE_FLUSH) return 26;
+    if (header->opcode != FUSE_STATFS || header->nodeid != 2) return 26;
+    struct fuse_kstatfs statistics = { .bsize = 4096, .namelen = 255 };
+    reply(slot, &statistics, sizeof(statistics));
+
+    slot = take_request(ring); header = (struct fuse_in_header *)slot->request;
+    struct fuse_setxattr_in *setxattr = (struct fuse_setxattr_in *)(header + 1);
+    if (header->opcode != FUSE_SETXATTR || header->nodeid != 2
+        || setxattr->size != 5 || setxattr->flags != 0
+        || strcmp((char *)setxattr + 8, "user.test") != 0
+        || memcmp((char *)setxattr + 8 + 10, "value", 5) != 0) return 27;
+    reply(slot, 0, 0);
+
+    slot = take_request(ring); header = (struct fuse_in_header *)slot->request;
+    struct fuse_getxattr_in *getxattr = (struct fuse_getxattr_in *)(header + 1);
+    if (header->opcode != FUSE_GETXATTR || getxattr->size != 0
+        || strcmp((char *)(getxattr + 1), "user.test") != 0) return 28;
+    struct fuse_getxattr_out xattr_size = { .size = 5 };
+    reply(slot, &xattr_size, sizeof(xattr_size));
+
+    slot = take_request(ring); header = (struct fuse_in_header *)slot->request;
+    getxattr = (struct fuse_getxattr_in *)(header + 1);
+    if (header->opcode != FUSE_GETXATTR || getxattr->size != 8) return 29;
+    reply(slot, "value", 5);
+
+    slot = take_request(ring); header = (struct fuse_in_header *)slot->request;
+    getxattr = (struct fuse_getxattr_in *)(header + 1);
+    if (header->opcode != FUSE_LISTXATTR || getxattr->size != 0) return 30;
+    xattr_size.size = 10;
+    reply(slot, &xattr_size, sizeof(xattr_size));
+
+    slot = take_request(ring); header = (struct fuse_in_header *)slot->request;
+    getxattr = (struct fuse_getxattr_in *)(header + 1);
+    if (header->opcode != FUSE_LISTXATTR || getxattr->size != 16) return 31;
+    reply(slot, "user.test\0", 10);
+
+    slot = take_request(ring); header = (struct fuse_in_header *)slot->request;
+    if (header->opcode != FUSE_REMOVEXATTR
+        || strcmp((char *)(header + 1), "user.test") != 0) return 32;
+    reply(slot, 0, 0);
+
+    slot = take_request(ring); header = (struct fuse_in_header *)slot->request;
+    struct fuse_fallocate_in *fallocate = (struct fuse_fallocate_in *)(header + 1);
+    if (header->opcode != FUSE_FALLOCATE || fallocate->fh != 9
+        || fallocate->mode != FALLOC_FL_KEEP_SIZE
+        || fallocate->offset != 4096 || fallocate->length != 8192) return 33;
+    reply(slot, 0, 0);
+
+    slot = take_request(ring); header = (struct fuse_in_header *)slot->request;
+    struct fuse_lseek_in *lseek = (struct fuse_lseek_in *)(header + 1);
+    if (header->opcode != FUSE_LSEEK || lseek->fh != 9
+        || lseek->offset != 0 || lseek->whence != SEEK_DATA) return 34;
+    struct fuse_lseek_out seeked = { .offset = 4096 };
+    reply(slot, &seeked, sizeof(seeked));
+
+    slot = take_request(ring); header = (struct fuse_in_header *)slot->request;
+    if (header->opcode != FUSE_FLUSH) return 35;
     reply(slot, 0, 0);
     slot = take_request(ring); header = (struct fuse_in_header *)slot->request;
-    if (header->opcode != FUSE_RELEASE) return 27;
+    if (header->opcode != FUSE_RELEASE) return 36;
     reply(slot, 0, 0);
     return 0;
 }

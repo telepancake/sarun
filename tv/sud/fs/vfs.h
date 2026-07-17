@@ -45,6 +45,25 @@ int sud_vfs_fsync(int fd, int datasync);
 int sud_vfs_setattrat(int dirfd, const char *path, int follow,
                       const struct fuse_setattr_in *request);
 int sud_vfs_fsetattr(int fd, const struct fuse_setattr_in *request);
+int sud_vfs_statfsat(int dirfd, const char *path, void *statistics,
+                     int wide_counts);
+int sud_vfs_fstatfs(int fd, void *statistics, int wide_counts);
+long sud_vfs_getxattrat(int dirfd, const char *path, int follow,
+                        const char *name, void *value, size_t size);
+long sud_vfs_fgetxattr(int fd, const char *name, void *value, size_t size);
+long sud_vfs_listxattrat(int dirfd, const char *path, int follow,
+                         char *names, size_t size);
+long sud_vfs_flistxattr(int fd, char *names, size_t size);
+int sud_vfs_setxattrat(int dirfd, const char *path, int follow,
+                       const char *name, const void *value, size_t size,
+                       unsigned int flags);
+int sud_vfs_fsetxattr(int fd, const char *name, const void *value,
+                      size_t size, unsigned int flags);
+int sud_vfs_removexattrat(int dirfd, const char *path, int follow,
+                          const char *name);
+int sud_vfs_fremovexattr(int fd, const char *name);
+int sud_vfs_fallocate(int fd, unsigned int mode, uint64_t offset,
+                      uint64_t length);
 void sud_vfs_fork_child(void);
 void sud_vfs_process_exit(void);
 

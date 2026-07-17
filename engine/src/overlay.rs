@@ -90,6 +90,8 @@ impl Errno {
     const ENOTEMPTY: Self = Self(libc::ENOTEMPTY);
     const EPERM: Self = Self(libc::EPERM);
     const EROFS: Self = Self(libc::EROFS);
+    const ESPIPE: Self = Self(libc::ESPIPE);
+    const EOVERFLOW: Self = Self(libc::EOVERFLOW);
     const EXDEV: Self = Self(libc::EXDEV);
 }
 
@@ -2391,6 +2393,30 @@ impl SarunFs {
         }
     }
 
+    fn lseek_node(&self, handle: u64, offset: u64, whence: u32) -> Result<u64, Errno> {
+        if whence != libc::SEEK_DATA as u32 && whence != libc::SEEK_HOLE as u32 {
+            return Err(Errno::EINVAL);
+        }
+        let handle = self.inner.handles.get(handle).ok_or(Errno::EBADF)?;
+        let Handle::File(handle) = &*handle else {
+            return Err(Errno::EBADF);
+        };
+        let handle = handle.lock().unwrap();
+        match &handle.inner.data {
+            FileData::Native(file) => {
+                let offset = i64::try_from(offset).map_err(|_| Errno::EOVERFLOW)?;
+                let result = unsafe { libc::lseek64(file.as_raw_fd(), offset, whence as i32) };
+                if result < 0 {
+                    Err(Errno::from(std::io::Error::last_os_error()))
+                } else {
+                    Ok(result as u64)
+                }
+            }
+            FileData::Lower(lower) => lower.lseek(offset, whence).map_err(Errno::from),
+            FileData::Sink(_) => Err(Errno::ESPIPE),
+        }
+    }
+
     fn statfs_node(&self) -> Result<libc::statvfs64, Errno> {
         self.inner.backing.statfs().map_err(Errno::from)
     }
@@ -3132,6 +3158,17 @@ impl virtiofsd::filesystem::FileSystem for SarunFs {
         _inode: u64,
     ) -> std::io::Result<libc::statvfs64> {
         self.statfs_node().map_err(virtio_error)
+    }
+
+    fn lseek(
+        &self,
+        _ctx: virtiofsd::filesystem::Context,
+        _inode: u64,
+        handle: u64,
+        offset: u64,
+        whence: u32,
+    ) -> std::io::Result<u64> {
+        self.lseek_node(handle, offset, whence).map_err(virtio_error)
     }
 
     fn access(
