@@ -726,10 +726,19 @@ impl SarunFs {
             || s.ninja.iter().any(|pat| pat.matches_path(p))
     }
 
-    /// The host path of the engine binary — what we serve as the
-    /// shadow target. Cloned out under the read lock; the path
-    /// rarely changes during a run (only on Shadows::reload).
-    fn shadow_target_path(&self) -> Option<PathBuf> {
+    /// The host path of the architecture-matching engine binary served as the
+    /// shadow target. Native FUSE/SUD use this process's executable; a QEMU box
+    /// uses its cached target `/init`, so a cross-architecture guest never sees
+    /// a host-architecture make/shell/ninja projection.
+    fn shadow_target_path(&self, b: &BoxState) -> Option<PathBuf> {
+        if let Some(architecture) = b.get_meta("qemu_architecture") {
+            let architecture = match architecture.as_str() {
+                "aarch64" => crate::generated_wire::QemuArchitecture::Aarch64,
+                "x86_64" => crate::generated_wire::QemuArchitecture::X8664,
+                _ => return None,
+            };
+            return Some(crate::appliance::target_init(architecture));
+        }
         let s = self.inner.shadows.read().unwrap();
         s.self_exe.clone()
     }
@@ -1478,7 +1487,7 @@ impl SarunFs {
         // ...) the upper wins — the shadow only kicks in for the
         // host-passthrough case.
         if matches!(layer, Layer::Lower) && b.is_brush() && self.shadow_matches(rel) {
-            if let Some(exe) = self.shadow_target_path() {
+            if let Some(exe) = self.shadow_target_path(b) {
                 if let Ok(md) = std::fs::metadata(&exe) {
                     let mut a = self.attr_from_md(ino, &md);
                     a.kind = NodeKind::RegularFile;
@@ -1843,7 +1852,7 @@ impl SarunFs {
                 let projected = if b.is_api() && Self::matches_host_oaita_config(&rel) {
                     Some(crate::paths::api_box_oaita_toml_path())
                 } else if b.is_brush() && self.shadow_matches(&rel) {
-                    self.shadow_target_path()
+                    self.shadow_target_path(&b)
                 } else {
                     None
                 };

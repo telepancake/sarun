@@ -726,7 +726,9 @@ belong to the relation.
 - [x] Finish a native aarch64 Rust test build linked with the archive.
 - [x] Build the normal optimized aarch64 release with `make engine`; verify it
       is fully static and runs its help entry point on the current host.
-- [ ] Revalidate the x86_64 archive/build after the pipeline change.
+- [x] Revalidate the x86_64 archive/build after the pipeline change. The
+      reproducible inner builder emits a static x86_64-musl init, and the
+      aarch64 host boots it under paired x86_64 TCG to run brush, Kati, and n2.
 - [x] Define and test native aarch64 runtime behavior: FUSE and paired QEMU run
       natively, while `--sud` remains an explicitly x86 Syscall User Dispatch
       transport. The aarch64 build, canonical core, both x86 wrapper ABIs, and

@@ -301,6 +301,67 @@ def run_backend(backend):
         shutil.rmtree(root, ignore_errors=True)
 
 
+def run_cross_arch_brush(architecture):
+    root = Path(tempfile.mkdtemp(
+        prefix=f"sarun-equiv-qemu-{architecture}-brush-", dir="/var/tmp"
+    ))
+    work = root / "lower"
+    work.mkdir()
+    env = dict(os.environ)
+    for key, name in (
+        ("XDG_STATE_HOME", "state"), ("XDG_RUNTIME_DIR", "run"),
+        ("XDG_CONFIG_HOME", "config"), ("XDG_DATA_HOME", "data"),
+    ):
+        directory = root / name
+        directory.mkdir()
+        env[key] = str(directory)
+    env["SLOPBOX_NS"] = f"EQUIVQEMU{architecture.upper().replace('_', '')}"
+    old = dict(os.environ)
+    os.environ.clear()
+    os.environ.update(env)
+    module = SourceFileLoader(
+        f"slopbox_qemu_{architecture}_brush", str(LIBTESTSARUN)
+    ).load_module()
+    module.ensure_dirs()
+    engine = subprocess.Popen(
+        [str(ENGINE_BIN), "serve"], env=env,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    try:
+        if not wait_socket(module.sock_path()):
+            raise RuntimeError("engine socket never appeared")
+        result = subprocess.run(
+            [str(ENGINE_BIN), "run", "--net", "off", "--qemu", architecture,
+             "-b", f"EQUIV-qemu-{architecture}-brush", "-C", str(work), "--",
+             "sh", "-c", BRUSH_WORKLOAD],
+            env=env, capture_output=True, text=True, timeout=240,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"rc={result.returncode}; stdout={result.stdout[-300:]!r}; "
+                f"stderr={result.stderr[-500:]!r}"
+            )
+        store = Path(env["XDG_STATE_HOME"]) / f"slopbox.{env['SLOPBOX_NS']}"
+        sqlar = max(store.glob("*.sqlar"), key=lambda path: int(path.stem))
+        prefix = str(work).lstrip("/") + "/brush-build/"
+        return {
+            "brush": module.sqlar_content(sqlar, prefix + "brush-result"),
+            "kati": module.sqlar_content(sqlar, prefix + "kati-out"),
+            "ninja": module.sqlar_content(sqlar, prefix + "ninja-out"),
+            "host_unchanged": not (work / "brush-build").exists(),
+        }
+    finally:
+        engine.terminate()
+        try:
+            engine.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            engine.kill()
+            engine.wait(timeout=5)
+        os.environ.clear()
+        os.environ.update(old)
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def main():
     if not ENGINE_BIN.exists():
         print(f"backend-equiv: no {ENGINE_BIN} — SKIP")
@@ -355,6 +416,29 @@ def main():
         for backend in backends[1:]:
             check(observations[backend] == reference,
                   f"equiv: {backend} observations equal {backends[0]}")
+
+    other_architecture = "x86_64" if HOST_ARCH == "aarch64" else "aarch64"
+    other_kernel = appliance_root / other_architecture / "kernel"
+    other_init = appliance_root / other_architecture / "init"
+    other_qemu = appliance_root / f"host-{HOST_ARCH}" / (
+        f"qemu-system-{other_architecture}"
+    )
+    if other_kernel.exists() and other_init.exists() and other_qemu.exists():
+        try:
+            cross = run_cross_arch_brush(other_architecture)
+        except Exception as error:
+            check(False, f"qemu {other_architecture}: cross-architecture brush ({error})")
+        else:
+            check(cross["brush"] == b"BRUSH",
+                  f"qemu {other_architecture}: parser-driven brush command ran")
+            check(cross["kati"] == b"KATI",
+                  f"qemu {other_architecture}: target-architecture Kati ran")
+            check(cross["ninja"] == b"NINJA",
+                  f"qemu {other_architecture}: target-architecture n2 ran")
+            check(cross["host_unchanged"],
+                  f"qemu {other_architecture}: no cross-architecture host escape")
+    else:
+        print(f"  (paired {other_architecture} appliance unavailable — cross-arch brush skipped)")
 
     print("\n" + ("BACKEND-EQUIV PASS" if not _fails
                   else f"{len(_fails)} FAILURE(S)"))

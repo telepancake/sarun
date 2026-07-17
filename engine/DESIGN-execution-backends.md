@@ -226,6 +226,10 @@ as executable mappings and mmap that genuinely need a host fd.
       Revalidated after the SUD deletion with target `/init brush`, exact
       captured bytes, and an architecture-mismatched exec returning 127 in
       three seconds instead of hanging until the host timeout.
+  - [x] Select brush shadow executables from the box's registered QEMU
+        architecture instead of the host process. The automated live gate now
+        runs parser-driven brush, target-x86_64 Kati, and target-x86_64 n2;
+        projecting the aarch64 host engine into that guest is impossible.
 - [ ] Pass the full appliance suite on aarch64 TCG here, then aarch64 KVM where
       available, then x86_64 TCG/KVM.
 
@@ -311,14 +315,17 @@ as executable mappings and mmap that genuinely need a host fd.
   aarch64 host, captures the exact requested blob, and exits through its
   triple-fault reboot in five seconds. An intentionally mismatched aarch64
   `/bin/sh` reports versioned exit 127 and shuts down in three seconds.
+- The cross-architecture brush leg is part of `make test-backends`, not a
+  manual-only smoke test. Both cached target init binaries are static, and the
+  x86_64 guest's make/ninja shadows resolve to the x86_64 init artifact.
 - Native live SUD remains untestable on this machine: its x86 wrappers require
   an x86 kernel with `PR_SET_SYSCALL_USER_DISPATCH`, while qemu-user/binfmt
   rejects that prctl with `EINVAL`. The 32/64 freestanding behavioral fixtures
   are the strongest valid substitute here; final live parity requires native
   x86 Linux hardware.
 - `/dev/kvm` is absent, so the TCG legs are proven here and both KVM legs remain
-  open. The broad real-project/benchmark matrix in section 5 also remains open;
-  it must not be represented as complete from smoke tests.
+  open. Native-SUD real projects/soak/benchmarks also remain open; neither
+  external-hardware leg is represented as complete from local smoke tests.
 - `make test-backends` passes live FUSE/QEMU equivalence on aarch64. The first
   architecture-correct run of the broader historical Python suite collected
   53 tests and produced 10 pass, 1 skip, 42 fail; most failures are explicit
