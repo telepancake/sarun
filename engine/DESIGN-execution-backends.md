@@ -39,6 +39,12 @@ as executable mappings and mmap that genuinely need a host fd.
 - QEMU: pinned 11.0.2.  Linux: pinned 6.18 LTS.  Sources and built artifacts
   live in the external cache; hashes, configs, patches, and reproducible build
   recipes live here.
+- QEMU and Linux are one tightly coupled Sarun execution appliance, not two
+  general-purpose components that happen to interoperate.  Their machine ABI,
+  devices, kernel modules, kernel interfaces, boot path, and lifecycle may all
+  be changed together when doing so removes translation layers or makes the
+  complete system smaller, faster, or easier to reason about.  Upstream
+  compatibility outside the paired build is not a constraint.
 - CLI: `sarun run --fuse`, `--sud`, or `--qemu ARCH`.  The initial appliance
   architectures are `aarch64` and `x86_64`.
 - Matching host/guest uses KVM when available.  TCG is the required fallback,
@@ -191,6 +197,12 @@ as executable mappings and mmap that genuinely need a host fd.
       manifests/configs.
 - [x] Build minimal paired QEMU/kernel artifacts with virtio-fs, console,
       virtio-serial control, KVM, and TCG support required by sarun.
+- [ ] Replace generic guest/host emulation at remaining Sarun control
+      boundaries with the smallest paired QEMU+kernel ABI.  In particular, do
+      not reproduce Unix descriptor passing through a byte-stream mux: define
+      the operations the appliance actually needs and implement them directly
+      in the paired device/kernel boundary, including authenticated nesting
+      and lifecycle ownership.
 - [x] Add the host launcher/vhost-user backend and target `/init` control plane.
   - [x] Embedded vhost-user lifecycle serves a scoped `SarunFs` box root on a
         private per-box engine socket and exits when its frontend disconnects.
