@@ -138,6 +138,23 @@ as executable mappings and mmap that genuinely need a host fd.
   and event workloads also match on the current host.
 - [x] Cut over, delete the old `fuser::Filesystem` implementation, and remove
       `fuser`.
+- [x] Determine whether the engine-wide FUSE mount can live in a private
+      user+mount namespace while ordinary outer runners consume it by path or
+      descriptor. It cannot: `/proc/<owner>/root` is subject to ptrace-style
+      cross-user-namespace checks, and although an `O_PATH` mount-root fd can
+      cross outward with `SCM_RIGHTS` and supports `openat`, an unprivileged
+      bwrap user namespace cannot bind a mount owned by its sibling user
+      namespace. A standalone child-userns tmpfs fixture reproduces the same
+      kernel rejection, so this is not a FUSE or SarunFs defect.
+- [ ] Remove the engine's outer-namespace FUSE mount using the viable nested
+      topology: a small mount-owner/spawn broker creates the user+mount
+      namespace, owns the single FUSE mount and launches each FUSE runner as
+      its descendant. The runner's bwrap user namespace is then nested below
+      the mount owner instead of being its sibling. Preserve direct stdio,
+      PTY, signal, pidfd, Tap, nested-run and box-channel behavior through the
+      broker, prove all backend/workload gates, and only then remove the
+      currently working outer mount. Do not add an alternate mode or retain
+      the failed outside-in descriptor path.
 
 ### 3. SUD cutover
 
