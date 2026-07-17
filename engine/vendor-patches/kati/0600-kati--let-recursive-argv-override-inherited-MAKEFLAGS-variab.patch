@@ -1,0 +1,47 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Fri, 17 Jul 2026 19:23:45 +0000
+Subject: [PATCH] kati: let recursive argv override inherited MAKEFLAGS variables
+
+Parse each in-process make's out-of-band inherited MAKEFLAGS before its own argv. This prevents a parent's obj=fs from overriding a grandchild's obj=fs/notify and recursively rebuilding the wrong directory forever.
+
+---
+diff --git a/src-rs/flags.rs b/src-rs/flags.rs
+index e94a1ed..6acec82 100644
+--- a/src-rs/flags.rs
++++ b/src-rs/flags.rs
+@@ -322,14 +322,32 @@ impl Flags {
+     }
+ 
+     pub fn from_args(args: Vec<OsString>) -> Flags {
++        let makeflags = env::var_os("MAKEFLAGS");
++        Self::from_args_with_makeflags(
++            args,
++            makeflags.as_deref().map(OsStrExt::as_bytes),
++        )
++    }
++
++    /// Parse one make invocation with an explicit inherited MAKEFLAGS value.
++    ///
++    /// An in-process sub-make carries its environment outside process-global
++    /// `std::env`, so its caller supplies that value here. Inherited variable
++    /// definitions are deliberately applied BEFORE argv: GNU command-line
++    /// precedence requires `$(MAKE) obj=child` to override the parent's
++    /// propagated `obj=parent`, including at every recursive level.
++    pub fn from_args_with_makeflags(
++        args: Vec<OsString>,
++        makeflags: Option<&[u8]>,
++    ) -> Flags {
+         let mut iter = args.into_iter();
+         let mut flags = Flags::default();
+         flags.subkati_args.push(iter.next().unwrap());
+         flags.num_jobs = std::thread::available_parallelism().map_or(1, |p| p.get());
+         flags.num_cpus = flags.num_jobs;
+ 
+-        if let Some(makeflags) = env::var_os("MAKEFLAGS") {
+-            flags.apply_makeflags(makeflags.as_bytes());
++        if let Some(makeflags) = makeflags {
++            flags.apply_makeflags(makeflags);
+         }
+ 
+         while let Some(arg) = iter.next() {

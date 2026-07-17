@@ -57,3 +57,4 @@
 0570-make-role-argv--GNU--i--n-semantics--ignore-errors---dry-run.patch
 0580-stall-watchdog--exponential-backoff-per-activity--SARUN-STAL.patch
 0590-kati--expose-make-exports-to-parse-time-shell-expansions.patch
+0600-kati--let-recursive-argv-override-inherited-MAKEFLAGS-variab.patch

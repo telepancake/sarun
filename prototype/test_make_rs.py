@@ -1073,6 +1073,91 @@ def main():
         check(r.returncode != 0,
               f"case29: failing recursive make under -j10 returns promptly "
               f"and non-zero (got {r.returncode}: {(r.stdout+r.stderr)[-600:]})")
+        # ── CASE 30: Kbuild's expanded static-pattern subdirectory gate ──
+        # scripts/Makefile.build turns each nested archive into a static-pattern
+        # target whose stem-specific prerequisite is a phony subdirectory.  The
+        # phony recipe recursively builds the archive; the empty static-pattern
+        # rule is the ordering bridge consumed by the aggregate archive.
+        sp = work / "static-pattern-subdirs"
+        shutil.rmtree(sp, ignore_errors=True)
+        sp.mkdir(parents=True, exist_ok=True)
+        (sp / "sub.mk").write_text(
+            "targets-for-builtin :=\n"
+            "ifdef need-builtin\n"
+            "targets-for-builtin += $(obj)/built-in.a\n"
+            "endif\n"
+            "$(obj)/: $(if $(KBUILD_BUILTIN),$(targets-for-builtin))\n"
+            "\t@:\n"
+            ".PHONY: FORCE\n"
+            "$(obj)/built-in.a: FORCE\n"
+            "\t@mkdir -p $(obj); printf '%s\\n' $(obj) > $@\n")
+        (sp / "Makefile").write_text(
+            "obj := fs\n"
+            "export KBUILD_BUILTIN := y\n"
+            "subdir-builtin := fs/notify/built-in.a fs/quota/built-in.a\n"
+            ".PHONY: fs/notify fs/quota\n"
+            "$(subdir-builtin): $(obj)/%/built-in.a: $(obj)/% ;\n"
+            "fs/notify fs/quota:\n"
+            "\t@$(MAKE) -f sub.mk obj=$@ need-builtin=1\n"
+            "fs/built-in.a: $(subdir-builtin)\n"
+            "\t@cat $^ > $@\n"
+            "all: fs/built-in.a\n")
+        r = run_make("MAKE30", sp, "-j10", "all")
+        check(r.returncode == 0,
+              f"case30: expanded static-pattern prerequisites order nested "
+              f"archives under -j10 (got {r.returncode}: "
+              f"{(r.stdout+r.stderr)[-800:]})")
+        sp30 = latest_sqlar(m)
+        combined = m.sqlar_content(
+            sp30, str((sp / "fs/built-in.a").resolve()).lstrip("/"))
+        check(combined == b"fs/notify\nfs/quota\n",
+              f"case30: each concrete target substitutes its own stem into "
+              f"the phony prerequisite; got {combined!r}")
+        # ── CASE 31: inherited exports survive a second recursive level ──
+        # Kbuild's top make exports KBUILD_BUILTIN, the fs make inherits it,
+        # and the fs/notify make must inherit it AGAIN.  Environment-origin
+        # names stay exported even when the intermediate makefile never says
+        # `export` itself; losing that property makes the grandchild's default
+        # directory goal omit its built-in archive while still returning 0.
+        ml = work / "multilevel-export"
+        shutil.rmtree(ml, ignore_errors=True)
+        ml.mkdir(parents=True, exist_ok=True)
+        (ml / "build.mk").write_text(
+            "ifeq ($(obj),fs)\n"
+            "obj-y := notify/\n"
+            "endif\n"
+            "ifdef need-builtin\n"
+            "obj-y := $(patsubst %/,%/built-in.a,$(obj-y))\n"
+            "endif\n"
+            "real-obj-y := $(addprefix $(obj)/,$(obj-y))\n"
+            "subdir-builtin := $(filter %/built-in.a,$(real-obj-y))\n"
+            "targets-for-builtin := $(if $(need-builtin),$(obj)/built-in.a)\n"
+            "$(subdir-builtin): $(obj)/%/built-in.a: $(obj)/% ;\n"
+            ".PHONY: $(patsubst %/built-in.a,%,$(subdir-builtin)) FORCE\n"
+            "$(patsubst %/built-in.a,%,$(subdir-builtin)):\n"
+            "\t@$(MAKE) -f build.mk obj=$@ need-builtin=1\n"
+            "$(obj)/built-in.a: $(real-obj-y) FORCE\n"
+            "\t@mkdir -p $(obj); printf '%s\\n' $(obj) > $@\n"
+            "$(obj)/: $(if $(KBUILD_BUILTIN),$(targets-for-builtin)) "
+            "$(patsubst %/built-in.a,%,$(subdir-builtin))\n"
+            "\t@:\n")
+        (ml / "Makefile").write_text(
+            "export KBUILD_BUILTIN := y\n"
+            ".PHONY: fs\n"
+            "fs/built-in.a: fs ;\n"
+            "fs:\n\t@$(MAKE) -f build.mk obj=fs need-builtin=1\n"
+            "all: fs/built-in.a\n")
+        r = run_make("MAKE31", ml, "-j10", "all")
+        check(r.returncode == 0,
+              f"case31: a make-inherited export survives two recursive "
+              f"make boundaries (got {r.returncode}: "
+              f"{(r.stdout+r.stderr)[-800:]})")
+        sp31 = latest_sqlar(m)
+        grandchild = m.sqlar_content(
+            sp31, str((ml / "fs/notify/built-in.a").resolve()).lstrip("/"))
+        check(grandchild == b"fs/notify\n",
+              f"case31: grandchild default goal includes built-in archive; "
+              f"got {grandchild!r}")
     finally:
         if eng is not None and eng.poll() is None:
             eng.terminate()

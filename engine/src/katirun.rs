@@ -390,10 +390,25 @@ fn run_kati(
         // through the `--` section, exactly like GNU (`make DESTDIR=/x
         // install` must mean DESTDIR=/x in every sub-make — losing it sent
         // `install -d` at un-prefixed system paths).
+        fn command_line_var_name(def: &[u8]) -> &[u8] {
+            let Some(eq) = def.iter().position(|&b| b == b'=') else {
+                return def;
+            };
+            let end = if eq > 0 && b":+?!".contains(&def[eq - 1]) {
+                eq - 1
+            } else {
+                eq
+            };
+            &def[..end]
+        }
         for v in cl_vars {
-            if !fvars.contains(v) {
-                fvars.push(v.clone());
-            }
+            // A recursive make's own `NAME=value` replaces the inherited
+            // definition of NAME; retaining both grows MAKEFLAGS at every
+            // level and, more importantly, lets a stale parent value win if a
+            // consumer replays the list in a different order.
+            let name = command_line_var_name(v);
+            fvars.retain(|old| command_line_var_name(old) != name);
+            fvars.push(v.clone());
         }
         let mut mf = BytesMut::new();
         for w in &fwords {
@@ -1282,14 +1297,18 @@ pub fn make_builtin(
         }
     };
     let _ = kati::flags::install_args(kargv.clone());
-    let mut flags = kati::flags::Flags::from_args(kargv);
-    // from_args folded in the PROCESS env's MAKEFLAGS — but this make's real
-    // inherited MAKEFLAGS rides seed_env (the subshell env carrying the parent
-    // make's export prefix), which is where a parent's
-    // `MAKEFLAGS += --include-dir=…` / `-rR` actually arrive. Fold it in too.
-    if let Some((_, mf)) = seed_env.iter().find(|(k, _)| k == "MAKEFLAGS") {
-        flags.apply_makeflags(mf.as_bytes());
-    }
+    // This make's real inherited MAKEFLAGS rides seed_env (the subshell env
+    // carrying the parent make's export prefix), not the shared engine process
+    // environment. Parse it BEFORE argv so this invocation's `obj=child`
+    // overrides a propagated `obj=parent`, exactly as GNU make does.
+    let inherited_makeflags = seed_env
+        .iter()
+        .find(|(k, _)| k == "MAKEFLAGS")
+        .map(|(_, value)| value.as_bytes());
+    let flags = kati::flags::Flags::from_args_with_makeflags(
+        kargv,
+        inherited_makeflags,
+    );
 
     // Resolve -C against the context cwd (NO process chdir). flags.working_dir
     // is kati's parsed -C value.

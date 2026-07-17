@@ -451,10 +451,11 @@ as executable mappings and mmap that genuinely need a host fd.
     - [x] Pass GNU-make-4 feature detection, preserve top-level `set -e`, give
           snooped shebang interpreters their own argv, and expose inherited and
           explicit exports to parse-time `$(shell ...)` and recursive makes.
-    - [ ] Fix Kati's expanded static-pattern prerequisite binding. Kbuild's
-          `dir/%/built-in.a: dir/%` rules currently lose the target stem, so an
-          aggregate archive can run before a nested directory has produced its
-          `built-in.a`.
+    - [x] Preserve recursive command-line-variable precedence across multiple
+          make levels. The inherited `MAKEFLAGS` definitions must be applied
+          before the child's argv and replaced by variable name; otherwise
+          Kbuild's parent `obj=fs` overrides `obj=fs/notify`, recursively runs
+          the wrong directory forever, and never creates the nested archive.
     - [ ] Re-run the complete FUSE Brush build, then the complete QEMU Brush
           build, compare retained artifacts, and record timings/counts here.
 - [x] Remove backend-specific semantic branches and obsolete compatibility
