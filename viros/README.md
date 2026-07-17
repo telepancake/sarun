@@ -45,16 +45,24 @@ Useful individual stages and run modes are:
 ./viros.sh kernel-debug ppc-440
 ./viros.sh run ppc-440
 ./viros.sh debug ppc-440
+./viros.sh run mipsbe
+./viros.sh debug mipsbe
+./viros.sh run mmips
+./viros.sh debug mmips
 ./viros.sh debug smips
+./viros.sh run x86
+./viros.sh debug x86
 ```
 
 `debug` is the single-command source-level workflow: it starts target-specific
 QEMU, stops after init has started, connects the Python-enabled multi-target
 GDB, and cleans QEMU up when GDB exits. ARM uses a hardware breakpoint at the
-symbolic `ret_to_user`; PPC remains stopped at the init-exit panic with
-`-no-shutdown`. Before presenting the prompt GDB runs `lx-version`, `lx-ps`,
-and examines PID 1 with `$lx_task_by_pid(1)`. MikroTik's printk changes are not
-compatible with the stock 5.6.3 `lx-dmesg` helper.
+symbolic `ret_to_user`; MIPS stops at `start_thread`; and x86 stops at
+`compat_start_thread` because its RouterOS init is IA32. MIPS and x86 inspect
+PID 1 and then stop at the extracted `/init` entry. PPC remains stopped at the
+init-exit panic with `-no-shutdown`. Before presenting the prompt GDB runs
+`lx-version`, `lx-ps`, and examines PID 1 with `$lx_task_by_pid(1)`. MikroTik's
+printk changes are not compatible with the stock 5.6.3 `lx-dmesg` helper.
 
 ## Strict status matrix
 
@@ -63,14 +71,14 @@ compatible with the stock 5.6.3 `lx-dmesg` helper.
 | `arm` | `virt`, Cortex-A15 | **Success:** PID 1 entered; source-level debug boot can examine it |
 | `arm64` | `virt`, Cortex-A57 | **Success:** PID 1 entered; source-level debug boot can examine it |
 | `ppc-e500-smp` | `ppce500`, e500v2, one CPU | **Success:** PID 1 entered; source-level debug boot can examine it |
+| `ppc-e500` | `ppce500`, e500v2, RB1000 DTB | **Success:** PID 1 entered; source-level debug boot can examine it |
 | `ppc-440` | `sam460ex`, 460EX | **Success:** PID 1 entered; source-level debug boot can examine it |
 | `smips` | patched Malta, MikroTik `board=vm` | **Success:** PID 1 and its executable were examined; GDB stopped at `/init` entry |
-| `mipsbe` | no successful board model yet | **Unfinished:** RB400 hardware path stalls before PID 1 |
-| `mmips` | no successful board model yet | **Unfinished:** MT7621 hardware path resets before PID 1 |
-| `ppc-e500` | no successful match | **Blocked:** this kernel lacks the QEMU e500 platform path and never reaches PID 1 |
+| `mipsbe` | patched Malta, MikroTik `board=vm` | **Success:** PID 1 and its executable were examined; GDB stopped at `/init` entry |
+| `x86` | PC/CHR disk | **Success:** production CHR reached login; rebuilt kernel started PID 1 and GDB stopped at `/init` entry |
+| `mmips` | patched Malta, 34Kf with MT7621 compatibility | **Success:** PID 1 and its executable were examined; GDB stopped at `/init` entry |
 | `ppc-83xx` | none | **Blocked:** QEMU has no matching MPC83xx/RB333/RB600 machine |
 | `tile` | disclosed TILE-Gx KVM QEMU | **Blocked:** native TILE-Gx KVM only, no TCG system execution, and incomplete GDB hooks |
-| `x86` | `q35`/CHR | **Pending:** strict PID 1 plus Python-GDB validation is not complete |
 
 `./viros.sh list` prints the corresponding concise status from the script.
 
@@ -111,6 +119,15 @@ streams into the Linux image and CPIO initramfs, preserves and classifies all
 four PPC variants, and emits the minimal ELF containers required by QEMU's
 direct kernel loaders.
 
+The x86 system NPK instead carries its Linux bzImage as `BOOTX64.EFI`. The
+extractor decompresses the bzImage's XZ Linux ELF and recovers its embedded
+newc initramfs and IA32 `/init`. A normal `run x86` boots the official CHR disk
+to its login prompt. The strict debug path directly boots the matching x86-64
+rebuild with that extracted production initramfs and the CHR disk on the
+emulated PIIX IDE controller. On non-x86-64 build hosts this requires an
+`x86_64-linux-gnu-gcc` cross compiler; GCC 11 is preferred when available to
+match the disclosed production toolchain generation.
+
 The ARM32 RouterOS image is linked for a raw load offset of `0x48000`; the
 QEMU build applies that target-specific load adjustment. Its kernel has no
 usable PL011 console, so the translated-block trace supplies the production
@@ -118,19 +135,30 @@ boot evidence. The PPC-440 run derives a private Canyonlands device tree with
 the `RB1200`, `amcc,canyonlands` compatibility pair required by that kernel.
 
 The three MIPS containers use the disclosed `0x80011000` virtual, physical,
-and entry address, avoiding Malta's firmware parameter block. SMIPS can use
-MikroTik's disclosed MetaROUTER `board=vm` platform instead of emulating an
-RB700. `qemu-mips-routeros.patch` makes Malta pass each kernel argument as a
-separate PROM argument, supplies the correct argument count, and provides the
-minimal AR9330 UART status mapping used by the panic path. With that platform,
-both the production SMIPS kernel and the matching debug rebuild execute
-RouterOS `/init`.
+and entry address, avoiding Malta's firmware parameter block. MIPSBE and SMIPS
+can use MikroTik's disclosed MetaROUTER `board=vm` platform instead of
+emulating their RouterBOARD hardware. `qemu-mips-routeros.patch` makes Malta
+pass each kernel argument as a separate PROM argument, supplies the correct
+argument count, and provides the minimal AR9330 UART status mapping used by
+the panic path.
 
-MIPSBE does not share that successful path: it enters the RB400 reset loop
-before init. MMIPS still faults while accessing absent MT7621 platform/MMIO
-state. Neither is presented as working merely because its early kernel code
-executes. The embedded `MIPS GENERIC QEMU` string is a CPU PRID label, not
-Malta machine support.
+MIPSBE's published configuration uses `CONFIG_MAPPED_KERNEL` and maps RAM at
+`0xc0000000`. QEMU places a Malta initrd at a dynamically chosen, 64-KiB-aligned
+physical offset; the script mirrors that placement calculation from the
+actual initramfs size and passes the corresponding mapped `rd_start` plus
+`rd_size`. With those target-specific details, both production kernels and
+their matching debug rebuilds execute RouterOS `/init`.
+
+MMIPS selects the disclosed `board=750g-mt` path. The QEMU patch keeps the MIPS
+coherence manager present with one active 34Kf CPU and supplies the polling
+MT7621 UART status register at `0x1e000c00`; this is the hardware shape needed
+for that kernel to finish early platform setup. The 34Kf model also matches
+the production init's legacy-NaN MIPS32r2 ABI. QEMU's initial GDB stop reply
+includes the CPS thread ID so upstream GDB can retain the selected CPU. With
+those compatibility pieces, both the extracted production kernel and the
+matching `mmips.config` rebuild enter `/init`; the debug path examines PID 1
+with the exact output-tree Linux Python helpers and stops at the extracted
+entry address.
 
 Raw ext2 images are created with `mkfs.ext2 -d`, requiring neither root nor
 loop devices. They contain the corresponding RouterOS NPK, although successful
@@ -139,9 +167,15 @@ invented RouterBOARD flash layout.
 
 ## Remaining hardware gaps
 
-The single-core PPC e500 image is distinct from `ppc-e500-smp`: only the SMP
-variant contains MikroTik's QEMU-e500 platform support. The 83xx image expects
-MPC83xx RouterBOARD hardware absent from upstream QEMU.
+The single-core PPC e500 kernel selects its disclosed RB1000 platform through
+the root device-tree compatibility string. The script asks QEMU to generate a
+fresh ppce500 tree for the exact kernel/initramfs pair, preserving its dynamic
+load addresses, then changes only the root model and compatibility. The kernel
+also uses SPR 1023 for a private `hv_yield` call; `qemu-ppc-routeros.patch`
+implements call 16 with the kernel's CR0.SO success convention. Both the
+production image and the matching `e500.config` debug rebuild then reach
+`/init`. The 83xx image expects MPC83xx RouterBOARD hardware absent from
+upstream QEMU.
 
 MikroTik's disclosure also contains a patched QEMU 2.0.2
 `tilegx-softmmu`. It is not portable TILE system emulation: it requires a

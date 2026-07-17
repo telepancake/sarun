@@ -20,6 +20,8 @@ ROUTEROS_VERSION=${ROUTEROS_VERSION:-latest}
 MIKROTIK_GPL_COMMIT=${MIKROTIK_GPL_COMMIT:-c3e110db1d35886c96ee14e16fc5a06bcac59692}
 PPC_TOOLCHAIN_NAME=${PPC_TOOLCHAIN_NAME:-powerpc-e500mc--glibc--bleeding-edge-2020.08-1}
 PPC_TOOLCHAIN_SHA256=${PPC_TOOLCHAIN_SHA256:-8cab4fbb645be782a6eaeb7b6afd75fda4c0dc8ca9a4095b0be9b6eeb29a9759}
+MMIPS_TOOLCHAIN_NAME=${MMIPS_TOOLCHAIN_NAME:-mips32el--musl--stable-2020.08-1}
+MMIPS_TOOLCHAIN_SHA256=${MMIPS_TOOLCHAIN_SHA256:-02155c88e0bf92f63105803767ce457790bfd920297ef326c9920853b5a3fe20}
 JOBS=${JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || printf '2')}
 DISK_SIZE=${DISK_SIZE:-64M}
 DEBUG_BOOT_TIMEOUT=${DEBUG_BOOT_TIMEOUT:-30}
@@ -88,6 +90,7 @@ download_stage() {
     download_file "https://download.qemu.org/qemu-${TILE_QEMU_VERSION}.tar.xz" "$DOWNLOADS/qemu-${TILE_QEMU_VERSION}-tile-legacy.tar.xz"
     download_file "https://github.com/tikoci/mikrotik-gpl/archive/${MIKROTIK_GPL_COMMIT}.tar.gz" "$DOWNLOADS/mikrotik-gpl-${MIKROTIK_GPL_COMMIT}.tar.gz"
     download_file "https://toolchains.bootlin.com/downloads/releases/toolchains/powerpc-e500mc/tarballs/${PPC_TOOLCHAIN_NAME}.tar.bz2" "$DOWNLOADS/${PPC_TOOLCHAIN_NAME}.tar.bz2"
+    download_file "https://toolchains.bootlin.com/downloads/releases/toolchains/mips32el/tarballs/${MMIPS_TOOLCHAIN_NAME}.tar.bz2" "$DOWNLOADS/${MMIPS_TOOLCHAIN_NAME}.tar.bz2"
     resolve_routeros_version
     local arch suffix name
     for arch in "${ARCHES[@]}"; do
@@ -120,10 +123,16 @@ build_qemu() {
         : > "$src/.routeros-arm-load"
     fi
     if [[ ! -f "$src/.routeros-mips-vm" ]]; then
-        say "Applying the RouterOS MetaROUTER/SMIPS Malta boot patch"
+        say "Applying the RouterOS MetaROUTER/MMIPS Malta boot patch"
         patch --batch --forward -d "$src" -p1 < "$SCRIPT_DIR/qemu-mips-routeros.patch" ||
             die "RouterOS MIPS QEMU patch failed"
         : > "$src/.routeros-mips-vm"
+    fi
+    if [[ ! -f "$src/.routeros-ppc-hypercall" ]]; then
+        say "Applying the RouterOS e500 yield compatibility patch"
+        patch --batch --forward -d "$src" -p1 < "$SCRIPT_DIR/qemu-ppc-routeros.patch" ||
+            die "RouterOS PowerPC QEMU patch failed"
+        : > "$src/.routeros-ppc-hypercall"
     fi
     mkdir -p "$out" "$TOOLS/qemu"
     say "Configuring QEMU $QEMU_VERSION"
@@ -170,6 +179,17 @@ unpack_ppc_toolchain() {
     fi
 }
 
+unpack_mmips_toolchain() {
+    local archive="$DOWNLOADS/${MMIPS_TOOLCHAIN_NAME}.tar.bz2" destination="$TOOLS/cross-mmips"
+    [[ -s "$archive" ]] || die "MMIPS toolchain is missing; run download first"
+    verify_file "$MMIPS_TOOLCHAIN_SHA256" "$archive"
+    if [[ ! -f "$destination/.unpacked" ]]; then
+        mkdir -p "$destination"
+        tar -xf "$archive" -C "$destination" --strip-components=1
+        : > "$destination/.unpacked"
+    fi
+}
+
 mikrotik_kernel_source() {
     printf '%s\n' "$SOURCES/linux-${LINUX_VERSION}-mikrotik"
 }
@@ -205,6 +225,7 @@ prepare_mikrotik_kernel_source() {
 }
 
 PPC_CROSS_PREFIX=
+MMIPS_CROSS_PREFIX=
 setup_ppc_cross() {
     local real_bin compiler emulator_root wrapper_bin tool compiler_version
     unpack_ppc_toolchain
@@ -233,6 +254,40 @@ setup_ppc_cross() {
     [[ "${compiler_version%%$'\n'*}" == *10.2.0* ]] || die "the pinned PowerPC compiler is not GCC 10.2.0"
 }
 
+setup_mmips_cross() {
+    local real_bin compiler emulator_root wrapper_bin tool
+    local triplet=mipsel-buildroot-linux-musl
+    unpack_mmips_toolchain
+    compiler=$(find "$TOOLS/cross-mmips" -path "*/bin/$triplet-gcc" -print -quit)
+    [[ -n "$compiler" ]] || die "$triplet-gcc was not found in the Bootlin toolchain"
+    real_bin=$(dirname -- "$compiler")
+    if [[ $(uname -m) == x86_64 ]]; then
+        MMIPS_CROSS_PREFIX="$real_bin/$triplet-"
+    else
+        [[ -x "$TOOLS/qemu/bin/qemu-x86_64" ]] || die "qemu-x86_64 is required to run the pinned MMIPS compiler on $(uname -m); run build first"
+        # The musl target toolchain's host programs still use glibc.  Reuse
+        # the pinned PowerPC toolchain's x86-64 host runtime under qemu-user.
+        unpack_ppc_toolchain
+        emulator_root="$TOOLS/cross-mmips-emulated/root"
+        wrapper_bin="$TOOLS/cross-mmips-emulated/bin"
+        mkdir -p "$emulator_root/lib64" "$wrapper_bin/gcc-tools"
+        [[ -s "$TOOLS/cross-powerpc/lib/ld-linux-x86-64.so.2" ]] || die "Bootlin x86-64 loader was not found"
+        cp -a -- "$TOOLS/cross-powerpc/lib/." "$emulator_root/lib64/"
+        chmod +x "$SCRIPT_DIR/emulated-cross-tool"
+        for tool in gcc ld as nm objcopy objdump strip ar ranlib readelf size strings; do
+            ln -sfn "$SCRIPT_DIR/emulated-cross-tool" "$wrapper_bin/$triplet-$tool"
+        done
+        # GCC reports this path to Kbuild and collect2 executes it directly;
+        # keeping it separate avoids double-wrapping GCC's assembler child.
+        ln -sfn "$SCRIPT_DIR/emulated-cross-tool" "$wrapper_bin/gcc-tools/ld"
+        export VIROS_QEMU_X86_64="$TOOLS/qemu/bin/qemu-x86_64"
+        export VIROS_X86_LD_ROOT="$emulator_root"
+        export VIROS_CROSS_REAL_BIN="$real_bin"
+        export VIROS_CROSS_TRIPLET="$triplet"
+        MMIPS_CROSS_PREFIX="$wrapper_bin/$triplet-"
+    fi
+}
+
 find_kernel_config() {
     local candidate
     for candidate in "$@"; do
@@ -248,7 +303,7 @@ build_debug_kernel() {
     local target=${1:-} src out config arch prefix= cc= image= obj raw compiler_version
     local -a targets
     case "$target" in
-        arm|arm64|smips|ppc-e500-smp|ppc-440) ;;
+        x86|arm|arm64|mipsbe|mmips|smips|ppc-e500-smp|ppc-e500|ppc-440) ;;
         *) die "no validated matching debug-kernel boot for $target" ;;
     esac
     need flex; need bison; need bc; need perl
@@ -256,6 +311,21 @@ build_debug_kernel() {
     src=$(mikrotik_kernel_source)
     out="$BUILD/kernel-$target"
     case "$target" in
+        x86)
+            arch=x86_64
+            config=$(find_kernel_config x86_64.config)
+            if [[ $(uname -m) == x86_64 ]]; then
+                prefix=
+                if command -v gcc-11 >/dev/null 2>&1; then cc=gcc-11; else cc=gcc; fi
+            elif command -v x86_64-linux-gnu-gcc-11 >/dev/null 2>&1; then
+                prefix=x86_64-linux-gnu-; cc=x86_64-linux-gnu-gcc-11
+            elif command -v x86_64-linux-gnu-gcc >/dev/null 2>&1; then
+                prefix=x86_64-linux-gnu-
+            else
+                die "an x86-64 cross compiler is required off x86-64 (x86_64-linux-gnu-gcc)"
+            fi
+            image=bzImage
+            ;;
         arm)
             arch=arm
             config=$(find_kernel_config arm.config)
@@ -280,6 +350,18 @@ build_debug_kernel() {
             fi
             image=Image
             ;;
+        mipsbe)
+            arch=mips
+            config=$(find_kernel_config mips.config)
+            command -v mips-linux-gnu-gcc >/dev/null 2>&1 ||
+                die "a big-endian MIPS cross compiler is required (mips-linux-gnu-gcc)"
+            prefix=mips-linux-gnu-
+            ;;
+        mmips)
+            arch=mips
+            config=$(find_kernel_config mmips.config)
+            setup_mmips_cross; prefix=$MMIPS_CROSS_PREFIX
+            ;;
         smips)
             arch=mips
             config=$(find_kernel_config smips.config)
@@ -289,6 +371,10 @@ build_debug_kernel() {
             ;;
         ppc-e500-smp)
             arch=powerpc; config=$(find_kernel_config e500-smp.config)
+            setup_ppc_cross; prefix=$PPC_CROSS_PREFIX
+            ;;
+        ppc-e500)
+            arch=powerpc; config=$(find_kernel_config e500.config)
             setup_ppc_cross; prefix=$PPC_CROSS_PREFIX
             ;;
         ppc-440)
@@ -301,7 +387,12 @@ build_debug_kernel() {
     "$src/scripts/config" --file "$out/.config" \
         --enable GDB_SCRIPTS --enable DEBUG_INFO \
         --disable DEBUG_INFO_REDUCED --disable DEBUG_INFO_SPLIT --disable DEBUG_INFO_DWARF4
-    if [[ "$target" == smips ]]; then
+    if [[ "$target" == x86 ]]; then
+        # The published path names an out-of-tree build input.  The extractor
+        # supplies that exact production initramfs to QEMU instead.
+        "$src/scripts/config" --file "$out/.config" --set-str INITRAMFS_SOURCE '' \
+            --enable KALLSYMS --enable KALLSYMS_ALL --enable IKCONFIG
+    elif [[ "$target" == smips || "$target" == mipsbe || "$target" == mmips ]]; then
         "$src/scripts/config" --file "$out/.config" \
             --enable DEBUG_INFO_DWARF4 --enable KALLSYMS --enable KALLSYMS_ALL --enable IKCONFIG
     fi
@@ -315,14 +406,24 @@ build_debug_kernel() {
     cp -f -- "$out/vmlinux" "$ARTIFACTS/$target/vmlinux.debug"
     [[ -s "$out/vmlinux-gdb.py" ]] || die "kernel build did not create vmlinux-gdb.py"
     case "$target" in
+        x86)
+            cp -f -- "$out/arch/x86/boot/bzImage" "$ARTIFACTS/x86/kernel.debug.bzImage"
+            ;;
         arm)
             cp -f -- "$out/arch/arm/boot/zImage" "$ARTIFACTS/arm/kernel.debug.zImage"
             ;;
         arm64)
             cp -f -- "$out/arch/arm64/boot/Image" "$ARTIFACTS/arm64/kernel.debug.Image"
             ;;
-        smips)
-            cp -f -- "$out/vmlinux" "$ARTIFACTS/smips/kernel.debug.qemu.elf"
+        smips|mmips)
+            cp -f -- "$out/vmlinux" "$ARTIFACTS/$target/kernel.debug.qemu.elf"
+            ;;
+        mipsbe)
+            # CONFIG_MAPPED_KERNEL links at 0xc0000000.  Shift only the ELF
+            # load view so Malta places the bytes in RAM; the entry code
+            # installs the disclosed c0000000 wired mapping before continuing.
+            "$prefix"objcopy --change-addresses=-0x40000000 "$out/vmlinux" \
+                "$ARTIFACTS/mipsbe/kernel.debug.qemu.elf"
             ;;
         ppc-*)
             raw="$ARTIFACTS/$target/kernel.debug.raw"
@@ -395,10 +496,14 @@ build_stage() {
     build_gdb
     build_tile_linux_user
     build_mikrotik_tile_kvm
+    build_debug_kernel x86
     build_debug_kernel arm
     build_debug_kernel arm64
+    build_debug_kernel mipsbe
+    build_debug_kernel mmips
     build_debug_kernel smips
     build_debug_kernel ppc-e500-smp
+    build_debug_kernel ppc-e500
     build_debug_kernel ppc-440
 }
 
@@ -503,6 +608,33 @@ prepare_ppc440_dtb() {
     printf '%s\n' "$out"
 }
 
+prepare_ppc_e500_dtb() {
+    local qemu=$1 kernel=$2 initrd=$3 cmdline=$4 target=$5
+    local directory="$ARTIFACTS/$target"
+    local base="$ARTIFACTS/$target/ppce500-base.dtb"
+    local dts="$ARTIFACTS/$target/rb1000.dts"
+    local out="$ARTIFACTS/$target/rb1000.dtb"
+    need dtc; need sed
+    mkdir -p "$directory"
+
+    # Preserve QEMU's load addresses for this exact kernel/initramfs pair.
+    # Only select the RB1000 platform published in MikroTik's e500 kernel.
+    rm -f -- "$base" "$dts" "$out"
+    "$qemu" -M "ppce500,dumpdtb=$base" -cpu e500v2 -smp 1 -m 256M \
+        -display none -monitor none -serial null -no-reboot -no-shutdown \
+        -nodefaults -kernel "$kernel" -initrd "$initrd" -append "$cmdline" \
+        -nic none >/dev/null
+    [[ -s "$base" ]] || die "QEMU did not generate the ppce500 device tree"
+    dtc -q -I dtb -O dts -o "$dts" "$base"
+    sed -i '0,/compatible = "fsl,qemu-e500";/s//compatible = "RB1000";/' "$dts"
+    sed -i '0,/model = "QEMU ppce500";/s//model = "RB1000";/' "$dts"
+    grep -q 'compatible = "RB1000";' "$dts" || die "failed to select the RB1000 e500 platform"
+    grep -q 'linux,initrd-start' "$dts" || die "generated e500 device tree lacks initrd placement"
+    grep -q 'linux,initrd-end' "$dts" || die "generated e500 device tree lacks initrd extent"
+    dtc -q -I dts -O dtb -o "$out" "$dts"
+    printf '%s\n' "$out"
+}
+
 prepare_stage() {
     need truncate; need mkfs.ext2
     local wanted=${1:-all} target
@@ -525,6 +657,22 @@ qemu_binary() {
     fi
 }
 
+mipsbe_kernel_cmdline() {
+    local initrd=$1 size physical mapped
+    local ram_bytes=$((256 * 1024 * 1024)) alignment=$((64 * 1024)) overhead=$((128 * 1024))
+    [[ -s "$initrd" ]] || die "MIPSBE initramfs is missing: $initrd"
+    size=$(wc -c < "$initrd")
+    (( size + overhead < ram_bytes )) || die "MIPSBE initramfs is too large for the 256 MiB Malta guest"
+
+    # Malta rounds the initrd placement up to 64 KiB.  QEMU's normal PROM
+    # argument uses a KSEG0 address, but MikroTik's CONFIG_MAPPED_KERNEL maps
+    # RAM at 0xc0000000, so supply the same physical offset in that mapping.
+    physical=$(( ((ram_bytes - size - overhead + alignment - 1) / alignment) * alignment ))
+    mapped=$((0xc0000000 + physical))
+    printf 'board=vm mem=256M HZ=100000000 init=/init panic=-1 rd_start=0x%x rd_size=%d\n' \
+        "$mapped" "$size"
+}
+
 run_stage() {
     local target=${1:-}
     [[ -n "$target" ]] || die "run requires a target (see: ./viros.sh list)"
@@ -539,13 +687,10 @@ run_stage() {
         ppc-83xx)
             die "ppc-83xx cannot boot yet: QEMU has no MPC83xx machine matching the RB333/RB600 kernel"
             ;;
-        ppc-e500)
-            die "ppc-e500 is not a success: unlike e500-smp, this kernel lacks QEMU e500 platform support and does not reach init on ppce500"
-            ;;
     esac
 
     prepare_one "$target"
-    local qemu kernel initrd disk
+    local qemu kernel initrd disk mips_cmdline ppc_cmdline dtb
     disk="$IMAGES/$target.raw"
     case "$target" in
         x86)
@@ -553,8 +698,8 @@ run_stage() {
             local version chr
             version=$(routeros_version); chr="$IMAGES/chr-${version}.img"
             [[ -s "$chr" ]] || die "CHR image missing; run download then prepare x86"
-            exec "$qemu" -machine q35,accel=tcg -m 256M -nographic -no-reboot \
-                -drive "file=$chr,format=raw,if=virtio" -nic user,model=virtio-net-pci "$@"
+            exec "$qemu" -machine pc,accel=tcg -cpu qemu64 -m 512M -nographic -no-reboot \
+                -drive "file=$chr,format=raw,if=ide" -nic none "$@"
             ;;
         arm)
             qemu=$(qemu_binary qemu-system-arm); kernel="$ARTIFACTS/arm/kernel.raw"; initrd="$ARTIFACTS/arm/initramfs.cpio"
@@ -573,9 +718,11 @@ run_stage() {
                 -nic none "$@"
             ;;
         mipsbe)
-            qemu=$(qemu_binary qemu-system-mips); kernel="$ARTIFACTS/mipsbe/kernel.qemu.elf"; initrd="$ARTIFACTS/mipsbe/initramfs.cpio"
-            exec "$qemu" -M malta -cpu 24Kc -m 256M -nographic -no-reboot -nodefaults -serial stdio -monitor none \
-                -kernel "$kernel" -initrd "$initrd" -append 'console=ttyS0 root=/dev/ram0' \
+            qemu="$TOOLS/qemu/bin/qemu-system-mips"; kernel="$ARTIFACTS/mipsbe/kernel.qemu.elf"; initrd="$ARTIFACTS/mipsbe/initramfs.cpio"
+            [[ -x "$qemu" ]] || die "MIPSBE requires viros's MetaROUTER-patched QEMU; run download and build"
+            mips_cmdline=$(mipsbe_kernel_cmdline "$initrd")
+            exec "$qemu" -M malta -cpu 24Kc -m 256M -display none -monitor none -serial null -parallel none \
+                -no-reboot -no-shutdown -nodefaults -kernel "$kernel" -initrd "$initrd" -append "$mips_cmdline" \
                 -nic none "$@"
             ;;
         smips)
@@ -587,9 +734,12 @@ run_stage() {
                 -nic none "$@"
             ;;
         mmips)
-            qemu=$(qemu_binary qemu-system-mipsel); kernel="$ARTIFACTS/mmips/kernel.qemu.elf"; initrd="$ARTIFACTS/mmips/initramfs.cpio"
-            exec "$qemu" -M malta -cpu 34Kf -m 256M -nographic -no-reboot -nodefaults -serial stdio -monitor none \
-                -kernel "$kernel" -initrd "$initrd" -append 'console=ttyS0 root=/dev/ram0' \
+            qemu="$TOOLS/qemu/bin/qemu-system-mipsel"; kernel="$ARTIFACTS/mmips/kernel.qemu.elf"; initrd="$ARTIFACTS/mmips/initramfs.cpio"
+            [[ -x "$qemu" ]] || die "MMIPS requires viros's MT7621-compatible patched QEMU; run download and build"
+            exec "$qemu" -M malta -cpu 34Kf -smp 1 -m 256M \
+                -display none -monitor none -serial none -parallel none \
+                -no-reboot -no-shutdown -nodefaults -kernel "$kernel" -initrd "$initrd" \
+                -append 'board=750g-mt mem=256M HZ=100000000 init=/init panic=-1' \
                 -nic none "$@"
             ;;
         ppc-e500-smp)
@@ -600,6 +750,19 @@ run_stage() {
             exec "$qemu" -M ppce500 -cpu e500v2 -smp 1 -m 256M -nographic -no-reboot \
                 -nodefaults -serial stdio -monitor none \
                 -kernel "$kernel" -initrd "$initrd" -append 'console=ttyS0 root=/dev/ram0' \
+                -nic none "$@"
+            ;;
+        ppc-e500)
+            qemu=$(qemu_binary qemu-system-ppc)
+            kernel="$ARTIFACTS/$target/kernel.qemu.elf"
+            initrd="$ARTIFACTS/$target/initramfs.cpio"
+            [[ -x "$TOOLS/qemu/bin/qemu-system-ppc" ]] ||
+                die "PPC e500 requires viros's RouterOS-patched QEMU; run download and build"
+            ppc_cmdline='console=ttyS0 root=/dev/ram0 init=/init panic=-1'
+            dtb=$(prepare_ppc_e500_dtb "$qemu" "$kernel" "$initrd" "$ppc_cmdline" "$target")
+            exec "$qemu" -M ppce500 -cpu e500v2 -smp 1 -m 256M -nographic -no-reboot \
+                -nodefaults -serial stdio -monitor none -dtb "$dtb" \
+                -kernel "$kernel" -initrd "$initrd" -append "$ppc_cmdline" \
                 -nic none "$@"
             ;;
         ppc-440)
@@ -616,9 +779,10 @@ run_stage() {
 
 gdb_stage() {
     local target=${1:-} remote=${2:-:1234} gdb out vmlinux helper
+    local -a gdb_args
     [[ -n "$target" ]] || die "gdb requires a target"
     case "$target" in
-        arm|arm64|smips|ppc-e500-smp|ppc-440) ;;
+        x86|arm|arm64|mipsbe|mmips|smips|ppc-e500-smp|ppc-e500|ppc-440) ;;
         *) die "no validated matching debug kernel for $target" ;;
     esac
     gdb="$TOOLS/gdb/bin/gdb"
@@ -628,10 +792,15 @@ gdb_stage() {
     [[ -x "$gdb" ]] || die "Python-enabled GDB is not built; run download and build"
     [[ -s "$vmlinux" ]] || die "debug vmlinux is missing; run: ./viros.sh kernel-debug $target"
     [[ -s "$helper" ]] || die "output-tree Linux GDB Python extension is missing; rebuild $target"
-    exec "$gdb" -nx -q -iex 'set auto-load safe-path /' "$vmlinux" \
-        -ex "source $helper" \
-        -ex 'set remotetimeout 10' \
-        -ex "target remote $remote"
+    gdb_args=( -nx -q -iex 'set auto-load safe-path /' "$vmlinux"
+        -ex "source $helper" -ex 'set remotetimeout 10' )
+    if [[ "$target" == mipsbe || "$target" == mmips || "$target" == smips ]]; then
+        gdb_args+=( -ex 'set architecture mips' )
+        [[ "$target" == mmips ]] && gdb_args+=( -ex 'set suppress-cli-notifications on' )
+    elif [[ "$target" == x86 ]]; then
+        gdb_args+=( -ex 'set architecture i386:x86-64' )
+    fi
+    exec "$gdb" "${gdb_args[@]}" -ex "target remote $remote"
 }
 
 DEBUG_QEMU_PID=
@@ -684,14 +853,11 @@ wait_for_console_pattern() {
 }
 
 debug_stage() {
-    local target=${1:-} qemu kernel initrd bios= out vmlinux helper console_log qemu_log gdb status init_entry=
+    local target=${1:-} qemu kernel initrd bios= out vmlinux helper console_log qemu_log gdb status init_entry= mips_cmdline= ppc_cmdline= dtb=
     local -a qemu_args gdb_args
     case "$target" in
-        arm|arm64|smips|ppc-e500-smp|ppc-440) ;;
-        mipsbe|mmips)
-            die "$target is not implemented: its RouterBOARD/MT7621 platform must reach /init before it can be offered as a debug target"
-            ;;
-        *) die "debug requires a validated target: arm, arm64, smips, ppc-e500-smp, or ppc-440" ;;
+        x86|arm|arm64|mipsbe|mmips|smips|ppc-e500-smp|ppc-e500|ppc-440) ;;
+        *) die "debug requires a validated target: x86, arm, arm64, mipsbe, mmips, smips, ppc-e500-smp, ppc-e500, or ppc-440" ;;
     esac
     need mkfs.ext2; need truncate
     prepare_one "$target"
@@ -710,6 +876,25 @@ debug_stage() {
     : > "$qemu_log"
 
     case "$target" in
+        x86)
+            qemu=$(qemu_binary qemu-system-x86_64)
+            kernel="$ARTIFACTS/x86/kernel.debug.bzImage"
+            initrd="$ARTIFACTS/x86/initramfs.cpio"
+            local version chr
+            version=$(routeros_version); chr="$IMAGES/chr-${version}.img"
+            [[ -s "$kernel" ]] || die "debug bzImage is missing; run: ./viros.sh kernel-debug x86"
+            [[ -s "$initrd" ]] || die "x86 initramfs is missing; re-extract x86"
+            [[ -s "$chr" ]] || die "CHR image missing; run download then prepare x86"
+            [[ -s "$ARTIFACTS/x86/init.entry" ]] || die "x86 init entry is missing; re-extract x86"
+            init_entry=$(head -n 1 "$ARTIFACTS/x86/init.entry")
+            [[ "$init_entry" =~ ^0x[0-9a-fA-F]+$ ]] || die "invalid x86 init entry: $init_entry"
+            qemu_args=( -machine pc,accel=tcg -cpu qemu64 -smp 1 -m 512M
+                -display none -monitor none -serial "file:$console_log" -nic none
+                -no-reboot -no-shutdown -nodefaults -S
+                -kernel "$kernel" -initrd "$initrd"
+                -append 'console=ttyS0,115200 loglevel=8 ignore_loglevel rdinit=/init init=/init panic=-1 nokaslr'
+                -drive "file=$chr,format=raw,if=ide" )
+            ;;
         arm)
             qemu=$(qemu_binary qemu-system-arm)
             kernel="$ARTIFACTS/arm/kernel.debug.zImage"
@@ -729,6 +914,35 @@ debug_stage() {
                 -display none -monitor none -serial none -nic none -no-reboot -no-shutdown -S
                 -kernel "$kernel" -initrd "$initrd"
                 -append 'console=ttyAMA0,115200 earlycon=pl011,0x09000000 loglevel=8 ignore_loglevel init=/init panic=-1 nokaslr' )
+            ;;
+        mipsbe)
+            qemu="$TOOLS/qemu/bin/qemu-system-mips"
+            kernel="$ARTIFACTS/mipsbe/kernel.debug.qemu.elf"
+            initrd="$ARTIFACTS/mipsbe/initramfs.cpio"
+            [[ -x "$qemu" ]] || die "MIPSBE requires viros's MetaROUTER-patched QEMU; run build"
+            [[ -s "$kernel" ]] || die "debug vmlinux is missing; run: ./viros.sh kernel-debug mipsbe"
+            [[ -s "$ARTIFACTS/mipsbe/init.entry" ]] || die "MIPSBE init entry is missing; re-extract mipsbe"
+            init_entry=$(head -n 1 "$ARTIFACTS/mipsbe/init.entry")
+            [[ "$init_entry" =~ ^0x[0-9a-fA-F]+$ ]] || die "invalid MIPSBE init entry: $init_entry"
+            mips_cmdline=$(mipsbe_kernel_cmdline "$initrd")
+            qemu_args=( -M malta -cpu 24Kc -m 256M
+                -display none -monitor none -serial null -parallel none -nic none
+                -no-reboot -no-shutdown -nodefaults -S -kernel "$kernel" -initrd "$initrd"
+                -append "$mips_cmdline" )
+            ;;
+        mmips)
+            qemu="$TOOLS/qemu/bin/qemu-system-mipsel"
+            kernel="$ARTIFACTS/mmips/kernel.debug.qemu.elf"
+            initrd="$ARTIFACTS/mmips/initramfs.cpio"
+            [[ -x "$qemu" ]] || die "MMIPS requires viros's MT7621-compatible patched QEMU; run build"
+            [[ -s "$kernel" ]] || die "debug vmlinux is missing; run: ./viros.sh kernel-debug mmips"
+            [[ -s "$ARTIFACTS/mmips/init.entry" ]] || die "MMIPS init entry is missing; re-extract mmips"
+            init_entry=$(head -n 1 "$ARTIFACTS/mmips/init.entry")
+            [[ "$init_entry" =~ ^0x[0-9a-fA-F]+$ ]] || die "invalid MMIPS init entry: $init_entry"
+            qemu_args=( -M malta -cpu 34Kf -smp 1 -m 256M
+                -display none -monitor none -serial none -parallel none -nic none
+                -no-reboot -no-shutdown -nodefaults -S -kernel "$kernel" -initrd "$initrd"
+                -append 'board=750g-mt mem=256M HZ=100000000 init=/init panic=-1' )
             ;;
         smips)
             qemu="$TOOLS/qemu/bin/qemu-system-mips"
@@ -753,6 +967,20 @@ debug_stage() {
                 -display none -monitor none -serial "file:$console_log" -nic none
                 -no-reboot -no-shutdown -nodefaults -kernel "$kernel" -initrd "$initrd"
                 -append 'console=ttyS0 root=/dev/ram0' )
+            ;;
+        ppc-e500)
+            qemu=$(qemu_binary qemu-system-ppc)
+            [[ -x "$TOOLS/qemu/bin/qemu-system-ppc" ]] ||
+                die "PPC e500 requires viros's RouterOS-patched QEMU; run build"
+            kernel="$ARTIFACTS/$target/kernel.debug.qemu.elf"
+            initrd="$ARTIFACTS/$target/initramfs.cpio"
+            [[ -s "$kernel" ]] || die "debug QEMU ELF is missing; run: ./viros.sh kernel-debug $target"
+            ppc_cmdline='console=ttyS0 root=/dev/ram0 init=/init panic=-1'
+            dtb=$(prepare_ppc_e500_dtb "$qemu" "$kernel" "$initrd" "$ppc_cmdline" "$target")
+            qemu_args=( -M ppce500 -cpu e500v2 -smp 1 -m 256M
+                -display none -monitor none -serial "file:$console_log" -nic none
+                -no-reboot -no-shutdown -nodefaults -dtb "$dtb"
+                -kernel "$kernel" -initrd "$initrd" -append "$ppc_cmdline" )
             ;;
         ppc-440)
             qemu=$(qemu_binary qemu-system-ppc)
@@ -779,19 +1007,38 @@ debug_stage() {
     gdb_args=( -nx -q -iex 'set auto-load safe-path /' "$vmlinux"
         -ex 'set pagination off' -ex 'set confirm off' -ex 'set remotetimeout 10'
         -ex "target remote $DEBUG_GDB_SOCKET" )
-    if [[ "$target" == smips ]]; then
+    if [[ "$target" == mmips ]]; then
+        # CPS-backed MIPS starts with a topology refresh that briefly leaves
+        # GDB without a selected CLI thread.  Suppress only those connection
+        # notifications; breakpoints, registers, and Python helpers are live.
+        gdb_args=( -nx -q -iex 'set auto-load safe-path /' "$vmlinux"
+            -ex 'set pagination off' -ex 'set confirm off' -ex 'set remotetimeout 10'
+            -ex 'set suppress-cli-notifications on' -ex 'set architecture mips'
+            -ex "target remote $DEBUG_GDB_SOCKET" -ex 'hbreak start_thread' -ex continue )
+    elif [[ "$target" == mipsbe || "$target" == smips ]]; then
         gdb_args=( -nx -q -iex 'set auto-load safe-path /' "$vmlinux"
             -ex 'set pagination off' -ex 'set confirm off' -ex 'set remotetimeout 10' -ex 'set architecture mips'
             -ex "target remote $DEBUG_GDB_SOCKET" -ex 'hbreak start_thread' -ex continue )
+    elif [[ "$target" == x86 ]]; then
+        gdb_args=( -nx -q -iex 'set auto-load safe-path /' "$vmlinux"
+            -ex 'set pagination off' -ex 'set confirm off' -ex 'set remotetimeout 10' -ex 'set architecture i386:x86-64'
+            -ex "target remote $DEBUG_GDB_SOCKET" -ex 'break compat_start_thread' -ex continue )
     fi
     if [[ "$target" == arm || "$target" == arm64 ]]; then
         gdb_args+=( -ex 'hbreak ret_to_user' -ex continue )
     fi
     gdb_args+=( -ex "source $helper" -ex lx-version -ex lx-ps
         -ex 'p $lx_task_by_pid(1)->pid' -ex 'p $lx_task_by_pid(1)->comm' )
-    if [[ "$target" == smips ]]; then
+    if [[ "$target" == mipsbe || "$target" == mmips || "$target" == smips || "$target" == x86 ]]; then
         gdb_args+=( -ex 'p $lx_task_by_pid(1)->mm->exe_file->f_path.dentry->d_name.name'
-            -ex 'delete breakpoints' -ex "hbreak *$init_entry" -ex continue )
+            -ex 'delete breakpoints' )
+        if [[ "$target" == x86 ]]; then
+            # QEMU x86 TCG does not advertise hardware breakpoints, but a
+            # software breakpoint in the mapped IA32 init page is reliable.
+            gdb_args+=( -ex "break *$init_entry" -ex continue )
+        else
+            gdb_args+=( -ex "hbreak *$init_entry" -ex continue )
+        fi
     fi
     say "Starting exact-symbol GDB for $target; PID 1 must be printed before the prompt"
     set +e
@@ -806,14 +1053,14 @@ debug_stage() {
 list_stage() {
     cat <<'EOF'
 Target          QEMU machine       Status
-x86             q35                pending strict init + GDB validation
+x86             PC/CHR             success: PID 1 inspected with matching Python GDB
 arm             virt/cortex-a15    success: PID 1 inspected with matching Python GDB
 arm64           virt/cortex-a57    success: PID 1 inspected with matching Python GDB
-mipsbe          no board model      unfinished: RB400 hardware, no init
-mmips           no board model      unfinished: MT7621 hardware, no init
-smips           Malta/board=vm      success: PID 1 inspected with matching Python GDB
+mipsbe          Malta/board=vm     success: PID 1 inspected with matching Python GDB
+mmips           Malta/MT7621       success: PID 1 inspected with matching Python GDB
+smips           Malta/board=vm     success: PID 1 inspected with matching Python GDB
 ppc-e500-smp    ppce500/e500v2     success: PID 1 inspected with matching Python GDB
-ppc-e500        —                  failed: ppce500 does not reach init
+ppc-e500        ppce500/RB1000     success: PID 1 inspected with matching Python GDB
 ppc-440         sam460ex/460EX      success: PID 1 inspected with matching Python GDB
 ppc-83xx        —                  blocked: no MPC83xx QEMU machine
 tile            TILE KVM-only      blocked: no TCG and unfinished GDB stub
@@ -842,10 +1089,16 @@ doctor_stage() {
         printf 'missing  %s\n' 'aarch64-linux-gnu-gcc (needed off AArch64)'
         failed=1
     fi
+    if [[ $(uname -m) == x86_64 ]] || command -v x86_64-linux-gnu-gcc-11 >/dev/null 2>&1 || command -v x86_64-linux-gnu-gcc >/dev/null 2>&1; then
+        printf 'ok       %s\n' 'x86-64 kernel compiler'
+    else
+        printf 'missing  %s\n' 'x86_64-linux-gnu-gcc (needed for x86 debug kernel off x86-64)'
+        failed=1
+    fi
     if command -v mips-linux-gnu-gcc >/dev/null 2>&1; then
         printf 'ok       %s\n' 'big-endian MIPS cross compiler'
     else
-        printf 'missing  %s\n' 'mips-linux-gnu-gcc (needed for SMIPS debug kernel)'
+        printf 'missing  %s\n' 'mips-linux-gnu-gcc (needed for MIPSBE/SMIPS debug kernels)'
         failed=1
     fi
     return "$failed"

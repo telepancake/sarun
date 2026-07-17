@@ -6,13 +6,22 @@ set -Eeuo pipefail
 : "${VIROS_CROSS_REAL_BIN:?}"
 
 name=${0##*/}
-tool=${name#powerpc-linux-}
-real="$VIROS_CROSS_REAL_BIN/powerpc-linux-$tool"
+triplet=${VIROS_CROSS_TRIPLET:-powerpc-linux}
+tool=${name#"$triplet"-}
+real="$VIROS_CROSS_REAL_BIN/$triplet-$tool"
 
 if [[ "$tool" == gcc ]]; then
-    real="$VIROS_CROSS_REAL_BIN/powerpc-linux-gcc.br_real"
+    args=()
+    for arg in "$@"; do
+        # GCC does not apply -wrapper to a piped assembler child.  A temporary
+        # assembly file lets QEMU user emulation wrap every x86-64 subprocess.
+        [[ "$arg" == -pipe ]] || args+=("$arg")
+    done
+    real="$VIROS_CROSS_REAL_BIN/$triplet-gcc.br_real"
+    wrapper_bin=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
     exec "$VIROS_QEMU_X86_64" -L "$VIROS_X86_LD_ROOT" "$real" \
-        -wrapper "$VIROS_QEMU_X86_64,-L,$VIROS_X86_LD_ROOT" "$@"
+        -B "$wrapper_bin/gcc-tools/" \
+        -wrapper "$VIROS_QEMU_X86_64,-L,$VIROS_X86_LD_ROOT" "${args[@]}"
 fi
 
 exec "$VIROS_QEMU_X86_64" -L "$VIROS_X86_LD_ROOT" "$real" "$@"

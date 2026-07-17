@@ -185,6 +185,42 @@ def cpio_init(data: bytes) -> tuple[bytes, int] | None:
     return None
 
 
+def embedded_cpio_initramfs(data: bytes) -> tuple[bytes, bytes, int] | None:
+    """Find a complete newc archive containing /init inside a kernel ELF."""
+    search_at = 0
+    while True:
+        start = data.find(b"070701", search_at)
+        if start < 0:
+            return None
+        pos = start
+        found = None
+        valid = False
+        try:
+            while pos + 110 <= len(data) and data[pos:pos + 6] in (b"070701", b"070702"):
+                fields = [int(data[pos + 6 + i * 8:pos + 14 + i * 8], 16) for i in range(13)]
+                mode, size, name_size = fields[1], fields[6], fields[11]
+                name_at = pos + 110
+                name_end = name_at + name_size
+                if not name_size or name_end > len(data) or data[name_end - 1] != 0:
+                    break
+                name = data[name_at:name_end - 1].decode("utf-8", "replace")
+                payload_at = (name_end + 3) & ~3
+                payload_end = payload_at + size
+                if payload_end > len(data):
+                    break
+                if name in ("init", "/init"):
+                    found = (data[payload_at:payload_end], mode)
+                pos = (payload_end + 3) & ~3
+                if name == "TRAILER!!!":
+                    valid = True
+                    break
+        except ValueError:
+            valid = False
+        if valid and found:
+            return data[start:pos], found[0], found[1]
+        search_at = start + 1
+
+
 def classify_ppc(kernel: bytes) -> str:
     match = re.search(rb"Linux version ([^ \x00]+)", kernel)
     version = match.group(1).decode("ascii", "replace") if match else ""
@@ -219,6 +255,48 @@ def write_file(path: Path, data: bytes, mode: int = 0o644):
 
 
 def boot_artifacts(arch: str, wrapper: bytes, output: Path):
+    if arch == "x86":
+        # A bzImage contains arbitrary bytes after its real compressed payload,
+        # so apparent XZ signatures there are not necessarily streams.
+        linux = None
+        xz_count = 0
+        search_at = 0
+        while True:
+            start = wrapper.find(XZ_MAGIC, search_at)
+            if start < 0:
+                break
+            search_at = start + 1
+            decoder = lzma.LZMADecompressor(format=lzma.FORMAT_XZ)
+            try:
+                unpacked = decoder.decompress(wrapper[start:])
+            except lzma.LZMAError:
+                continue
+            if decoder.eof:
+                xz_count += 1
+                if unpacked.startswith(b"\x7fELF"):
+                    linux = unpacked
+                    break
+        if linux is None:
+            raise FormatError("x86 BOOTX64.EFI has no XZ-compressed Linux ELF")
+        embedded = embedded_cpio_initramfs(linux)
+        if embedded is None:
+            raise FormatError("x86 Linux ELF has no complete initramfs containing /init")
+        initramfs, init, mode = embedded
+        target = output / arch
+        write_file(target / "BOOTX64.EFI", wrapper, 0o755)
+        write_file(target / "kernel.production.bzImage", wrapper, 0o755)
+        write_file(target / "initramfs.cpio", initramfs)
+        write_file(target / "init", init, mode & 0o777)
+        entry = elf_entry(init)
+        if entry is not None:
+            write_file(target / "init.entry", f"0x{entry:x}\n".encode())
+        return {
+            "variant": "x86_64",
+            "linux_bytes": len(linux),
+            "initramfs_bytes": len(initramfs),
+            "xz_streams": xz_count,
+        }
+
     if arch == "tile":
         filesystem = elf_section(wrapper, "fs")
         if filesystem is None:
@@ -331,7 +409,11 @@ def extract(npk: Path, arch: str, output: Path):
         elif name == "boot/initrd.rgz":
             write_file(output / arch / "initrd.rgz", payload)
         elif name == "boot/EFI/BOOT/BOOTX64.EFI":
-            write_file(output / arch / "BOOTX64.EFI", payload, 0o755)
+            result = boot_artifacts(arch, payload, output)
+            if result:
+                boot.append(result)
+            else:
+                write_file(output / arch / "BOOTX64.EFI", payload, 0o755)
 
     metadata = {
         "source": str(npk),

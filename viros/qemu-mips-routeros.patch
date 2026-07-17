@@ -1,6 +1,9 @@
 diff --git a/hw/mips/malta.c b/hw/mips/malta.c
 --- a/hw/mips/malta.c
 +++ b/hw/mips/malta.c
+@@ -591 +591 @@ static MaltaFPGAState *malta_fpga_init(MemoryRegion *address_space,
+-    chr = qemu_chr_new("fpga", "vc:320x200", NULL);
++    chr = qemu_chr_new("fpga", "null", NULL);
 @@ -675,7 +675,7 @@ static void write_bootloader_nanomips(uint8_t *base, int64_t run_addr,
                          * If semihosting is used, arguments have already
                          * been passed, so we preserve $a0.
@@ -64,15 +67,26 @@ diff --git a/hw/mips/malta.c b/hw/mips/malta.c
 
      g_free(prom_buf);
      return kernel_entry;
-@@ -1085,6 +1073,7 @@ void mips_malta_init(MachineState *machine)
+@@ -1065,6 +1053,8 @@ static void mips_create_cpu(MachineState *ms, MaltaState *s,
+                             qemu_irq *cbus_irq, qemu_irq *i8259_irq)
+ {
+-    if ((ms->smp.cpus > 1) && cpu_type_supports_cps_smp(ms->cpu_type)) {
++    /* MT7621 exposes its coherence manager even when only one virtual
++     * processor is active.  Keep CPS/CM present for deterministic debug. */
++    if (cpu_type_supports_cps_smp(ms->cpu_type)) {
+         create_cps(ms, s, cbus_irq, i8259_irq);
+     } else {
+         create_cpu_without_cps(ms, s, cbus_irq, i8259_irq);
+@@ -1085,6 +1075,8 @@ void mips_malta_init(MachineState *machine)
      MemoryRegion *system_memory = get_system_memory();
      MemoryRegion *ram_low_preio = g_new(MemoryRegion, 1);
      MemoryRegion *ram_low_postio;
 +    MemoryRegion *rb_uart = g_new(MemoryRegion, 1);
++    MemoryRegion *mmips_uart = g_new(MemoryRegion, 1);
      MemoryRegion *bios, *bios_copy = g_new(MemoryRegion, 1);
      const size_t smbus_eeprom_size = 8 * 256;
      uint8_t *smbus_eeprom_buf = g_malloc0(smbus_eeprom_size);
-@@ -1120,6 +1109,15 @@ void mips_malta_init(MachineState *machine)
+@@ -1120,6 +1112,24 @@ void mips_malta_init(MachineState *machine)
                               machine->ram, 0, MIN(ram_size, 256 * MiB));
      memory_region_add_subregion(system_memory, 0, ram_low_preio);
 
@@ -85,6 +99,44 @@ diff --git a/hw/mips/malta.c b/hw/mips/malta.c
 +                                        rb_uart, 10);
 +    stl_be_p(memory_region_get_ram_ptr(rb_uart), 0x200);
 +
++    /* MMIPS uses the MT7621 UART at 0x1e000c00.  It overlaps Malta's
++     * pflash window, so place a small polling-compatible register page
++     * above it.  LSR bits 5 and 6 keep early printk from stalling. */
++    memory_region_init_ram(mmips_uart, NULL, "mikrotik.mmips-uart", 0x1000,
++                           &error_fatal);
++    memory_region_add_subregion_overlap(system_memory, 0x1e000c00,
++                                        mmips_uart, 10);
++    *((uint8_t *)memory_region_get_ram_ptr(mmips_uart) + 0x14) = 0x60;
++
      /* alias for post IO hole access, if there is enough RAM */
      if (ram_size > 512 * MiB) {
          ram_low_postio = g_new(MemoryRegion, 1);
+diff --git a/target/mips/cpu-defs.c.inc b/target/mips/cpu-defs.c.inc
+--- a/target/mips/cpu-defs.c.inc
++++ b/target/mips/cpu-defs.c.inc
+@@ -281,7 +281,7 @@ const mips_def_t mips_defs[] =
+                        (1 << CP0C1_CA),
+         .CP0_Config2 = MIPS_CONFIG2,
+         .CP0_Config3 = MIPS_CONFIG3 | (1 << CP0C3_VInt) | (1 << CP0C3_MT) |
+-                       (1 << CP0C3_DSPP),
++                       (1 << CP0C3_DSPP) | (1 << CP0C3_CMGCR),
+         .CP0_LLAddr_rw_bitmask = 0,
+         .CP0_LLAddr_shift = 0,
+         .SYNCI_Step = 32,
+diff --git a/gdbstub/system.c b/gdbstub/system.c
+--- a/gdbstub/system.c
++++ b/gdbstub/system.c
+@@ -667,2 +667,3 @@
+- * The minimal system-mode stop reply packet is:
+- *   T05core:{id};
++ * Include both the topology core and the protocol thread.  A CPS-backed
++ * single-vCPU machine can number its visible CPU from one, and debuggers
++ * otherwise have to infer the current thread from a separate query.
+@@ -673,3 +674,6 @@ void gdb_build_stop_packet(GString *buf, CPUState *cs)
+     g_string_printf(buf,
+-                    "T%02xcore:%02x;", GDB_SIGNAL_TRAP, gdb_get_cpu_index(cs));
++                    "T%02xcore:%02x;thread:",
++                    GDB_SIGNAL_TRAP, gdb_get_cpu_index(cs));
++    gdb_append_thread_id(cs, buf);
++    g_string_append_c(buf, ';');
+ }
