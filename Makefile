@@ -75,6 +75,10 @@ engine: vendor wire-codegen ## Build the engine (fully-static musl binary; cargo
 	  ln -sf sarun $(ENGINE_RELEASE)/$$d; done
 	@echo "→ ./sarun → $(ENGINE_RELEASE)/sarun"
 
+.PHONY: appliances
+appliances: ## Build both tightly paired QEMU + Linux + target-/init appliances
+	scripts/build-appliances.sh all
+
 .PHONY: release-licenses
 release-licenses: vendor ## Regenerate notices beside the current static release
 	python3 scripts/release_licenses.py --target $(ENGINE_TARGET) \
@@ -164,6 +168,7 @@ test-sud: ## sud vs FUSE equivalence + sud exec capabilities (needs `make engine
 test-backends: ## Portable live SarunFs equivalence (FUSE, host QEMU, and native SUD where supported)
 	cd prototype && uv run --with "wcmatch>=8.4" --with "python-magic>=0.4" \
 	  python test_backend_equiv_rs.py
+	cd prototype && uv run python test_appliance_compat32.py
 
 .PHONY: bench-backends
 bench-backends: ## Compare live backend filesystem workloads (set SARUN_BENCH_ROUNDS=N)
@@ -174,6 +179,20 @@ bench-backends: ## Compare live backend filesystem workloads (set SARUN_BENCH_RO
 test-backend-workloads: ## Strict real-tool matrix across every locally runnable backend
 	cd prototype && uv run --with "wcmatch>=8.4" --with "python-magic>=0.4" \
 	  python test_backend_workloads.py
+
+.PHONY: validate-backends
+validate-backends: ## Build appliances, run all backend gates, then print comparable benchmark medians
+	$(MAKE) appliances
+	$(MAKE) engine
+	$(MAKE) test-backends
+	$(MAKE) test-backend-workloads
+	$(MAKE) bench-backends
+
+.PHONY: validate-backends-kvm
+validate-backends-kvm: ## Require KVM, then run the complete backend validation and benchmark gate
+	@test -r /dev/kvm && test -w /dev/kvm || { \
+	  echo "validate-backends-kvm needs read/write access to /dev/kvm" >&2; exit 1; }
+	SARUN_REQUIRE_KVM=1 $(MAKE) validate-backends
 
 # ---- Housekeeping ---------------------------------------------------------
 

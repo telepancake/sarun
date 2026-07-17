@@ -48,7 +48,11 @@ as executable mappings and mmap that genuinely need a host fd.
 - CLI: `sarun run --fuse`, `--sud`, or `--qemu ARCH`.  The initial appliance
   architectures are `aarch64` and `x86_64`.
 - Matching host/guest uses KVM when available.  TCG is the required fallback,
-  including aarch64 on the current aarch64 host without `/dev/kvm`.
+  including aarch64 on the current aarch64 host without `/dev/kvm`.  Every
+  appliance supports both its native 64-bit process ABI and its corresponding
+  32-bit ABI (AArch32 on aarch64, i386 on x86_64).  Because AArch32 EL0 is an
+  optional ARM CPU feature, an aarch64 host selects KVM only when the host also
+  advertises 32-bit process support; otherwise it deliberately retains TCG.
 - The guest boots directly from tag `sarun-root` with
   `root=sarun-root rootfstype=virtiofs rw`.  Target sarun is `/init`, mounts the
   essential pseudo-filesystems, supervises/reaps the command tree, forwards
@@ -300,6 +304,14 @@ as executable mappings and mmap that genuinely need a host fd.
         immediately rerun one named x86_64 brush box and prove both generations
         of captured state share one archive without a host write. This exercises
         the descriptor teardown barrier under cross-architecture TCG as well.
+- [x] Enable and behaviorally gate both process ABIs in each paired kernel.
+      The aarch64 kernel carries `CONFIG_COMPAT`/AArch32 ELF support and the
+      x86_64 kernel carries `CONFIG_IA32_EMULATION`/i386 ELF support.  Tiny
+      freestanding ARM EABI and i386 programs are compiled as real ELF32 files,
+      executed through ordinary SarunFs from the host, print a sentinel and
+      return exit 32 in both TCG appliances.  The gate also asserts the
+      launcher's reported accelerator.  Native aarch64 KVM is conservatively
+      disabled when the host lacks AArch32 EL0, preserving the two-ABI promise.
 - [x] Pass the full locally runnable appliance suite on aarch64 TCG and the
       cross-architecture lifecycle/build suite on x86_64 TCG.
 - [ ] Re-run the same suite with aarch64 and x86_64 KVM where available.
@@ -405,6 +417,11 @@ as executable mappings and mmap that genuinely need a host fd.
   host whose kernel rejects unprivileged user namespaces), with additional
   stale API/baseline cases. Those are recorded work, not treated as backend
   failures or silently converted to green skips.
+- The same gate executes real ARM EABI and i386 static ELF32 probes under the
+  aarch64 and x86_64 paired kernels, respectively.  Both print the exact
+  sentinel and return exit 32 on this aarch64 TCG host.  This catches missing
+  compatibility loaders or syscall ABIs; inspecting kernel config alone is not
+  accepted as proof.
 - `make test-backends` also launches QEMU from inside a FUSE box through the
   authenticated broker and descriptor-only appliance boundary. It checks the
   persisted parent edge and child archive, not merely a successful boot.
@@ -436,6 +453,17 @@ tests; FUSE parity/cutover; SUD ring; SUD parity/deletion; reproducible applianc
 builders; aarch64 appliance; x86_64 appliance; final equivalence and cleanup.
 During any long gate, commit and push a compiling WIP checkpoint rather than
 holding hours of work only in the worktree.
+
+The one-command local/external-hardware gate is `make validate-backends`: it
+builds both tightly paired appliances and the host engine, runs portable
+backend equivalence (including the ELF32 process gates and native SUD when the
+host supports it), runs the strict real-project workload matrix, then prints
+three-round benchmark medians.  Re-run only the timing portion with a larger
+sample as `SARUN_BENCH_ROUNDS=5 make bench-backends`.  On physical x86_64,
+read/write access to `/dev/kvm` causes the native x86_64 appliance to select
+KVM, and the test fails if the accelerator marker does not confirm that choice.
+Use `make validate-backends-kvm` on that machine to require accessible KVM and
+make absence or fallback a hard failure instead of accepting the TCG fallback.
 
 ## Known baseline failures
 

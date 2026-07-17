@@ -62,6 +62,27 @@ fn qemu_binary(architecture: QemuArchitecture) -> PathBuf {
         .join(format!("qemu-system-{}", architecture_name(architecture)))
 }
 
+fn host_supports_compat32(architecture: QemuArchitecture) -> bool {
+    match architecture {
+        // IA32 execution is architectural on the x86-64 KVM hosts Sarun
+        // supports; the paired kernel still has to enable IA32_EMULATION.
+        QemuArchitecture::X8664 => true,
+        // AArch32 EL0 is optional in ARMv8 and absent on some modern CPUs.
+        // Never select an accelerator that would make the paired appliance
+        // lose its promised 32-bit process ABI. `lscpu` derives this from the
+        // host kernel/CPU and is forced to stable English output; uncertainty
+        // conservatively retains TCG's known-compatible `max` CPU.
+        QemuArchitecture::Aarch64 => Command::new("lscpu")
+            .env("LC_ALL", "C")
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .and_then(|output| String::from_utf8(output.stdout).ok())
+            .is_some_and(|output| output.lines().any(|line|
+                line.starts_with("CPU op-mode(s):") && line.contains("32-bit"))),
+    }
+}
+
 fn qemu_args(
     architecture: QemuArchitecture,
     kernel: &Path,
@@ -232,12 +253,19 @@ pub fn run(
     let qemu_virtiofs = inherit(virtiofs.as_raw_fd())?;
     let qemu_control = inherit(qemu_control.as_raw_fd())?;
     let qemu_network = network.as_ref().map(|fd| inherit(fd.as_raw_fd())).transpose()?;
-    let kvm = architecture_name(architecture) == std::env::consts::ARCH
-        && std::fs::OpenOptions::new()
+    let matching_host = architecture_name(architecture) == std::env::consts::ARCH;
+    let kvm_device = matching_host && std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open("/dev/kvm")
             .is_ok();
+    let kvm = kvm_device && host_supports_compat32(architecture);
+    if kvm_device && !kvm {
+        eprintln!(
+            "sarun-engine: qemu {} retaining tcg because host KVM lacks the 32-bit process ABI",
+            architecture_name(architecture),
+        );
+    }
     let args = qemu_args(
         architecture,
         &kernel,
@@ -247,6 +275,11 @@ pub fn run(
         kvm,
         command.net_mode,
         qemu_network.as_ref().map(AsRawFd::as_raw_fd),
+    );
+    eprintln!(
+        "sarun-engine: qemu {} accelerator {}",
+        architecture_name(architecture),
+        if kvm { "kvm" } else { "tcg" },
     );
     let mut child = Command::new(&qemu)
         .args(&args)

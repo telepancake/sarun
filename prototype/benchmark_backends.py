@@ -99,10 +99,14 @@ def available_backends():
     result = ["fuse"]
     if HOST_ARCH == "x86_64" and (REPO_ROOT / "tv/sud64").exists():
         result.append("sud")
-    appliance = Path.home() / f".cache/sarun/appliances/v1/{HOST_ARCH}/kernel"
-    qemu = Path.home() / (
-        f".cache/sarun/appliances/v1/host-{HOST_ARCH}/qemu-system-{HOST_ARCH}"
-    )
+    configured = os.environ.get("SARUN_APPLIANCE_ROOT")
+    if configured:
+        root = Path(configured)
+    else:
+        root = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) \
+            / "sarun/appliances/v1"
+    appliance = root / HOST_ARCH / "kernel"
+    qemu = root / f"host-{HOST_ARCH}" / f"qemu-system-{HOST_ARCH}"
     if appliance.exists() and qemu.exists():
         result.append("qemu")
     return result
