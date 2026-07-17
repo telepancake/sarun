@@ -263,8 +263,12 @@ as executable mappings and mmap that genuinely need a host fd.
         a TCG result, not KVM. Native SUD and KVM measurements remain open; the
         already-deleted historical SUD filesystem cannot be validly benchmarked
         on this non-x86 Syscall User Dispatch host.
-- [ ] Remove backend-specific semantic branches and obsolete compatibility
-      code; update generated help and user documentation.
+- [x] Remove backend-specific semantic branches and obsolete compatibility
+      code; update generated help and user documentation. A repository audit
+      finds backend selection only in registration, runner, transport, trace,
+      and appliance lifecycle code; filesystem policy remains in `SarunFs`.
+      Stale step-number, path-remap, sweep, and default-backend descriptions
+      have been corrected while the design documents retain deletion history.
 
 ## Validation ledger (2026-07-17, aarch64 host)
 

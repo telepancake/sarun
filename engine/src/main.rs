@@ -840,8 +840,8 @@ fn main() {
                 if passthrough || direct || pty || api {
                     eprintln!(
                         "sarun: --sud is incompatible with \
-                               -t/-d/-p/--api (step-1 scope, see \
-                               engine/DESIGN-sud.md)"
+                               -t/-d/-p/--api (these are FUSE runner modes; \
+                               see engine/DESIGN-sud.md)"
                     );
                     std::process::exit(2);
                 }

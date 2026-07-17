@@ -1,9 +1,7 @@
 // Rust TRACE codec layered on crate::wire, the single Rust implementation of
-// tv/wire/wire.h (tv/trace/trace.h — TRACE_VERSION 3). Step-1.5 of the sud integration
-// (engine/DESIGN-sud.md, WIP): the runner now IS the sud launcher, so it
-// writes the stream head (version atom) and the launcher-side EV_EXIT
-// events that tv's sudtrace used to emit. The decoder half lands with
-// step 2 (trace ingest for per-write attribution).
+// tv/wire/wire.h (tv/trace/trace.h — TRACE_VERSION 3). The runner owns the
+// stream head and launcher-side EV_EXIT events; the engine stores the compact
+// bytes and decodes them on demand while applying provenance live.
 //
 // Atom encoding:
 //   b in 0x00..=0xBF  1-byte atom, payload is the byte itself

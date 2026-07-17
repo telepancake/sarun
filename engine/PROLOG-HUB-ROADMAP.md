@@ -727,9 +727,10 @@ belong to the relation.
 - [x] Build the normal optimized aarch64 release with `make engine`; verify it
       is fully static and runs its help entry point on the current host.
 - [ ] Revalidate the x86_64 archive/build after the pipeline change.
-- [ ] Decide and test native aarch64 runtime behavior where the separate SUD
-      wrapper backend is x86-specific; do not claim full `make engine` support
-      until this is explicit and working.
+- [x] Define and test native aarch64 runtime behavior: FUSE and paired QEMU run
+      natively, while `--sud` remains an explicitly x86 Syscall User Dispatch
+      transport. The aarch64 build, canonical core, both x86 wrapper ABIs, and
+      live FUSE/QEMU equivalence are covered without an emulated SUD fallback.
 - [ ] Copy third-party license notices beside every normal release artifact.
 
 ### 2. Generic typed FFI — NEXT
@@ -1347,13 +1348,14 @@ belong to the relation.
   The full native aarch64-musl suite passes 311 tests with one existing browser
   e2e test ignored.
 - Extended that dispatcher to every non-stream transport reply: budget grants
-  now consume the generated broker-or-selector `BoxTarget`, and SUD sweep
-  consumes `TransportRequest::SudIngest` and materializes bounded
-  `TransportResponse::SudIngested` errors. The old listener only converts its
-  input and projects the response spelling. Reply-mode transport is therefore
-  ready for direct binary framing; register, subscriptions, PTY, API, and
-  service requests remain connection-mode handoffs rather than ordinary
-  replies.
+  now consume the generated broker-or-selector `BoxTarget`, and the former SUD
+  post-exit ingest path consumed `TransportRequest::SudIngest` and materialized
+  bounded `TransportResponse::SudIngested` errors. The old listener only
+  converts its input and projects the response spelling. That ingest path was
+  later deleted with the sweep during the shared-SarunFs cutover. Reply-mode
+  transport is therefore ready for direct binary framing; register,
+  subscriptions, PTY, API, and service requests remain connection-mode
+  handoffs rather than ordinary replies.
 - Moved PTY handoff onto `TransportRequest::PtySpawn`: argv is a non-empty
   bounded byte vector, dimensions are checked `u16` values, cwd remains an OS
   byte path, and environment is the generated bounded byte map. The PTY

@@ -57,7 +57,7 @@ engine: vendor wire-codegen ## Build the engine (fully-static musl binary; cargo
 	cd engine && PATH="$$(uv tool dir)/cargo-zigbuild/bin:$$HOME/.local/bin:$$PATH" \
 	  cargo zigbuild --release --target $(ENGINE_TARGET)
 	@ln -sfn $(ENGINE_RELEASE)/sarun sarun
-	@# sud is the DEFAULT run backend: the wrappers must sit next to the
+	@# SUD is a first-class run backend: both wrappers must sit next to the
 	@# engine binary (runner::sud_wrapper_paths resolves the sibling).
 	@# sud64 and sud32 are both required: the wrappers hand off to each
 	@# other on cross-class execs, so they MUST come from the same build.

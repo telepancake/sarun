@@ -444,13 +444,10 @@ impl Shadows {
     }
 }
 
-/// The raw shadow glob pattern strings (sh, make, ninja) from the SAME
-/// config files + defaults the FUSE shadows compile. Shared with the sud
-/// runner, which expands them into concrete wrapper remap rules — the two
-/// backends must honor the same shadow configuration (a make matched by
-/// shadow_make.glob was shadowed under FUSE but ran REAL under sud,
-/// recording processes but no pipelines and no build edges).
-pub fn shadow_glob_strings() -> (Vec<String>, Vec<String>, Vec<String>) {
+/// The raw shadow glob pattern strings (sh, make, ninja). They feed the single
+/// SarunFs shadow decision, so FUSE, SUD, and QEMU see the same projected
+/// executable without any runner-side remap rules.
+fn shadow_glob_strings() -> (Vec<String>, Vec<String>, Vec<String>) {
     (
         load_glob_strings(
             &crate::paths::shadow_sh_glob_path(),

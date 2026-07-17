@@ -9,8 +9,8 @@
 //!
 //! Mechanism: at box startup (`brush_sh`) we install a handler for a realtime
 //! signal on an fd the runner pre-opened to a host file (`SARUN_STUCK_FD`,
-//! inherited across the sud execs — writes to an already-open fd are NOT
-//! path-remapped, so they land in the real host file the engine reads). On
+//! inherited across the sud execs — writes to an already-open host fd do not
+//! perform any pathname operation and therefore bypass SarunFs). On
 //! `stuck`, the engine truncates that file, `tgkill`s each on-CPU thread with
 //! the same signal, and reads back the blocks. `std::backtrace` does the
 //! symbolization in-process via gimli reading `/proc/self/exe`.
