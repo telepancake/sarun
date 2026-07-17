@@ -843,6 +843,123 @@ long sud_vfs_readlinkat(int dirfd, const char *path, char *buffer, size_t size)
     return result;
 }
 
+int sud_vfs_mkdirat(int dirfd, const char *path, unsigned int mode,
+                    unsigned int umask)
+{
+    char parent_path[PATH_MAX];
+    char name[256];
+    struct resolved_node parent;
+    int result = resolve_parent(dirfd, path, &parent, name, sizeof(name),
+                                parent_path);
+    if (result != 0) return result;
+    struct fuse_entry_out entry;
+    result = sud_fuse_mkdir(parent.inode, name,
+                            (mode & 07777) | S_IFDIR, umask, &entry);
+    resolved_forget(&parent);
+    if (result == 0 && entry.nodeid != FUSE_ROOT_ID)
+        (void)sud_fuse_forget(entry.nodeid, 1);
+    return result;
+}
+
+int sud_vfs_mknodat(int dirfd, const char *path, unsigned int mode,
+                    unsigned int device, unsigned int umask)
+{
+    char parent_path[PATH_MAX];
+    char name[256];
+    struct resolved_node parent;
+    int result = resolve_parent(dirfd, path, &parent, name, sizeof(name),
+                                parent_path);
+    if (result != 0) return result;
+    struct fuse_entry_out entry;
+    result = sud_fuse_mknod(parent.inode, name, mode, device, umask, &entry);
+    resolved_forget(&parent);
+    if (result == 0 && entry.nodeid != FUSE_ROOT_ID)
+        (void)sud_fuse_forget(entry.nodeid, 1);
+    return result;
+}
+
+int sud_vfs_unlinkat(int dirfd, const char *path, int directory)
+{
+    char parent_path[PATH_MAX];
+    char name[256];
+    struct resolved_node parent;
+    int result = resolve_parent(dirfd, path, &parent, name, sizeof(name),
+                                parent_path);
+    if (result != 0) return result;
+    result = sud_fuse_unlink(parent.inode, name, directory);
+    resolved_forget(&parent);
+    return result;
+}
+
+int sud_vfs_renameat2(int old_dirfd, const char *old_path,
+                      int new_dirfd, const char *new_path,
+                      unsigned int flags)
+{
+    char old_parent_path[PATH_MAX];
+    char new_parent_path[PATH_MAX];
+    char old_name[256];
+    char new_name[256];
+    struct resolved_node old_parent;
+    struct resolved_node new_parent;
+    memset(&new_parent, 0, sizeof(new_parent));
+    int result = resolve_parent(old_dirfd, old_path, &old_parent,
+                                old_name, sizeof(old_name), old_parent_path);
+    if (result != 0) return result;
+    result = resolve_parent(new_dirfd, new_path, &new_parent,
+                            new_name, sizeof(new_name), new_parent_path);
+    if (result == 0)
+        result = sud_fuse_rename(old_parent.inode, old_name,
+                                 new_parent.inode, new_name, flags);
+    resolved_forget(&new_parent);
+    resolved_forget(&old_parent);
+    return result;
+}
+
+int sud_vfs_symlinkat(const char *target, int dirfd, const char *path)
+{
+    if (!target) return -EFAULT;
+    char parent_path[PATH_MAX];
+    char name[256];
+    struct resolved_node parent;
+    int result = resolve_parent(dirfd, path, &parent, name, sizeof(name),
+                                parent_path);
+    if (result != 0) return result;
+    struct fuse_entry_out entry;
+    result = sud_fuse_symlink(parent.inode, name, target, &entry);
+    resolved_forget(&parent);
+    if (result == 0 && entry.nodeid != FUSE_ROOT_ID)
+        (void)sud_fuse_forget(entry.nodeid, 1);
+    return result;
+}
+
+int sud_vfs_linkat(int old_dirfd, const char *old_path,
+                   int new_dirfd, const char *new_path, int follow)
+{
+    char old_absolute[PATH_MAX];
+    int result = absolute_at(old_dirfd, old_path, old_absolute,
+                             sizeof(old_absolute));
+    if (result != 0) return result;
+    struct resolved_node source;
+    result = resolve_absolute_full(old_absolute, &source, follow, 0);
+    if (result != 0) return result;
+    char new_parent_path[PATH_MAX];
+    char new_name[256];
+    struct resolved_node new_parent;
+    memset(&new_parent, 0, sizeof(new_parent));
+    result = resolve_parent(new_dirfd, new_path, &new_parent,
+                            new_name, sizeof(new_name), new_parent_path);
+    if (result == 0) {
+        struct fuse_entry_out entry;
+        result = sud_fuse_link(source.inode, new_parent.inode, new_name,
+                               &entry);
+        if (result == 0 && entry.nodeid != FUSE_ROOT_ID)
+            (void)sud_fuse_forget(entry.nodeid, 1);
+    }
+    resolved_forget(&new_parent);
+    resolved_forget(&source);
+    return result;
+}
+
 int sud_vfs_close(int fd)
 {
     fd_table_init();

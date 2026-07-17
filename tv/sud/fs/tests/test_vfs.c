@@ -53,6 +53,19 @@ static void no_reply(struct sud_fs_slot *slot)
     finish_reply(slot);
 }
 
+static int root_getattr(struct sud_fs_ring *ring)
+{
+    struct sud_fs_slot *slot = take_request(ring);
+    struct fuse_in_header *header = (struct fuse_in_header *)slot->request;
+    if (header->opcode != FUSE_GETATTR || header->nodeid != FUSE_ROOT_ID)
+        return -1;
+    struct fuse_attr_out attributes = {0};
+    attributes.attr.ino = FUSE_ROOT_ID;
+    attributes.attr.mode = S_IFDIR | 0755;
+    reply(slot, &attributes, sizeof(attributes));
+    return 0;
+}
+
 static long fs_call(long nr, long a0, long a1, long a2,
                     long a3, long a4, long a5)
 {
@@ -110,6 +123,19 @@ static int child_calls(struct sud_fs_ring *ring)
                               O_RDONLY, 0, 0, 0);
     if (linked < 0) return 25;
     if (fs_call(SYS_close, linked, 0, 0, 0, 0, 0) != 0) return 26;
+    if (fs_call(SYS_mkdirat, AT_FDCWD, (long)"/made", 0750, 0, 0, 0) != 0)
+        return 27;
+    if (fs_call(SYS_renameat2, AT_FDCWD, (long)"/hello", AT_FDCWD,
+                (long)"/moved", 0, 0) != 0) return 28;
+    if (fs_call(SYS_linkat, AT_FDCWD, (long)"/moved", AT_FDCWD,
+                (long)"/hard", 0, 0) != 0) return 29;
+    if (fs_call(SYS_symlinkat, (long)"moved", AT_FDCWD,
+                (long)"/soft", 0, 0, 0) != 0) return 30;
+    if (fs_call(SYS_unlinkat, AT_FDCWD, (long)"/hard", 0, 0, 0, 0) != 0
+        || fs_call(SYS_unlinkat, AT_FDCWD, (long)"/soft", 0, 0, 0, 0) != 0
+        || fs_call(SYS_unlinkat, AT_FDCWD, (long)"/moved", 0, 0, 0, 0) != 0
+        || fs_call(SYS_unlinkat, AT_FDCWD, (long)"/made", AT_REMOVEDIR,
+                   0, 0, 0) != 0) return 31;
     return 0;
 }
 
@@ -277,6 +303,81 @@ static int serve_calls(struct sud_fs_ring *ring)
     slot = take_request(ring); header = (struct fuse_in_header *)slot->request;
     if (header->opcode != FUSE_FORGET || header->nodeid != 2) return 47;
     no_reply(slot);
+
+    if (root_getattr(ring) != 0) return 48;
+    slot = take_request(ring); header = (struct fuse_in_header *)slot->request;
+    struct fuse_mkdir_in *mkdir_input = (struct fuse_mkdir_in *)(header + 1);
+    if (header->opcode != FUSE_MKDIR || header->nodeid != FUSE_ROOT_ID
+        || mkdir_input->mode != (S_IFDIR | 0750)
+        || strcmp((char *)(mkdir_input + 1), "made") != 0) return 49;
+    memset(&entry, 0, sizeof(entry));
+    entry.nodeid = 6;
+    entry.attr.ino = 6;
+    entry.attr.mode = S_IFDIR | 0750;
+    reply(slot, &entry, sizeof(entry));
+    slot = take_request(ring); header = (struct fuse_in_header *)slot->request;
+    if (header->opcode != FUSE_FORGET || header->nodeid != 6) return 50;
+    no_reply(slot);
+
+    if (root_getattr(ring) != 0 || root_getattr(ring) != 0) return 51;
+    slot = take_request(ring); header = (struct fuse_in_header *)slot->request;
+    struct fuse_rename2_in *rename_input =
+        (struct fuse_rename2_in *)(header + 1);
+    char *rename_names = (char *)(rename_input + 1);
+    if (header->opcode != FUSE_RENAME2 || header->nodeid != FUSE_ROOT_ID
+        || rename_input->newdir != FUSE_ROOT_ID
+        || strcmp(rename_names, "hello") != 0
+        || strcmp(rename_names + strlen(rename_names) + 1, "moved") != 0)
+        return 52;
+    reply(slot, 0, 0);
+
+    slot = take_request(ring); header = (struct fuse_in_header *)slot->request;
+    if (header->opcode != FUSE_LOOKUP || header->nodeid != FUSE_ROOT_ID
+        || strcmp((char *)(header + 1), "moved") != 0) return 53;
+    memset(&entry, 0, sizeof(entry));
+    entry.nodeid = 2;
+    entry.attr.ino = 2;
+    entry.attr.mode = S_IFREG | 0644;
+    reply(slot, &entry, sizeof(entry));
+    if (root_getattr(ring) != 0) return 54;
+    slot = take_request(ring); header = (struct fuse_in_header *)slot->request;
+    struct fuse_link_in *link_input = (struct fuse_link_in *)(header + 1);
+    if (header->opcode != FUSE_LINK || link_input->oldnodeid != 2
+        || strcmp((char *)(link_input + 1), "hard") != 0) return 55;
+    reply(slot, &entry, sizeof(entry));
+    slot = take_request(ring); header = (struct fuse_in_header *)slot->request;
+    if (header->opcode != FUSE_FORGET || header->nodeid != 2) return 56;
+    no_reply(slot);
+    slot = take_request(ring); header = (struct fuse_in_header *)slot->request;
+    if (header->opcode != FUSE_FORGET || header->nodeid != 2) return 57;
+    no_reply(slot);
+
+    if (root_getattr(ring) != 0) return 58;
+    slot = take_request(ring); header = (struct fuse_in_header *)slot->request;
+    char *symlink_names = (char *)(header + 1);
+    if (header->opcode != FUSE_SYMLINK
+        || strcmp(symlink_names, "soft") != 0
+        || strcmp(symlink_names + strlen(symlink_names) + 1, "moved") != 0)
+        return 59;
+    memset(&entry, 0, sizeof(entry));
+    entry.nodeid = 7;
+    entry.attr.ino = 7;
+    entry.attr.mode = S_IFLNK | 0777;
+    reply(slot, &entry, sizeof(entry));
+    slot = take_request(ring); header = (struct fuse_in_header *)slot->request;
+    if (header->opcode != FUSE_FORGET || header->nodeid != 7) return 60;
+    no_reply(slot);
+
+    const char *removed[] = { "hard", "soft", "moved", "made" };
+    for (int i = 0; i < 4; i++) {
+        if (root_getattr(ring) != 0) return 61 + i;
+        slot = take_request(ring);
+        header = (struct fuse_in_header *)slot->request;
+        uint32_t expected_opcode = i == 3 ? FUSE_RMDIR : FUSE_UNLINK;
+        if (header->opcode != expected_opcode
+            || strcmp((char *)(header + 1), removed[i]) != 0) return 65 + i;
+        reply(slot, 0, 0);
+    }
     return 0;
 }
 

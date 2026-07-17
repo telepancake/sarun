@@ -250,6 +250,96 @@ static int fs_pre_syscall(struct sud_syscall_ctx *ctx)
         return handled(ctx, previous);
     }
 #endif
+#ifdef SYS_mkdir
+    if (nr == SYS_mkdir)
+        return handled(ctx, sud_vfs_mkdirat(AT_FDCWD,
+                         (const char *)ctx->args[0],
+                         (unsigned int)ctx->args[1], g_fs_umask));
+#endif
+#ifdef SYS_mkdirat
+    if (nr == SYS_mkdirat)
+        return handled(ctx, sud_vfs_mkdirat((int)ctx->args[0],
+                         (const char *)ctx->args[1],
+                         (unsigned int)ctx->args[2], g_fs_umask));
+#endif
+#ifdef SYS_mknod
+    if (nr == SYS_mknod)
+        return handled(ctx, sud_vfs_mknodat(AT_FDCWD,
+                         (const char *)ctx->args[0],
+                         (unsigned int)ctx->args[1],
+                         (unsigned int)ctx->args[2], g_fs_umask));
+#endif
+#ifdef SYS_mknodat
+    if (nr == SYS_mknodat)
+        return handled(ctx, sud_vfs_mknodat((int)ctx->args[0],
+                         (const char *)ctx->args[1],
+                         (unsigned int)ctx->args[2],
+                         (unsigned int)ctx->args[3], g_fs_umask));
+#endif
+#ifdef SYS_unlink
+    if (nr == SYS_unlink)
+        return handled(ctx, sud_vfs_unlinkat(AT_FDCWD,
+                         (const char *)ctx->args[0], 0));
+#endif
+#ifdef SYS_rmdir
+    if (nr == SYS_rmdir)
+        return handled(ctx, sud_vfs_unlinkat(AT_FDCWD,
+                         (const char *)ctx->args[0], 1));
+#endif
+#ifdef SYS_unlinkat
+    if (nr == SYS_unlinkat) {
+        int flags = (int)ctx->args[2];
+        if (flags & ~AT_REMOVEDIR) return handled(ctx, -EINVAL);
+        return handled(ctx, sud_vfs_unlinkat((int)ctx->args[0],
+                         (const char *)ctx->args[1],
+                         !!(flags & AT_REMOVEDIR)));
+    }
+#endif
+#ifdef SYS_rename
+    if (nr == SYS_rename)
+        return handled(ctx, sud_vfs_renameat2(AT_FDCWD,
+                         (const char *)ctx->args[0], AT_FDCWD,
+                         (const char *)ctx->args[1], 0));
+#endif
+#ifdef SYS_renameat
+    if (nr == SYS_renameat)
+        return handled(ctx, sud_vfs_renameat2((int)ctx->args[0],
+                         (const char *)ctx->args[1], (int)ctx->args[2],
+                         (const char *)ctx->args[3], 0));
+#endif
+#ifdef SYS_renameat2
+    if (nr == SYS_renameat2)
+        return handled(ctx, sud_vfs_renameat2((int)ctx->args[0],
+                         (const char *)ctx->args[1], (int)ctx->args[2],
+                         (const char *)ctx->args[3],
+                         (unsigned int)ctx->args[4]));
+#endif
+#ifdef SYS_symlink
+    if (nr == SYS_symlink)
+        return handled(ctx, sud_vfs_symlinkat((const char *)ctx->args[0],
+                         AT_FDCWD, (const char *)ctx->args[1]));
+#endif
+#ifdef SYS_symlinkat
+    if (nr == SYS_symlinkat)
+        return handled(ctx, sud_vfs_symlinkat((const char *)ctx->args[0],
+                         (int)ctx->args[1], (const char *)ctx->args[2]));
+#endif
+#ifdef SYS_link
+    if (nr == SYS_link)
+        return handled(ctx, sud_vfs_linkat(AT_FDCWD,
+                         (const char *)ctx->args[0], AT_FDCWD,
+                         (const char *)ctx->args[1], 0));
+#endif
+#ifdef SYS_linkat
+    if (nr == SYS_linkat) {
+        int flags = (int)ctx->args[4];
+        if (flags & ~AT_SYMLINK_FOLLOW) return handled(ctx, -EINVAL);
+        return handled(ctx, sud_vfs_linkat((int)ctx->args[0],
+                         (const char *)ctx->args[1], (int)ctx->args[2],
+                         (const char *)ctx->args[3],
+                         !!(flags & AT_SYMLINK_FOLLOW)));
+    }
+#endif
 #ifdef SYS_copy_file_range
     if (nr == SYS_copy_file_range
         && (sud_vfs_owns_fd((int)ctx->args[0])

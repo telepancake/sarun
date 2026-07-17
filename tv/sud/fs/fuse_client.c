@@ -203,6 +203,106 @@ int sud_fuse_create(uint64_t parent, const char *name, uint32_t flags,
     return result;
 }
 
+static int entry_name_call(uint32_t opcode, uint64_t parent,
+                           const void *prefix, size_t prefix_len,
+                           const char *name, struct fuse_entry_out *entry)
+{
+    size_t name_len = strlen(name) + 1;
+    if (name_len <= 1 || name_len > 256) return -ENAMETOOLONG;
+    struct fuse_call call;
+    int result = call_begin(&call, opcode, parent, prefix_len + name_len);
+    if (result != 0) return result;
+    if (prefix_len) memcpy(call_input_payload(&call), prefix, prefix_len);
+    memcpy((unsigned char *)call_input_payload(&call) + prefix_len,
+           name, name_len);
+    return copy_fixed_reply(&call, entry, sizeof(*entry));
+}
+
+int sud_fuse_mkdir(uint64_t parent, const char *name, uint32_t mode,
+                   uint32_t umask, struct fuse_entry_out *entry)
+{
+    struct fuse_mkdir_in input = { .mode = mode, .umask = umask };
+    return entry_name_call(FUSE_MKDIR, parent, &input, sizeof(input),
+                           name, entry);
+}
+
+int sud_fuse_mknod(uint64_t parent, const char *name, uint32_t mode,
+                   uint32_t rdev, uint32_t umask,
+                   struct fuse_entry_out *entry)
+{
+    struct fuse_mknod_in input;
+    memset(&input, 0, sizeof(input));
+    input.mode = mode;
+    input.rdev = rdev;
+    input.umask = umask;
+    return entry_name_call(FUSE_MKNOD, parent, &input, sizeof(input),
+                           name, entry);
+}
+
+int sud_fuse_symlink(uint64_t parent, const char *name, const char *target,
+                     struct fuse_entry_out *entry)
+{
+    size_t name_len = strlen(name) + 1;
+    size_t target_len = strlen(target) + 1;
+    if (name_len <= 1 || name_len > 256) return -ENAMETOOLONG;
+    if (name_len + target_len > SUD_FS_SLOT_DATA - sizeof(struct fuse_in_header))
+        return -ENAMETOOLONG;
+    struct fuse_call call;
+    int result = call_begin(&call, FUSE_SYMLINK, parent,
+                            name_len + target_len);
+    if (result != 0) return result;
+    unsigned char *payload = call_input_payload(&call);
+    memcpy(payload, name, name_len);
+    memcpy(payload + name_len, target, target_len);
+    return copy_fixed_reply(&call, entry, sizeof(*entry));
+}
+
+int sud_fuse_unlink(uint64_t parent, const char *name, int directory)
+{
+    size_t name_len = strlen(name) + 1;
+    if (name_len <= 1 || name_len > 256) return -ENAMETOOLONG;
+    struct fuse_call call;
+    int result = call_begin(&call, directory ? FUSE_RMDIR : FUSE_UNLINK,
+                            parent, name_len);
+    if (result != 0) return result;
+    memcpy(call_input_payload(&call), name, name_len);
+    result = call_submit(&call);
+    call_end(&call);
+    return result;
+}
+
+int sud_fuse_rename(uint64_t old_parent, const char *old_name,
+                    uint64_t new_parent, const char *new_name,
+                    uint32_t flags)
+{
+    size_t old_len = strlen(old_name) + 1;
+    size_t new_len = strlen(new_name) + 1;
+    if (old_len <= 1 || old_len > 256 || new_len <= 1 || new_len > 256)
+        return -ENAMETOOLONG;
+    struct fuse_call call;
+    int result = call_begin(&call, FUSE_RENAME2, old_parent,
+                            sizeof(struct fuse_rename2_in) + old_len + new_len);
+    if (result != 0) return result;
+    struct fuse_rename2_in *input = call_input_payload(&call);
+    memset(input, 0, sizeof(*input));
+    input->newdir = new_parent;
+    input->flags = flags;
+    unsigned char *names = (unsigned char *)(input + 1);
+    memcpy(names, old_name, old_len);
+    memcpy(names + old_len, new_name, new_len);
+    result = call_submit(&call);
+    call_end(&call);
+    return result;
+}
+
+int sud_fuse_link(uint64_t inode, uint64_t new_parent, const char *new_name,
+                  struct fuse_entry_out *entry)
+{
+    struct fuse_link_in input = { .oldnodeid = inode };
+    return entry_name_call(FUSE_LINK, new_parent, &input, sizeof(input),
+                           new_name, entry);
+}
+
 size_t sud_fuse_max_read(void)
 {
     return SUD_FS_SLOT_DATA - sizeof(struct fuse_out_header);

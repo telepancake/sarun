@@ -24,6 +24,17 @@ int sud_vfs_fchdir(int fd);
 long sud_vfs_getcwd(char *buffer, size_t size);
 long sud_vfs_getdents64(int fd, void *buffer, size_t size);
 long sud_vfs_readlinkat(int dirfd, const char *path, char *buffer, size_t size);
+int sud_vfs_mkdirat(int dirfd, const char *path, unsigned int mode,
+                    unsigned int umask);
+int sud_vfs_mknodat(int dirfd, const char *path, unsigned int mode,
+                    unsigned int device, unsigned int umask);
+int sud_vfs_unlinkat(int dirfd, const char *path, int directory);
+int sud_vfs_renameat2(int old_dirfd, const char *old_path,
+                      int new_dirfd, const char *new_path,
+                      unsigned int flags);
+int sud_vfs_symlinkat(const char *target, int dirfd, const char *path);
+int sud_vfs_linkat(int old_dirfd, const char *old_path,
+                   int new_dirfd, const char *new_path, int follow);
 void sud_vfs_fork_child(void);
 void sud_vfs_process_exit(void);
 

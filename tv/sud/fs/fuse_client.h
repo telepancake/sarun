@@ -20,6 +20,19 @@ int sud_fuse_create(uint64_t parent, const char *name, uint32_t flags,
                     uint32_t mode, uint32_t umask,
                     struct fuse_entry_out *entry,
                     struct fuse_open_out *opened);
+int sud_fuse_mkdir(uint64_t parent, const char *name, uint32_t mode,
+                   uint32_t umask, struct fuse_entry_out *entry);
+int sud_fuse_mknod(uint64_t parent, const char *name, uint32_t mode,
+                   uint32_t rdev, uint32_t umask,
+                   struct fuse_entry_out *entry);
+int sud_fuse_symlink(uint64_t parent, const char *name, const char *target,
+                     struct fuse_entry_out *entry);
+int sud_fuse_unlink(uint64_t parent, const char *name, int directory);
+int sud_fuse_rename(uint64_t old_parent, const char *old_name,
+                    uint64_t new_parent, const char *new_name,
+                    uint32_t flags);
+int sud_fuse_link(uint64_t inode, uint64_t new_parent, const char *new_name,
+                  struct fuse_entry_out *entry);
 long sud_fuse_read(uint64_t inode, uint64_t handle, uint64_t offset,
                    uint32_t flags, void *buffer, size_t size);
 long sud_fuse_write(uint64_t inode, uint64_t handle, uint64_t offset,
