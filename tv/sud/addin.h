@@ -57,5 +57,6 @@ extern const struct sud_addin sud_path_remap_addin;
 extern const struct sud_addin sud_cmd_rewrite_addin;
 extern const struct sud_addin sud_fake_exec_addin;
 extern const struct sud_addin sud_inramfs_addin;
+extern const struct sud_addin sud_fs_addin;
 
 #endif /* SUD_ADDIN_H */

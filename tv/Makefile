@@ -124,6 +124,13 @@ ifneq ($(filter sud/trace,$(SUD_ADDINS)),)
 SUD_CFLAGS  += -DSUD_ADDIN_TRACE
 SUD_SRCS    += sud/trace/event.c sud/trace/addin.c
 endif
+ifneq ($(filter sud/fs,$(SUD_ADDINS)),)
+ifneq ($(filter sud/path_remap sud/inramfs,$(SUD_ADDINS)),)
+$(error sud/fs replaces sud/path_remap and sud/inramfs; they cannot be built together)
+endif
+SUD_CFLAGS  += -DSUD_ADDIN_FS
+SUD_SRCS    += sud/fs/addin.c sud/fs/vfs.c sud/fs/fuse_client.c sud/fs/client.c
+endif
 ifneq ($(filter sud/path_remap,$(SUD_ADDINS)),)
 SUD_CFLAGS  += -DSUD_ADDIN_PATH_REMAP
 SUD_SRCS    += sud/path_remap/addin.c sud/path_remap/overlay.c sud/path_remap/path.c sud/path_remap/fakeroot.c sud/path_remap/rules.c
@@ -304,8 +311,9 @@ build/fs_fuse_client_test32: $(FS_FUSE_CLIENT_TEST_SRCS) sud/fs/fuse_client.h su
 	@mkdir -p build
 	$(SUD_CC32) $(SUD_CFLAGS) $(SUD_LDFLAGS) -o $@ $(FS_FUSE_CLIENT_TEST_SRCS)
 
-FS_VFS_TEST_SRCS := sud/fs/tests/test_vfs.c sud/fs/vfs.c \
+FS_VFS_TEST_SRCS := sud/fs/tests/test_vfs.c sud/fs/addin.c sud/fs/vfs.c \
                     sud/fs/fuse_client.c sud/fs/client.c \
+                    sud/runtime_config.c \
                     libc-fs/libc.c libc-fs/deps/printf/printf.c \
                     libc-fs/divdi3.c
 

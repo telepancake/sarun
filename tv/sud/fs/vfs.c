@@ -34,6 +34,8 @@ struct fd_entry {
 static struct fd_entry g_fds[SUD_FD_TABLE_SIZE];
 static uint32_t g_fd_lock;
 static int g_fd_initialized;
+static uint32_t g_cwd_lock;
+static char g_cwd[PATH_MAX];
 
 static long truncate_fd(int fd, uint64_t size)
 {
@@ -188,8 +190,14 @@ static int absolute_at(int dirfd, const char *path, char *output, size_t size)
     }
     char base[PATH_MAX];
     if (dirfd == AT_FDCWD) {
-        long result = raw_syscall6(SYS_getcwd, (long)base, sizeof(base), 0, 0, 0, 0);
-        if (result < 0) return (int)result;
+        local_lock(&g_cwd_lock);
+        size_t length = strlen(g_cwd);
+        if (!length || length >= sizeof(base)) {
+            local_unlock(&g_cwd_lock);
+            return -ENOENT;
+        }
+        memcpy(base, g_cwd, length + 1);
+        local_unlock(&g_cwd_lock);
     } else {
         struct sud_remote_ofd *description = description_for(dirfd);
         if (description && (description->mode & S_IFMT) == S_IFDIR) {
@@ -345,11 +353,22 @@ static int create_placeholder(uint64_t inode, uint64_t handle,
     return fd;
 }
 
-int sud_vfs_init(void)
+int sud_vfs_init(const char *initial_cwd)
 {
     int result = sud_fs_client_init();
     if (result != 0) return result;
     fd_table_init();
+    if (!g_cwd[0]) {
+        if (initial_cwd && initial_cwd[0] == '/') {
+            size_t length = strlen(initial_cwd);
+            if (length >= sizeof(g_cwd)) return -ENAMETOOLONG;
+            memcpy(g_cwd, initial_cwd, length + 1);
+        } else {
+            long length = raw_syscall6(SYS_getcwd, (long)g_cwd,
+                                       sizeof(g_cwd), 0, 0, 0, 0);
+            if (length < 0) return (int)length;
+        }
+    }
     return sud_fuse_init();
 }
 
@@ -516,6 +535,151 @@ long sud_vfs_lseek(int fd, int64_t offset, int whence)
     return (long)next;
 }
 
+int sud_vfs_ftruncate(int fd, uint64_t size)
+{
+    struct sud_remote_ofd *description = description_for(fd);
+    if (!description) return -EBADF;
+    if ((description->flags & O_ACCMODE) == O_RDONLY) return -EINVAL;
+    struct fuse_setattr_in request;
+    struct fuse_attr_out attributes;
+    memset(&request, 0, sizeof(request));
+    request.valid = FATTR_SIZE | FATTR_FH;
+    request.fh = description->handle;
+    request.size = size;
+    return sud_fuse_setattr(description->inode, &request, &attributes);
+}
+
+#if defined(__x86_64__)
+struct sud_kernel_stat {
+    unsigned long st_dev, st_ino, st_nlink;
+    unsigned int st_mode, st_uid, st_gid;
+    int pad;
+    unsigned long st_rdev;
+    long st_size, st_blksize, st_blocks;
+    long st_atime, st_atime_nsec;
+    long st_mtime, st_mtime_nsec;
+    long st_ctime, st_ctime_nsec;
+    long unused[3];
+};
+#else
+struct sud_kernel_stat {
+    unsigned long long st_dev;
+    unsigned char pad0[4];
+    unsigned long old_ino;
+    unsigned int st_mode, st_nlink;
+    unsigned long st_uid, st_gid;
+    unsigned long long st_rdev;
+    unsigned char pad3[4];
+    long long st_size;
+    unsigned long st_blksize;
+    unsigned long long st_blocks;
+    unsigned long st_atime, st_atime_nsec;
+    unsigned long st_mtime, st_mtime_nsec;
+    unsigned long st_ctime, st_ctime_nsec;
+    unsigned long long st_ino;
+};
+#endif
+
+static void fill_stat(void *buffer, const struct fuse_attr *attr)
+{
+    struct sud_kernel_stat *st = buffer;
+    memset(st, 0, sizeof(*st));
+    st->st_dev = 0;
+    st->st_mode = attr->mode;
+    st->st_nlink = attr->nlink;
+    st->st_uid = attr->uid;
+    st->st_gid = attr->gid;
+    st->st_rdev = attr->rdev;
+    st->st_size = attr->size;
+    st->st_blksize = attr->blksize;
+    st->st_blocks = attr->blocks;
+    st->st_atime = attr->atime;
+    st->st_atime_nsec = attr->atimensec;
+    st->st_mtime = attr->mtime;
+    st->st_mtime_nsec = attr->mtimensec;
+    st->st_ctime = attr->ctime;
+    st->st_ctime_nsec = attr->ctimensec;
+#if defined(__x86_64__)
+    st->st_ino = attr->ino;
+#else
+    st->old_ino = (unsigned long)attr->ino;
+    st->st_ino = attr->ino;
+#endif
+}
+
+int sud_vfs_fstat(int fd, void *stat_buffer)
+{
+    struct sud_remote_ofd *description = description_for(fd);
+    if (!description || !stat_buffer) return -EBADF;
+    struct fuse_attr_out attributes;
+    int result = sud_fuse_getattr(description->inode, description->handle,
+                                  1, &attributes);
+    if (result == 0) fill_stat(stat_buffer, &attributes.attr);
+    return result;
+}
+
+int sud_vfs_getfl(int fd)
+{
+    struct sud_remote_ofd *description = description_for(fd);
+    if (!description) return -EBADF;
+    return (int)(description->flags
+                 & (O_ACCMODE | O_APPEND | O_NONBLOCK));
+}
+
+int sud_vfs_setfl(int fd, int flags)
+{
+    struct sud_remote_ofd *description = description_for(fd);
+    if (!description) return -EBADF;
+    ofd_lock(description);
+    description->flags = (description->flags & ~(O_APPEND | O_NONBLOCK))
+                       | (flags & (O_APPEND | O_NONBLOCK));
+    ofd_unlock(description);
+    return 0;
+}
+
+int sud_vfs_chdir(const char *path)
+{
+    char absolute[PATH_MAX];
+    int result = absolute_at(AT_FDCWD, path, absolute, sizeof(absolute));
+    if (result != 0) return result;
+    struct resolved_node node;
+    result = resolve_absolute(absolute, &node);
+    if (result != 0) return result;
+    if ((node.attr.mode & S_IFMT) != S_IFDIR) result = -ENOTDIR;
+    resolved_forget(&node);
+    if (result != 0) return result;
+    local_lock(&g_cwd_lock);
+    size_t length = strlen(absolute);
+    memcpy(g_cwd, absolute, length + 1);
+    local_unlock(&g_cwd_lock);
+    return 0;
+}
+
+int sud_vfs_fchdir(int fd)
+{
+    struct sud_remote_ofd *description = description_for(fd);
+    if (!description) return -EBADF;
+    if ((description->mode & S_IFMT) != S_IFDIR) return -ENOTDIR;
+    local_lock(&g_cwd_lock);
+    memcpy(g_cwd, description->path, description->path_len + 1);
+    local_unlock(&g_cwd_lock);
+    return 0;
+}
+
+long sud_vfs_getcwd(char *buffer, size_t size)
+{
+    if (!buffer) return -EFAULT;
+    local_lock(&g_cwd_lock);
+    size_t length = strlen(g_cwd) + 1;
+    if (length > size) {
+        local_unlock(&g_cwd_lock);
+        return -ERANGE;
+    }
+    memcpy(buffer, g_cwd, length);
+    local_unlock(&g_cwd_lock);
+    return (long)length;
+}
+
 int sud_vfs_close(int fd)
 {
     fd_table_init();
@@ -579,7 +743,9 @@ int sud_vfs_dup(int oldfd, int newfd)
 
 void sud_vfs_fork_child(void)
 {
+    if (raw_getpid() != raw_gettid()) return;
     g_fd_lock = 0;
+    g_cwd_lock = 0;
     if (!g_fd_initialized) return;
     for (unsigned int i = 0; i < SUD_FD_TABLE_SIZE; i++)
         if (g_fds[i].fd >= 0)

@@ -68,6 +68,9 @@ static const struct sud_addin *const g_addins[] = {
 #ifdef SUD_ADDIN_TRACE
     &sud_trace_addin,
 #endif
+#ifdef SUD_ADDIN_FS
+    &sud_fs_addin,
+#endif
 #ifdef SUD_ADDIN_PATH_REMAP
     &sud_path_remap_addin,
 #endif

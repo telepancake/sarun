@@ -1,5 +1,6 @@
 #include "libc-fs/libc.h"
 #include "sud/raw.h"
+#include "sud/addin.h"
 #include "sud/fs/client.h"
 #include "sud/fs/fuse_client.h"
 #include "sud/fs/vfs.h"
@@ -52,24 +53,43 @@ static void no_reply(struct sud_fs_slot *slot)
     finish_reply(slot);
 }
 
+static long fs_call(long nr, long a0, long a1, long a2,
+                    long a3, long a4, long a5)
+{
+    char scratch[PATH_MAX * 2];
+    struct sud_syscall_ctx context = {
+        nr, { a0, a1, a2, a3, a4, a5 }, 0, raw_gettid(),
+        scratch, sizeof(scratch), { 0 }
+    };
+    if (!sud_fs_addin.pre_syscall(&context)) return -ENOSYS;
+    return context.ret;
+}
+
 static int child_calls(struct sud_fs_ring *ring)
 {
-    if (sud_fs_client_bind(ring) != 0 || sud_vfs_init() != 0) return 10;
-    int fd = sud_vfs_openat(AT_FDCWD, "/hello", O_RDWR, 0, 0);
+    if (sud_fs_client_bind(ring) != 0 || sud_vfs_init("/") != 0) return 10;
+    int fd = (int)fs_call(SYS_openat, AT_FDCWD, (long)"/hello",
+                          O_RDWR, 0, 0, 0);
     if (fd < 0 || !sud_vfs_owns_fd(fd)) return 11;
     char data[8] = {0};
-    if (sud_vfs_read(fd, data, 5) != 5 || memcmp(data, "hello", 5) != 0)
+    if (fs_call(SYS_read, fd, (long)data, 5, 0, 0, 0) != 5
+        || memcmp(data, "hello", 5) != 0)
         return 12;
-    if (sud_vfs_lseek(fd, 1, SEEK_SET) != 1
-        || sud_vfs_write(fd, "A", 1) != 1) return 13;
-    int duplicate = (int)raw_syscall6(SYS_dup, fd, 0, 0, 0, 0, 0);
-    if (duplicate < 0 || sud_vfs_dup(fd, duplicate) != 0) return 14;
-    if (sud_vfs_lseek(duplicate, 0, SEEK_SET) != 0) return 15;
+    if (fs_call(SYS_lseek, fd, 1, SEEK_SET, 0, 0, 0) != 1
+        || fs_call(SYS_write, fd, (long)"A", 1, 0, 0, 0) != 1) return 13;
+    int duplicate = (int)fs_call(SYS_dup, fd, 0, 0, 0, 0, 0);
+    if (duplicate < 0) return 14;
+    if (fs_call(SYS_lseek, duplicate, 0, SEEK_SET, 0, 0, 0) != 0) return 15;
     memset(data, 0, sizeof(data));
-    if (sud_vfs_read(fd, data, 2) != 2 || memcmp(data, "hA", 2) != 0)
+    if (fs_call(SYS_read, fd, (long)data, 2, 0, 0, 0) != 2
+        || memcmp(data, "hA", 2) != 0)
         return 16;
-    if (sud_vfs_close(fd) != 0 || raw_close(fd) != 0) return 17;
-    if (sud_vfs_close(duplicate) != 0 || raw_close(duplicate) != 0) return 18;
+    stat_buf_t stat_buffer;
+    if (fs_call(SYS_fstat, fd, (long)&stat_buffer, 0, 0, 0, 0) != 0)
+        return 17;
+    if (fs_call(SYS_ftruncate, fd, 3, 0, 0, 0, 0) != 0) return 18;
+    if (fs_call(SYS_close, fd, 0, 0, 0, 0, 0) != 0) return 19;
+    if (fs_call(SYS_close, duplicate, 0, 0, 0, 0, 0) != 0) return 20;
     return 0;
 }
 
@@ -120,20 +140,39 @@ static int serve_calls(struct sud_fs_ring *ring)
     reply(slot, "hA", 2);
 
     slot = take_request(ring); header = (struct fuse_in_header *)slot->request;
-    if (header->opcode != FUSE_FLUSH || header->nodeid != 2) return 26;
+    if (header->opcode != FUSE_GETATTR || header->nodeid != 2
+        || !(((struct fuse_getattr_in *)(header + 1))->getattr_flags
+             & FUSE_GETATTR_FH)) return 26;
+    struct fuse_attr_out attributes = {0};
+    attributes.attr.ino = 2;
+    attributes.attr.mode = S_IFREG | 0644;
+    attributes.attr.size = 5;
+    attributes.attr.blksize = 4096;
+    reply(slot, &attributes, sizeof(attributes));
+
+    slot = take_request(ring); header = (struct fuse_in_header *)slot->request;
+    struct fuse_setattr_in *setattr = (struct fuse_setattr_in *)(header + 1);
+    if (header->opcode != FUSE_SETATTR || header->nodeid != 2
+        || !(setattr->valid & FATTR_SIZE) || !(setattr->valid & FATTR_FH)
+        || setattr->fh != 9 || setattr->size != 3) return 27;
+    attributes.attr.size = 3;
+    reply(slot, &attributes, sizeof(attributes));
+
+    slot = take_request(ring); header = (struct fuse_in_header *)slot->request;
+    if (header->opcode != FUSE_FLUSH || header->nodeid != 2) return 28;
     reply(slot, 0, 0);
 
     slot = take_request(ring); header = (struct fuse_in_header *)slot->request;
-    if (header->opcode != FUSE_FLUSH || header->nodeid != 2) return 27;
+    if (header->opcode != FUSE_FLUSH || header->nodeid != 2) return 29;
     reply(slot, 0, 0);
 
     slot = take_request(ring); header = (struct fuse_in_header *)slot->request;
-    if (header->opcode != FUSE_RELEASE || header->nodeid != 2) return 28;
+    if (header->opcode != FUSE_RELEASE || header->nodeid != 2) return 30;
     reply(slot, 0, 0);
 
     slot = take_request(ring); header = (struct fuse_in_header *)slot->request;
     if (header->opcode != FUSE_FORGET || header->nodeid != 2
-        || ((struct fuse_forget_in *)(header + 1))->nlookup != 1) return 29;
+        || ((struct fuse_forget_in *)(header + 1))->nlookup != 1) return 31;
     no_reply(slot);
     return 0;
 }

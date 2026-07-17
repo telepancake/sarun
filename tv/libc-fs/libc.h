@@ -77,6 +77,7 @@
 #define SYS_ptrace         __NR_ptrace
 #define SYS_sched_yield    __NR_sched_yield
 #define SYS_sigaltstack    __NR_sigaltstack
+#define SYS_umask          __NR_umask
 
 #ifdef __NR_exit_group
 #define SYS_exit_group     __NR_exit_group
