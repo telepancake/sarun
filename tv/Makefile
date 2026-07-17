@@ -49,6 +49,8 @@ clean:
 	rm -f build/fake_exec_test32 build/fake_exec_test64
 	rm -f build/cmd_rewrite_test64
 	rm -f build/fs_ring_abi32.o build/fs_ring_abi64.o
+	rm -f build/fs_ring_client32.o build/fs_ring_client64.o
+	rm -f build/fs_client_test32 build/fs_client_test64
 
 install:
 	$(MAKE) -C $(MOD_DIR) install
@@ -227,7 +229,11 @@ sud32: $(SUD_SRCS) $(SUD_HDRS) sudtrace.lds
 	$(SUD_CC32) $(SUD_CFLAGS) $(SUD_LDFLAGS) $(SUD_BASE32) -T sudtrace.lds -o sud32 $(SUD_SRCS)
 
 .PHONY: fs-ring-test
-fs-ring-test: build/fs_ring_abi64.o build/fs_ring_abi32.o
+fs-ring-test: build/fs_ring_abi64.o build/fs_ring_abi32.o \
+              build/fs_ring_client64.o build/fs_ring_client32.o \
+              build/fs_client_test64 build/fs_client_test32
+	./build/fs_client_test64
+	./build/fs_client_test32
 
 build/fs_ring_abi64.o: sud/fs/tests/ring_abi.c sud/fs/ring.h
 	@mkdir -p build
@@ -236,6 +242,26 @@ build/fs_ring_abi64.o: sud/fs/tests/ring_abi.c sud/fs/ring.h
 build/fs_ring_abi32.o: sud/fs/tests/ring_abi.c sud/fs/ring.h
 	@mkdir -p build
 	$(SUD_CC32) $(SUD_CFLAGS) -c -o $@ $<
+
+build/fs_ring_client64.o: sud/fs/client.c sud/fs/client.h sud/fs/ring.h
+	@mkdir -p build
+	$(SUD_CC64) $(SUD_CFLAGS) -c -o $@ $<
+
+build/fs_ring_client32.o: sud/fs/client.c sud/fs/client.h sud/fs/ring.h
+	@mkdir -p build
+	$(SUD_CC32) $(SUD_CFLAGS) -c -o $@ $<
+
+FS_CLIENT_TEST_SRCS := sud/fs/tests/test_client.c sud/fs/client.c \
+                       libc-fs/libc.c libc-fs/deps/printf/printf.c \
+                       libc-fs/divdi3.c
+
+build/fs_client_test64: $(FS_CLIENT_TEST_SRCS) sud/fs/client.h sud/fs/ring.h
+	@mkdir -p build
+	$(SUD_CC64) $(SUD_CFLAGS) $(SUD_LDFLAGS) -o $@ $(FS_CLIENT_TEST_SRCS)
+
+build/fs_client_test32: $(FS_CLIENT_TEST_SRCS) sud/fs/client.h sud/fs/ring.h
+	@mkdir -p build
+	$(SUD_CC32) $(SUD_CFLAGS) $(SUD_LDFLAGS) -o $@ $(FS_CLIENT_TEST_SRCS)
 
 .PHONY: libc-fs-test
 libc-fs-test:
