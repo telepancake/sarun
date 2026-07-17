@@ -817,6 +817,16 @@ fn cli_run(args: &[String]) -> i32 {
                    <ref> [-- CMD...]");
         return 2;
     };
+    // Rootless Tap needs its user+network namespace while the process is
+    // single-threaded.  Resolve that process boundary before image lookup or
+    // loading, so the one required self-exec never repeats OCI side effects or
+    // emits a phantom container announcement.
+    if net_mode == crate::net::NetMode::Tap {
+        if let Err(error) = crate::runner::prepare_tap_or_reexec() {
+            eprintln!("sarun oci run: tap setup failed: {error}");
+            return 1;
+        }
+    }
     if let Err(e) = paths::ensure_dirs() {
         eprintln!("sarun oci run: {e}");
         return 1;

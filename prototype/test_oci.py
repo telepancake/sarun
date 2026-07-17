@@ -390,6 +390,9 @@ def main():
                   "cat /etc/resolv.conf")
         check(r.returncode == 0,
               f"oci run RSLV (tap) exits 0 (stderr: {r.stderr.strip()[:300]})")
+        check(r.stderr.count("sarun oci run: container") == 1,
+              "rootless Tap setup does not repeat OCI resolution or announce "
+              "a phantom container")
         check("9.9.9.9" not in r.stdout and "nameserver" in r.stdout,
               "image-baked resolv.conf is shadowed by the per-box DNS "
               f"(got {r.stdout.strip()[:120]!r})")

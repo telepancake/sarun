@@ -4280,7 +4280,7 @@ fn register(
 ) -> Result<crate::generated_wire::RegisterReply, String> {
     use crate::generated_wire::{NetMode, RegistrationName, RunBackend, TransportRequest};
     let TransportRequest::Register {
-        command: _, provenance, name: registration_name, backend, architecture, net_mode,
+        command, provenance, name: registration_name, backend, architecture, net_mode,
         capture, direct, capture_environment, brush, api, web_capture,
         web_filter, replay_from, no_parent, readonly_parent,
     } = request else {
@@ -4402,6 +4402,20 @@ fn register(
             name = Some(want.to_string());
         }
     }
+
+    // Registration is deliberately allowed to carry no caller override: an
+    // OCI container's command is a relation of its parent image and is only
+    // known after that parent has been resolved.  Resolve it here, before any
+    // box state is created, and put the effective non-empty argv into the root
+    // provenance row.  Do not weaken the actual-process invariant.
+    let oci = oci_runtime_from_chain(
+        &boxes,
+        if *no_parent { None } else { parent },
+    )?;
+    let effective_command = registration_command(command, oci.as_ref())?;
+    let mut provenance = provenance.clone();
+    provenance.argv = crate::wire::BoundedVec::new(effective_command)
+        .map_err(|error| format!("resolved process argv exceeds relation bound: {error:?}"))?;
 
     // ── CREATE-VS-RERUN ────────────────────────────────────────────────────
     // A named launch RERUNS the same box_id if a sibling with that NAME already
@@ -4536,7 +4550,7 @@ fn register(
     // no host filesystem underneath. Surfaced to the runner so it can pick the
     // right default cwd ("/" when there's no host directory to inherit).
     let no_host = b.no_host_fallback() || chain_has_no_host(&boxes, parent);
-    match b.root_process(provenance, i64::from(host_pid)) {
+    match b.root_process(&provenance, i64::from(host_pid)) {
         Ok(()) => (),
         Err(error) => {
             if let Some(fd) = peer_pidfd { unsafe { libc::close(fd); } }
@@ -4723,7 +4737,6 @@ fn register(
     // image's User — without which `sarun img -- /bin/sh` would inherit
     // the HOST's PATH (pointing at host bins that don't exist in a closed
     // box) and the HOST's cwd (likely a path outside the image).
-    let oci = oci_runtime_from_chain(&boxes, parent)?;
     let bounded_path = |value: &std::path::Path, field: &str| {
         crate::wire::BoundedBytes::new(value.as_os_str().as_bytes().to_vec())
             .map_err(|error| format!("{field} exceeds relation bound: {error:?}"))
@@ -4788,6 +4801,30 @@ fn oci_runtime_from_chain(
         cur = b.parent;
     }
     Ok(None)
+}
+
+fn registration_command(
+    override_command: &crate::wire::BoundedVec<
+        crate::generated_wire::OsString,
+        0,
+        { crate::generated_wire::LIMIT_COMMAND_ITEMS },
+    >,
+    oci: Option<&crate::generated_wire::OciRuntime>,
+) -> Result<Vec<crate::generated_wire::OsString>, String> {
+    if !override_command.as_slice().is_empty() {
+        return Ok(override_command.as_slice().to_vec());
+    }
+    let mut command = oci.and_then(|runtime| runtime.entrypoint.as_ref())
+        .map(|values| values.as_slice().to_vec())
+        .unwrap_or_default();
+    if let Some(values) = oci.and_then(|runtime| runtime.command.as_ref()) {
+        command.extend_from_slice(values.as_slice());
+    }
+    if command.is_empty() {
+        Err("no command given and the selected image has neither Entrypoint nor Cmd".into())
+    } else {
+        Ok(command)
+    }
 }
 
 /// True if any ancestor in the parent chain (starting at `parent`) is marked

@@ -92,8 +92,12 @@ run_test(actions_are_not_duplicated_as_transport_requests) :-
                         wire(131, quit, control, [], unit))).
 
 run_test(register_schema_captures_conditional_fd_roles) :-
+    once(wire_type(process_provenance, record(ProvenanceFields))),
+    expect(member_eq(field(argv, list(os_string, command_items)),
+                     ProvenanceFields)),
     once(wire_request(register, 257, mode(box), Fields, Fds,
                       pidfd_identity)),
+    expect(member_eq(field(command, list(os_string, command_items)), Fields)),
     expect(member_eq(field(name, registration_name), Fields)),
     expect(member_eq(field(backend, run_backend), Fields)),
     expect(member_eq(field(architecture, option(qemu_architecture)), Fields)),
@@ -116,7 +120,7 @@ run_test(unix_values_remain_bytes) :-
                              environment_entries)))),
     once(wire_type(process_provenance, record(Provenance))),
     expect(member_eq(field(executable, path), Provenance)),
-    expect(member_eq(field(argv, list(os_string, 1, command_items)), Provenance)).
+    expect(member_eq(field(argv, list(os_string, command_items)), Provenance)).
 
 run_test(events_are_compact_late_decode_invalidations) :-
     once(wire_event(brush_provenance_added, 6,

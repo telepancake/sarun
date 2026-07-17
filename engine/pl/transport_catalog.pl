@@ -132,7 +132,10 @@ wire_type(process_provenance, record([
     field(ppid, s32),
     field(executable, path),
     field(cwd, path),
-    field(argv, list(os_string, 1, command_items)),
+    % Registration can precede resolution of an OCI image's Entrypoint/Cmd.
+    % The engine resolves this pending empty vector before recording a process;
+    % every actual process request and stored root process remains non-empty.
+    field(argv, list(os_string, command_items)),
     field(environment, option(environment))
 ])).
 
@@ -895,7 +898,10 @@ wire_variant(build_edge_transition, done, 2, [
 % wire_request(Name, Code, Success, PositionalFields, FdSchema, Authority).
 wire_request(subscribe,             256, mode(subscribe), [], [], public).
 wire_request(register,              257, mode(box), [
-    field(command, list(os_string, 1, command_items)),
+    % An empty list is the singular representation of "no caller override".
+    % OCI registration must complete first so the engine can return the image
+    % Entrypoint/Cmd relation; appliance execution remains non-empty below.
+    field(command, list(os_string, command_items)),
     field(provenance, process_provenance),
     field(name, registration_name),
     field(backend, run_backend),

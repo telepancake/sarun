@@ -1251,6 +1251,9 @@ impl BoxState {
         let start = if tgid > 0 { Self::start_time_of(tgid) } else { 0 };
         let argv = provenance.argv.as_slice().iter().map(|value|
             text(value.as_slice(), "argument")).collect::<Result<Vec<_>, _>>()?;
+        if argv.is_empty() {
+            return Err("resolved root process has an empty argv".into());
+        }
         // -e env capture: the root's env. Prefer the env the runner sent in prov
         // (its full HOST env — correct even for a nested runner whose tgid is a
         // parent-namespace pid the engine can't /proc-read); else read the host

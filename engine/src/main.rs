@@ -530,6 +530,14 @@ fn main() {
     if unsafe { libc::getpid() } == 1 {
         std::process::exit(appliance::init_main());
     }
+    // A rootless Tap network namespace must be created while this is still a
+    // single-threaded process.  Ordinary invocations do nothing here; a runner
+    // that discovered it lacked CAP_NET_ADMIN self-execs once with the private
+    // marker consumed by this call.
+    if let Err(error) = net::tap::prepare_early_tap() {
+        eprintln!("sarun-engine: early Tap setup failed: {error}");
+        std::process::exit(1);
+    }
     prolog::ensure_linked();
 
     // Symlinked-as-`oaita` dispatch — same trick brush_sh / ninja / make use

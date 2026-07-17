@@ -312,6 +312,42 @@ fn tty_restore(tty_fd: Option<i32>, old_fg: Option<i32>,
     }
 }
 
+fn reexec_for_early_tap() -> ! {
+    let executable = match std::env::current_exe() {
+        Ok(executable) => executable,
+        Err(error) => {
+            eprintln!("sarun-engine: cannot locate itself for rootless Tap setup: {error}");
+            std::process::exit(1);
+        }
+    };
+    let mut command = Command::new(executable);
+    command.args(std::env::args_os().skip(1));
+    crate::net::tap::mark_early_tap_reexec(&mut command);
+    let error = command.exec();
+    eprintln!("sarun-engine: cannot restart for rootless Tap setup: {error}");
+    std::process::exit(1);
+}
+
+pub fn prepare_tap_or_reexec() -> Result<(), anyhow::Error> {
+    if crate::net::tap::tap_is_prepared() {
+        return Ok(());
+    }
+    match crate::net::tap::create_netns_tap() {
+        Ok(tap) => {
+            crate::net::tap::keep_prepared_tap(tap);
+            Ok(())
+        }
+        Err(error) if error.downcast_ref::<crate::net::tap::EarlyUserNamespaceRequired>()
+            .is_some() => reexec_for_early_tap(),
+        Err(error) => Err(error),
+    }
+}
+
+fn create_runner_tap() -> Result<std::os::fd::OwnedFd, anyhow::Error> {
+    prepare_tap_or_reexec()?;
+    crate::net::tap::create_netns_tap()
+}
+
 pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
            pty: bool, brush: bool, api: bool,
            no_parent: bool, readonly_parent: bool, chdir: Option<String>,
@@ -410,7 +446,7 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
     // never silently fall through to some other network.
     let tap_fd: Option<std::os::fd::OwnedFd> =
         if net_mode == crate::net::NetMode::Tap {
-            match crate::net::tap::create_netns_tap() {
+            match create_runner_tap() {
                 Ok(fd) => Some(fd),
                 Err(e) => {
                     eprintln!("sarun-engine: tap setup failed: {e}");
@@ -856,7 +892,9 @@ pub fn run_qemu(
             ppid: unsafe { libc::getppid() },
             executable,
             cwd,
-            argv: appliance_command.command.clone(),
+            argv: crate::wire::BoundedVec::new(
+                appliance_command.command.as_slice().to_vec(),
+            ).expect("a validated appliance command fits the looser provenance bound"),
             environment: env.then(|| appliance_command.environment.clone()),
         },
         (Err(error), _) | (_, Err(error)) => {
@@ -896,7 +934,9 @@ pub fn run_qemu(
         (None, None)
     };
     let request = RequestEnvelope::Transport(TransportRequest::Register {
-        command: appliance_command.command.clone(),
+        command: crate::wire::BoundedVec::new(
+            appliance_command.command.as_slice().to_vec(),
+        ).expect("a validated appliance command fits the looser register bound"),
         provenance,
         name,
         backend: RunBackend::Qemu,
@@ -1306,7 +1346,7 @@ fn sud_netns_setup(net_mode: crate::net::NetMode)
                    -> Result<Option<std::os::fd::OwnedFd>, String> {
     match net_mode {
         crate::net::NetMode::Tap =>
-            crate::net::tap::create_netns_tap().map(Some).map_err(|e|
+            create_runner_tap().map(Some).map_err(|e|
                 format!("tap setup failed: {e}\n\
                          hint: `ls -l /dev/net/tun` should be 0666; \
                          otherwise pass `--net host` or `--net off`")),

@@ -13,7 +13,7 @@
 // source-sha256 engine/pl/grammar_ir.pl 1a2a9a63076618402864e0ac630fca29b91210d54a03687f5be198d94a370d77
 // source-sha256 engine/pl/relation_api.pl e87d850a3cfd6a511e49b00bc7497e0c2790a45cf91aa4aa7b833b4b75364f6c
 // source-sha256 engine/pl/context_relation.pl 6819379ba751c4850e40f3a9d53cab888b9c2b1151283f1eaf479ae84f735473
-// source-sha256 engine/pl/transport_catalog.pl 9f5583d3d3797076a7cf7898fcb3f29653ca456aa66886d05e0f30f19f5c01a1
+// source-sha256 engine/pl/transport_catalog.pl 1ad6ee3eab2a0db393e4d194fafe2bfa5b6bd257b3348c9f499f77da9ade71cc
 // source-sha256 engine/pl/wire_codegen.pl 64652e644954f2c801aaef1c96772a52da5f07792d27db006399e800ca58a3c9
 // source-sha256 scripts/wire_codegen.py cebd448fb51f20128aa3ea1f9041cf9c18e7908645e82543efbc5b80af8145fd
 
@@ -196,7 +196,7 @@ impl<T: RelationWireValue> RelationWireValue for Option<T> {
 
 pub const WIRE_PROTOCOL_VERSION: u64 = 1;
 pub const WIRE_SCHEMA_SHA256: &str =
-    "6c18048ff8ab1e2ad7d6b76a20a885e35b8b9b6127438d3c780203f8b7e82cc4";
+    "a87439a884d69ca9c795cd8206e3ef18bd1ee1a371cf2ca4deb21d27ed71bea8";
 pub const LIMIT_FRAME_BYTES: usize = 16777216;
 pub const LIMIT_BLOB_BYTES: usize = 16777216;
 pub const LIMIT_TEXT_BYTES: usize = 1048576;
@@ -636,7 +636,7 @@ pub struct ProcessProvenance {
     pub ppid: i32,
     pub executable: Path,
     pub cwd: Path,
-    pub argv: BoundedVec<OsString, 1, LIMIT_COMMAND_ITEMS>,
+    pub argv: BoundedVec<OsString, 0, LIMIT_COMMAND_ITEMS>,
     pub environment: Option<Environment>,
 }
 
@@ -659,7 +659,7 @@ impl WireValue for ProcessProvenance {
             ppid: <i32 as WireValue>::decode_atom(&mut fields)?,
             executable: <Path as WireValue>::decode_atom(&mut fields)?,
             cwd: <Path as WireValue>::decode_atom(&mut fields)?,
-            argv: <BoundedVec<OsString, 1, LIMIT_COMMAND_ITEMS> as WireValue>::decode_atom(
+            argv: <BoundedVec<OsString, 0, LIMIT_COMMAND_ITEMS> as WireValue>::decode_atom(
                 &mut fields,
             )?,
             environment: <Option<Environment> as WireValue>::decode_atom(&mut fields)?,
@@ -680,7 +680,7 @@ impl RelationWireValue for ProcessProvenance {
             executable: <Path as RelationWireValue>::from_relation(fields.next().unwrap())?,
             cwd: <Path as RelationWireValue>::from_relation(fields.next().unwrap())?,
             argv:
-                <BoundedVec<OsString, 1, LIMIT_COMMAND_ITEMS> as RelationWireValue>::from_relation(
+                <BoundedVec<OsString, 0, LIMIT_COMMAND_ITEMS> as RelationWireValue>::from_relation(
                     fields.next().unwrap(),
                 )?,
             environment: <Option<Environment> as RelationWireValue>::from_relation(
@@ -11354,7 +11354,7 @@ pub const TRANSPORT_REQUEST_IDENTITIES: &[(&str, u64)] = &[
 pub enum TransportRequest {
     Subscribe,
     Register {
-        command: BoundedVec<OsString, 1, LIMIT_COMMAND_ITEMS>,
+        command: BoundedVec<OsString, 0, LIMIT_COMMAND_ITEMS>,
         provenance: ProcessProvenance,
         name: RegistrationName,
         backend: RunBackend,
@@ -11556,7 +11556,7 @@ impl WireValue for TransportRequest {
         let value = match get_u64(&mut fields)? {
             256 => Self::Subscribe,
             257 => Self::Register {
-                command: <BoundedVec<OsString, 1, LIMIT_COMMAND_ITEMS> as WireValue>::decode_atom(&mut fields)?,
+                command: <BoundedVec<OsString, 0, LIMIT_COMMAND_ITEMS> as WireValue>::decode_atom(&mut fields)?,
                 provenance: <ProcessProvenance as WireValue>::decode_atom(&mut fields)?,
                 name: <RegistrationName as WireValue>::decode_atom(&mut fields)?,
                 backend: <RunBackend as WireValue>::decode_atom(&mut fields)?,
@@ -11643,7 +11643,7 @@ impl RelationWireValue for TransportRequest {
                 require_relation_arity(fields, 16)?;
                 let mut fields = fields.iter();
                 Ok(Self::Register {
-                    command: <BoundedVec<OsString, 1, LIMIT_COMMAND_ITEMS> as RelationWireValue>::from_relation(fields.next().unwrap())?,
+                    command: <BoundedVec<OsString, 0, LIMIT_COMMAND_ITEMS> as RelationWireValue>::from_relation(fields.next().unwrap())?,
                     provenance: <ProcessProvenance as RelationWireValue>::from_relation(fields.next().unwrap())?,
                     name: <RegistrationName as RelationWireValue>::from_relation(fields.next().unwrap())?,
                     backend: <RunBackend as RelationWireValue>::from_relation(fields.next().unwrap())?,
@@ -12893,7 +12893,7 @@ mod generated_tests {
             ppid: 0i32,
             executable: BoundedBytes::new(Vec::new()).unwrap(),
             cwd: BoundedBytes::new(Vec::new()).unwrap(),
-            argv: BoundedVec::new(vec![BoundedBytes::new(Vec::new()).unwrap()]).unwrap(),
+            argv: BoundedVec::new(vec![]).unwrap(),
             environment: None,
         });
         roundtrip::<OciRuntime>(OciRuntime {
@@ -14238,13 +14238,13 @@ mod generated_tests {
         let values = vec![
             TransportRequest::Subscribe,
             TransportRequest::Register {
-                command: BoundedVec::new(vec![BoundedBytes::new(Vec::new()).unwrap()]).unwrap(),
+                command: BoundedVec::new(vec![]).unwrap(),
                 provenance: ProcessProvenance {
                     tgid: 0u32,
                     ppid: 0i32,
                     executable: BoundedBytes::new(Vec::new()).unwrap(),
                     cwd: BoundedBytes::new(Vec::new()).unwrap(),
-                    argv: BoundedVec::new(vec![BoundedBytes::new(Vec::new()).unwrap()]).unwrap(),
+                    argv: BoundedVec::new(vec![]).unwrap(),
                     environment: None,
                 },
                 name: RegistrationName::Automatic,

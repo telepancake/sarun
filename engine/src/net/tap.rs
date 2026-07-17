@@ -11,6 +11,7 @@
 // box's stack/flows/pcap by box id, never by address.
 
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Result, bail};
 
@@ -25,6 +26,57 @@ pub const BOX_SUBNET_ID: u16 = 1;
 /// as the gateway MAC); a stable locally-administered value just so the
 /// interface has one.
 pub const BOX_MAC: [u8; 6] = [0x02, 0x73, 0x72, 0x6e, 0x00, 0x02];
+
+const EARLY_TAP_ENV: &str = "SARUN_EARLY_TAP_NAMESPACE";
+static EARLY_TAP: OnceLock<Mutex<Option<OwnedFd>>> = OnceLock::new();
+
+/// `CLONE_NEWUSER` may only be entered while the caller is single-threaded.
+/// Top-level argv is parsed by the persistent Prolog worker before a runner is
+/// selected, so rootless Tap setup cannot be deferred until `runner::run`.
+#[derive(Debug)]
+pub struct EarlyUserNamespaceRequired;
+
+impl std::fmt::Display for EarlyUserNamespaceRequired {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("rootless Tap setup must precede parser worker startup")
+    }
+}
+
+impl std::error::Error for EarlyUserNamespaceRequired {}
+
+/// Mark the current invocation for one early self-exec.  The new image handles
+/// the marker in `prepare_early_tap` before Prolog (or any other worker) starts.
+pub fn mark_early_tap_reexec(command: &mut std::process::Command) {
+    command.env(EARLY_TAP_ENV, "1");
+}
+
+/// Enter and configure the rootless Tap namespace before worker startup.
+/// Returns false for ordinary invocations.  User+network namespaces are made
+/// atomically: the new network namespace is consequently owned by the new user
+/// namespace, and this thread has CAP_NET_ADMIN while configuring its TAP.
+pub fn prepare_early_tap() -> Result<bool> {
+    let Some(marker) = std::env::var_os(EARLY_TAP_ENV) else {
+        return Ok(false);
+    };
+    unsafe { std::env::remove_var(EARLY_TAP_ENV); }
+    if marker != "1" {
+        bail!("invalid internal early-Tap marker");
+    }
+    let task_count = std::fs::read_dir("/proc/self/task")?.count();
+    if task_count != 1 {
+        bail!("early Tap setup found {task_count} threads instead of one");
+    }
+    let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+    if unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNET) } != 0 {
+        bail!("unshare(CLONE_NEWUSER|CLONE_NEWNET) for rootless Tap: {}",
+              std::io::Error::last_os_error());
+    }
+    write_identity_maps(uid, gid)?;
+    let tap = configure_current_netns_tap()?;
+    EARLY_TAP.get_or_init(|| Mutex::new(None))
+        .lock().unwrap().replace(tap);
+    Ok(true)
+}
 
 /// The fixed per-box subnet (see `BOX_SUBNET_ID`).
 pub fn box_subnet() -> BoxSubnet { BoxSubnet::new(BOX_SUBNET_ID) }
@@ -125,7 +177,27 @@ pub fn gateway_mac() -> [u8; 6] { derive_gw_mac(BOX_SUBNET_ID) }
 /// self-acquires CAP_NET_ADMIN via an unprivileged user namespace when the
 /// process doesn't already have it (the rootless top-level case).
 pub fn create_netns_tap() -> Result<OwnedFd> {
+    if let Some(tap) = EARLY_TAP.get()
+        .and_then(|slot| slot.lock().unwrap().take())
+    {
+        return Ok(tap);
+    }
     unshare_netns()?;
+    configure_current_netns_tap()
+}
+
+pub fn tap_is_prepared() -> bool {
+    EARLY_TAP.get()
+        .is_some_and(|slot| slot.lock().unwrap().is_some())
+}
+
+pub fn keep_prepared_tap(tap: OwnedFd) {
+    let previous = EARLY_TAP.get_or_init(|| Mutex::new(None))
+        .lock().unwrap().replace(tap);
+    debug_assert!(previous.is_none(), "replaced an unconsumed prepared TAP");
+}
+
+fn configure_current_netns_tap() -> Result<OwnedFd> {
     let subnet = box_subnet();
     let tap_name = "tap0";
     // The IP on the TAP is the BOX's address (.0.2); the gateway (.0.1) lives on
@@ -235,22 +307,37 @@ pub fn unshare_netns() -> Result<()> {
     if bare.raw_os_error() != Some(libc::EPERM) {
         bail!("unshare(CLONE_NEWNET): {bare}");
     }
+    // A persistent parser worker now exists by the time ordinary runner code
+    // is reached.  Linux rejects CLONE_NEWUSER from a multithreaded process;
+    // request the deliberate early self-exec instead of misdiagnosing EINVAL
+    // as a host limitation.
+    if std::fs::read_dir("/proc/self/task")
+        .map(|tasks| tasks.count())
+        .unwrap_or(2) != 1
+    {
+        return Err(EarlyUserNamespaceRequired.into());
+    }
     // Rootless: acquire the capability via our own user namespace, then retry.
     let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
     if unsafe { libc::unshare(libc::CLONE_NEWUSER) } != 0 {
         bail!("unshare(CLONE_NEWUSER) (for rootless tap): {}",
               std::io::Error::last_os_error());
     }
+    write_identity_maps(uid, gid)?;
+    if unsafe { libc::unshare(libc::CLONE_NEWNET) } != 0 {
+        bail!("unshare(CLONE_NEWNET) after userns: {}",
+              std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn write_identity_maps(uid: libc::uid_t, gid: libc::gid_t) -> Result<()> {
     // setgroups must be denied before an unprivileged gid_map write.
     let _ = std::fs::write("/proc/self/setgroups", "deny");
     std::fs::write("/proc/self/uid_map", format!("{uid} {uid} 1"))
         .map_err(|e| anyhow::anyhow!("write uid_map (rootless tap): {e}"))?;
     std::fs::write("/proc/self/gid_map", format!("{gid} {gid} 1"))
         .map_err(|e| anyhow::anyhow!("write gid_map (rootless tap): {e}"))?;
-    if unsafe { libc::unshare(libc::CLONE_NEWNET) } != 0 {
-        bail!("unshare(CLONE_NEWNET) after userns: {}",
-              std::io::Error::last_os_error());
-    }
     Ok(())
 }
 
