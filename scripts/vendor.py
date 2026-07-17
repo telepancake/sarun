@@ -29,6 +29,22 @@ CACHE = os.path.join(ENGINE, ".vendor-cache")
 ASSEMBLY_VERSION = "2-dereference-license-symlinks"
 
 
+def copy_selected_file(src, dst, relpath):
+    """Copy one selected upstream file exactly as assembly expects it."""
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    # Brush and some other workspace crates ship `LICENSE` as a link to the
+    # repository-level notice.  A selected crate is assembled independently,
+    # so preserving that link would leave a broken `../LICENSE`.
+    if os.path.islink(src) and os.path.basename(relpath).upper().startswith(
+            ("LICENSE", "COPYING", "NOTICE", "COPYRIGHT")):
+        resolved = os.path.realpath(src)
+        if not os.path.isfile(resolved):
+            sys.exit(f"license link has no target: {src}")
+        shutil.copy2(resolved, dst)
+    else:
+        shutil.copy2(src, dst, follow_symlinks=False)
+
+
 def sha256(path):
     h = hashlib.sha256()
     with open(path, "rb") as f:
@@ -96,19 +112,7 @@ def assemble(name, entry, root):
         for fl in files:
             src = os.path.join(root, fl)
             dst = os.path.join(stage, fl)
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            # Brush and some other workspace crates ship `LICENSE` as a link
-            # to the repository-level notice.  `root` is the selected crate
-            # subdirectory, so preserving that link would create a broken
-            # `../LICENSE` in the independently assembled vendor tree.
-            if os.path.islink(src) and os.path.basename(fl).upper().startswith(
-                    ("LICENSE", "COPYING", "NOTICE", "COPYRIGHT")):
-                resolved = os.path.realpath(src)
-                if not os.path.isfile(resolved):
-                    sys.exit(f"{name}: license link has no target: {src}")
-                shutil.copy2(resolved, dst)
-            else:
-                shutil.copy2(src, dst, follow_symlinks=False)
+            copy_selected_file(src, dst, fl)
         for p in series:
             r = subprocess.run(
                 ["git", "apply", "--whitespace=nowarn", os.path.join(pdir, p)],
@@ -189,8 +193,7 @@ def assemble_baseline(name, drop_last=False):
     for fl in files:
         src = os.path.join(root, fl)
         dst = os.path.join(stage, fl)
-        os.makedirs(os.path.dirname(dst), exist_ok=True)
-        shutil.copy2(src, dst, follow_symlinks=False)
+        copy_selected_file(src, dst, fl)
     for pch in applied:
         subprocess.run(["git", "apply", "--whitespace=nowarn",
                         os.path.join(pdir, pch)], cwd=stage, check=True)

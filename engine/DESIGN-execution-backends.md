@@ -444,6 +444,19 @@ as executable mappings and mmap that genuinely need a host fd.
         wall/131 s compile; aarch64 TCG takes 3,624/3,373 s (24.0x wall), which
         is a correctness result rather than an acceptable KVM-performance
         claim.
+  - [ ] Run the same from-scratch `make -j10` workload through `sarun run -b`
+        under FUSE and QEMU. Require ordinary process/output/artifact checks as
+        well as nonempty `brushprov` and `build_edges`, so this validates the
+        embedded parser and Kati path rather than merely wrapping a real shell.
+    - [x] Pass GNU-make-4 feature detection, preserve top-level `set -e`, give
+          snooped shebang interpreters their own argv, and expose inherited and
+          explicit exports to parse-time `$(shell ...)` and recursive makes.
+    - [ ] Fix Kati's expanded static-pattern prerequisite binding. Kbuild's
+          `dir/%/built-in.a: dir/%` rules currently lose the target stem, so an
+          aggregate archive can run before a nested directory has produced its
+          `built-in.a`.
+    - [ ] Re-run the complete FUSE Brush build, then the complete QEMU Brush
+          build, compare retained artifacts, and record timings/counts here.
 - [x] Remove backend-specific semantic branches and obsolete compatibility
       code; update generated help and user documentation. A repository audit
       finds backend selection only in registration, runner, transport, trace,

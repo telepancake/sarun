@@ -164,8 +164,9 @@ def main():
     m.ensure_dirs()
     eng = None
     # A box-absolute working dir the overlay exposes (host /tmp is tmpfs-hidden
-    # box-side). Author the Makefile under /root (visible via the overlay).
-    work = Path("/root/makers_work")
+    # box-side). Keep it beneath the invoking user's home; hard-coding /root
+    # made the native aarch64 fixture fail before it ever launched Sarun.
+    work = Path.home() / "makers_work"
     shutil.rmtree(work, ignore_errors=True)
     work.mkdir(parents=True, exist_ok=True)
     try:
@@ -960,6 +961,118 @@ def main():
         so = m.sqlar_content(sp26, str((sm / "result.txt").resolve()).lstrip("/"))
         check(so == b"stdin-mk\n",
               f"case26: `make -f -` built from the piped makefile; got {so!r}")
+        # ── CASE 27: Linux's GNU-make-4 capability gate + top-level errexit ─
+        # Linux rejects make engines whose .FEATURES lacks output-sync. Also
+        # exercise `set -e` in the TOP `run -b` program (not merely a nested
+        # recipe/script): provenance executes complete commands separately, but
+        # that split must preserve ExitShell and skip everything after false.
+        k4 = work / "make4"
+        shutil.rmtree(k4, ignore_errors=True)
+        k4.mkdir(parents=True, exist_ok=True)
+        (k4 / "Makefile").write_text(
+            "ifeq ($(filter output-sync,$(.FEATURES)),)\n"
+            "$(error output-sync missing)\n"
+            "endif\n"
+            "all:\n\t@echo feature-ok > feature.txt\n")
+        r = subprocess.run(
+            [str(BIN), "run", "-b", "MAKE27", "-C", str(k4), "--",
+             "sh", "-c", "set -e; make; false; echo escaped > escaped.txt"],
+            capture_output=True, text=True, timeout=180)
+        check(r.returncode == 1,
+              f"case27: top-level errexit returns the failing status "
+              f"(got {r.returncode}: {r.stderr[-400:]})")
+        sp27 = latest_sqlar(m)
+        feature = m.sqlar_content(
+            sp27, str((k4 / "feature.txt").resolve()).lstrip("/"))
+        escaped = m.sqlar_content(
+            sp27, str((k4 / "escaped.txt").resolve()).lstrip("/"))
+        check(feature == b"feature-ok\n",
+              f"case27: embedded make passes Linux's output-sync feature gate; "
+              f"got {feature!r}")
+        check(escaped is None,
+              f"case27: command after top-level `set -e; false` was skipped; "
+              f"escaped={escaped!r}")
+        # ── CASE 28: compiler discovery through an in-process shebang child ─
+        # Linux selects scripts/Makefile.clang by inspecting `$(CC) --version`,
+        # appends CLANG_FLAGS in the included fragment, exports them, and then
+        # consumes them from a recursive make.  Keep that complete shape here:
+        # a shebang wrapper's stdout and argv must survive $(shell), and its
+        # resulting make variable must survive the sub-make boundary.
+        kd = work / "compiler-discovery"
+        shutil.rmtree(kd, ignore_errors=True)
+        kd.mkdir(parents=True, exist_ok=True)
+        wrapper = kd / "clang-probe"
+        wrapper.write_text(
+            "#!/bin/sh\n"
+            "set -u\n"
+            "state=${SARUN_CLANG_PROBE_STATE:?}\n"
+            "IFS=' ' read -r started _ < /proc/uptime\n"
+            "trace=\"$state/trace.$$.$started\"\n"
+            "printf '%s\\n' \"$started\" > \"$trace\"\n"
+            "/usr/bin/clang-21 \"$@\"\n"
+            "status=$?\n"
+            "IFS=' ' read -r ended _ < /proc/uptime\n"
+            "printf '%s\\n' \"$ended\" >> \"$trace\"\n"
+            "exit \"$status\"\n")
+        wrapper.chmod(0o755)
+        (kd / "traces").mkdir()
+        (kd / "clang.mk").write_text(
+            "CLANG_FLAGS += --target=aarch64-linux-gnu\n"
+            "CLANG_FLAGS += -fintegrated-as\n"
+            "export CLANG_FLAGS\n")
+        (kd / "child.mk").write_text(
+            "all:\n\t@printf '%s|%s\\n' \"$(CLANG_FLAGS)\" "
+            "\"$(SARUN_CLANG_PROBE_STATE)\" > result.txt\n")
+        (kd / "Makefile").write_text(
+            "CC := ./clang-probe\n"
+            f"export SARUN_CLANG_PROBE_STATE := {kd}/traces\n"
+            "CLANG_FLAGS :=\n"
+            "CC_VERSION_TEXT = $(shell $(CC) --version 2>/dev/null | head -n 1)\n"
+            "ifneq ($(findstring clang,$(CC_VERSION_TEXT)),)\n"
+            "include clang.mk\n"
+            "endif\n"
+            "all:\n\t@$(MAKE) -f child.mk\n")
+        r = run_make("MAKE28", kd, "-j10")
+        check(r.returncode == 0,
+              f"case28: compiler discovery/sub-make exits promptly and cleanly "
+              f"(got {r.returncode}: {r.stderr[-600:]})")
+        sp28 = latest_sqlar(m)
+        discovered = m.sqlar_content(
+            sp28, str((kd / "result.txt").resolve()).lstrip("/"))
+        trace_names = [n for n in sqlar_names(sp28) if "traces/trace." in n]
+        trace_data = [(n, m.sqlar_content(sp28, n)) for n in trace_names]
+        expected_discovery = (
+            b"--target=aarch64-linux-gnu -fintegrated-as|" +
+            str(kd / "traces").encode() + b"\n")
+        check(discovered == expected_discovery,
+              f"case28: shebang compiler identity selects and exports clang "
+              f"flags through recursive make; got {discovered!r}; "
+              f"traces={trace_data!r}")
+        check(len(trace_data) == 1 and trace_data[0][1] is not None
+              and len(trace_data[0][1].splitlines()) == 2,
+              f"case28: the exact compiler wrapper completed its start/end "
+              f"trace around clang; traces={trace_data!r}")
+        # ── CASE 29: parallel parent promptly reaps a failing sub-make ───
+        # The kernel exposed a failure path where syncconfig's recursive make
+        # returned non-zero while sibling jobs were active, but the -j10 parent
+        # spun forever instead of draining workers and returning the failure.
+        pf = work / "parallel-failure"
+        shutil.rmtree(pf, ignore_errors=True)
+        pf.mkdir(parents=True, exist_ok=True)
+        (pf / "fail.mk").write_text("boom:\n\t@false\n")
+        siblings = " ".join(f"s{i}" for i in range(9))
+        (pf / "Makefile").write_text(
+            f"all: recurse {siblings}\n"
+            "recurse:\n\t@$(MAKE) -f fail.mk boom\n" +
+            "".join(
+                f"s{i}:\n\t@sleep 0.1; echo {i} > $@\n" for i in range(9)))
+        r = subprocess.run(
+            [str(BIN), "run", "-b", "MAKE29", "-C", str(pf), "--",
+             "make", "-j10"],
+            capture_output=True, text=True, timeout=20)
+        check(r.returncode != 0,
+              f"case29: failing recursive make under -j10 returns promptly "
+              f"and non-zero (got {r.returncode}: {(r.stdout+r.stderr)[-600:]})")
     finally:
         if eng is not None and eng.poll() is None:
             eng.terminate()
@@ -967,7 +1080,7 @@ def main():
             except Exception: eng.kill()
         os.environ.pop("SLOPBOX_NS", None)
         shutil.rmtree(tmp, ignore_errors=True)
-        shutil.rmtree("/root/makers_work", ignore_errors=True)
+        shutil.rmtree(work, ignore_errors=True)
     print("\n" + ("MAKE-RS PASS" if not _fails else f"{len(_fails)} FAILURE(S)"))
     return 1 if _fails else 0
 

@@ -1,0 +1,185 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Fri, 17 Jul 2026 18:53:53 +0000
+Subject: [PATCH] kati: expose make exports to parse-time shell expansions
+
+Materialize each embedded make evaluator's inherited and explicit exports before parse-time shell calls as well as recipes. This preserves compiler-discovery environment and recursive make flags without mutating process-global state.
+
+---
+diff --git a/src-rs/eval.rs b/src-rs/eval.rs
+index f186c0b..6df5292 100644
+--- a/src-rs/eval.rs
++++ b/src-rs/eval.rs
+@@ -344,6 +344,17 @@ pub struct Evaluator {
+     /// Empty for the standalone rkati binary, which keeps the `std::env` path
+     /// (one OS process per make, where that's correct).
+     pub box_export_prefix: Bytes,
++    /// Names inherited in this make's environment. GNU keeps these names
++    /// exported even if the makefile later replaces their values; retaining
++    /// the names lets parse-time `$(shell ...)` materialize the *current*
++    /// values without touching the engine process environment.
++    pub box_inherited_exports: Vec<Symbol>,
++    /// MAKELEVEL exported to this make's children. None means the standalone
++    /// evaluator path, where the process environment remains authoritative.
++    pub box_child_makelevel: Option<u32>,
++    /// Recursion guard: expanding an exported recursive variable may itself
++    /// contain `$(shell ...)`. The nested shell uses the last complete prefix.
++    box_refreshing_exports: bool,
+     symbols_for_eval: HashSet<Symbol>,
+ 
+     in_rule: bool,
+@@ -405,6 +416,9 @@ impl Evaluator {
+             delete_on_error: false,
+             pending_remake_includes: Vec::new(),
+             box_export_prefix: Bytes::new(),
++            box_inherited_exports: Vec::new(),
++            box_child_makelevel: None,
++            box_refreshing_exports: false,
+             symbols_for_eval: HashSet::new(),
+ 
+             in_rule: false,
+@@ -1579,6 +1593,128 @@ impl Evaluator {
+         }
+     }
+ 
++    /// Rebuild the environment prefix used by in-process recipes and
++    /// `$(shell ...)` from this evaluator's current variable state.
++    ///
++    /// This must be callable during makefile parsing: an inherited variable or
++    /// an earlier `export NAME := value` is observable by a later `$(shell
++    /// ...)`, long before dependency analysis and recipe execution begin.
++    pub fn refresh_box_export_prefix(&mut self) -> Result<()> {
++        let Some(child_makelevel) = self.box_child_makelevel else {
++            return Ok(());
++        };
++        if self.box_refreshing_exports {
++            return Ok(());
++        }
++        self.box_refreshing_exports = true;
++
++        fn is_sh_name(name: &[u8]) -> bool {
++            !name.is_empty()
++                && (name[0].is_ascii_alphabetic() || name[0] == b'_')
++                && name
++                    .iter()
++                    .all(|&b| b.is_ascii_alphanumeric() || b == b'_')
++        }
++        fn emit_export(prefix: &mut Vec<u8>, name: &[u8], value: &[u8]) {
++            prefix.extend_from_slice(b"export ");
++            prefix.extend_from_slice(name);
++            prefix.extend_from_slice(b"='");
++            for &b in value {
++                if b == b'\'' {
++                    prefix.extend_from_slice(b"'\\''");
++                } else {
++                    prefix.push(b);
++                }
++            }
++            prefix.extend_from_slice(b"'\n");
++        }
++
++        let result = (|| -> Result<Bytes> {
++            let makelevel = intern(b"MAKELEVEL".to_vec());
++            let makeflags = intern(b"MAKEFLAGS".to_vec());
++            let shell_managed = [b"PWD".as_slice(), b"OLDPWD", b"SHLVL", b"_"];
++            let mut prefix = Vec::new();
++            emit_export(
++                &mut prefix,
++                b"MAKELEVEL",
++                child_makelevel.to_string().as_bytes(),
++            );
++
++            // Environment-origin names stay exported after a makefile changes
++            // their value. Sort by name for deterministic prefixes/traces.
++            let mut inherited = self.box_inherited_exports.clone();
++            inherited.sort_by_key(|sym| sym.as_bytes().to_vec());
++            inherited.dedup();
++            for sym in inherited {
++                let name = sym.as_bytes();
++                if sym == makelevel
++                    || sym == makeflags
++                    || shell_managed.contains(&name.as_ref())
++                    || !is_sh_name(&name)
++                    || self.exports.get(&sym) == Some(&false)
++                {
++                    continue;
++                }
++                let value = if let Some(var) = self.lookup_var(sym)? {
++                    var.read().eval_to_buf(self)?
++                } else {
++                    Bytes::new()
++                };
++                emit_export(&mut prefix, &name, &value);
++            }
++
++            if self.export_all_vars {
++                for (sym, _) in self.get_symbol_names(|var| {
++                    !matches!(
++                        var.read().origin(),
++                        VarOrigin::Default | VarOrigin::Automatic
++                    )
++                }) {
++                    self.exports.entry(sym).or_insert(true);
++                }
++            }
++
++            let mut explicit: Vec<(Symbol, bool)> =
++                self.exports.iter().map(|(s, v)| (*s, *v)).collect();
++            explicit.sort_by_key(|(sym, _)| sym.as_bytes().to_vec());
++            for (sym, export) in explicit {
++                let name = sym.as_bytes();
++                if sym == makelevel || sym == makeflags || !is_sh_name(&name) {
++                    continue;
++                }
++                if export {
++                    let value = if let Some(var) = self.lookup_var(sym)? {
++                        var.read().eval_to_buf(self)?
++                    } else {
++                        Bytes::new()
++                    };
++                    emit_export(&mut prefix, &name, &value);
++                } else {
++                    prefix.extend_from_slice(b"unset ");
++                    prefix.extend_from_slice(&name);
++                    prefix.push(b'\n');
++                }
++            }
++
++            // GNU make always exports its final MAKEFLAGS value.
++            if let Some(var) = self.lookup_var(makeflags)? {
++                let value = var.read().eval_to_buf(self)?;
++                if !value.is_empty() {
++                    emit_export(&mut prefix, b"MAKEFLAGS", &value);
++                }
++            }
++            Ok(Bytes::from(prefix))
++        })();
++
++        self.box_refreshing_exports = false;
++        if let Ok(prefix) = result {
++            self.box_export_prefix = prefix;
++            Ok(())
++        } else {
++            result.map(|_| ())
++        }
++    }
++
+     pub fn enter(&mut self, frame_type: FrameType, name: Bytes, loc: Loc) -> ScopedFrame {
+         if !self.trace {
+             return ScopedFrame::new(self.stack.clone(), None);
+diff --git a/src-rs/func.rs b/src-rs/func.rs
+index 179172d..30f25b4 100644
+--- a/src-rs/func.rs
++++ b/src-rs/func.rs
+@@ -702,6 +702,11 @@ fn shell_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut) ->
+     let loc = ev.loc.clone().unwrap_or_default();
+     let shell = ev.get_shell()?;
+     let shellflag = ev.get_shell_flag();
++    // GNU make exposes inherited variables and all export/unexport directives
++    // seen so far to parse-time $(shell ...). The in-process engine cannot
++    // mutate its shared process environment, so refresh the evaluator-owned
++    // shell prefix at this exact expansion point.
++    ev.refresh_box_export_prefix()?;
+     let box_prefix = ev.box_export_prefix.clone();
+ 
+     let (exit_code, output, fc) = shell_func_impl(&shell, shellflag, &cmd, &loc, &box_prefix,

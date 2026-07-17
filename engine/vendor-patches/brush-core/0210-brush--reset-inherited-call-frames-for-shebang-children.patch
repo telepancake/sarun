@@ -1,0 +1,27 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Fri, 17 Jul 2026 18:53:53 +0000
+Subject: [PATCH] brush: reset inherited call frames for shebang children
+
+A snooped shebang child stands in for a fresh interpreter and must see its own positional arguments. Clear the caller's frames before installing the child's identity so compiler wrappers receive their real argv.
+
+---
+diff --git a/src/shell.rs b/src/shell.rs
+index 72dc929..0bc731f 100644
+--- a/src/shell.rs
++++ b/src/shell.rs
+@@ -298,6 +298,14 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
+         positional: Vec<String>,
+         synth: u32,
+     ) {
++        // This clone is standing in for a fresh interpreter process, not a
++        // POSIX subshell. It must not inherit the caller's script/function
++        // frames: current_shell_args() gives those frames precedence over
++        // self.args, so a shebang child invoked as `child -E ...` otherwise
++        // saw the parent's arguments (in Kbuild, the compiler wrapper saw its
++        // own pathname instead of `-E -P -x c -`). The child installs its own
++        // command-string frame immediately before execution.
++        self.call_stack = crate::callstack::CallStack::default();
+         self.name = Some(dollar0);
+         self.args = positional;
+         self.synthetic_pid = Some(synth);

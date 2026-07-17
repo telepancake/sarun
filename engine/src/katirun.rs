@@ -187,12 +187,17 @@ fn read_bootstrap_makefile(
     // matching, order-only prerequisites — so advertise them; anything kati
     // doesn't actually implement would surface as its own visible error
     // elsewhere, not silently no-op because of a missing .FEATURES token.
+    // `output-sync` is the GNU 4.x capability marker used by Linux's top-level
+    // Makefile. The embedded executor owns recipe output and coordinates its
+    // emission on the make thread, so it has the required synchronization
+    // boundary even though the default policy deliberately streams chunks
+    // (equivalent to GNU make without an active -O mode).
     // `jobserver` is real here too: jobserver.rs advertises the engine's
     // slip pool into MAKEFLAGS, so builds gating their parallel plumbing on
     // $(filter jobserver,$(.FEATURES)) get the coordinated path.
     bootstrap.put_slice(
         b".FEATURES?=target-specific order-only second-expansion else-if \
-          shortest-stem undefine oneshell jobserver\n",
+          shortest-stem undefine oneshell output-sync jobserver\n",
     );
     if !no_builtin_rules {
         bootstrap.put_slice(b".c.o:\n");
@@ -431,6 +436,16 @@ fn run_kati(
         .and_then(|s| s.parse::<u32>().ok())
         .unwrap_or(0);
     let child_makelevel = makelevel + 1;
+    ev.box_inherited_exports = seed_env
+        .iter()
+        .map(|(name, _)| intern(name.as_bytes().to_vec()))
+        .collect();
+    ev.box_child_makelevel = Some(child_makelevel);
+    // Parse-time $(shell ...) must already see this make's inherited
+    // environment. refresh_box_export_prefix is called again by each shell
+    // expansion, so earlier export/unexport directives and assignments are
+    // reflected at their exact point in the makefile.
+    ev.refresh_box_export_prefix()?;
     let bootstrap_asts = read_bootstrap_makefile(targets, working_dir, no_builtin_rules, no_builtin_variables, makelevel)?;
     {
         let _frame = ev.enter(FrameType::Phase, bytes::Bytes::from_static(b"*bootstrap*"), Loc::default());
@@ -515,118 +530,9 @@ fn run_kati(
         nodes = make_dep(&mut ev, dep_targets)?;
     }
 
-    // sarun: build the make's exported environment as a non-echoed shell prefix
-    // (`export NAME='val'` / `unset NAME`) rather than staging it into the
-    // process env. In a box, every recipe — and every recursive `$(MAKE)` — runs
-    // in-process through a brush subshell; many of those makes share ONE engine
-    // process, so a `std::env::set_var` here would (a) be a data race against
-    // sibling makes building their own subshells and (b) leak one make's exports
-    // into another. exec.rs prepends this prefix to each recipe's subshell and
-    // func.rs prepends it to `$(shell)`, so exports reach children through the
-    // per-subshell env instead. The standalone rkati binary leaves this empty and
-    // keeps the std::env path (one OS process per make, where that's correct).
-    if ev.export_all_vars {
-        let all = ev.get_symbol_names(|v| {
-            !matches!(
-                v.read().origin(),
-                kati::var::VarOrigin::Default | kati::var::VarOrigin::Automatic
-            )
-        });
-        for (sym, _) in all {
-            ev.exports.entry(sym).or_insert(true);
-        }
-    }
-    fn emit_export(prefix: &mut Vec<u8>, name: &[u8], value: &[u8]) {
-        prefix.extend_from_slice(b"export ");
-        prefix.extend_from_slice(name);
-        prefix.extend_from_slice(b"='");
-        for &b in value {
-            if b == b'\'' {
-                prefix.extend_from_slice(b"'\\''");
-            } else {
-                prefix.push(b);
-            }
-        }
-        prefix.extend_from_slice(b"'\n");
-    }
-    let mut prefix: Vec<u8> = Vec::new();
-    // MAKELEVEL is exported to children at the NEXT level (computed above from
-    // the seed env, never from a process-global bump).
-    emit_export(&mut prefix, b"MAKELEVEL", child_makelevel.to_string().as_bytes());
-    // GNU make exports ENVIRONMENT-origin variables to children by default. The
-    // recipe subshell inherits the engine process env, but a NESTED make's
-    // environment additions (its parent's exports, carried in via seed_env) are
-    // NOT in that process env — so re-export the make's inherited env here, with
-    // current values, so recipes and recursive sub-makes see them. Skip the
-    // shell-managed vars brush maintains itself (PWD/OLDPWD/SHLVL/_) and
-    // MAKELEVEL (emitted above), and skip anything the makefile explicitly
-    // `unexport`ed.
-    // MAKEFLAGS is make-managed and is also the jobserver's advertisement
-    // channel (jobserver::advertise writes it into the process env so forked
-    // tools like `gcc -flto=jobserver` inherit it). Don't re-export the stale
-    // seed value here — that would clobber the advertised one in recipes.
-    const SHELL_MANAGED: &[&[u8]] = &[b"PWD", b"OLDPWD", b"SHLVL", b"_", b"MAKELEVEL", b"MAKEFLAGS"];
-    fn is_sh_name(n: &[u8]) -> bool {
-        !n.is_empty()
-            && (n[0].is_ascii_alphabetic() || n[0] == b'_')
-            && n.iter().all(|&b| b.is_ascii_alphanumeric() || b == b'_')
-    }
-    for (k, _) in seed_env {
-        let kb = k.as_bytes();
-        // Names that aren't valid shell identifiers (e.g. exported bash
-        // functions like `BASH_FUNC_x%%`) can't be set via `export NAME=` and
-        // would break the prefix — the subshell already inherits them anyway.
-        if SHELL_MANAGED.contains(&kb) || !is_sh_name(kb) {
-            continue;
-        }
-        let sym = intern(kb.to_vec());
-        if ev.exports.get(&sym) == Some(&false) {
-            continue; // explicitly unexported
-        }
-        let value = if let Some(v) = ev.lookup_var(sym)? {
-            use kati::expr::Evaluable;
-            v.read().eval_to_buf(&mut ev)?
-        } else {
-            bytes::Bytes::new()
-        };
-        emit_export(&mut prefix, kb, &value);
-    }
-    // Explicitly `export`ed make variables (override any env-origin value above)
-    // and explicit `unexport`s.
-    for (name, export) in ev.exports.clone() {
-        let nb = name.as_bytes();
-        if export {
-            let value = if let Some(v) = ev.lookup_var(name)? {
-                use kati::expr::Evaluable;
-                v.read().eval_to_buf(&mut ev)?
-            } else {
-                bytes::Bytes::new()
-            };
-            emit_export(&mut prefix, &nb, &value);
-        } else {
-            prefix.extend_from_slice(b"unset ");
-            prefix.extend_from_slice(&nb);
-            prefix.push(b'\n');
-        }
-    }
-    // GNU make ALWAYS passes MAKEFLAGS to children through the environment —
-    // including makefile-level appends like the kernel's
-    // `MAKEFLAGS += --include-dir=$(abs_srctree)`. Emit the FINAL evaluated
-    // value (composed above with the seed env and the live jobserver
-    // advertisement) so an in-process sub-make's seed_env carries it; without
-    // this, flags a makefile appended for its sub-makes died at the shared
-    // process-env boundary and e.g. the kernel's out-of-tree second pass
-    // failed `include scripts/Kbuild.include`.
-    {
-        use kati::expr::Evaluable;
-        if let Some(v) = ev.lookup_var(intern(b"MAKEFLAGS".to_vec()))? {
-            let value = v.read().eval_to_buf(&mut ev)?;
-            if !value.is_empty() {
-                emit_export(&mut prefix, b"MAKEFLAGS", &value);
-            }
-        }
-    }
-    ev.box_export_prefix = bytes::Bytes::from(prefix);
+    // Materialize the final recipe environment after parsing. The same helper
+    // is called immediately before every parse-time $(shell ...) expansion.
+    ev.refresh_box_export_prefix()?;
 
     // sarun: emit the build_edges provenance frame BEFORE exec so the
     // UI's build target pane is populated immediately, even for

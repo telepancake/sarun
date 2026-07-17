@@ -16,6 +16,9 @@ Run from the repository root:
     uv run --with "pyfuse3>=3.2" --with "trio>=0.22" \
       --with "wcmatch>=8.4" --with "python-magic>=0.4" \
       python prototype/test_kernel_build_backends.py --keep
+
+Add ``--brush`` to execute the identical workload through ``sarun run -b`` and
+require the archive to contain the parser-driven brush provenance.
 """
 
 import argparse
@@ -119,7 +122,10 @@ def sqlar_counts(path):
             )
         }
         counts = {}
-        for table in ("sqlar", "provenance", "process", "outputs", "meta"):
+        for table in (
+            "sqlar", "provenance", "process", "outputs", "meta",
+            "brushprov", "build_edges",
+        ):
             counts[table] = (
                 connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
                 if table in tables else 0
@@ -200,8 +206,11 @@ sha256sum {out}/arch/arm64/boot/Image {out}/vmlinux
 '''
 
 
-def run_backend(backend, source, jobs, keep):
-    root = Path(tempfile.mkdtemp(prefix=f"sarun-kernel-{backend}-", dir="/var/tmp"))
+def run_backend(backend, source, jobs, keep, brush=False, trace_vars=False):
+    mode = "brush" if brush else "shell"
+    root = Path(tempfile.mkdtemp(
+        prefix=f"sarun-kernel-{backend}-{mode}-", dir="/var/tmp"
+    ))
     work = root / "lower"
     work.mkdir()
     probe = work / "clang-probe"
@@ -220,7 +229,7 @@ def run_backend(backend, source, jobs, keep):
         directory = root / name
         directory.mkdir()
         env[key] = str(directory)
-    env["SLOPBOX_NS"] = f"KERNEL{backend.upper()}"
+    env["SLOPBOX_NS"] = f"KERNEL{backend.upper()}{mode.upper()}"
 
     old_env = dict(os.environ)
     os.environ.clear()
@@ -238,11 +247,16 @@ def run_backend(backend, source, jobs, keep):
     try:
         if not wait_socket(module.sock_path()):
             raise RuntimeError(f"{backend}: engine socket never appeared")
-        command = [
-            str(ENGINE_BIN), "run", "--net", "off", *backend_selector(backend),
-            f"KERNEL-{backend}", "-C", str(work), "--", "sh", "-c",
+        command = [str(ENGINE_BIN), "run"]
+        if brush:
+            command.append("-b")
+        if trace_vars:
+            command.append("--vars")
+        command.extend([
+            "--net", "off", *backend_selector(backend),
+            f"KERNEL-{backend}-{mode}", "-C", str(work), "--", "sh", "-c",
             shell_workload(source, work, jobs),
-        ]
+        ])
         started = time.monotonic()
         result = run_workload(command, env, timeout=7200)
         elapsed = time.monotonic() - started
@@ -277,6 +291,7 @@ def run_backend(backend, source, jobs, keep):
 
         observation = {
             "backend": backend,
+            "mode": mode,
             "command_returncode": result.returncode,
             "wall_seconds": round(elapsed, 3),
             "sqlar": str(sqlar),
@@ -316,6 +331,10 @@ def run_backend(backend, source, jobs, keep):
             errors.append(f"only {object_rows} object files were captured")
         if not processes or not clang_processes:
             errors.append("process trace lacks compiler processes")
+        if brush and counts["brushprov"] == 0:
+            errors.append("run -b produced no brush pipeline provenance")
+        if brush and counts["build_edges"] == 0:
+            errors.append("brush make produced no build-edge provenance")
         if not artifact_writers:
             errors.append("artifact writer provenance is absent")
         if not observation["host_lower_unchanged"] or not observation["host_output_absent"]:
@@ -349,6 +368,14 @@ def main(argv=None):
     parser.add_argument("--jobs", type=int, default=10)
     parser.add_argument("--source", type=Path, default=DEFAULT_SOURCE)
     parser.add_argument("--keep", action="store_true")
+    parser.add_argument(
+        "--brush", action="store_true",
+        help="run the workload through the embedded brush parser (sarun run -b)",
+    )
+    parser.add_argument(
+        "--trace-vars", action="store_true",
+        help="record make/shell variable assignments for fixture diagnosis",
+    )
     args = parser.parse_args(argv)
     backends = args.backend or ["fuse", "qemu"]
 
@@ -367,9 +394,13 @@ def main(argv=None):
 
     observations = []
     for backend in backends:
-        print(f"[{backend}] Linux kernel make -j{args.jobs}", flush=True)
+        mode = "brush" if args.brush else "shell"
+        print(f"[{backend}/{mode}] Linux kernel make -j{args.jobs}", flush=True)
         try:
-            observation, root = run_backend(backend, args.source, args.jobs, args.keep)
+            observation, root = run_backend(
+                backend, args.source, args.jobs, args.keep, brush=args.brush,
+                trace_vars=args.trace_vars,
+            )
         except Exception as error:
             print(f"FAIL: {error}")
             return 1

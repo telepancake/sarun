@@ -2851,6 +2851,14 @@ async fn run_brush(conn_fd: i32, script: String, sh_mode: bool) -> i32 {
             Ok(result) => {
                 last_code = u8::from(result.exit_code) as i32;
                 send_pipeline_done(&uids, last_code, now_secs());
+                // We deliberately execute one complete-command at a time to
+                // emit provenance immediately before it runs. Preserve the
+                // Program executor's control-flow contract across that split:
+                // `set -e; false; next` returns ExitShell for `false`, and the
+                // remaining complete commands must not run.
+                if !result.is_normal_flow() {
+                    break;
+                }
             }
             Err(e) => {
                 eprintln!("sarun-engine inner: -b brush execution error \

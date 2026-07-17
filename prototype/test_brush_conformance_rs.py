@@ -135,6 +135,12 @@ trap 'echo parent-exit; touch trapmark' EXIT
 sh -c 'echo child-ran'
 if test -f trapmark; then echo "LEAK: child fired parent trap"; else echo no-leak; fi
 rm -f trapmark''',
+    "shebang_child_args": '''printf '%s\n' '#!/bin/sh' \
+  'printf "zero=[%s] one=[%s] two=[%s] n=[%s]\\n" "$0" "$1" "$2" "$#"' \
+  > child-pos.sh
+chmod +x child-pos.sh
+./child-pos.sh alpha 'beta gamma'
+rm -f child-pos.sh''',
     "trap_exit_rc": '''(trap 'echo t' EXIT; exit 7); echo "rc=$?"''',
     # ── set -e / -u / pipefail ─────────────────────────────────────────────
     "errexit_basic": '''(set -e; false; echo not-reached); echo "rc=$?"
@@ -211,7 +217,7 @@ def main():
     m = SourceFileLoader("slopbox", SARUN).load_module()
     m.ensure_dirs()
 
-    work = Path("/root/brushconf_work")
+    work = Path.home() / "brushconf_work"
     shutil.rmtree(work, ignore_errors=True)
     (work / "probes").mkdir(parents=True)
     names = sorted(PROBES)

@@ -56,3 +56,4 @@
 0560-bootstrap--set-MAKE-HOST-and-advertise-jobserver-in--FEATURE.patch
 0570-make-role-argv--GNU--i--n-semantics--ignore-errors---dry-run.patch
 0580-stall-watchdog--exponential-backoff-per-activity--SARUN-STAL.patch
+0590-kati--expose-make-exports-to-parse-time-shell-expansions.patch
