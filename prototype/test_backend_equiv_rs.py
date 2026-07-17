@@ -303,6 +303,79 @@ def run_backend(backend):
         shutil.rmtree(root, ignore_errors=True)
 
 
+def run_fuse_broker_lifecycle():
+    """The steady-state mount is private and engine death reaps a live box."""
+    root = Path(tempfile.mkdtemp(prefix="sarun-fuse-broker-", dir="/var/tmp"))
+    env = dict(os.environ)
+    for key, name in (
+        ("XDG_STATE_HOME", "state"), ("XDG_RUNTIME_DIR", "run"),
+        ("XDG_CONFIG_HOME", "config"), ("XDG_DATA_HOME", "data"),
+    ):
+        directory = root / name
+        directory.mkdir()
+        env[key] = str(directory)
+    env["SLOPBOX_NS"] = "FUSEBROKER"
+    runtime = root / "run" / "slopbox.FUSEBROKER"
+    socket_path = runtime / "ui.sock"
+    mountpoint = runtime / "mnt"
+    engine = subprocess.Popen(
+        [str(ENGINE_BIN), "serve"], env=env,
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+    )
+    runner = None
+    broker_pid = None
+    try:
+        if not wait_socket(str(socket_path)):
+            detail = engine.stderr.read() if engine.poll() is not None else ""
+            raise RuntimeError(f"engine socket never appeared: {detail[-500:]}")
+        children_path = Path(f"/proc/{engine.pid}/task/{engine.pid}/children")
+        deadline = time.time() + 5
+        while time.time() < deadline and broker_pid is None:
+            for word in children_path.read_text().split():
+                command = Path(f"/proc/{word}/cmdline").read_bytes()
+                if b"fuse-mount-broker" in command:
+                    broker_pid = int(word)
+                    break
+            if broker_pid is None:
+                time.sleep(0.05)
+        if broker_pid is None:
+            raise RuntimeError("mount broker child was not found")
+
+        outer_mount = mountpoint.as_posix() in Path(
+            f"/proc/{engine.pid}/mountinfo"
+        ).read_text()
+        caller_mount = mountpoint.as_posix() in Path(
+            "/proc/self/mountinfo"
+        ).read_text()
+        broker_mount = mountpoint.as_posix() in Path(
+            f"/proc/{broker_pid}/mountinfo"
+        ).read_text()
+        runner = subprocess.Popen(
+            [str(ENGINE_BIN), "run", "--fuse", "--net", "off", "LIVE", "--",
+             "sh", "-c", "printf READY; sleep 60"],
+            env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        time.sleep(1)
+        runner_was_live = runner.poll() is None
+        engine.terminate()
+        engine.wait(timeout=10)
+        runner.wait(timeout=10)
+        return {
+            "outer_absent": not outer_mount and not caller_mount,
+            "broker_present": broker_mount,
+            "runner_reaped": runner_was_live and runner.poll() is not None,
+            "broker_reaped": not Path(f"/proc/{broker_pid}").exists(),
+        }
+    finally:
+        if runner is not None and runner.poll() is None:
+            runner.kill()
+            runner.wait(timeout=5)
+        if engine.poll() is None:
+            engine.kill()
+            engine.wait(timeout=5)
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def run_cross_arch_brush(architecture):
     root = Path(tempfile.mkdtemp(
         prefix=f"sarun-equiv-qemu-{architecture}-brush-", dir="/var/tmp"
@@ -765,6 +838,16 @@ def main():
         for backend in backends[1:]:
             check(observations[backend] == reference,
                   f"equiv: {backend} observations equal {backends[0]}")
+
+    try:
+        fuse_broker = run_fuse_broker_lifecycle()
+    except Exception as error:
+        check(False, f"fuse broker: lifecycle completed ({error})")
+    else:
+        check(fuse_broker["outer_absent"] and fuse_broker["broker_present"],
+              "fuse broker: mount exists only in private namespace")
+        check(fuse_broker["runner_reaped"] and fuse_broker["broker_reaped"],
+              "fuse broker: engine shutdown reaps live runner and broker")
 
     if "qemu" in backends:
         try:

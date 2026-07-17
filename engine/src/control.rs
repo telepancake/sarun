@@ -90,6 +90,63 @@ fn pidfd_signal(pidfd: i32, sig: i32) {
     }
 }
 
+/// Stop every live runner before the engine tears down shared transports.
+/// Waiting on pidfds is namespace-safe and also gives bubblewrap's
+/// `--die-with-parent` children time to release the broker mount namespace.
+pub fn terminate_runners(state: &State) {
+    let fds: Vec<i32> = lock(state).box_pids.values().copied().collect();
+    for &fd in &fds {
+        pidfd_signal(fd, libc::SIGTERM);
+    }
+    wait_pidfds(&fds, 3000);
+    let remaining: Vec<i32> = fds
+        .into_iter()
+        .filter(|&fd| !pidfd_exited(fd))
+        .collect();
+    for &fd in &remaining {
+        pidfd_signal(fd, libc::SIGKILL);
+    }
+    wait_pidfds(&remaining, 3000);
+}
+
+fn pidfd_exited(fd: i32) -> bool {
+    let mut descriptor = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    (unsafe { libc::poll(&mut descriptor, 1, 0) }) == 1
+        && descriptor.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0
+}
+
+fn wait_pidfds(fds: &[i32], timeout_ms: i32) {
+    let deadline = std::time::Instant::now()
+        + std::time::Duration::from_millis(timeout_ms.max(0) as u64);
+    loop {
+        let mut descriptors: Vec<libc::pollfd> = fds
+            .iter()
+            .copied()
+            .filter(|&fd| !pidfd_exited(fd))
+            .map(|fd| libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            })
+            .collect();
+        if descriptors.is_empty() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return;
+        }
+        let remaining = (deadline - now).as_millis().min(i32::MAX as u128) as i32;
+        unsafe {
+            libc::poll(descriptors.as_mut_ptr(), descriptors.len() as _, remaining);
+        }
+    }
+}
+
 /// The HOST-namespace pid named by `pidfd`, read from /proc/self/fdinfo/<fd>
 /// ("Pid:" line; its FIRST field is the pid in our (init) namespace). 0 on any
 /// failure. This is the wrap-immune identity path — the pidfd names one exact

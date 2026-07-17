@@ -1,29 +1,21 @@
 //! Thin Linux `/dev/fuse` transport for the shared virtiofsd server.
 //!
-//! This module owns only mounting, request/reply byte movement, worker fds,
-//! and teardown.  Opcode decoding and every filesystem semantic operation are
-//! handled by [`virtiofsd::server::Server`] and its `FileSystem` implementation.
+//! This module owns only request/reply byte movement and raw-device workers.
+//! Mount namespace ownership and teardown live in [`crate::fuse_broker`].
+//! Opcode decoding and every filesystem semantic operation are handled by
+//! [`virtiofsd::server::Server`] and its `FileSystem` implementation.
 
-use std::ffi::CString;
 use std::fs::{File, OpenOptions};
-use std::io::{self, IoSliceMut};
-use std::os::fd::{AsFd, AsRawFd, FromRawFd, RawFd};
-use std::os::unix::ffi::OsStrExt;
-use std::os::unix::net::UnixStream;
-use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::io;
+use std::os::fd::{AsFd, AsRawFd, FromRawFd};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
-use nix::sys::socket::{ControlMessageOwned, MsgFlags, SockaddrStorage, recvmsg};
 use virtiofsd::filesystem::FileSystem;
 use virtiofsd::server::{FuseBacking, Server};
 
 const MAX_REQUEST_SIZE: usize = (1 << 20) + 0x1000;
-const FUSERMOUNT_COMM_FD: &str = "_FUSE_COMMFD";
-
 nix::ioctl_read!(fuse_dev_ioc_clone, 229, 0, u32);
 
 #[repr(C)]
@@ -109,17 +101,19 @@ impl Drop for BackingRegistry {
     }
 }
 
-/// A mounted raw-FUSE server. Dropping it detaches the mount and joins every
-/// request worker.
+/// Raw-FUSE request workers for a connection whose mount is broker-owned.
 pub struct FuseSession {
-    mountpoint: PathBuf,
     device: Option<Arc<File>>,
+    stop: Arc<File>,
     backing: Option<Arc<BackingRegistry>>,
     workers: Vec<JoinHandle<io::Result<()>>>,
 }
 
 impl FuseSession {
-    pub fn mount<F>(filesystem: F, mountpoint: &Path, workers: usize) -> io::Result<Self>
+    /// Serve a FUSE connection mounted by the private mount-owner broker.
+    /// Teardown of the mount itself belongs to that broker; this object only
+    /// owns the raw request fds and workers.
+    pub(crate) fn serve_mounted<F>(filesystem: F, device: File, workers: usize) -> io::Result<Self>
     where
         F: FileSystem + Send + Sync + 'static,
     {
@@ -129,8 +123,8 @@ impl FuseSession {
                 "a FUSE session needs at least one worker",
             ));
         }
-        let mountpoint = mountpoint.canonicalize()?;
-        let device = Arc::new(mount_with_helper(&mountpoint)?);
+        let device = Arc::new(device);
+        let stop = Arc::new(stop_event()?);
         let backing = Arc::new(BackingRegistry {
             device: device.clone(),
             by_handle: Mutex::new(std::collections::HashMap::new()),
@@ -140,8 +134,8 @@ impl FuseSession {
         });
         let server = Arc::new(Server::new(filesystem));
         let mut session = Self {
-            mountpoint,
             device: Some(device.clone()),
+            stop: stop.clone(),
             backing: Some(backing.clone()),
             workers: Vec::with_capacity(workers),
         };
@@ -154,10 +148,11 @@ impl FuseSession {
             };
             let server = server.clone();
             let backing = backing.clone();
+            let stop = stop.clone();
             match thread::Builder::new()
                 .name(format!("sarun-fuse-{index}"))
                 .spawn(move || {
-                    let result = serve_device(worker_device, server, backing);
+                    let result = serve_device(worker_device, stop, server, backing);
                     if let Err(error) = &result {
                         eprintln!("sarun-engine: raw FUSE worker failed: {error}");
                     }
@@ -171,7 +166,7 @@ impl FuseSession {
     }
 
     #[cfg(test)]
-    fn backing_results(&self) -> (u64, u64) {
+    pub(crate) fn backing_results(&self) -> (u64, u64) {
         let backing = self.backing.as_ref().unwrap();
         (
             backing.successes.load(Ordering::Relaxed),
@@ -183,18 +178,9 @@ impl FuseSession {
         if self.device.is_none() {
             return;
         }
-        let Ok(path) = CString::new(self.mountpoint.as_os_str().as_bytes()) else {
-            return;
-        };
-        // A direct detach works in a privileged mount namespace. Ordinary
-        // users need the setuid fusermount helper that created the mount.
-        if unsafe { libc::umount2(path.as_ptr(), libc::MNT_DETACH) } != 0 {
-            let _ = Command::new(fusermount_binary())
-                .args(["-u", "-q", "-z", "--"])
-                .arg(&self.mountpoint)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
+        let wake = 1u64.to_ne_bytes();
+        unsafe {
+            libc::write(self.stop.as_raw_fd(), wake.as_ptr().cast(), wake.len());
         }
         self.device.take();
     }
@@ -229,109 +215,6 @@ fn join_workers(workers: &mut Vec<JoinHandle<io::Result<()>>>) -> io::Result<()>
     result
 }
 
-fn fusermount_binary() -> String {
-    if let Some(path) = std::env::var_os("FUSERMOUNT_PATH") {
-        return path.to_string_lossy().into_owned();
-    }
-    if Command::new("fusermount3").arg("-h").output().is_ok() {
-        "fusermount3".into()
-    } else {
-        "fusermount".into()
-    }
-}
-
-fn mount_with_helper(mountpoint: &Path) -> io::Result<File> {
-    let (child_socket, receive_socket) = UnixStream::pair()?;
-    let fd = child_socket.as_raw_fd();
-    let mut command = Command::new(fusermount_binary());
-    command
-        .arg("-o")
-        .arg("fsname=sarun-rs")
-        .arg("--")
-        .arg(mountpoint)
-        .env(FUSERMOUNT_COMM_FD, fd.to_string())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    // SAFETY: this closure runs after fork and before exec, performs only the
-    // async-signal-safe fcntl syscall, and captures one integer descriptor.
-    unsafe {
-        command.pre_exec(move || {
-            let flags = libc::fcntl(fd, libc::F_GETFD);
-            if flags < 0 || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    let child = command.spawn()?;
-    drop(child_socket);
-
-    let device = match receive_device(&receive_socket) {
-        Ok(device) => device,
-        Err(receive_error) => {
-            drop(receive_socket);
-            let output = child.wait_with_output()?;
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-            return Err(if stderr.is_empty() {
-                receive_error
-            } else {
-                io::Error::other(stderr)
-            });
-        }
-    };
-    drop(receive_socket);
-    let output = child.wait_with_output()?;
-    if !output.status.success() {
-        return Err(io::Error::other(
-            String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-        ));
-    }
-    let flags = unsafe { libc::fcntl(device.as_raw_fd(), libc::F_GETFD) };
-    if flags >= 0 {
-        unsafe { libc::fcntl(device.as_raw_fd(), libc::F_SETFD, flags | libc::FD_CLOEXEC) };
-    }
-    Ok(device)
-}
-
-fn receive_device(socket: &UnixStream) -> io::Result<File> {
-    let mut byte = [0u8];
-    let mut iov = [IoSliceMut::new(&mut byte)];
-    let mut control = nix::cmsg_space!(RawFd);
-    let message = loop {
-        match recvmsg::<SockaddrStorage>(
-            socket.as_raw_fd(),
-            &mut iov,
-            Some(&mut control),
-            MsgFlags::empty(),
-        ) {
-            Ok(message) => break message,
-            Err(nix::errno::Errno::EINTR) => continue,
-            Err(error) => return Err(error.into()),
-        }
-    };
-    if message.bytes == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "fusermount closed its descriptor socket",
-        ));
-    }
-    for item in message
-        .cmsgs()
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
-    {
-        if let ControlMessageOwned::ScmRights(fds) = item {
-            if let Some(fd) = fds.into_iter().find(|fd| *fd >= 0) {
-                // SAFETY: SCM_RIGHTS transferred a new descriptor to us.
-                return Ok(unsafe { File::from_raw_fd(fd) });
-            }
-        }
-    }
-    Err(io::Error::new(
-        io::ErrorKind::InvalidData,
-        "fusermount did not return a /dev/fuse descriptor",
-    ))
-}
-
 fn clone_device(source: &File) -> io::Result<File> {
     let clone = OpenOptions::new()
         .read(true)
@@ -344,18 +227,64 @@ fn clone_device(source: &File) -> io::Result<File> {
     Ok(clone)
 }
 
+fn stop_event() -> io::Result<File> {
+    let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+    if fd < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        // SAFETY: eventfd returned a fresh owned descriptor.
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+}
+
+fn set_nonblocking(file: &File) -> io::Result<()> {
+    let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+    if flags < 0
+        || unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
+    {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
 fn serve_device<F>(
     device: Arc<File>,
+    stop: Arc<File>,
     server: Arc<Server<F>>,
     backing: Arc<BackingRegistry>,
 ) -> io::Result<()>
 where
     F: FileSystem + Send + Sync + 'static,
 {
+    set_nonblocking(&device)?;
     let mut request = vec![0u8; MAX_REQUEST_SIZE];
     let mut response = vec![0u8; MAX_REQUEST_SIZE];
     loop {
         let count = loop {
+            let mut descriptors = [
+                libc::pollfd {
+                    fd: device.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: stop.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
+            let ready = unsafe { libc::poll(descriptors.as_mut_ptr(), descriptors.len() as _, -1) };
+            if ready < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error);
+            }
+            if descriptors[1].revents != 0 {
+                return Ok(());
+            }
             match nix::unistd::read(device.as_fd(), &mut request) {
                 Ok(count) => break count,
                 Err(
@@ -403,6 +332,7 @@ mod tests {
     use std::ffi::CStr;
     use std::io::Write;
     use std::mem::size_of;
+    use std::path::Path;
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
     use virtiofsd::filesystem::{
@@ -535,28 +465,62 @@ mod tests {
             return;
         }
         let directory = tempfile::tempdir().unwrap();
+        let runtime = directory.path().join("run");
+        std::fs::create_dir(&runtime).unwrap();
+        let old_runtime = std::env::var_os("XDG_RUNTIME_DIR");
+        let old_namespace = std::env::var_os("SLOPBOX_NS");
+        unsafe {
+            std::env::set_var("XDG_RUNTIME_DIR", &runtime);
+            std::env::set_var("SLOPBOX_NS", "FUSETRANSPORTTEST");
+        }
+        crate::paths::ensure_dirs().unwrap();
+        let mountpoint = crate::paths::mnt_point();
         let daemon_reads = Arc::new(AtomicUsize::new(0));
         let mut backing = tempfile::tempfile().unwrap();
         backing.write_all(b"shared decoder\n").unwrap();
-        let session = FuseSession::mount(
+        let session = crate::fuse_broker::BrokeredFuseSession::mount(
             StaticFile {
                 backing,
                 daemon_reads: daemon_reads.clone(),
             },
-            directory.path(),
+            &mountpoint,
             2,
         )
         .unwrap();
-        assert_eq!(
-            std::fs::read(directory.path().join("hello")).unwrap(),
-            b"shared decoder\n"
+        assert!(
+            !std::fs::read_to_string("/proc/self/mountinfo")
+                .unwrap()
+                .contains(mountpoint.to_string_lossy().as_ref())
         );
+        let read = std::process::Command::new("nsenter")
+            .args(["-t", &session.broker_pid().to_string(), "-U", "-m"])
+            .arg("--preserve-credentials")
+            .args(["--", "cat"])
+            .arg(mountpoint.join("hello"))
+            .output()
+            .unwrap();
+        assert!(
+            read.status.success(),
+            "{}",
+            String::from_utf8_lossy(&read.stderr)
+        );
+        assert_eq!(read.stdout, b"shared decoder\n");
         let (backing_successes, backing_failures) = session.backing_results();
         assert!(
             (backing_successes == 1 && daemon_reads.load(Ordering::Relaxed) == 0)
                 || (backing_failures == 1 && daemon_reads.load(Ordering::Relaxed) == 1)
         );
         session.unmount().unwrap();
+        unsafe {
+            match old_runtime {
+                Some(value) => std::env::set_var("XDG_RUNTIME_DIR", value),
+                None => std::env::remove_var("XDG_RUNTIME_DIR"),
+            }
+            match old_namespace {
+                Some(value) => std::env::set_var("SLOPBOX_NS", value),
+                None => std::env::remove_var("SLOPBOX_NS"),
+            }
+        }
     }
 
     #[test]

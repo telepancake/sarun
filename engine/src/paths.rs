@@ -135,6 +135,13 @@ pub fn mnt_point() -> PathBuf {
     runtime_home().join("mnt")
 }
 
+/// Control socket of the private FUSE mount-owner namespace. Top-level FUSE
+/// runners receive the owner user+mount namespace descriptors here before any
+/// parser/runtime worker starts; it never carries filesystem operations.
+pub fn fuse_broker_socket() -> PathBuf {
+    runtime_home().join("fuse-broker.sock")
+}
+
 /// Per-run vhost-user socket used by the QEMU transport.  It lives beside the
 /// box's other ephemeral state, never in the persistent sqlar/depot.  A named
 /// helper also keeps QEMU launch code from inventing a second path convention.

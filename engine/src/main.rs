@@ -43,6 +43,7 @@ mod browser;
 mod dockerfile;
 mod editor;
 mod frames;
+mod fuse_broker;
 mod fuse_transport;
 #[allow(dead_code)]
 mod generated_wire;
@@ -183,20 +184,6 @@ fn serve() -> i32 {
             return 1;
         }
     };
-    // No live engine — safe to clean up after a previous crashed one. A
-    // stale FUSE mount at mnt_point() makes ensure_dirs() fail with
-    // EEXIST: stat() on a dead-daemon FUSE mount returns ENOTCONN, so
-    // create_dir_all() can't verify the path is a directory and the
-    // error bubbles up. Path::exists() ALSO returns false on a dead
-    // mount (same ENOTCONN), so we just try unconditionally —
-    // fusermount3 silently no-ops when there's nothing to unmount.
-    let mnt = paths::mnt_point();
-    let _ = std::process::Command::new("fusermount3")
-        .arg("-u")
-        .arg(&mnt)
-        .stderr(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .status();
     if let Err(e) = paths::ensure_dirs() {
         eprintln!("sarun-engine: cannot create instance dirs: {e}");
         return 1;
@@ -222,17 +209,21 @@ fn serve() -> i32 {
         libc::signal(libc::SIGTERM, on_term as *const () as libc::sighandler_t);
         libc::signal(libc::SIGINT, on_term as *const () as libc::sighandler_t);
     }
-    // Mount the multi-box overlay at the instance mountpoint (threads = cores).
+    // Retain the multi-box overlay only in the mount-owner broker's private
+    // user+mount namespace. The engine keeps the raw FUSE connection and
+    // workers; the short superblock-creation attachment is gone before those
+    // workers or the control accept loop start.
     let mnt = paths::mnt_point();
     let ov = sarunfs::SarunFs::new(PathBuf::from("/"));
     let n = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
-    let session = match fuse_transport::FuseSession::mount(ov.clone(), &mnt, n) {
-        Ok(s) => Some(s),
+    let session = match fuse_broker::BrokeredFuseSession::mount(ov.clone(), &mnt, n) {
+        Ok(s) => s,
         Err(e) => {
-            eprintln!("sarun-engine: overlay mount FAILED: {e} — boxes cannot run");
-            None
+            eprintln!("sarun-engine: private overlay mount FAILED: {e}");
+            let _ = std::fs::remove_file(&sock);
+            return 1;
         }
     };
     let state: control::State = Default::default();
@@ -382,7 +373,7 @@ fn serve() -> i32 {
     // Mirror-update scheduler: a minute tick starting whatever jobs are
     // due (mirrors.db). No jobs → pure no-op loop.
     mirrors::scheduler_thread();
-    let rc = match control::serve(state, listener) {
+    let rc = match control::serve(state.clone(), listener) {
         Ok(()) => 0,
         Err(_) if TERMINATING.load(Ordering::Acquire) => 0,
         Err(e) => {
@@ -391,10 +382,9 @@ fn serve() -> i32 {
         }
     };
     LISTENER_FOR_SIGNAL.store(-1, Ordering::Release);
-    if let Some(session) = session {
-        if let Err(error) = session.unmount() {
-            eprintln!("sarun-engine: overlay unmount failed: {error}");
-        }
+    control::terminate_runners(&state);
+    if let Err(error) = session.unmount() {
+        eprintln!("sarun-engine: overlay unmount failed: {error}");
     }
     let _ = std::fs::remove_file(&sock);
     rc
@@ -526,6 +516,12 @@ fn main() {
     if unsafe { libc::getpid() } == 1 {
         std::process::exit(appliance::init_main());
     }
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    // The mount-owner is a deliberately tiny role that must unshare while it
+    // is still single-threaded and must never initialize Prolog.
+    if fuse_broker::is_child_command(&argv) {
+        std::process::exit(fuse_broker::child_main());
+    }
     // A rootless Tap network namespace must be created while this is still a
     // single-threaded process.  Ordinary invocations do nothing here; a runner
     // that discovered it lacked CAP_NET_ADMIN self-execs once with the private
@@ -533,6 +529,16 @@ fn main() {
     if let Err(error) = net::tap::prepare_early_tap() {
         eprintln!("sarun-engine: early Tap setup failed: {error}");
         std::process::exit(1);
+    }
+    // A top-level FUSE runner must join the mount owner's user namespace and
+    // then its mount namespace before the parser can start a worker. This
+    // preserves the runner process, foreground group, stdio and signal path;
+    // bwrap later creates the required child user namespace in the usual way.
+    if fuse_broker::is_top_level_fuse_run(&argv) {
+        if let Err(error) = fuse_broker::enter_runner_namespace() {
+            eprintln!("sarun-engine: cannot enter private FUSE namespace: {error}");
+            std::process::exit(3);
+        }
     }
     prolog::ensure_linked();
 
@@ -580,7 +586,6 @@ fn main() {
         let full: Vec<String> = std::env::args().collect();
         std::process::exit(katirun::make_main(&full));
     }
-    let argv: Vec<String> = std::env::args().skip(1).collect();
     // Explicit `brush-sh -- <argv...>` subcommand for DIRECT testing of the shim
     // without the bwrap shadow binds: everything after `--` is the shell argv
     // (argv[0] = the shell name). The env stash vars still select the real shell.

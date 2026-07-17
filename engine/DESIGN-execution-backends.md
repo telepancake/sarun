@@ -150,7 +150,7 @@ as executable mappings and mmap that genuinely need a host fd.
       bwrap user namespace cannot bind a mount owned by its sibling user
       namespace. A standalone child-userns tmpfs fixture reproduces the same
       kernel rejection, so this is not a FUSE or SarunFs defect.
-- [ ] Remove the engine's outer-namespace FUSE mount using the viable nested
+- [x] Remove the engine's outer-namespace FUSE mount using the viable nested
       topology: a small mount-owner/spawn broker creates the user+mount
       namespace, owns the single FUSE mount and launches each FUSE runner as
       its descendant. The runner's bwrap user namespace is then nested below
@@ -159,6 +159,34 @@ as executable mappings and mmap that genuinely need a host fd.
       broker, prove all backend/workload gates, and only then remove the
       currently working outer mount. Do not add an alternate mode or retain
       the failed outside-in descriptor path.
+  - [x] Use a namespace-fd handoff rather than a command/stdin proxy.  The
+        single-threaded top-level FUSE runner joins the broker-owned user then
+        mount namespace before Prolog or any other worker starts, and only then
+        creates its Tap namespace and invokes bwrap.  The runner consequently
+        stays in the caller's process/session/foreground group with its original
+        stdio, terminal and signal path, while bwrap's user namespace is a child
+        of the mount owner.  A live kernel fixture has proven that this ordered
+        `setns(user)`/`setns(mount)` descent works and that a subsequent bwrap
+        sees mounts private to the broker; it avoids inventing a terminal and
+        signal relay protocol merely to reproduce inherited Unix semantics.
+  - [x] Preserve the complete canonical uid/gid space while privatizing the
+        mount. A FUSE superblock translates protocol IDs through its creating
+        user namespace; creating it in the broker's one-ID namespace makes
+        every other owner invalid and Linux rejects writes before FUSE sees
+        them. Therefore `fusermount3` creates the superblock in the initial
+        user namespace, the broker immediately clones it by unsharing its
+        identity-mapped user+mount namespaces, and the outer startup copy is
+        removed with a propagating, non-lazy unmount before workers, the
+        control accept loop, or any runner become ready. The broker then owns
+        the sole live mount, serves authenticated
+        namespace-fd handoffs, and unmounts on ordered shutdown or engine EOF.
+        Assert the engine/ordinary host mountinfo has no steady-state FUSE
+        entry; do not normalize or collapse ownership to fit a one-ID map.
+        The aarch64 raw-transport fixture reads through the broker namespace
+        while asserting both engine and caller host mountinfo stay clean. The
+        portable backend equivalence, 32-bit appliance, nested/flat QEMU,
+        live-runner shutdown, Tap capture, and real developer workload gates
+        all pass with the broker active; FUSE and QEMU observations match.
 
 ### 3. SUD cutover
 
