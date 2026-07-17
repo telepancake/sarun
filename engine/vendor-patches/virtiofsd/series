@@ -3,3 +3,4 @@
 0030-Share-decoder-with-raw-FUSE-transport.patch
 0040-Negotiate-kernel-FUSE-transport-defaults.patch
 0050-Preserve-kernel-FUSE-backing-acceleration.patch
+0060-Decode-and-expose-filesystem-record-locks.patch

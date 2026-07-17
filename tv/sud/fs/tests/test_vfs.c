@@ -166,6 +166,14 @@ static long fs_call(long nr, long a0, long a1, long a2,
     return context.ret;
 }
 
+struct test_flock {
+    short type;
+    short whence;
+    long start;
+    long length;
+    int pid;
+};
+
 static int child_calls(struct sud_fs_ring *ring, int lane)
 {
     if (raw_syscall6(SYS_dup2, lane, SUD_FS_FD_LANE_FD, 0, 0, 0, 0) < 0)
@@ -221,6 +229,21 @@ static int child_calls(struct sud_fs_ring *ring, int lane)
     if (fs_call(SYS_ftruncate, fd, 3, 0, 0, 0, 0) != 0) return 18;
     if (fs_call(SYS_fsync, fd, 0, 0, 0, 0, 0) != 0
         || fs_call(SYS_fchmod, fd, 0600, 0, 0, 0, 0) != 0) return 19;
+    struct test_flock lock = {
+        .type = F_WRLCK, .whence = SEEK_SET, .start = 2, .length = 3,
+    };
+#ifdef SYS_fcntl
+    long lock_syscall = SYS_fcntl;
+#else
+    long lock_syscall = SYS_fcntl64;
+#endif
+    if (fs_call(lock_syscall, fd, F_SETLK, (long)&lock, 0, 0, 0) != 0)
+        return 19;
+    lock.type = F_WRLCK;
+    if (fs_call(lock_syscall, fd, F_GETLK, (long)&lock, 0, 0, 0) != 0
+        || lock.type != F_UNLCK) return 19;
+    if (fs_call(SYS_flock, fd, LOCK_EX | LOCK_NB, 0, 0, 0, 0) != 0
+        || fs_call(SYS_flock, fd, LOCK_UN, 0, 0, 0, 0) != 0) return 19;
     struct timespec times[2] = { { 123, 456 }, { 789, 12 } };
     if (fs_call(SYS_utimensat, AT_FDCWD, (long)"/hello", (long)times,
                 0, 0, 0) != 0) return 19;
@@ -349,6 +372,34 @@ static int serve_calls(struct sud_fs_ring *ring)
         || setattr->mode != 0600 || setattr->fh != 9) return 29;
     attributes.attr.mode = S_IFREG | 0600;
     reply(slot, &attributes, sizeof(attributes));
+
+    slot = take_request(ring); header = (struct fuse_in_header *)slot->request;
+    struct fuse_lk_in *lock_input = (struct fuse_lk_in *)(header + 1);
+    if (header->opcode != FUSE_SETLK || lock_input->fh != 9
+        || lock_input->owner == 0 || lock_input->lk.start != 2
+        || lock_input->lk.end != 4 || lock_input->lk.type != F_WRLCK) return 90;
+    reply(slot, 0, 0);
+
+    slot = take_request(ring); header = (struct fuse_in_header *)slot->request;
+    lock_input = (struct fuse_lk_in *)(header + 1);
+    if (header->opcode != FUSE_GETLK || lock_input->lk.start != 2
+        || lock_input->lk.end != 4) return 91;
+    struct fuse_lk_out no_lock = { .lk = lock_input->lk };
+    no_lock.lk.type = F_UNLCK;
+    reply(slot, &no_lock, sizeof(no_lock));
+
+    slot = take_request(ring); header = (struct fuse_in_header *)slot->request;
+    lock_input = (struct fuse_lk_in *)(header + 1);
+    if (header->opcode != FUSE_SETLK || !(lock_input->lk_flags & FUSE_LK_FLOCK)
+        || lock_input->lk.type != F_WRLCK || lock_input->lk.start != 0
+        || lock_input->lk.end != UINT64_MAX) return 92;
+    reply(slot, 0, 0);
+
+    slot = take_request(ring); header = (struct fuse_in_header *)slot->request;
+    lock_input = (struct fuse_lk_in *)(header + 1);
+    if (header->opcode != FUSE_SETLK || !(lock_input->lk_flags & FUSE_LK_FLOCK)
+        || lock_input->lk.type != F_UNLCK) return 93;
+    reply(slot, 0, 0);
 
     slot = take_request(ring); header = (struct fuse_in_header *)slot->request;
     if (header->opcode != FUSE_LOOKUP || header->nodeid != FUSE_ROOT_ID

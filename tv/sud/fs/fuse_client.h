@@ -58,6 +58,12 @@ int sud_fuse_fallocate(uint64_t inode, uint64_t handle, uint32_t mode,
                        uint64_t offset, uint64_t length);
 long sud_fuse_lseek(uint64_t inode, uint64_t handle, uint64_t offset,
                     uint32_t whence);
+int sud_fuse_getlk(uint64_t inode, uint64_t handle, uint64_t owner,
+                   const struct fuse_file_lock *request, uint32_t flags,
+                   struct fuse_file_lock *result);
+int sud_fuse_setlk(uint64_t inode, uint64_t handle, uint64_t owner,
+                   const struct fuse_file_lock *lock, uint32_t flags,
+                   int blocking);
 
 size_t sud_fuse_max_read(void);
 size_t sud_fuse_max_write(void);

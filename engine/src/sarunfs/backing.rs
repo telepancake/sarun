@@ -376,6 +376,10 @@ impl BackingNode {
 }
 
 impl BackingFile {
+    pub(crate) fn identity(&self) -> u64 {
+        self.inode
+    }
+
     pub(crate) fn lseek(&self, offset: u64, whence: u32) -> io::Result<u64> {
         self.store.inner.fs.lseek(
             context(),

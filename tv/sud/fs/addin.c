@@ -77,6 +77,78 @@ static long duplicate_fd(int oldfd, int newfd, int flags, int exact)
     return result;
 }
 
+struct sud_kernel_flock {
+    short type;
+    short whence;
+    long start;
+    long length;
+    int pid;
+};
+
+struct sud_kernel_flock64 {
+    short type;
+    short whence;
+    int64_t start;
+    int64_t length;
+    int pid;
+} __attribute__((packed, aligned(4)));
+
+static int fcntl_lock_command(int command)
+{
+    return command == F_GETLK || command == F_SETLK || command == F_SETLKW
+        || command == F_GETLK64 || command == F_SETLK64 || command == F_SETLKW64
+        || command == F_OFD_GETLK || command == F_OFD_SETLK
+        || command == F_OFD_SETLKW;
+}
+
+static long dispatch_lock(int fd, int command, void *argument)
+{
+    if (!argument) return -EFAULT;
+#if defined(__x86_64__)
+    int wide = 0;
+#else
+    int wide = command == F_GETLK64 || command == F_SETLK64
+            || command == F_SETLKW64 || command == F_OFD_GETLK
+            || command == F_OFD_SETLK || command == F_OFD_SETLKW;
+#endif
+    struct sud_vfs_lock lock;
+    if (wide) {
+        struct sud_kernel_flock64 *input = argument;
+        lock.type = input->type;
+        lock.whence = input->whence;
+        lock.start = input->start;
+        lock.length = input->length;
+        lock.pid = input->pid;
+    } else {
+        struct sud_kernel_flock *input = argument;
+        lock.type = input->type;
+        lock.whence = input->whence;
+        lock.start = input->start;
+        lock.length = input->length;
+        lock.pid = input->pid;
+    }
+    long result = sud_vfs_lock(fd, command, &lock);
+    if (result != 0 || (command != F_GETLK && command != F_GETLK64
+                         && command != F_OFD_GETLK)) return result;
+    if (wide) {
+        struct sud_kernel_flock64 *output = argument;
+        output->type = (short)lock.type;
+        output->whence = (short)lock.whence;
+        output->start = lock.start;
+        output->length = lock.length;
+        output->pid = lock.pid;
+    } else {
+        if (lock.start > LONG_MAX || lock.length > LONG_MAX) return -EOVERFLOW;
+        struct sud_kernel_flock *output = argument;
+        output->type = (short)lock.type;
+        output->whence = (short)lock.whence;
+        output->start = (long)lock.start;
+        output->length = (long)lock.length;
+        output->pid = lock.pid;
+    }
+    return 0;
+}
+
 static int dispatch_dup_to(struct sud_syscall_ctx *ctx,
                            int oldfd, int newfd, int flags, int is_dup3)
 {
@@ -115,6 +187,9 @@ static int dispatch_fcntl(struct sud_syscall_ctx *ctx)
     case F_SETFL:
         return handled(ctx, sud_vfs_setfl(fd, (int)ctx->args[2]));
     default:
+        if (fcntl_lock_command((int)ctx->args[1]))
+            return handled(ctx, dispatch_lock(fd, (int)ctx->args[1],
+                                              (void *)ctx->args[2]));
         return 0;
     }
 }
@@ -307,6 +382,11 @@ static int fs_pre_syscall(struct sud_syscall_ctx *ctx)
 #endif
 #ifdef SYS_fcntl64
     if (nr == SYS_fcntl64) return dispatch_fcntl(ctx);
+#endif
+#ifdef SYS_flock
+    if (nr == SYS_flock && sud_vfs_owns_fd((int)ctx->args[0]))
+        return handled(ctx, sud_vfs_flock((int)ctx->args[0],
+                         (int)ctx->args[1]));
 #endif
     if (nr == SYS_fstat && sud_vfs_owns_fd((int)ctx->args[0]))
         return handled(ctx, sud_vfs_fstat((int)ctx->args[0],

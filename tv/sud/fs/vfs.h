@@ -64,6 +64,15 @@ int sud_vfs_removexattrat(int dirfd, const char *path, int follow,
 int sud_vfs_fremovexattr(int fd, const char *name);
 int sud_vfs_fallocate(int fd, unsigned int mode, uint64_t offset,
                       uint64_t length);
+struct sud_vfs_lock {
+    int type;
+    int whence;
+    int64_t start;
+    int64_t length;
+    int pid;
+};
+int sud_vfs_lock(int fd, int command, struct sud_vfs_lock *lock);
+int sud_vfs_flock(int fd, int operation);
 void sud_vfs_fork_child(void);
 void sud_vfs_process_exit(void);
 

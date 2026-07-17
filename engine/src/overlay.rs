@@ -27,6 +27,7 @@ use std::os::fd::FromRawFd;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Condvar;
 use std::sync::Mutex;
 use std::sync::RwLock;
 use std::sync::atomic::AtomicU64;
@@ -77,6 +78,7 @@ struct Errno(i32);
 
 impl Errno {
     const EACCES: Self = Self(libc::EACCES);
+    const EAGAIN: Self = Self(libc::EAGAIN);
     const EBADF: Self = Self(libc::EBADF);
     const EEXIST: Self = Self(libc::EEXIST);
     const EFBIG: Self = Self(libc::EFBIG);
@@ -153,10 +155,170 @@ struct Inner {
     passthrough_ok: std::sync::atomic::AtomicBool,
     daemon_reads: AtomicU64,
     mutations: crate::sarunfs::mutation::MutationJournal,
+    locks: LockTable,
 }
 
 struct Fh {
     inner: FhInner,
+    lock_identity: LockIdentity,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum LockIdentity {
+    Native(u64, u64),
+    Lower(u64),
+    Synthetic(u64),
+}
+
+#[derive(Clone, Copy)]
+struct RecordLock {
+    owner: u64,
+    start: u64,
+    end: u64,
+    type_: u32,
+    pid: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct LockKey {
+    file: LockIdentity,
+    flock: bool,
+}
+
+struct LockTable {
+    state: Mutex<HashMap<LockKey, Vec<RecordLock>>>,
+    changed: Condvar,
+}
+
+impl LockTable {
+    fn new() -> Self {
+        Self { state: Mutex::new(HashMap::new()), changed: Condvar::new() }
+    }
+
+    fn conflict(records: &[RecordLock], owner: u64,
+                requested: &virtiofsd::fuse::FileLock) -> Option<RecordLock> {
+        records.iter().copied().find(|record| {
+            record.owner != owner
+                && record.start <= requested.end
+                && requested.start <= record.end
+                && (record.type_ == libc::F_WRLCK as u32
+                    || requested.type_ == libc::F_WRLCK as u32)
+        })
+    }
+
+    fn get(&self, key: LockKey, owner: u64,
+           requested: virtiofsd::fuse::FileLock) -> virtiofsd::fuse::FileLock {
+        let state = self.state.lock().unwrap();
+        Self::conflict(state.get(&key).map(Vec::as_slice).unwrap_or(&[]),
+                       owner, &requested)
+            .map(|record| virtiofsd::fuse::FileLock {
+                start: record.start,
+                end: record.end,
+                type_: record.type_,
+                pid: record.pid,
+            })
+            .unwrap_or(virtiofsd::fuse::FileLock {
+                type_: libc::F_UNLCK as u32,
+                ..requested
+            })
+    }
+
+    fn set(&self, key: LockKey, owner: u64,
+           requested: virtiofsd::fuse::FileLock, blocking: bool)
+           -> Result<(), Errno> {
+        if requested.start > requested.end
+            || !matches!(requested.type_, x if x == libc::F_RDLCK as u32
+                                      || x == libc::F_WRLCK as u32
+                                      || x == libc::F_UNLCK as u32)
+        {
+            return Err(Errno::EINVAL);
+        }
+        let mut state = self.state.lock().unwrap();
+        while requested.type_ != libc::F_UNLCK as u32
+            && Self::conflict(state.get(&key).map(Vec::as_slice).unwrap_or(&[]),
+                              owner, &requested).is_some()
+        {
+            if !blocking { return Err(Errno::EAGAIN); }
+            state = self.changed.wait(state).unwrap();
+        }
+        let records = state.entry(key).or_default();
+        let mut replacement = Vec::with_capacity(records.len() + 2);
+        for record in records.drain(..) {
+            if record.owner != owner
+                || record.end < requested.start || requested.end < record.start
+            {
+                replacement.push(record);
+                continue;
+            }
+            if record.start < requested.start {
+                replacement.push(RecordLock {
+                    end: requested.start - 1,
+                    ..record
+                });
+            }
+            if record.end > requested.end {
+                replacement.push(RecordLock {
+                    start: requested.end + 1,
+                    ..record
+                });
+            }
+        }
+        if requested.type_ != libc::F_UNLCK as u32 {
+            replacement.push(RecordLock {
+                owner,
+                start: requested.start,
+                end: requested.end,
+                type_: requested.type_,
+                pid: requested.pid,
+            });
+        }
+        *records = replacement;
+        if records.is_empty() { state.remove(&key); }
+        drop(state);
+        self.changed.notify_all();
+        Ok(())
+    }
+
+    fn release(&self, key: LockKey, owner: u64) {
+        let mut state = self.state.lock().unwrap();
+        if let Some(records) = state.get_mut(&key) {
+            records.retain(|record| record.owner != owner);
+            if records.is_empty() { state.remove(&key); }
+        }
+        drop(state);
+        self.changed.notify_all();
+    }
+}
+
+#[cfg(test)]
+mod lock_tests {
+    use super::*;
+
+    #[test]
+    fn record_locks_conflict_split_and_release_by_owner() {
+        let table = LockTable::new();
+        let key = LockKey { file: LockIdentity::Synthetic(1), flock: false };
+        let write = virtiofsd::fuse::FileLock {
+            start: 10, end: 19, type_: libc::F_WRLCK as u32, pid: 123,
+        };
+        table.set(key, 100, write, false).unwrap();
+        let conflict = table.get(key, 200, write);
+        assert_eq!(conflict.type_, libc::F_WRLCK as u32);
+        assert_eq!((conflict.start, conflict.end, conflict.pid), (10, 19, 123));
+        assert_eq!(table.set(key, 200, write, false), Err(Errno::EAGAIN));
+
+        table.set(key, 100, virtiofsd::fuse::FileLock {
+            start: 13, end: 16, type_: libc::F_UNLCK as u32, pid: 123,
+        }, false).unwrap();
+        let middle = table.get(key, 200, virtiofsd::fuse::FileLock {
+            start: 13, end: 16, type_: libc::F_WRLCK as u32, pid: 200,
+        });
+        assert_eq!(middle.type_, libc::F_UNLCK as u32);
+        assert_eq!(table.get(key, 200, write).start, 10);
+
+        table.release(key, 100);
+        assert_eq!(table.get(key, 200, write).type_, libc::F_UNLCK as u32);
+    }
 }
 
 enum FileData {
@@ -441,6 +603,7 @@ impl SarunFs {
                 passthrough_ok: std::sync::atomic::AtomicBool::new(false),
                 daemon_reads: AtomicU64::new(0),
                 mutations: crate::sarunfs::mutation::MutationJournal::new(),
+                locks: LockTable::new(),
                 shadows: RwLock::new(Shadows::load()),
             }),
             root: (0, String::new()),
@@ -2453,6 +2616,43 @@ impl SarunFs {
         }
     }
 
+    fn lock_key(&self, handle: u64, flags: u32) -> Result<LockKey, Errno> {
+        let handle = self.inner.handles.get(handle).ok_or(Errno::EBADF)?;
+        let Handle::File(handle) = &*handle else {
+            return Err(Errno::EBADF);
+        };
+        let handle = handle.lock().unwrap();
+        if matches!(handle.inner.data, FileData::Sink(_)) {
+            return Err(Errno::EBADF);
+        }
+        Ok(LockKey {
+            file: handle.lock_identity,
+            flock: flags & virtiofsd::fuse::LK_FLOCK != 0,
+        })
+    }
+
+    fn get_lock_node(&self, handle: u64, owner: u64,
+                     lock: virtiofsd::fuse::FileLock, flags: u32)
+                     -> Result<virtiofsd::fuse::FileLock, Errno> {
+        let key = self.lock_key(handle, flags)?;
+        Ok(self.inner.locks.get(key, owner, lock))
+    }
+
+    fn set_lock_node(&self, handle: u64, owner: u64,
+                     lock: virtiofsd::fuse::FileLock, flags: u32,
+                     blocking: bool) -> Result<(), Errno> {
+        let key = self.lock_key(handle, flags)?;
+        self.inner.locks.set(key, owner, lock, blocking)
+    }
+
+    fn release_lock_owner(&self, handle: u64, owner: u64, flock: bool) {
+        if let Ok(key) = self.lock_key(handle, if flock {
+            virtiofsd::fuse::LK_FLOCK
+        } else { 0 }) {
+            self.inner.locks.release(key, owner);
+        }
+    }
+
     fn statfs_node(&self) -> Result<libc::statvfs64, Errno> {
         self.inner.backing.statfs().map_err(Errno::from)
     }
@@ -2525,9 +2725,16 @@ impl SarunFs {
     }
 
     fn reg_fh(&self, fh: FhInner) -> u64 {
+        let lock_identity = match &fh.data {
+            FileData::Native(file) => file.metadata().ok()
+                .map(|metadata| LockIdentity::Native(metadata.dev(), metadata.ino()))
+                .unwrap_or(LockIdentity::Synthetic(u64::MAX)),
+            FileData::Lower(lower) => LockIdentity::Lower(lower.identity()),
+            FileData::Sink(stream) => LockIdentity::Synthetic(*stream as u64),
+        };
         self.inner
             .handles
-            .insert(Handle::File(Mutex::new(Fh { inner: fh })))
+            .insert(Handle::File(Mutex::new(Fh { inner: fh, lock_identity })))
     }
 
     /// Merged listing of (box, rel) through the FULL chain: host entries, then
@@ -2729,11 +2936,12 @@ impl virtiofsd::filesystem::FileSystem for SarunFs {
         if self.root.0 == 0 {
             self.inner.passthrough_ok.store(passthrough, Ordering::Relaxed);
         }
-        Ok(if passthrough {
-            virtiofsd::filesystem::FsOptions::PASSTHROUGH
-        } else {
-            virtiofsd::filesystem::FsOptions::empty()
-        })
+        let mut wanted = virtiofsd::filesystem::FsOptions::POSIX_LOCKS
+            | virtiofsd::filesystem::FsOptions::FLOCK_LOCKS;
+        if passthrough {
+            wanted |= virtiofsd::filesystem::FsOptions::PASSTHROUGH;
+        }
+        Ok(wanted)
     }
 
     fn lookup(
@@ -3170,9 +3378,15 @@ impl virtiofsd::filesystem::FileSystem for SarunFs {
         _flags: u32,
         handle: u64,
         _flush: bool,
-        _flock_release: bool,
-        _lock_owner: Option<u64>,
+        flock_release: bool,
+        lock_owner: Option<u64>,
     ) -> std::io::Result<()> {
+        self.release_lock_owner(handle, (1u64 << 63) | handle, false);
+        if flock_release {
+            if let Some(owner) = lock_owner {
+                self.release_lock_owner(handle, owner, true);
+            }
+        }
         self.release_node(handle).map_err(virtio_error)
     }
 
@@ -3181,9 +3395,11 @@ impl virtiofsd::filesystem::FileSystem for SarunFs {
         _ctx: virtiofsd::filesystem::Context,
         _inode: u64,
         handle: u64,
-        _lock_owner: u64,
+        lock_owner: u64,
     ) -> std::io::Result<()> {
-        self.sync_file_node(handle, false).map_err(virtio_error)
+        self.sync_file_node(handle, false).map_err(virtio_error)?;
+        self.release_lock_owner(handle, lock_owner, false);
+        Ok(())
     }
 
     fn fsync(
@@ -3213,6 +3429,42 @@ impl virtiofsd::filesystem::FileSystem for SarunFs {
         whence: u32,
     ) -> std::io::Result<u64> {
         self.lseek_node(handle, offset, whence).map_err(virtio_error)
+    }
+
+    fn getlk(
+        &self,
+        _ctx: virtiofsd::filesystem::Context,
+        _inode: u64,
+        handle: u64,
+        owner: u64,
+        lock: virtiofsd::fuse::FileLock,
+        flags: u32,
+    ) -> std::io::Result<virtiofsd::fuse::FileLock> {
+        self.get_lock_node(handle, owner, lock, flags).map_err(virtio_error)
+    }
+
+    fn setlk(
+        &self,
+        _ctx: virtiofsd::filesystem::Context,
+        _inode: u64,
+        handle: u64,
+        owner: u64,
+        lock: virtiofsd::fuse::FileLock,
+        flags: u32,
+    ) -> std::io::Result<()> {
+        self.set_lock_node(handle, owner, lock, flags, false).map_err(virtio_error)
+    }
+
+    fn setlkw(
+        &self,
+        _ctx: virtiofsd::filesystem::Context,
+        _inode: u64,
+        handle: u64,
+        owner: u64,
+        lock: virtiofsd::fuse::FileLock,
+        flags: u32,
+    ) -> std::io::Result<()> {
+        self.set_lock_node(handle, owner, lock, flags, true).map_err(virtio_error)
     }
 
     fn access(

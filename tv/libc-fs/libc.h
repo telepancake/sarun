@@ -804,6 +804,35 @@ extern int g_errno_value;
 #ifndef F_DUPFD_CLOEXEC
 #define F_DUPFD_CLOEXEC  1030
 #endif
+#ifndef F_GETLK
+#define F_GETLK          5
+#define F_SETLK          6
+#define F_SETLKW         7
+#endif
+#ifndef F_GETLK64
+#define F_GETLK64        12
+#define F_SETLK64        13
+#define F_SETLKW64       14
+#endif
+#ifndef F_OFD_GETLK
+#define F_OFD_GETLK      36
+#define F_OFD_SETLK      37
+#define F_OFD_SETLKW     38
+#endif
+#ifndef F_RDLCK
+#define F_RDLCK          0
+#define F_WRLCK          1
+#define F_UNLCK          2
+#endif
+#ifndef LOCK_SH
+#define LOCK_SH          1
+#define LOCK_EX          2
+#define LOCK_NB          4
+#define LOCK_UN          8
+#endif
+#if !defined(SYS_flock) && defined(__NR_flock)
+#define SYS_flock        __NR_flock
+#endif
 #ifndef FD_CLOEXEC
 #define FD_CLOEXEC       1
 #endif
@@ -1341,3 +1370,10 @@ int  fctprintf(void (*out)(char ch, void *arg), void *arg,
 #define vprintf   vprintf_
 
 #endif /* LIBC_FS_LIBC_H */
+#ifndef LONG_MAX
+#if __SIZEOF_LONG__ == 8
+#define LONG_MAX INT64_MAX
+#else
+#define LONG_MAX INT32_MAX
+#endif
+#endif

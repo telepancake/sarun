@@ -71,8 +71,18 @@ static int child_calls(struct sud_fs_ring *ring)
     if (sud_fuse_fallocate(2, 9, FALLOC_FL_KEEP_SIZE, 4096, 8192) != 0)
         return 23;
     if (sud_fuse_lseek(2, 9, 0, SEEK_DATA) != 4096) return 24;
-    if (sud_fuse_flush(2, 9, O_RDWR) != 0) return 25;
-    if (sud_fuse_release(2, 9, O_RDWR) != 0) return 26;
+    struct fuse_file_lock lock = {
+        .start = 10, .end = 19, .type = F_WRLCK, .pid = 123,
+    };
+    if (sud_fuse_setlk(2, 9, 100, &lock, 0, 0) != 0) return 25;
+    struct fuse_file_lock conflict;
+    if (sud_fuse_getlk(2, 9, 200, &lock, 0, &conflict) != 0
+        || conflict.start != 10 || conflict.end != 19
+        || conflict.type != F_WRLCK || conflict.pid != 123) return 26;
+    lock.type = F_UNLCK;
+    if (sud_fuse_setlk(2, 9, 100, &lock, 0, 0) != 0) return 27;
+    if (sud_fuse_flush(2, 9, O_RDWR) != 0) return 28;
+    if (sud_fuse_release(2, 9, O_RDWR) != 0) return 29;
     return 0;
 }
 
@@ -176,10 +186,29 @@ static int serve_calls(struct sud_fs_ring *ring)
     reply(slot, &seeked, sizeof(seeked));
 
     slot = take_request(ring); header = (struct fuse_in_header *)slot->request;
-    if (header->opcode != FUSE_FLUSH) return 35;
+    struct fuse_lk_in *lock = (struct fuse_lk_in *)(header + 1);
+    if (header->opcode != FUSE_SETLK || lock->fh != 9 || lock->owner != 100
+        || lock->lk.start != 10 || lock->lk.end != 19
+        || lock->lk.type != F_WRLCK || lock->lk.pid != 123) return 35;
+    reply(slot, 0, 0);
+
+    slot = take_request(ring); header = (struct fuse_in_header *)slot->request;
+    lock = (struct fuse_lk_in *)(header + 1);
+    if (header->opcode != FUSE_GETLK || lock->owner != 200) return 36;
+    struct fuse_lk_out locked = { .lk = lock->lk };
+    reply(slot, &locked, sizeof(locked));
+
+    slot = take_request(ring); header = (struct fuse_in_header *)slot->request;
+    lock = (struct fuse_lk_in *)(header + 1);
+    if (header->opcode != FUSE_SETLK || lock->owner != 100
+        || lock->lk.type != F_UNLCK) return 37;
+    reply(slot, 0, 0);
+
+    slot = take_request(ring); header = (struct fuse_in_header *)slot->request;
+    if (header->opcode != FUSE_FLUSH) return 38;
     reply(slot, 0, 0);
     slot = take_request(ring); header = (struct fuse_in_header *)slot->request;
-    if (header->opcode != FUSE_RELEASE) return 36;
+    if (header->opcode != FUSE_RELEASE) return 39;
     reply(slot, 0, 0);
     return 0;
 }

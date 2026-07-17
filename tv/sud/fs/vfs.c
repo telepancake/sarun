@@ -8,7 +8,7 @@
 #include <asm/statfs.h>
 
 #define SUD_OFD_MAGIC UINT32_C(0x53464f44) /* "SFOD" */
-#define SUD_OFD_VERSION 1u
+#define SUD_OFD_VERSION 3u
 #define SUD_OFD_MAP_SIZE 8192u
 #define SUD_FD_TABLE_SIZE 2048u
 
@@ -24,6 +24,8 @@ struct sud_remote_ofd {
     uint32_t flags;
     uint32_t open_flags;
     uint32_t mode;
+    uint32_t flocked;
+    uint32_t ofd_locked;
     uint32_t path_len;
     char path[PATH_MAX];
 };
@@ -1018,6 +1020,124 @@ int sud_vfs_fallocate(int fd, unsigned int mode, uint64_t offset,
                               mode, offset, length);
 }
 
+static int lock_range(struct sud_remote_ofd *description,
+                      const struct sud_vfs_lock *input,
+                      struct fuse_file_lock *output)
+{
+    int64_t base;
+    if (input->whence == SEEK_SET) base = 0;
+    else if (input->whence == SEEK_CUR) {
+        ofd_lock(description);
+        base = (int64_t)description->offset;
+        ofd_unlock(description);
+    } else if (input->whence == SEEK_END) {
+        struct fuse_attr_out attributes;
+        int result = sud_fuse_getattr(description->inode, description->handle,
+                                      1, &attributes);
+        if (result != 0) return result;
+        if (attributes.attr.size > INT64_MAX) return -EOVERFLOW;
+        base = (int64_t)attributes.attr.size;
+    } else return -EINVAL;
+    if ((input->start < 0
+         && (input->start == INT64_MIN || base < -input->start))
+        || (input->start > 0 && base > INT64_MAX - input->start))
+        return -EINVAL;
+    int64_t start = base + input->start;
+    int64_t end;
+    if (input->length > 0) {
+        if (start < 0 || input->length - 1 > INT64_MAX - start)
+            return -EOVERFLOW;
+        end = start + input->length - 1;
+    } else if (input->length == 0) {
+        if (start < 0) return -EINVAL;
+        end = INT64_MAX;
+    } else {
+        if (input->length == INT64_MIN || start < -input->length)
+            return -EINVAL;
+        end = start - 1;
+        start += input->length;
+    }
+    output->start = (uint64_t)start;
+    output->end = end == INT64_MAX ? UINT64_MAX : (uint64_t)end;
+    output->type = (uint32_t)input->type;
+    output->pid = (uint32_t)input->pid;
+    return 0;
+}
+
+int sud_vfs_lock(int fd, int command, struct sud_vfs_lock *lock)
+{
+    struct sud_remote_ofd *description = description_for(fd);
+    if (!description) return -EBADF;
+    if (!lock) return -EFAULT;
+    int query = command == F_GETLK || command == F_GETLK64
+             || command == F_OFD_GETLK;
+    int blocking = command == F_SETLKW || command == F_SETLKW64
+                || command == F_OFD_SETLKW;
+    int set = command == F_SETLK || command == F_SETLK64
+           || command == F_OFD_SETLK || blocking;
+    if (!query && !set) return -EINVAL;
+    if (lock->type == F_RDLCK
+        && (description->flags & O_ACCMODE) == O_WRONLY) return -EBADF;
+    if (lock->type == F_WRLCK
+        && (description->flags & O_ACCMODE) == O_RDONLY) return -EBADF;
+    struct fuse_file_lock request;
+    int result = lock_range(description, lock, &request);
+    if (result != 0) return result;
+    int ofd = command == F_OFD_GETLK || command == F_OFD_SETLK
+           || command == F_OFD_SETLKW;
+    uint64_t owner = ofd
+        ? (UINT64_C(1) << 63) | description->handle
+        : (uint64_t)(uint32_t)raw_getpid();
+    request.pid = ofd ? UINT32_MAX : (uint32_t)raw_getpid();
+    if (query) {
+        struct fuse_file_lock conflict;
+        result = sud_fuse_getlk(description->inode, description->handle,
+                                owner, &request, 0, &conflict);
+        if (result == 0) {
+            if (conflict.start > INT64_MAX
+                || (conflict.end != UINT64_MAX
+                    && conflict.end - conflict.start + 1 > INT64_MAX))
+                return -EOVERFLOW;
+            lock->type = (int)conflict.type;
+            lock->whence = SEEK_SET;
+            lock->start = (int64_t)conflict.start;
+            lock->length = conflict.end == UINT64_MAX ? 0
+                : (int64_t)(conflict.end - conflict.start + 1);
+            lock->pid = (int)conflict.pid;
+        }
+        return result;
+    }
+    result = sud_fuse_setlk(description->inode, description->handle,
+                            owner, &request, 0, blocking);
+    if (result == 0 && ofd)
+        __atomic_store_n(&description->ofd_locked, 1u, __ATOMIC_RELEASE);
+    return result;
+}
+
+int sud_vfs_flock(int fd, int operation)
+{
+    struct sud_remote_ofd *description = description_for(fd);
+    if (!description) return -EBADF;
+    if (operation & ~(LOCK_SH | LOCK_EX | LOCK_NB | LOCK_UN)) return -EINVAL;
+    int kind = operation & (LOCK_SH | LOCK_EX | LOCK_UN);
+    if (kind != LOCK_SH && kind != LOCK_EX && kind != LOCK_UN) return -EINVAL;
+    struct fuse_file_lock lock = {
+        .start = 0,
+        .end = UINT64_MAX,
+        .type = kind == LOCK_SH ? F_RDLCK
+              : kind == LOCK_EX ? F_WRLCK : F_UNLCK,
+        .pid = (uint32_t)raw_getpid(),
+    };
+    uint64_t owner = (UINT64_C(1) << 63) | description->handle;
+    int result = sud_fuse_setlk(description->inode, description->handle,
+                                owner, &lock, FUSE_LK_FLOCK,
+                                kind != LOCK_UN && !(operation & LOCK_NB));
+    if (result == 0)
+        __atomic_store_n(&description->flocked, kind != LOCK_UN,
+                         __ATOMIC_RELEASE);
+    return result;
+}
+
 int sud_vfs_getfl(int fd)
 {
     struct sud_remote_ofd *description = description_for(fd);
@@ -1281,9 +1401,28 @@ int sud_vfs_close(int fd)
             (void)sud_fuse_releasedir(description->inode,
                                       description->handle,
                                       description->flags);
-        else
+        else {
+            if (__atomic_load_n(&description->ofd_locked, __ATOMIC_ACQUIRE)) {
+                struct fuse_file_lock unlock = {
+                    .start = 0, .end = UINT64_MAX, .type = F_UNLCK,
+                    .pid = UINT32_MAX,
+                };
+                (void)sud_fuse_setlk(description->inode, description->handle,
+                                     (UINT64_C(1) << 63) | description->handle,
+                                     &unlock, 0, 0);
+            }
+            if (__atomic_load_n(&description->flocked, __ATOMIC_ACQUIRE)) {
+            struct fuse_file_lock unlock = {
+                .start = 0, .end = UINT64_MAX, .type = F_UNLCK,
+                .pid = (uint32_t)raw_getpid(),
+            };
+            (void)sud_fuse_setlk(description->inode, description->handle,
+                                 (UINT64_C(1) << 63) | description->handle,
+                                 &unlock, FUSE_LK_FLOCK, 0);
+            }
             (void)sud_fuse_release(description->inode, description->handle,
                                    description->flags);
+        }
         if (description->lookup_count)
             (void)sud_fuse_forget(description->inode,
                                   description->lookup_count);
@@ -1324,9 +1463,28 @@ int sud_vfs_dup(int oldfd, int newfd)
                 (void)sud_fuse_releasedir(displaced->inode,
                                           displaced->handle,
                                           displaced->flags);
-            else
+            else {
+                if (__atomic_load_n(&displaced->ofd_locked, __ATOMIC_ACQUIRE)) {
+                    struct fuse_file_lock unlock = {
+                        .start = 0, .end = UINT64_MAX, .type = F_UNLCK,
+                        .pid = UINT32_MAX,
+                    };
+                    (void)sud_fuse_setlk(displaced->inode, displaced->handle,
+                                         (UINT64_C(1) << 63) | displaced->handle,
+                                         &unlock, 0, 0);
+                }
+                if (__atomic_load_n(&displaced->flocked, __ATOMIC_ACQUIRE)) {
+                struct fuse_file_lock unlock = {
+                    .start = 0, .end = UINT64_MAX, .type = F_UNLCK,
+                    .pid = (uint32_t)raw_getpid(),
+                };
+                (void)sud_fuse_setlk(displaced->inode, displaced->handle,
+                                     (UINT64_C(1) << 63) | displaced->handle,
+                                     &unlock, FUSE_LK_FLOCK, 0);
+                }
                 (void)sud_fuse_release(displaced->inode, displaced->handle,
                                        displaced->flags);
+            }
             if (displaced->lookup_count)
                 (void)sud_fuse_forget(displaced->inode,
                                       displaced->lookup_count);

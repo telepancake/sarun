@@ -605,3 +605,41 @@ long sud_fuse_lseek(uint64_t inode, uint64_t handle, uint64_t offset,
     if (output.offset > INT64_MAX) return -EOVERFLOW;
     return (long)output.offset;
 }
+
+int sud_fuse_getlk(uint64_t inode, uint64_t handle, uint64_t owner,
+                   const struct fuse_file_lock *request, uint32_t flags,
+                   struct fuse_file_lock *result_lock)
+{
+    struct fuse_call call;
+    int result = call_begin(&call, FUSE_GETLK, inode, sizeof(struct fuse_lk_in));
+    if (result != 0) return result;
+    struct fuse_lk_in *input = call_input_payload(&call);
+    memset(input, 0, sizeof(*input));
+    input->fh = handle;
+    input->owner = owner;
+    input->lk = *request;
+    input->lk_flags = flags;
+    struct fuse_lk_out output;
+    result = copy_fixed_reply(&call, &output, sizeof(output));
+    if (result == 0) *result_lock = output.lk;
+    return result;
+}
+
+int sud_fuse_setlk(uint64_t inode, uint64_t handle, uint64_t owner,
+                   const struct fuse_file_lock *lock, uint32_t flags,
+                   int blocking)
+{
+    struct fuse_call call;
+    int result = call_begin(&call, blocking ? FUSE_SETLKW : FUSE_SETLK,
+                            inode, sizeof(struct fuse_lk_in));
+    if (result != 0) return result;
+    struct fuse_lk_in *input = call_input_payload(&call);
+    memset(input, 0, sizeof(*input));
+    input->fh = handle;
+    input->owner = owner;
+    input->lk = *lock;
+    input->lk_flags = flags;
+    result = call_submit(&call);
+    call_end(&call);
+    return result;
+}

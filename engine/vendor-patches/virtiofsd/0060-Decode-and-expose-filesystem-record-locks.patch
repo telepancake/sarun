@@ -1,0 +1,119 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Fri, 17 Jul 2026 02:51:18 +0000
+Subject: [PATCH] Decode and expose filesystem record locks
+
+---
+diff --git a/src/filesystem.rs b/src/filesystem.rs
+index 3d797dc..28bddf9 100644
+--- a/src/filesystem.rs
++++ b/src/filesystem.rs
+@@ -985,19 +985,43 @@ pub trait FileSystem {
+         Err(io::Error::from_raw_os_error(libc::ENOSYS))
+     }
+ 
+-    /// TODO: support this
+-    fn getlk(&self) -> io::Result<()> {
++    /// Return the first lock conflicting with `lock`, or an unlocked record.
++    fn getlk(
++        &self,
++        ctx: Context,
++        inode: Self::Inode,
++        handle: Self::Handle,
++        owner: u64,
++        lock: fuse::FileLock,
++        flags: u32,
++    ) -> io::Result<fuse::FileLock> {
+         Err(io::Error::from_raw_os_error(libc::ENOSYS))
+     }
+ 
+-    /// TODO: support this
+-    fn setlk(&self) -> io::Result<()> {
++    /// Acquire, replace, or release a non-blocking record lock.
++    fn setlk(
++        &self,
++        ctx: Context,
++        inode: Self::Inode,
++        handle: Self::Handle,
++        owner: u64,
++        lock: fuse::FileLock,
++        flags: u32,
++    ) -> io::Result<()> {
+         Err(io::Error::from_raw_os_error(libc::ENOSYS))
+     }
+ 
+-    /// TODO: support this
+-    fn setlkw(&self) -> io::Result<()> {
+-        Err(io::Error::from_raw_os_error(libc::ENOSYS))
++    /// Blocking form of [`FileSystem::setlk`].
++    fn setlkw(
++        &self,
++        ctx: Context,
++        inode: Self::Inode,
++        handle: Self::Handle,
++        owner: u64,
++        lock: fuse::FileLock,
++        flags: u32,
++    ) -> io::Result<()> {
++        self.setlk(ctx, inode, handle, owner, lock, flags)
+     }
+ 
+     /// TODO: support this
+diff --git a/src/server.rs b/src/server.rs
+index fe538ac..7b9809e 100644
+--- a/src/server.rs
++++ b/src/server.rs
+@@ -1540,32 +1540,38 @@ impl<F: FileSystem + Sync> Server<F> {
+         }
+     }
+ 
+-    fn getlk(&self, in_header: InHeader, mut _r: MessageReader, w: MessageWriter) -> Result<usize> {
+-        if let Err(e) = self.fs.getlk() {
+-            reply_error(e, in_header.unique, w)
+-        } else {
+-            Ok(0)
++    fn getlk(&self, in_header: InHeader, mut r: MessageReader, w: MessageWriter) -> Result<usize> {
++        let LkIn { fh, owner, lk, lk_flags, .. } =
++            r.read_obj().map_err(Error::DecodeMessage)?;
++        match self.fs.getlk(Context::from(in_header), in_header.nodeid.into(),
++                            fh.into(), owner, lk, lk_flags) {
++            Ok(lk) => reply_ok(Some(LkOut { lk }), None, in_header.unique, w),
++            Err(e) => reply_error(e, in_header.unique, w),
+         }
+     }
+ 
+-    fn setlk(&self, in_header: InHeader, mut _r: MessageReader, w: MessageWriter) -> Result<usize> {
+-        if let Err(e) = self.fs.setlk() {
+-            reply_error(e, in_header.unique, w)
+-        } else {
+-            Ok(0)
++    fn setlk(&self, in_header: InHeader, mut r: MessageReader, w: MessageWriter) -> Result<usize> {
++        let LkIn { fh, owner, lk, lk_flags, .. } =
++            r.read_obj().map_err(Error::DecodeMessage)?;
++        match self.fs.setlk(Context::from(in_header), in_header.nodeid.into(),
++                            fh.into(), owner, lk, lk_flags) {
++            Ok(()) => reply_ok(None::<u8>, None, in_header.unique, w),
++            Err(e) => reply_error(e, in_header.unique, w),
+         }
+     }
+ 
+     fn setlkw(
+         &self,
+         in_header: InHeader,
+-        mut _r: MessageReader,
++        mut r: MessageReader,
+         w: MessageWriter,
+     ) -> Result<usize> {
+-        if let Err(e) = self.fs.setlkw() {
+-            reply_error(e, in_header.unique, w)
+-        } else {
+-            Ok(0)
++        let LkIn { fh, owner, lk, lk_flags, .. } =
++            r.read_obj().map_err(Error::DecodeMessage)?;
++        match self.fs.setlkw(Context::from(in_header), in_header.nodeid.into(),
++                             fh.into(), owner, lk, lk_flags) {
++            Ok(()) => reply_ok(None::<u8>, None, in_header.unique, w),
++            Err(e) => reply_error(e, in_header.unique, w),
+         }
+     }
+ 
