@@ -430,14 +430,20 @@ as executable mappings and mmap that genuinely need a host fd.
         rows. The probe exposed an unset guest wall clock; the paired kernels
         now enable their PL031/CMOS RTC and initialize CLOCK_REALTIME before
         PID 1. Guest and lower-file epoch seconds agree after the rebuild.
-  - [ ] Finish the QEMU kernel build and byte-for-byte artifact comparison.
-        Rerun after the output, clock, and concurrency fixes. Compiler processes
-        and artifact writers must be guest records, and output/trace rows must
-        be populated, not merely inferred from a successful exit. The apparent
-        second stall at 186 objects was isolated to the test's own shared
-        `flock` concurrency counter, whose advisory lock does not survive this
-        virtio-fs use correctly; the fixture now records one lock-free interval
-        per compiler and derives maximum overlap from the closed archive.
+  - [x] Finish the QEMU kernel build and byte-for-byte artifact comparison.
+        The apparent second stall at 186 objects was the test's shared `flock`
+        counter; the final fixture records private, process-free compiler
+        intervals and derives overlap from the closed archive. Both backends
+        build 823 real objects with ten overlapping clang processes. Their
+        4,837,384-byte Image and 6,021,328-byte vmlinux match byte-for-byte
+        (SHA-256 respectively `b424e85ff1a243e68ee234c9ea09f97c7109f88bd089d0600d3cfc6d15a98d87`
+        and `25655d3f4d8f82b1ac298abd3a20fcf41ad5c72b7e51668db470826a059b6a44`).
+        QEMU records 7,916 guest process rows and 57,609 output bytes; FUSE
+        records 7,607 and 57,608. Both artifacts have nonzero writer rows and
+        neither backend changes the lower or source tree. FUSE takes 151 s
+        wall/131 s compile; aarch64 TCG takes 3,624/3,373 s (24.0x wall), which
+        is a correctness result rather than an acceptable KVM-performance
+        claim.
 - [x] Remove backend-specific semantic branches and obsolete compatibility
       code; update generated help and user documentation. A repository audit
       finds backend selection only in registration, runner, transport, trace,
