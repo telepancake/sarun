@@ -96,6 +96,10 @@ as executable mappings and mmap that genuinely need a host fd.
         their name disappears; source handles follow rename, overwritten
         destination handles stay detached, and neither release nor later
         writes can resurrect or rebind a vanished pathname.
+  - [x] Give every raw-message frontend the same malformed-request contract.
+        Header-bearing decoder failures return `EIO` with the original unique
+        ID, and a SUD ring session demonstrably accepts a valid request after a
+        malformed one instead of poisoning or cancelling the transport.
 
 ### 2. FUSE cutover
 

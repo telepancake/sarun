@@ -457,7 +457,13 @@ impl SudFsSession {
                 while let Some(request) = ring.wait()? {
                     match decoder.handle_fuse_message(&request.bytes, &mut response) {
                         Ok(length) => ring.complete(request, &response[..length])?,
-                        Err(_) => ring.cancel(request),
+                        Err(_) => match crate::sarunfs::malformed_fuse_reply(
+                            &request.bytes,
+                            &mut response,
+                        ) {
+                            Some(length) => ring.complete(request, &response[..length])?,
+                            None => ring.cancel(request),
+                        },
                     }
                 }
                 Ok(())
@@ -953,10 +959,30 @@ mod tests {
     }
 
     #[test]
-    fn session_feeds_messages_through_the_canonical_decoder() {
+    fn session_recovers_after_bad_message_and_feeds_the_canonical_decoder() {
         let client_mapping = Arc::new(RingMapping::create().unwrap());
         let server_fd = client_mapping.duplicate_fd().unwrap();
         let session = SudFsSession::start_for_test(LookupFs, server_fd, 2).unwrap();
+
+        let malformed = InHeader {
+            len: (size_of::<InHeader>() + 10) as u32,
+            opcode: 1,
+            unique: 76,
+            nodeid: ROOT_ID,
+            pid: std::process::id(),
+            ..Default::default()
+        };
+        let malformed = unsafe {
+            std::slice::from_raw_parts(
+                (&malformed as *const InHeader).cast::<u8>(),
+                size_of::<InHeader>(),
+            )
+        };
+        let client = RingClient::new(client_mapping);
+        let response = client.request(malformed).unwrap();
+        let output = unsafe { std::ptr::read_unaligned(response.as_ptr().cast::<OutHeader>()) };
+        assert_eq!((output.unique, output.error), (76, -libc::EIO));
+
         let header = InHeader {
             len: (size_of::<InHeader>() + 6) as u32,
             opcode: 1,
@@ -974,7 +1000,7 @@ mod tests {
         };
         request.extend_from_slice(bytes);
         request.extend_from_slice(b"hello\0");
-        let response = RingClient::new(client_mapping).request(&request).unwrap();
+        let response = client.request(&request).unwrap();
         let output = unsafe { std::ptr::read_unaligned(response.as_ptr().cast::<OutHeader>()) };
         assert_eq!((output.unique, output.error), (77, 0));
         session.stop().unwrap();

@@ -20,6 +20,36 @@ use std::time::UNIX_EPOCH;
 
 pub(crate) type NodeKey = (i64, String);
 
+/// Turn a decoder failure for a header-bearing raw FUSE message into the
+/// protocol error reply expected by every byte transport.  Keeping this next
+/// to the canonical protocol state prevents `/dev/fuse` and the SUD ring from
+/// assigning different meanings to the same malformed message.
+pub(crate) fn malformed_fuse_reply(request: &[u8], response: &mut [u8]) -> Option<usize> {
+    use std::mem::size_of;
+    use virtiofsd::fuse::{InHeader, OutHeader};
+
+    if request.len() < size_of::<InHeader>() || response.len() < size_of::<OutHeader>() {
+        return None;
+    }
+    // SAFETY: the length checks cover one possibly-unaligned protocol header;
+    // ByteValued permits every initialized bit pattern.
+    let input = unsafe { std::ptr::read_unaligned(request.as_ptr().cast::<InHeader>()) };
+    let output = OutHeader {
+        len: size_of::<OutHeader>() as u32,
+        error: -libc::EIO,
+        unique: input.unique,
+    };
+    // SAFETY: OutHeader is a plain repr(C) protocol value.
+    let output_bytes = unsafe {
+        std::slice::from_raw_parts(
+            (&output as *const OutHeader).cast::<u8>(),
+            size_of::<OutHeader>(),
+        )
+    };
+    response[..size_of::<OutHeader>()].copy_from_slice(output_bytes);
+    Some(size_of::<OutHeader>())
+}
+
 /// Transport-independent file kind. The shared protocol server translates it
 /// when constructing a reply; overlay policy never handles a wire enum.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

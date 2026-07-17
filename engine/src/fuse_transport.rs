@@ -7,7 +7,6 @@
 use std::ffi::CString;
 use std::fs::{File, OpenOptions};
 use std::io::{self, IoSliceMut};
-use std::mem::size_of;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixStream;
@@ -20,7 +19,6 @@ use std::thread::{self, JoinHandle};
 
 use nix::sys::socket::{ControlMessageOwned, MsgFlags, SockaddrStorage, recvmsg};
 use virtiofsd::filesystem::FileSystem;
-use virtiofsd::fuse::{InHeader, OutHeader};
 use virtiofsd::server::{FuseBacking, Server};
 
 const MAX_REQUEST_SIZE: usize = (1 << 20) + 0x1000;
@@ -378,7 +376,7 @@ where
             &*backing,
         ) {
             Ok(reply_count) => reply_count,
-            Err(error) => malformed_reply(&request[..count], &mut response)
+            Err(error) => crate::sarunfs::malformed_fuse_reply(&request[..count], &mut response)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?,
         };
         if reply_count == 0 {
@@ -399,41 +397,18 @@ where
     }
 }
 
-fn malformed_reply(request: &[u8], response: &mut [u8]) -> Option<usize> {
-    if request.len() < size_of::<InHeader>() || response.len() < size_of::<OutHeader>() {
-        return None;
-    }
-    // SAFETY: the length checks cover one possibly-unaligned protocol header;
-    // ByteValued permits every initialized bit pattern.
-    let input = unsafe { std::ptr::read_unaligned(request.as_ptr().cast::<InHeader>()) };
-    let output = OutHeader {
-        len: size_of::<OutHeader>() as u32,
-        error: -libc::EIO,
-        unique: input.unique,
-    };
-    // SAFETY: OutHeader is a plain repr(C) protocol value with no padding
-    // whose contents need initialization beyond its three fields.
-    let output_bytes = unsafe {
-        std::slice::from_raw_parts(
-            (&output as *const OutHeader).cast::<u8>(),
-            size_of::<OutHeader>(),
-        )
-    };
-    response[..size_of::<OutHeader>()].copy_from_slice(output_bytes);
-    Some(size_of::<OutHeader>())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::ffi::CStr;
     use std::io::Write;
+    use std::mem::size_of;
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
     use virtiofsd::filesystem::{
         Context, DirEntry, DirectoryIterator, Entry, OpenOptions, ROOT_ID, ZeroCopyWriter,
     };
-    use virtiofsd::fuse::Attr;
+    use virtiofsd::fuse::{Attr, InHeader, OutHeader};
 
     struct EmptyDirectory;
 
@@ -597,7 +572,7 @@ mod tests {
                 size_of::<InHeader>(),
             )
         };
-        let count = malformed_reply(input_bytes, &mut response).unwrap();
+        let count = crate::sarunfs::malformed_fuse_reply(input_bytes, &mut response).unwrap();
         assert_eq!(count, size_of::<OutHeader>());
         let output = unsafe { std::ptr::read_unaligned(response.as_ptr().cast::<OutHeader>()) };
         assert_eq!((output.unique, output.error), (98, -libc::EIO));
