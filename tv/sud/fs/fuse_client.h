@@ -14,6 +14,8 @@ int sud_fuse_getattr(uint64_t inode, uint64_t handle,
                      int has_handle, struct fuse_attr_out *attributes);
 int sud_fuse_open(uint64_t inode, uint32_t flags,
                   struct fuse_open_out *opened);
+int sud_fuse_opendir(uint64_t inode, uint32_t flags,
+                     struct fuse_open_out *opened);
 int sud_fuse_create(uint64_t parent, const char *name, uint32_t flags,
                     uint32_t mode, uint32_t umask,
                     struct fuse_entry_out *entry,
@@ -24,6 +26,9 @@ long sud_fuse_write(uint64_t inode, uint64_t handle, uint64_t offset,
                     uint32_t flags, const void *buffer, size_t size);
 int sud_fuse_flush(uint64_t inode, uint64_t handle, uint32_t flags);
 int sud_fuse_release(uint64_t inode, uint64_t handle, uint32_t flags);
+long sud_fuse_readdir(uint64_t inode, uint64_t handle, uint64_t offset,
+                      void *buffer, size_t size);
+int sud_fuse_releasedir(uint64_t inode, uint64_t handle, uint32_t flags);
 int sud_fuse_setattr(uint64_t inode, const struct fuse_setattr_in *input,
                      struct fuse_attr_out *attributes);
 

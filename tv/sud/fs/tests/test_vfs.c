@@ -90,6 +90,18 @@ static int child_calls(struct sud_fs_ring *ring)
     if (fs_call(SYS_ftruncate, fd, 3, 0, 0, 0, 0) != 0) return 18;
     if (fs_call(SYS_close, fd, 0, 0, 0, 0, 0) != 0) return 19;
     if (fs_call(SYS_close, duplicate, 0, 0, 0, 0, 0) != 0) return 20;
+    int directory = (int)fs_call(SYS_openat, AT_FDCWD, (long)"/dir",
+                                 O_RDONLY | O_DIRECTORY, 0, 0, 0);
+    if (directory < 0) return 21;
+    unsigned char entries[256];
+    long entry_bytes = fs_call(SYS_getdents64, directory, (long)entries,
+                               sizeof(entries), 0, 0, 0);
+    struct linux_dirent64 *directory_entry =
+        (struct linux_dirent64 *)entries;
+    if (entry_bytes <= 0 || directory_entry->d_ino != 4
+        || directory_entry->d_type != DT_REG
+        || strcmp(directory_entry->d_name, "x") != 0) return 22;
+    if (fs_call(SYS_close, directory, 0, 0, 0, 0, 0) != 0) return 23;
     return 0;
 }
 
@@ -173,6 +185,42 @@ static int serve_calls(struct sud_fs_ring *ring)
     slot = take_request(ring); header = (struct fuse_in_header *)slot->request;
     if (header->opcode != FUSE_FORGET || header->nodeid != 2
         || ((struct fuse_forget_in *)(header + 1))->nlookup != 1) return 31;
+    no_reply(slot);
+
+    slot = take_request(ring); header = (struct fuse_in_header *)slot->request;
+    if (header->opcode != FUSE_LOOKUP || header->nodeid != FUSE_ROOT_ID
+        || strcmp((char *)(header + 1), "dir") != 0) return 32;
+    memset(&entry, 0, sizeof(entry));
+    entry.nodeid = 3;
+    entry.attr.ino = 3;
+    entry.attr.mode = S_IFDIR | 0755;
+    reply(slot, &entry, sizeof(entry));
+
+    slot = take_request(ring); header = (struct fuse_in_header *)slot->request;
+    if (header->opcode != FUSE_OPENDIR || header->nodeid != 3) return 33;
+    opened.fh = 10;
+    reply(slot, &opened, sizeof(opened));
+
+    slot = take_request(ring); header = (struct fuse_in_header *)slot->request;
+    read = (struct fuse_read_in *)(header + 1);
+    if (header->opcode != FUSE_READDIR || header->nodeid != 3
+        || read->fh != 10 || read->offset != 0) return 34;
+    unsigned char directory_data[64] = {0};
+    struct fuse_dirent *directory_entry = (struct fuse_dirent *)directory_data;
+    directory_entry->ino = 4;
+    directory_entry->off = 1;
+    directory_entry->namelen = 1;
+    directory_entry->type = DT_REG;
+    directory_entry->name[0] = 'x';
+    size_t directory_length = FUSE_DIRENT_ALIGN(FUSE_NAME_OFFSET + 1);
+    reply(slot, directory_data, directory_length);
+
+    slot = take_request(ring); header = (struct fuse_in_header *)slot->request;
+    if (header->opcode != FUSE_RELEASEDIR || header->nodeid != 3) return 35;
+    reply(slot, 0, 0);
+
+    slot = take_request(ring); header = (struct fuse_in_header *)slot->request;
+    if (header->opcode != FUSE_FORGET || header->nodeid != 3) return 36;
     no_reply(slot);
     return 0;
 }

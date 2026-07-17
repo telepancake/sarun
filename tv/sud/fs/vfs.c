@@ -386,7 +386,12 @@ int sud_vfs_openat(int dirfd, const char *path, int flags,
             resolved_forget(&node);
             return -EEXIST;
         }
-        if ((node.attr.mode & S_IFMT) == S_IFDIR) {
+        int is_directory = (node.attr.mode & S_IFMT) == S_IFDIR;
+        if ((flags & O_DIRECTORY) && !is_directory) {
+            resolved_forget(&node);
+            return -ENOTDIR;
+        }
+        if (is_directory && (flags & (O_CREAT | O_TRUNC))) {
             resolved_forget(&node);
             return -EISDIR;
         }
@@ -400,7 +405,9 @@ int sud_vfs_openat(int dirfd, const char *path, int flags,
             if (result != 0) { resolved_forget(&node); return result; }
             node.attr = attributes.attr;
         }
-        result = sud_fuse_open(node.inode, (uint32_t)flags, &opened);
+        result = is_directory
+            ? sud_fuse_opendir(node.inode, (uint32_t)flags, &opened)
+            : sud_fuse_open(node.inode, (uint32_t)flags, &opened);
         if (result != 0) { resolved_forget(&node); return result; }
     } else if (result == -ENOENT && (flags & O_CREAT)) {
         char parent_path[PATH_MAX];
@@ -430,7 +437,11 @@ int sud_vfs_openat(int dirfd, const char *path, int flags,
                                 &node.attr,
                                 &opened, flags, absolute);
     if (fd < 0) {
-        (void)sud_fuse_release(node.inode, opened.fh, (uint32_t)flags);
+        if ((node.attr.mode & S_IFMT) == S_IFDIR)
+            (void)sud_fuse_releasedir(node.inode, opened.fh,
+                                      (uint32_t)flags);
+        else
+            (void)sud_fuse_release(node.inode, opened.fh, (uint32_t)flags);
         resolved_forget(&node);
         return fd;
     }
@@ -446,6 +457,7 @@ long sud_vfs_pread(int fd, void *buffer, size_t size, uint64_t offset)
 {
     struct sud_remote_ofd *description = description_for(fd);
     if (!description) return -EBADF;
+    if ((description->mode & S_IFMT) == S_IFDIR) return -EISDIR;
     if ((description->flags & O_ACCMODE) == O_WRONLY) return -EBADF;
     size_t done = 0;
     while (done < size) {
@@ -463,7 +475,8 @@ long sud_vfs_read(int fd, void *buffer, size_t size)
 {
     struct sud_remote_ofd *description = description_for(fd);
     if (!description) return -EBADF;
-    if ((description->flags & O_ACCMODE) == O_RDONLY) return -EBADF;
+    if ((description->mode & S_IFMT) == S_IFDIR) return -EISDIR;
+    if ((description->flags & O_ACCMODE) == O_WRONLY) return -EBADF;
     ofd_lock(description);
     long result = sud_vfs_pread(fd, buffer, size, description->offset);
     if (result > 0) description->offset += (uint64_t)result;
@@ -475,6 +488,8 @@ long sud_vfs_pwrite(int fd, const void *buffer, size_t size, uint64_t offset)
 {
     struct sud_remote_ofd *description = description_for(fd);
     if (!description) return -EBADF;
+    if ((description->mode & S_IFMT) == S_IFDIR) return -EISDIR;
+    if ((description->flags & O_ACCMODE) == O_RDONLY) return -EBADF;
     size_t done = 0;
     while (done < size) {
         long count = sud_fuse_write(description->inode, description->handle,
@@ -680,6 +695,56 @@ long sud_vfs_getcwd(char *buffer, size_t size)
     return (long)length;
 }
 
+long sud_vfs_getdents64(int fd, void *buffer, size_t size)
+{
+    struct sud_remote_ofd *description = description_for(fd);
+    if (!description) return -EBADF;
+    if ((description->mode & S_IFMT) != S_IFDIR) return -ENOTDIR;
+    unsigned char raw[SUD_FS_SLOT_DATA];
+    ofd_lock(description);
+    long count = sud_fuse_readdir(description->inode, description->handle,
+                                  description->offset, raw, sizeof(raw));
+    if (count <= 0) {
+        ofd_unlock(description);
+        return count;
+    }
+    size_t input_offset = 0;
+    size_t output_offset = 0;
+    while (input_offset < (size_t)count) {
+        struct fuse_dirent *entry = (struct fuse_dirent *)(raw + input_offset);
+        if ((size_t)count - input_offset < FUSE_NAME_OFFSET) {
+            ofd_unlock(description);
+            return -EPROTO;
+        }
+        size_t fuse_length = FUSE_DIRENT_ALIGN(FUSE_NAME_OFFSET
+                                               + entry->namelen);
+        if (entry->namelen > 255 || fuse_length > (size_t)count - input_offset) {
+            ofd_unlock(description);
+            return -EPROTO;
+        }
+        size_t output_length = (sizeof(struct linux_dirent64)
+                                + entry->namelen + 1 + 7) & ~(size_t)7;
+        if (output_length > size - output_offset) break;
+        struct linux_dirent64 *out =
+            (struct linux_dirent64 *)((unsigned char *)buffer + output_offset);
+        out->d_ino = entry->ino;
+        out->d_off = entry->off;
+        out->d_reclen = (unsigned short)output_length;
+        out->d_type = (unsigned char)entry->type;
+        memcpy(out->d_name, entry->name, entry->namelen);
+        out->d_name[entry->namelen] = '\0';
+        size_t used = sizeof(*out) + entry->namelen + 1;
+        if (output_length > used)
+            memset((unsigned char *)out + used, 0, output_length - used);
+        output_offset += output_length;
+        input_offset += fuse_length;
+        description->offset = entry->off;
+    }
+    ofd_unlock(description);
+    if (output_offset == 0 && count > 0) return -EINVAL;
+    return (long)output_offset;
+}
+
 int sud_vfs_close(int fd)
 {
     fd_table_init();
@@ -690,11 +755,18 @@ int sud_vfs_close(int fd)
     entry->fd = -1;
     entry->description = 0;
     local_unlock(&g_fd_lock);
-    int result = sud_fuse_flush(description->inode, description->handle,
-                                description->flags);
+    int is_directory = (description->mode & S_IFMT) == S_IFDIR;
+    int result = is_directory ? 0
+        : sud_fuse_flush(description->inode, description->handle,
+                         description->flags);
     if (__atomic_sub_fetch(&description->refs, 1u, __ATOMIC_ACQ_REL) == 0) {
-        (void)sud_fuse_release(description->inode, description->handle,
-                               description->flags);
+        if (is_directory)
+            (void)sud_fuse_releasedir(description->inode,
+                                      description->handle,
+                                      description->flags);
+        else
+            (void)sud_fuse_release(description->inode, description->handle,
+                                   description->flags);
         if (description->lookup_count)
             (void)sud_fuse_forget(description->inode,
                                   description->lookup_count);
@@ -726,11 +798,18 @@ int sud_vfs_dup(int oldfd, int newfd)
     }
     local_unlock(&g_fd_lock);
     if (displaced) {
-        (void)sud_fuse_flush(displaced->inode, displaced->handle,
-                             displaced->flags);
+        int is_directory = (displaced->mode & S_IFMT) == S_IFDIR;
+        if (!is_directory)
+            (void)sud_fuse_flush(displaced->inode, displaced->handle,
+                                 displaced->flags);
         if (__atomic_sub_fetch(&displaced->refs, 1u, __ATOMIC_ACQ_REL) == 0) {
-            (void)sud_fuse_release(displaced->inode, displaced->handle,
-                                   displaced->flags);
+            if (is_directory)
+                (void)sud_fuse_releasedir(displaced->inode,
+                                          displaced->handle,
+                                          displaced->flags);
+            else
+                (void)sud_fuse_release(displaced->inode, displaced->handle,
+                                       displaced->flags);
             if (displaced->lookup_count)
                 (void)sud_fuse_forget(displaced->inode,
                                       displaced->lookup_count);
@@ -758,11 +837,19 @@ void sud_vfs_process_exit(void)
     for (unsigned int i = 0; i < SUD_FD_TABLE_SIZE; i++) {
         if (g_fds[i].fd < 0) continue;
         struct sud_remote_ofd *description = g_fds[i].description;
-        (void)sud_fuse_flush(description->inode, description->handle,
-                             description->flags);
+        int is_directory = (description->mode & S_IFMT) == S_IFDIR;
+        if (!is_directory)
+            (void)sud_fuse_flush(description->inode, description->handle,
+                                 description->flags);
         if (__atomic_sub_fetch(&description->refs, 1u, __ATOMIC_ACQ_REL) == 0) {
-            (void)sud_fuse_release(description->inode, description->handle,
-                                   description->flags);
+            if (is_directory)
+                (void)sud_fuse_releasedir(description->inode,
+                                          description->handle,
+                                          description->flags);
+            else
+                (void)sud_fuse_release(description->inode,
+                                       description->handle,
+                                       description->flags);
             if (description->lookup_count)
                 (void)sud_fuse_forget(description->inode,
                                       description->lookup_count);

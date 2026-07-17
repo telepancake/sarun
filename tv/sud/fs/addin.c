@@ -219,6 +219,11 @@ static int fs_pre_syscall(struct sud_syscall_ctx *ctx)
         return handled(ctx, sud_vfs_ftruncate((int)ctx->args[0],
                          split_offset(ctx->args, 1)));
 #endif
+#ifdef SYS_getdents64
+    if (nr == SYS_getdents64 && sud_vfs_owns_fd((int)ctx->args[0]))
+        return handled(ctx, sud_vfs_getdents64((int)ctx->args[0],
+                         (void *)ctx->args[1], (size_t)ctx->args[2]));
+#endif
     if (nr == SYS_chdir)
         return handled(ctx, sud_vfs_chdir((const char *)ctx->args[0]));
     if (nr == SYS_fchdir && sud_vfs_owns_fd((int)ctx->args[0]))

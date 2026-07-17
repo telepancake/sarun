@@ -160,6 +160,19 @@ int sud_fuse_open(uint64_t inode, uint32_t flags, struct fuse_open_out *opened)
     return copy_fixed_reply(&call, opened, sizeof(*opened));
 }
 
+int sud_fuse_opendir(uint64_t inode, uint32_t flags,
+                     struct fuse_open_out *opened)
+{
+    struct fuse_call call;
+    int result = call_begin(&call, FUSE_OPENDIR, inode,
+                            sizeof(struct fuse_open_in));
+    if (result != 0) return result;
+    struct fuse_open_in *input = call_input_payload(&call);
+    input->flags = flags;
+    input->open_flags = 0;
+    return copy_fixed_reply(&call, opened, sizeof(*opened));
+}
+
 int sud_fuse_create(uint64_t parent, const char *name, uint32_t flags,
                     uint32_t mode, uint32_t umask,
                     struct fuse_entry_out *entry,
@@ -272,6 +285,47 @@ int sud_fuse_release(uint64_t inode, uint64_t handle, uint32_t flags)
     input->fh = handle;
     input->flags = flags;
     input->lock_owner = (uint64_t)raw_getpid();
+    result = call_submit(&call);
+    call_end(&call);
+    return result;
+}
+
+long sud_fuse_readdir(uint64_t inode, uint64_t handle, uint64_t offset,
+                      void *buffer, size_t size)
+{
+    if (size > sud_fuse_max_read()) size = sud_fuse_max_read();
+    struct fuse_call call;
+    int result = call_begin(&call, FUSE_READDIR, inode,
+                            sizeof(struct fuse_read_in));
+    if (result != 0) return result;
+    struct fuse_read_in *input = call_input_payload(&call);
+    memset(input, 0, sizeof(*input));
+    input->fh = handle;
+    input->offset = offset;
+    input->size = (uint32_t)size;
+    result = call_submit(&call);
+    long count = result;
+    if (result == 0) {
+        if (call.payload_len > size) count = -EPROTO;
+        else {
+            memcpy(buffer, call.payload, call.payload_len);
+            count = (long)call.payload_len;
+        }
+    }
+    call_end(&call);
+    return count;
+}
+
+int sud_fuse_releasedir(uint64_t inode, uint64_t handle, uint32_t flags)
+{
+    struct fuse_call call;
+    int result = call_begin(&call, FUSE_RELEASEDIR, inode,
+                            sizeof(struct fuse_release_in));
+    if (result != 0) return result;
+    struct fuse_release_in *input = call_input_payload(&call);
+    memset(input, 0, sizeof(*input));
+    input->fh = handle;
+    input->flags = flags;
     result = call_submit(&call);
     call_end(&call);
     return result;
