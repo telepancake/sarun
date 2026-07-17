@@ -1310,6 +1310,31 @@ def main():
             sp37, str((pv / "lib-unit.pi.o").resolve()).lstrip("/"))
         check(flags == b"common specific\n",
               f"case37: specific += retains common pattern value; got {flags!r}")
+        # ── CASE 38: .PHONY targets skip match-anything implicit rules ─────
+        # OpenWrt uses a `%::` fallback to re-enter its real build after the
+        # prerequisite pass and a phony FORCE target throughout the graph. GNU
+        # never applies implicit rules to .PHONY targets; doing so makes FORCE
+        # recursively invoke the fallback forever.
+        ph = work / "phony-implicit-skip"
+        shutil.rmtree(ph, ignore_errors=True)
+        ph.mkdir(parents=True, exist_ok=True)
+        (ph / "Makefile").write_text(
+            ".PHONY: all FORCE\n"
+            "all: FORCE\n\t@printf good > result.txt\n"
+            "FORCE:\n"
+            "%::\n\t@printf bad >> fallback.txt\n")
+        r = run_make("MAKE38", ph, "-j10", "all")
+        check(r.returncode == 0,
+              f"case38: phony FORCE completes without the %:: fallback "
+              f"(got {r.returncode}: {(r.stdout+r.stderr)[-500:]})")
+        sp38 = latest_sqlar(m)
+        good = m.sqlar_content(
+            sp38, str((ph / "result.txt").resolve()).lstrip("/"))
+        bad = m.sqlar_content(
+            sp38, str((ph / "fallback.txt").resolve()).lstrip("/"))
+        check(good == b"good" and bad is None,
+              f"case38: implicit search is skipped for .PHONY; "
+              f"good={good!r} fallback={bad!r}")
     finally:
         if eng is not None and eng.poll() is None:
             eng.terminate()

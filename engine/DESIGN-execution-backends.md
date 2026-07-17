@@ -490,6 +490,10 @@ as executable mappings and mmap that genuinely need a host fd.
           ARM64 Kbuild's `lib-%.pi.o: OBJCOPYFLAGS += ...` now retains the common
           `%.pi.o` symbol-prefix flags instead of producing duplicate symbols at
           final link. The focused fixture brings the suite to 37 cases.
+    - [x] Skip implicit-rule search for `.PHONY` targets, as GNU does. This keeps
+          a match-anything `%::` fallback from becoming the recipe of OpenWrt's
+          empty `FORCE` target and recursively re-entering `make prereq`. The
+          direct `%::`/`FORCE` fixture brings the suite to 38 cases.
     - [x] Complete the native-aarch64 FUSE Brush gate from a clean output tree.
           Linux 6.18 builds 823 objects with `-j10` (11 observed overlapping
           clang processes), takes 162 s wall / 143 s compile, and records 2,797

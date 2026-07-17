@@ -1,0 +1,28 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Fri, 17 Jul 2026 21:08:24 +0000
+Subject: [PATCH] Skip implicit rules for phony make targets
+
+---
+diff --git a/src-rs/dep.rs b/src-rs/dep.rs
+index 8a0125f..be599fc 100644
+--- a/src-rs/dep.rs
++++ b/src-rs/dep.rs
+@@ -1199,6 +1199,17 @@ impl<'a> DepBuilder<'a> {
+                 vars = self.merge_implicit_rule_vars(psym, vars);
+             }
+         }
++        // GNU skips implicit-rule search for targets declared through .PHONY.
++        // In particular, OpenWrt's top-level `%::` fallback must not become the
++        // recipe of its ubiquitous empty `FORCE` target; doing so recursively
++        // launches `make prereq` for every forced edge.
++        if self.phony.contains(&output) && rule_merger.is_some() {
++            return Some(PickedRuleInfo {
++                merger: rule_merger,
++                pattern_rule: None,
++                vars,
++            });
++        }
+         if let Some(rule_merger) = &rule_merger
+             && rule_merger.lock().primary_rule.is_some()
+         {

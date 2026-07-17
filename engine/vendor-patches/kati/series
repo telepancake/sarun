@@ -64,3 +64,4 @@
 0640-Stop-after-draining-parallel-make-failures.patch
 0650-Prefer-more-specific-implicit-make-patterns.patch
 0660-Compose-overlapping-pattern-specific-make-variables.patch
+0670-Skip-implicit-rules-for-phony-make-targets.patch
