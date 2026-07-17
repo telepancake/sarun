@@ -105,6 +105,10 @@ impl<T> HandleTable<T> {
     pub(crate) fn remove(&self, handle: u64) -> Option<Arc<T>> {
         self.entries.write().unwrap().remove(&handle)
     }
+
+    pub(crate) fn values(&self) -> Vec<Arc<T>> {
+        self.entries.read().unwrap().values().cloned().collect()
+    }
 }
 
 impl InodeTable {
@@ -125,6 +129,10 @@ impl InodeTable {
 
     pub(crate) fn key(&self, inode: u64) -> Option<NodeKey> {
         self.state.read().unwrap().by_inode.get(&inode).cloned()
+    }
+
+    pub(crate) fn inode(&self, key: &NodeKey) -> Option<u64> {
+        self.state.read().unwrap().by_key.get(key).copied()
     }
 
     pub(crate) fn intern(&self, key: &NodeKey) -> u64 {

@@ -91,6 +91,11 @@ as executable mappings and mmap that genuinely need a host fd.
       rename/unlink lifetime, hardlinks, symlinks, xattrs, ownership, locks,
       mmap, sparse files, truncation, directory cookies, concurrency, and bad
       requests.
+  - [x] Preserve and test open-file-description identity across unlink and
+        rename-over. Lazy lower handles become private anonymous copies before
+        their name disappears; source handles follow rename, overwritten
+        destination handles stay detached, and neither release nor later
+        writes can resurrect or rebind a vanished pathname.
 
 ### 2. FUSE cutover
 
@@ -223,7 +228,7 @@ as executable mappings and mmap that genuinely need a host fd.
 
 ## Validation ledger (2026-07-17, aarch64 host)
 
-- The final static `aarch64-unknown-linux-musl` test harness has 383 passing
+- The final static `aarch64-unknown-linux-musl` test harness has 384 passing
   tests and one ignored browser test. Its only two failures are the pre-existing
   relation-completion cases
   `bash_editor_uses_relation_for_backward_completion_and_insertion` and

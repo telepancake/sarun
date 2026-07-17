@@ -336,6 +336,11 @@ enum Handle {
 struct FhInner {
     box_id: i64,
     rel: String,
+    /// Whether `rel` still names this open file description. Unlink and
+    /// rename-over detach the description while its kernel-style handle keeps
+    /// the backing inode alive. Detached writes must never recreate or
+    /// finalize the vanished pathname.
+    linked: bool,
     data: FileData,
     upper: bool,
     dirty: bool,
@@ -372,7 +377,7 @@ struct OpenedNode {
 enum WriteTarget {
     Jobserver { box_id: i64 },
     Sink { box_id: i64, stream: i32 },
-    File { file: File, box_id: i64, rel: String },
+    File { file: File, box_id: i64, rel: Option<String> },
 }
 
 struct NodeSetattr {
@@ -1582,6 +1587,13 @@ impl SarunFs {
     }
 
     fn getattr_node(&self, inode: u64) -> Result<NodeAttr, Errno> {
+        // A detached inode may intentionally retain the same historical key
+        // as a replacement now occupying that pathname. Its saved identity
+        // must win; consulting the live namespace first would make an open
+        // overwritten fd appear to become the replacement file.
+        if let Some(attr) = self.inner.detached_attrs.read().unwrap().get(&inode).copied() {
+            return Ok(attr);
+        }
         let (bid, rel) = self.key_of(inode).ok_or(Errno::ENOENT)?;
         if bid == 0 || rel.is_empty() {
             return Ok(self.synth_dir_attr(inode, 0o40755, 0));
@@ -1590,9 +1602,7 @@ impl SarunFs {
             return Ok(node.attr(inode));
         }
         let b = self.box_of(bid).ok_or(Errno::ENOENT)?;
-        self.attr_of(&b, inode, &rel)
-            .or_else(|| self.inner.detached_attrs.read().unwrap().get(&inode).copied())
-            .ok_or(Errno::ENOENT)
+        self.attr_of(&b, inode, &rel).ok_or(Errno::ENOENT)
     }
 
     fn readlink_node(&self, inode: u64) -> Result<Vec<u8>, Errno> {
@@ -1691,6 +1701,7 @@ impl SarunFs {
             let handle = self.reg_fh(FhInner {
                 box_id: bid,
                 rel,
+                linked: true,
                 data: FileData::Native(file),
                 upper: false,
                 dirty: false,
@@ -1729,6 +1740,7 @@ impl SarunFs {
             let handle = self.reg_fh(FhInner {
                 box_id: bid,
                 rel,
+                linked: true,
                 data: FileData::Sink(stream),
                 upper: false,
                 dirty: false,
@@ -1759,6 +1771,7 @@ impl SarunFs {
             let handle = self.reg_fh(FhInner {
                 box_id: bid,
                 rel,
+                linked: true,
                 data: FileData::Native(file),
                 upper: true,
                 dirty: false,
@@ -1791,6 +1804,7 @@ impl SarunFs {
             let handle = self.reg_fh(FhInner {
                 box_id: bid,
                 rel,
+                linked: true,
                 data: FileData::Native(file),
                 upper: false,
                 dirty: false,
@@ -1867,6 +1881,7 @@ impl SarunFs {
         let handle = self.reg_fh(FhInner {
             box_id: bid,
             rel,
+            linked: true,
             data,
             upper,
             dirty: false,
@@ -1928,6 +1943,7 @@ impl SarunFs {
             let handle = self.reg_fh(FhInner {
                 box_id: bid,
                 rel,
+                linked: true,
                 data: FileData::Native(file),
                 upper: true,
                 dirty: false,
@@ -1966,6 +1982,7 @@ impl SarunFs {
             let handle = self.reg_fh(FhInner {
                 box_id: bid,
                 rel,
+                linked: true,
                 data: FileData::Native(file),
                 upper: true,
                 dirty: true,
@@ -2048,6 +2065,66 @@ impl SarunFs {
         Ok(attr)
     }
 
+    /// Preserve POSIX open-file-description lifetime before a namespace entry
+    /// disappears. A lower handle must first acquire a private copy: after the
+    /// following unlink/rename-over removes the captured row, the open file
+    /// descriptor still owns that now-anonymous blob and can be read/written
+    /// without touching the host or recreating the pathname.
+    fn detach_open_handles(&self, box_id: i64, rel: &str, pid: u32) -> Result<(), Errno> {
+        let b = self.box_of(box_id).ok_or(Errno::ENOENT)?;
+        for handle in self.inner.handles.values() {
+            let Handle::File(handle) = &*handle else { continue };
+            let mut handle = handle.lock().unwrap();
+            if handle.inner.box_id != box_id
+                || handle.inner.rel != rel
+                || !handle.inner.linked
+            {
+                continue;
+            }
+            if matches!(handle.inner.data, FileData::Lower(_)) {
+                handle.inner.data = FileData::Native(
+                    self.copy_up(&b, rel, pid).map_err(Errno::from)?,
+                );
+                handle.inner.upper = true;
+                handle.inner.backing_candidate = false;
+            }
+            handle.inner.linked = false;
+        }
+        Ok(())
+    }
+
+    fn remap_open_handle_subtree(&self, box_id: i64, old: &str, new: &str) {
+        let prefix = format!("{old}/");
+        for handle in self.inner.handles.values() {
+            let Handle::File(handle) = &*handle else { continue };
+            let mut handle = handle.lock().unwrap();
+            if handle.inner.box_id != box_id || !handle.inner.linked {
+                continue;
+            }
+            let replacement = if handle.inner.rel == old {
+                Some(new.to_owned())
+            } else {
+                handle
+                    .inner
+                    .rel
+                    .strip_prefix(&prefix)
+                    .map(|tail| format!("{new}/{tail}"))
+            };
+            if let Some(replacement) = replacement {
+                handle.inner.rel = replacement;
+            }
+        }
+    }
+
+    fn detach_inode_name(&self, b: &BoxState, rel: &str) {
+        let key = (b.id, rel.to_owned());
+        let Some(inode) = self.inner.inodes.inode(&key) else { return };
+        if let Some(attr) = self.attr_of(b, inode, rel) {
+            self.inner.detached_attrs.write().unwrap().insert(inode, attr);
+        }
+        self.inner.inodes.detach(&key);
+    }
+
     fn unlink_node(&self, pid: u32, parent: u64, name: &OsStr) -> Result<(), Errno> {
         let (box_id, rel) = self.child_path(parent, name)?;
         let b = self.box_of(box_id).ok_or(Errno::ENOENT)?;
@@ -2059,6 +2136,7 @@ impl SarunFs {
         if attr.kind == NodeKind::Directory {
             return Err(Errno::EISDIR);
         }
+        self.detach_open_handles(box_id, &rel, pid)?;
         self.inner.inodes.detach(&(box_id, rel.clone()));
         self.inner.detached_attrs.write().unwrap().insert(inode, attr);
         self.inner.mutations.writer(&b, pid).delete(&rel);
@@ -2116,6 +2194,9 @@ impl SarunFs {
         };
         let old_rel = join(&old_parent, name);
         let new_rel = join(&new_parent, new_name);
+        if old_rel == new_rel {
+            return Ok(());
+        }
         let b = self.box_of(box_id).ok_or(Errno::ENOENT)?;
         if self.ro_denied(box_id, &old_rel) || self.ro_denied(box_id, &new_rel) {
             return Err(Errno::EROFS);
@@ -2124,6 +2205,10 @@ impl SarunFs {
             && !matches!(self.resolve(box_id, &new_rel), Layer::Absent)
         {
             return Err(Errno::EEXIST);
+        }
+        if !matches!(self.resolve(box_id, &new_rel), Layer::Absent) {
+            self.detach_open_handles(box_id, &new_rel, pid)?;
+            self.detach_inode_name(&b, &new_rel);
         }
         let capture = self.inner.mutations.writer(&b, pid);
         let lower_attr = self.inner.backing.attr(&old_rel).ok();
@@ -2152,6 +2237,7 @@ impl SarunFs {
             Layer::ExtFile { .. } => return Err(Errno::EROFS),
         }
         self.remap_inode_subtree(box_id, &old_rel, &new_rel);
+        self.remap_open_handle_subtree(box_id, &old_rel, &new_rel);
         self.inner.mutations.record(box_id, old_rel, "rename_src");
         self.inner.mutations.record(box_id, new_rel, "rename_dst");
         Ok(())
@@ -2492,6 +2578,12 @@ impl SarunFs {
             });
         }
         if !handle.inner.upper {
+            if !handle.inner.linked {
+                // Read-only native projections cannot be promoted after their
+                // name vanished. Ordinary lower handles were converted to an
+                // anonymous native copy by detach_open_handles().
+                return Err(Errno::EBADF);
+            }
             let b = self.box_of(handle.inner.box_id).ok_or(Errno::EIO)?;
             handle.inner.data = FileData::Native(
                 self.copy_up(&b, &handle.inner.rel.clone(), pid)
@@ -2516,12 +2608,14 @@ impl SarunFs {
         Ok(WriteTarget::File {
             file,
             box_id: handle.inner.box_id,
-            rel: handle.inner.rel.clone(),
+            rel: handle.inner.linked.then(|| handle.inner.rel.clone()),
         })
     }
 
-    fn finish_file_write(&self, box_id: i64, rel: String) {
-        self.inner.mutations.record(box_id, rel, "write");
+    fn finish_file_write(&self, box_id: i64, rel: Option<String>) {
+        if let Some(rel) = rel {
+            self.inner.mutations.record(box_id, rel, "write");
+        }
     }
 
     fn write_sink_node(&self, pid: u32, box_id: i64, stream: i32, data: &[u8]) {
@@ -2551,7 +2645,7 @@ impl SarunFs {
         let handle = handle.lock().unwrap();
         if matches!(&handle.inner.data, FileData::Sink(_)) {
             self.inner.synthetic.sink_released(handle.inner.box_id);
-        } else if handle.inner.dirty && !handle.inner.passthrough {
+        } else if handle.inner.dirty && handle.inner.linked && !handle.inner.passthrough {
             if let Some(b) = self.box_of(handle.inner.box_id) {
                 let writer_id = if handle.inner.last_tgid != 0 {
                     handle.inner.last_tgid
@@ -4127,6 +4221,224 @@ mod chain_tests {
             &fs, ctx, 1, 0, handle,
         )
         .unwrap();
+
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn canonical_open_handles_survive_unlink_and_rename_over_without_rebinding() {
+        let _g = crate::depot::TEST_STATE_HOME_LOCK.lock().unwrap();
+        let tmp = std::env::temp_dir().join(format!(
+            "sarun-open-lifetime-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("lower-victim"), b"lower-old").unwrap();
+        // SAFETY: TEST_STATE_HOME_LOCK serializes state-home tests.
+        unsafe { std::env::set_var("XDG_STATE_HOME", &tmp); }
+        std::fs::create_dir_all(crate::paths::state_home()).unwrap();
+
+        let fs = SarunFs::new(tmp.clone());
+        let id = 9401;
+        fs.add_box(Arc::new(BoxState::create(id).unwrap()));
+        let ctx = virtiofsd::filesystem::Context {
+            uid: 0.into(),
+            gid: 0.into(),
+            pid: std::process::id() as i32,
+        };
+        let box_name = CString::new(id.to_string()).unwrap();
+        let root = <SarunFs as virtiofsd::filesystem::FileSystem>::lookup(
+            &fs, ctx, 1, &box_name,
+        )
+        .unwrap();
+
+        // A lazy lower handle is privately materialized before unlink. Later
+        // writes remain readable through the fd but neither touch the host nor
+        // recreate the deleted namespace entry.
+        let victim_name = CString::new("lower-victim").unwrap();
+        let victim = <SarunFs as virtiofsd::filesystem::FileSystem>::lookup(
+            &fs, ctx, root.inode, &victim_name,
+        )
+        .unwrap();
+        let (victim_handle, _) = <SarunFs as virtiofsd::filesystem::FileSystem>::open(
+            &fs, ctx, victim.inode, false, libc::O_RDWR as u32,
+        )
+        .unwrap();
+        let victim_handle = victim_handle.unwrap();
+        <SarunFs as virtiofsd::filesystem::FileSystem>::unlink(
+            &fs, ctx, root.inode, &victim_name,
+        )
+        .unwrap();
+        assert_eq!(
+            <SarunFs as virtiofsd::filesystem::FileSystem>::lookup(
+                &fs, ctx, root.inode, &victim_name,
+            )
+            .err()
+            .unwrap()
+            .raw_os_error(),
+            Some(libc::ENOENT),
+        );
+        <SarunFs as virtiofsd::filesystem::FileSystem>::write(
+            &fs,
+            ctx,
+            victim.inode,
+            victim_handle,
+            BytesReader(b"PRIVATE"),
+            7,
+            0,
+            None,
+            false,
+            false,
+            0,
+        )
+        .unwrap();
+        let detached_bytes = Arc::new(Mutex::new(Vec::new()));
+        <SarunFs as virtiofsd::filesystem::FileSystem>::read(
+            &fs,
+            ctx,
+            victim.inode,
+            victim_handle,
+            CollectWriter(detached_bytes.clone()),
+            32,
+            0,
+            None,
+            0,
+        )
+        .unwrap();
+        assert_eq!(&*detached_bytes.lock().unwrap(), b"PRIVATEld");
+        assert_eq!(std::fs::read(tmp.join("lower-victim")).unwrap(), b"lower-old");
+        <SarunFs as virtiofsd::filesystem::FileSystem>::release(
+            &fs, ctx, victim.inode, 0, victim_handle, false, false, None,
+        )
+        .unwrap();
+        assert!(matches!(fs.resolve(id, "lower-victim"), Layer::Absent));
+
+        let create = |name: &CString| {
+            <SarunFs as virtiofsd::filesystem::FileSystem>::create(
+                &fs,
+                ctx,
+                root.inode,
+                name,
+                0o600,
+                false,
+                libc::O_RDWR as u32,
+                0,
+                virtiofsd::filesystem::Extensions::default(),
+            )
+            .unwrap()
+        };
+        let source_name = CString::new("source").unwrap();
+        let destination_name = CString::new("destination").unwrap();
+        let (source, source_handle, _) = create(&source_name);
+        let source_handle = source_handle.unwrap();
+        <SarunFs as virtiofsd::filesystem::FileSystem>::write(
+            &fs,
+            ctx,
+            source.inode,
+            source_handle,
+            BytesReader(b"SOURCE"),
+            6,
+            0,
+            None,
+            false,
+            false,
+            0,
+        )
+        .unwrap();
+        let (destination, destination_handle, _) = create(&destination_name);
+        let destination_handle = destination_handle.unwrap();
+        <SarunFs as virtiofsd::filesystem::FileSystem>::write(
+            &fs,
+            ctx,
+            destination.inode,
+            destination_handle,
+            BytesReader(b"DEST"),
+            4,
+            0,
+            None,
+            false,
+            false,
+            0,
+        )
+        .unwrap();
+
+        <SarunFs as virtiofsd::filesystem::FileSystem>::rename(
+            &fs,
+            ctx,
+            root.inode,
+            &source_name,
+            root.inode,
+            &destination_name,
+            0,
+        )
+        .unwrap();
+        let visible = <SarunFs as virtiofsd::filesystem::FileSystem>::lookup(
+            &fs, ctx, root.inode, &destination_name,
+        )
+        .unwrap();
+        assert_eq!(visible.inode, source.inode);
+        assert_eq!(
+            <SarunFs as virtiofsd::filesystem::FileSystem>::getattr(
+                &fs, ctx, destination.inode, Some(destination_handle),
+            )
+            .unwrap()
+            .0
+            .size,
+            4,
+        );
+
+        // The overwritten destination fd is anonymous; modifying it cannot
+        // mutate the source that now occupies its former name.
+        <SarunFs as virtiofsd::filesystem::FileSystem>::write(
+            &fs,
+            ctx,
+            destination.inode,
+            destination_handle,
+            BytesReader(b"OLD!"),
+            4,
+            0,
+            None,
+            false,
+            false,
+            0,
+        )
+        .unwrap();
+        <SarunFs as virtiofsd::filesystem::FileSystem>::release(
+            &fs,
+            ctx,
+            destination.inode,
+            0,
+            destination_handle,
+            false,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(fs.box_read_file(id, "destination").unwrap(), b"SOURCE");
+
+        // The source fd follows the rename and continues to finalize the new
+        // pathname, never the vanished source name.
+        <SarunFs as virtiofsd::filesystem::FileSystem>::write(
+            &fs,
+            ctx,
+            source.inode,
+            source_handle,
+            BytesReader(b"RENAMED"),
+            7,
+            0,
+            None,
+            false,
+            false,
+            0,
+        )
+        .unwrap();
+        <SarunFs as virtiofsd::filesystem::FileSystem>::release(
+            &fs, ctx, source.inode, 0, source_handle, false, false, None,
+        )
+        .unwrap();
+        assert_eq!(fs.box_read_file(id, "destination").unwrap(), b"RENAMED");
+        assert!(fs.box_read_file(id, "source").is_err());
 
         let _ = std::fs::remove_dir_all(tmp);
     }
