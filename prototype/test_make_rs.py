@@ -1366,6 +1366,36 @@ def main():
         check(reached == b"reached",
               f"case39: child parsed the parent-rooted include after -C; "
               f"got {reached!r}")
+        # ── CASE 40: guarded recursive includes do not lock the AST ───────
+        # OpenWrt's package metadata makefiles revisit common include files
+        # through nested include layers, with make variables guarding the
+        # recursion. GNU make simply evaluates the already-parsed statements
+        # again. Holding Kati's parser mutation mutex while evaluating an
+        # include instead deadlocks before the inner guard can be checked.
+        ri = work / "recursive-include"
+        shutil.rmtree(ri, ignore_errors=True)
+        ri.mkdir(parents=True, exist_ok=True)
+        (ri / "Makefile").write_text(
+            "include a.mk\n"
+            "all:\n\t@printf '%s' '$(REACHED)' > result.txt\n")
+        (ri / "a.mk").write_text(
+            "ifndef A_SEEN\n"
+            "A_SEEN := 1\n"
+            "include b.mk\n"
+            "endif\n")
+        (ri / "b.mk").write_text(
+            "include a.mk\n"
+            "REACHED := yes\n")
+        r = run_make("MAKE40", ri, "-j10", "all")
+        check(r.returncode == 0,
+              f"case40: a variable-guarded recursive include completes "
+              f"(got {r.returncode}: {(r.stdout+r.stderr)[-500:]})")
+        sp40 = latest_sqlar(m)
+        reached = m.sqlar_content(
+            sp40, str((ri / "result.txt").resolve()).lstrip("/"))
+        check(reached == b"yes",
+              f"case40: the inner include guard runs and evaluation resumes; "
+              f"got {reached!r}")
     finally:
         if eng is not None and eng.poll() is None:
             eng.terminate()

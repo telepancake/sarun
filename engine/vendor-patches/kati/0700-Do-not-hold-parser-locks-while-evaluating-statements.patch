@@ -1,0 +1,132 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Fri, 17 Jul 2026 22:48:10 +0000
+Subject: [PATCH] Do not hold parser locks while evaluating statements
+
+---
+diff --git a/src-rs/eval.rs b/src-rs/eval.rs
+index e972d6d..f8e776c 100644
+--- a/src-rs/eval.rs
++++ b/src-rs/eval.rs
+@@ -453,6 +453,23 @@ impl Evaluator {
+         ev
+     }
+ 
++    /// Evaluate a completed parser statement list without retaining its
++    /// mutation lock while statements run. Evaluation can invoke `$(shell)` or
++    /// an in-process recursive make, either of which may evaluate the same
++    /// cached makefile again. The statements are immutable Arcs after parsing,
++    /// so taking a cheap snapshot avoids that re-entrant deadlock.
++    pub fn eval_stmts(
++        &mut self,
++        stmts: &Arc<Mutex<Vec<crate::stmt::Stmt>>>,
++    ) -> Result<()> {
++        let stmts = stmts.lock().clone();
++        for stmt in &stmts {
++            log!("{stmt:?}");
++            stmt.eval(self)?;
++        }
++        Ok(())
++    }
++
+     /// sarun: seed the builtin special variables that used to be installed
+     /// process-globally by Symtab::new(). Now each Evaluator seeds them into
+     /// its own per-instance global namespace, so behavior is identical for a
+@@ -1130,11 +1147,7 @@ impl Evaluator {
+ 
+         if !self.in_rule {
+             let stmts = parse_buf_no_stats(&stmt.orig(), stmt.loc())?;
+-            let stmts = stmts.lock();
+-            for a in &*stmts {
+-                a.eval(self)?;
+-            }
+-            return Ok(());
++            return self.eval_stmts(&stmts);
+         }
+ 
+         let last_rule = self.rules.last_mut().unwrap();
+@@ -1181,12 +1194,7 @@ impl Evaluator {
+             true => &stmt.true_stmts,
+             false => &stmt.false_stmts,
+         };
+-        let stmts = stmts.lock();
+-        for a in stmts.iter() {
+-            log!("{:?}", a);
+-            a.eval(self)?;
+-        }
+-        Ok(())
++        self.eval_stmts(stmts)
+     }
+ 
+     pub fn do_include(&mut self, fname: &Bytes) -> Result<()> {
+@@ -1217,10 +1225,7 @@ impl Evaluator {
+                 None,
+             )?;
+         }
+-        for stmt in mk.stmts.lock().iter() {
+-            log!("{stmt:?}");
+-            stmt.eval(self)?;
+-        }
++        self.eval_stmts(&mk.stmts)?;
+ 
+         if !self.profiled_files.is_empty() {
+             for mk in std::mem::take(&mut self.profiled_files) {
+diff --git a/src-rs/func.rs b/src-rs/func.rs
+index 30f25b4..2cb20c3 100644
+--- a/src-rs/func.rs
++++ b/src-rs/func.rs
+@@ -555,12 +555,7 @@ fn eval_func(args: &[Arc<Value>], ev: &mut Evaluator, _out: &mut dyn BufMut) ->
+         );
+     }
+     let stmts = parse_buf(&text, ev.loc.clone().unwrap_or_default())?;
+-    let stmts = stmts.lock();
+-    for stmt in stmts.iter() {
+-        log!("{:?}", stmt);
+-        stmt.eval(ev)?;
+-    }
+-    Ok(())
++    ev.eval_stmts(&stmts)
+ }
+ 
+ // A hack for Android build. We need to evaluate things like $((3+4))
+diff --git a/src-rs/main.rs b/src-rs/main.rs
+index da91e57..29f4556 100644
+--- a/src-rs/main.rs
++++ b/src-rs/main.rs
+@@ -188,10 +188,7 @@ fn run(targets: &[Symbol], cl_vars: &Vec<Bytes>, orig_args: OsString) -> Result<
+             Loc::default(),
+         );
+         ev.in_bootstrap();
+-        for stmt in bootstrap_asts.lock().iter() {
+-            log!("{stmt:?}");
+-            stmt.eval(&mut ev)?;
+-        }
++        ev.eval_stmts(&bootstrap_asts)?;
+     }
+ 
+     {
+@@ -209,9 +206,8 @@ fn run(targets: &[Symbol], cl_vars: &Vec<Bytes>, orig_args: OsString) -> Result<
+                     line: 0,
+                 },
+             )?;
+-            let asts = asts.lock();
+-            assert!(asts.len() == 1);
+-            asts[0].eval(&mut ev)?;
++            assert!(asts.lock().len() == 1);
++            ev.eval_stmts(&asts)?;
+         }
+     }
+     ev.in_toplevel_makefile();
+@@ -233,11 +229,7 @@ fn run(targets: &[Symbol], cl_vars: &Vec<Bytes>, orig_args: OsString) -> Result<
+         let Some(mk) = kati::file_cache::get_makefile(&makefile, &ev.working_dir)? else {
+             bail!("makefile not found")
+         };
+-        let stmts = mk.stmts.lock();
+-        for stmt in stmts.iter() {
+-            log!("{stmt:?}");
+-            stmt.eval(&mut ev)?;
+-        }
++        ev.eval_stmts(&mk.stmts)?;
+     }
+ 
+     if let Some(filename) = &FLAGS.dump_include_graph {

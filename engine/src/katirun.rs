@@ -466,19 +466,14 @@ fn run_kati(
     {
         let _frame = ev.enter(FrameType::Phase, bytes::Bytes::from_static(b"*bootstrap*"), Loc::default());
         ev.in_bootstrap();
-        for stmt in bootstrap_asts.lock().iter() {
-            stmt.eval(&mut ev)?;
-        }
+        ev.eval_stmts(&bootstrap_asts)?;
     }
     {
         let _frame = ev.enter(FrameType::Phase, bytes::Bytes::from_static(b"*command line*"), Loc::default());
         ev.in_command_line();
         for l in cl_vars {
             let asts = kati::parser::parse_buf(l, Loc { filename: intern("*bootstrap*"), line: 0 })?;
-            let asts = asts.lock();
-            for a in asts.iter() {
-                a.eval(&mut ev)?;
-            }
+            ev.eval_stmts(&asts)?;
         }
     }
     ev.in_toplevel_makefile();
@@ -488,10 +483,7 @@ fn run_kati(
         let Some(mk) = kati::file_cache::get_makefile(makefile, &ev.working_dir)? else {
             anyhow::bail!("makefile not found");
         };
-        let stmts = mk.stmts.lock();
-        for stmt in stmts.iter() {
-            stmt.eval(&mut ev)?;
-        }
+        ev.eval_stmts(&mk.stmts)?;
     }
 
     // sarun: GNU make's remake-the-makefile loop. Every included makefile is

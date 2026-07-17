@@ -517,10 +517,17 @@ as executable mappings and mmap that genuinely need a host fd.
           `SHELL` as the POSIX shell it actually invokes, so the make export
           prefix (including `TOPDIR`) reaches recursive package scans. The
           exact two-level `env bash` / compound subshell / literal `make -C`
-          regression brings the Make/Brush suite to 39 cases. A real clean
-          prereq run now enters `package/base-files` successfully; the next
-          conformance boundary is completing the package metadata scan rather
-          than failing its first package include.
+          regression brings the Make/Brush suite to 39 cases. Kati statement
+          evaluation now snapshots immutable parsed statement Arcs before
+          releasing the parser-list mutex: OpenWrt's variable-guarded recursive
+          includes can revisit a cached makefile and reach their inner guard
+          instead of deadlocking on the outer include evaluation. The focused
+          recursive-include regression brings the suite to 40 cases. A clean
+          real `make -j10 prereq` now completes in 43 seconds, records 397
+          processes, 5,627 Brush provenance rows and 3,734 build edges, and
+          captures the 1,821,710-byte `.packageinfo` plus 1,103,452-byte
+          `.targetinfo` without changing the source checkout. The next boundary
+          is the complete `world` build.
     - [x] Complete the native-aarch64 FUSE Brush gate from a clean output tree.
           Linux 6.18 builds 823 objects with `-j10` (11 observed overlapping
           clang processes), takes 162 s wall / 143 s compile, and records 2,797
