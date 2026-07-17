@@ -918,7 +918,7 @@ pub fn run_qemu(
     let virtiofs = unsafe {
         <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(virtiofs_fd)
     };
-    match crate::appliance::run(
+    let result = match crate::appliance::run(
         architecture,
         virtiofs,
         &appliance_command,
@@ -929,7 +929,22 @@ pub fn run_qemu(
             eprintln!("sarun-engine run --qemu: {error}");
             1
         }
+    };
+    // EOF is the box-lifetime commit. Half-close our channel, then wait for
+    // the engine to tear down the virtio-fs export, process identity, and live
+    // box before returning to the caller. Without this barrier an immediate
+    // same-name rerun could race the engine reader and report a dead box as
+    // still running.
+    let _ = conn.shutdown(std::net::Shutdown::Write);
+    let mut drain = &conn;
+    let mut bytes = [0u8; 64];
+    loop {
+        match std::io::Read::read(&mut drain, &mut bytes) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
     }
+    result
 }
 
 // ── sud launcher (absorbed from tv/sud/sudtrace.c) ──────────────────────────

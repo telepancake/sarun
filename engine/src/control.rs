@@ -1392,20 +1392,28 @@ fn handle_binary_registration(
         let path = std::path::Path::new(std::ffi::OsStr::from_bytes(socket.as_slice()));
         UnixStream::connect(path)
     });
-    if let Err(error) = &virtiofs {
-        let _ = crate::socket_wire::write_mode(
+    let channel_ready = match &virtiofs {
+        Err(error) => {
+            let _ = crate::socket_wire::write_mode(
+                &mut conn,
+                &binary_error(format!("registered QEMU export is not connectable: {error}")),
+            );
+            false
+        }
+        Ok(export) => crate::socket_wire::write_mode(
             &mut conn,
-            &binary_error(format!("registered QEMU export is not connectable: {error}")),
-        );
-        stop_live_transports(&state, id);
-    } else if crate::socket_wire::write_mode(
-        &mut conn,
-        &ConnectionMode::Box { registration },
-    ).is_err() || send_stream_with_fd(
-        &conn,
-        &crate::frames::encode(crate::frames::FRAME_APPLIANCE_FS, &[]),
-        virtiofs.as_ref().expect("checked successful export connection").as_raw_fd(),
-    ).is_err() {
+            &ConnectionMode::Box { registration },
+        ).is_ok() && send_stream_with_fd(
+            &conn,
+            &crate::frames::encode(crate::frames::FRAME_APPLIANCE_FS, &[]),
+            export.as_raw_fd(),
+        ).is_ok(),
+    };
+    // SCM_RIGHTS has duplicated the endpoint into the runner. The engine must
+    // not retain its temporary connected copy: doing so keeps virtiofsd's
+    // frontend alive after QEMU exits and makes teardown wait for itself.
+    drop(virtiofs);
+    if !channel_ready {
         stop_live_transports(&state, id);
     } else {
         let mut bytes = [0u8; 256];

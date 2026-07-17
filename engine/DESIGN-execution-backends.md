@@ -229,6 +229,14 @@ as executable mappings and mmap that genuinely need a host fd.
       FD broker. The strict live gate verifies relative naming, recorded
       `parent_box_id`, child-local capture, returned exit/output, and no host
       write; there is no separate nested-appliance path.
+- [x] Make runner return a QEMU lifecycle barrier: it half-closes the box
+      channel after appliance exit and waits for engine EOF, which means the
+      virtio-fs export and live process identity are gone before an immediate
+      same-name rerun begins. The engine drops its temporary SCM_RIGHTS source
+      fd before joining virtiofsd, so frontend EOF cannot be self-retained.
+- [x] Gate exact exit 37, signalled exit 143, versioned exec failure 127,
+      environment/cwd transfer, off/host/tap device topology, same-name stateful
+      rerun, and host non-escape on the current aarch64 TCG appliance.
 - [x] Carry the existing registration `brush` value through QEMU instead of
       hardcoding it false. Target `/init brush-sh` now runs the ordinary parser,
       and the shared SarunFs shadow projection runs embedded Kati and n2 in a
@@ -348,6 +356,10 @@ as executable mappings and mmap that genuinely need a host fd.
 - `make test-backends` also launches QEMU from inside a FUSE box through the
   authenticated broker and descriptor-only appliance boundary. It checks the
   persisted parent edge and child archive, not merely a successful boot.
+- The same gate runs the aarch64 QEMU lifecycle matrix, including an immediate
+  same-name rerun that must observe prior captured state. This regression found
+  and now prevents both stale running-box registration and retained frontend-fd
+  teardown races.
 - `make test-backend-workloads` passes every strict real-tool stage on both
   FUSE and aarch64 QEMU/TCG, compares equal backend observations, and proves
   the caller-writable lower trees remain byte-for-byte and metadata unchanged.

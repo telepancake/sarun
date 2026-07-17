@@ -739,6 +739,11 @@ belong to the relation.
       descriptors, so no engine socket pathname or optional nesting mode leaks
       into the appliance API. The aarch64 live gate verifies the persisted
       parent edge, child capture, exit/output, and host isolation.
+- [x] Make QEMU completion a lifecycle barrier and cover exact nonzero/signal/
+      exec-failure results, binary environment/cwd control, all three network
+      device modes, and immediate same-name stateful rerun on aarch64 TCG. The
+      runner now returns only after engine transport teardown, rather than
+      racing a subsequent invocation against stale live-box state.
 - [ ] Copy third-party license notices beside every normal release artifact.
 
 ### 2. Generic typed FFI — NEXT

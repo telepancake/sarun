@@ -434,6 +434,112 @@ def run_nested_qemu():
         shutil.rmtree(root, ignore_errors=True)
 
 
+def run_qemu_lifecycle():
+    root = Path(tempfile.mkdtemp(prefix="sarun-equiv-qemu-life-", dir="/var/tmp"))
+    work = root / "lower"
+    work.mkdir()
+    env = dict(os.environ)
+    for key, name in (
+        ("XDG_STATE_HOME", "state"), ("XDG_RUNTIME_DIR", "run"),
+        ("XDG_CONFIG_HOME", "config"), ("XDG_DATA_HOME", "data"),
+    ):
+        directory = root / name
+        directory.mkdir()
+        env[key] = str(directory)
+    env["SLOPBOX_NS"] = "EQUIVQEMULIFE"
+    env["APPLIANCE_MARK"] = "descriptor-control"
+    old = dict(os.environ)
+    os.environ.clear()
+    os.environ.update(env)
+    module = SourceFileLoader(
+        "slopbox_qemu_lifecycle", str(LIBTESTSARUN)
+    ).load_module()
+    module.ensure_dirs()
+    engine = subprocess.Popen(
+        [str(ENGINE_BIN), "serve"], env=env,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+
+    def run_case(name, command, net="off"):
+        return subprocess.run(
+            [str(ENGINE_BIN), "run", "--net", net, "--qemu", HOST_ARCH,
+             name, "-C", str(work), "--", *command],
+            env=env, capture_output=True, timeout=240,
+        )
+
+    try:
+        if not wait_socket(module.sock_path()):
+            raise RuntimeError("engine socket never appeared")
+        nonzero = run_case("LIFE-NONZERO", ["sh", "-c", "exit 37"])
+        signalled = run_case("LIFE-SIGNAL", ["sh", "-c", "kill -TERM $$"])
+        missing = run_case("LIFE-MISSING", ["/definitely/missing-sarun-command"])
+        environment = run_case(
+            "LIFE-ENV",
+            ["sh", "-c", "printf '%s:%s' \"$APPLIANCE_MARK\" \"$PWD\" > appliance-env"],
+        )
+        network_off = run_case(
+            "LIFE-NET-OFF", ["sh", "-c", "test ! -e /sys/class/net/eth0"], "off"
+        )
+        network_host = run_case(
+            "LIFE-NET-HOST", ["sh", "-c", "test -e /sys/class/net/eth0"], "host"
+        )
+        network_tap = run_case(
+            "LIFE-NET-TAP", ["sh", "-c", "test -e /sys/class/net/eth0"], "tap"
+        )
+        rerun_first = run_case(
+            "LIFE-RERUN", ["sh", "-c", "printf first > rerun-first"]
+        )
+        rerun_second = run_case(
+            "LIFE-RERUN",
+            ["sh", "-c", "test \"$(cat rerun-first)\" = first; printf second > rerun-second"],
+        )
+        store = Path(env["XDG_STATE_HOME"]) / f"slopbox.{env['SLOPBOX_NS']}"
+        archives = list(store.glob("*.sqlar"))
+        named = {
+            module.sqlar_meta_get(archive, "name"): archive for archive in archives
+        }
+        rerun_archives = [
+            archive for archive in archives
+            if module.sqlar_meta_get(archive, "name") == "LIFE-RERUN"
+        ]
+        rerun_archive = rerun_archives[0] if len(rerun_archives) == 1 else None
+        prefix = str(work).lstrip("/") + "/"
+        return {
+            "nonzero": nonzero.returncode,
+            "signalled": signalled.returncode,
+            "missing": missing.returncode,
+            "environment_exit": environment.returncode,
+            "environment": module.sqlar_content(
+                named["LIFE-ENV"], prefix + "appliance-env"
+            ),
+            "expected_environment": f"descriptor-control:{work}".encode(),
+            "network": (
+                network_off.returncode,
+                network_host.returncode,
+                network_tap.returncode,
+            ),
+            "rerun_exits": (rerun_first.returncode, rerun_second.returncode),
+            "rerun_unique": len(rerun_archives) == 1,
+            "rerun_first": None if rerun_archive is None else module.sqlar_content(
+                rerun_archive, prefix + "rerun-first"
+            ),
+            "rerun_second": None if rerun_archive is None else module.sqlar_content(
+                rerun_archive, prefix + "rerun-second"
+            ),
+            "host_unchanged": not any(work.iterdir()),
+        }
+    finally:
+        engine.terminate()
+        try:
+            engine.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            engine.kill()
+            engine.wait(timeout=5)
+        os.environ.clear()
+        os.environ.update(old)
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def main():
     if not ENGINE_BIN.exists():
         print(f"backend-equiv: no {ENGINE_BIN} — SKIP")
@@ -505,6 +611,29 @@ def main():
                   "nested qemu: child write captured in child archive")
             check(nested["host_unchanged"],
                   "nested qemu: child write did not escape to host")
+        try:
+            lifecycle = run_qemu_lifecycle()
+        except Exception as error:
+            check(False, f"qemu lifecycle: suite completed ({error})")
+        else:
+            check(lifecycle["nonzero"] == 37,
+                  "qemu lifecycle: exact nonzero exit returned")
+            check(lifecycle["signalled"] == 128 + signal.SIGTERM,
+                  "qemu lifecycle: child signal returned as shell status")
+            check(lifecycle["missing"] == 127,
+                  "qemu lifecycle: exec failure returned as versioned status 127")
+            check(lifecycle["environment_exit"] == 0
+                  and lifecycle["environment"] == lifecycle["expected_environment"],
+                  "qemu lifecycle: environment and cwd crossed binary control")
+            check(lifecycle["network"] == (0, 0, 0),
+                  "qemu lifecycle: off/host/tap device topology is exact")
+            check(lifecycle["rerun_exits"] == (0, 0)
+                  and lifecycle["rerun_unique"]
+                  and lifecycle["rerun_first"] == b"first"
+                  and lifecycle["rerun_second"] == b"second",
+                  "qemu lifecycle: same-name rerun reuses captured state")
+            check(lifecycle["host_unchanged"],
+                  "qemu lifecycle: no captured write escaped to host")
 
     other_architecture = "x86_64" if HOST_ARCH == "aarch64" else "aarch64"
     other_kernel = appliance_root / other_architecture / "kernel"
