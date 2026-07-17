@@ -112,6 +112,20 @@ def available_backends():
     return result
 
 
+def qemu_accelerator(stderr):
+    prefix = f"sarun-engine: qemu {HOST_ARCH} accelerator "
+    accelerators = {
+        line.removeprefix(prefix)
+        for line in stderr.splitlines()
+        if line.startswith(prefix)
+    }
+    if len(accelerators) != 1 or not accelerators <= {"kvm", "tcg"}:
+        raise RuntimeError(
+            f"missing or ambiguous QEMU accelerator marker: {sorted(accelerators)!r}"
+        )
+    return accelerators.pop()
+
+
 def run_once(backend, iteration):
     root = Path(tempfile.mkdtemp(prefix=f"sarun-bench-{backend}-", dir="/var/tmp"))
     work = root / "lower"
@@ -151,16 +165,23 @@ def run_once(backend, iteration):
                 f"rc={result.returncode}: stdout={result.stdout[-500:]!r}; "
                 f"stderr={result.stderr[-500:]!r}"
             )
+        accelerator = qemu_accelerator(result.stderr) if backend == "qemu" else None
+        if (backend == "qemu" and os.environ.get("SARUN_REQUIRE_KVM") == "1"
+                and accelerator != "kvm"):
+            raise RuntimeError(
+                f"KVM benchmark required, but QEMU selected {accelerator}"
+            )
         store = Path(env["XDG_STATE_HOME"]) / f"slopbox.{env['SLOPBOX_NS']}"
         sqlar = max(store.glob("*.sqlar"), key=lambda path: int(path.stem))
         rel = f"{str(work).lstrip('/')}/benchmark-results"
         payload = module.sqlar_content(sqlar, rel).decode()
         if (work / "benchmark-results").exists():
             raise RuntimeError("benchmark write escaped to the host")
-        return {
+        timings = {
             key: int(value) * 10.0
             for key, value in (line.split("=", 1) for line in payload.splitlines())
         }
+        return timings, accelerator
     finally:
         engine.terminate()
         try:
@@ -179,11 +200,15 @@ def main():
     rounds = int(os.environ.get("SARUN_BENCH_ROUNDS", "3"))
     backends = available_backends()
     samples = {backend: [] for backend in backends}
+    accelerators = {backend: set() for backend in backends}
     for iteration in range(rounds):
         for backend in backends:
-            result = run_once(backend, iteration)
+            result, accelerator = run_once(backend, iteration)
             samples[backend].append(result)
-            print(f"{backend} round {iteration + 1}: {result}")
+            if accelerator:
+                accelerators[backend].add(accelerator)
+            suffix = f" ({accelerator})" if accelerator else ""
+            print(f"{backend}{suffix} round {iteration + 1}: {result}")
 
     metrics = ("sequential", "metadata", "parallel")
     medians = {
@@ -200,7 +225,9 @@ def main():
         ratios = [medians[backend][metric] / baseline[metric] for metric in metrics]
         geometric = math.prod(ratios) ** (1 / len(ratios))
         values = medians[backend]
-        print(f"| {backend} | {values['sequential']:.1f} | "
+        accelerator = "/".join(sorted(accelerators[backend]))
+        label = f"{backend} ({accelerator})" if accelerator else backend
+        print(f"| {label} | {values['sequential']:.1f} | "
               f"{values['metadata']:.1f} | {values['parallel']:.1f} | "
               f"{geometric:.2f}x |")
     return 0
