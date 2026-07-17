@@ -1076,6 +1076,10 @@ wire_frame(appliance, nested_result, 6, host_to_guest, [
 wire_frame(appliance, result, 7, guest_to_host, [
     field(code, exit_code)
 ], [], close).
+% PID 1 emits this only after the requested command has been spawned.  Until
+% then serial input belongs to kernel boot, not to the command, so the host
+% runner must retain caller input rather than feeding it into QEMU early.
+wire_frame(appliance, ready, 8, guest_to_host, [], [], stay).
 
 wire_frame(pty, data,             7, bidirectional, [
     field(data, bytes(stream_chunk_bytes))

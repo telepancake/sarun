@@ -46,7 +46,7 @@ run_test(catalog_is_closed_bounded_and_valid) :-
     length(Responses, 5),
     length(Modes, 7),
     length(Events, 10),
-    length(Frames, 18),
+    length(Frames, 19),
     expect(wire_limit(frame_bytes, 16777216)),
     expect(wire_response(action, 6, [field(value, action_success)])).
 
@@ -140,7 +140,8 @@ run_test(stream_frames_cover_modes_directions_and_fd_handoffs) :-
                     [field(stream, u64),
                      field(request, appliance_run_request)], [], stay)),
     once(wire_frame(appliance, nested_result, 6, host_to_guest,
-                    [field(stream, u64), field(code, exit_code)], [], stay)).
+                    [field(stream, u64), field(code, exit_code)], [], stay)),
+    once(wire_frame(appliance, ready, 8, guest_to_host, [], [], stay)).
 
 run_test(all_transport_facts_project_through_central_relation) :-
     expect(all_requests_project),

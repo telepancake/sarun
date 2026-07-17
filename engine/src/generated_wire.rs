@@ -13,7 +13,7 @@
 // source-sha256 engine/pl/grammar_ir.pl 1a2a9a63076618402864e0ac630fca29b91210d54a03687f5be198d94a370d77
 // source-sha256 engine/pl/relation_api.pl e87d850a3cfd6a511e49b00bc7497e0c2790a45cf91aa4aa7b833b4b75364f6c
 // source-sha256 engine/pl/context_relation.pl 6819379ba751c4850e40f3a9d53cab888b9c2b1151283f1eaf479ae84f735473
-// source-sha256 engine/pl/transport_catalog.pl 879c1a4b04f22dc53d76fac3616c7dea5a7b82370960ac0de759e241dd4cb356
+// source-sha256 engine/pl/transport_catalog.pl 9f5583d3d3797076a7cf7898fcb3f29653ca456aa66886d05e0f30f19f5c01a1
 // source-sha256 engine/pl/wire_codegen.pl 64652e644954f2c801aaef1c96772a52da5f07792d27db006399e800ca58a3c9
 // source-sha256 scripts/wire_codegen.py cebd448fb51f20128aa3ea1f9041cf9c18e7908645e82543efbc5b80af8145fd
 
@@ -196,7 +196,7 @@ impl<T: RelationWireValue> RelationWireValue for Option<T> {
 
 pub const WIRE_PROTOCOL_VERSION: u64 = 1;
 pub const WIRE_SCHEMA_SHA256: &str =
-    "0fa51baf9cd0a8351e63cd0cedda2193c85290059b9b10b9d418266547786725";
+    "6c18048ff8ab1e2ad7d6b76a20a885e35b8b9b6127438d3c780203f8b7e82cc4";
 pub const LIMIT_FRAME_BYTES: usize = 16777216;
 pub const LIMIT_BLOB_BYTES: usize = 16777216;
 pub const LIMIT_TEXT_BYTES: usize = 1048576;
@@ -12485,6 +12485,7 @@ pub const APPLIANCE_FRAME_IDENTITIES: &[(&str, u64)] = &[
     ("nested_output", 5),
     ("nested_result", 6),
     ("result", 7),
+    ("ready", 8),
 ];
 
 #[derive(Clone, Debug, PartialEq)]
@@ -12515,6 +12516,7 @@ pub enum ApplianceFrame {
     Result {
         code: ExitCode,
     },
+    Ready,
 }
 
 impl ApplianceFrame {
@@ -12527,6 +12529,7 @@ impl ApplianceFrame {
             Self::NestedOutput { .. } => 5,
             Self::NestedResult { .. } => 6,
             Self::Result { .. } => 7,
+            Self::Ready => 8,
         }
     }
 }
@@ -12562,6 +12565,7 @@ impl WireValue for ApplianceFrame {
             Self::Result { code } => {
                 code.encode_atom(&mut fields)?;
             }
+            Self::Ready => {}
         }
         put_compound_payload(output, &fields)
     }
@@ -12599,6 +12603,7 @@ impl WireValue for ApplianceFrame {
             7 => Self::Result {
                 code: <ExitCode as WireValue>::decode_atom(&mut fields)?,
             },
+            8 => Self::Ready,
             _ => return Err(DecodeError::InvalidValue),
         };
         require_empty(fields)?;
@@ -12669,6 +12674,10 @@ impl RelationWireValue for ApplianceFrame {
                 Ok(Self::Result {
                     code: <ExitCode as RelationWireValue>::from_relation(fields.next().unwrap())?,
                 })
+            }
+            "ready" => {
+                require_relation_arity(fields, 0)?;
+                Ok(Self::Ready)
             }
             _ => Err(format!("unknown ApplianceFrame relation choice {case}")),
         }
@@ -14519,6 +14528,7 @@ mod generated_tests {
                 code: 0i32,
             },
             ApplianceFrame::Result { code: 0i32 },
+            ApplianceFrame::Ready,
         ];
         assert_eq!(values.len(), APPLIANCE_FRAME_IDENTITIES.len());
         for (value, (name, code)) in values.into_iter().zip(APPLIANCE_FRAME_IDENTITIES) {

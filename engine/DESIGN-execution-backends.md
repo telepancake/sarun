@@ -211,10 +211,13 @@ as executable mappings and mmap that genuinely need a host fd.
         operations on the existing paired control port; the host outer runner
         mints an engine connection over its authenticated box channel and
         inherits that host FD into the flat child launcher. The live aarch64
-        gate proves two host-side appliances, logical `OUTER -> INNER`
-        parenting, returned child output, child-local capture, and no host
-        write. A new QEMU device/kernel driver would add more machinery than it
-        removes here, so the paired kernel remains free to gain one when a
+        gate proves flat host-side appliances, logical parent edges, relayed
+        stdin/EOF, output, exact signal status, child-local capture, no host
+        write, and parent completion as a child-teardown barrier. PID 1 emits
+        a generated `ready` frame after spawning the command, so the host does
+        not feed caller input into the serial port while the kernel is still
+        booting. A new QEMU device/kernel driver would add more machinery than
+        it removes here, so the paired kernel remains free to gain one when a
         later operation actually benefits from it.
 - [x] Add the host launcher/vhost-user backend and target `/init` control plane.
   - [x] Embedded vhost-user lifecycle serves a scoped `SarunFs` box root on a

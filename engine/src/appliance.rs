@@ -13,7 +13,7 @@ use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::generated_wire::{
@@ -250,17 +250,31 @@ pub fn run(
     );
     let mut child = Command::new(&qemu)
         .args(&args)
-        .stdin(Stdio::inherit())
+        .stdin(Stdio::piped())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()?;
+    let mut qemu_input = child.stdin.take().ok_or_else(|| {
+        io::Error::other("QEMU stdin pipe was not created")
+    })?;
+    let input_ready = Arc::new((Mutex::new(false), Condvar::new()));
+    let input_gate = input_ready.clone();
+    std::thread::spawn(move || {
+        let (ready, changed) = &*input_gate;
+        let mut ready = ready.lock().unwrap();
+        while !*ready {
+            ready = changed.wait(ready).unwrap();
+        }
+        drop(ready);
+        let _ = io::copy(&mut io::stdin().lock(), &mut qemu_input);
+    });
     drop(qemu_virtiofs);
     drop(qemu_control);
     drop(qemu_network);
     let control_writer = Arc::new(Mutex::new(control.try_clone()?));
     let box_channel = Arc::new(Mutex::new(box_channel));
     let nested = Arc::new(Mutex::new(HashMap::<u64, NestedChild>::new()));
-    let result = (|| {
+    let mut result = (|| {
         crate::socket_wire::write_versioned(&mut control, command)?;
         loop {
             match crate::socket_wire::read_atom::<_, ApplianceFrame>(&mut control)? {
@@ -291,6 +305,11 @@ pub fn run(
                         unsafe { libc::kill(-child.pid, signal) };
                     }
                 }
+                ApplianceFrame::Ready => {
+                    let (ready, changed) = &*input_ready;
+                    *ready.lock().unwrap() = true;
+                    changed.notify_all();
+                }
                 ApplianceFrame::Result { code } => break Ok(code),
                 _ => break Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -299,8 +318,15 @@ pub fn run(
             }
         }
     })();
-    for child in nested.lock().unwrap().values() {
-        unsafe { libc::kill(-child.pid, libc::SIGTERM) };
+    signal_nested_children(&nested, libc::SIGTERM);
+    if !wait_nested_children(&nested, Duration::from_secs(10)) {
+        signal_nested_children(&nested, libc::SIGKILL);
+        if !wait_nested_children(&nested, Duration::from_secs(10)) && result.is_ok() {
+            result = Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "flat child appliance did not terminate",
+            ));
+        }
     }
     if result.is_err() {
         let _ = child.kill();
@@ -312,6 +338,28 @@ pub fn run(
 struct NestedChild {
     pid: i32,
     input: Option<ChildStdin>,
+}
+
+fn signal_nested_children(children: &Arc<Mutex<HashMap<u64, NestedChild>>>, signal: i32) {
+    for child in children.lock().unwrap().values() {
+        unsafe { libc::kill(-child.pid, signal) };
+    }
+}
+
+fn wait_nested_children(
+    children: &Arc<Mutex<HashMap<u64, NestedChild>>>,
+    timeout: Duration,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if children.lock().unwrap().is_empty() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn write_appliance_frame(writer: &Arc<Mutex<UnixStream>>, frame: &ApplianceFrame) {
@@ -440,10 +488,13 @@ fn spawn_nested_appliance(
     drop(engine);
     let pid = child.id() as i32;
     let input = child.stdin.take();
-    for mut output in [child.stdout.take().map(OutputPipe::Stdout),
-                       child.stderr.take().map(OutputPipe::Stderr)]
-        .into_iter().flatten()
-    {
+    let output_threads: Vec<_> = [
+        child.stdout.take().map(OutputPipe::Stdout),
+        child.stderr.take().map(OutputPipe::Stderr),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|mut output| {
         let writer = control.clone();
         std::thread::spawn(move || {
             let mut bytes = [0u8; 65536];
@@ -457,8 +508,9 @@ fn spawn_nested_appliance(
                     Ok(count) => nested_output(&writer, stream, &bytes[..count]),
                 }
             }
-        });
-    }
+        })
+    })
+    .collect();
     children.lock().unwrap().insert(stream, NestedChild { pid, input });
     std::thread::spawn(move || {
         let code = match child.wait() {
@@ -468,6 +520,9 @@ fn spawn_nested_appliance(
             }),
             Err(_) => 1,
         };
+        for output in output_threads {
+            let _ = output.join();
+        }
         children.lock().unwrap().remove(&stream);
         write_appliance_frame(&control,
             &ApplianceFrame::NestedResult { stream, code });
@@ -607,15 +662,17 @@ pub fn nested_run(request: ApplianceRunRequest, broker: &str) -> io::Result<i32>
     )?;
     stream.flush()?;
 
-    let mut input_stream = stream.try_clone()?;
+    let operation_writer = Arc::new(Mutex::new(stream.try_clone()?));
+    let input_writer = operation_writer.clone();
     std::thread::spawn(move || {
         let mut input = io::stdin().lock();
         let mut bytes = vec![0u8; crate::generated_wire::LIMIT_STREAM_CHUNK_BYTES.min(65536)];
         loop {
             match input.read(&mut bytes) {
                 Ok(0) | Err(_) => {
+                    let mut input_stream = input_writer.lock().unwrap();
                     let _ = crate::socket_wire::write_atom(
-                        &mut input_stream,
+                        &mut *input_stream,
                         &ApplianceFrame::NestedInputEof { stream: 0 },
                     );
                     let _ = input_stream.flush();
@@ -625,8 +682,9 @@ pub fn nested_run(request: ApplianceRunRequest, broker: &str) -> io::Result<i32>
                     let Ok(data) = crate::wire::BoundedBytes::new(bytes[..count].to_vec()) else {
                         break;
                     };
+                    let mut input_stream = input_writer.lock().unwrap();
                     if crate::socket_wire::write_atom(
-                        &mut input_stream,
+                        &mut *input_stream,
                         &ApplianceFrame::NestedInput { stream: 0, data },
                     ).and_then(|()| input_stream.flush()).is_err() {
                         break;
@@ -638,12 +696,13 @@ pub fn nested_run(request: ApplianceRunRequest, broker: &str) -> io::Result<i32>
     for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP, libc::SIGQUIT] {
         unsafe { libc::signal(signal, record_nested_signal as *const () as libc::sighandler_t) };
     }
-    let mut signal_stream = stream.try_clone()?;
+    let signal_writer = operation_writer;
     std::thread::spawn(move || loop {
         let signal = NESTED_SIGNAL.swap(0, std::sync::atomic::Ordering::SeqCst);
         if signal != 0 {
+            let mut signal_stream = signal_writer.lock().unwrap();
             if crate::socket_wire::write_atom(
-                &mut signal_stream,
+                &mut *signal_stream,
                 &ApplianceFrame::NestedSignal { stream: 0, signal },
             ).and_then(|()| signal_stream.flush()).is_err() {
                 break;
@@ -704,7 +763,10 @@ fn mount_one(source: &str, target: &str, kind: &str, flags: libc::c_ulong) -> io
     }
 }
 
-fn execute_guest(command: &ApplianceCommand) -> io::Result<i32> {
+fn execute_guest(
+    command: &ApplianceCommand,
+    control: &Arc<Mutex<std::fs::File>>,
+) -> io::Result<i32> {
     let words: Vec<OsString> = command
         .command
         .as_slice()
@@ -739,6 +801,11 @@ fn execute_guest(command: &ApplianceCommand) -> io::Result<i32> {
     let child = process.spawn()?;
     let root = child.id() as i32;
     GUEST_CHILD.store(root, std::sync::atomic::Ordering::SeqCst);
+    {
+        let mut writer = control.lock().unwrap();
+        crate::socket_wire::write_atom(&mut *writer, &ApplianceFrame::Ready)?;
+        writer.flush()?;
+    }
     let mut root_status = None;
     while root_status.is_none() {
         let mut status = 0;
@@ -934,7 +1001,7 @@ pub fn init_main() -> i32 {
         let control = start_guest_nested_broker(&stream)?;
         let guest_outcome = crate::net::tap::configure_appliance_network(command.net_mode)
             .map_err(|error| io::Error::other(format!("configure network: {error}")))
-            .and_then(|()| execute_guest(&command));
+            .and_then(|()| execute_guest(&command, &control));
         // The result is the host's safe-to-stop boundary: publish it only
         // after dirty guest pages have reached the shared filesystem. Exec
         // and network failures are results too: the host must never wait for

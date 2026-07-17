@@ -754,8 +754,11 @@ belong to the relation.
       virtualization. The guest emits generated nested-run/I/O frames to PID 1,
       its live host runner obtains a broker-authenticated engine connection and
       launches the sibling appliance, and no host descriptor crosses into the
-      guest. A live aarch64 gate proves output, parent identity, child capture,
-      and host non-escape.
+      guest. The generated command-ready frame gates QEMU serial input until
+      PID 1 has spawned the command. The full aarch64 backend gate proves
+      stdin/EOF, ordered output-before-result, exact relayed TERM status,
+      parent identity, child capture, host non-escape, and teardown of a flat
+      child that is still running when the outer command exits.
 - [ ] Copy third-party license notices beside every normal release artifact.
 
 ### 2. Generic typed FFI — NEXT

@@ -481,7 +481,7 @@ def run_nested_qemu():
 
 
 def run_qemu_inside_qemu():
-    """A guest request launches a flat sibling QEMU through its host runner."""
+    """Guest requests launch flat sibling QEMUs through their host runner."""
     root = Path(tempfile.mkdtemp(prefix="sarun-equiv-qemu-flat-nested-", dir="/var/tmp"))
     work = root / "lower"
     work.mkdir()
@@ -509,9 +509,19 @@ def run_qemu_inside_qemu():
         if not wait_socket(module.sock_path()):
             raise RuntimeError("engine socket never appeared")
         nested = (
+            "printf 'NESTED-INPUT\\n' | "
             '"$SARUN_EXE" run --net off --qemu '
-            f'{HOST_ARCH} INNER -C "$PWD" -- sh -c '
-            "'printf FLAT-NESTED > flat-nested-result; printf flat-nested-ok'"
+            f'{HOST_ARCH} INPUT -C "$PWD" -- sh -c '
+            "'IFS= read -r value; test \"$value\" = NESTED-INPUT; "
+            "printf %s \"$value\" > flat-nested-input; printf flat-input-ok'; "
+            '"$SARUN_EXE" run --net off --qemu '
+            f'{HOST_ARCH} SIGNAL -C "$PWD" -- sh -c '
+            "'printf flat-signal-ready; exec sleep 60' & nested=$!; "
+            'sleep 5; kill -TERM "$nested"; wait "$nested"; code=$?; '
+            "printf 'flat-signal-%s' \"$code\"; test \"$code\" -eq 143; "
+            '"$SARUN_EXE" run --net off --qemu '
+            f'{HOST_ARCH} ORPHAN -C "$PWD" -- sh -c '
+            "'exec sleep 60' & sleep 5; printf flat-outer-exit"
         )
         result = subprocess.run(
             [str(ENGINE_BIN), "run", "--net", "off", "--qemu", HOST_ARCH,
@@ -525,19 +535,34 @@ def run_qemu_inside_qemu():
             )
         store = Path(env["XDG_STATE_HOME"]) / f"slopbox.{env['SLOPBOX_NS']}"
         archives = sorted(store.glob("*.sqlar"), key=lambda path: int(path.stem))
-        if len(archives) != 2:
-            raise RuntimeError(f"expected outer and inner archives, got {archives}")
-        outer, inner = archives
+        if len(archives) != 4:
+            raise RuntimeError(
+                f"expected outer and three inner archives, got {archives}"
+            )
+        by_name = {
+            module.sqlar_meta_get(archive, "name"): archive
+            for archive in archives
+        }
+        outer = by_name["OUTER"]
+        input_box = by_name["INPUT"]
+        signal_box = by_name["SIGNAL"]
+        orphan_box = by_name["ORPHAN"]
         return {
-            "exit_output": b"flat-nested-ok" in result.stdout,
+            "input_output": b"flat-input-ok" in result.stdout,
+            "signal_output": b"flat-signal-ready" in result.stdout,
+            "signal_result": b"flat-signal-143" in result.stdout,
+            "outer_exit": b"flat-outer-exit" in result.stdout,
             "outer_name": module.sqlar_meta_get(outer, "name"),
-            "inner_name": module.sqlar_meta_get(inner, "name"),
-            "inner_parent": module.sqlar_meta_get(inner, "parent_box_id"),
+            "input_name": module.sqlar_meta_get(input_box, "name"),
+            "signal_name": module.sqlar_meta_get(signal_box, "name"),
+            "input_parent": module.sqlar_meta_get(input_box, "parent_box_id"),
+            "signal_parent": module.sqlar_meta_get(signal_box, "parent_box_id"),
+            "orphan_parent": module.sqlar_meta_get(orphan_box, "parent_box_id"),
             "outer_id": outer.stem,
-            "inner_result": module.sqlar_content(
-                inner, str(work / "flat-nested-result").lstrip("/")
+            "input_result": module.sqlar_content(
+                input_box, str(work / "flat-nested-input").lstrip("/")
             ),
-            "host_unchanged": not (work / "flat-nested-result").exists(),
+            "host_unchanged": not (work / "flat-nested-input").exists(),
         }
     finally:
         engine.terminate()
@@ -762,15 +787,22 @@ def main():
         except Exception as error:
             check(False, f"qemu inside qemu: flat sibling launch completed ({error})")
         else:
-            check(flat_nested["exit_output"],
-                  "qemu inside qemu: child output returned to guest caller")
+            check(flat_nested["input_output"],
+                  "qemu inside qemu: stdin and output crossed operation stream")
+            check(flat_nested["signal_output"] and flat_nested["signal_result"],
+                  "qemu inside qemu: caller signal returned exact status 143")
+            check(flat_nested["outer_exit"],
+                  "qemu inside qemu: outer result waited for flat child teardown")
             check(flat_nested["outer_name"] == "OUTER"
-                  and flat_nested["inner_name"] == "INNER",
+                  and flat_nested["input_name"] == "INPUT"
+                  and flat_nested["signal_name"] == "SIGNAL",
                   "qemu inside qemu: relative names retained")
-            check(flat_nested["inner_parent"] == flat_nested["outer_id"],
+            check(flat_nested["input_parent"] == flat_nested["outer_id"]
+                  and flat_nested["signal_parent"] == flat_nested["outer_id"]
+                  and flat_nested["orphan_parent"] == flat_nested["outer_id"],
                   "qemu inside qemu: authenticated logical parent recorded")
-            check(flat_nested["inner_result"] == b"FLAT-NESTED",
-                  "qemu inside qemu: sibling appliance captured its own write")
+            check(flat_nested["input_result"] == b"NESTED-INPUT",
+                  "qemu inside qemu: relayed input reached child capture")
             check(flat_nested["host_unchanged"],
                   "qemu inside qemu: sibling write did not escape to host")
         try:
