@@ -433,7 +433,11 @@ as executable mappings and mmap that genuinely need a host fd.
   - [ ] Finish the QEMU kernel build and byte-for-byte artifact comparison.
         Rerun after the output, clock, and concurrency fixes. Compiler processes
         and artifact writers must be guest records, and output/trace rows must
-        be populated, not merely inferred from a successful exit.
+        be populated, not merely inferred from a successful exit. The apparent
+        second stall at 186 objects was isolated to the test's own shared
+        `flock` concurrency counter, whose advisory lock does not survive this
+        virtio-fs use correctly; the fixture now records one lock-free interval
+        per compiler and derives maximum overlap from the closed archive.
 - [x] Remove backend-specific semantic branches and obsolete compatibility
       code; update generated help and user documentation. A repository audit
       finds backend selection only in registration, runner, transport, trace,

@@ -6,8 +6,10 @@ builds Linux from a clean output directory with ``make -j10``, then the test rea
 the result back from the box archive.  The lower directory and kernel source must
 remain unchanged on the host.
 
-The target compiler is wrapped only to count simultaneous, real clang processes;
-the wrapper always invokes /usr/bin/clang-21 with the original arguments.
+The target compiler is wrapped only to write one private start/end interval per
+real clang process; the wrapper always invokes /usr/bin/clang-21 with the
+original arguments. The host derives overlap after the archive is closed, so
+the measurement never introduces a shared lock into the build being measured.
 
 Run from the repository root:
 
@@ -42,24 +44,13 @@ ARCH_CONFIG = REPO_ROOT / "engine/appliance/kernel-aarch64.config"
 CLANG_PROBE = r'''#!/bin/sh
 set -u
 state=${SARUN_CLANG_PROBE_STATE:?}
-exec 9>"$state/lock"
-flock 9
-active=$(cat "$state/active")
-active=$((active + 1))
-printf '%s\n' "$active" > "$state/active"
-maximum=$(cat "$state/maximum")
-if [ "$active" -gt "$maximum" ]; then
-    printf '%s\n' "$active" > "$state/maximum"
-fi
-flock -u 9
-
+started=$(date +%s%N)
+trace="$state/trace.$$.$started"
+printf '%s\n' "$started" > "$trace"
 /usr/bin/clang-21 "$@"
 status=$?
-
-flock 9
-active=$(cat "$state/active")
-printf '%s\n' "$((active - 1))" > "$state/active"
-flock -u 9
+ended=$(date +%s%N)
+printf '%s\n' "$ended" >> "$trace"
 exit "$status"
 '''
 
@@ -151,6 +142,32 @@ def captured_output(module, sqlar):
     return b"".join(chunks)
 
 
+def compiler_overlap(module, sqlar, prefix):
+    """Maximum real compiler overlap from private archived intervals."""
+    intervals = []
+    trace_prefix = prefix + ".clang-probe/trace."
+    for name, *_ in module.sqlar_list(sqlar):
+        if not name.startswith(trace_prefix):
+            continue
+        content = module.sqlar_content(sqlar, name)
+        if content is None:
+            continue
+        try:
+            started, ended = (int(value) for value in content.splitlines())
+        except (TypeError, ValueError):
+            continue
+        if ended >= started:
+            intervals.append((started, ended))
+    events = [(started, 1) for started, _ in intervals]
+    events.extend((ended, -1) for _, ended in intervals)
+    active = maximum = 0
+    # An interval ending at the exact instant another starts is not overlap.
+    for _, change in sorted(events, key=lambda event: (event[0], event[1])):
+        active += change
+        maximum = max(maximum, active)
+    return maximum, len(intervals)
+
+
 def shell_workload(source, work, jobs):
     out = work / "out"
     probe = work / "clang-probe"
@@ -166,19 +183,16 @@ make -C {source} O={out} ARCH=arm64 LLVM=-21 tinyconfig
     {out}/.config {COMMON_CONFIG} {ARCH_CONFIG}
 make -C {source} O={out} ARCH=arm64 LLVM=-21 olddefconfig
 mkdir -p "$SARUN_CLANG_PROBE_STATE"
-printf '0\n' > "$SARUN_CLANG_PROBE_STATE/active"
-printf '0\n' > "$SARUN_CLANG_PROBE_STATE/maximum"
 started=$(date +%s)
 make -C {source} O={out} ARCH=arm64 LLVM=-21 CC={probe} -j{jobs} Image
 ended=$(date +%s)
 test -s {out}/arch/arm64/boot/Image
 test -s {out}/vmlinux
 objects=$(find {out} -type f -name '*.o' | wc -l)
-maximum=$(cat "$SARUN_CLANG_PROBE_STATE/maximum")
-printf 'SARUN_KERNEL_BUILD_DONE jobs={jobs} max_clang=%s objects=%s seconds=%s\n' \
-    "$maximum" "$objects" "$((ended - started))"
-printf 'jobs={jobs}\nmax_clang=%s\nobjects=%s\nseconds=%s\n' \
-    "$maximum" "$objects" "$((ended - started))" > {out}/sarun-build-summary
+printf 'SARUN_KERNEL_BUILD_DONE jobs={jobs} objects=%s seconds=%s\n' \
+    "$objects" "$((ended - started))"
+printf 'jobs={jobs}\nobjects=%s\nseconds=%s\n' \
+    "$objects" "$((ended - started))" > {out}/sarun-build-summary
 sha256sum {out}/arch/arm64/boot/Image {out}/vmlinux
 '''
 
@@ -255,6 +269,7 @@ def run_backend(backend, source, jobs, keep):
             or any("clang-21" in Path(str(arg)).name for arg in row[5])
         ]
         object_rows = sum(name.startswith(prefix) and name.endswith(".o") for name in names)
+        max_clang, compiler_intervals = compiler_overlap(module, sqlar, prefix)
         counts, meta, artifact_writers = sqlar_counts(sqlar)
 
         observation = {
@@ -267,6 +282,8 @@ def run_backend(backend, source, jobs, keep):
             "archive_object_rows": object_rows,
             "process_rows": len(processes),
             "clang_process_rows": len(clang_processes),
+            "compiler_intervals": compiler_intervals,
+            "max_clang": max_clang,
             "output_bytes": len(output),
             "completion_marker_captured": b"SARUN_KERNEL_BUILD_DONE" in output,
             "summary": summary.decode(errors="replace") if summary else None,
@@ -302,12 +319,8 @@ def run_backend(backend, source, jobs, keep):
             errors.append("a build write escaped into the host lower tree")
         if not observation["host_source_unchanged"]:
             errors.append("the host kernel source tree changed")
-        if summary:
-            fields = dict(
-                line.split("=", 1) for line in summary.decode().splitlines() if "=" in line
-            )
-            if int(fields.get("max_clang", "0")) < 2:
-                errors.append("fewer than two real clang processes overlapped")
+        if max_clang < 2:
+            errors.append("fewer than two real clang processes overlapped")
 
         if errors:
             raise RuntimeError(f"{backend}: " + "; ".join(errors) + f"; report={root / 'report.json'}")
@@ -339,7 +352,7 @@ def main(argv=None):
     required = (ENGINE_BIN, args.source / "Makefile", COMMON_CONFIG, ARCH_CONFIG)
     missing_paths = [str(path) for path in required if not path.exists()]
     missing_tools = [
-        tool for tool in ("clang-21", "flock", "make") if shutil.which(tool) is None
+        tool for tool in ("clang-21", "make") if shutil.which(tool) is None
     ]
     if missing_paths or missing_tools:
         print("missing paths: " + ", ".join(missing_paths))
@@ -360,7 +373,8 @@ def main(argv=None):
         observations.append(observation)
         summary = observation["summary"].strip().replace("\n", ", ")
         print(
-            f"PASS: {summary}; {observation['process_rows']} process rows; "
+            f"PASS: {summary}; max_clang={observation['max_clang']}; "
+            f"{observation['process_rows']} process rows; "
             f"{observation['output_bytes']} output bytes; state={root}",
             flush=True,
         )
