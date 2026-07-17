@@ -102,6 +102,14 @@ static int child_calls(struct sud_fs_ring *ring)
         || directory_entry->d_type != DT_REG
         || strcmp(directory_entry->d_name, "x") != 0) return 22;
     if (fs_call(SYS_close, directory, 0, 0, 0, 0, 0) != 0) return 23;
+    char link_target[16] = {0};
+    if (fs_call(SYS_readlinkat, AT_FDCWD, (long)"/link",
+                (long)link_target, sizeof(link_target), 0, 0) != 5
+        || memcmp(link_target, "hello", 5) != 0) return 24;
+    int linked = (int)fs_call(SYS_openat, AT_FDCWD, (long)"/link",
+                              O_RDONLY, 0, 0, 0);
+    if (linked < 0) return 25;
+    if (fs_call(SYS_close, linked, 0, 0, 0, 0, 0) != 0) return 26;
     return 0;
 }
 
@@ -221,6 +229,53 @@ static int serve_calls(struct sud_fs_ring *ring)
 
     slot = take_request(ring); header = (struct fuse_in_header *)slot->request;
     if (header->opcode != FUSE_FORGET || header->nodeid != 3) return 36;
+    no_reply(slot);
+
+    slot = take_request(ring); header = (struct fuse_in_header *)slot->request;
+    if (header->opcode != FUSE_LOOKUP || header->nodeid != FUSE_ROOT_ID
+        || strcmp((char *)(header + 1), "link") != 0) return 37;
+    memset(&entry, 0, sizeof(entry));
+    entry.nodeid = 5;
+    entry.attr.ino = 5;
+    entry.attr.mode = S_IFLNK | 0777;
+    reply(slot, &entry, sizeof(entry));
+    slot = take_request(ring); header = (struct fuse_in_header *)slot->request;
+    if (header->opcode != FUSE_READLINK || header->nodeid != 5) return 38;
+    reply(slot, "hello", 5);
+    slot = take_request(ring); header = (struct fuse_in_header *)slot->request;
+    if (header->opcode != FUSE_FORGET || header->nodeid != 5) return 39;
+    no_reply(slot);
+
+    slot = take_request(ring); header = (struct fuse_in_header *)slot->request;
+    if (header->opcode != FUSE_LOOKUP || header->nodeid != FUSE_ROOT_ID
+        || strcmp((char *)(header + 1), "link") != 0) return 40;
+    reply(slot, &entry, sizeof(entry));
+    slot = take_request(ring); header = (struct fuse_in_header *)slot->request;
+    if (header->opcode != FUSE_READLINK || header->nodeid != 5) return 41;
+    reply(slot, "hello", 5);
+    slot = take_request(ring); header = (struct fuse_in_header *)slot->request;
+    if (header->opcode != FUSE_FORGET || header->nodeid != 5) return 42;
+    no_reply(slot);
+    slot = take_request(ring); header = (struct fuse_in_header *)slot->request;
+    if (header->opcode != FUSE_LOOKUP || header->nodeid != FUSE_ROOT_ID
+        || strcmp((char *)(header + 1), "hello") != 0) return 43;
+    memset(&entry, 0, sizeof(entry));
+    entry.nodeid = 2;
+    entry.attr.ino = 2;
+    entry.attr.mode = S_IFREG | 0644;
+    reply(slot, &entry, sizeof(entry));
+    slot = take_request(ring); header = (struct fuse_in_header *)slot->request;
+    if (header->opcode != FUSE_OPEN || header->nodeid != 2) return 44;
+    opened.fh = 11;
+    reply(slot, &opened, sizeof(opened));
+    slot = take_request(ring); header = (struct fuse_in_header *)slot->request;
+    if (header->opcode != FUSE_FLUSH || header->nodeid != 2) return 45;
+    reply(slot, 0, 0);
+    slot = take_request(ring); header = (struct fuse_in_header *)slot->request;
+    if (header->opcode != FUSE_RELEASE || header->nodeid != 2) return 46;
+    reply(slot, 0, 0);
+    slot = take_request(ring); header = (struct fuse_in_header *)slot->request;
+    if (header->opcode != FUSE_FORGET || header->nodeid != 2) return 47;
     no_reply(slot);
     return 0;
 }

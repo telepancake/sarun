@@ -235,13 +235,13 @@ static void resolved_forget(struct resolved_node *node)
     }
 }
 
-static int resolve_absolute(const char *path, struct resolved_node *node)
+static int normalize_absolute(const char *path, char *output, size_t size)
 {
     if (!path || path[0] != '/') return -EINVAL;
-    memset(node, 0, sizeof(*node));
-    uint64_t stack[PATH_MAX / 2];
-    unsigned int depth = 1;
-    stack[0] = FUSE_ROOT_ID;
+    size_t used = 1;
+    if (size < 2) return -ENAMETOOLONG;
+    output[0] = '/';
+    output[1] = '\0';
     const char *cursor = path;
     while (*cursor) {
         while (*cursor == '/') cursor++;
@@ -249,43 +249,118 @@ static int resolve_absolute(const char *path, struct resolved_node *node)
         const char *end = cursor;
         while (*end && *end != '/') end++;
         size_t length = (size_t)(end - cursor);
-        if (length == 1 && cursor[0] == '.') { cursor = end; continue; }
-        if (length == 2 && cursor[0] == '.' && cursor[1] == '.') {
-            if (depth > 1) depth--;
+        if (length == 1 && cursor[0] == '.') {
             cursor = end;
             continue;
         }
+        if (length == 2 && cursor[0] == '.' && cursor[1] == '.') {
+            if (used > 1) {
+                if (output[used - 1] == '/') used--;
+                while (used > 1 && output[used - 1] != '/') used--;
+                output[used] = '\0';
+            }
+            cursor = end;
+            continue;
+        }
+        if (length > 255) return -ENAMETOOLONG;
+        if (used > 1 && output[used - 1] != '/') {
+            if (used + 1 >= size) return -ENAMETOOLONG;
+            output[used++] = '/';
+        }
+        if (used + length >= size) return -ENAMETOOLONG;
+        memcpy(output + used, cursor, length);
+        used += length;
+        output[used] = '\0';
+        cursor = end;
+    }
+    return 0;
+}
+
+static int resolve_absolute_full(const char *path, struct resolved_node *node,
+                                 int follow_final, char *canonical)
+{
+    char pending[PATH_MAX];
+    int result = normalize_absolute(path, pending, sizeof(pending));
+    if (result != 0) return result;
+    unsigned int symlinks = 0;
+
+restart:
+    memset(node, 0, sizeof(*node));
+    uint64_t parent = FUSE_ROOT_ID;
+    const char *cursor = pending;
+    while (*cursor) {
+        while (*cursor == '/') cursor++;
+        if (!*cursor) break;
+        const char *end = cursor;
+        while (*end && *end != '/') end++;
+        size_t length = (size_t)(end - cursor);
         if (length == 0 || length > 255) return -ENAMETOOLONG;
         char component[256];
         memcpy(component, cursor, length);
         component[length] = '\0';
         struct fuse_entry_out entry;
-        int result = sud_fuse_lookup(stack[depth - 1], component, &entry);
+        result = sud_fuse_lookup(parent, component, &entry);
         if (result != 0) {
             resolved_forget(node);
             return result;
         }
         resolved_forget(node);
-        if (depth >= sizeof(stack) / sizeof(stack[0])) {
-            if (entry.nodeid != FUSE_ROOT_ID)
+        const char *remaining = end;
+        while (*remaining == '/') remaining++;
+        int is_final = !*remaining;
+        if ((entry.attr.mode & S_IFMT) == S_IFLNK
+            && (!is_final || follow_final)) {
+            if (++symlinks > 40) {
                 (void)sud_fuse_forget(entry.nodeid, 1);
-            return -ENAMETOOLONG;
+                return -ELOOP;
+            }
+            char target[PATH_MAX];
+            long target_len = sud_fuse_readlink(entry.nodeid, target,
+                                                 sizeof(target) - 1);
+            (void)sud_fuse_forget(entry.nodeid, 1);
+            if (target_len < 0) return (int)target_len;
+            if ((size_t)target_len >= sizeof(target)) return -ENAMETOOLONG;
+            target[target_len] = '\0';
+            char expanded[PATH_MAX * 2];
+            size_t used = 0;
+            if (target[0] != '/') {
+                size_t prefix = (size_t)(cursor - pending);
+                if (prefix >= sizeof(expanded)) return -ENAMETOOLONG;
+                memcpy(expanded, pending, prefix);
+                used = prefix;
+            }
+            size_t target_size = (size_t)target_len;
+            size_t remaining_size = strlen(end);
+            if (used + target_size + remaining_size >= sizeof(expanded))
+                return -ENAMETOOLONG;
+            memcpy(expanded + used, target, target_size);
+            used += target_size;
+            memcpy(expanded + used, end, remaining_size + 1);
+            result = normalize_absolute(expanded, pending, sizeof(pending));
+            if (result != 0) return result;
+            goto restart;
         }
-        stack[depth++] = entry.nodeid;
         node->inode = entry.nodeid;
         node->lookup_count = 1;
         node->attr = entry.attr;
+        parent = entry.nodeid;
         cursor = end;
     }
-    if (depth == 1) {
+    if (!node->lookup_count) {
         struct fuse_attr_out attributes;
-        int result = sud_fuse_getattr(FUSE_ROOT_ID, 0, 0, &attributes);
+        result = sud_fuse_getattr(FUSE_ROOT_ID, 0, 0, &attributes);
         if (result != 0) return result;
         node->inode = FUSE_ROOT_ID;
         node->lookup_count = 0;
         node->attr = attributes.attr;
     }
+    if (canonical) memcpy(canonical, pending, strlen(pending) + 1);
     return 0;
+}
+
+static int resolve_absolute(const char *path, struct resolved_node *node)
+{
+    return resolve_absolute_full(path, node, 1, 0);
 }
 
 static int resolve_parent(int dirfd, const char *path, struct resolved_node *parent,
@@ -379,7 +454,9 @@ int sud_vfs_openat(int dirfd, const char *path, int flags,
     int result = absolute_at(dirfd, path, absolute, sizeof(absolute));
     if (result != 0) return result;
     struct resolved_node node;
-    result = resolve_absolute(absolute, &node);
+    char canonical[PATH_MAX];
+    result = resolve_absolute_full(absolute, &node,
+                                   !(flags & O_NOFOLLOW), canonical);
     struct fuse_open_out opened;
     if (result == 0) {
         if ((flags & O_CREAT) && (flags & O_EXCL)) {
@@ -387,6 +464,11 @@ int sud_vfs_openat(int dirfd, const char *path, int flags,
             return -EEXIST;
         }
         int is_directory = (node.attr.mode & S_IFMT) == S_IFDIR;
+        if (!is_directory && (node.attr.mode & S_IFMT) == S_IFLNK
+            && (flags & O_NOFOLLOW)) {
+            resolved_forget(&node);
+            return -ELOOP;
+        }
         if ((flags & O_DIRECTORY) && !is_directory) {
             resolved_forget(&node);
             return -ENOTDIR;
@@ -409,6 +491,7 @@ int sud_vfs_openat(int dirfd, const char *path, int flags,
             ? sud_fuse_opendir(node.inode, (uint32_t)flags, &opened)
             : sud_fuse_open(node.inode, (uint32_t)flags, &opened);
         if (result != 0) { resolved_forget(&node); return result; }
+        memcpy(absolute, canonical, strlen(canonical) + 1);
     } else if (result == -ENOENT && (flags & O_CREAT)) {
         char parent_path[PATH_MAX];
         char name[256];
@@ -658,14 +741,15 @@ int sud_vfs_chdir(const char *path)
     int result = absolute_at(AT_FDCWD, path, absolute, sizeof(absolute));
     if (result != 0) return result;
     struct resolved_node node;
-    result = resolve_absolute(absolute, &node);
+    char canonical[PATH_MAX];
+    result = resolve_absolute_full(absolute, &node, 1, canonical);
     if (result != 0) return result;
     if ((node.attr.mode & S_IFMT) != S_IFDIR) result = -ENOTDIR;
     resolved_forget(&node);
     if (result != 0) return result;
     local_lock(&g_cwd_lock);
-    size_t length = strlen(absolute);
-    memcpy(g_cwd, absolute, length + 1);
+    size_t length = strlen(canonical);
+    memcpy(g_cwd, canonical, length + 1);
     local_unlock(&g_cwd_lock);
     return 0;
 }
@@ -743,6 +827,20 @@ long sud_vfs_getdents64(int fd, void *buffer, size_t size)
     ofd_unlock(description);
     if (output_offset == 0 && count > 0) return -EINVAL;
     return (long)output_offset;
+}
+
+long sud_vfs_readlinkat(int dirfd, const char *path, char *buffer, size_t size)
+{
+    char absolute[PATH_MAX];
+    int result = absolute_at(dirfd, path, absolute, sizeof(absolute));
+    if (result != 0) return result;
+    struct resolved_node node;
+    result = resolve_absolute_full(absolute, &node, 0, 0);
+    if (result != 0) return result;
+    if ((node.attr.mode & S_IFMT) != S_IFLNK) result = -EINVAL;
+    else result = (int)sud_fuse_readlink(node.inode, buffer, size);
+    resolved_forget(&node);
+    return result;
 }
 
 int sud_vfs_close(int fd)

@@ -23,6 +23,7 @@ int sud_vfs_chdir(const char *path);
 int sud_vfs_fchdir(int fd);
 long sud_vfs_getcwd(char *buffer, size_t size);
 long sud_vfs_getdents64(int fd, void *buffer, size_t size);
+long sud_vfs_readlinkat(int dirfd, const char *path, char *buffer, size_t size);
 void sud_vfs_fork_child(void);
 void sud_vfs_process_exit(void);
 

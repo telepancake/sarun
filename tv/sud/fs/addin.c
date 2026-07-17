@@ -224,6 +224,16 @@ static int fs_pre_syscall(struct sud_syscall_ctx *ctx)
         return handled(ctx, sud_vfs_getdents64((int)ctx->args[0],
                          (void *)ctx->args[1], (size_t)ctx->args[2]));
 #endif
+    if (nr == SYS_readlinkat)
+        return handled(ctx, sud_vfs_readlinkat((int)ctx->args[0],
+                         (const char *)ctx->args[1], (char *)ctx->args[2],
+                         (size_t)ctx->args[3]));
+#ifdef SYS_readlink
+    if (nr == SYS_readlink)
+        return handled(ctx, sud_vfs_readlinkat(AT_FDCWD,
+                         (const char *)ctx->args[0], (char *)ctx->args[1],
+                         (size_t)ctx->args[2]));
+#endif
     if (nr == SYS_chdir)
         return handled(ctx, sud_vfs_chdir((const char *)ctx->args[0]));
     if (nr == SYS_fchdir && sud_vfs_owns_fd((int)ctx->args[0]))
