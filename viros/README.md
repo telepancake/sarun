@@ -82,11 +82,13 @@ Useful individual stages and run modes are:
 
 `debug` is the single-command source-level workflow: it starts target-specific
 QEMU, stops after init has started, connects the Python-enabled multi-target
-GDB, and cleans QEMU up when GDB exits. ARM uses a hardware breakpoint at the
-symbolic `ret_to_user`; MIPS stops at `start_thread`; and x86 stops at
-`compat_start_thread` because its RouterOS init is IA32. MIPS and x86 inspect
-PID 1 and then stop at the extracted `/init` entry. PPC remains stopped at the
-init-exit panic with `-no-shutdown`. Before presenting the prompt GDB runs
+GDB, and cleans QEMU up when GDB exits. `gdb <target>` is an alias for this
+complete workflow; supplying an explicit remote as the second argument keeps
+the attach-only form, for example `gdb mmips :1234`. ARM uses a hardware
+breakpoint at the symbolic `ret_to_user`; MIPS stops at `start_thread`; and x86
+stops at `compat_start_thread` because its RouterOS init is IA32. MIPS and x86
+inspect PID 1 and then stop at the extracted `/init` entry. PPC remains stopped
+at the init-exit panic with `-no-shutdown`. Before presenting the prompt GDB runs
 `lx-version`, `lx-ps`, and examines PID 1 with `$lx_task_by_pid(1)`. MikroTik's
 printk changes are not compatible with the stock 5.6.3 `lx-dmesg` helper.
 

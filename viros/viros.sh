@@ -102,7 +102,7 @@ Stages:
   extract [arch|all]    Extract Linux images/initramfs from RouterOS NPKs
   prepare [arch|all]    Extract and create per-target raw ext2 disk images
   run <target> [-- ...] Prepare and run one target; extra args go to QEMU
-  gdb <target> [remote] Attach Python-enabled GDB to a paused QEMU
+  gdb <target> [remote] Launch debug workflow, or attach to explicit remote
   debug <target>        Boot matching debug kernel, stop after init, open GDB
 
 Information:
@@ -945,9 +945,14 @@ run_stage() {
 }
 
 gdb_stage() {
-    local target=${1:-} remote=${2:-:1234} gdb out vmlinux helper
+    local target=${1:-} remote gdb out vmlinux helper
     local -a gdb_args
     [[ -n "$target" ]] || die "gdb requires a target"
+    if (($# == 1)); then
+        debug_stage "$target"
+        return
+    fi
+    remote=$2
     case "$target" in
         x86|arm|arm64|mipsbe|mmips|smips|ppc-e500-smp|ppc-e500|ppc-440) ;;
         *) die "no validated matching debug kernel for $target" ;;
