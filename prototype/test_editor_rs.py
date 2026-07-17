@@ -96,7 +96,11 @@ def main():
         def verb(name, *args):
             rep = m.sync_request(sock, type="ui", verb=name,
                                  args=[str(a) for a in args]) or {}
-            return rep.get("r") or {}
+            # Successful control actions project their typed result under
+            # `r`; transport/action failures are top-level error envelopes.
+            # Preserve the latter instead of erasing the very refusal this
+            # test is meant to inspect.
+            return (rep.get("r") or {}) if rep.get("ok") is True else rep
 
         def b64(data: bytes) -> str:
             return base64.b64encode(data).decode()
