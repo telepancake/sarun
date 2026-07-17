@@ -30,6 +30,9 @@ pub const FRAME_UNMUTE: u8 = 5;
 //             line — see D9). The engine records it into the box's sqlar
 //             `brushprov` table and broadcasts a `brush_prov` event.
 pub const FRAME_PROV: u8 = 6;
+// QEMU runner→engine process provenance. Code 7 is scoped to the box stream;
+// the independent PTY stream also uses 7 for PTY_DATA.
+pub const FRAME_GUEST_PROCESS: u8 = 7;
 //
 // Engine-held-PTY mux frames (D7/D9). On a `pty_spawn` control connection the
 // engine spawns a command on a PTY it holds (portable-pty) and muxes the master

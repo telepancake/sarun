@@ -13,7 +13,7 @@
 // source-sha256 engine/pl/grammar_ir.pl 1a2a9a63076618402864e0ac630fca29b91210d54a03687f5be198d94a370d77
 // source-sha256 engine/pl/relation_api.pl e87d850a3cfd6a511e49b00bc7497e0c2790a45cf91aa4aa7b833b4b75364f6c
 // source-sha256 engine/pl/context_relation.pl 6819379ba751c4850e40f3a9d53cab888b9c2b1151283f1eaf479ae84f735473
-// source-sha256 engine/pl/transport_catalog.pl 1ad6ee3eab2a0db393e4d194fafe2bfa5b6bd257b3348c9f499f77da9ade71cc
+// source-sha256 engine/pl/transport_catalog.pl c2149253cfaf570c5f74db37d6753d6c85c205d606f44138b56181f9ae682e1c
 // source-sha256 engine/pl/wire_codegen.pl 64652e644954f2c801aaef1c96772a52da5f07792d27db006399e800ca58a3c9
 // source-sha256 scripts/wire_codegen.py cebd448fb51f20128aa3ea1f9041cf9c18e7908645e82543efbc5b80af8145fd
 
@@ -196,7 +196,7 @@ impl<T: RelationWireValue> RelationWireValue for Option<T> {
 
 pub const WIRE_PROTOCOL_VERSION: u64 = 1;
 pub const WIRE_SCHEMA_SHA256: &str =
-    "a87439a884d69ca9c795cd8206e3ef18bd1ee1a371cf2ca4deb21d27ed71bea8";
+    "4fea08f27464d60d2127e5260c3337d5533a77ff6a0317b11338313c5848089f";
 pub const LIMIT_FRAME_BYTES: usize = 16777216;
 pub const LIMIT_BLOB_BYTES: usize = 16777216;
 pub const LIMIT_TEXT_BYTES: usize = 1048576;
@@ -686,6 +686,49 @@ impl RelationWireValue for ProcessProvenance {
             environment: <Option<Environment> as RelationWireValue>::from_relation(
                 fields.next().unwrap(),
             )?,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GuestProcessEvent {
+    pub pid: u32,
+    pub provenance: ProcessProvenance,
+    pub start: u64,
+}
+
+impl WireValue for GuestProcessEvent {
+    fn encode_atom(&self, output: &mut Vec<u8>) -> Result<(), DecodeError> {
+        let mut fields = Vec::new();
+        self.pid.encode_atom(&mut fields)?;
+        self.provenance.encode_atom(&mut fields)?;
+        self.start.encode_atom(&mut fields)?;
+        put_compound_payload(output, &fields)
+    }
+
+    fn decode_atom(input: &mut &[u8]) -> Result<Self, DecodeError> {
+        let mut fields = get_atom(input, LIMIT_FRAME_BYTES)?;
+        let value = Self {
+            pid: <u32 as WireValue>::decode_atom(&mut fields)?,
+            provenance: <ProcessProvenance as WireValue>::decode_atom(&mut fields)?,
+            start: <u64 as WireValue>::decode_atom(&mut fields)?,
+        };
+        require_empty(fields)?;
+        Ok(value)
+    }
+}
+
+impl RelationWireValue for GuestProcessEvent {
+    fn from_relation(value: &RelationValue) -> Result<Self, String> {
+        let fields = relation_compound(value, "record")?;
+        require_relation_arity(fields, 3)?;
+        let mut fields = fields.iter();
+        Ok(Self {
+            pid: <u32 as RelationWireValue>::from_relation(fields.next().unwrap())?,
+            provenance: <ProcessProvenance as RelationWireValue>::from_relation(
+                fields.next().unwrap(),
+            )?,
+            start: <u64 as RelationWireValue>::from_relation(fields.next().unwrap())?,
         })
     }
 }
@@ -12348,6 +12391,7 @@ pub const BOX_FRAME_IDENTITIES: &[(&str, u64)] = &[
     ("mute", 4),
     ("unmute", 5),
     ("provenance", 6),
+    ("guest_process", 7),
     ("open_connection", 13),
     ("connection", 14),
 ];
@@ -12364,6 +12408,9 @@ pub enum BoxFrame {
     Provenance {
         record: PipelineProvenance,
     },
+    GuestProcess {
+        event: GuestProcessEvent,
+    },
     OpenConnection,
     Connection,
 }
@@ -12376,6 +12423,7 @@ impl BoxFrame {
             Self::Mute => 4,
             Self::Unmute => 5,
             Self::Provenance { .. } => 6,
+            Self::GuestProcess { .. } => 7,
             Self::OpenConnection => 13,
             Self::Connection => 14,
         }
@@ -12397,6 +12445,9 @@ impl WireValue for BoxFrame {
             Self::Provenance { record } => {
                 record.encode_atom(&mut fields)?;
             }
+            Self::GuestProcess { event } => {
+                event.encode_atom(&mut fields)?;
+            }
             Self::OpenConnection => {}
             Self::Connection => {}
         }
@@ -12417,6 +12468,9 @@ impl WireValue for BoxFrame {
             5 => Self::Unmute,
             6 => Self::Provenance {
                 record: <PipelineProvenance as WireValue>::decode_atom(&mut fields)?,
+            },
+            7 => Self::GuestProcess {
+                event: <GuestProcessEvent as WireValue>::decode_atom(&mut fields)?,
             },
             13 => Self::OpenConnection,
             14 => Self::Connection,
@@ -12464,6 +12518,15 @@ impl RelationWireValue for BoxFrame {
                     )?,
                 })
             }
+            "guest_process" => {
+                require_relation_arity(fields, 1)?;
+                let mut fields = fields.iter();
+                Ok(Self::GuestProcess {
+                    event: <GuestProcessEvent as RelationWireValue>::from_relation(
+                        fields.next().unwrap(),
+                    )?,
+                })
+            }
             "open_connection" => {
                 require_relation_arity(fields, 0)?;
                 Ok(Self::OpenConnection)
@@ -12486,6 +12549,7 @@ pub const APPLIANCE_FRAME_IDENTITIES: &[(&str, u64)] = &[
     ("nested_result", 6),
     ("result", 7),
     ("ready", 8),
+    ("process", 9),
 ];
 
 #[derive(Clone, Debug, PartialEq)]
@@ -12517,6 +12581,9 @@ pub enum ApplianceFrame {
         code: ExitCode,
     },
     Ready,
+    Process {
+        event: GuestProcessEvent,
+    },
 }
 
 impl ApplianceFrame {
@@ -12530,6 +12597,7 @@ impl ApplianceFrame {
             Self::NestedResult { .. } => 6,
             Self::Result { .. } => 7,
             Self::Ready => 8,
+            Self::Process { .. } => 9,
         }
     }
 }
@@ -12566,6 +12634,9 @@ impl WireValue for ApplianceFrame {
                 code.encode_atom(&mut fields)?;
             }
             Self::Ready => {}
+            Self::Process { event } => {
+                event.encode_atom(&mut fields)?;
+            }
         }
         put_compound_payload(output, &fields)
     }
@@ -12604,6 +12675,9 @@ impl WireValue for ApplianceFrame {
                 code: <ExitCode as WireValue>::decode_atom(&mut fields)?,
             },
             8 => Self::Ready,
+            9 => Self::Process {
+                event: <GuestProcessEvent as WireValue>::decode_atom(&mut fields)?,
+            },
             _ => return Err(DecodeError::InvalidValue),
         };
         require_empty(fields)?;
@@ -12678,6 +12752,15 @@ impl RelationWireValue for ApplianceFrame {
             "ready" => {
                 require_relation_arity(fields, 0)?;
                 Ok(Self::Ready)
+            }
+            "process" => {
+                require_relation_arity(fields, 1)?;
+                let mut fields = fields.iter();
+                Ok(Self::Process {
+                    event: <GuestProcessEvent as RelationWireValue>::from_relation(
+                        fields.next().unwrap(),
+                    )?,
+                })
             }
             _ => Err(format!("unknown ApplianceFrame relation choice {case}")),
         }
@@ -12895,6 +12978,18 @@ mod generated_tests {
             cwd: BoundedBytes::new(Vec::new()).unwrap(),
             argv: BoundedVec::new(vec![]).unwrap(),
             environment: None,
+        });
+        roundtrip::<GuestProcessEvent>(GuestProcessEvent {
+            pid: 0u32,
+            provenance: ProcessProvenance {
+                tgid: 0u32,
+                ppid: 0i32,
+                executable: BoundedBytes::new(Vec::new()).unwrap(),
+                cwd: BoundedBytes::new(Vec::new()).unwrap(),
+                argv: BoundedVec::new(vec![]).unwrap(),
+                environment: None,
+            },
+            start: 0u64,
         });
         roundtrip::<OciRuntime>(OciRuntime {
             environment: None,
@@ -14482,6 +14577,20 @@ mod generated_tests {
                     edge_output: None,
                 },
             },
+            BoxFrame::GuestProcess {
+                event: GuestProcessEvent {
+                    pid: 0u32,
+                    provenance: ProcessProvenance {
+                        tgid: 0u32,
+                        ppid: 0i32,
+                        executable: BoundedBytes::new(Vec::new()).unwrap(),
+                        cwd: BoundedBytes::new(Vec::new()).unwrap(),
+                        argv: BoundedVec::new(vec![]).unwrap(),
+                        environment: None,
+                    },
+                    start: 0u64,
+                },
+            },
             BoxFrame::OpenConnection,
             BoxFrame::Connection,
         ];
@@ -14529,6 +14638,20 @@ mod generated_tests {
             },
             ApplianceFrame::Result { code: 0i32 },
             ApplianceFrame::Ready,
+            ApplianceFrame::Process {
+                event: GuestProcessEvent {
+                    pid: 0u32,
+                    provenance: ProcessProvenance {
+                        tgid: 0u32,
+                        ppid: 0i32,
+                        executable: BoundedBytes::new(Vec::new()).unwrap(),
+                        cwd: BoundedBytes::new(Vec::new()).unwrap(),
+                        argv: BoundedVec::new(vec![]).unwrap(),
+                        environment: None,
+                    },
+                    start: 0u64,
+                },
+            },
         ];
         assert_eq!(values.len(), APPLIANCE_FRAME_IDENTITIES.len());
         for (value, (name, code)) in values.into_iter().zip(APPLIANCE_FRAME_IDENTITIES) {

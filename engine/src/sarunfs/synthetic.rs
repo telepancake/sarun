@@ -240,19 +240,24 @@ impl SyntheticRuntime {
 
     pub(crate) fn write_sink(
         &self,
-        host_pid: u32,
-        host_tgid: i32,
+        pid: u32,
+        tgid: i32,
+        host_actor: bool,
         box_state: Option<&BoxState>,
         box_id: i64,
         stream: i32,
         data: &[u8],
     ) {
-        let record = self
-            .muted_owner(host_tgid)
+        let record = !host_actor || self
+            .muted_owner(tgid)
             .is_none_or(|owner| owner == box_id);
         if record {
             if let Some(box_state) = box_state {
-                box_state.add_output(stream, host_pid, data);
+                if host_actor {
+                    box_state.add_output(stream, pid, data);
+                } else {
+                    box_state.add_guest_output(stream, pid, data);
+                }
             }
         }
         self.echo_send(box_id, stream, data);
@@ -391,7 +396,7 @@ mod tests {
         runtime.set_echo(7, Arc::new(Mutex::new(writer)));
         runtime.sink_opened(7);
         runtime.sink_opened(7);
-        runtime.write_sink(123, 123, None, 7, 1, b"hello");
+        runtime.write_sink(123, 123, true, None, 7, 1, b"hello");
         runtime.sink_released(7);
         runtime.sink_released(7);
 

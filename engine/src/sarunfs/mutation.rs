@@ -44,15 +44,28 @@ impl MutationJournal {
     /// Begin one attributed mutation group. Writer identity is resolved while
     /// the calling process still exists and cannot be substituted later by a
     /// transport's release callback.
-    pub(crate) fn writer<'a>(&self, box_state: &'a BoxState, actor: u32) -> CaptureWriter<'a> {
+    pub(crate) fn writer<'a>(
+        &self,
+        box_state: &'a BoxState,
+        actor: u32,
+        host_actor: bool,
+    ) -> CaptureWriter<'a> {
         CaptureWriter {
             box_state,
-            writer: box_state.writer_for(actor),
+            writer: if host_actor {
+                box_state.writer_for(actor)
+            } else {
+                box_state.guest_writer_for(actor)
+            },
         }
     }
 
-    pub(crate) fn observe_writer(&self, box_state: &BoxState, actor: u32) {
-        let _ = box_state.writer_for(actor);
+    pub(crate) fn observe_writer(&self, box_state: &BoxState, actor: u32, host_actor: bool) {
+        if host_actor {
+            let _ = box_state.writer_for(actor);
+        } else {
+            let _ = box_state.guest_writer_for(actor);
+        }
     }
 
     pub(crate) fn set_xattr(&self, box_state: &BoxState, rel: &str, key: &str, value: &[u8]) {

@@ -221,6 +221,10 @@ pub struct BoxState {
     // start_time a NEW row, never a dedup into a stale incarnation (PID-reuse proof).
     proc_cache: Mutex<HashMap<(u32, i64), i64>>,
     proc_current: Mutex<HashMap<u32, (i64, i64)>>,
+    // virtio-fs reports guest thread ids. PID 1 supplies the corresponding
+    // guest thread-group identities over the appliance relation; these values
+    // must never be looked up in the host's /proc namespace.
+    guest_tgids: Mutex<HashMap<u32, u32>>,
     /// Live in-flight builtin activity (kati recipes / \$(shell) / parse
     /// phases), pushed by the box's watchdog as `box_activity` frames:
     /// (description, age seconds, received-at unix ts). Ephemeral — a UI
@@ -505,6 +509,7 @@ impl BoxState {
             proc_cache: Mutex::new(HashMap::new()),
             activity: Mutex::new(Vec::new()),
             proc_current: Mutex::new(HashMap::new()),
+            guest_tgids: Mutex::new(HashMap::new()),
             roots: Mutex::new(std::collections::HashSet::new()),
             parent: std::sync::atomic::AtomicI64::new(0),
             env_capture: std::sync::atomic::AtomicBool::new(false),
@@ -685,6 +690,82 @@ impl BoxState {
                        else { None };
         self.record_proc(tgid, start, ppid, &exe, &cwd, &argv, env_json, false)
             .unwrap_or(tgid as i64)
+    }
+
+    /// Resolve a virtio-fs request actor exclusively through guest identities
+    /// supplied by the paired PID 1. Numeric guest PIDs are never meaningful
+    /// host PIDs; falling back to host `/proc` here can attribute a guest write
+    /// to an unrelated host process with the same number.
+    pub fn guest_writer_for(&self, pid: u32) -> i64 {
+        let tgid = self.guest_tgids.lock().unwrap().get(&pid).copied().unwrap_or(pid);
+        self.proc_current.lock().unwrap().get(&tgid)
+            .map(|(_, row)| *row).unwrap_or(0)
+    }
+
+    /// Record one process/thread observation made inside the appliance's own
+    /// procfs. `event.pid` maps the FUSE request thread id to the provenance's
+    /// thread group. Parent linkage is resolved only against other guest rows;
+    /// a guest process whose parent has not appeared yet attaches to this
+    /// launch's stored host-runner root rather than escaping into host /proc.
+    pub fn record_guest_process(
+        &self,
+        event: &crate::generated_wire::GuestProcessEvent,
+    ) -> Result<i64, String> {
+        let provenance = &event.provenance;
+        let start = i64::try_from(event.start)
+            .map_err(|_| "guest process start identity exceeds i64")?;
+        let text = |value: &[u8], field: &str| {
+            std::str::from_utf8(value).map(str::to_owned)
+                .map_err(|_| format!("guest process {field} is not UTF-8"))
+        };
+        let exe = text(provenance.executable.as_slice(), "executable")?;
+        let cwd = text(provenance.cwd.as_slice(), "cwd")?;
+        let argv = provenance.argv.as_slice().iter()
+            .map(|value| text(value.as_slice(), "argument"))
+            .collect::<Result<Vec<_>, _>>()?;
+        let argv_json = serde_json::to_string(&argv).map_err(|error| error.to_string())?;
+        self.guest_tgids.lock().unwrap().insert(event.pid, provenance.tgid);
+
+        if let Some(row) = self.proc_cache.lock().unwrap()
+            .get(&(provenance.tgid, start)).copied()
+        {
+            self.proc_current.lock().unwrap()
+                .insert(provenance.tgid, (start, row));
+            let conn = self.conn.lock().unwrap();
+            let _ = conn.execute(
+                "UPDATE process SET ppid=?1,exe=?2,cwd=?3,argv=?4 WHERE id=?5",
+                params![provenance.ppid, exe, cwd, argv_json, row],
+            );
+            return Ok(row);
+        }
+
+        let parent_id = u32::try_from(provenance.ppid).ok()
+            .filter(|parent| *parent > 1)
+            .and_then(|parent| self.proc_current.lock().unwrap()
+                .get(&parent).map(|(_, row)| *row));
+        let conn = self.conn.lock().unwrap();
+        let root = conn.query_row(
+            "SELECT id FROM process WHERE root<>0 ORDER BY id DESC LIMIT 1",
+            [], |row| row.get::<_, i64>(0),
+        ).ok();
+        let parent_id = parent_id.or(root);
+        let inserted = conn.execute(
+            "INSERT OR IGNORE INTO process(tgid,start,ppid,parent_id,exe,cwd,argv,root) \
+             VALUES(?1,?2,?3,?4,?5,?6,?7,0)",
+            params![provenance.tgid, start, provenance.ppid, parent_id,
+                    exe, cwd, argv_json],
+        ).map_err(|error| error.to_string())?;
+        let row = conn.query_row(
+            "SELECT id FROM process WHERE tgid=?1 AND start=?2",
+            params![provenance.tgid, start], |row| row.get::<_, i64>(0),
+        ).map_err(|error| error.to_string())?;
+        drop(conn);
+        self.proc_cache.lock().unwrap().insert((provenance.tgid, start), row);
+        self.proc_current.lock().unwrap().insert(provenance.tgid, (start, row));
+        if inserted > 0 {
+            self.push_event("", "process_added");
+        }
+        Ok(row)
     }
 
     /// Mint (or refresh) a process row purely from trace-EVENT data — for
@@ -976,6 +1057,15 @@ impl BoxState {
     /// to the writing process (stream 0=stdout, 1=stderr).
     pub fn add_output(&self, stream: i32, pid: u32, content: &[u8]) {
         let writer = self.writer_for(pid);
+        self.add_output_for_writer(stream, writer, content);
+    }
+
+    pub fn add_guest_output(&self, stream: i32, pid: u32, content: &[u8]) {
+        let writer = self.guest_writer_for(pid);
+        self.add_output_for_writer(stream, writer, content);
+    }
+
+    fn add_output_for_writer(&self, stream: i32, writer: i64, content: &[u8]) {
         let pipeline = self.cur_brush_pipeline.load(std::sync::atomic::Ordering::Relaxed);
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

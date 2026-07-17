@@ -360,6 +360,9 @@ pub fn run(
                         unsafe { libc::kill(-child.pid, signal) };
                     }
                 }
+                ApplianceFrame::Process { event } => {
+                    forward_guest_process(&box_channel, event)?;
+                }
                 ApplianceFrame::Ready => {
                     let (ready, changed) = &*input_ready;
                     *ready.lock().unwrap() = true;
@@ -421,6 +424,23 @@ fn write_appliance_frame(writer: &Arc<Mutex<UnixStream>>, frame: &ApplianceFrame
     let mut writer = writer.lock().unwrap();
     let _ = crate::socket_wire::write_atom(&mut *writer, frame);
     let _ = writer.flush();
+}
+
+fn forward_guest_process(
+    channel: &Arc<Mutex<UnixStream>>,
+    event: crate::generated_wire::GuestProcessEvent,
+) -> io::Result<()> {
+    use crate::wire::WireValue;
+    let mut encoded = Vec::new();
+    crate::generated_wire::BoxFrame::GuestProcess { event }
+        .encode_atom(&mut encoded)
+        .map_err(|error| io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("encode guest process event: {error:?}"),
+        ))?;
+    let mut channel = channel.lock().unwrap();
+    channel.write_all(&encoded)?;
+    channel.flush()
 }
 
 fn nested_output(writer: &Arc<Mutex<UnixStream>>, stream: u64, bytes: &[u8]) {
@@ -818,6 +838,112 @@ fn mount_one(source: &str, target: &str, kind: &str, flags: libc::c_ulong) -> io
     }
 }
 
+fn guest_proc_stat(pid: u32) -> Option<(u32, u64)> {
+    let raw = std::fs::read(format!("/proc/{pid}/stat")).ok()?;
+    let text = String::from_utf8_lossy(&raw);
+    let rest = text.get(text.rfind(')')? + 1..)?
+        .split_whitespace().collect::<Vec<_>>();
+    Some((rest.get(1)?.parse().ok()?, rest.get(19)?.parse().ok()?))
+}
+
+fn guest_process_provenance(
+    pid: u32,
+) -> Option<crate::generated_wire::ProcessProvenance> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    let tgid = status.lines().find_map(|line| {
+        line.strip_prefix("Tgid:")?.trim().parse::<u32>().ok()
+    })?;
+    let (ppid, _) = guest_proc_stat(tgid)?;
+    let executable = std::fs::read_link(format!("/proc/{tgid}/exe")).ok()?;
+    let cwd = std::fs::read_link(format!("/proc/{tgid}/cwd")).ok()?;
+    let argv = std::fs::read(format!("/proc/{tgid}/cmdline")).ok()?
+        .split(|byte| *byte == 0)
+        .filter(|word| !word.is_empty())
+        .map(|word| crate::wire::BoundedBytes::new(word.to_vec()).ok())
+        .collect::<Option<Vec<_>>>()?;
+    if argv.is_empty() {
+        return None;
+    }
+    Some(crate::generated_wire::ProcessProvenance {
+        tgid,
+        ppid: i32::try_from(ppid).ok()?,
+        executable: crate::wire::BoundedBytes::new(
+            executable.as_os_str().as_bytes().to_vec(),
+        ).ok()?,
+        cwd: crate::wire::BoundedBytes::new(cwd.as_os_str().as_bytes().to_vec()).ok()?,
+        argv: crate::wire::BoundedVec::new(argv).ok()?,
+        environment: None,
+    })
+}
+
+fn guest_descends_from(
+    pid: u32,
+    root: u32,
+    parents: &HashMap<u32, u32>,
+) -> bool {
+    let mut current = pid;
+    for _ in 0..64 {
+        if current == root {
+            return true;
+        }
+        let Some(parent) = parents.get(&current).copied() else {
+            return false;
+        };
+        if parent <= 1 || parent == current {
+            return false;
+        }
+        current = parent;
+    }
+    false
+}
+
+fn observe_guest_processes(
+    root: u32,
+    epoch: u64,
+    writer: &Arc<Mutex<std::fs::File>>,
+    seen: &mut HashMap<u32, (u64, Vec<u8>)>,
+) {
+    let mut parents = HashMap::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else { return };
+    for entry in entries.flatten() {
+        let Some(pid) = entry.file_name().to_str().and_then(|name| name.parse::<u32>().ok())
+        else { continue };
+        if let Some((ppid, _)) = guest_proc_stat(pid) {
+            parents.insert(pid, ppid);
+        }
+    }
+    let mut processes = parents.keys().copied()
+        .filter(|pid| guest_descends_from(*pid, root, &parents))
+        .collect::<Vec<_>>();
+    processes.sort_unstable();
+    for tgid in processes {
+        let Some(provenance) = guest_process_provenance(tgid) else { continue };
+        let Some((_, start_tick)) = guest_proc_stat(tgid) else { continue };
+        let start = epoch.saturating_add(start_tick);
+        let executable = provenance.executable.as_slice().to_vec();
+        let tasks = std::fs::read_dir(format!("/proc/{tgid}/task"))
+            .ok().into_iter().flatten().flatten().filter_map(|entry| {
+                entry.file_name().to_str()?.parse::<u32>().ok()
+            }).collect::<Vec<_>>();
+        for pid in tasks {
+            if seen.get(&pid).is_some_and(|value| value == &(start, executable.clone())) {
+                continue;
+            }
+            seen.insert(pid, (start, executable.clone()));
+            write_appliance_file_frame(
+                writer,
+                &ApplianceFrame::Process {
+                    event: crate::generated_wire::GuestProcessEvent {
+                        pid,
+                        provenance: provenance.clone(),
+                        start,
+                    },
+                },
+            );
+        }
+    }
+}
+
 fn execute_guest(
     command: &ApplianceCommand,
     control: &Arc<Mutex<std::fs::File>>,
@@ -856,6 +982,45 @@ fn execute_guest(
     let child = process.spawn()?;
     let root = child.id() as i32;
     GUEST_CHILD.store(root, std::sync::atomic::Ordering::SeqCst);
+    let process_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos() as u64)
+        .unwrap_or(0);
+    let mut initial_processes = HashMap::new();
+    observe_guest_processes(
+        root as u32,
+        process_epoch,
+        control,
+        &mut initial_processes,
+    );
+    if initial_processes.is_empty() {
+        eprintln!(
+            "sarun init: process observer did not see root {root}: stat={:?} provenance={}",
+            guest_proc_stat(root as u32),
+            guest_process_provenance(root as u32).is_some(),
+        );
+    }
+    let process_observer_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let observer_stop = process_observer_stop.clone();
+    let observer_writer = control.clone();
+    let observer = std::thread::spawn(move || {
+        let mut seen = initial_processes;
+        while !observer_stop.load(std::sync::atomic::Ordering::Relaxed) {
+            observe_guest_processes(
+                root as u32,
+                process_epoch,
+                &observer_writer,
+                &mut seen,
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        observe_guest_processes(
+            root as u32,
+            process_epoch,
+            &observer_writer,
+            &mut seen,
+        );
+    });
     {
         let mut writer = control.lock().unwrap();
         crate::socket_wire::write_atom(&mut *writer, &ApplianceFrame::Ready)?;
@@ -877,6 +1042,8 @@ fn execute_guest(
         }
     }
     GUEST_CHILD.store(0, std::sync::atomic::Ordering::SeqCst);
+    process_observer_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = observer.join();
     let status = root_status.unwrap();
     Ok(if libc::WIFEXITED(status) {
         libc::WEXITSTATUS(status)
@@ -947,8 +1114,11 @@ fn write_appliance_file_frame(
     frame: &ApplianceFrame,
 ) {
     let mut writer = writer.lock().unwrap();
-    let _ = crate::socket_wire::write_atom(&mut *writer, frame);
-    let _ = writer.flush();
+    if let Err(error) = crate::socket_wire::write_atom(&mut *writer, frame)
+        .and_then(|()| writer.flush())
+    {
+        eprintln!("sarun init: appliance frame write: {error:?}");
+    }
 }
 
 fn start_guest_nested_broker(

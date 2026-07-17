@@ -412,16 +412,19 @@ as executable mappings and mmap that genuinely need a host fd.
   - [x] Remove QEMU's hard-coded one-vCPU/256-MiB ceiling. The appliance now
         follows its cgroup/affinity-visible CPU budget (bounded at 16), budgets
         memory per vCPU, and uses multi-threaded TCG when KVM is unavailable.
+  - [x] Add a generated binary guest-process event lane from paired PID 1 to
+        the engine. Virtio-fs request TIDs are now resolved exclusively through
+        that guest process namespace and never through host `/proc`. A live
+        QEMU shell/child check records both guest rows, links the child to the
+        shell, assigns the shell's row to its created file, and records none of
+        the unrelated host services whose numeric PIDs previously collided.
   - [ ] Finish the QEMU kernel build and byte-for-byte artifact comparison.
-        The first live run exposed that virtio-fs request PIDs are guest PIDs,
-        while filesystem writer attribution currently resolves them through
-        host `/proc`. This records unrelated host processes whose numeric PIDs
-        collide with guest processes. Add a generated binary guest-process
-        event lane from the tightly paired kernel/PID-1 to the host, use that
-        guest namespace for writer/process attribution, and explicitly forbid
-        host `/proc` resolution for virtio-fs request PIDs. Then rerun the full
-        build; compiler processes and artifact writers must be guest records,
-        not merely non-empty rows.
+        The first live run also exposed absent QEMU output recording and a
+        parallel-build stall after roughly 200 objects. Complete the binary
+        guest-output lane, isolate the stall with a bounded `make -j10`
+        workload, then rerun the full build. Compiler processes and artifact
+        writers must be guest records, and output/trace rows must be populated,
+        not merely inferred from a successful exit.
 - [x] Remove backend-specific semantic branches and obsolete compatibility
       code; update generated help and user documentation. A repository audit
       finds backend selection only in registration, runner, transport, trace,

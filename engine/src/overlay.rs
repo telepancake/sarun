@@ -1164,7 +1164,7 @@ impl SarunFs {
             .map(|d| d.as_nanos() as i64).unwrap_or(0);
         self.inner
             .mutations
-            .writer(&b, 0)
+            .writer(&b, 0, self.host_request_pids)
             .finalize_file(rel, sz, mtime_ns);
         Ok(())
     }
@@ -1980,7 +1980,7 @@ impl SarunFs {
             });
             (attr, handle)
         } else {
-            let capture = self.inner.mutations.writer(&b, pid);
+            let capture = self.inner.mutations.writer(&b, pid, self.host_request_pids);
             let rowid = capture.ensure_file(&rel, mode | libc::S_IFREG);
             capture.set_owner(&rel, uid, gid);
             let path = blob_path(bid, rowid);
@@ -2058,7 +2058,7 @@ impl SarunFs {
         if !matches!(self.resolve(box_id, &rel), Layer::Absent) {
             return Err(Errno::EEXIST);
         }
-        let capture = self.inner.mutations.writer(&b, pid);
+        let capture = self.inner.mutations.writer(&b, pid, self.host_request_pids);
         capture.set_dir(&rel, mode);
         capture.set_owner(&rel, uid, gid);
         let inode = self.ino_for(&(box_id, rel.clone()));
@@ -2084,7 +2084,7 @@ impl SarunFs {
         if self.ro_denied(box_id, &rel) {
             return Err(Errno::EROFS);
         }
-        let capture = self.inner.mutations.writer(&b, pid);
+        let capture = self.inner.mutations.writer(&b, pid, self.host_request_pids);
         capture.set_symlink(&rel, target);
         capture.set_owner(&rel, uid, gid);
         let inode = self.ino_for(&(box_id, rel.clone()));
@@ -2173,7 +2173,7 @@ impl SarunFs {
         self.detach_open_handles(box_id, &rel, pid)?;
         self.inner.inodes.detach(&(box_id, rel.clone()));
         self.inner.detached_attrs.write().unwrap().insert(inode, attr);
-        self.inner.mutations.writer(&b, pid).delete(&rel);
+        self.inner.mutations.writer(&b, pid, self.host_request_pids).delete(&rel);
         self.inner.mutations.record(box_id, rel, "unlink");
         Ok(())
     }
@@ -2194,7 +2194,7 @@ impl SarunFs {
         }
         self.inner.inodes.detach(&(box_id, rel.clone()));
         self.inner.detached_attrs.write().unwrap().insert(inode, attr);
-        self.inner.mutations.writer(&b, pid).delete(&rel);
+        self.inner.mutations.writer(&b, pid, self.host_request_pids).delete(&rel);
         self.inner.mutations.record(box_id, rel, "rmdir");
         Ok(())
     }
@@ -2244,7 +2244,7 @@ impl SarunFs {
             self.detach_open_handles(box_id, &new_rel, pid)?;
             self.detach_inode_name(&b, &new_rel);
         }
-        let capture = self.inner.mutations.writer(&b, pid);
+        let capture = self.inner.mutations.writer(&b, pid, self.host_request_pids);
         let lower_attr = self.inner.backing.attr(&old_rel).ok();
         let lower_old = lower_attr.is_some();
         match self.layer(&b, &old_rel) {
@@ -2294,7 +2294,7 @@ impl SarunFs {
         }
         match mode & libc::S_IFMT {
             libc::S_IFREG => {
-                let capture = self.inner.mutations.writer(&b, pid);
+                let capture = self.inner.mutations.writer(&b, pid, self.host_request_pids);
                 let rowid = capture.ensure_file(&rel, mode);
                 capture.set_owner(&rel, uid, gid);
                 let path = blob_path(box_id, rowid);
@@ -2304,7 +2304,7 @@ impl SarunFs {
                 File::create(path).map_err(Errno::from)?;
             }
             libc::S_IFIFO | libc::S_IFCHR | libc::S_IFBLK | libc::S_IFSOCK => {
-                let capture = self.inner.mutations.writer(&b, pid);
+                let capture = self.inner.mutations.writer(&b, pid, self.host_request_pids);
                 capture.set_special(&rel, mode, rdev as u64);
                 capture.set_owner(&rel, uid, gid);
             }
@@ -2346,7 +2346,7 @@ impl SarunFs {
         let new_rowid = self
             .inner
             .mutations
-            .writer(&b, pid)
+            .writer(&b, pid, self.host_request_pids)
             .ensure_file(&new_rel, source_mode);
         let destination = blob_path(box_id, new_rowid);
         if let Some(parent) = destination.parent() {
@@ -2463,7 +2463,7 @@ impl SarunFs {
             let metadata = file.metadata().map_err(Errno::from)?;
             self.inner
                 .mutations
-                .writer(&b, pid)
+                .writer(&b, pid, self.host_request_pids)
                 .finalize_file(
                     &rel,
                     metadata.size() as i64,
@@ -2472,7 +2472,7 @@ impl SarunFs {
         }
         if let Some(mode) = request.mode {
             let permissions = mode & 0o7777;
-            let capture = self.inner.mutations.writer(&b, pid);
+            let capture = self.inner.mutations.writer(&b, pid, self.host_request_pids);
             match self.layer(&b, &rel) {
                 Layer::UpperFile { .. } => capture.set_mode(&rel, libc::S_IFREG | permissions),
                 Layer::UpperDir { .. } => capture.set_mode(&rel, libc::S_IFDIR | permissions),
@@ -2514,7 +2514,7 @@ impl SarunFs {
             }
             self.inner
                 .mutations
-                .writer(&b, pid)
+                .writer(&b, pid, self.host_request_pids)
                 .set_owner(&rel, uid, gid);
         }
         if request.atime.is_some() || request.mtime.is_some() {
@@ -2525,7 +2525,7 @@ impl SarunFs {
                 }) {
                     self.inner
                         .mutations
-                        .writer(&b, pid)
+                        .writer(&b, pid, self.host_request_pids)
                         .set_dir(&rel, self.inner.backing.attr(&rel)
                             .map(|attr| attr.mode)
                             .unwrap_or(libc::S_IFDIR | 0o755));
@@ -2533,7 +2533,7 @@ impl SarunFs {
                     self.copy_up(&b, &rel, pid).map_err(|_| Errno::EIO)?;
                 }
             }
-            let capture = self.inner.mutations.writer(&b, pid);
+            let capture = self.inner.mutations.writer(&b, pid, self.host_request_pids);
             if let Some(atime) = request.atime {
                 let nanos = atime.duration_since(UNIX_EPOCH)
                     .map(|duration| duration.as_nanos() as i64)
@@ -2639,11 +2639,11 @@ impl SarunFs {
         }
         handle.inner.dirty = true;
         if pid != handle.inner.last_pid || handle.inner.last_tgid == 0 {
-            handle.inner.last_tgid = tgid_of(pid);
+            handle.inner.last_tgid = if self.host_request_pids { tgid_of(pid) } else { pid };
             if let Some(b) = self.box_of(handle.inner.box_id) {
                 self.inner
                     .mutations
-                    .observe_writer(&b, handle.inner.last_tgid);
+                    .observe_writer(&b, handle.inner.last_tgid, self.host_request_pids);
             }
         }
         handle.inner.last_pid = pid;
@@ -2668,7 +2668,8 @@ impl SarunFs {
         let box_state = self.box_of(box_id);
         self.inner.synthetic.write_sink(
             pid,
-            tgid_of(pid) as i32,
+            if self.host_request_pids { tgid_of(pid) as i32 } else { pid as i32 },
+            self.host_request_pids,
             box_state.as_deref(),
             box_id,
             stream,
@@ -2703,7 +2704,7 @@ impl SarunFs {
                     if let Some(metadata) = metadata {
                         self.inner
                             .mutations
-                            .writer(&b, writer_id)
+                            .writer(&b, writer_id, self.host_request_pids)
                             .finalize_file(
                                 &handle.inner.rel,
                                 metadata.size() as i64,
@@ -2822,7 +2823,7 @@ impl SarunFs {
         if self.ro_denied(b.id, rel) {
             return Err(std::io::Error::from_raw_os_error(libc::EROFS));
         }
-        let capture = self.inner.mutations.writer(b, pid);
+        let capture = self.inner.mutations.writer(b, pid, self.host_request_pids);
         // Source the lower bytes + mode from the parent-chain resolution.
         let (src, mode, lower_source): (Option<PathBuf>, u32, bool) =
             match self.resolve(b.id, rel) {

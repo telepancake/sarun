@@ -139,6 +139,19 @@ wire_type(process_provenance, record([
     field(environment, option(environment))
 ])).
 
+% A virtio-fs request carries a PID from the guest namespace.  The host must
+% never resolve that number through host /proc: unrelated host processes can
+% have the same numeric PID.  PID 1 snapshots the paired guest's real procfs
+% and emits this namespaced identity over the appliance control relation.
+wire_type(guest_process_event, record([
+    % FUSE reports the calling thread id, not necessarily the thread-group id.
+    field(pid, u32),
+    field(provenance, process_provenance),
+    % Unique per appliance boot plus the guest kernel start tick.  This keeps
+    % repeated guest PID allocations distinct across same-box reruns.
+    field(start, u64)
+])).
+
 wire_type(oci_runtime, record([
     field(environment, option(list(os_string, environment_entries))),
     field(cwd, option(path)),
@@ -1048,6 +1061,9 @@ wire_frame(box, unmute,           5, runner_to_engine, [], [], stay).
 wire_frame(box, provenance,       6, runner_to_engine, [
     field(record, pipeline_provenance)
 ], [], stay).
+wire_frame(box, guest_process,    7, runner_to_engine, [
+    field(event, guest_process_event)
+], [], stay).
 wire_frame(box, open_connection, 13, runner_to_engine, [], [], stay).
 wire_frame(box, connection,      14, engine_to_runner, [], [
     fd(connected_socket, required, always)
@@ -1086,6 +1102,9 @@ wire_frame(appliance, result, 7, guest_to_host, [
 % then serial input belongs to kernel boot, not to the command, so the host
 % runner must retain caller input rather than feeding it into QEMU early.
 wire_frame(appliance, ready, 8, guest_to_host, [], [], stay).
+wire_frame(appliance, process, 9, guest_to_host, [
+    field(event, guest_process_event)
+], [], stay).
 
 wire_frame(pty, data,             7, bidirectional, [
     field(data, bytes(stream_chunk_bytes))

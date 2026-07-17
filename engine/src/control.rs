@@ -1383,6 +1383,32 @@ fn binary_error(message: String) -> crate::generated_wire::ConnectionMode {
     }
 }
 
+fn record_guest_process_frame(state: &State, id: i64, payload: &[u8]) {
+    let mut encoded = Vec::new();
+    if crate::wire::put_compound_payload(&mut encoded, payload).is_err() {
+        return;
+    }
+    let mut input = encoded.as_slice();
+    let event = <crate::generated_wire::GuestProcessEvent as crate::wire::WireValue>::decode_atom(
+        &mut input,
+    );
+    let overlay = lock(state).overlay.clone();
+    match (
+        event,
+        overlay.as_ref().and_then(|overlay| overlay.live_box(id)),
+    ) {
+        (Ok(event), Some(box_state)) => {
+            if let Err(error) = box_state.record_guest_process(&event) {
+                eprintln!("sarun-engine: guest process record: {error}");
+            }
+        }
+        (Err(error), _) => {
+            eprintln!("sarun-engine: invalid guest process frame: {error:?}");
+        }
+        (_, None) => {}
+    }
+}
+
 /// Direct typed registration used by the QEMU launcher.  The request and
 /// reply are generated binary values; after the reply, the connection is the
 /// runner's lifetime channel exactly like the established FUSE/SUD channel.
@@ -1483,8 +1509,10 @@ fn handle_binary_registration(
                 Ok(count) => frames.extend_from_slice(&bytes[..count]),
             }
             let (decoded, used) = crate::frames::decode(&frames);
-            for (kind, _) in decoded {
-                if kind != crate::frames::FRAME_OPEN_CONN {
+            for (kind, payload) in decoded {
+                if kind == crate::frames::FRAME_GUEST_PROCESS {
+                    record_guest_process_frame(&state, id, &payload);
+                } else if kind != crate::frames::FRAME_OPEN_CONN {
                     continue;
                 }
                 // The QEMU runner stays on the host for the entire appliance
@@ -7282,6 +7310,9 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
                 for (ft, payload) in &frames {
                     if *ft == crate::frames::FRAME_PROV {
                         record_brush_prov(&state, &ov, id, payload);
+                    }
+                    if *ft == crate::frames::FRAME_GUEST_PROCESS {
+                        record_guest_process_frame(&state, id, payload);
                     }
                 }
                 // FD broker — the inner asks the engine for a fresh
