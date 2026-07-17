@@ -400,6 +400,28 @@ as executable mappings and mmap that genuinely need a host fd.
         a TCG result, not KVM. Native SUD and KVM measurements remain open; the
         already-deleted historical SUD filesystem cannot be validly benchmarked
         on this non-x86 Syscall User Dispatch host.
+- [ ] Gate a from-scratch paired Linux kernel build, its records, and its
+      provenance under every runnable backend.
+  - [x] Add a reproducible Linux 6.18 workload that configures a fresh output
+        tree, runs the real compiler through `make -j10`, measures overlapping
+        clang processes, reads Image/vmlinux back out of the archive, compares
+        backend artifact hashes, and checks the lower and source trees for host
+        writes. FUSE completes with 10 simultaneous clang processes, 813 object
+        files, captured Image/vmlinux, 7,994 process rows, recorded output, and
+        no host escape.
+  - [x] Remove QEMU's hard-coded one-vCPU/256-MiB ceiling. The appliance now
+        follows its cgroup/affinity-visible CPU budget (bounded at 16), budgets
+        memory per vCPU, and uses multi-threaded TCG when KVM is unavailable.
+  - [ ] Finish the QEMU kernel build and byte-for-byte artifact comparison.
+        The first live run exposed that virtio-fs request PIDs are guest PIDs,
+        while filesystem writer attribution currently resolves them through
+        host `/proc`. This records unrelated host processes whose numeric PIDs
+        collide with guest processes. Add a generated binary guest-process
+        event lane from the tightly paired kernel/PID-1 to the host, use that
+        guest namespace for writer/process attribution, and explicitly forbid
+        host `/proc` resolution for virtio-fs request PIDs. Then rerun the full
+        build; compiler processes and artifact writers must be guest records,
+        not merely non-empty rows.
 - [x] Remove backend-specific semantic branches and obsolete compatibility
       code; update generated help and user documentation. A repository audit
       finds backend selection only in registration, runner, transport, trace,

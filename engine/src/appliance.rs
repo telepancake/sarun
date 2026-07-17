@@ -25,6 +25,21 @@ const ROOT_TAG: &str = "sarun-root";
 const CONTROL_PORT: &str = "sarun-control";
 pub const NESTED_BROKER: &str = "sarun-appliance-run";
 
+const MAX_APPLIANCE_CPUS: usize = 16;
+
+fn appliance_resources() -> (usize, usize) {
+    // available_parallelism() observes the process's affinity/cgroup limit, so
+    // the appliance follows the CPU budget Sarun was actually given rather
+    // than the physical-machine count.  Enough RAM per vCPU matters here: ten
+    // simultaneously live clang processes cannot make useful progress in the
+    // old fixed 256 MiB guest even when the paired kernel itself is tiny.
+    let cpus = std::thread::available_parallelism()
+        .map_or(1, |count| count.get())
+        .clamp(1, MAX_APPLIANCE_CPUS);
+    let memory_mib = (256 + cpus * 128).clamp(512, 4096);
+    (cpus, memory_mib)
+}
+
 pub fn architecture_name(architecture: QemuArchitecture) -> &'static str {
     match architecture {
         QemuArchitecture::Aarch64 => "aarch64",
@@ -93,6 +108,8 @@ fn qemu_args(
     net_mode: NetMode,
     network_fd: Option<RawFd>,
 ) -> Vec<OsString> {
+    let (cpus, memory_mib) = appliance_resources();
+    let memory = format!("{memory_mib}M");
     let mut args: Vec<OsString> = [
         "-nodefaults",
         "-no-user-config",
@@ -102,18 +119,20 @@ fn qemu_args(
         "-serial",
         "stdio",
         "-m",
-        "256M",
-        "-object",
-        "memory-backend-memfd,id=mem,size=256M,share=on",
-        "-numa",
-        "node,memdev=mem",
-        "-smp",
-        "1",
-        "-kernel",
     ]
     .into_iter()
     .map(OsString::from)
     .collect();
+    args.extend([
+        memory.clone().into(),
+        "-object".into(),
+        format!("memory-backend-memfd,id=mem,size={memory},share=on").into(),
+        "-numa".into(),
+        "node,memdev=mem".into(),
+        "-smp".into(),
+        cpus.to_string().into(),
+        "-kernel".into(),
+    ]);
     args.push(kernel.as_os_str().to_owned());
     let (machine, console, fs_device, serial_device, shutdown) = match architecture {
         QemuArchitecture::Aarch64 => (
@@ -140,7 +159,10 @@ fn qemu_args(
     if architecture == QemuArchitecture::X8664 {
         args.extend(["-L".into(), data_dir.as_os_str().to_owned()]);
     }
-    args.extend(["-accel".into(), if kvm { "kvm" } else { "tcg" }.into()]);
+    args.extend([
+        "-accel".into(),
+        if kvm { "kvm" } else { "tcg,thread=multi" }.into(),
+    ]);
     args.extend(["-cpu".into(), if kvm { "host" } else { "max" }.into()]);
     args.extend([
         "-append".into(),
@@ -1082,6 +1104,7 @@ mod tests {
 
     #[test]
     fn qemu_arguments_keep_architecture_specific_devices_at_the_edge() {
+        let (cpus, memory_mib) = appliance_resources();
         let a = qemu_args(
             QemuArchitecture::Aarch64,
             Path::new("K"),
@@ -1102,6 +1125,9 @@ mod tests {
         assert!(a.contains("console=ttyAMA0"));
         assert!(a.contains("socket,id=fs,fd=11"));
         assert!(a.contains("socket,id=control,fd=12"));
+        assert!(a.contains(&format!("-smp {cpus}")));
+        assert!(a.contains(&format!("-m {memory_mib}M")));
+        assert!(a.contains("-accel tcg,thread=multi"));
         let x = qemu_args(
             QemuArchitecture::X8664,
             Path::new("K"),
@@ -1140,6 +1166,14 @@ mod tests {
             .join(" ");
         assert!(host.contains("-netdev user,id=network"));
         assert!(!host.contains("local.type=fd"));
+    }
+
+    #[test]
+    fn appliance_resources_support_parallel_builds_without_unbounded_guests() {
+        let (cpus, memory_mib) = appliance_resources();
+        assert!((1..=MAX_APPLIANCE_CPUS).contains(&cpus));
+        assert!((512..=4096).contains(&memory_mib));
+        assert!(memory_mib >= 256 + cpus * 128);
     }
 
     #[test]
