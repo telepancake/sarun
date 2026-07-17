@@ -49,6 +49,18 @@ fn pidfd_open(pid: i32) -> i32 {
     unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) as i32 }
 }
 
+/// Acquire a control connection from the runner's current execution context.
+/// A process inside a box asks its authenticated parent channel for a fresh
+/// connection; a host process dials the filesystem socket.  Callers must not
+/// independently interpret `SARUN_BROKER`, because the choice also carries
+/// the engine's parent-attribution boundary.
+pub fn engine_connection() -> std::io::Result<UnixStream> {
+    match std::env::var("SARUN_BROKER").ok().filter(|value| !value.is_empty()) {
+        Some(name) => broker_dial(&name),
+        None => UnixStream::connect(paths::sock_path()),
+    }
+}
+
 // Note: shadowing is now done LAZILY inside the FUSE overlay's
 // lookup/open path. No filesystem walk from this module. See
 // overlay.rs::shadows for the actual matching, and
@@ -308,15 +320,10 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
     //   host:   dial the engine's filesystem UDS (the universal contract;
     //           the engine's abstract listener exists for in-box, not
     //           here).
-    let broker_name = std::env::var("SARUN_BROKER").ok()
-        .filter(|s| !s.is_empty());
+    let broker_name = std::env::var("SARUN_BROKER").ok().filter(|s| !s.is_empty());
     let in_box = broker_name.is_some();
     let sock = paths::sock_path();
-    let conn = match if let Some(name) = broker_name.as_ref() {
-        broker_dial(name)
-    } else {
-        UnixStream::connect(&sock)
-    } {
+    let conn = match engine_connection() {
         Ok(c) => c,
         Err(_) => {
             eprintln!("sarun-engine: no engine running (control socket {}).",
@@ -750,10 +757,7 @@ pub fn run_qemu(
         eprintln!("sarun-engine run --qemu: needs a command");
         return 2;
     }
-    if std::env::var("SARUN_BROKER").is_ok_and(|value| !value.is_empty()) {
-        eprintln!("sarun-engine run --qemu: nested appliance boxes are not supported yet");
-        return 2;
-    }
+    let in_box = std::env::var("SARUN_BROKER").is_ok_and(|value| !value.is_empty());
     let guest_cmd = if brush {
         brush_cmd("/init", &cmd)
     } else {
@@ -793,11 +797,16 @@ pub fn run_qemu(
     };
     let name = match name {
         Some(value) if !value.is_empty() => match crate::wire::BoundedText::new(value) {
+            Ok(value) if in_box => RegistrationName::Nested { name: value },
             Ok(selector) => RegistrationName::Host { selector },
             Err(error) => {
                 eprintln!("sarun-engine run --qemu: box name exceeds relation bound: {error:?}");
                 return 2;
             }
+        },
+        _ if in_box => RegistrationName::Nested {
+            name: crate::wire::BoundedText::new(String::new())
+                .expect("an empty nested name is always bounded"),
         },
         _ => RegistrationName::Automatic,
     };
@@ -840,7 +849,7 @@ pub fn run_qemu(
         eprintln!("sarun-engine run --qemu: encode registration: {error}");
         return 1;
     }
-    let conn = match UnixStream::connect(paths::sock_path()) {
+    let conn = match engine_connection() {
         Ok(value) => value,
         Err(error) => {
             eprintln!("sarun-engine: no engine running: {error}");
@@ -882,15 +891,36 @@ pub fn run_qemu(
             return 1;
         }
     };
-    let Some(socket) = registration.virtiofs_socket.as_ref() else {
+    if registration.virtiofs_socket.is_none() {
         eprintln!("sarun-engine run --qemu: engine omitted the virtio-fs socket");
         return 1;
+    }
+    let mut descriptor_frame = [0u8; 64];
+    let mut virtiofs_fd = None;
+    let received = recv_box_frame_bytes(
+        conn.as_raw_fd(),
+        &mut descriptor_frame,
+        &mut virtiofs_fd,
+    );
+    let descriptor_valid = received > 0 && {
+        let (frames, used) = crate::frames::decode(&descriptor_frame[..received as usize]);
+        used == received as usize
+            && frames.len() == 1
+            && frames[0].0 == crate::frames::FRAME_APPLIANCE_FS
     };
-    let socket = Path::new(std::ffi::OsStr::from_bytes(socket.as_slice()));
+    let Some(virtiofs_fd) = virtiofs_fd.filter(|_| descriptor_valid) else {
+        if let Some(fd) = virtiofs_fd {
+            unsafe { libc::close(fd) };
+        }
+        eprintln!("sarun-engine run --qemu: engine omitted the virtio-fs descriptor");
+        return 1;
+    };
+    let virtiofs = unsafe {
+        <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(virtiofs_fd)
+    };
     match crate::appliance::run(
         architecture,
-        registration.r#box,
-        socket,
+        virtiofs,
         &appliance_command,
         qemu_network,
     ) {

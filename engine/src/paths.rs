@@ -142,10 +142,6 @@ pub fn virtiofs_socket(box_id: i64) -> PathBuf {
     live_home().join(box_id.to_string()).join("virtiofs.sock")
 }
 
-pub fn appliance_control_socket(box_id: i64) -> PathBuf {
-    live_home().join(box_id.to_string()).join("appliance-control.sock")
-}
-
 /// Resolver projected into QEMU appliances using QEMU's direct host network.
 /// Like the target `/init`, this is engine presentation state rather than a
 /// captured write in the box.

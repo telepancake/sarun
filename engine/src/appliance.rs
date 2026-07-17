@@ -9,7 +9,7 @@ use std::ffi::{OsStr, OsString};
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -59,8 +59,8 @@ fn qemu_binary(architecture: QemuArchitecture) -> PathBuf {
 fn qemu_args(
     architecture: QemuArchitecture,
     kernel: &Path,
-    virtiofs_socket: &Path,
-    control_socket: &Path,
+    virtiofs_fd: RawFd,
+    control_fd: RawFd,
     data_dir: &Path,
     kvm: bool,
     net_mode: NetMode,
@@ -122,11 +122,11 @@ fn qemu_args(
         )
             .into(),
         "-chardev".into(),
-        format!("socket,id=fs,path={}", virtiofs_socket.display()).into(),
+        format!("socket,id=fs,fd={virtiofs_fd}").into(),
         "-device".into(),
         format!("{fs_device},chardev=fs,tag={ROOT_TAG}").into(),
         "-chardev".into(),
-        format!("socket,id=control,path={}", control_socket.display()).into(),
+        format!("socket,id=control,fd={control_fd}").into(),
         "-device".into(),
         serial_device.into(),
         "-device".into(),
@@ -177,31 +177,6 @@ pub fn packet_socket_pair() -> io::Result<(OwnedFd, OwnedFd)> {
     Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
 }
 
-fn wait_for_control(listener: &UnixListener, child: &mut Child) -> io::Result<UnixStream> {
-    listener.set_nonblocking(true)?;
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        match listener.accept() {
-            Ok((stream, _)) => return Ok(stream),
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-            Err(error) => return Err(error),
-        }
-        if let Some(status) = child.try_wait()? {
-            return Err(io::Error::other(format!(
-                "QEMU exited before its control port connected: {status}"
-            )));
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "QEMU appliance did not connect its control port within 30 seconds",
-            ));
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-}
-
 fn reap_appliance(child: &mut Child) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
@@ -217,8 +192,7 @@ fn reap_appliance(child: &mut Child) {
 /// Boot one command and return its guest exit status.
 pub fn run(
     architecture: QemuArchitecture,
-    box_id: u64,
-    virtiofs_socket: &Path,
+    virtiofs: OwnedFd,
     command: &ApplianceCommand,
     network: Option<OwnedFd>,
 ) -> io::Result<i32> {
@@ -239,14 +213,18 @@ pub fn run(
             ));
         }
     }
-    let control_socket = crate::paths::appliance_control_socket(
-        i64::try_from(box_id).map_err(|_| io::Error::other("box id exceeds engine range"))?,
-    );
-    if let Some(parent) = control_socket.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let _ = std::fs::remove_file(&control_socket);
-    let listener = UnixListener::bind(&control_socket)?;
+    let (mut control, qemu_control) = UnixStream::pair()?;
+    let inherit = |fd: RawFd| {
+        let duplicated = unsafe { libc::fcntl(fd, libc::F_DUPFD, 3) };
+        if duplicated < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(unsafe { OwnedFd::from_raw_fd(duplicated) })
+        }
+    };
+    let qemu_virtiofs = inherit(virtiofs.as_raw_fd())?;
+    let qemu_control = inherit(qemu_control.as_raw_fd())?;
+    let qemu_network = network.as_ref().map(|fd| inherit(fd.as_raw_fd())).transpose()?;
     let kvm = architecture_name(architecture) == std::env::consts::ARCH
         && std::fs::OpenOptions::new()
             .read(true)
@@ -256,12 +234,12 @@ pub fn run(
     let args = qemu_args(
         architecture,
         &kernel,
-        virtiofs_socket,
-        &control_socket,
+        qemu_virtiofs.as_raw_fd(),
+        qemu_control.as_raw_fd(),
         &data_dir,
         kvm,
         command.net_mode,
-        network.as_ref().map(AsRawFd::as_raw_fd),
+        qemu_network.as_ref().map(AsRawFd::as_raw_fd),
     );
     let mut child = Command::new(&qemu)
         .args(&args)
@@ -269,17 +247,18 @@ pub fn run(
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()?;
+    drop(qemu_virtiofs);
+    drop(qemu_control);
+    drop(qemu_network);
     let result = (|| {
-        let mut stream = wait_for_control(&listener, &mut child)?;
-        crate::socket_wire::write_versioned(&mut stream, command)?;
-        let result: ApplianceResult = crate::socket_wire::read_versioned(&mut stream)?;
+        crate::socket_wire::write_versioned(&mut control, command)?;
+        let result: ApplianceResult = crate::socket_wire::read_versioned(&mut control)?;
         Ok(result.code)
     })();
     if result.is_err() {
         let _ = child.kill();
     }
     reap_appliance(&mut child);
-    let _ = std::fs::remove_file(control_socket);
     result
 }
 
@@ -544,8 +523,8 @@ mod tests {
         let a = qemu_args(
             QemuArchitecture::Aarch64,
             Path::new("K"),
-            Path::new("F"),
-            Path::new("C"),
+            11,
+            12,
             Path::new("D"),
             false,
             NetMode::Off,
@@ -559,11 +538,13 @@ mod tests {
         assert!(a.contains("-machine virt"));
         assert!(a.contains("vhost-user-fs-pci"));
         assert!(a.contains("console=ttyAMA0"));
+        assert!(a.contains("socket,id=fs,fd=11"));
+        assert!(a.contains("socket,id=control,fd=12"));
         let x = qemu_args(
             QemuArchitecture::X8664,
             Path::new("K"),
-            Path::new("F"),
-            Path::new("C"),
+            11,
+            12,
             Path::new("D"),
             false,
             NetMode::Tap,
@@ -584,8 +565,8 @@ mod tests {
         let host = qemu_args(
             QemuArchitecture::Aarch64,
             Path::new("K"),
-            Path::new("V"),
-            Path::new("C"),
+            11,
+            12,
             Path::new("D"),
             false,
             NetMode::Host,

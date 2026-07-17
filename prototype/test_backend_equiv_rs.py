@@ -362,6 +362,78 @@ def run_cross_arch_brush(architecture):
         shutil.rmtree(root, ignore_errors=True)
 
 
+def run_nested_qemu():
+    """A FUSE child launches QEMU through its authenticated broker channel."""
+    root = Path(tempfile.mkdtemp(prefix="sarun-equiv-nested-qemu-", dir="/var/tmp"))
+    work = root / "lower"
+    work.mkdir()
+    env = dict(os.environ)
+    for key, name in (
+        ("XDG_STATE_HOME", "state"), ("XDG_RUNTIME_DIR", "run"),
+        ("XDG_CONFIG_HOME", "config"), ("XDG_DATA_HOME", "data"),
+    ):
+        directory = root / name
+        directory.mkdir()
+        env[key] = str(directory)
+    env["SLOPBOX_NS"] = "EQUIVNESTEDQEMU"
+    old = dict(os.environ)
+    os.environ.clear()
+    os.environ.update(env)
+    module = SourceFileLoader(
+        "slopbox_nested_qemu", str(LIBTESTSARUN)
+    ).load_module()
+    module.ensure_dirs()
+    engine = subprocess.Popen(
+        [str(ENGINE_BIN), "serve"], env=env,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    try:
+        if not wait_socket(module.sock_path()):
+            raise RuntimeError("engine socket never appeared")
+        nested = (
+            '"$SARUN_EXE" run --net off --qemu '
+            f'{HOST_ARCH} CHILD -C "$PWD" -- sh -c '
+            "'printf NESTED-QEMU > nested-result; printf nested-qemu-ok'"
+        )
+        result = subprocess.run(
+            [str(ENGINE_BIN), "run", "--net", "off", "--fuse", "OUTER",
+             "-C", str(work), "--", "sh", "-c", nested],
+            env=env, capture_output=True, timeout=240,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"rc={result.returncode}; stdout={result.stdout[-300:]!r}; "
+                f"stderr={result.stderr[-500:]!r}"
+            )
+        store = Path(env["XDG_STATE_HOME"]) / f"slopbox.{env['SLOPBOX_NS']}"
+        archives = sorted(store.glob("*.sqlar"), key=lambda path: int(path.stem))
+        if len(archives) != 2:
+            raise RuntimeError(f"expected parent and child archives, got {archives}")
+        parent, child = archives
+        child_result = module.sqlar_content(
+            child, str(work / "nested-result").lstrip("/")
+        )
+        return {
+            "exit_output": b"nested-qemu-ok" in result.stdout,
+            "parent_name": module.sqlar_meta_get(parent, "name"),
+            "child_name": module.sqlar_meta_get(child, "name"),
+            "child_parent": module.sqlar_meta_get(child, "parent_box_id"),
+            "parent_id": parent.stem,
+            "child_result": child_result,
+            "host_unchanged": not (work / "nested-result").exists(),
+        }
+    finally:
+        engine.terminate()
+        try:
+            engine.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            engine.kill()
+            engine.wait(timeout=5)
+        os.environ.clear()
+        os.environ.update(old)
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def main():
     if not ENGINE_BIN.exists():
         print(f"backend-equiv: no {ENGINE_BIN} — SKIP")
@@ -416,6 +488,23 @@ def main():
         for backend in backends[1:]:
             check(observations[backend] == reference,
                   f"equiv: {backend} observations equal {backends[0]}")
+
+    if "qemu" in backends:
+        try:
+            nested = run_nested_qemu()
+        except Exception as error:
+            check(False, f"nested qemu: FUSE parent launched appliance ({error})")
+        else:
+            check(nested["exit_output"],
+                  "nested qemu: appliance exit/output returned through parent")
+            check(nested["parent_name"] == "OUTER" and nested["child_name"] == "CHILD",
+                  "nested qemu: relative names retained")
+            check(nested["child_parent"] == nested["parent_id"],
+                  "nested qemu: broker-authenticated parent recorded")
+            check(nested["child_result"] == b"NESTED-QEMU",
+                  "nested qemu: child write captured in child archive")
+            check(nested["host_unchanged"],
+                  "nested qemu: child write did not escape to host")
 
     other_architecture = "x86_64" if HOST_ARCH == "aarch64" else "aarch64"
     other_kernel = appliance_root / other_architecture / "kernel"

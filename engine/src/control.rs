@@ -1385,9 +1385,26 @@ fn handle_binary_registration(
             return;
         }
     };
-    if crate::socket_wire::write_mode(
+    let virtiofs = registration.virtiofs_socket.as_ref().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, "registration omitted virtio-fs socket")
+    }).and_then(|socket| {
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::path::Path::new(std::ffi::OsStr::from_bytes(socket.as_slice()));
+        UnixStream::connect(path)
+    });
+    if let Err(error) = &virtiofs {
+        let _ = crate::socket_wire::write_mode(
+            &mut conn,
+            &binary_error(format!("registered QEMU export is not connectable: {error}")),
+        );
+        stop_live_transports(&state, id);
+    } else if crate::socket_wire::write_mode(
         &mut conn,
         &ConnectionMode::Box { registration },
+    ).is_err() || send_stream_with_fd(
+        &conn,
+        &crate::frames::encode(crate::frames::FRAME_APPLIANCE_FS, &[]),
+        virtiofs.as_ref().expect("checked successful export connection").as_raw_fd(),
     ).is_err() {
         stop_live_transports(&state, id);
     } else {
@@ -8203,14 +8220,9 @@ impl tokio::io::AsyncWrite for PrebufferedIo {
     }
 }
 
-/// Send a frame over the box-channel WITH an attached fd via SCM_RIGHTS.
-/// Engine-side analogue of runner::send_frame's pidfd path. Best-effort:
-/// a closed/blocked channel silently fails (the receiver will EOF later
-/// and we don't want one slow runner to deadlock the engine).
-fn send_frame_with_fd(channel: &std::sync::Arc<Mutex<UnixStream>>, frame: &[u8], fd: i32) {
+/// Send a complete frame with one attached descriptor via SCM_RIGHTS.
+fn send_stream_with_fd(conn: &UnixStream, frame: &[u8], fd: i32) -> std::io::Result<()> {
     use std::os::fd::AsRawFd;
-    let c = channel.lock().unwrap();
-    let conn_fd = c.as_raw_fd();
     let mut iov = libc::iovec {
         iov_base: frame.as_ptr() as *mut libc::c_void,
         iov_len: frame.len(),
@@ -8227,13 +8239,56 @@ fn send_frame_with_fd(channel: &std::sync::Arc<Mutex<UnixStream>>, frame: &[u8],
         (*cm).cmsg_type = libc::SCM_RIGHTS;
         (*cm).cmsg_len = libc::CMSG_LEN(4) as _;
         std::ptr::copy_nonoverlapping((&fd as *const i32).cast(), libc::CMSG_DATA(cm), 4);
-        libc::sendmsg(conn_fd, &msg, 0);
+        let written = libc::sendmsg(conn.as_raw_fd(), &msg, 0);
+        if written == frame.len() as isize {
+            Ok(())
+        } else if written < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "short descriptor frame write",
+            ))
+        }
     }
+}
+
+fn send_frame_with_fd(channel: &std::sync::Arc<Mutex<UnixStream>>, frame: &[u8], fd: i32) {
+    // Broker delivery remains best-effort: a closed channel will EOF and one
+    // abandoned runner must not bring down the engine's box-channel thread.
+    let conn = channel.lock().unwrap();
+    let _ = send_stream_with_fd(&conn, frame, fd);
 }
 
 #[cfg(test)]
 mod verb_tests {
     use super::*;
+
+    #[test]
+    fn appliance_descriptor_frame_transfers_a_connected_endpoint() {
+        use std::io::{Read, Write};
+        use std::os::fd::FromRawFd;
+
+        let (sender, receiver) = UnixStream::pair().unwrap();
+        let (mut payload_sender, payload_receiver) = UnixStream::pair().unwrap();
+        let frame = crate::frames::encode(crate::frames::FRAME_APPLIANCE_FS, &[]);
+        send_stream_with_fd(&sender, &frame, payload_receiver.as_raw_fd()).unwrap();
+
+        let mut bytes = [0u8; 64];
+        let mut received_fd = None;
+        let received = crate::runner::recv_box_frame_bytes_pub(
+            receiver.as_raw_fd(), &mut bytes, &mut received_fd,
+        );
+        assert_eq!(&bytes[..received as usize], frame.as_slice());
+        let transferred = unsafe {
+            std::os::fd::OwnedFd::from_raw_fd(received_fd.expect("descriptor attached"))
+        };
+        let mut transferred = UnixStream::from(transferred);
+        payload_sender.write_all(b"connected").unwrap();
+        let mut payload = [0u8; 9];
+        transferred.read_exact(&mut payload).unwrap();
+        assert_eq!(&payload, b"connected");
+    }
 
     #[test]
     fn typed_capture_events_preserve_the_live_ui_projection() {

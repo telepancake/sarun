@@ -193,7 +193,10 @@ as executable mappings and mmap that genuinely need a host fd.
       virtio-serial control, KVM, and TCG support required by sarun.
 - [x] Add the host launcher/vhost-user backend and target `/init` control plane.
   - [x] Embedded vhost-user lifecycle serves a scoped `SarunFs` box root on a
-        private per-box socket and exits when its frontend disconnects.
+        private per-box engine socket and exits when its frontend disconnects.
+        The engine connects that socket itself and transfers the connected
+        endpoint to the runner; QEMU consumes an inherited descriptor and
+        never resolves engine runtime paths.
   - [x] QEMU registration uses the generated binary request/reply directly;
         its architecture and virtio-fs socket never acquire a JSON form.
   - [x] Launch the paired QEMU appliance and implement the guest `/init`
@@ -202,6 +205,11 @@ as executable mappings and mmap that genuinely need a host fd.
         than a missing reply. PID 1 reports exit 127 after syncing dirty pages;
         the ACPI-free x86 appliance uses its configured triple-fault reboot so
         QEMU exits deterministically under `-no-reboot`.
+  - [x] Make the complete appliance boundary descriptor-based. The runner and
+        QEMU use a local socketpair for virtio-serial control, while the
+        authenticated engine channel transfers the connected virtio-fs fd.
+        A FUSE-contained runner can therefore launch a QEMU child without a
+        bind-mounted control socket or a namespace-specific pathname mode.
 - [x] Connect off/host/tap networking with the intended policy boundaries.
   - [x] For `tap`, carry one Ethernet frame per datagram between virtio-net and
         the existing per-box smoltcp stack; keep QEMU out of Prolog and out of
@@ -217,6 +225,10 @@ as executable mappings and mmap that genuinely need a host fd.
         excluding default-y device families absent from the paired machines.
 - [x] Boot aarch64 under TCG on the current host; verify a successful command,
       non-zero exit propagation, captured filesystem writes, and no host write.
+- [x] Launch an aarch64 QEMU child from a live FUSE parent through the ordinary
+      FD broker. The strict live gate verifies relative naming, recorded
+      `parent_box_id`, child-local capture, returned exit/output, and no host
+      write; there is no separate nested-appliance path.
 - [x] Carry the existing registration `brush` value through QEMU instead of
       hardcoding it false. Target `/init brush-sh` now runs the ordinary parser,
       and the shared SarunFs shadow projection runs embedded Kati and n2 in a
@@ -298,7 +310,7 @@ as executable mappings and mmap that genuinely need a host fd.
 
 ## Validation ledger (2026-07-17, aarch64 host)
 
-- The final static `aarch64-unknown-linux-musl` test harness has 385 passing
+- The final static `aarch64-unknown-linux-musl` test harness has 386 passing
   tests and one ignored browser test. Its only two failures are the pre-existing
   relation-completion cases
   `bash_editor_uses_relation_for_backward_completion_and_insertion` and
@@ -333,6 +345,9 @@ as executable mappings and mmap that genuinely need a host fd.
   host whose kernel rejects unprivileged user namespaces), with additional
   stale API/baseline cases. Those are recorded work, not treated as backend
   failures or silently converted to green skips.
+- `make test-backends` also launches QEMU from inside a FUSE box through the
+  authenticated broker and descriptor-only appliance boundary. It checks the
+  persisted parent edge and child archive, not merely a successful boot.
 - `make test-backend-workloads` passes every strict real-tool stage on both
   FUSE and aarch64 QEMU/TCG, compares equal backend observations, and proves
   the caller-writable lower trees remain byte-for-byte and metadata unchanged.
@@ -347,7 +362,7 @@ holding hours of work only in the worktree.
 
 ## Known baseline failures
 
-- The 2026-07-17 full static aarch64 unit run now passes 385 tests, ignores one,
+- The 2026-07-17 full static aarch64 unit run now passes 386 tests, ignores one,
   and exposed two pre-existing Brush/editor semantic-completion assertions:
   `production_brush_document_propagates_later_find_type_constraint` and
   `bash_editor_uses_relation_for_backward_completion_and_insertion`.  The

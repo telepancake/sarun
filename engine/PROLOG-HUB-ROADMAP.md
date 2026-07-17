@@ -733,6 +733,12 @@ belong to the relation.
       natively, while `--sud` remains an explicitly x86 Syscall User Dispatch
       transport. The aarch64 build, canonical core, both x86 wrapper ABIs, and
       live FUSE/QEMU equivalence are covered without an emulated SUD fallback.
+- [x] Make nested QEMU use the same authenticated runner broker as nested FUSE
+      launches. Registration uses the generated binary relation and a nested
+      name; virtio-fs and guest control cross the namespace as inherited file
+      descriptors, so no engine socket pathname or optional nesting mode leaks
+      into the appliance API. The aarch64 live gate verifies the persisted
+      parent edge, child capture, exit/output, and host isolation.
 - [ ] Copy third-party license notices beside every normal release artifact.
 
 ### 2. Generic typed FFI — NEXT

@@ -68,6 +68,13 @@ pub const FRAME_PTY_EOF: u8 = 9;
 pub const FRAME_OPEN_CONN: u8 = 13;
 pub const FRAME_CONN: u8 = 14;
 
+// QEMU registration descriptor lane.  The engine connects to the freshly
+// created virtio-fs export in its own mount namespace, then passes that
+// connected endpoint to the runner.  QEMU therefore never resolves an engine
+// pathname and nested appliances work across the same authenticated broker
+// boundary as every other nested runner.
+pub const FRAME_APPLIANCE_FS: u8 = 15;
+
 /// Body of a FRAME_PTY_RESIZE frame: [rows:u16 BE][cols:u16 BE].
 #[allow(dead_code)]
 pub fn pty_resize_payload(rows: u16, cols: u16) -> Vec<u8> {
