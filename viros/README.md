@@ -85,6 +85,8 @@ Useful individual stages and run modes are:
 ./viros.sh debug smips
 ./viros.sh run x86
 ./viros.sh debug x86
+./viros.sh run openwrt-malta-le
+./viros.sh debug openwrt-malta-le
 ```
 
 `debug` is the single-command source-level workflow: it starts target-specific
@@ -104,7 +106,9 @@ terminal to its serial console. On first use it replays the retained boot output
 before showing new live output. Press `Ctrl-]` to stop the VM and return to GDB;
 the harness breakpoints are temporary, so they do not immediately catch again
 when the console resumes. Console output is also retained in the target's
-`debug-console.log`. ARM's QEMU `virt` machine uses the PL011 console
+`debug-console.log`. QEMU runs in a separate terminal session, so `Ctrl-C`
+while GDB is continuing interrupts the remote target instead of terminating
+the VM process. ARM's QEMU `virt` machine uses the PL011 console
 `ttyAMA0`; the other kernel command lines select their target's corresponding
 serial device.
 You can inspect the retained output without resuming the VM as well:
@@ -122,6 +126,90 @@ For MMIPS, the emulated MT7621 UART is routed to
 at `/init`, then shows kernel diagnostics once `viros-console` resumes it;
 RouterOS init does not necessarily provide an interactive shell on that UART.
 
+### Userspace debugging through QEMU
+
+QEMU's system GDB stub can debug a guest userspace process without running
+`gdbserver` inside the guest. QEMU exposes CPUs rather than Linux processes, so
+viros adds the missing kernel-aware process selection and ELF relocation. With
+the matching kernel symbols loaded, select an existing PID or the 15-character
+Linux `comm`, then provide the local executable and optional separate debug
+file:
+
+```gdb
+viros-user-debug procd /openwrt/build_dir/.../procd /openwrt/debug/procd.debug
+viros-user-info
+viros-user-break main
+continue
+bt
+```
+
+For a process already stopped at its entry point, `viros-user-load PID EXEC
+[DEBUG-FILE]` skips the scheduler wait. `viros-user-focus PID|COMM` waits at
+`finish_task_switch` until that task owns a QEMU CPU. `viros-user-break` and
+`viros-user-tbreak` filter breakpoint hits by Linux PID, which prevents another
+process with the same virtual address from causing a false stop. The filter is
+implemented without architecture-specific MMU registers: it fingerprints the
+selected process through the random bytes addressed by its saved `AT_RANDOM`
+entry, then checks that address through QEMU's currently active MMU on every
+breakpoint hit. A child immediately after `fork` still has the parent's copied
+fingerprint until it executes a new image; distinguishing that case requires
+a fuller inferior-aware remote stub.
+
+PIE/ASLR is handled without walking version-specific VMA trees: the command
+reads `task->mm->saved_auxv`, uses `AT_PHDR` to calculate the ELF load bias, and
+checks the result against `AT_ENTRY`. The executable supplied first must be the
+exact guest build and retain its ELF program headers; the optional second file
+may be the unstripped executable or its separate debug file. Kernel and
+userspace symbols remain loaded together.
+
+The included OpenWrt Malta target provides a reproducible, long-running MIPS
+guest for this workflow. It uses OpenWrt's official initramfs kernel, matching
+`kernel-debug` archive, and default rootfs; it does not pretend that Malta is a
+RouterBOARD hardware model. A complete smoke test is:
+
+```sh
+./viros.sh download
+./viros.sh build
+./viros.sh debug openwrt-malta-le
+```
+
+The launcher uses PID 1's `start_thread` to infer its kernel task data, loads
+the published BusyBox ELF, and presents the initial GDB prompt at BusyBox's
+relocated entry without any guest-side server. The equivalent manual commands
+are:
+
+```gdb
+viros-user-load 1 artifacts/openwrt-malta-le/rootfs-25.12.5/bin/busybox
+viros-user-tbreak entry
+continue
+viros-console
+```
+
+`viros-console` boots through `procd`; press `Ctrl-]` to return to GDB, then:
+
+```gdb
+viros-ps
+viros-user-debug procd artifacts/openwrt-malta-le/rootfs-25.12.5/sbin/procd /path/to/matching/unstripped/procd
+viros-user-break main
+continue
+```
+
+The release rootfs's `procd` is stripped and has no ELF section table. Passing
+it without the optional debug ELF still provides PIE relocation, PID filtering,
+and numeric breakpoints; source names require an exact unstripped or separate
+debug ELF from the corresponding OpenWrt build. The official OpenWrt kernel
+debug archive also uses reduced DWARF and leaves `task_struct` incomplete, so
+the extension infers the required task-list, PID, command-name, `mm`, and saved
+aux-vector offsets from the live `init_task` and PID 1. This is why `viros-ps`
+works here even though the stock Linux helpers cannot enumerate tasks.
+
+This is most reliable when the kernel and userspace have the same register ABI.
+Compat processes (such as an IA32 executable under an x86-64 kernel) can be
+selected and relocated, but register decoding and unwinding depend on QEMU's
+compat-mode target description. Shared-library symbols are not loaded
+automatically yet; the main executable, static programs, and pre-libc failures
+are the intended first use case.
+
 ## Strict status matrix
 
 | Target | Emulated machine | Strict status |
@@ -135,6 +223,7 @@ RouterOS init does not necessarily provide an interactive shell on that UART.
 | `mipsbe` | patched Malta, MikroTik `board=vm` | **Success:** PID 1 and its executable were examined; GDB stopped at `/init` entry |
 | `x86` | PC/CHR disk | **Success:** production CHR reached login; rebuilt kernel started PID 1 and GDB stopped at `/init` entry |
 | `mmips` | patched Malta, 34Kf with MT7621 compatibility | **Success:** PID 1 and its executable were examined; GDB stopped at `/init` entry |
+| `openwrt-malta-le` | Malta, 24Kc | **Test target success:** official OpenWrt reached `/init` and `procd`; reduced-DWARF task enumeration, PIE relocation, PID-filtered breakpoints, and console switching were exercised |
 | `ppc-83xx` | none | **Blocked:** QEMU has no matching MPC83xx/RB333/RB600 machine |
 | `tile` | disclosed TILE-Gx KVM QEMU | **Blocked:** native TILE-Gx KVM only, no TCG system execution, and incomplete GDB hooks |
 

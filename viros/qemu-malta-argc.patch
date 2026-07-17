@@ -1,0 +1,22 @@
+diff --git a/hw/mips/malta.c b/hw/mips/malta.c
+--- a/hw/mips/malta.c
++++ b/hw/mips/malta.c
+@@ -110,4 +110,5 @@
+     const char *kernel_filename;
+     const char *kernel_cmdline;
+     const char *initrd_filename;
++    int kernel_argc;
+ } loaderparams;
+@@ -675,7 +676,7 @@ static void bl_setup_gt64120_jump_kernel(void **p, uint64_t run_addr,
+                         * If semihosting is used, arguments have already
+                         * been passed, so we preserve $a0.
+                         */
+-                       !semihosting_get_argc(), ENVP_NB_ENTRIES,
++                       !semihosting_get_argc(), loaderparams.kernel_argc,
+                        true, ENVP_VADDR,
+                        true, ENVP_VADDR + 8,
+                        true, loaderparams.ram_low_size,
+@@ -943,1 +944,3 @@ static uint64_t load_kernel(void)
++    loaderparams.kernel_argc = prom_index;
++
+     prom_set(prom_buf, prom_index++, NULL);

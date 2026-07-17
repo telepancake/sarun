@@ -20,6 +20,13 @@ MPFR_VERSION=${MPFR_VERSION:-4.2.2}
 MPFR_SHA256=${MPFR_SHA256:-b67ba0383ef7e8a8563734e2e889ef5ec3c3b898a01d00fa0a6869ad81c6ce01}
 TILE_QEMU_VERSION=${TILE_QEMU_VERSION:-5.2.0}
 LINUX_VERSION=${LINUX_VERSION:-5.6.3}
+OPENWRT_VERSION=${OPENWRT_VERSION:-25.12.5}
+OPENWRT_TARGET=${OPENWRT_TARGET:-malta/le}
+OPENWRT_KERNEL_SHA256=${OPENWRT_KERNEL_SHA256:-a2aec5d5bd31d411511fd799f936ea0c3d9a878dbc4b2729c600d3f3953931ca}
+OPENWRT_KERNEL_DEBUG_SHA256=${OPENWRT_KERNEL_DEBUG_SHA256:-0eacea705607b84062c84c205be4161e0111db2a56c0849806948c9e570bdc65}
+OPENWRT_ROOTFS_SHA256=${OPENWRT_ROOTFS_SHA256:-d28b07e52b21844ae29bdea48cec8e92ac70a8b0397a0bcc488ef7169f3f194d}
+ZSTD_VERSION=${ZSTD_VERSION:-1.5.7}
+ZSTD_SHA256=${ZSTD_SHA256:-eb33e51f49a15e023950cd7825ca74a4a2b43db8354825ac24fc1b7ee09e6fa3}
 ROUTEROS_VERSION=${ROUTEROS_VERSION:-latest}
 ROUTEROS_NPK=${ROUTEROS_NPK:-}
 MIKROTIK_GPL_COMMIT=${MIKROTIK_GPL_COMMIT:-c3e110db1d35886c96ee14e16fc5a06bcac59692}
@@ -54,7 +61,7 @@ DISK_SIZE=${DISK_SIZE:-64M}
 DEBUG_BOOT_TIMEOUT=${DEBUG_BOOT_TIMEOUT:-30}
 
 ARCHES=(x86 arm arm64 mipsbe mmips smips ppc tile)
-RUN_TARGETS=(x86 arm arm64 mipsbe mmips smips ppc-e500-smp ppc-e500 ppc-440 ppc-83xx tile)
+RUN_TARGETS=(x86 arm arm64 mipsbe mmips smips ppc-e500-smp ppc-e500 ppc-440 ppc-83xx tile openwrt-malta-le)
 
 say() { printf '==> %s\n' "$*"; }
 die() { printf 'viros.sh: %s\n' "$*" >&2; exit 1; }
@@ -97,7 +104,7 @@ usage() {
 Usage: ./viros.sh <subcommand> [argument] [-- QEMU options...]
 
 Stages:
-  download              Download pinned QEMU/GDB sources and current RouterOS
+  download              Download pinned tools, current RouterOS, and OpenWrt
   build                 Build emulators, Python GDB, and debug kernel(s)
   kernel-debug <target> Build a MikroTik-configured vmlinux with GDB scripts
   extract [arch|all]    Extract Linux images/initramfs from RouterOS NPKs
@@ -111,8 +118,8 @@ Information:
   doctor                Check host prerequisites
 
 Configuration is via QEMU_VERSION, GDB_VERSION, ROUTEROS_VERSION,
-ROUTEROS_NPK, JOBS, DISK_SIZE, and VIROS_WORKDIR.  All output remains inside
-VIROS_WORKDIR.
+ROUTEROS_NPK, OPENWRT_VERSION, JOBS, DISK_SIZE, and VIROS_WORKDIR.  All output
+remains inside VIROS_WORKDIR.
 EOF
 }
 
@@ -170,6 +177,7 @@ download_stage() {
     download_file "https://ftp.gnu.org/gnu/gmp/gmp-${GMP_VERSION}.tar.xz" "$DOWNLOADS/gmp-${GMP_VERSION}.tar.xz"
     download_file "https://ftp.gnu.org/gnu/mpfr/mpfr-${MPFR_VERSION}.tar.xz" "$DOWNLOADS/mpfr-${MPFR_VERSION}.tar.xz"
     download_file "https://cdn.kernel.org/pub/linux/kernel/v5.x/linux-${LINUX_VERSION}.tar.xz" "$DOWNLOADS/linux-${LINUX_VERSION}.tar.xz"
+    download_file "https://github.com/facebook/zstd/releases/download/v${ZSTD_VERSION}/zstd-${ZSTD_VERSION}.tar.gz" "$DOWNLOADS/zstd-${ZSTD_VERSION}.tar.gz"
     download_file "https://files.pythonhosted.org/packages/5d/95/6b5cb3461ea5673ba0995989746db58eb18b91b54dbf331e72f569540946/${PIP_WHEEL_NAME}" "$DOWNLOADS/${PIP_WHEEL_NAME}"
     download_file "https://files.pythonhosted.org/packages/5d/40/e1e72872c6354b306daef1703549e8e83b4d43cfea356311bf722a043752/${SETUPTOOLS_WHEEL_NAME}" "$DOWNLOADS/${SETUPTOOLS_WHEEL_NAME}"
     download_file "https://files.pythonhosted.org/packages/b7/b9/c538f279a4e237a006a2c98387d081e9eb060d203d8ed34467cc0f0b9b53/${PACKAGING_WHEEL_NAME}" "$DOWNLOADS/${PACKAGING_WHEEL_NAME}"
@@ -185,6 +193,13 @@ download_stage() {
     download_file "https://toolchains.bootlin.com/downloads/releases/toolchains/mips32/tarballs/${MIPSBE_TOOLCHAIN_NAME}.tar.bz2" "$DOWNLOADS/${MIPSBE_TOOLCHAIN_NAME}.tar.bz2"
     download_file "https://toolchains.bootlin.com/downloads/releases/toolchains/powerpc-e500mc/tarballs/${PPC_TOOLCHAIN_NAME}.tar.bz2" "$DOWNLOADS/${PPC_TOOLCHAIN_NAME}.tar.bz2"
     download_file "https://toolchains.bootlin.com/downloads/releases/toolchains/mips32el/tarballs/${MMIPS_TOOLCHAIN_NAME}.tar.bz2" "$DOWNLOADS/${MMIPS_TOOLCHAIN_NAME}.tar.bz2"
+    local openwrt_base="https://downloads.openwrt.org/releases/${OPENWRT_VERSION}/targets/${OPENWRT_TARGET}"
+    download_file "$openwrt_base/openwrt-${OPENWRT_VERSION}-malta-le-vmlinux-initramfs.elf" \
+        "$DOWNLOADS/openwrt-${OPENWRT_VERSION}-malta-le-vmlinux-initramfs.elf"
+    download_file "$openwrt_base/kernel-debug.tar.zst" \
+        "$DOWNLOADS/openwrt-${OPENWRT_VERSION}-malta-le-kernel-debug.tar.zst"
+    download_file "$openwrt_base/openwrt-${OPENWRT_VERSION}-malta-le-default-rootfs.tar.gz" \
+        "$DOWNLOADS/openwrt-${OPENWRT_VERSION}-malta-le-default-rootfs.tar.gz"
     download_managed_python
     resolve_routeros_version
     local arch suffix name
@@ -229,6 +244,13 @@ build_qemu() {
         patch --batch --forward -d "$src" -p1 < "$SCRIPT_DIR/qemu-mips-routeros.patch" ||
             die "RouterOS MIPS QEMU patch failed"
         : > "$src/.routeros-mips-vm"
+    fi
+    if [[ ! -f "$src/.malta-actual-argc" ]] ||
+       ! grep -q 'loaderparams.kernel_argc = prom_index' "$src/hw/mips/malta.c"; then
+        say "Making Malta pass the actual firmware argument count"
+        patch --batch --forward -d "$src" -p1 < "$SCRIPT_DIR/qemu-malta-argc.patch" ||
+            die "QEMU Malta argument-count patch failed"
+        : > "$src/.malta-actual-argc"
     fi
     if [[ ! -f "$src/.routeros-mips-debug" ]] ||
        ! grep -q 'mmu_idx != MMU_KERNEL_IDX' "$src/target/mips/system/physaddr.c"; then
@@ -317,6 +339,21 @@ build_gdb() {
     say "Building GDB"
     make -C "$out" -j "$JOBS" all-gdb
     make -C "$out" install-gdb
+}
+
+build_zstd() {
+    local archive="$DOWNLOADS/zstd-${ZSTD_VERSION}.tar.gz"
+    local src="$SOURCES/zstd-${ZSTD_VERSION}" destination="$TOOLS/zstd/bin"
+    [[ -s "$archive" ]] || die "zstd source is missing; run download first"
+    verify_file "$ZSTD_SHA256" "$archive"
+    if [[ -x "$destination/zstd" ]]; then
+        return
+    fi
+    unpack_source "$archive" "$src"
+    say "Building project-local zstd $ZSTD_VERSION"
+    make -C "$src" -j "$JOBS" zstd
+    mkdir -p "$destination"
+    cp -f -- "$src/zstd" "$destination/zstd"
 }
 
 verify_file() {
@@ -672,6 +709,7 @@ build_stage() {
     [[ -s "$DOWNLOADS/qemu-${QEMU_VERSION}.tar.xz" ]] || die "run download first"
     build_qemu
     build_gdb
+    build_zstd
     build_tile_linux_user
     build_mikrotik_tile_kvm
     build_debug_kernel x86
@@ -756,8 +794,46 @@ create_disk() {
     say "Created $disk ($DISK_SIZE ext2, containing routeros.npk)"
 }
 
+prepare_openwrt() {
+    local directory="$ARTIFACTS/openwrt-malta-le"
+    local rootfs="$directory/rootfs-${OPENWRT_VERSION}"
+    local debug_source="$SOURCES/openwrt-${OPENWRT_VERSION}-malta-le-kernel-debug"
+    local kernel_archive="$DOWNLOADS/openwrt-${OPENWRT_VERSION}-malta-le-vmlinux-initramfs.elf"
+    local debug_archive="$DOWNLOADS/openwrt-${OPENWRT_VERSION}-malta-le-kernel-debug.tar.zst"
+    local rootfs_archive="$DOWNLOADS/openwrt-${OPENWRT_VERSION}-malta-le-default-rootfs.tar.gz"
+    local zstd="$TOOLS/zstd/bin/zstd"
+
+    [[ -s "$kernel_archive" && -s "$debug_archive" && -s "$rootfs_archive" ]] ||
+        die "OpenWrt $OPENWRT_VERSION Malta files are missing; run download"
+    verify_file "$OPENWRT_KERNEL_SHA256" "$kernel_archive"
+    verify_file "$OPENWRT_KERNEL_DEBUG_SHA256" "$debug_archive"
+    verify_file "$OPENWRT_ROOTFS_SHA256" "$rootfs_archive"
+    [[ -x "$zstd" ]] || build_zstd
+
+    mkdir -p "$directory" "$debug_source" "$rootfs"
+    if [[ ! -f "$debug_source/.unpacked" ]]; then
+        "$zstd" -dc "$debug_archive" | tar -xf - -C "$debug_source"
+        [[ -s "$debug_source/debug/vmlinux" ]] ||
+            die "OpenWrt kernel-debug archive did not contain debug/vmlinux"
+        : > "$debug_source/.unpacked"
+    fi
+    if [[ ! -f "$rootfs/.unpacked" ]]; then
+        tar -xzf "$rootfs_archive" --no-same-owner -C "$rootfs"
+        [[ -s "$rootfs/sbin/procd" ]] ||
+            die "OpenWrt rootfs did not contain /sbin/procd"
+        : > "$rootfs/.unpacked"
+    fi
+    cp -f -- "$kernel_archive" "$directory/kernel-${OPENWRT_VERSION}.elf"
+    cp -f -- "$debug_source/debug/vmlinux" "$directory/vmlinux-${OPENWRT_VERSION}.debug"
+    say "Prepared OpenWrt $OPENWRT_VERSION Malta/le with matching kernel DWARF and rootfs"
+}
+
 prepare_one() {
     local target=$1 arch
+    if [[ "$target" == openwrt-malta-le ]]; then
+        prepare_openwrt
+        return
+    fi
     arch=$(base_arch "$target")
     extract_one "$arch"
     create_disk "$target"
@@ -875,6 +951,16 @@ run_stage() {
     local qemu kernel initrd disk mips_cmdline ppc_cmdline dtb
     disk="$IMAGES/$target.raw"
     case "$target" in
+        openwrt-malta-le)
+            qemu=$(qemu_binary qemu-system-mipsel)
+            kernel="$ARTIFACTS/openwrt-malta-le/kernel-${OPENWRT_VERSION}.elf"
+            [[ -s "$kernel" ]] || die "OpenWrt Malta kernel is missing; run prepare openwrt-malta-le"
+            exec "$qemu" -M malta -cpu 24Kc -smp 1 -m 256M \
+                -display none -monitor none -serial stdio -parallel none \
+                -no-reboot -no-shutdown -nodefaults -kernel "$kernel" \
+                -append 'mem=256M console=ttyS0,115200 loglevel=8 ignore_loglevel' \
+                -nic none "$@"
+            ;;
         x86)
             qemu=$(qemu_binary qemu-system-x86_64)
             local version chr
@@ -970,19 +1056,28 @@ gdb_stage() {
     fi
     remote=$2
     case "$target" in
-        x86|arm|arm64|mipsbe|mmips|smips|ppc-e500-smp|ppc-e500|ppc-440) ;;
+        x86|arm|arm64|mipsbe|mmips|smips|ppc-e500-smp|ppc-e500|ppc-440|openwrt-malta-le) ;;
         *) die "no validated matching debug kernel for $target" ;;
     esac
     gdb="$TOOLS/gdb/bin/gdb"
-    out="$BUILD/kernel-$target"
-    vmlinux="$ARTIFACTS/$target/vmlinux.debug"
-    helper="$out/vmlinux-gdb.py"
+    if [[ "$target" == openwrt-malta-le ]]; then
+        prepare_openwrt
+        out="$ARTIFACTS/openwrt-malta-le"
+        vmlinux="$out/vmlinux-${OPENWRT_VERSION}.debug"
+        helper=
+    else
+        out="$BUILD/kernel-$target"
+        vmlinux="$ARTIFACTS/$target/vmlinux.debug"
+        helper="$out/vmlinux-gdb.py"
+    fi
     [[ -x "$gdb" ]] || die "Python-enabled GDB is not built; run download and build"
     [[ -s "$vmlinux" ]] || die "debug vmlinux is missing; run: ./viros.sh kernel-debug $target"
-    [[ -s "$helper" ]] || die "output-tree Linux GDB Python extension is missing; rebuild $target"
+    [[ -z "$helper" || -s "$helper" ]] || die "output-tree Linux GDB Python extension is missing; rebuild $target"
     gdb_args=( -nx -q -iex 'set auto-load safe-path /' "$vmlinux"
-        -ex "source $helper" -ex 'set remotetimeout 10' )
-    if [[ "$target" == mipsbe || "$target" == mmips || "$target" == smips ]]; then
+        -ex 'set confirm off' -ex 'set remotetimeout 10' )
+    [[ -z "$helper" ]] || gdb_args+=( -ex "source $helper" )
+    gdb_args+=( -ex "source $SCRIPT_DIR/gdb_user.py" )
+    if [[ "$target" == mipsbe || "$target" == mmips || "$target" == smips || "$target" == openwrt-malta-le ]]; then
         gdb_args+=( -ex 'set architecture mips' )
         [[ "$target" == mmips ]] && gdb_args+=( -ex 'set suppress-cli-notifications on' )
     elif [[ "$target" == x86 ]]; then
@@ -1047,17 +1142,24 @@ debug_stage() {
     local target=${1:-} qemu kernel initrd bios= out vmlinux helper console_log qemu_log gdb status init_entry= mips_cmdline= ppc_cmdline= dtb= console_chardev
     local -a qemu_args gdb_args
     case "$target" in
-        x86|arm|arm64|mipsbe|mmips|smips|ppc-e500-smp|ppc-e500|ppc-440) ;;
-        *) die "debug requires a validated target: x86, arm, arm64, mipsbe, mmips, smips, ppc-e500-smp, ppc-e500, or ppc-440" ;;
+        x86|arm|arm64|mipsbe|mmips|smips|ppc-e500-smp|ppc-e500|ppc-440|openwrt-malta-le) ;;
+        *) die "debug requires a validated target (see: ./viros.sh list)" ;;
     esac
     need mkfs.ext2; need truncate
     prepare_one "$target"
-    out="$BUILD/kernel-$target"
-    vmlinux="$ARTIFACTS/$target/vmlinux.debug"
-    helper="$out/vmlinux-gdb.py"
+    if [[ "$target" == openwrt-malta-le ]]; then
+        out="$ARTIFACTS/openwrt-malta-le"
+        vmlinux="$out/vmlinux-${OPENWRT_VERSION}.debug"
+        helper=
+    else
+        out="$BUILD/kernel-$target"
+        vmlinux="$ARTIFACTS/$target/vmlinux.debug"
+        helper="$out/vmlinux-gdb.py"
+    fi
     gdb="$TOOLS/gdb/bin/gdb"
     [[ -x "$gdb" ]] || die "Python-enabled GDB is missing; run build"
-    [[ -s "$vmlinux" && -s "$helper" ]] || die "matching kernel/debug helpers are missing; run: ./viros.sh kernel-debug $target"
+    [[ -s "$vmlinux" ]] || die "matching kernel DWARF is missing for $target"
+    [[ -z "$helper" || -s "$helper" ]] || die "matching kernel/debug helpers are missing; run: ./viros.sh kernel-debug $target"
     mkdir -p "$ARTIFACTS/$target" "$BUILD"
     DEBUG_GDB_SOCKET="$BUILD/gdb-$target-$$.sock"
     DEBUG_CONSOLE_SOCKET="$BUILD/console-$target-$$.sock"
@@ -1069,6 +1171,15 @@ debug_stage() {
     : > "$qemu_log"
 
     case "$target" in
+        openwrt-malta-le)
+            qemu=$(qemu_binary qemu-system-mipsel)
+            kernel="$ARTIFACTS/openwrt-malta-le/kernel-${OPENWRT_VERSION}.elf"
+            [[ -s "$kernel" ]] || die "OpenWrt Malta kernel is missing; run prepare openwrt-malta-le"
+            qemu_args=( -M malta -cpu 24Kc -smp 1 -m 256M
+                -display none -monitor none -parallel none -nic none
+                -no-reboot -no-shutdown -nodefaults -S -kernel "$kernel"
+                -append 'mem=256M console=ttyS0,115200 loglevel=8 ignore_loglevel' )
+            ;;
         x86)
             qemu=$(qemu_binary qemu-system-x86_64)
             kernel="$ARTIFACTS/x86/kernel.debug.bzImage"
@@ -1195,7 +1306,10 @@ debug_stage() {
     qemu_args+=( -chardev "socket,id=$console_chardev,path=$DEBUG_CONSOLE_SOCKET,server=on,wait=off,logfile=$console_log,logappend=on" )
     [[ "$target" == mmips ]] || qemu_args+=( -serial "chardev:$console_chardev" )
     qemu_args+=( -gdb "unix:path=$DEBUG_GDB_SOCKET,server=on,wait=off" )
-    "$qemu" "${qemu_args[@]}" 2> "$qemu_log" &
+    need setsid
+    # Keep terminal-generated signals for foreground GDB away from QEMU.
+    # Ctrl-C can then interrupt a remote continue without killing the VM.
+    setsid "$qemu" "${qemu_args[@]}" 2> "$qemu_log" &
     DEBUG_QEMU_PID=$!
     trap cleanup_debug_qemu EXIT INT TERM
     wait_for_debug_socket "$qemu_log" "$console_log"
@@ -1215,7 +1329,7 @@ debug_stage() {
             -ex 'set pagination off' -ex 'set confirm off' -ex 'set python print-stack full' -ex 'set remotetimeout 10'
             -ex 'set suppress-cli-notifications on' -ex 'set architecture mips'
             -ex "target remote $DEBUG_GDB_SOCKET" -ex 'thbreak start_thread' -ex continue )
-    elif [[ "$target" == mipsbe || "$target" == smips ]]; then
+    elif [[ "$target" == mipsbe || "$target" == smips || "$target" == openwrt-malta-le ]]; then
         gdb_args=( -nx -q -iex 'set auto-load safe-path /' "$vmlinux"
             -ex 'set pagination off' -ex 'set confirm off' -ex 'set python print-stack full' -ex 'set remotetimeout 10' -ex 'set architecture mips'
             -ex "target remote $DEBUG_GDB_SOCKET" -ex 'thbreak start_thread' -ex continue )
@@ -1227,20 +1341,29 @@ debug_stage() {
     if [[ "$target" == arm || "$target" == arm64 ]]; then
         gdb_args+=( -ex 'thbreak ret_to_user' -ex continue )
     fi
-    gdb_args+=( -ex "source $helper" -ex lx-version -ex lx-ps
-        -ex 'p $lx_task_by_pid(1)->pid' -ex 'p $lx_task_by_pid(1)->comm' )
-    if [[ "$target" == mipsbe || "$target" == mmips || "$target" == smips || "$target" == x86 ]]; then
-        gdb_args+=( -ex 'p $lx_task_by_pid(1)->mm->exe_file->f_path.dentry->d_name.name'
-            -ex 'delete breakpoints' )
-        if [[ "$target" == x86 ]]; then
-            # QEMU x86 TCG does not advertise hardware breakpoints, but a
-            # software breakpoint in the mapped IA32 init page is reliable.
-            gdb_args+=( -ex "tbreak *$init_entry" -ex continue )
-        else
-            gdb_args+=( -ex "thbreak *$init_entry" -ex continue )
+    if [[ "$target" == openwrt-malta-le ]]; then
+        gdb_args+=( -ex "source $SCRIPT_DIR/gdb_user.py" -ex viros-ps
+            -ex 'viros-user-info 1' -ex 'delete breakpoints'
+            -ex "viros-user-load 1 $ARTIFACTS/openwrt-malta-le/rootfs-${OPENWRT_VERSION}/bin/busybox"
+            -ex 'viros-user-tbreak entry' -ex continue )
+    else
+        gdb_args+=( -ex "source $helper" -ex lx-version -ex lx-ps
+            -ex 'p $lx_task_by_pid(1)->pid' -ex 'p $lx_task_by_pid(1)->comm' )
+        if [[ "$target" == mipsbe || "$target" == mmips || "$target" == smips || "$target" == x86 ]]; then
+            gdb_args+=( -ex 'p $lx_task_by_pid(1)->mm->exe_file->f_path.dentry->d_name.name'
+                -ex 'delete breakpoints' )
+            if [[ "$target" == x86 ]]; then
+                # QEMU x86 TCG does not advertise hardware breakpoints, but a
+                # software breakpoint in the mapped IA32 init page is reliable.
+                gdb_args+=( -ex "tbreak *$init_entry" -ex continue )
+            else
+                gdb_args+=( -ex "thbreak *$init_entry" -ex continue )
+            fi
         fi
     fi
     gdb_args+=( -ex "source $SCRIPT_DIR/gdb_console.py" )
+    [[ "$target" == openwrt-malta-le ]] ||
+        gdb_args+=( -ex "source $SCRIPT_DIR/gdb_user.py" )
     say "QEMU PID: $DEBUG_QEMU_PID"
     say "GDB socket: $DEBUG_GDB_SOCKET"
     say "interactive console socket: $DEBUG_CONSOLE_SOCKET"
@@ -1249,6 +1372,9 @@ debug_stage() {
     if [[ "$target" == mipsbe || "$target" == mmips || "$target" == smips ]]; then
         say "Temporary breakpoint 1: kernel start_thread (prove and inspect PID 1)"
         say "Temporary breakpoint 2: RouterOS /init ELF entry $init_entry (final prompt)"
+    elif [[ "$target" == openwrt-malta-le ]]; then
+        say "Temporary breakpoints: OpenWrt PID 1 start_thread, then its BusyBox ELF entry"
+        say "Local OpenWrt rootfs: $ARTIFACTS/openwrt-malta-le/rootfs-${OPENWRT_VERSION}"
     fi
     say "At the GDB prompt run 'viros-console'; press Ctrl-] to return to GDB"
     say "Starting exact-symbol GDB for $target; PID 1 must be printed before the prompt"
@@ -1274,6 +1400,7 @@ smips           Malta/board=vm     success: PID 1 inspected with matching Python
 ppc-e500-smp    ppce500/e500v2     success: PID 1 inspected with matching Python GDB
 ppc-e500        ppce500/RB1000     success: PID 1 inspected with matching Python GDB
 ppc-440         sam460ex/460EX      success: PID 1 inspected with matching Python GDB
+openwrt-malta-le Malta/24Kc         test success: /init, procd, PIE/PID debugging, console
 ppc-83xx        —                  blocked: no MPC83xx QEMU machine
 tile            TILE KVM-only      blocked: no TCG and unfinished GDB stub
 EOF
