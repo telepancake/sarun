@@ -490,8 +490,19 @@ as executable mappings and mmap that genuinely need a host fd.
           ARM64 Kbuild's `lib-%.pi.o: OBJCOPYFLAGS += ...` now retains the common
           `%.pi.o` symbol-prefix flags instead of producing duplicate symbols at
           final link. The focused fixture brings the suite to 37 cases.
-    - [ ] Re-run the complete FUSE Brush build, then the complete QEMU Brush
-          build, compare retained artifacts, and record timings/counts here.
+    - [x] Complete the native-aarch64 FUSE Brush gate from a clean output tree.
+          Linux 6.18 builds 823 objects with `-j10` (11 observed overlapping
+          clang processes), takes 162 s wall / 143 s compile, and records 2,797
+          process rows, 43,513 `brushprov` rows, 4,276 build edges, and 63,019
+          output bytes. The captured 5,320,862-byte Image and 6,089,312-byte
+          vmlinux have writer provenance and SHA-256
+          `8272075e0b226fa543c4031bf83158a175e9dc56e18f47db3b5f773d7055a8ef`
+          and `3b65a88b2f5e8f25840eeaeb9009c3adac8e163fe7f2ade82eb426e6eef0d73e`;
+          lower/output/source escape checks all pass.
+    - [ ] Run the complete QEMU Brush gate under KVM and compare its artifacts
+          with the FUSE Brush result. This aarch64 OrbStack host exposes no KVM;
+          the hour-long TCG result is not a useful substitute for that remaining
+          performance/conformance gate.
 - [x] Remove backend-specific semantic branches and obsolete compatibility
       code; update generated help and user documentation. A repository audit
       finds backend selection only in registration, runner, transport, trace,
