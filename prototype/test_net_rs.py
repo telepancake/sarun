@@ -179,6 +179,25 @@ def test_n_box_has_tap_and_route():
         eng.stop()
 
 
+def test_engine_stop_releases_fuse_mount():
+    """SIGTERM follows normal teardown so an unprivileged FUSE mount does not
+    survive its engine as a dead kernel mount."""
+    skip_if_no_binary()
+    eng = Engine("TST-UNMOUNT")
+    mountpoint = eng.tmp / "run" / "slopbox.TST-UNMOUNT" / "mnt"
+    eng.start()
+    try:
+        assert os.path.ismount(mountpoint), f"engine did not mount {mountpoint}"
+    finally:
+        eng.stop()
+    mounted_paths = {
+        line.split(" - ", 1)[0].split()[4].replace("\\040", " ")
+        for line in Path("/proc/self/mountinfo").read_text().splitlines()
+    }
+    assert str(mountpoint) not in mounted_paths, \
+        f"dead engine leaked FUSE mount {mountpoint}"
+
+
 def test_n_box_synthetic_dns():
     """DNS to the gateway resolves arbitrary hostnames to a synthetic IP
     inside the box's /16. Same host → same IP (allocator dedup)."""

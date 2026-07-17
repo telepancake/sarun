@@ -8227,11 +8227,16 @@ pub fn bind_listener(sock: &std::path::Path) -> std::io::Result<UnixListener> {
 
 /// Run the accept loop on an already-bound listener (see [`bind_listener`]).
 pub fn serve(state: State, listener: UnixListener) -> std::io::Result<()> {
-    for conn in listener.incoming().flatten() {
-        let st = state.clone();
-        std::thread::spawn(move || handle(st, conn));
+    loop {
+        match listener.accept() {
+            Ok((conn, _)) => {
+                let st = state.clone();
+                std::thread::spawn(move || handle(st, conn));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
     }
-    Ok(())
 }
 
 /// A tokio AsyncRead+AsyncWrite that serves a fixed prefix first, then

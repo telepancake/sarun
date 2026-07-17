@@ -15,6 +15,8 @@
 // for (bench/FINDINGS.md "parallel builds"), not the product entry point.
 
 use std::path::PathBuf;
+use std::os::fd::AsRawFd;
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::time::Duration;
 
 pub use net::NetMode;
@@ -80,25 +82,19 @@ mod wire;
 // speaking the Python ChannelServer's protocol (single-instance guard, ui
 // verbs over on-disk box discovery, subscribe event feed). No boxes yet —
 // register is refused politely; the overlay arrives at m3.
-static SOCK_FOR_SIGNAL: std::sync::OnceLock<std::ffi::CString> = std::sync::OnceLock::new();
-static MNT_FOR_SIGNAL: std::sync::OnceLock<std::ffi::CString> = std::sync::OnceLock::new();
+static LISTENER_FOR_SIGNAL: AtomicI32 = AtomicI32::new(-1);
+static TERMINATING: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn on_term(_sig: i32) {
-    // async-signal-safe teardown: lazy-unmount our FUSE overlay (MNT_DETACH
-    // lets the kernel finalize when the last reference drops, so the call
-    // itself can't block on in-flight handlers), drop the socket, exit. The
-    // detach prevents a "File exists (os error 17)" on the next startup —
-    // without it, the dead mountpoint stays in the kernel's mount table and
-    // `create_dir_all` on it returns EEXIST instead of "already a dir".
-    if let Some(p) = MNT_FOR_SIGNAL.get() {
-        unsafe {
-            libc::umount2(p.as_ptr(), libc::MNT_DETACH);
-        }
+    // Wake the blocking accept loop using only signal-safe operations.  FUSE
+    // teardown must happen on the ordinary main path: an unprivileged mount
+    // requires the fusermount helper, which cannot be spawned in a signal
+    // handler.  The old direct umount2(2)+_exit leaked every such mount.
+    TERMINATING.store(true, Ordering::Relaxed);
+    let listener = LISTENER_FOR_SIGNAL.load(Ordering::Relaxed);
+    if listener >= 0 {
+        unsafe { libc::shutdown(listener, libc::SHUT_RDWR); }
     }
-    if let Some(p) = SOCK_FOR_SIGNAL.get() {
-        unsafe { libc::unlink(p.as_ptr()) };
-    }
-    unsafe { libc::_exit(0) };
 }
 
 fn top_level_help() -> Result<String, String> {
@@ -221,10 +217,7 @@ fn serve() -> i32 {
             return 1;
         }
     };
-    let c = std::ffi::CString::new(sock.as_os_str().as_encoded_bytes()).unwrap();
-    let _ = SOCK_FOR_SIGNAL.set(c);
-    let mc = std::ffi::CString::new(mnt.as_os_str().as_encoded_bytes()).unwrap();
-    let _ = MNT_FOR_SIGNAL.set(mc);
+    LISTENER_FOR_SIGNAL.store(listener.as_raw_fd(), Ordering::Release);
     unsafe {
         libc::signal(libc::SIGTERM, on_term as *const () as libc::sighandler_t);
         libc::signal(libc::SIGINT, on_term as *const () as libc::sighandler_t);
@@ -391,16 +384,19 @@ fn serve() -> i32 {
     mirrors::scheduler_thread();
     let rc = match control::serve(state, listener) {
         Ok(()) => 0,
+        Err(_) if TERMINATING.load(Ordering::Acquire) => 0,
         Err(e) => {
             eprintln!("sarun-engine: serve failed: {e}");
             1
         }
     };
+    LISTENER_FOR_SIGNAL.store(-1, Ordering::Release);
     if let Some(session) = session {
         if let Err(error) = session.unmount() {
             eprintln!("sarun-engine: overlay unmount failed: {error}");
         }
     }
+    let _ = std::fs::remove_file(&sock);
     rc
 }
 
