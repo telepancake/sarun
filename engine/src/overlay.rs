@@ -99,6 +99,7 @@ pub struct SarunFs {
     inner: Arc<Inner>,
     root: Key,
     kernel_passthrough: Arc<std::sync::atomic::AtomicBool>,
+    host_request_pids: bool,
 }
 
 /// Transitional source-compatible name for control-plane callers.  Filesystem
@@ -450,6 +451,7 @@ impl SarunFs {
             }),
             root: (0, String::new()),
             kernel_passthrough: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            host_request_pids: true,
         };
         // Reclaim unreferenced cache pool files once per engine start —
         // cheap (one readdir sweep), and NEVER on the FUSE path: eviction
@@ -483,6 +485,7 @@ impl SarunFs {
             inner: self.inner.clone(),
             root: (box_id, String::new()),
             kernel_passthrough: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            host_request_pids: false,
         })
     }
 
@@ -3377,10 +3380,18 @@ impl virtiofsd::filesystem::FileSystem for SarunFs {
             return Ok(0);
         }
         if let Some((box_id, nonblocking)) = self.jobserver_handle(handle) {
-            let slip = self
-                .inner
-                .synthetic
-                .acquire_guest_jobserver_blocking(box_id, ctx.pid as u32, nonblocking)?;
+            let slip = if self.host_request_pids {
+                self.inner.synthetic.acquire_host_jobserver_blocking(
+                    tgid_of(ctx.pid as u32) as i32,
+                    nonblocking,
+                )?
+            } else {
+                self.inner.synthetic.acquire_guest_jobserver_blocking(
+                    box_id,
+                    ctx.pid as u32,
+                    nonblocking,
+                )?
+            };
             let staging = staging_file()?;
             staging.write_at(&[slip], 0)?;
             return writer.read_from_file_at(&staging, 1, 0, None);
@@ -3406,9 +3417,15 @@ impl virtiofsd::filesystem::FileSystem for SarunFs {
             .map_err(virtio_error)?
         {
             WriteTarget::Jobserver { box_id } => {
-                self.inner
-                    .synthetic
-                    .release_guest_jobserver(box_id, ctx.pid as u32);
+                if self.host_request_pids {
+                    self.inner
+                        .synthetic
+                        .release_host_jobserver(tgid_of(ctx.pid as u32) as i32);
+                } else {
+                    self.inner
+                        .synthetic
+                        .release_guest_jobserver(box_id, ctx.pid as u32);
+                }
                 Ok(size as usize)
             }
             WriteTarget::Sink { box_id, stream } => {

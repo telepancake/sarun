@@ -277,6 +277,35 @@ impl SyntheticRuntime {
         }
     }
 
+    fn acquire_jobserver_blocking(
+        &self,
+        actor: i32,
+        nonblocking: bool,
+        watch_host_pid: bool,
+    ) -> std::io::Result<u8> {
+        struct Reply(std::sync::mpsc::Sender<bool>);
+        impl crate::slippool::SlipReply for Reply {
+            fn grant(self: Box<Self>) {
+                let _ = self.0.send(true);
+            }
+
+            fn deny_again(self: Box<Self>) {
+                let _ = self.0.send(false);
+            }
+        }
+
+        let (send, receive) = std::sync::mpsc::channel();
+        self.acquire_jobserver(actor, Box::new(Reply(send)), nonblocking, watch_host_pid);
+        match receive.recv() {
+            Ok(true) => Ok(crate::slippool::SLIP),
+            Ok(false) => Err(std::io::Error::from_raw_os_error(libc::EAGAIN)),
+            Err(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "jobserver reply channel closed",
+            )),
+        }
+    }
+
     pub(crate) fn acquire_host_jobserver(
         &self,
         host_tgid: i32,
@@ -284,6 +313,14 @@ impl SyntheticRuntime {
         nonblocking: bool,
     ) {
         self.acquire_jobserver(host_tgid, reply, nonblocking, true);
+    }
+
+    pub(crate) fn acquire_host_jobserver_blocking(
+        &self,
+        host_tgid: i32,
+        nonblocking: bool,
+    ) -> std::io::Result<u8> {
+        self.acquire_jobserver_blocking(host_tgid, nonblocking, true)
     }
 
     fn guest_actor(&self, box_id: i64, guest_pid: u32) -> i32 {
@@ -303,28 +340,8 @@ impl SyntheticRuntime {
         guest_pid: u32,
         nonblocking: bool,
     ) -> std::io::Result<u8> {
-        struct Reply(std::sync::mpsc::Sender<bool>);
-        impl crate::slippool::SlipReply for Reply {
-            fn grant(self: Box<Self>) {
-                let _ = self.0.send(true);
-            }
-
-            fn deny_again(self: Box<Self>) {
-                let _ = self.0.send(false);
-            }
-        }
-
-        let (send, receive) = std::sync::mpsc::channel();
         let actor = self.guest_actor(box_id, guest_pid);
-        self.acquire_jobserver(actor, Box::new(Reply(send)), nonblocking, false);
-        match receive.recv() {
-            Ok(true) => Ok(crate::slippool::SLIP),
-            Ok(false) => Err(std::io::Error::from_raw_os_error(libc::EAGAIN)),
-            Err(_) => Err(std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "jobserver reply channel closed",
-            )),
-        }
+        self.acquire_jobserver_blocking(actor, nonblocking, false)
     }
 
     pub(crate) fn release_host_jobserver(&self, host_tgid: i32) {

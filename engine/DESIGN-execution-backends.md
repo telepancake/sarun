@@ -94,7 +94,7 @@ as executable mappings and mmap that genuinely need a host fd.
 
 ### 2. FUSE cutover
 
-- [ ] Add a thin `/dev/fuse` transport into the virtiofsd server/SarunFs.
+- [x] Add a thin `/dev/fuse` transport into the virtiofsd server/SarunFs.
   - [x] Feed ordinary FUSE request/reply buffers through the same virtiofsd
         opcode decoder used by vhost-user; retain transport-specific byte
         movement only at the reader/writer boundary.
@@ -106,6 +106,9 @@ as executable mappings and mmap that genuinely need a host fd.
         backing-open/close ioctls and reply IDs; fall back once on kernels or
         unprivileged daemons that reject registration (Linux currently requires
         `CAP_SYS_ADMIN`), matching the old adapter's behavior.
+  - [x] Run the live engine on the raw transport and prove captured write/read
+        without host escape, stdout sink delivery, blocking host jobserver
+        acquire/release, UI materialization, and live overlay events on aarch64.
 - [ ] Differential-test old and new implementations on identical workloads.
 - [ ] Cut over, delete the old `fuser::Filesystem` implementation, and remove
       `fuser`.
@@ -182,7 +185,7 @@ holding hours of work only in the worktree.
 
 ## Known baseline failures
 
-- The 2026-07-17 full static aarch64 unit run passed 375 tests, ignored one,
+- The 2026-07-17 full static aarch64 unit run passed 377 tests, ignored one,
   and exposed two pre-existing Brush/editor semantic-completion assertions:
   `production_brush_document_propagates_later_find_type_constraint` and
   `bash_editor_uses_relation_for_backward_completion_and_insertion`.  The

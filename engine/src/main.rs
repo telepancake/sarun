@@ -17,9 +17,6 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use fuser::Config;
-use fuser::MountOption;
-
 pub use net::NetMode;
 
 mod brush;
@@ -44,7 +41,6 @@ mod browser;
 mod dockerfile;
 mod editor;
 mod frames;
-#[allow(dead_code)] // Live raw mount is cut over after passthrough parity.
 mod fuse_transport;
 #[allow(dead_code)]
 mod generated_wire;
@@ -236,14 +232,10 @@ fn serve() -> i32 {
     // Mount the multi-box overlay at the instance mountpoint (threads = cores).
     let mnt = paths::mnt_point();
     let ov = sarunfs::SarunFs::new(PathBuf::from("/"));
-    let mut cfg = Config::default();
-    cfg.mount_options = vec![MountOption::FSName("sarun-rs".into())];
     let n = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
-    cfg.n_threads = Some(n);
-    cfg.clone_fd = n > 1;
-    let session = match fuser::spawn_mount2(ov.clone(), &mnt, &cfg) {
+    let session = match fuse_transport::FuseSession::mount(ov.clone(), &mnt, n) {
         Ok(s) => Some(s),
         Err(e) => {
             eprintln!("sarun-engine: overlay mount FAILED: {e} — boxes cannot run");
@@ -404,7 +396,11 @@ fn serve() -> i32 {
             1
         }
     };
-    drop(session); // unmount
+    if let Some(session) = session {
+        if let Err(error) = session.unmount() {
+            eprintln!("sarun-engine: overlay unmount failed: {error}");
+        }
+    }
     rc
 }
 
