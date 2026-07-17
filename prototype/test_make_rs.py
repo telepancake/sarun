@@ -1321,7 +1321,6 @@ def main():
         (ph / "Makefile").write_text(
             ".PHONY: all FORCE\n"
             "all: FORCE\n\t@printf good > result.txt\n"
-            "FORCE:\n"
             "%::\n\t@printf bad >> fallback.txt\n")
         r = run_make("MAKE38", ph, "-j10", "all")
         check(r.returncode == 0,

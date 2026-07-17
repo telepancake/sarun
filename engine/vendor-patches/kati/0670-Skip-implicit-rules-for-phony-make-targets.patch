@@ -16,7 +16,7 @@ index 8a0125f..be599fc 100644
 +        // In particular, OpenWrt's top-level `%::` fallback must not become the
 +        // recipe of its ubiquitous empty `FORCE` target; doing so recursively
 +        // launches `make prereq` for every forced edge.
-+        if self.phony.contains(&output) && rule_merger.is_some() {
++        if self.phony.contains(&output) {
 +            return Some(PickedRuleInfo {
 +                merger: rule_merger,
 +                pattern_rule: None,
