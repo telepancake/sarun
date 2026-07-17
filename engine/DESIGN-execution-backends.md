@@ -98,7 +98,7 @@ as executable mappings and mmap that genuinely need a host fd.
   - [x] Feed ordinary FUSE request/reply buffers through the same virtiofsd
         opcode decoder used by vhost-user; retain transport-specific byte
         movement only at the reader/writer boundary.
-  - [ ] Own the mount/device worker lifecycle and dispatch `/dev/fuse` buffers
+  - [x] Own the mount/device worker lifecycle and dispatch `/dev/fuse` buffers
         through that decoder.
 - [ ] Preserve the synthetic box-id root, sinks, jobserver, shadows, rules,
       attachments, nested boxes, live events, and passthrough behavior.

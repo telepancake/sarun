@@ -1,0 +1,104 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Fri, 17 Jul 2026 00:43:34 +0000
+Subject: [PATCH] Negotiate kernel FUSE transport defaults
+
+Keep raw /dev/fuse initialization distinct from virtio-fs transport defaults while preserving one filesystem-requested capability intersection. The host kernel rejects the broader virtio defaults during FUSE_INIT.
+
+---
+diff --git a/src/server.rs b/src/server.rs
+index 82574b9..08dfe73 100644
+--- a/src/server.rs
++++ b/src/server.rs
+@@ -44,6 +44,10 @@ impl Read for MessageReader<'_> {
+ }
+ 
+ impl MessageReader<'_> {
++    fn is_fuse(&self) -> bool {
++        matches!(self, Self::Fuse(_))
++    }
++
+     fn read_obj<T: ByteValued>(&mut self) -> io::Result<T> {
+         let mut value = std::mem::MaybeUninit::<T>::uninit();
+         // SAFETY: ByteValued permits every initialized byte pattern.
+@@ -284,6 +288,7 @@ impl<F: FileSystem + Sync> Server<F> {
+         vu_req: Option<&mut T>,
+     ) -> Result<usize> {
+         let in_header: InHeader = r.read_obj().map_err(Error::DecodeMessage)?;
++        let raw_fuse = r.is_fuse();
+ 
+         if in_header.len > (MAX_BUFFER_SIZE + FUSE_BUFFER_HEADER_SIZE) {
+             return reply_error(
+@@ -322,7 +327,7 @@ impl<F: FileSystem + Sync> Server<F> {
+                 Opcode::Listxattr => self.listxattr(in_header, r, w),
+                 Opcode::Removexattr => self.removexattr(in_header, r, w),
+                 Opcode::Flush => self.flush(in_header, r, w),
+-                Opcode::Init => self.init(in_header, r, w),
++                Opcode::Init => self.init(in_header, r, w, raw_fuse),
+                 Opcode::Opendir => self.opendir(in_header, r, w),
+                 Opcode::Readdir => self.readdir(in_header, r, w),
+                 Opcode::Releasedir => self.releasedir(in_header, r, w),
+@@ -1105,7 +1110,13 @@ impl<F: FileSystem + Sync> Server<F> {
+         }
+     }
+ 
+-    fn init(&self, in_header: InHeader, mut r: MessageReader, w: MessageWriter) -> Result<usize> {
++    fn init(
++        &self,
++        in_header: InHeader,
++        mut r: MessageReader,
++        w: MessageWriter,
++        raw_fuse: bool,
++    ) -> Result<usize> {
+         let InitInCompat {
+             major,
+             minor,
+@@ -1151,18 +1162,25 @@ impl<F: FileSystem + Sync> Server<F> {
+         }
+ 
+         // These fuse features are supported by this server by default.
+-        let supported = FsOptions::ASYNC_READ
+-            | FsOptions::PARALLEL_DIROPS
+-            | FsOptions::BIG_WRITES
+-            | FsOptions::AUTO_INVAL_DATA
+-            | FsOptions::ASYNC_DIO
+-            | FsOptions::HAS_IOCTL_DIR
+-            | FsOptions::ATOMIC_O_TRUNC
+-            | FsOptions::MAX_PAGES
+-            | FsOptions::SUBMOUNTS
+-            | FsOptions::INIT_EXT
+-            | FsOptions::CREATE_SUPP_GROUP
+-            | FsOptions::ALLOW_IDMAP;
++        let supported = if raw_fuse {
++            // The kernel-FUSE transport has a narrower set of unconditional
++            // defaults than virtio-fs. Filesystem-requested capabilities are
++            // still added below after intersection with `capable`.
++            FsOptions::ASYNC_READ | FsOptions::BIG_WRITES | FsOptions::MAX_PAGES
++        } else {
++            FsOptions::ASYNC_READ
++                | FsOptions::PARALLEL_DIROPS
++                | FsOptions::BIG_WRITES
++                | FsOptions::AUTO_INVAL_DATA
++                | FsOptions::ASYNC_DIO
++                | FsOptions::HAS_IOCTL_DIR
++                | FsOptions::ATOMIC_O_TRUNC
++                | FsOptions::MAX_PAGES
++                | FsOptions::SUBMOUNTS
++                | FsOptions::INIT_EXT
++                | FsOptions::CREATE_SUPP_GROUP
++                | FsOptions::ALLOW_IDMAP
++        };
+ 
+         let flags_64 = ((flags2 as u64) << 32) | (flags as u64);
+         let capable = FsOptions::from_bits_truncate(flags_64);
+@@ -1180,8 +1198,8 @@ impl<F: FileSystem + Sync> Server<F> {
+                     minor: KERNEL_MINOR_VERSION,
+                     max_readahead,
+                     flags: enabled as u32,
+-                    max_background: u16::MAX,
+-                    congestion_threshold: (u16::MAX / 4) * 3,
++                    max_background: if raw_fuse { 16 } else { u16::MAX },
++                    congestion_threshold: if raw_fuse { 12 } else { (u16::MAX / 4) * 3 },
+                     max_write: MAX_BUFFER_SIZE,
+                     time_gran: 1, // nanoseconds
+                     max_pages: max_pages.try_into().unwrap(),

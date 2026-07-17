@@ -1,3 +1,4 @@
 0010-Make-native-daemon-dependencies-optional.patch
 0020-Expose-embedded-vhost-user-runner.patch
 0030-Share-decoder-with-raw-FUSE-transport.patch
+0040-Negotiate-kernel-FUSE-transport-defaults.patch
