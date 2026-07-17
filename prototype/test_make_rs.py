@@ -1396,6 +1396,66 @@ def main():
         check(reached == b"yes",
               f"case40: the inner include guard runs and evaluation resumes; "
               f"got {reached!r}")
+        # ── CASE 41: recursive argv accepts GNU jobserver transport ────────
+        # OpenWrt passes the inherited auth token explicitly to some upstream
+        # package makes. It names the same pool already carried in MAKEFLAGS;
+        # a recursive make must consume it as control data, not reject it as an
+        # unknown goal/flag or append it to $(MAKE) indefinitely.
+        js = work / "jobserver-argv"
+        shutil.rmtree(js, ignore_errors=True)
+        js.mkdir(parents=True, exist_ok=True)
+        (js / "child.mk").write_text(
+            "all:\n\t@printf joined > result.txt\n")
+        (js / "Makefile").write_text(
+            "all:\n"
+            "\t@$(MAKE) --jobserver-auth=fifo:/.slopbox-jobserver "
+            "--jobserver-fds=15,16 -f child.mk\n")
+        r = run_make("MAKE41", js, "-j10", "all")
+        check(r.returncode == 0,
+              f"case41: explicit recursive jobserver authorization is "
+              f"accepted (got {r.returncode}: {(r.stdout+r.stderr)[-500:]})")
+        sp41 = latest_sqlar(m)
+        joined = m.sqlar_content(
+            sp41, str((js / "result.txt").resolve()).lstrip("/"))
+        check(joined == b"joined",
+              f"case41: authorized child make ran on the shared pool; "
+              f"got {joined!r}")
+        # ── CASE 42: standard compile variables are real relations ─────────
+        # Upstream build systems frequently write the same recipe GNU make's
+        # implicit rules use, rather than invoking $(CC) themselves.  zstd is
+        # one example.  Missing COMPILE.c left -MMD at the start of the command
+        # (where it was mistaken for make's ignore-error prefix), while missing
+        # COMPILE.S made the shell try to execute the source file.  Exercise an
+        # actual compile, not merely variable inspection.
+        cv = work / "compile-variables"
+        shutil.rmtree(cv, ignore_errors=True)
+        cv.mkdir(parents=True, exist_ok=True)
+        (cv / "unit.c").write_text("int answer(void) { return 42; }\n")
+        (cv / "Makefile").write_text(
+            ".PHONY: all\n"
+            "DEPFLAGS := -MMD -MP -MF unit.d\n"
+            "all: unit.o\n"
+            "\t@printf '%s\\n' '$(COMPILE.c)' '$(COMPILE.S)' "
+            "'$(OUTPUT_OPTION)' > relations.txt\n"
+            "unit.o: unit.c\n"
+            "\t@$(COMPILE.c) $(DEPFLAGS) $(OUTPUT_OPTION) $<\n")
+        r = run_make("MAKE42", cv, "-j10", "all")
+        check(r.returncode == 0,
+              f"case42: explicit GNU built-in compile relation executes "
+              f"(got {r.returncode}: {(r.stdout+r.stderr)[-500:]})")
+        sp42 = latest_sqlar(m)
+        obj = m.sqlar_content(
+            sp42, str((cv / "unit.o").resolve()).lstrip("/"))
+        dep = m.sqlar_content(
+            sp42, str((cv / "unit.d").resolve()).lstrip("/"))
+        relations = m.sqlar_content(
+            sp42, str((cv / "relations.txt").resolve()).lstrip("/"))
+        check(bool(obj) and dep is not None and relations is not None
+              and b"cc " in relations and b" -c" in relations
+              and b"-o all" in relations,
+              f"case42: C/C++/assembler recipes share GNU's compile/output "
+              f"variables; object={None if obj is None else len(obj)} "
+              f"dep={dep!r} relations={relations!r}")
     finally:
         if eng is not None and eng.poll() is None:
             eng.terminate()

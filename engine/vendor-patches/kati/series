@@ -68,3 +68,5 @@
 0680-accept-unambiguous-GNU-long-option-abbreviations.patch
 0690-recognize-env-wrapped-POSIX-make-shells.patch
 0700-Do-not-hold-parser-locks-while-evaluating-statements.patch
+0710-Accept-inherited-GNU-jobserver-transport-options.patch
+0720-Provide-GNU-core-compile-and-link-variables.patch

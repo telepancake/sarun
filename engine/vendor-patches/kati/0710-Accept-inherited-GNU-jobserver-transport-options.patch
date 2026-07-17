@@ -1,0 +1,59 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Fri, 17 Jul 2026 22:57:33 +0000
+Subject: [PATCH] Accept inherited GNU jobserver transport options
+
+---
+diff --git a/src-rs/flags.rs b/src-rs/flags.rs
+index 3806e86..69da25d 100644
+--- a/src-rs/flags.rs
++++ b/src-rs/flags.rs
+@@ -453,6 +453,26 @@ impl Flags {
+                         flags.include_dirs.push(arg);
+                     } else if let Some(arg) = parse_command_line_option_with_arg("--include-dir", &arg, &mut iter) {
+                         flags.include_dirs.push(arg);
++                    } else if parse_command_line_option_with_arg(
++                        "--jobserver-auth",
++                        &arg,
++                        &mut iter,
++                    )
++                    .is_some()
++                        || parse_command_line_option_with_arg(
++                            "--jobserver-fds",
++                            &arg,
++                            &mut iter,
++                        )
++                        .is_some()
++                    {
++                        // GNU recursive makes may receive the inherited
++                        // jobserver token both through MAKEFLAGS and explicitly
++                        // in argv. Sarun's executor joins that same advertised
++                        // pool through jobserver::Client; these argv fields are
++                        // transport authorization, not options to append to
++                        // $(MAKE) again.
++                        should_propagate = false;
+                     } else if let Some(arg) =
+                         parse_command_line_option_with_arg("--dump_include_graph", &arg, &mut iter)
+                     {
+@@ -631,4 +651,21 @@ mod tests {
+         );
+         assert_eq!(resolve_supported_gnu_long_option(b"--"), None);
+     }
++
++    #[test]
++    fn test_jobserver_transport_options_are_consumed() {
++        let flags = Flags::from_args(
++            vec![
++                "make",
++                "--jobserver-auth=fifo:/.slopbox-jobserver",
++                "--jobserver-fds=15,16",
++                "all",
++            ]
++            .into_iter()
++            .map(Into::into)
++            .collect(),
++        );
++        assert_eq!(flags.targets, vec![intern("all")]);
++        assert_eq!(flags.subkati_args, vec![OsString::from("make")]);
++    }
+ }

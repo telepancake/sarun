@@ -526,8 +526,17 @@ as executable mappings and mmap that genuinely need a host fd.
           real `make -j10 prereq` now completes in 43 seconds, records 397
           processes, 5,627 Brush provenance rows and 3,734 build edges, and
           captures the 1,821,710-byte `.packageinfo` plus 1,103,452-byte
-          `.targetinfo` without changing the source checkout. The next boundary
-          is the complete `world` build.
+          `.targetinfo` without changing the source checkout. The first clean
+          `world` attempt then reached zstd's upstream compile. Recursive make
+          now consumes explicit inherited `--jobserver-auth` and
+          `--jobserver-fds` control arguments without rejecting or propagating
+          them (case 41). Kati's bootstrap now provides GNU's core C, C++, and
+          preprocessed-assembler `COMPILE.*`, `LINK.*`, `PREPROCESS.S`, and
+          `OUTPUT_OPTION` relations, and its suffix rules use those same
+          definitions. Case 42 performs the exact dependency-producing
+          `$(COMPILE.c) $(DEPFLAGS) $(OUTPUT_OPTION) $<` recipe that zstd uses;
+          the complete native-aarch64 Make/Brush suite passes. The next boundary
+          is resuming the clean `world` build past zstd.
     - [x] Complete the native-aarch64 FUSE Brush gate from a clean output tree.
           Linux 6.18 builds 823 objects with `-j10` (11 observed overlapping
           clang processes), takes 162 s wall / 143 s compile, and records 2,797

@@ -146,8 +146,10 @@ fn kati_argv(argv: &[String]) -> Result<Vec<OsString>, String> {
 }
 
 /// kati's bootstrap makefile (ported from upstream main.rs read_bootstrap_makefile).
-/// Seeds CC/CXX/AR/MAKE/SHELL and the builtin .c.o/.cc.o suffix rules so ordinary
-/// Makefiles relying on implicit rules work. Returns the parsed bootstrap stmts.
+/// Seeds GNU make's core C/C++/assembler variables and suffix rules, plus the
+/// special MAKE/SHELL variables. Keep recipes expressed through COMPILE.* and
+/// OUTPUT_OPTION: projects use those relations directly and via implicit rules.
+/// Returns the parsed bootstrap stmts.
 fn read_bootstrap_makefile(
     targets: &[Symbol],
     working_dir: &std::path::Path,
@@ -158,8 +160,26 @@ fn read_bootstrap_makefile(
     let mut bootstrap = BytesMut::new();
     if !no_builtin_variables {
         bootstrap.put_slice(b"CC?=cc\n");
-        bootstrap.put_slice(b"CXX?=g++\n");
+        if cfg!(target_os = "macos") {
+            bootstrap.put_slice(b"CXX?=c++\n");
+        } else {
+            bootstrap.put_slice(b"CXX?=g++\n");
+        }
         bootstrap.put_slice(b"AR?=ar\n");
+        bootstrap.put_slice(b"AS?=as\n");
+        bootstrap.put_slice(b"CPP?=$(CC) -E\n");
+        bootstrap.put_slice(b"COMPILE.c?=$(CC) $(CFLAGS) $(CPPFLAGS) $(TARGET_ARCH) -c\n");
+        bootstrap.put_slice(b"COMPILE.cc?=$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(TARGET_ARCH) -c\n");
+        bootstrap.put_slice(b"COMPILE.cpp?=$(COMPILE.cc)\n");
+        bootstrap.put_slice(b"COMPILE.C?=$(COMPILE.cc)\n");
+        bootstrap.put_slice(b"COMPILE.S?=$(CC) $(ASFLAGS) $(CPPFLAGS) $(TARGET_MACH) -c\n");
+        bootstrap.put_slice(b"PREPROCESS.S?=$(CPP) $(CPPFLAGS)\n");
+        bootstrap.put_slice(b"LINK.o?=$(CC) $(LDFLAGS) $(TARGET_ARCH)\n");
+        bootstrap.put_slice(b"LINK.c?=$(CC) $(CFLAGS) $(CPPFLAGS) $(LDFLAGS) $(TARGET_ARCH)\n");
+        bootstrap.put_slice(b"LINK.cc?=$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) $(TARGET_ARCH)\n");
+        bootstrap.put_slice(b"LINK.cpp?=$(LINK.cc)\n");
+        bootstrap.put_slice(b"LINK.C?=$(LINK.cc)\n");
+        bootstrap.put_slice(b"OUTPUT_OPTION?=-o $@\n");
     }
     // sarun: report GNU make 4.3 (matches our compat target); Makefiles
     // gated on `ifeq ($(MAKE_VERSION),4.x)` see what they expect.
@@ -202,9 +222,15 @@ fn read_bootstrap_makefile(
     );
     if !no_builtin_rules {
         bootstrap.put_slice(b".c.o:\n");
-        bootstrap.put_slice(b"\t$(CC) $(CFLAGS) $(CPPFLAGS) $(TARGET_ARCH) -c -o $@ $<\n");
+        bootstrap.put_slice(b"\t$(COMPILE.c) $(OUTPUT_OPTION) $<\n");
         bootstrap.put_slice(b".cc.o:\n");
-        bootstrap.put_slice(b"\t$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(TARGET_ARCH) -c -o $@ $<\n");
+        bootstrap.put_slice(b"\t$(COMPILE.cc) $(OUTPUT_OPTION) $<\n");
+        bootstrap.put_slice(b".cpp.o:\n");
+        bootstrap.put_slice(b"\t$(COMPILE.cpp) $(OUTPUT_OPTION) $<\n");
+        bootstrap.put_slice(b".C.o:\n");
+        bootstrap.put_slice(b"\t$(COMPILE.C) $(OUTPUT_OPTION) $<\n");
+        bootstrap.put_slice(b".S.o:\n");
+        bootstrap.put_slice(b"\t$(COMPILE.S) $(OUTPUT_OPTION) $<\n");
     }
     // sarun: GNU make's $(MAKE) is the name make was invoked as (argv[0]) — no
     // -jN appended. Parallelism propagates via MAKEFLAGS, not MAKE itself.
