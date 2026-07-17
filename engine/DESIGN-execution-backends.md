@@ -62,7 +62,7 @@ as executable mappings and mmap that genuinely need a host fd.
 - [x] Prove fully static aarch64 and x86_64 musl builds.
 - [x] Introduce `SarunFs` implementing `FileSystem` and explicitly unsupported
       `SerializableFileSystem` migration hooks.
-- [ ] Separate virtual inode/handle lifetime, overlay policy, underlying layer
+- [x] Separate virtual inode/handle lifetime, overlay policy, underlying layer
       access, capture/provenance, and synthetic nodes.
   - [x] Make inode identity, lookup counts, handle allocation/lifetime, node
         kinds, and node attributes transport-independent; fuser and virtio-fs
@@ -80,10 +80,10 @@ as executable mappings and mmap that genuinely need a host fd.
           bounded journal owned outside the overlay/protocol adapters.
     - [x] Move depot mutations, copy-up attribution, and finalization behind a
           capture service rather than calling `BoxState` throughout policy.
-  - [ ] Isolate synthetic projections, sinks, jobserver, and nested-box nodes.
+  - [x] Isolate synthetic projections, sinks, jobserver, and nested-box nodes.
     - [x] Define every reserved per-box name, kind, attribute, and sink stream
           once in a typed transport-independent synthetic-node catalog.
-    - [ ] Move synthetic runtime behavior and projected-file ownership out of
+    - [x] Move synthetic runtime behavior and projected-file ownership out of
           the merged overlay implementation.
 - [x] Use virtiofsd passthrough machinery for ordinary host-backed operations;
       retain only sarun-specific composition and capture policy.
@@ -173,7 +173,7 @@ holding hours of work only in the worktree.
 
 ## Known baseline failures
 
-- The 2026-07-17 full static aarch64 unit run passed 374 tests, ignored one,
+- The 2026-07-17 full static aarch64 unit run passed 375 tests, ignored one,
   and exposed two pre-existing Brush/editor semantic-completion assertions:
   `production_brush_document_propagates_later_find_type_constraint` and
   `bash_editor_uses_relation_for_backward_completion_and_insertion`.  The

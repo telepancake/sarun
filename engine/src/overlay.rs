@@ -59,7 +59,7 @@ use crate::capture::BoxState;
 use crate::capture::Entry;
 use crate::depot::blob_path;
 use crate::sarunfs::layers::{ChainLink, Layer};
-use crate::sarunfs::synthetic::SyntheticNode;
+use crate::sarunfs::synthetic::{SyntheticNode, SyntheticRuntime};
 use crate::sarunfs::{HandleTable, NodeAttr, NodeKind};
 
 const TTL: Duration = Duration::from_secs(1);
@@ -107,10 +107,7 @@ pub type Overlay = SarunFs;
 struct Inner {
     backing: crate::sarunfs::backing::BackingStore,
     boxes: RwLock<BTreeMap<i64, Arc<BoxState>>>,
-    // Engine-owned read-only files projected into a live box without becoming
-    // captured upper state. This is the generic seam for boot/runtime support
-    // objects: review/apply must never mistake `/init` for a user write.
-    projections: RwLock<HashMap<Key, PathBuf>>,
+    synthetic: SyntheticRuntime,
     inodes: crate::sarunfs::InodeTable,
     detached_attrs: RwLock<HashMap<u64, NodeAttr>>,
     handles: HandleTable<Handle>,
@@ -132,22 +129,6 @@ struct Inner {
     /// of the host file. NO pre-enumeration of the host filesystem —
     /// matching is per-lookup, the way the user asked for it.
     shadows: RwLock<Shadows>,
-    // ── live echo mux (the captured-output readback channel) ──
-    // Per-box framed writer over the box's ONE muxed connection: the sink-write
-    // handler frames captured bytes as ECHO and sends them back to --inner.
-    echo: RwLock<HashMap<i64, std::sync::Arc<Mutex<std::os::unix::net::UnixStream>>>>,
-    // Per-box open-sink count: when it returns to 0 (both sinks released at child
-    // exit) the engine sends ECHO_DONE so --inner stops without truncation.
-    sink_open: Mutex<HashMap<i64, u32>>,
-    // Globally muted HOST tgids → the box id that muted tgid OWNS. A muted
-    // tgid's write to an ANCESTOR box's sink (sink box_id != its own box) is
-    // echo readback travelling up — echoed onward but NOT recorded (it was
-    // already captured once at its origin box). But a muted tgid's write to ITS
-    // OWN box's sink is FIRST-PARTY output (e.g. a brush in-process builtin like
-    // echo/printf, which writes fd 1 from the muted --inner pid) and MUST be
-    // recorded. A MUTE frame adds --inner's own host tgid mapped to its box id;
-    // UNMUTE / connection-close removes it.
-    muted: RwLock<std::collections::HashMap<i32, i64>>,
     // D5 (rule-gated): true iff the kernel negotiated FUSE_PASSTHROUGH at init.
     // ONLY read-only opens of `readonly`-RULED paths register backing fds; never
     // a blind per-open guess (see DESIGN.md D5). daemon_reads counts read() ops
@@ -170,7 +151,7 @@ enum FileData {
 enum Handle {
     File(Mutex<Fh>),
     Directory(Arc<Vec<DirNode>>),
-    Jobserver { nonblock: bool },
+    Jobserver { box_id: i64, nonblock: bool },
 }
 
 struct FhInner {
@@ -212,7 +193,7 @@ struct OpenedNode {
 }
 
 enum WriteTarget {
-    Jobserver,
+    Jobserver { box_id: i64 },
     Sink { box_id: i64, stream: i32 },
     File { file: File, box_id: i64, rel: String },
 }
@@ -452,16 +433,13 @@ impl SarunFs {
         let ov = SarunFs { inner: Arc::new(Inner {
             backing,
             boxes: RwLock::new(BTreeMap::new()),
-            projections: RwLock::new(HashMap::new()),
+            synthetic: SyntheticRuntime::new(),
             inodes: crate::sarunfs::InodeTable::new((0, String::new())),
             detached_attrs: RwLock::new(HashMap::new()),
             handles: HandleTable::new(),
             ext: RwLock::new(HashMap::new()),
             cache: std::sync::OnceLock::new(),
             rules: RwLock::new(crate::rules::Rules::load()),
-            echo: RwLock::new(HashMap::new()),
-            sink_open: Mutex::new(HashMap::new()),
-            muted: RwLock::new(std::collections::HashMap::new()),
             passthrough_ok: std::sync::atomic::AtomicBool::new(false),
             daemon_reads: AtomicU64::new(0),
             mutations: crate::sarunfs::mutation::MutationJournal::new(),
@@ -651,12 +629,11 @@ impl SarunFs {
     /// handler frames ECHO onto it). Replaces any prior writer for the box.
     pub fn set_echo(&self, id: i64,
                     conn: std::sync::Arc<Mutex<std::os::unix::net::UnixStream>>) {
-        self.inner.echo.write().unwrap().insert(id, conn);
+        self.inner.synthetic.set_echo(id, conn);
     }
     /// Drop the box's echo writer (box channel closing / teardown).
     pub fn clear_echo(&self, id: i64) {
-        self.inner.echo.write().unwrap().remove(&id);
-        self.inner.sink_open.lock().unwrap().remove(&id);
+        self.inner.synthetic.clear_echo(id);
     }
     /// The box-channel writer stored under id (set by control::handle as the
     /// echo conn). Reused by the oaita API mux to frame FRAME_API_DATA
@@ -664,56 +641,13 @@ impl SarunFs {
     pub fn echo_writer(&self, id: i64)
         -> Option<std::sync::Arc<Mutex<std::os::unix::net::UnixStream>>>
     {
-        self.inner.echo.read().unwrap().get(&id).cloned()
+        self.inner.synthetic.echo_writer(id)
     }
     pub fn mute_add(&self, host_pid: i32, box_id: i64) {
-        if host_pid > 0 { self.inner.muted.write().unwrap().insert(host_pid, box_id); }
+        self.inner.synthetic.mute_add(host_pid, box_id);
     }
     pub fn mute_remove(&self, host_pid: i32) {
-        self.inner.muted.write().unwrap().remove(&host_pid);
-    }
-    /// If `pid`'s tgid is muted, returns the box id that muted tgid OWNS (so the
-    /// sink-write path can tell a first-party write to its own box's sink from an
-    /// echo readback bubbling up through an ancestor sink). None if not muted.
-    fn muted_owner(&self, pid: u32) -> Option<i64> {
-        let m = self.inner.muted.read().unwrap();
-        if m.is_empty() { return None; }
-        m.get(&(tgid_of(pid) as i32)).copied()
-    }
-    /// Frame `data` as an ECHO for `id`'s stream and send it over the box
-    /// channel (best-effort; a dropped/blocked channel never fails a write).
-    fn echo_send(&self, id: i64, stream: i32, data: &[u8]) {
-        let conn = self.inner.echo.read().unwrap().get(&id).cloned();
-        if let Some(conn) = conn {
-            let frame = crate::frames::encode(crate::frames::FRAME_ECHO,
-                &crate::frames::echo_payload(stream as u8, data));
-            use std::io::Write;
-            let mut c = conn.lock().unwrap();
-            let _ = c.write_all(&frame);
-        }
-    }
-    /// Note a sink fd opened for `id` (capture start: out + err = 2).
-    fn note_sink_open(&self, id: i64) {
-        *self.inner.sink_open.lock().unwrap().entry(id).or_insert(0) += 1;
-    }
-    /// Note a sink fd released for `id`; when the count returns to 0 (child
-    /// exited, both sinks closed) send ECHO_DONE so --inner stops cleanly.
-    fn note_sink_release(&self, id: i64) {
-        let zero = {
-            let mut m = self.inner.sink_open.lock().unwrap();
-            if let Some(c) = m.get_mut(&id) {
-                *c = c.saturating_sub(1);
-                *c == 0
-            } else { false }
-        };
-        if zero {
-            let conn = self.inner.echo.read().unwrap().get(&id).cloned();
-            if let Some(conn) = conn {
-                let frame = crate::frames::encode(crate::frames::FRAME_ECHO_DONE, &[]);
-                use std::io::Write;
-                let _ = conn.lock().unwrap().write_all(&frame);
-            }
-        }
+        self.inner.synthetic.mute_remove(host_pid);
     }
 
     /// HOST-DIRECT WRITE routing decision: the FULL-grammar passthrough rule,
@@ -874,7 +808,7 @@ impl SarunFs {
 
     pub fn remove_box(&self, id: i64) {
         self.inner.boxes.write().unwrap().remove(&id);
-        self.inner.projections.write().unwrap().retain(|(bid, _), _| *bid != id);
+        self.inner.synthetic.remove_box(id);
     }
 
     /// Project a host file read-only at `rel` in one live box. Projections are
@@ -895,14 +829,12 @@ impl SarunFs {
                 format!("box {id} not registered"),
             ));
         }
-        self.inner.projections.write().unwrap()
-            .insert((id, rel.to_string()), source);
+        self.inner.synthetic.project(id, rel, source);
         Ok(())
     }
 
     fn projected_file(&self, id: i64, rel: &str) -> Option<PathBuf> {
-        self.inner.projections.read().unwrap()
-            .get(&(id, rel.to_string())).cloned()
+        self.inner.synthetic.projected(id, rel)
     }
 
     pub fn box_ids(&self) -> Vec<i64> {
@@ -1060,12 +992,6 @@ impl SarunFs {
     /// connection + RAM mirror instead of a rival on-disk handle.
     pub fn live_box(&self, id: i64) -> Option<Arc<BoxState>> {
         self.inner.boxes.read().unwrap().get(&id).cloned()
-    }
-
-    /// Live child box ids of `bid` (their parent() == bid) — KIDS_DIR entries.
-    fn children_of_box(&self, bid: i64) -> Vec<i64> {
-        self.inner.boxes.read().unwrap().values()
-            .filter(|c| c.parent() == Some(bid)).map(|c| c.id).collect()
     }
 
     /// On rename, the kernel keeps the cached inode and moves its dentry; our
@@ -1395,7 +1321,11 @@ impl SarunFs {
                 SyntheticNode::Children.attr(ino)
             } else if prel == SyntheticNode::Children.name() {
                 let cid = name.parse::<i64>().map_err(|_| Errno::ENOENT)?;
-                if self.box_of(cid).and_then(|child| child.parent()) != Some(bid) {
+                if !self.inner.synthetic.is_child(
+                    &self.inner.boxes.read().unwrap(),
+                    bid,
+                    cid,
+                ) {
                     return Err(Errno::ENOENT);
                 }
                 let ino = self.ino_for(&(cid, String::new()));
@@ -1561,7 +1491,7 @@ impl SarunFs {
             let handle = self
                 .inner
                 .handles
-                .insert(Handle::Jobserver { nonblock });
+                .insert(Handle::Jobserver { box_id: bid, nonblock });
             return Ok(OpenedNode {
                 handle,
                 direct_io: true,
@@ -1571,7 +1501,7 @@ impl SarunFs {
             });
         }
         if let Some(stream) = SyntheticNode::at(&rel).and_then(SyntheticNode::stream) {
-            self.note_sink_open(bid);
+            self.inner.synthetic.sink_opened(bid);
             let handle = self.reg_fh(FhInner {
                 box_id: bid,
                 rel,
@@ -2274,6 +2204,17 @@ impl SarunFs {
         }
     }
 
+    fn jobserver_handle(&self, handle: u64) -> Option<(i64, bool)> {
+        self.inner
+            .handles
+            .get(handle)
+            .as_deref()
+            .and_then(|handle| match handle {
+                Handle::Jobserver { box_id, nonblock } => Some((*box_id, *nonblock)),
+                _ => None,
+            })
+    }
+
     fn read_file_to<W: virtiofsd::filesystem::ZeroCopyWriter>(
         &self,
         handle: u64,
@@ -2302,8 +2243,8 @@ impl SarunFs {
 
     fn prepare_write_node(&self, pid: u32, handle: u64) -> Result<WriteTarget, Errno> {
         let handle = self.inner.handles.get(handle).ok_or(Errno::EBADF)?;
-        if matches!(&*handle, Handle::Jobserver { .. }) {
-            return Ok(WriteTarget::Jobserver);
+        if let Handle::Jobserver { box_id, .. } = &*handle {
+            return Ok(WriteTarget::Jobserver { box_id: *box_id });
         }
         let Handle::File(handle) = &*handle else {
             return Err(Errno::EBADF);
@@ -2349,21 +2290,21 @@ impl SarunFs {
     }
 
     fn write_sink_node(&self, pid: u32, box_id: i64, stream: i32, data: &[u8]) {
-        let record = match self.muted_owner(pid) {
-            None => true,
-            Some(owner) => owner == box_id,
-        };
-        if record {
-            if let Some(b) = self.box_of(box_id) {
-                b.add_output(stream, pid, data);
-            }
-        }
-        self.echo_send(box_id, stream, data);
+        let box_state = self.box_of(box_id);
+        self.inner.synthetic.write_sink(
+            pid,
+            tgid_of(pid) as i32,
+            box_state.as_deref(),
+            box_id,
+            stream,
+            data,
+        );
     }
 
-    fn release_jobserver_slip(&self, pid: u32) {
-        let pid = tgid_of(pid) as i32;
-        let _ = crate::slippool::global().lock().unwrap().release(pid);
+    fn release_host_jobserver_slip(&self, pid: u32) {
+        self.inner
+            .synthetic
+            .release_host_jobserver(tgid_of(pid) as i32);
     }
 
     fn release_node(&self, handle: u64) -> Result<(), Errno> {
@@ -2380,7 +2321,7 @@ impl SarunFs {
         };
         let handle = handle.lock().unwrap();
         if matches!(&handle.inner.data, FileData::Sink(_)) {
-            self.note_sink_release(handle.inner.box_id);
+            self.inner.synthetic.sink_released(handle.inner.box_id);
         } else if handle.inner.dirty && !handle.inner.passthrough {
             if let Some(b) = self.box_of(handle.inner.box_id) {
                 let writer_id = if handle.inner.last_tgid != 0 {
@@ -2578,12 +2519,8 @@ impl SarunFs {
                 for p in present { names.insert(p, ()); }
             }
         }
-        for ((bid, projected), _) in self.inner.projections.read().unwrap().iter() {
-            if *bid != b.id { continue; }
-            let (parent, name) = projected.rsplit_once('/')
-                .map(|(parent, name)| (parent, name))
-                .unwrap_or(("", projected.as_str()));
-            if parent == rel { names.insert(name.to_string(), ()); }
+        for name in self.inner.synthetic.projected_children(b.id, rel) {
+            names.insert(name, ());
         }
         let mut out = vec![];
         for name in names.keys() {
@@ -2619,7 +2556,9 @@ impl SarunFs {
         }
         if rel == SyntheticNode::Children.name() {
             return Ok(self
-                .children_of_box(bid)
+                .inner
+                .synthetic
+                .child_ids(&self.inner.boxes.read().unwrap(), bid)
                 .into_iter()
                 .map(|id| DirNode {
                     inode: self.ino_for(&(id, String::new())),
@@ -2765,22 +2704,15 @@ impl Filesystem for SarunFs {
         // caller pid. If the pool is empty we DEFER the reply (block the read)
         // until a release frees one — unless the handle is O_NONBLOCK, in which
         // case the pool denies it with EAGAIN at once.
-        let synthetic = self.inner.handles.get(u64::from(fh));
-        if let Some(nonblock) = synthetic.as_deref().and_then(|handle| match handle {
-            Handle::Jobserver { nonblock } => Some(*nonblock),
-            _ => None,
-        }) {
+        if let Some((_, nonblock)) = self.jobserver_handle(u64::from(fh)) {
             // Key by the process (TGID), so acquire and release agree and the
             // pidfd reaper can watch a real process. A thread's read maps to its
             // owning process.
             let pid = tgid_of(req.pid()) as i32;
             let r = Box::new(SlipReplyData(Some(reply)));
-            let watch = crate::slippool::global().lock().unwrap().acquire(pid, r, nonblock);
-            // Drop the pool lock (above) BEFORE registering the watch — watch may
-            // itself reap (taking the pool lock) if the pid already exited.
-            if let crate::slippool::Watch::Pid(p) = watch {
-                crate::slippool::watch_pid(p);
-            }
+            self.inner
+                .synthetic
+                .acquire_host_jobserver(pid, r, nonblock);
             return;
         }
         let mut buf = vec![0u8; size as usize];
@@ -2794,8 +2726,8 @@ impl Filesystem for SarunFs {
              data: &[u8], _wf: fuser::WriteFlags, _flags: OpenFlags,
              _lo: Option<LockOwner>, reply: ReplyWrite) {
         match self.prepare_write_node(req.pid(), u64::from(fh)) {
-            Ok(WriteTarget::Jobserver) => {
-                self.release_jobserver_slip(req.pid());
+            Ok(WriteTarget::Jobserver { .. }) => {
+                self.release_host_jobserver_slip(req.pid());
                 reply.written(data.len() as u32);
             }
             Ok(WriteTarget::Sink { box_id, stream }) => {
@@ -3371,15 +3303,27 @@ impl virtiofsd::filesystem::FileSystem for SarunFs {
 
     fn read<W: virtiofsd::filesystem::ZeroCopyWriter>(
         &self,
-        _ctx: virtiofsd::filesystem::Context,
+        ctx: virtiofsd::filesystem::Context,
         _inode: u64,
         handle: u64,
-        writer: W,
+        mut writer: W,
         size: u32,
         offset: u64,
         _lock_owner: Option<u64>,
         _flags: u32,
     ) -> std::io::Result<usize> {
+        if size == 0 {
+            return Ok(0);
+        }
+        if let Some((box_id, nonblocking)) = self.jobserver_handle(handle) {
+            let slip = self
+                .inner
+                .synthetic
+                .acquire_guest_jobserver_blocking(box_id, ctx.pid as u32, nonblocking)?;
+            let staging = staging_file()?;
+            staging.write_at(&[slip], 0)?;
+            return writer.read_from_file_at(&staging, 1, 0, None);
+        }
         self.read_file_to(handle, writer, size, offset)
     }
 
@@ -3400,8 +3344,10 @@ impl virtiofsd::filesystem::FileSystem for SarunFs {
             .prepare_write_node(ctx.pid as u32, handle)
             .map_err(virtio_error)?
         {
-            WriteTarget::Jobserver => {
-                self.release_jobserver_slip(ctx.pid as u32);
+            WriteTarget::Jobserver { box_id } => {
+                self.inner
+                    .synthetic
+                    .release_guest_jobserver(box_id, ctx.pid as u32);
                 Ok(size as usize)
             }
             WriteTarget::Sink { box_id, stream } => {
@@ -4165,7 +4111,7 @@ mod chain_tests {
         assert!(!state.kinds.read().unwrap().contains_key("init"));
 
         fs.remove_box(id);
-        assert!(fs.inner.projections.read().unwrap().is_empty());
+        assert_eq!(fs.inner.synthetic.projection_count(), 0);
         let _ = std::fs::remove_dir_all(tmp);
     }
 }
