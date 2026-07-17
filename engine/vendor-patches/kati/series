@@ -63,3 +63,4 @@
 0630-Dispatch-make-recipes-before-expanding-farther-ahead.patch
 0640-Stop-after-draining-parallel-make-failures.patch
 0650-Prefer-more-specific-implicit-make-patterns.patch
+0660-Compose-overlapping-pattern-specific-make-variables.patch

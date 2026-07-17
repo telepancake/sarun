@@ -1,0 +1,151 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Fri, 17 Jul 2026 20:55:10 +0000
+Subject: [PATCH] Compose overlapping pattern-specific make variables
+
+---
+diff --git a/src-rs/dep.rs b/src-rs/dep.rs
+index d93874e..8a0125f 100644
+--- a/src-rs/dep.rs
++++ b/src-rs/dep.rs
+@@ -1116,15 +1116,15 @@ impl<'a> DepBuilder<'a> {
+         output: Symbol,
+         vars: Option<Arc<Vars>>,
+     ) -> Option<Arc<Vars>> {
+-        let Some(mut found) = self.rule_vars.get(&output).cloned() else {
++        let Some(found) = self.rule_vars.get(&output).cloned() else {
+             return vars;
+         };
+         let Some(vars) = vars else {
+             return Some(found.clone());
+         };
+-        let r = Arc::make_mut(&mut found);
+-        r.merge_from(&vars);
+-        Some(found)
++        let merged = Arc::new((*vars).clone());
++        merged.merge_pattern_from(&found);
++        Some(merged)
+     }
+ 
+     /// For a target no rule matched: list each implicit rule whose output
+@@ -1190,9 +1190,9 @@ impl<'a> DepBuilder<'a> {
+             .copied()
+             .filter(|s| s.as_bytes().contains(&b'%'))
+             .collect();
+-        // Keep deterministic order — more-specific (longer non-stem
+-        // portion) first, like GNU make does for pattern-rule selection.
+-        pattern_keys.sort_by_key(|s| std::cmp::Reverse(s.as_bytes().len()));
++        // Apply broad patterns first and more-specific patterns afterward, so
++        // a specific `+=` composes with the inherited broad value.
++        pattern_keys.sort_by_key(|s| s.as_bytes().len());
+         for psym in pattern_keys {
+             let pat = crate::strutil::Pattern::new(psym.as_bytes());
+             if pat.matches(&out_bytes) {
+@@ -1250,7 +1250,6 @@ impl<'a> DepBuilder<'a> {
+                 });
+             }
+             assert!(pattern_rule.output_patterns.len() == 1);
+-            let vars = self.merge_implicit_rule_vars(pattern_rule.output_patterns[0], vars);
+             return Some(PickedRuleInfo {
+                 merger: None,
+                 pattern_rule: Some(pattern_rule),
+@@ -1345,7 +1344,6 @@ impl<'a> DepBuilder<'a> {
+                 });
+             }
+             assert!(pattern_rule.output_patterns.len() == 1);
+-            let vars = self.merge_implicit_rule_vars(pattern_rule.output_patterns[0], vars);
+             return Some(PickedRuleInfo {
+                 merger: None,
+                 pattern_rule: Some(pattern_rule),
+diff --git a/src-rs/var.rs b/src-rs/var.rs
+index 8c01c0b..d4d7fd0 100644
+--- a/src-rs/var.rs
++++ b/src-rs/var.rs
+@@ -113,6 +113,60 @@ fn is_value_empty(v: &Arc<Value>) -> bool {
+ }
+ 
+ impl Variable {
++    /// Overlay a pattern-specific `+=` assignment on a value inherited from a
++    /// less-specific matching pattern.  The evaluator stores each pattern's
++    /// scope independently, so an append parsed in `lib-%.o` cannot see the
++    /// base assignment in `%.o`; composition has to happen when those matching
++    /// scopes are applied to a concrete target.
++    fn append_pattern_assignment(&mut self, rhs: &Variable) -> bool {
++        if rhs.assign_op != Some(AssignOp::PlusEq) {
++            return false;
++        }
++
++        if let (InnerVar::Simple(left), InnerVar::Simple(right)) =
++            (&mut self.value, &rhs.value)
++        {
++            if !left.is_empty() && !right.is_empty() {
++                left.push(b' ');
++            }
++            left.extend_from_slice(right);
++            self.exported |= rhs.exported;
++            self.assign_op = Some(AssignOp::PlusEq);
++            return true;
++        }
++
++        let to_value = |v: &InnerVar| -> Option<(Arc<Value>, Bytes)> {
++            match v {
++                InnerVar::Simple(bytes) => Some((
++                    Arc::new(Value::Literal(None, Bytes::copy_from_slice(bytes))),
++                    Bytes::copy_from_slice(bytes),
++                )),
++                InnerVar::Recursive { v, orig } => Some((v.clone(), orig.clone())),
++                _ => None,
++            }
++        };
++        let Some((left, left_raw)) = to_value(&self.value) else { return false };
++        let Some((right, right_raw)) = to_value(&rhs.value) else { return false };
++        let mut pieces = vec![left];
++        if !left_raw.is_empty() && !right_raw.is_empty() {
++            pieces.push(Arc::new(Value::Literal(None, Bytes::from_static(b" "))));
++        }
++        pieces.push(right);
++        let mut raw = Vec::with_capacity(left_raw.len() + right_raw.len() + 1);
++        raw.extend_from_slice(&left_raw);
++        if !left_raw.is_empty() && !right_raw.is_empty() {
++            raw.push(b' ');
++        }
++        raw.extend_from_slice(&right_raw);
++        self.value = InnerVar::Recursive {
++            v: Arc::new(Value::List(None, pieces)),
++            orig: Bytes::from(raw),
++        };
++        self.exported |= rhs.exported;
++        self.assign_op = Some(AssignOp::PlusEq);
++        true
++    }
++
+     pub fn loc(&self) -> &Option<Loc> {
+         &self.loc
+     }
+@@ -547,6 +601,26 @@ impl Vars {
+             to.insert(*sym, var.clone());
+         }
+     }
++
++    /// Apply a more-specific pattern scope over an accumulated less-specific
++    /// one, preserving `+=` as composition instead of plain replacement.
++    pub fn merge_pattern_from(&self, vars: &Vars) {
++        let incoming: Vec<(Symbol, Var)> = vars
++            .0
++            .lock()
++            .iter()
++            .map(|(sym, var)| (*sym, var.clone()))
++            .collect();
++        for (sym, var) in incoming {
++            let existing = self.0.lock().get(&sym).cloned();
++            if let Some(existing) = existing
++                && existing.write().append_pattern_assignment(&var.read())
++            {
++                continue;
++            }
++            self.0.lock().insert(sym, var);
++        }
++    }
+ }
+ 
+ impl Clone for Vars {

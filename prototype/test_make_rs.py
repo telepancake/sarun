@@ -1221,18 +1221,20 @@ def main():
         (dq / "Makefile").write_text(
             ".PHONY: all left right shared\n"
             "all: left right shared shared\n"
-            "left: shared shared\n\t@printf '%s\\n' left >> result.txt\n"
-            "right: shared\n\t@printf '%s\\n' right >> result.txt\n"
-            "shared:\n\t@printf '%s\\n' shared >> result.txt\n")
+            "left: shared shared\n\t@printf x >> left.ran\n"
+            "right: shared\n\t@printf x >> right.ran\n"
+            "shared:\n\t@printf x >> shared.ran\n")
         r = run_make("MAKE34", dq, "-j10", "all")
         check(r.returncode == 0,
               f"case34: duplicate/shared dependency graph completes under "
               f"-j10 (got {r.returncode}: {(r.stdout+r.stderr)[-500:]})")
         sp34 = latest_sqlar(m)
-        lines = m.sqlar_content(
-            sp34, str((dq / "result.txt").resolve()).lstrip("/"))
-        got = sorted((lines or b"").splitlines())
-        check(got == [b"left", b"right", b"shared"],
+        got = {
+            name: m.sqlar_content(
+                sp34, str((dq / f"{name}.ran").resolve()).lstrip("/"))
+            for name in ("left", "right", "shared")
+        }
+        check(got == {"left": b"x", "right": b"x", "shared": b"x"},
               f"case34: every recipe runs exactly once; got {got!r}")
         # ── CASE 35: recipe expansion is bounded by execution capacity ────
         # GNU expands recipes when they are selected to run. In a -j1 build,
@@ -1283,6 +1285,31 @@ def main():
         check(piobj == b"source\n",
               f"case36: chained %.pi.o was built through existing unit.c; "
               f"got {piobj!r}")
+        # ── CASE 37: overlapping pattern-specific += composes ─────────────
+        # ARM64 Kbuild gives every %.pi.o common objcopy flags, then appends a
+        # section flag for lib-%.pi.o. The independently stored pattern scopes
+        # must compose for the concrete target rather than the specific value
+        # replacing the common prefix-symbol flags.
+        pv = work / "pattern-variable-compose"
+        shutil.rmtree(pv, ignore_errors=True)
+        pv.mkdir(parents=True, exist_ok=True)
+        (pv / "lib-unit.c").write_text("source\n")
+        (pv / "Makefile").write_text(
+            ".PHONY: all\n"
+            "all: lib-unit.pi.o\n"
+            "%.pi.o: FLAGS := common\n"
+            "lib-%.pi.o: FLAGS += specific\n"
+            "%.pi.o: %.o\n\t@printf '%s\\n' '$(FLAGS)' > $@\n"
+            "%.o: %.c\n\t@cp $< $@\n")
+        r = run_make("MAKE37", pv, "-j10", "all")
+        check(r.returncode == 0,
+              f"case37: overlapping pattern-specific variables compose "
+              f"(got {r.returncode}: {(r.stdout+r.stderr)[-500:]})")
+        sp37 = latest_sqlar(m)
+        flags = m.sqlar_content(
+            sp37, str((pv / "lib-unit.pi.o").resolve()).lstrip("/"))
+        check(flags == b"common specific\n",
+              f"case37: specific += retains common pattern value; got {flags!r}")
     finally:
         if eng is not None and eng.poll() is None:
             eng.terminate()

@@ -485,6 +485,11 @@ as executable mappings and mmap that genuinely need a host fd.
           Kbuild's `%.pi.o: %.o` chain beat the generic `%.o: %.S` chain instead
           of inventing a missing `idreg-override.pi.S`. A focused chained-rule
           fixture brings the native aarch64 Make/Brush suite to 36 cases.
+    - [x] Compose target-specific variables from every matching pattern in
+          broad-to-specific order, honoring `+=` across the independent scopes.
+          ARM64 Kbuild's `lib-%.pi.o: OBJCOPYFLAGS += ...` now retains the common
+          `%.pi.o` symbol-prefix flags instead of producing duplicate symbols at
+          final link. The focused fixture brings the suite to 37 cases.
     - [ ] Re-run the complete FUSE Brush build, then the complete QEMU Brush
           build, compare retained artifacts, and record timings/counts here.
 - [x] Remove backend-specific semantic branches and obsolete compatibility
