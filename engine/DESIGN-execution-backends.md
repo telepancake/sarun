@@ -126,11 +126,11 @@ as executable mappings and mmap that genuinely need a host fd.
   - [x] Pass the ring as the fourth ordered registration fd and own its worker
         lifecycle with the box; feed every request through the same virtiofsd
         decoder and scoped `SarunFs` used by FUSE and QEMU.
-  - [ ] Add the freestanding SUD client and split large reads/writes so no
+  - [x] Add the freestanding SUD client and split large reads/writes so no
         request exceeds the negotiated slot payload.
 - [ ] Translate intercepted syscalls and fd operations to canonical FUSE
       requests without resolving paths or applying overlay policy in SUD.
-  - [ ] Implement LOOKUP/GETATTR/OPEN/CREATE/READ/WRITE/FLUSH/RELEASE and a
+  - [x] Implement LOOKUP/GETATTR/OPEN/CREATE/READ/WRITE/FLUSH/RELEASE and a
         virtual-fd table, then directory, link/rename, xattr, statfs, locking,
         sparse/truncate, and executable-mapping operations.
   - [ ] Replace the path-remap and inramfs addins in the production wrapper in

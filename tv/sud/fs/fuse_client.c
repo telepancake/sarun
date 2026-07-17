@@ -104,6 +104,24 @@ int sud_fuse_lookup(uint64_t parent, const char *name,
     return copy_fixed_reply(&call, entry, sizeof(*entry));
 }
 
+long sud_fuse_readlink(uint64_t inode, char *buffer, size_t size)
+{
+    struct fuse_call call;
+    int result = call_begin(&call, FUSE_READLINK, inode, 0);
+    if (result != 0) return result;
+    result = call_submit(&call);
+    long count = result;
+    if (result == 0) {
+        if (call.payload_len > size) count = -ERANGE;
+        else {
+            memcpy(buffer, call.payload, call.payload_len);
+            count = (long)call.payload_len;
+        }
+    }
+    call_end(&call);
+    return count;
+}
+
 int sud_fuse_forget(uint64_t inode, uint64_t count)
 {
     struct fuse_call call;
@@ -257,4 +275,14 @@ int sud_fuse_release(uint64_t inode, uint64_t handle, uint32_t flags)
     result = call_submit(&call);
     call_end(&call);
     return result;
+}
+
+int sud_fuse_setattr(uint64_t inode, const struct fuse_setattr_in *request,
+                     struct fuse_attr_out *attributes)
+{
+    struct fuse_call call;
+    int result = call_begin(&call, FUSE_SETATTR, inode, sizeof(*request));
+    if (result != 0) return result;
+    memcpy(call_input_payload(&call), request, sizeof(*request));
+    return copy_fixed_reply(&call, attributes, sizeof(*attributes));
 }

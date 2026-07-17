@@ -36,6 +36,7 @@ int sud_fs_client_bind(struct sud_fs_ring *ring)
 
 int sud_fs_client_init(void)
 {
+    if (__atomic_load_n(&g_ring, __ATOMIC_ACQUIRE)) return 0;
     void *mapping = raw_mmap(0, sizeof(struct sud_fs_ring),
                              PROT_READ | PROT_WRITE, MAP_SHARED,
                              SUD_FS_RING_FD, 0);
