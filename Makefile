@@ -66,12 +66,19 @@ engine: vendor wire-codegen ## Build the engine (fully-static musl binary; cargo
 	@# wrapper siblings in the release directory.
 	$(MAKE) -C tv sud64 sud32
 	cp tv/sud64 tv/sud32 $(ENGINE_RELEASE)/
+	python3 scripts/release_licenses.py --target $(ENGINE_TARGET) \
+	  --output $(ENGINE_RELEASE)/LICENSES
 	@# The mirror drivers are compiled INTO sarun (multi-call dispatch on
 	@# argv[0] / subcommand — mirrors.rs self-execs); the symlinks are a
 	@# convenience for invoking a driver by name from the build dir.
 	@for d in gitdepot wikimak ietfmak; do \
 	  ln -sf sarun $(ENGINE_RELEASE)/$$d; done
 	@echo "→ ./sarun → $(ENGINE_RELEASE)/sarun"
+
+.PHONY: release-licenses
+release-licenses: vendor ## Regenerate notices beside the current static release
+	python3 scripts/release_licenses.py --target $(ENGINE_TARGET) \
+	  --output $(ENGINE_RELEASE)/LICENSES
 
 .PHONY: swipl
 swipl: ## Build pinned static SWI-Prolog + zlib artifacts (cached outside the repo)

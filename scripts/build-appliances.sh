@@ -80,6 +80,15 @@ build_qemu() {
     mkdir -p "$out/host-$host_arch"
     install -m755 "$qbuild/qemu-system-aarch64" "$out/host-$host_arch/"
     install -m755 "$qbuild/qemu-system-x86_64" "$out/host-$host_arch/"
+    mkdir -p "$out/host-$host_arch/LICENSES"
+    install -m644 "$trees/qemu-$qemu_version/COPYING" \
+        "$out/host-$host_arch/LICENSES/QEMU-GPL-2.0.txt"
+    install -m644 "$trees/qemu-$qemu_version/COPYING.LIB" \
+        "$out/host-$host_arch/LICENSES/QEMU-LGPL-2.1.txt"
+    install -m644 "$trees/qemu-$qemu_version/LICENSE" \
+        "$out/host-$host_arch/LICENSES/QEMU-LICENSE.txt"
+    install -m644 "$trees/qemu-$qemu_version/subprojects/slirp/COPYRIGHT" \
+        "$out/host-$host_arch/LICENSES/libslirp-COPYRIGHT.txt"
     mkdir -p "$out/host-$host_arch/share/qemu"
     install -m644 "$trees/qemu-$qemu_version/pc-bios/bios-microvm.bin" \
         "$trees/qemu-$qemu_version/pc-bios/qboot.rom" \
@@ -108,6 +117,9 @@ build_kernel() {
         mkdir -p "$out/$arch"
         install -m644 "$kbuild/$image" "$out/$arch/kernel"
         install -m644 "$kbuild/.config" "$out/$arch/kernel.config"
+        mkdir -p "$out/$arch/LICENSES"
+        install -m644 "$trees/linux-$linux_version/COPYING" \
+            "$out/$arch/LICENSES/Linux-COPYING.txt"
     done
 }
 
@@ -122,6 +134,8 @@ build_inner() {
             cargo zigbuild --release --target "$target")
         mkdir -p "$out/$arch"
         install -m755 "$repo/engine/target/$target/release/sarun" "$out/$arch/init"
+        python3 "$repo/scripts/release_licenses.py" --target "$target" \
+            --output "$out/$arch/LICENSES"
     done
 }
 

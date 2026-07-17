@@ -283,8 +283,9 @@ as executable mappings and mmap that genuinely need a host fd.
         immediately rerun one named x86_64 brush box and prove both generations
         of captured state share one archive without a host write. This exercises
         the descriptor teardown barrier under cross-architecture TCG as well.
-- [ ] Pass the full appliance suite on aarch64 TCG here, then aarch64 KVM where
-      available, then x86_64 TCG/KVM.
+- [x] Pass the full locally runnable appliance suite on aarch64 TCG and the
+      cross-architecture lifecycle/build suite on x86_64 TCG.
+- [ ] Re-run the same suite with aarch64 and x86_64 KVM where available.
 
 ### 5. Final equivalence and deletion
 
@@ -380,9 +381,9 @@ as executable mappings and mmap that genuinely need a host fd.
 - `/dev/kvm` is absent, so the TCG legs are proven here and both KVM legs remain
   open. Native-SUD real projects/soak/benchmarks also remain open; neither
   external-hardware leg is represented as complete from local smoke tests.
-- `make test-backends` passes live FUSE/QEMU equivalence on aarch64. The first
+- `make test-backends` passes live FUSE/QEMU equivalence on aarch64. The current
   architecture-correct run of the broader historical Python suite collected
-  53 tests and produced 10 pass, 1 skip, 42 fail; most failures are explicit
+  55 tests and produced 12 pass, 1 skip, 42 fail; most failures are explicit
   legacy harness assumptions (`/root` fixtures as uid 501 and default Tap on a
   host whose kernel rejects unprivileged user namespaces), with additional
   stale API/baseline cases. Those are recorded work, not treated as backend
@@ -391,10 +392,11 @@ as executable mappings and mmap that genuinely need a host fd.
   authenticated broker and descriptor-only appliance boundary. It checks the
   persisted parent edge and child archive, not merely a successful boot.
 - A QEMU guest can itself issue `run --qemu`; the request returns to its live
-  host outer runner and launches a flat sibling QEMU process. The focused
-  aarch64 TCG gate records the outer box as parent, relays the child's output
-  and exact result, captures the child's write only in the child archive, and
-  leaves the lower host tree unchanged. It does not execute QEMU in the guest.
+  host outer runner and launches a flat sibling QEMU process. The aarch64 TCG
+  gate records the outer box as parent, relays stdin/EOF and ordered output,
+  returns exact TERM status, captures the child's write only in its archive,
+  waits for a background flat child at outer teardown, and leaves the lower
+  host tree unchanged. It does not execute QEMU in the guest.
 - The same gate runs the aarch64 QEMU lifecycle matrix, including an immediate
   same-name rerun that must observe prior captured state. This regression found
   and now prevents both stale running-box registration and retained frontend-fd
@@ -402,6 +404,13 @@ as executable mappings and mmap that genuinely need a host fd.
 - `make test-backend-workloads` passes every strict real-tool stage on both
   FUSE and aarch64 QEMU/TCG, compares equal backend observations, and proves
   the caller-writable lower trees remain byte-for-byte and metadata unchanged.
+- Normal static-engine and target-init builds now place a deterministic Cargo
+  package/notice inventory plus the pinned SWI-Prolog and zlib notices in an
+  adjacent `LICENSES` directory. Appliance builds also install Linux COPYING,
+  QEMU GPL/LGPL/license guidance, and libslirp copyright beside their cached
+  kernel and host-QEMU artifacts. Vendored workspace license links are
+  dereferenced during assembly, so the notice bundle cannot inherit the old
+  broken `LICENSE -> ../LICENSE` links.
 
 ## Commit gates
 

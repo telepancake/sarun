@@ -759,7 +759,12 @@ belong to the relation.
       stdin/EOF, ordered output-before-result, exact relayed TERM status,
       parent identity, child capture, host non-escape, and teardown of a flat
       child that is still running when the outer command exits.
-- [ ] Copy third-party license notices beside every normal release artifact.
+- [x] Copy third-party notices beside every normal release artifact. Static
+      engine and target-init builds get a deterministic locked Cargo inventory
+      with deduplicated packaged notice texts plus SWI-Prolog/zlib notices;
+      appliance builds add Linux, QEMU, and libslirp notices beside the kernel
+      and host-QEMU artifacts. Vendor assembly dereferences repository-level
+      license links instead of producing broken links in isolated crates.
 
 ### 2. Generic typed FFI — NEXT
 

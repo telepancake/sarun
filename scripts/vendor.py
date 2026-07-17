@@ -26,6 +26,7 @@ ENGINE = os.path.join(REPO, "engine")
 VENDOR = os.path.join(ENGINE, "vendor")
 PATCHES = os.path.join(ENGINE, "vendor-patches")
 CACHE = os.path.join(ENGINE, ".vendor-cache")
+ASSEMBLY_VERSION = "2-dereference-license-symlinks"
 
 
 def sha256(path):
@@ -70,7 +71,8 @@ def fetch_git(url, commit):
 
 
 def stamp_of(name, entry):
-    h = hashlib.sha256(repr(sorted(entry.items())).encode())
+    h = hashlib.sha256(ASSEMBLY_VERSION.encode())
+    h.update(repr(sorted(entry.items())).encode())
     pdir = os.path.join(PATCHES, name)
     for fn in sorted(os.listdir(pdir)):
         h.update(fn.encode())
@@ -95,7 +97,18 @@ def assemble(name, entry, root):
             src = os.path.join(root, fl)
             dst = os.path.join(stage, fl)
             os.makedirs(os.path.dirname(dst), exist_ok=True)
-            shutil.copy2(src, dst, follow_symlinks=False)
+            # Brush and some other workspace crates ship `LICENSE` as a link
+            # to the repository-level notice.  `root` is the selected crate
+            # subdirectory, so preserving that link would create a broken
+            # `../LICENSE` in the independently assembled vendor tree.
+            if os.path.islink(src) and os.path.basename(fl).upper().startswith(
+                    ("LICENSE", "COPYING", "NOTICE", "COPYRIGHT")):
+                resolved = os.path.realpath(src)
+                if not os.path.isfile(resolved):
+                    sys.exit(f"{name}: license link has no target: {src}")
+                shutil.copy2(resolved, dst)
+            else:
+                shutil.copy2(src, dst, follow_symlinks=False)
         for p in series:
             r = subprocess.run(
                 ["git", "apply", "--whitespace=nowarn", os.path.join(pdir, p)],
