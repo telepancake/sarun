@@ -30,6 +30,20 @@ stub alone are not success.
 ./viros.sh debug arm64
 ```
 
+`doctor` checks only native bootstrap programs needed to build QEMU, GDB, and
+Linux (for example `gcc`, `g++`, `make`, Python, flex, bison, and device-tree
+tools). Target cross compilers do not come from the runner OS. `download`
+fetches checksum-pinned Bootlin toolchains for x86-64, ARM, AArch64, both MIPS
+endian variants, and PowerPC. Their host executables are x86-64: an x86-64
+Linux runner executes them directly, while another supported 64-bit Linux
+runner executes the identical archives through the `qemu-x86_64` user
+emulator built by the QEMU stage. This path has been exercised on x86-64 and
+AArch64 hosts. The work directory must be on a case-sensitive filesystem:
+Linux has source files whose names differ only by case, so its published patch
+cannot be represented correctly on a case-insensitive macOS-backed mount.
+`doctor` detects this before a kernel build starts; use a checkout or set
+`VIROS_WORKDIR` to a directory on a case-sensitive volume.
+
 RouterOS defaults to the current stable version returned by MikroTik's
 `LATEST.7` endpoint. A reproducible run can pin it explicitly:
 
@@ -124,9 +138,9 @@ extractor decompresses the bzImage's XZ Linux ELF and recovers its embedded
 newc initramfs and IA32 `/init`. A normal `run x86` boots the official CHR disk
 to its login prompt. The strict debug path directly boots the matching x86-64
 rebuild with that extracted production initramfs and the CHR disk on the
-emulated PIIX IDE controller. On non-x86-64 build hosts this requires an
-`x86_64-linux-gnu-gcc` cross compiler; GCC 11 is preferred when available to
-match the disclosed production toolchain generation.
+emulated PIIX IDE controller. The download stage supplies its x86-64 target
+compiler, and on a non-x86-64 host the build stage runs that compiler through
+its user-mode QEMU adapter.
 
 The ARM32 RouterOS image is linked for a raw load offset of `0x48000`; the
 QEMU build applies that target-specific load adjustment. Its kernel has no

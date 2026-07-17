@@ -22,6 +22,24 @@ PPC_TOOLCHAIN_NAME=${PPC_TOOLCHAIN_NAME:-powerpc-e500mc--glibc--bleeding-edge-20
 PPC_TOOLCHAIN_SHA256=${PPC_TOOLCHAIN_SHA256:-8cab4fbb645be782a6eaeb7b6afd75fda4c0dc8ca9a4095b0be9b6eeb29a9759}
 MMIPS_TOOLCHAIN_NAME=${MMIPS_TOOLCHAIN_NAME:-mips32el--musl--stable-2020.08-1}
 MMIPS_TOOLCHAIN_SHA256=${MMIPS_TOOLCHAIN_SHA256:-02155c88e0bf92f63105803767ce457790bfd920297ef326c9920853b5a3fe20}
+X86_TOOLCHAIN_NAME=${X86_TOOLCHAIN_NAME:-x86-64-core-i7--glibc--bleeding-edge-2020.08-1}
+X86_TOOLCHAIN_SHA256=${X86_TOOLCHAIN_SHA256:-77935109bbd1bdb84813a588b807052823033ed9094131fdd56f558023a3de08}
+ARM_TOOLCHAIN_NAME=${ARM_TOOLCHAIN_NAME:-armv5-eabi--glibc--bleeding-edge-2020.08-1}
+ARM_TOOLCHAIN_SHA256=${ARM_TOOLCHAIN_SHA256:-261e73520fb211f63a88ecce0689d3647acf295527bd6bd16e88e1bd65b3c603}
+AARCH64_TOOLCHAIN_NAME=${AARCH64_TOOLCHAIN_NAME:-aarch64--glibc--bleeding-edge-2020.08-1}
+AARCH64_TOOLCHAIN_SHA256=${AARCH64_TOOLCHAIN_SHA256:-212f3c05f3b2263b0e2f902d055aecc2755eba10c0011927788a38faee8fc9aa}
+MIPSBE_TOOLCHAIN_NAME=${MIPSBE_TOOLCHAIN_NAME:-mips32--glibc--bleeding-edge-2020.08-1}
+MIPSBE_TOOLCHAIN_SHA256=${MIPSBE_TOOLCHAIN_SHA256:-63baffcf0a94d7f1b7421ad61ddb56ce5c05595acd09f482dffe13ddf17efd81}
+PIP_WHEEL_NAME=${PIP_WHEEL_NAME:-pip-26.1.2-py3-none-any.whl}
+PIP_WHEEL_SHA256=${PIP_WHEEL_SHA256:-382ff9f685ee3bc25864f820aa50505825f10f5458ffff07e30a6d96e5715cab}
+SETUPTOOLS_WHEEL_NAME=${SETUPTOOLS_WHEEL_NAME:-setuptools-83.0.0-py3-none-any.whl}
+SETUPTOOLS_WHEEL_SHA256=${SETUPTOOLS_WHEEL_SHA256:-29b23c360f22f414dc7336bb39178cc7bcbf6021ed2733cde173f09dba19abb3}
+PACKAGING_WHEEL_NAME=${PACKAGING_WHEEL_NAME:-packaging-26.0-py3-none-any.whl}
+PACKAGING_WHEEL_SHA256=${PACKAGING_WHEEL_SHA256:-b36f1fef9334a5588b4166f8bcd26a14e521f2b55e6b9de3aaa80d3ff7a37529}
+WHEEL_WHEEL_NAME=${WHEEL_WHEEL_NAME:-wheel-0.46.3-py3-none-any.whl}
+WHEEL_WHEEL_SHA256=${WHEEL_WHEEL_SHA256:-4b399d56c9d9338230118d705d9737a2a468ccca63d5e813e2a4fc7815d8bc4d}
+DTC_COMMIT=${DTC_COMMIT:-b6910bec11614980a21e46fbccc35934b671bd81}
+DTC_SHA256=${DTC_SHA256:-e115f987eec23a1ba25150a46ced1675de3716072d3b4905afb3a9cda0f007c7}
 JOBS=${JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || printf '2')}
 DISK_SIZE=${DISK_SIZE:-64M}
 DEBUG_BOOT_TIMEOUT=${DEBUG_BOOT_TIMEOUT:-30}
@@ -32,6 +50,21 @@ RUN_TARGETS=(x86 arm arm64 mipsbe mmips smips ppc-e500-smp ppc-e500 ppc-440 ppc-
 say() { printf '==> %s\n' "$*"; }
 die() { printf 'viros.sh: %s\n' "$*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || die "required host command not found: $1"; }
+
+workdir_is_case_sensitive() {
+    local check="$BUILD/.case-check-$$"
+    mkdir -p "$check" || return 1
+    : > "$check/probe"
+    if [[ -e "$check/PROBE" ]]; then
+        rm -rf -- "$check"
+        return 1
+    fi
+    rm -rf -- "$check"
+}
+
+host_is_supported() {
+    [[ $(uname -s) == Linux && $(getconf LONG_BIT 2>/dev/null || printf 0) == 64 ]]
+}
 
 usage() {
     cat <<'EOF'
@@ -51,8 +84,8 @@ Information:
   list                  Print accepted run targets and their current status
   doctor                Check host prerequisites
 
-Configuration is via QEMU_VERSION, GDB_VERSION, ROUTEROS_VERSION, JOBS,
-DISK_SIZE, and VIROS_WORKDIR.  All output remains inside VIROS_WORKDIR.
+Configuration is via QEMU_VERSION, GDB_VERSION, ROUTEROS_VERSION, QEMU_PYTHON,
+JOBS, DISK_SIZE, and VIROS_WORKDIR.  All output remains inside VIROS_WORKDIR.
 EOF
 }
 
@@ -66,6 +99,23 @@ download_file() {
     say "Downloading $url"
     curl --fail --location --retry 3 --continue-at - --output "$partial" "$url"
     mv -- "$partial" "$destination"
+}
+
+extract_zip_image() {
+    local archive=$1 destination=$2
+    python3 - "$archive" "$destination" <<'PY'
+import shutil
+import sys
+import zipfile
+
+archive, destination = sys.argv[1:]
+with zipfile.ZipFile(archive) as source:
+    images = [name for name in source.namelist() if name.endswith(".img") and not name.endswith("/")]
+    if len(images) != 1:
+        raise SystemExit(f"expected one .img in {archive}, found {len(images)}")
+    with source.open(images[0]) as src, open(destination, "wb") as dst:
+        shutil.copyfileobj(src, dst)
+PY
 }
 
 resolve_routeros_version() {
@@ -85,10 +135,19 @@ download_stage() {
     download_file "https://download.qemu.org/qemu-${QEMU_VERSION}.tar.xz" "$DOWNLOADS/qemu-${QEMU_VERSION}.tar.xz"
     download_file "https://ftp.gnu.org/gnu/gdb/gdb-${GDB_VERSION}.tar.xz" "$DOWNLOADS/gdb-${GDB_VERSION}.tar.xz"
     download_file "https://cdn.kernel.org/pub/linux/kernel/v5.x/linux-${LINUX_VERSION}.tar.xz" "$DOWNLOADS/linux-${LINUX_VERSION}.tar.xz"
+    download_file "https://files.pythonhosted.org/packages/5d/95/6b5cb3461ea5673ba0995989746db58eb18b91b54dbf331e72f569540946/${PIP_WHEEL_NAME}" "$DOWNLOADS/${PIP_WHEEL_NAME}"
+    download_file "https://files.pythonhosted.org/packages/5d/40/e1e72872c6354b306daef1703549e8e83b4d43cfea356311bf722a043752/${SETUPTOOLS_WHEEL_NAME}" "$DOWNLOADS/${SETUPTOOLS_WHEEL_NAME}"
+    download_file "https://files.pythonhosted.org/packages/b7/b9/c538f279a4e237a006a2c98387d081e9eb060d203d8ed34467cc0f0b9b53/${PACKAGING_WHEEL_NAME}" "$DOWNLOADS/${PACKAGING_WHEEL_NAME}"
+    download_file "https://files.pythonhosted.org/packages/87/22/b76d483683216dde3d67cba61fb2444be8d5be289bf628c13fc0fd90e5f9/${WHEEL_WHEEL_NAME}" "$DOWNLOADS/${WHEEL_WHEEL_NAME}"
+    download_file "https://gitlab.com/qemu-project/dtc/-/archive/${DTC_COMMIT}/dtc-${DTC_COMMIT}.tar.gz" "$DOWNLOADS/dtc-${DTC_COMMIT}.tar.gz"
     # Last upstream release containing TILE-Gx translation.  It is built for
     # linux-user analysis; it is not presented as a full-system emulator.
     download_file "https://download.qemu.org/qemu-${TILE_QEMU_VERSION}.tar.xz" "$DOWNLOADS/qemu-${TILE_QEMU_VERSION}-tile-legacy.tar.xz"
     download_file "https://github.com/tikoci/mikrotik-gpl/archive/${MIKROTIK_GPL_COMMIT}.tar.gz" "$DOWNLOADS/mikrotik-gpl-${MIKROTIK_GPL_COMMIT}.tar.gz"
+    download_file "https://toolchains.bootlin.com/downloads/releases/toolchains/x86-64-core-i7/tarballs/${X86_TOOLCHAIN_NAME}.tar.bz2" "$DOWNLOADS/${X86_TOOLCHAIN_NAME}.tar.bz2"
+    download_file "https://toolchains.bootlin.com/downloads/releases/toolchains/armv5-eabi/tarballs/${ARM_TOOLCHAIN_NAME}.tar.bz2" "$DOWNLOADS/${ARM_TOOLCHAIN_NAME}.tar.bz2"
+    download_file "https://toolchains.bootlin.com/downloads/releases/toolchains/aarch64/tarballs/${AARCH64_TOOLCHAIN_NAME}.tar.bz2" "$DOWNLOADS/${AARCH64_TOOLCHAIN_NAME}.tar.bz2"
+    download_file "https://toolchains.bootlin.com/downloads/releases/toolchains/mips32/tarballs/${MIPSBE_TOOLCHAIN_NAME}.tar.bz2" "$DOWNLOADS/${MIPSBE_TOOLCHAIN_NAME}.tar.bz2"
     download_file "https://toolchains.bootlin.com/downloads/releases/toolchains/powerpc-e500mc/tarballs/${PPC_TOOLCHAIN_NAME}.tar.bz2" "$DOWNLOADS/${PPC_TOOLCHAIN_NAME}.tar.bz2"
     download_file "https://toolchains.bootlin.com/downloads/releases/toolchains/mips32el/tarballs/${MMIPS_TOOLCHAIN_NAME}.tar.bz2" "$DOWNLOADS/${MMIPS_TOOLCHAIN_NAME}.tar.bz2"
     resolve_routeros_version
@@ -115,11 +174,29 @@ unpack_source() {
 }
 
 build_qemu() {
-    local src="$SOURCES/qemu-${QEMU_VERSION}" out="$BUILD/qemu-${QEMU_VERSION}"
+    local src="$SOURCES/qemu-${QEMU_VERSION}" out="$BUILD/qemu-${QEMU_VERSION}" python wheel_file pythonpath=
+    python=${QEMU_PYTHON:-$(command -v python3)}
+    [[ -s "$DOWNLOADS/dtc-${DTC_COMMIT}.tar.gz" ]] || die "QEMU dtc/libfdt source is missing; run download first"
+    verify_file "$DTC_SHA256" "$DOWNLOADS/dtc-${DTC_COMMIT}.tar.gz"
+    unpack_source "$DOWNLOADS/dtc-${DTC_COMMIT}.tar.gz" "$src/subprojects/dtc"
+    local -a python_wheels=(
+        "$PIP_WHEEL_NAME:$PIP_WHEEL_SHA256"
+        "$SETUPTOOLS_WHEEL_NAME:$SETUPTOOLS_WHEEL_SHA256"
+        "$PACKAGING_WHEEL_NAME:$PACKAGING_WHEEL_SHA256"
+        "$WHEEL_WHEEL_NAME:$WHEEL_WHEEL_SHA256"
+    )
+    for wheel_file in "${python_wheels[@]}"; do
+        local wheel_name=${wheel_file%%:*} wheel_sha=${wheel_file#*:}
+        [[ -s "$DOWNLOADS/$wheel_name" ]] || die "pinned Python bootstrap wheel is missing: $wheel_name; run download first"
+        verify_file "$wheel_sha" "$DOWNLOADS/$wheel_name"
+        pythonpath+="${pythonpath:+:}$DOWNLOADS/$wheel_name"
+    done
+    export PYTHONPATH="$pythonpath${PYTHONPATH:+:$PYTHONPATH}"
     unpack_source "$DOWNLOADS/qemu-${QEMU_VERSION}.tar.xz" "$src"
     if [[ ! -f "$src/.routeros-arm-load" ]]; then
-        grep -q '#define KERNEL_LOAD_ADDR 0x00010000' "$src/hw/arm/boot.c" || die "QEMU ARM raw load constant changed; cannot apply RouterOS TEXT_OFFSET fix"
-        sed -i 's/#define KERNEL_LOAD_ADDR 0x00010000/#define KERNEL_LOAD_ADDR 0x00048000/' "$src/hw/arm/boot.c"
+        grep -Eq '^#define KERNEL_LOAD_ADDR[[:space:]]+0x00010000$' "$src/hw/arm/boot.c" ||
+            die "QEMU ARM raw load constant changed; cannot apply RouterOS TEXT_OFFSET fix"
+        sed -i -E 's/^(#define KERNEL_LOAD_ADDR)[[:space:]]+0x00010000$/\1 0x00048000/' "$src/hw/arm/boot.c"
         : > "$src/.routeros-arm-load"
     fi
     if [[ ! -f "$src/.routeros-mips-vm" ]]; then
@@ -137,8 +214,11 @@ build_qemu() {
     mkdir -p "$out" "$TOOLS/qemu"
     say "Configuring QEMU $QEMU_VERSION"
     (cd "$out" && "$src/configure" \
+        --python="$python" \
         --prefix="$TOOLS/qemu" \
         --target-list=x86_64-softmmu,x86_64-linux-user,arm-softmmu,aarch64-softmmu,mips-softmmu,mipsel-softmmu,ppc-softmmu,ppc64-softmmu \
+        --disable-download \
+        -Dfdt=internal \
         --disable-docs --disable-gtk --disable-sdl --disable-vnc \
         --disable-curl --disable-libssh --disable-rbd --disable-glusterfs)
     say "Building QEMU"
@@ -168,21 +248,11 @@ verify_file() {
     [[ "$actual" == "$expected" ]] || die "checksum mismatch for $file: expected $expected, got $actual"
 }
 
-unpack_ppc_toolchain() {
-    local archive="$DOWNLOADS/${PPC_TOOLCHAIN_NAME}.tar.bz2" destination="$TOOLS/cross-powerpc"
-    [[ -s "$archive" ]] || die "PowerPC toolchain is missing; run download first"
-    verify_file "$PPC_TOOLCHAIN_SHA256" "$archive"
-    if [[ ! -f "$destination/.unpacked" ]]; then
-        mkdir -p "$destination"
-        tar -xf "$archive" -C "$destination" --strip-components=1
-        : > "$destination/.unpacked"
-    fi
-}
-
-unpack_mmips_toolchain() {
-    local archive="$DOWNLOADS/${MMIPS_TOOLCHAIN_NAME}.tar.bz2" destination="$TOOLS/cross-mmips"
-    [[ -s "$archive" ]] || die "MMIPS toolchain is missing; run download first"
-    verify_file "$MMIPS_TOOLCHAIN_SHA256" "$archive"
+unpack_toolchain() {
+    local name=$1 expected=$2 key=$3 label=$4
+    local archive="$DOWNLOADS/${name}.tar.bz2" destination="$TOOLS/cross-$key"
+    [[ -s "$archive" ]] || die "$label toolchain is missing; run download first"
+    verify_file "$expected" "$archive"
     if [[ ! -f "$destination/.unpacked" ]]; then
         mkdir -p "$destination"
         tar -xf "$archive" -C "$destination" --strip-components=1
@@ -224,69 +294,58 @@ prepare_mikrotik_kernel_source() {
         die "patched Linux source is incomplete"
 }
 
+X86_CROSS_PREFIX=
+ARM_CROSS_PREFIX=
+AARCH64_CROSS_PREFIX=
+MIPSBE_CROSS_PREFIX=
 PPC_CROSS_PREFIX=
 MMIPS_CROSS_PREFIX=
-setup_ppc_cross() {
-    local real_bin compiler emulator_root wrapper_bin tool compiler_version
-    unpack_ppc_toolchain
-    compiler=$(find "$TOOLS/cross-powerpc" -path '*/bin/powerpc-linux-gcc' -print -quit)
-    [[ -n "$compiler" ]] || die "powerpc-linux-gcc was not found in the Bootlin toolchain"
-    real_bin=$(dirname -- "$compiler")
-    if [[ $(uname -m) == x86_64 ]]; then
-        PPC_CROSS_PREFIX="$real_bin/powerpc-linux-"
-    else
-        [[ -x "$TOOLS/qemu/bin/qemu-x86_64" ]] || die "qemu-x86_64 is required to run the pinned PowerPC compiler on $(uname -m); run build first"
-        emulator_root="$TOOLS/cross-powerpc-emulated/root"
-        wrapper_bin="$TOOLS/cross-powerpc-emulated/bin"
-        mkdir -p "$emulator_root/lib64" "$wrapper_bin"
-        [[ -s "$TOOLS/cross-powerpc/lib/ld-linux-x86-64.so.2" ]] || die "Bootlin x86-64 loader was not found"
-        cp -f -- "$TOOLS/cross-powerpc/lib/ld-linux-x86-64.so.2" "$emulator_root/lib64/ld-linux-x86-64.so.2"
-        chmod +x "$SCRIPT_DIR/emulated-cross-tool"
-        for tool in gcc ld as nm objcopy objdump strip ar ranlib readelf size strings; do
-            ln -sfn "$SCRIPT_DIR/emulated-cross-tool" "$wrapper_bin/powerpc-linux-$tool"
-        done
-        export VIROS_QEMU_X86_64="$TOOLS/qemu/bin/qemu-x86_64"
-        export VIROS_X86_LD_ROOT="$emulator_root"
-        export VIROS_CROSS_REAL_BIN="$real_bin"
-        PPC_CROSS_PREFIX="$wrapper_bin/powerpc-linux-"
-    fi
-    compiler_version=$("$PPC_CROSS_PREFIX"gcc --version)
-    [[ "${compiler_version%%$'\n'*}" == *10.2.0* ]] || die "the pinned PowerPC compiler is not GCC 10.2.0"
-}
 
-setup_mmips_cross() {
-    local real_bin compiler emulator_root wrapper_bin tool
-    local triplet=mipsel-buildroot-linux-musl
-    unpack_mmips_toolchain
-    compiler=$(find "$TOOLS/cross-mmips" -path "*/bin/$triplet-gcc" -print -quit)
-    [[ -n "$compiler" ]] || die "$triplet-gcc was not found in the Bootlin toolchain"
+setup_downloaded_cross() {
+    local name=$1 expected=$2 key=$3 triplet=$4 output_name=$5 gcc_version=$6 label=$7
+    local destination="$TOOLS/cross-$key" real_bin compiler wrapper_bin tool compiler_version cross_prefix x86_loader x86_root
+    unpack_toolchain "$name" "$expected" "$key" "$label"
+    compiler=$(find "$destination" -path "*/bin/$triplet-gcc" -print -quit)
+    [[ -n "$compiler" ]] || die "$triplet-gcc was not found in the pinned $label toolchain"
     real_bin=$(dirname -- "$compiler")
     if [[ $(uname -m) == x86_64 ]]; then
-        MMIPS_CROSS_PREFIX="$real_bin/$triplet-"
+        cross_prefix="$real_bin/$triplet-"
     else
-        [[ -x "$TOOLS/qemu/bin/qemu-x86_64" ]] || die "qemu-x86_64 is required to run the pinned MMIPS compiler on $(uname -m); run build first"
-        # The musl target toolchain's host programs still use glibc.  Reuse
-        # the pinned PowerPC toolchain's x86-64 host runtime under qemu-user.
-        unpack_ppc_toolchain
-        emulator_root="$TOOLS/cross-mmips-emulated/root"
-        wrapper_bin="$TOOLS/cross-mmips-emulated/bin"
-        mkdir -p "$emulator_root/lib64" "$wrapper_bin/gcc-tools"
-        [[ -s "$TOOLS/cross-powerpc/lib/ld-linux-x86-64.so.2" ]] || die "Bootlin x86-64 loader was not found"
-        cp -a -- "$TOOLS/cross-powerpc/lib/." "$emulator_root/lib64/"
+        [[ -x "$TOOLS/qemu/bin/qemu-x86_64" ]] ||
+            die "qemu-x86_64 is required to run the pinned $label compiler on $(uname -m); build QEMU first"
+        # Bootlin's compiler programs are x86-64, but non-x86 target sysroots
+        # naturally contain only their target loaders.  The pinned x86
+        # toolchain provides one common x86-64 glibc runtime for every adapter.
+        unpack_toolchain "$X86_TOOLCHAIN_NAME" "$X86_TOOLCHAIN_SHA256" x86 x86-64
+        x86_loader=$(find "$TOOLS/cross-x86" -path '*/sysroot/lib/ld-linux-x86-64.so.2' -print -quit)
+        [[ -n "$x86_loader" ]] || die "the pinned x86-64 toolchain has no host runtime loader"
+        x86_root=${x86_loader%/lib/ld-linux-x86-64.so.2}
+        wrapper_bin="$TOOLS/cross-$key-emulated/bin"
+        mkdir -p "$wrapper_bin/gcc-tools"
         chmod +x "$SCRIPT_DIR/emulated-cross-tool"
         for tool in gcc ld as nm objcopy objdump strip ar ranlib readelf size strings; do
             ln -sfn "$SCRIPT_DIR/emulated-cross-tool" "$wrapper_bin/$triplet-$tool"
         done
-        # GCC reports this path to Kbuild and collect2 executes it directly;
-        # keeping it separate avoids double-wrapping GCC's assembler child.
+        # GCC reports this path to Kbuild and collect2 executes it directly.
         ln -sfn "$SCRIPT_DIR/emulated-cross-tool" "$wrapper_bin/gcc-tools/ld"
         export VIROS_QEMU_X86_64="$TOOLS/qemu/bin/qemu-x86_64"
-        export VIROS_X86_LD_ROOT="$emulator_root"
+        export VIROS_X86_LD_ROOT="$x86_root"
         export VIROS_CROSS_REAL_BIN="$real_bin"
         export VIROS_CROSS_TRIPLET="$triplet"
-        MMIPS_CROSS_PREFIX="$wrapper_bin/$triplet-"
+        cross_prefix="$wrapper_bin/$triplet-"
     fi
+    compiler_version=$("${cross_prefix}gcc" --version)
+    [[ "${compiler_version%%$'\n'*}" == *"$gcc_version"* ]] ||
+        die "the pinned $label compiler is not GCC $gcc_version: ${compiler_version%%$'\n'*}"
+    printf -v "$output_name" '%s' "$cross_prefix"
 }
+
+setup_x86_cross() { setup_downloaded_cross "$X86_TOOLCHAIN_NAME" "$X86_TOOLCHAIN_SHA256" x86 x86_64-buildroot-linux-gnu X86_CROSS_PREFIX 10.2.0 x86-64; }
+setup_arm_cross() { setup_downloaded_cross "$ARM_TOOLCHAIN_NAME" "$ARM_TOOLCHAIN_SHA256" arm arm-buildroot-linux-gnueabi ARM_CROSS_PREFIX 10.2.0 ARM; }
+setup_aarch64_cross() { setup_downloaded_cross "$AARCH64_TOOLCHAIN_NAME" "$AARCH64_TOOLCHAIN_SHA256" aarch64 aarch64-buildroot-linux-gnu AARCH64_CROSS_PREFIX 10.2.0 AArch64; }
+setup_mipsbe_cross() { setup_downloaded_cross "$MIPSBE_TOOLCHAIN_NAME" "$MIPSBE_TOOLCHAIN_SHA256" mipsbe mips-buildroot-linux-gnu MIPSBE_CROSS_PREFIX 10.2.0 MIPSBE; }
+setup_ppc_cross() { setup_downloaded_cross "$PPC_TOOLCHAIN_NAME" "$PPC_TOOLCHAIN_SHA256" powerpc powerpc-linux PPC_CROSS_PREFIX 10.2.0 PowerPC; }
+setup_mmips_cross() { setup_downloaded_cross "$MMIPS_TOOLCHAIN_NAME" "$MMIPS_TOOLCHAIN_SHA256" mmips mipsel-buildroot-linux-musl MMIPS_CROSS_PREFIX 9.3.0 MMIPS; }
 
 find_kernel_config() {
     local candidate
@@ -300,12 +359,15 @@ find_kernel_config() {
 }
 
 build_debug_kernel() {
-    local target=${1:-} src out config arch prefix= cc= image= obj raw compiler_version
+    local target=${1:-} src out config arch prefix= image= obj raw compiler_version
     local -a targets
+    host_is_supported || die "debug-kernel build requires a 64-bit Linux host"
     case "$target" in
         x86|arm|arm64|mipsbe|mmips|smips|ppc-e500-smp|ppc-e500|ppc-440) ;;
         *) die "no validated matching debug-kernel boot for $target" ;;
     esac
+    workdir_is_case_sensitive ||
+        die "Linux debug kernels require a case-sensitive VIROS_WORKDIR; $WORKDIR is case-insensitive"
     need flex; need bison; need bc; need perl
     prepare_mikrotik_kernel_source
     src=$(mikrotik_kernel_source)
@@ -314,48 +376,25 @@ build_debug_kernel() {
         x86)
             arch=x86_64
             config=$(find_kernel_config x86_64.config)
-            if [[ $(uname -m) == x86_64 ]]; then
-                prefix=
-                if command -v gcc-11 >/dev/null 2>&1; then cc=gcc-11; else cc=gcc; fi
-            elif command -v x86_64-linux-gnu-gcc-11 >/dev/null 2>&1; then
-                prefix=x86_64-linux-gnu-; cc=x86_64-linux-gnu-gcc-11
-            elif command -v x86_64-linux-gnu-gcc >/dev/null 2>&1; then
-                prefix=x86_64-linux-gnu-
-            else
-                die "an x86-64 cross compiler is required off x86-64 (x86_64-linux-gnu-gcc)"
-            fi
+            setup_x86_cross; prefix=$X86_CROSS_PREFIX
             image=bzImage
             ;;
         arm)
             arch=arm
             config=$(find_kernel_config arm.config)
-            if command -v arm-linux-gnueabi-gcc-11 >/dev/null 2>&1; then
-                prefix=arm-linux-gnueabi-; cc=arm-linux-gnueabi-gcc-11
-            elif command -v arm-linux-gnueabi-gcc >/dev/null 2>&1; then
-                prefix=arm-linux-gnueabi-
-            else
-                die "an ARM EABI cross compiler is required (arm-linux-gnueabi-gcc)"
-            fi
+            setup_arm_cross; prefix=$ARM_CROSS_PREFIX
             image=zImage
             ;;
         arm64)
             arch=arm64
             config=$(find_kernel_config arm64.config aarch64.config)
-            if [[ $(uname -m) == aarch64 ]]; then
-                prefix=
-            elif command -v aarch64-linux-gnu-gcc >/dev/null 2>&1; then
-                prefix=aarch64-linux-gnu-
-            else
-                die "an AArch64 cross compiler is required (aarch64-linux-gnu-gcc)"
-            fi
+            setup_aarch64_cross; prefix=$AARCH64_CROSS_PREFIX
             image=Image
             ;;
         mipsbe)
             arch=mips
             config=$(find_kernel_config mips.config)
-            command -v mips-linux-gnu-gcc >/dev/null 2>&1 ||
-                die "a big-endian MIPS cross compiler is required (mips-linux-gnu-gcc)"
-            prefix=mips-linux-gnu-
+            setup_mipsbe_cross; prefix=$MIPSBE_CROSS_PREFIX
             ;;
         mmips)
             arch=mips
@@ -365,9 +404,7 @@ build_debug_kernel() {
         smips)
             arch=mips
             config=$(find_kernel_config smips.config)
-            command -v mips-linux-gnu-gcc >/dev/null 2>&1 ||
-                die "a big-endian MIPS cross compiler is required (mips-linux-gnu-gcc)"
-            prefix=mips-linux-gnu-
+            setup_mipsbe_cross; prefix=$MIPSBE_CROSS_PREFIX
             ;;
         ppc-e500-smp)
             arch=powerpc; config=$(find_kernel_config e500-smp.config)
@@ -397,7 +434,6 @@ build_debug_kernel() {
             --enable DEBUG_INFO_DWARF4 --enable KALLSYMS --enable KALLSYMS_ALL --enable IKCONFIG
     fi
     local make_args=( -C "$src" O="$out" ARCH="$arch" CROSS_COMPILE="$prefix" )
-    [[ -n "$cc" ]] && make_args+=( CC="$cc" )
     say "Building patched Linux $LINUX_VERSION for $target with MikroTik's published config"
     make "${make_args[@]}" olddefconfig
     targets=(vmlinux scripts_gdb)
@@ -438,9 +474,7 @@ build_debug_kernel() {
         printf 'gpl_commit  %s\n' "$MIKROTIK_GPL_COMMIT"
         sha256sum "$DOWNLOADS/linux-${LINUX_VERSION}.tar.xz" \
             "$SOURCES/mikrotik-gpl/2025-03-19/linux-${LINUX_VERSION}.patch" "$config"
-        if [[ -n "$cc" ]]; then
-            compiler_version=$("$cc" --version)
-        elif [[ -n "$prefix" ]]; then
+        if [[ -n "$prefix" ]]; then
             compiler_version=$("$prefix"gcc --version)
         else
             compiler_version=$(gcc --version)
@@ -490,6 +524,7 @@ build_mikrotik_tile_kvm() {
 }
 
 build_stage() {
+    host_is_supported || die "build requires a 64-bit Linux host"
     need make; need tar; need python3; need gcc; need g++; need pkg-config; need sha256sum
     [[ -s "$DOWNLOADS/qemu-${QEMU_VERSION}.tar.xz" ]] || die "run download first"
     build_qemu
@@ -583,8 +618,7 @@ prepare_one() {
         version=$(routeros_version)
         zip="$DOWNLOADS/chr-${version}.img.zip"
         if [[ -s "$zip" ]]; then
-            need unzip
-            unzip -p "$zip" > "$IMAGES/chr-${version}.img"
+            extract_zip_image "$zip" "$IMAGES/chr-${version}.img"
         fi
     fi
 }
@@ -1068,8 +1102,8 @@ EOF
 }
 
 doctor_stage() {
-    local failed=0 command
-    for command in bash curl python3 tar xz make gcc g++ pkg-config ninja mkfs.ext2 truncate unzip sha256sum flex bison bc perl dtc sed patch; do
+    local failed=0 command host_bits name python
+    for command in bash curl python3 tar xz make gcc g++ pkg-config ninja mkfs.ext2 truncate sha256sum flex bison bc perl dtc sed patch; do
         if command -v "$command" >/dev/null 2>&1; then
             printf 'ok       %s\n' "$command"
         else
@@ -1077,30 +1111,34 @@ doctor_stage() {
             failed=1
         fi
     done
-    if command -v arm-linux-gnueabi-gcc-11 >/dev/null 2>&1 || command -v arm-linux-gnueabi-gcc >/dev/null 2>&1; then
-        printf 'ok       %s\n' 'ARM EABI cross compiler'
+    python=${QEMU_PYTHON:-$(command -v python3 2>/dev/null || true)}
+    if [[ -n "$python" ]] && "$python" -c 'import sys, venv; assert sys.version_info >= (3, 10)' >/dev/null 2>&1; then
+        printf 'ok       %s\n' "Python >= 3.10 with venv module ($python)"
     else
-        printf 'missing  %s\n' 'arm-linux-gnueabi-gcc (needed for ARM debug kernel)'
+        printf 'missing  %s\n' "Python >= 3.10 with venv module (set QEMU_PYTHON or install the host python3-venv package)"
         failed=1
     fi
-    if [[ $(uname -m) == aarch64 ]] || command -v aarch64-linux-gnu-gcc >/dev/null 2>&1; then
-        printf 'ok       %s\n' 'AArch64 kernel compiler'
+    host_bits=$(getconf LONG_BIT 2>/dev/null || printf 0)
+    if [[ $(uname -s) == Linux && "$host_bits" == 64 ]]; then
+        printf 'ok       64-bit Linux/%s build host\n' "$(uname -m)"
     else
-        printf 'missing  %s\n' 'aarch64-linux-gnu-gcc (needed off AArch64)'
+        printf 'missing  supported 64-bit Linux build host (found %s-bit %s/%s)\n' "$host_bits" "$(uname -s)" "$(uname -m)"
         failed=1
     fi
-    if [[ $(uname -m) == x86_64 ]] || command -v x86_64-linux-gnu-gcc-11 >/dev/null 2>&1 || command -v x86_64-linux-gnu-gcc >/dev/null 2>&1; then
-        printf 'ok       %s\n' 'x86-64 kernel compiler'
+    if workdir_is_case_sensitive; then
+        printf 'ok       case-sensitive VIROS_WORKDIR\n'
     else
-        printf 'missing  %s\n' 'x86_64-linux-gnu-gcc (needed for x86 debug kernel off x86-64)'
+        printf 'missing  case-sensitive VIROS_WORKDIR (required by the Linux source tree; found %s)\n' "$WORKDIR"
         failed=1
     fi
-    if command -v mips-linux-gnu-gcc >/dev/null 2>&1; then
-        printf 'ok       %s\n' 'big-endian MIPS cross compiler'
-    else
-        printf 'missing  %s\n' 'mips-linux-gnu-gcc (needed for MIPSBE/SMIPS debug kernels)'
-        failed=1
-    fi
+    for name in "$X86_TOOLCHAIN_NAME" "$ARM_TOOLCHAIN_NAME" "$AARCH64_TOOLCHAIN_NAME" \
+        "$MIPSBE_TOOLCHAIN_NAME" "$MMIPS_TOOLCHAIN_NAME" "$PPC_TOOLCHAIN_NAME"; do
+        if [[ -s "$DOWNLOADS/$name.tar.bz2" ]]; then
+            printf 'ready    %s\n' "$name"
+        else
+            printf 'download %s (supplied by ./viros.sh download)\n' "$name"
+        fi
+    done
     return "$failed"
 }
 
