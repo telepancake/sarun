@@ -1456,6 +1456,54 @@ def main():
               f"case42: C/C++/assembler recipes share GNU's compile/output "
               f"variables; object={None if obj is None else len(obj)} "
               f"dep={dep!r} relations={relations!r}")
+        # ── CASE 43: legacy backquotes preserve escaped backslashes ─────────
+        # Libtool's config.status uses this standard double-eval idiom to quote
+        # command templates before emitting the executable libtool script.
+        # Within legacy backquotes, \\ becomes one backslash. Keeping both made
+        # Brush's inner eval fail and stripped every escaped quote from OpenWrt
+        # xz's generated libtool, whose later recipes then could not be parsed.
+        # This reduced real fragment reparses the generated assignment.
+        bq = work / "backquote-libtool"
+        shutil.rmtree(bq, ignore_errors=True)
+        bq.mkdir(parents=True, exist_ok=True)
+        probe = bq / "probe.sh"
+        probe.write_text(r'''#!/bin/sh
+sed_quote_subst='s/\(["`\$\\]\)/\\\1/g'
+double_quote_subst='s/\(["`\\]\)/\\\1/g'
+delay_variable_subst='s/\\\\\\\$/\\\$/g'
+ECHO='printf %s\n'
+SED=sed
+archive_expsym_cmds='echo "{ global:" > x~ echo "local: *; };" >> x'
+var=archive_expsym_cmds
+case `eval \\$ECHO \\""\\$$var"\\"` in
+*[\\\`\"\$]*)
+  eval "lt_$var=\\\"\`\$ECHO \"\$$var\" | \$SED -e \"\$double_quote_subst\" -e \"\$sed_quote_subst\" -e \"\$delay_variable_subst\"\`\\\""
+  ;;
+*)
+  eval "lt_$var=\\\"\$$var\\\""
+  ;;
+esac
+printf 'archive_expsym_cmds=%s\n' "$lt_archive_expsym_cmds" > generated.sh
+sh -n generated.sh
+printf preserved > result.txt
+'''.replace("`", chr(96)))
+        probe.chmod(0o755)
+        (bq / "Makefile").write_text(
+            "all:\n\t@./probe.sh\n")
+        r = run_make("MAKE43", bq, "-j10", "all")
+        check(r.returncode == 0,
+              f"case43: libtool double-eval fragment preserves syntax "
+              f"(got {r.returncode}: {(r.stdout+r.stderr)[-700:]})")
+        sp43 = latest_sqlar(m)
+        generated = m.sqlar_content(
+            sp43, str((bq / "generated.sh").resolve()).lstrip("/"))
+        preserved = m.sqlar_content(
+            sp43, str((bq / "result.txt").resolve()).lstrip("/"))
+        check(generated is not None and b"global:" in generated
+              and b"\\\\" in generated
+              and preserved == b"preserved",
+              f"case43: generated command retains quote escapes and reparses; "
+              f"generated={generated!r} result={preserved!r}")
     finally:
         if eng is not None and eng.poll() is None:
             eng.terminate()

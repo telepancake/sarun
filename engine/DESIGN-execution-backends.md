@@ -535,8 +535,15 @@ as executable mappings and mmap that genuinely need a host fd.
           `OUTPUT_OPTION` relations, and its suffix rules use those same
           definitions. Case 42 performs the exact dependency-producing
           `$(COMPILE.c) $(DEPFLAGS) $(OUTPUT_OPTION) $<` recipe that zstd uses;
-          the complete native-aarch64 Make/Brush suite passes. The next boundary
-          is resuming the clean `world` build past zstd.
+          the complete native-aarch64 Make/Brush suite passes. A fresh `world`
+          run then advanced for 7m40s through the parallel host-tool wave before
+          xz exposed a Brush legacy-backquote bug: `\\` inside backquotes was
+          incorrectly retained as two backslashes, so libtool's standard
+          config.status double-eval lost the escaped quotes in its generated
+          script. The parser now performs the POSIX two-to-one reduction. Its
+          focused parser test and the real libtool fragment in Make/Brush case
+          43 both pass; the generated assignment retains escapes and reparses.
+          The next boundary is resuming the clean `world` build past xz.
     - [x] Complete the native-aarch64 FUSE Brush gate from a clean output tree.
           Linux 6.18 builds 823 objects with `-j10` (11 observed overlapping
           clang processes), takes 162 s wall / 143 s compile, and records 2,797

@@ -1,0 +1,41 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Fri, 17 Jul 2026 23:22:37 +0000
+Subject: [PATCH] Honor escaped backslashes in legacy command substitutions
+
+POSIX legacy backquotes remove a backslash that escapes another backslash. Preserve the resulting single backslash in the command text so standard libtool double-eval quoting survives configure and config.status.
+
+---
+diff --git a/src/word.rs b/src/word.rs
+index 6413cb4..5544b3d 100644
+--- a/src/word.rs
++++ b/src/word.rs
+@@ -1083,7 +1083,7 @@ peg::parser! {
+ 
+         rule backquoted_char() -> &'input str =
+             "\\`" { "`" } /
+-            "\\\\" { "\\\\" } /
++            "\\\\" { "\\" } /
+             s:$([^'`']) { s }
+ 
+         rule arithmetic_expansion() -> WordPiece =
+@@ -1306,6 +1306,19 @@ mod tests {
+         Ok(())
+     }
+ 
++    #[test]
++    fn backquoted_command_removes_backslash_escaping_backslash() -> Result<()> {
++        let parsed = super::parse(r"`eval \\$ECHO`", &ParserOptions::default())?;
++        assert_matches!(
++            &parsed[..],
++            [WordPieceWithSource {
++                piece: WordPiece::BackquotedCommandSubstitution(command),
++                ..
++            }] if command == r"eval \$ECHO"
++        );
++        Ok(())
++    }
++
+     #[test]
+     fn parse_extglob_with_embedded_parameter() -> Result<()> {
+         assert_ron_snapshot!(test_parse("+([$var])")?);

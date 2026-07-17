@@ -1,1 +1,2 @@
 0010-brush-de-workspace-vendored-crate-manifests-for-standalone-p.patch
+0020-Honor-escaped-backslashes-in-legacy-command-substitutions.patch
