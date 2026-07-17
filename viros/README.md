@@ -39,7 +39,8 @@ bootstrap and the Python-enabled GDB build both use that interpreter and
 project-local environments populated from pinned wheels. GDB's GMP and MPFR
 prerequisites are likewise built from checksum-pinned source archives below
 the work directory, so their development headers need not be installed on the
-runner.
+runner. The legacy QEMU 5.2 TILE translator is also forced to use this managed
+interpreter with its bundled Meson rather than discovering a host `python3`.
 
 Target cross compilers do not come from the runner OS either. `download`
 fetches checksum-pinned Bootlin toolchains for x86-64, ARM, AArch64, both MIPS

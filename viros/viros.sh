@@ -611,11 +611,16 @@ build_debug_kernel() {
 }
 
 build_tile_linux_user() {
-    local src="$SOURCES/qemu-${TILE_QEMU_VERSION}-tile-legacy" out="$BUILD/qemu-${TILE_QEMU_VERSION}-tile-legacy"
+    local src="$SOURCES/qemu-${TILE_QEMU_VERSION}-tile-legacy"
+    local out="$BUILD/qemu-${TILE_QEMU_VERSION}-tile-legacy-python-${UV_PYTHON_VERSION}" python
+    setup_build_python
+    python=$BUILD_PYTHON
     unpack_source "$DOWNLOADS/qemu-${TILE_QEMU_VERSION}-tile-legacy.tar.xz" "$src"
     mkdir -p "$out" "$TOOLS/tile-legacy"
     say "Configuring legacy TILE-Gx linux-user translator"
-    (cd "$out" && "$src/configure" --prefix="$TOOLS/tile-legacy" \
+    (cd "$out" && env -u PYTHONPATH PYTHONNOUSERSITE=1 \
+        "$src/configure" --python="$python" --meson=internal \
+        --prefix="$TOOLS/tile-legacy" \
         --target-list=tilegx-linux-user --disable-system --disable-docs \
         --disable-gtk --disable-sdl --disable-vnc)
     make -C "$out" -j "$JOBS"
