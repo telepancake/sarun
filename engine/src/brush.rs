@@ -2627,8 +2627,6 @@ impl brush_core::commands::ExecInterposer<brush_core::extensions::DefaultShellEx
             // though they share one OS process.
             static SNOOP_PID: AtomicU32 = AtomicU32::new(0x4000_0000);
             let synth = SNOOP_PID.fetch_add(1, Ordering::Relaxed);
-            sub.set_snoop_identity(snoop.dollar0, snoop.positional, synth);
-
             // Mode by invocation name. The cloned subshell was built in the box's
             // POSIX sh_mode; `bash …` wants the extended dialect (`[[ ]]`, arrays,
             // bash keywords). `build_box_shell` varies ONLY `sh_mode` between its
@@ -2640,6 +2638,13 @@ impl brush_core::commands::ExecInterposer<brush_core::extensions::DefaultShellEx
             if snoop.bash_mode {
                 sub.options_mut().sh_mode = false;
             }
+
+            sub.set_snoop_identity(
+                snoop.dollar0,
+                snoop.positional,
+                synth,
+                snoop.bash_mode,
+            );
 
             // Replay simple set-flags (-e/-u/-x…) via `set`, like run_brush_script.
             if !snoop.set_flags.is_empty() {

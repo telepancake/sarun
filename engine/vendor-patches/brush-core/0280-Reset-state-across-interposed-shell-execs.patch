@@ -1,0 +1,88 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Sat, 18 Jul 2026 17:59:55 +0000
+Subject: [PATCH] Reset state across interposed shell execs
+
+A snooped script replaces a fork+exec, not a subshell. Rebuild its environment from exported values, initialize fresh well-known variables including default IFS, import only explicitly exported functions in bash mode, and clear aliases and interpreter-local bookkeeping. This prevents caller-local state such as OpenWrt rstrip.sh's IFS=: from corrupting a child's word splitting.
+
+---
+diff --git a/src/shell.rs b/src/shell.rs
+index 4773c97..7b56649 100644
+--- a/src/shell.rs
++++ b/src/shell.rs
+@@ -311,7 +311,63 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
+         dollar0: String,
+         positional: Vec<String>,
+         synth: u32,
++        import_exported_functions: bool,
+     ) {
++        // The exec interposer starts a fresh interpreter, not a POSIX
++        // subshell. Reproduce the environment boundary that fork+exec would
++        // have provided: only exported, set variables cross it, and they
++        // arrive as plain strings. In particular, a shell must initialize IFS
++        // itself instead of inheriting the caller's shell-local IFS. OpenWrt's
++        // rstrip.sh sets IFS=: and then invokes strip-kmod.sh; leaking that IFS
++        // made the child's unquoted $ARGS one argument and corrupted every
++        // objcopy invocation.
++        let exported_vars: Vec<(String, String)> = self
++            .env
++            .iter_exported()
++            .filter(|(_, var)| var.value().is_set())
++            .map(|(name, var)| {
++                (
++                    name.clone(),
++                    var.value().to_cow_str(self).into_owned(),
++                )
++            })
++            .collect();
++        self.env = ShellEnvironment::new();
++        for (name, value) in exported_vars {
++            let mut var = crate::variables::ShellVariable::new(
++                crate::variables::ShellValue::String(value),
++            );
++            var.export();
++            let _ = self.env.set_global(name, var);
++        }
++
++        // Functions cross an exec boundary only through bash's exported
++        // function environment encoding. A POSIX sh/dash child imports none;
++        // a bash child imports only registrations explicitly marked exported.
++        let exported_funcs = if import_exported_functions {
++            self.funcs
++                .iter()
++                .filter(|(_, registration)| registration.is_exported())
++                .map(|(name, registration)| (name.clone(), registration.clone()))
++                .collect()
++        } else {
++            Vec::new()
++        };
++        self.funcs = crate::functions::FunctionEnv::default();
++        for (name, registration) in exported_funcs {
++            self.funcs.update(name, registration);
++        }
++
++        // Aliases and command/path bookkeeping are interpreter-local. Keeping
++        // them on an in-process exec would make the optimization observably
++        // different from launching the same script normally.
++        self.aliases.clear();
++        self.directory_stack.clear();
++        self.program_location_cache = crate::pathcache::PathCache::default();
++        self.last_exit_status = 0;
++        self.last_exit_status_change_count = 0;
++        self.last_pipeline_statuses.clear();
++
+         // This clone is standing in for a fresh interpreter process, not a
+         // POSIX subshell. It must not inherit the caller's script/function
+         // frames: current_shell_args() gives those frames precedence over
+@@ -323,6 +379,11 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
+         self.name = Some(dollar0);
+         self.args = positional;
+         self.synthetic_pid = Some(synth);
++
++        // Recreate the variables a newly initialized interpreter owns. This
++        // deliberately overwrites hostile/shell-local inherited values such as
++        // IFS, while retaining ordinary exported inputs such as PATH and CC.
++        let _ = crate::wellknownvars::init_well_known_vars(self);
+         // BASHPID is a stored global (set once to the real pid at init); update
+         // it so the snooped script's `$BASHPID` matches its synthetic `$$`.
+         let mut bashpid = crate::variables::ShellVariable::new(

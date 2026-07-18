@@ -91,7 +91,8 @@ def main():
                                     "/root/neg.txt", "/root/f.txt",
                                     "/root/bash.txt", "/root/shbad.txt",
                                     "/root/dashdash.txt", "/root/producer.sh",
-                                    "/root/pipeline-count.txt")]
+                                    "/root/pipeline-count.txt",
+                                    "/root/fresh-exec.txt")]
     for h in host_paths: h.unlink(missing_ok=True)
     try:
         eng = subprocess.Popen([str(BIN), "serve"],
@@ -376,6 +377,30 @@ chmod +x /root/producer.sh
         check(count == b"220000\n",
               f"case12: downstream stage consumed every producer byte; "
               f"count={count!r}")
+
+        # CASE 13: an interposed script is an exec boundary, not a subshell.
+        # OpenWrt's rstrip.sh sets IFS=: around a read loop and invokes
+        # strip-kmod.sh from inside it. A real interpreter resets IFS and sees
+        # only exported variables. Leaking the caller's shell state made the
+        # child's unquoted `$ARGS` a single objcopy argument such as
+        # "-x -G __this_module", corrupting every kernel-module strip.
+        fresh_script = r'''X=secret
+export Y=visible
+IFS=:
+/bin/sh -c 'ARGS="-x -G sym"; set -- $ARGS; printf "%s|%s|%s|%s|%s\n" "$#" "$1" "$2" "${X-unset}" "${Y-unset}"' > /root/fresh-exec.txt
+'''
+        r = subprocess.run(
+            [str(BIN), "run", "-b", "FRESHEXEC", "--",
+             "sh", "-c", fresh_script],
+            capture_output=True, text=True, timeout=120)
+        check(r.returncode == 0,
+              f"case13: nested interpreter boundary exits 0 "
+              f"(got {r.returncode}: {r.stderr[-500:]})")
+        sp13 = latest_sqlar(m)
+        fresh = m.sqlar_content(sp13, "root/fresh-exec.txt")
+        check(fresh == b"3|-x|-G|unset|visible\n",
+              "case13: fresh interpreter resets IFS, hides unexported X, "
+              f"and imports exported Y (content={fresh!r})")
 
         # ── CASE 4 (negative): non-brush box ───────────────────────────────
         # No -b → no shadow binds, no SARUN_BRUSH_SH. The nested /bin/sh is the

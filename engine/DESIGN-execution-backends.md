@@ -931,8 +931,26 @@ as executable mappings and mmap that genuinely need a host fd.
           Kati units, the static aarch64 build, and all 66 Make/Brush cases pass.
           A clean rebuild of the actual OpenWrt Lua package through Brush also
           compiles and installs `lua5.1`, `luac5.1`, headers, manuals, pkg-config
-          metadata, symlinks, and the host-package stamp. The next gate is
-          resuming `world -j10` in the preserved box with these fixes.
+          metadata, symlinks, and the host-package stamp. The resumed
+          `world -j10` crossed Lua and the repaired fakeroot stage, packaged the
+          target C runtime, and held the repaired kernel replay near 130 seconds
+          (versus 2,373 seconds before the build-edge indexes). Kernel-module
+          packaging then exposed a separate interposed-exec semantic leak:
+          OpenWrt's `rstrip.sh` sets `IFS=:` inside its read-loop subshell and
+          invokes `strip-kmod.sh` as a fresh interpreter. The in-process shebang
+          optimization had cloned the caller's whole shell state, so the child
+          passed its unquoted `$ARGS` to `objcopy` as one space-containing
+          argument; its following unconditional `exit 0` hid the failed strip.
+          A snooped interpreter now recreates a real exec boundary: only set,
+          exported variables cross as strings; well-known variables including
+          default IFS are initialized afresh; POSIX shells import no functions
+          while bash imports only explicitly exported functions; and aliases,
+          directory stack, path cache, and status bookkeeping are cleared. The
+          exact regression observes three split arguments, hidden unexported X,
+          and preserved exported Y. All thirteen nested-shell integration cases,
+          vendor reconstruction, and the static aarch64 build pass. The tainted
+          module packages from the interrupted run must be cleaned and rebuilt
+          before the complete `world -j10` gate resumes.
           Earlier nonfatal empty-operand arithmetic and generated-config `sed`
           diagnostics stay recorded for attribution rather than normalization.
     - [x] Complete the native-aarch64 FUSE Brush gate from a clean output tree.
