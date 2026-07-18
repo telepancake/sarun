@@ -1,0 +1,72 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Sat, 18 Jul 2026 16:45:00 +0000
+Subject: [PATCH] Accept tabs after make function names
+
+GNU make accepts any whitespace between a function name and its first
+argument. Linux uses a tab in `$(shell<TAB> \\` inside a multiline eval
+recipe. Treating only a literal space as the separator misclassifies the
+whole reference as a variable and leaves the outer closing parenthesis as a
+shell command.
+
+---
+diff --git a/src-rs/expr.rs b/src-rs/expr.rs
+index 81709d7..a7390f8 100644
+--- a/src-rs/expr.rs
++++ b/src-rs/expr.rs
+@@ -445,7 +445,7 @@ fn parse_dollar(
+         ));
+     };
+
+-    let mut terms = vec![cp, b':', b' '];
++    let mut terms = vec![cp, b':', b' ', b'\t', b'\n', b'\r', b'\x0b', b'\x0c'];
+     let mut i = 2;
+     loop {
+         let (n, vname) =
+@@ -471,7 +471,7 @@ fn parse_dollar(
+             return Ok((i + 1, Arc::new(Value::VarRef(start_loc, vname))));
+         }
+
+-        if t.first() == Some(&b' ') || t.first() == Some(&b'\\') {
++        if t.first().is_some_and(u8::is_ascii_whitespace) || t.first() == Some(&b'\\') {
+             // ${func ...}
+             if let Value::Literal(_, lit) = &*vname {
+                 if let Some(fi) = get_func_info(lit) {
+@@ -491,7 +491,7 @@ fn parse_dollar(
+                 }
+             }
+
+-            // Not a function. Drop ' ' from |terms| and parse it
++            // Not a function. Drop whitespace from |terms| and parse it
+             // again. This is inefficient, but this code path should be
+             // rarely used.
+             terms.truncate(2);
+@@ -861,6 +861,25 @@ mod tests {
+                     ))],
+                 })
+             )
+         );
++        let (n, parsed) = parse_dollar(
++            &mut Loc::default(),
++            Bytes::from_static(b"$(shell\tprintf yes)"),
++            false,
++            true,
++        )
++        .unwrap();
++        assert_eq!(n, 19);
++        let Value::Func { fi, args, .. } = parsed.as_ref() else {
++            panic!("tab-separated make function parsed as {parsed:?}");
++        };
++        assert_eq!(fi.name, b"shell");
++        assert_eq!(
++            args,
++            &[Arc::new(Value::Literal(
++                None,
++                Bytes::from_static(b"printf yes")
++            ))]
++        );
+     }
+ 
+     #[test]
+-- 
+2.43.0

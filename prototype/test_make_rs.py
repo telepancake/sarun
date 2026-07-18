@@ -2047,6 +2047,43 @@ fi
         check(rm_result == b"removed" and victim is None,
               f"case59: $(RM) removes the requested file; "
               f"result={rm_result!r} victim={victim!r}")
+        # ── CASE 60: tabs delimit make function names ───────────────
+        # Linux's arm64 stack-protector preparation uses a tab between
+        # `shell` and its multiline argument. GNU accepts all whitespace here;
+        # parsing only a literal space leaves the outer ')' as a shell recipe.
+        tabfn = work / "tab-separated-make-function"
+        shutil.rmtree(tabfn, ignore_errors=True)
+        tabfn.mkdir(parents=True)
+        (tabfn / "Makefile").write_text(
+            ".PHONY: all prepare stack_protector_prepare prepare0\n"
+            "ifeq ($(CONFIG_STACKPROTECTOR_PER_TASK),y)\n"
+            "prepare: stack_protector_prepare\n"
+            "stack_protector_prepare: prepare0 offsets.h\n"
+            "\t$(eval KBUILD_CFLAGS += -mstack-protector-guard=sysreg\t\t  \\\n"
+            "\t\t\t\t-mstack-protector-guard-reg=sp_el0\t  \\\n"
+            "\t\t\t\t-mstack-protector-guard-offset=$(shell\t  \\\n"
+            "\t\t\tawk '{if ($$2 == \"TSK_STACK_CANARY\") print $$3;}' \\\n"
+            "\t\t\t\t\toffsets.h))\n"
+            "endif\n"
+            "prepare0:\n"
+            "offsets.h:\n"
+            "\t@printf 'x TSK_STACK_CANARY 1224\\n' > $@\n"
+            "all: prepare\n"
+            "\t@printf '%s\\n' '$(KBUILD_CFLAGS)' > result.txt\n")
+        r = run_make("MAKE60", tabfn, "-j10",
+                     "CONFIG_STACKPROTECTOR_PER_TASK=y", "all")
+        check(r.returncode == 0,
+              f"case60: tab-delimited multiline make function completes "
+              f"(got {r.returncode}: {(r.stdout+r.stderr)[-700:]})")
+        sp60 = latest_sqlar(m)
+        tab_result = m.sqlar_content(
+            sp60, str((tabfn / "result.txt").resolve()).lstrip("/"))
+        check(tab_result ==
+              b"-mstack-protector-guard=sysreg "
+              b"-mstack-protector-guard-reg=sp_el0 "
+              b"-mstack-protector-guard-offset=1224\n",
+              f"case60: eval consumes the recipe and appends the shell result; "
+              f"got {tab_result!r}")
     finally:
         if eng is not None and eng.poll() is None:
             eng.terminate()

@@ -79,3 +79,4 @@
 0790-Honor-implicit-pattern-cancellations.patch
 0800-Propagate-make-stdin-into-embedded-recipes.patch
 0810-Provide-GNU-default-RM-variable.patch
+0820-Accept-tabs-after-make-function-names.patch

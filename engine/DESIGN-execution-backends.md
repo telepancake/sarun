@@ -804,8 +804,19 @@ as executable mappings and mmap that genuinely need a host fd.
           the toolchain specs, and created both `.built` and
           `.gcc_final_installed`. An independent Brush box executed the installed
           OpenWrt GCC 14.3.0 C++ driver and compiled a C++20 translation unit into
-          a 64-bit AArch64 ELF relocatable object. The remaining `world` graph is
-          the next real gate.
+          a 64-bit AArch64 ELF relocatable object. Resuming `world` for 1,571
+          seconds extracted and patched Linux 6.12.94, installed its UAPI
+          headers, generated both AArch64 and compat32 syscall tables, and
+          reached the target kernel compile. ARM64's stack-protector setup uses
+          a tab between the make function name and argument in a multiline
+          `$(shell ...)`; Kati scanned that tab into the variable name and left
+          the outer `)` as a recipe. Function-name scanning now treats every
+          ASCII whitespace byte as GNU make does. The exact multiline Linux
+          shape is Make/Brush case 60; the Kati unit, vendor reproduction,
+          static aarch64 build, and all 60 Make/Brush cases pass. The preserved
+          real Linux tree now completes `ARCH=arm64 stack_protector_prepare`
+          with the eval consumed as make syntax. The next real gate is the
+          parallel `target/linux/compile` continuation, followed by `world`.
           Earlier nonfatal empty-operand arithmetic and generated-config `sed`
           diagnostics stay recorded for attribution rather than normalization.
     - [x] Complete the native-aarch64 FUSE Brush gate from a clean output tree.
