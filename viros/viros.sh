@@ -146,12 +146,16 @@ run_case_sensitive_workspace() {
         --dir "$mount/build" \
         --dir "$mount/artifacts" \
         --dir "$mount/images" \
+        --dir "$mount/tmp" \
         "${retained_bind[@]}" \
         --bind "$export_path" "$export_path" \
         --setenv VIROS_WORKDIR "$mount" \
         --setenv VIROS_ORIGINAL_WORKDIR "$WORKDIR" \
         --setenv VIROS_KBUILD_TMPFS_ACTIVE 1 \
         --setenv VIROS_KBUILD_EXPORT "$export_path" \
+        --setenv TMPDIR "$mount/tmp" \
+        --setenv TMP "$mount/tmp" \
+        --setenv TEMP "$mount/tmp" \
         "${retained_environment[@]}" \
         "$@"; then
         status=0

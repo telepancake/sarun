@@ -63,7 +63,9 @@ case-sensitive tmpfs at an existing path below `VIROS_WORKDIR/build`, unpacks
 the already-downloaded pinned Linux source and published MikroTik source update there,
 and copies the finished output and provenance back below `VIROS_WORKDIR`.
 Nothing is placed in system `/tmp`, and the mount disappears with the build
-process. The retained `build/kernel-TARGET` tree includes generated headers,
+process. GNU make and compiler temporary files use a `tmp` directory inside
+that mount through `TMPDIR`, `TMP`, and `TEMP`. The retained
+`build/kernel-TARGET` tree includes generated headers,
 scripts, `.config`, `vmlinux`, and a `.viros-case-kbuild` identity record. The
 `vmlinux-gdb.py` loader and everything it imports are retained as regular files,
 so GDB does not depend on the expired source mount. Before copying the output,

@@ -66,6 +66,7 @@ class CaseKbuildTests(unittest.TestCase):
             }
             env = os.environ.copy()
             tmpfs = None
+            directories = []
             index = 0
             while index < len(args) and args[index].startswith("--"):
                 option = args[index]
@@ -75,7 +76,11 @@ class CaseKbuildTests(unittest.TestCase):
                     env[values[0]] = values[1]
                 elif option == "--tmpfs":
                     tmpfs = Path(values[0])
+                elif option == "--dir":
+                    directories.append(Path(values[0]))
                 index += count + 1
+            for directory in directories:
+                directory.mkdir(parents=True, exist_ok=True)
             result = subprocess.run(args[index:], env=env, check=False)
             # A real mount discards tmpfs contents before bwrap exits.
             if tmpfs is not None and tmpfs.is_dir():
@@ -101,7 +106,14 @@ class CaseKbuildTests(unittest.TestCase):
                 r"""
                 mkdir -p "$WORKDIR/export"
                 run_case_sensitive_workspace fixture "$WORKDIR/export" \
-                    /bin/sh -c 'printf retained > "$VIROS_KBUILD_EXPORT/result"; printf transient > "$VIROS_WORKDIR/transient"'
+                    /bin/sh -c '
+                        test "$TMPDIR" = "$VIROS_WORKDIR/tmp"
+                        test "$TMP" = "$VIROS_WORKDIR/tmp"
+                        test "$TEMP" = "$VIROS_WORKDIR/tmp"
+                        printf retained > "$VIROS_KBUILD_EXPORT/result"
+                        printf transient > "$VIROS_WORKDIR/transient"
+                        printf temporary > "$TMPDIR/compiler-temporary"
+                    '
                 test "$(cat "$WORKDIR/export/result")" = retained
                 test ! -e "$BUILD/.case-kbuild-fixture"
                 """,
@@ -116,7 +128,9 @@ class CaseKbuildTests(unittest.TestCase):
             self.assertIn(str(work / "build" / ".case-kbuild-fixture"), arguments)
             self.assertIn(str(retained), arguments)
             self.assertIn("VIROS_KBUILD_RETAINED", arguments)
-            self.assertNotIn("/tmp", arguments)
+            self.assertIn("TMPDIR", arguments)
+            self.assertIn(str(work / "build/.case-kbuild-fixture/tmp"), arguments)
+            self.assertNotIn("/tmp", arguments.splitlines())
 
     def test_case_insensitive_build_routes_before_source_or_toolchain_setup(self):
         with tempfile.TemporaryDirectory(prefix="case-route-", dir=PROJECT) as raw:
