@@ -18,6 +18,8 @@ GMP_VERSION=${GMP_VERSION:-6.3.0}
 GMP_SHA256=${GMP_SHA256:-a3c2b80201b89e68616f4ad30bc66aee4927c3ce50e33929ca819d5c43538898}
 MPFR_VERSION=${MPFR_VERSION:-4.2.2}
 MPFR_SHA256=${MPFR_SHA256:-b67ba0383ef7e8a8563734e2e889ef5ec3c3b898a01d00fa0a6869ad81c6ce01}
+EXPAT_VERSION=${EXPAT_VERSION:-2.8.2}
+EXPAT_SHA256=${EXPAT_SHA256:-3ad89b8588e6644bd4e49981480d48b21289eebbcd4f0a1a4afb1c29f99b6ab4}
 TILE_QEMU_VERSION=${TILE_QEMU_VERSION:-5.2.0}
 LINUX_VERSION=${LINUX_VERSION:-5.6.3}
 OPENWRT_VERSION=${OPENWRT_VERSION:-25.12.5}
@@ -25,6 +27,12 @@ OPENWRT_TARGET=${OPENWRT_TARGET:-malta/le}
 OPENWRT_KERNEL_SHA256=${OPENWRT_KERNEL_SHA256:-a2aec5d5bd31d411511fd799f936ea0c3d9a878dbc4b2729c600d3f3953931ca}
 OPENWRT_KERNEL_DEBUG_SHA256=${OPENWRT_KERNEL_DEBUG_SHA256:-0eacea705607b84062c84c205be4161e0111db2a56c0849806948c9e570bdc65}
 OPENWRT_ROOTFS_SHA256=${OPENWRT_ROOTFS_SHA256:-d28b07e52b21844ae29bdea48cec8e92ac70a8b0397a0bcc488ef7169f3f194d}
+OPENWRT_ARM_KERNEL_SHA256=${OPENWRT_ARM_KERNEL_SHA256:-25a94f7622b70f059a7ac79d3d9ac09dac64e86b838d4e83395e385919632859}
+OPENWRT_ARM_KERNEL_DEBUG_SHA256=${OPENWRT_ARM_KERNEL_DEBUG_SHA256:-34053d3e767954c644e75f6aaf8ea7601fcb79b587365c39c4aa930c08abb4ca}
+OPENWRT_ARM_ROOTFS_SHA256=${OPENWRT_ARM_ROOTFS_SHA256:-2b78ac4bcabcc7056a238d0f56b3f35dd73d635c9827dee80746b4f43e1c6111}
+OPENWRT_ARM64_KERNEL_SHA256=${OPENWRT_ARM64_KERNEL_SHA256:-f510b0c73c1ee70a64df384d7e2ad4404caf83e6bc7cce9ac13426f77b9ae3be}
+OPENWRT_ARM64_KERNEL_DEBUG_SHA256=${OPENWRT_ARM64_KERNEL_DEBUG_SHA256:-86f9f440fa980335b66935e85aed757442745290e2588b5e0202b2efc9b83592}
+OPENWRT_ARM64_ROOTFS_SHA256=${OPENWRT_ARM64_ROOTFS_SHA256:-2aaddba935ea4e6ad300bfc9946c4d944e2693af6246251e528ed8e27133e962}
 ZSTD_VERSION=${ZSTD_VERSION:-1.5.7}
 ZSTD_SHA256=${ZSTD_SHA256:-eb33e51f49a15e023950cd7825ca74a4a2b43db8354825ac24fc1b7ee09e6fa3}
 ROUTEROS_VERSION=${ROUTEROS_VERSION:-latest}
@@ -61,7 +69,7 @@ DISK_SIZE=${DISK_SIZE:-64M}
 DEBUG_BOOT_TIMEOUT=${DEBUG_BOOT_TIMEOUT:-30}
 
 ARCHES=(x86 arm arm64 mipsbe mmips smips ppc tile)
-RUN_TARGETS=(x86 arm arm64 mipsbe mmips smips ppc-e500-smp ppc-e500 ppc-440 ppc-83xx tile openwrt-malta-le)
+RUN_TARGETS=(x86 arm arm64 mipsbe mmips smips ppc-e500-smp ppc-e500 ppc-440 ppc-83xx tile openwrt-malta-le openwrt-arm openwrt-arm64)
 
 say() { printf '==> %s\n' "$*"; }
 die() { printf 'viros.sh: %s\n' "$*" >&2; exit 1; }
@@ -176,6 +184,8 @@ download_stage() {
     download_file "https://ftp.gnu.org/gnu/gdb/gdb-${GDB_VERSION}.tar.xz" "$DOWNLOADS/gdb-${GDB_VERSION}.tar.xz"
     download_file "https://ftp.gnu.org/gnu/gmp/gmp-${GMP_VERSION}.tar.xz" "$DOWNLOADS/gmp-${GMP_VERSION}.tar.xz"
     download_file "https://ftp.gnu.org/gnu/mpfr/mpfr-${MPFR_VERSION}.tar.xz" "$DOWNLOADS/mpfr-${MPFR_VERSION}.tar.xz"
+    download_file "https://github.com/libexpat/libexpat/releases/download/R_${EXPAT_VERSION//./_}/expat-${EXPAT_VERSION}.tar.xz" \
+        "$DOWNLOADS/expat-${EXPAT_VERSION}.tar.xz"
     download_file "https://cdn.kernel.org/pub/linux/kernel/v5.x/linux-${LINUX_VERSION}.tar.xz" "$DOWNLOADS/linux-${LINUX_VERSION}.tar.xz"
     download_file "https://github.com/facebook/zstd/releases/download/v${ZSTD_VERSION}/zstd-${ZSTD_VERSION}.tar.gz" "$DOWNLOADS/zstd-${ZSTD_VERSION}.tar.gz"
     download_file "https://files.pythonhosted.org/packages/5d/95/6b5cb3461ea5673ba0995989746db58eb18b91b54dbf331e72f569540946/${PIP_WHEEL_NAME}" "$DOWNLOADS/${PIP_WHEEL_NAME}"
@@ -200,6 +210,20 @@ download_stage() {
         "$DOWNLOADS/openwrt-${OPENWRT_VERSION}-malta-le-kernel-debug.tar.zst"
     download_file "$openwrt_base/openwrt-${OPENWRT_VERSION}-malta-le-default-rootfs.tar.gz" \
         "$DOWNLOADS/openwrt-${OPENWRT_VERSION}-malta-le-default-rootfs.tar.gz"
+    local openwrt_arm_base="https://downloads.openwrt.org/releases/${OPENWRT_VERSION}/targets/armsr/armv7"
+    download_file "$openwrt_arm_base/openwrt-${OPENWRT_VERSION}-armsr-armv7-generic-initramfs-kernel.bin" \
+        "$DOWNLOADS/openwrt-${OPENWRT_VERSION}-armsr-armv7-generic-initramfs-kernel.bin"
+    download_file "$openwrt_arm_base/kernel-debug.tar.zst" \
+        "$DOWNLOADS/openwrt-${OPENWRT_VERSION}-armsr-armv7-kernel-debug.tar.zst"
+    download_file "$openwrt_arm_base/openwrt-${OPENWRT_VERSION}-armsr-armv7-generic-targz-rootfs.tar.gz" \
+        "$DOWNLOADS/openwrt-${OPENWRT_VERSION}-armsr-armv7-generic-targz-rootfs.tar.gz"
+    local openwrt_arm64_base="https://downloads.openwrt.org/releases/${OPENWRT_VERSION}/targets/armsr/armv8"
+    download_file "$openwrt_arm64_base/openwrt-${OPENWRT_VERSION}-armsr-armv8-generic-initramfs-kernel.bin" \
+        "$DOWNLOADS/openwrt-${OPENWRT_VERSION}-armsr-armv8-generic-initramfs-kernel.bin"
+    download_file "$openwrt_arm64_base/kernel-debug.tar.zst" \
+        "$DOWNLOADS/openwrt-${OPENWRT_VERSION}-armsr-armv8-kernel-debug.tar.zst"
+    download_file "$openwrt_arm64_base/openwrt-${OPENWRT_VERSION}-armsr-armv8-generic-targz-rootfs.tar.gz" \
+        "$DOWNLOADS/openwrt-${OPENWRT_VERSION}-armsr-armv8-generic-targz-rootfs.tar.gz"
     download_managed_python
     resolve_routeros_version
     local arch suffix name
@@ -321,11 +345,32 @@ build_mpfr() {
     make -C "$out" install
 }
 
+build_expat() {
+    local archive="$DOWNLOADS/expat-${EXPAT_VERSION}.tar.xz"
+    local src="$SOURCES/expat-${EXPAT_VERSION}" out="$BUILD/expat-${EXPAT_VERSION}"
+    local prefix="$TOOLS/expat-${EXPAT_VERSION}"
+    [[ -s "$archive" ]] || die "Expat source is missing; run download first"
+    verify_file "$EXPAT_SHA256" "$archive"
+    if [[ -s "$prefix/include/expat.h" && -s "$prefix/lib/libexpat.a" ]]; then
+        return
+    fi
+    unpack_source "$archive" "$src"
+    mkdir -p "$out" "$prefix"
+    say "Building project-local Expat $EXPAT_VERSION for GDB target descriptions"
+    (cd "$out" && CFLAGS="${CFLAGS:--O2} -std=gnu17" \
+        "$src/configure" --prefix="$prefix" --disable-shared --enable-static \
+        --without-xmlwf --without-examples --without-tests --without-docbook)
+    make -C "$out" -j "$JOBS"
+    make -C "$out" install
+}
+
 build_gdb() {
     local src="$SOURCES/gdb-${GDB_VERSION}"
-    local out="$BUILD/gdb-${GDB_VERSION}-python-${UV_PYTHON_VERSION}-localdeps" python python_prefix
+    local out="$BUILD/gdb-${GDB_VERSION}-python-${UV_PYTHON_VERSION}-localdeps-expat" python python_prefix
     local gmp_prefix="$TOOLS/gmp-${GMP_VERSION}" mpfr_prefix="$TOOLS/mpfr-${MPFR_VERSION}"
+    local expat_prefix="$TOOLS/expat-${EXPAT_VERSION}"
     build_mpfr
+    build_expat
     unpack_source "$DOWNLOADS/gdb-${GDB_VERSION}.tar.xz" "$src"
     mkdir -p "$out" "$TOOLS/gdb"
     python=$(managed_python)
@@ -334,6 +379,7 @@ build_gdb() {
     (cd "$out" && LDFLAGS="-L$python_prefix/lib -Wl,-rpath,$python_prefix/lib${LDFLAGS:+ $LDFLAGS}" "$src/configure" \
         --prefix="$TOOLS/gdb" --enable-targets=all --with-python="$python" \
         --with-gmp="$gmp_prefix" --with-mpfr="$mpfr_prefix" \
+        --with-expat --with-libexpat-prefix="$expat_prefix" --with-libexpat-type=static \
         --disable-binutils --disable-gas --disable-gold --disable-gprof \
         --disable-ld --disable-sim)
     say "Building GDB"
@@ -795,19 +841,53 @@ create_disk() {
 }
 
 prepare_openwrt() {
-    local directory="$ARTIFACTS/openwrt-malta-le"
+    local target=${1:-openwrt-malta-le}
+    local profile kernel_name label kernel_sha debug_sha rootfs_sha
+    case "$target" in
+        openwrt-malta-le)
+            profile=malta-le
+            kernel_name="openwrt-${OPENWRT_VERSION}-malta-le-vmlinux-initramfs.elf"
+            label=Malta/le
+            kernel_sha=$OPENWRT_KERNEL_SHA256
+            debug_sha=$OPENWRT_KERNEL_DEBUG_SHA256
+            rootfs_sha=$OPENWRT_ROOTFS_SHA256
+            ;;
+        openwrt-arm)
+            profile=armsr-armv7
+            kernel_name="openwrt-${OPENWRT_VERSION}-armsr-armv7-generic-initramfs-kernel.bin"
+            label=armsr/armv7
+            kernel_sha=$OPENWRT_ARM_KERNEL_SHA256
+            debug_sha=$OPENWRT_ARM_KERNEL_DEBUG_SHA256
+            rootfs_sha=$OPENWRT_ARM_ROOTFS_SHA256
+            ;;
+        openwrt-arm64)
+            profile=armsr-armv8
+            kernel_name="openwrt-${OPENWRT_VERSION}-armsr-armv8-generic-initramfs-kernel.bin"
+            label=armsr/armv8
+            kernel_sha=$OPENWRT_ARM64_KERNEL_SHA256
+            debug_sha=$OPENWRT_ARM64_KERNEL_DEBUG_SHA256
+            rootfs_sha=$OPENWRT_ARM64_ROOTFS_SHA256
+            ;;
+        *) die "unknown OpenWrt target: $target" ;;
+    esac
+    local directory="$ARTIFACTS/$target"
     local rootfs="$directory/rootfs-${OPENWRT_VERSION}"
-    local debug_source="$SOURCES/openwrt-${OPENWRT_VERSION}-malta-le-kernel-debug"
-    local kernel_archive="$DOWNLOADS/openwrt-${OPENWRT_VERSION}-malta-le-vmlinux-initramfs.elf"
-    local debug_archive="$DOWNLOADS/openwrt-${OPENWRT_VERSION}-malta-le-kernel-debug.tar.zst"
-    local rootfs_archive="$DOWNLOADS/openwrt-${OPENWRT_VERSION}-malta-le-default-rootfs.tar.gz"
+    local debug_source="$SOURCES/openwrt-${OPENWRT_VERSION}-${profile}-kernel-debug"
+    local kernel_archive="$DOWNLOADS/$kernel_name"
+    local debug_archive="$DOWNLOADS/openwrt-${OPENWRT_VERSION}-${profile}-kernel-debug.tar.zst"
+    local rootfs_archive
+    if [[ "$target" == openwrt-malta-le ]]; then
+        rootfs_archive="$DOWNLOADS/openwrt-${OPENWRT_VERSION}-malta-le-default-rootfs.tar.gz"
+    else
+        rootfs_archive="$DOWNLOADS/openwrt-${OPENWRT_VERSION}-${profile}-generic-targz-rootfs.tar.gz"
+    fi
     local zstd="$TOOLS/zstd/bin/zstd"
 
     [[ -s "$kernel_archive" && -s "$debug_archive" && -s "$rootfs_archive" ]] ||
-        die "OpenWrt $OPENWRT_VERSION Malta files are missing; run download"
-    verify_file "$OPENWRT_KERNEL_SHA256" "$kernel_archive"
-    verify_file "$OPENWRT_KERNEL_DEBUG_SHA256" "$debug_archive"
-    verify_file "$OPENWRT_ROOTFS_SHA256" "$rootfs_archive"
+        die "OpenWrt $OPENWRT_VERSION $label files are missing; run download"
+    verify_file "$kernel_sha" "$kernel_archive"
+    verify_file "$debug_sha" "$debug_archive"
+    verify_file "$rootfs_sha" "$rootfs_archive"
     [[ -x "$zstd" ]] || build_zstd
 
     mkdir -p "$directory" "$debug_source" "$rootfs"
@@ -823,15 +903,15 @@ prepare_openwrt() {
             die "OpenWrt rootfs did not contain /sbin/procd"
         : > "$rootfs/.unpacked"
     fi
-    cp -f -- "$kernel_archive" "$directory/kernel-${OPENWRT_VERSION}.elf"
+    cp -f -- "$kernel_archive" "$directory/kernel-${OPENWRT_VERSION}"
     cp -f -- "$debug_source/debug/vmlinux" "$directory/vmlinux-${OPENWRT_VERSION}.debug"
-    say "Prepared OpenWrt $OPENWRT_VERSION Malta/le with matching kernel DWARF and rootfs"
+    say "Prepared OpenWrt $OPENWRT_VERSION $label with matching kernel DWARF and rootfs"
 }
 
 prepare_one() {
     local target=$1 arch
-    if [[ "$target" == openwrt-malta-le ]]; then
-        prepare_openwrt
+    if [[ "$target" == openwrt-malta-le || "$target" == openwrt-arm || "$target" == openwrt-arm64 ]]; then
+        prepare_openwrt "$target"
         return
     fi
     arch=$(base_arch "$target")
@@ -953,12 +1033,32 @@ run_stage() {
     case "$target" in
         openwrt-malta-le)
             qemu=$(qemu_binary qemu-system-mipsel)
-            kernel="$ARTIFACTS/openwrt-malta-le/kernel-${OPENWRT_VERSION}.elf"
+            kernel="$ARTIFACTS/openwrt-malta-le/kernel-${OPENWRT_VERSION}"
             [[ -s "$kernel" ]] || die "OpenWrt Malta kernel is missing; run prepare openwrt-malta-le"
             exec "$qemu" -M malta -cpu 24Kc -smp 1 -m 256M \
                 -display none -monitor none -serial stdio -parallel none \
                 -no-reboot -no-shutdown -nodefaults -kernel "$kernel" \
                 -append 'mem=256M console=ttyS0,115200 loglevel=8 ignore_loglevel' \
+                -nic none "$@"
+            ;;
+        openwrt-arm)
+            qemu=$(qemu_binary qemu-system-arm)
+            kernel="$ARTIFACTS/openwrt-arm/kernel-${OPENWRT_VERSION}"
+            [[ -s "$kernel" ]] || die "OpenWrt ARMv7 kernel is missing; run prepare openwrt-arm"
+            exec "$qemu" -M virt -cpu cortex-a15 -smp 1 -m 512M \
+                -display none -monitor none -serial stdio -no-reboot -no-shutdown \
+                -kernel "$kernel" \
+                -append 'console=ttyAMA0,115200 earlycon=pl011,0x09000000 loglevel=8 ignore_loglevel nokaslr' \
+                -nic none "$@"
+            ;;
+        openwrt-arm64)
+            qemu=$(qemu_binary qemu-system-aarch64)
+            kernel="$ARTIFACTS/openwrt-arm64/kernel-${OPENWRT_VERSION}"
+            [[ -s "$kernel" ]] || die "OpenWrt AArch64 kernel is missing; run prepare openwrt-arm64"
+            exec "$qemu" -M virt -cpu cortex-a57 -smp 2 -m 512M \
+                -display none -monitor none -serial stdio -no-reboot -no-shutdown \
+                -kernel "$kernel" \
+                -append 'console=ttyAMA0,115200 earlycon=pl011,0x09000000 loglevel=8 ignore_loglevel nokaslr' \
                 -nic none "$@"
             ;;
         x86)
@@ -1056,13 +1156,13 @@ gdb_stage() {
     fi
     remote=$2
     case "$target" in
-        x86|arm|arm64|mipsbe|mmips|smips|ppc-e500-smp|ppc-e500|ppc-440|openwrt-malta-le) ;;
+        x86|arm|arm64|mipsbe|mmips|smips|ppc-e500-smp|ppc-e500|ppc-440|openwrt-malta-le|openwrt-arm|openwrt-arm64) ;;
         *) die "no validated matching debug kernel for $target" ;;
     esac
     gdb="$TOOLS/gdb/bin/gdb"
-    if [[ "$target" == openwrt-malta-le ]]; then
-        prepare_openwrt
-        out="$ARTIFACTS/openwrt-malta-le"
+    if [[ "$target" == openwrt-malta-le || "$target" == openwrt-arm || "$target" == openwrt-arm64 ]]; then
+        prepare_openwrt "$target"
+        out="$ARTIFACTS/$target"
         vmlinux="$out/vmlinux-${OPENWRT_VERSION}.debug"
         helper=
     else
@@ -1142,13 +1242,13 @@ debug_stage() {
     local target=${1:-} qemu kernel initrd bios= out vmlinux helper console_log qemu_log gdb status init_entry= mips_cmdline= ppc_cmdline= dtb= console_chardev
     local -a qemu_args gdb_args
     case "$target" in
-        x86|arm|arm64|mipsbe|mmips|smips|ppc-e500-smp|ppc-e500|ppc-440|openwrt-malta-le) ;;
+        x86|arm|arm64|mipsbe|mmips|smips|ppc-e500-smp|ppc-e500|ppc-440|openwrt-malta-le|openwrt-arm|openwrt-arm64) ;;
         *) die "debug requires a validated target (see: ./viros.sh list)" ;;
     esac
     need mkfs.ext2; need truncate
     prepare_one "$target"
-    if [[ "$target" == openwrt-malta-le ]]; then
-        out="$ARTIFACTS/openwrt-malta-le"
+    if [[ "$target" == openwrt-malta-le || "$target" == openwrt-arm || "$target" == openwrt-arm64 ]]; then
+        out="$ARTIFACTS/$target"
         vmlinux="$out/vmlinux-${OPENWRT_VERSION}.debug"
         helper=
     else
@@ -1173,12 +1273,30 @@ debug_stage() {
     case "$target" in
         openwrt-malta-le)
             qemu=$(qemu_binary qemu-system-mipsel)
-            kernel="$ARTIFACTS/openwrt-malta-le/kernel-${OPENWRT_VERSION}.elf"
+            kernel="$ARTIFACTS/openwrt-malta-le/kernel-${OPENWRT_VERSION}"
             [[ -s "$kernel" ]] || die "OpenWrt Malta kernel is missing; run prepare openwrt-malta-le"
             qemu_args=( -M malta -cpu 24Kc -smp 1 -m 256M
                 -display none -monitor none -parallel none -nic none
                 -no-reboot -no-shutdown -nodefaults -S -kernel "$kernel"
                 -append 'mem=256M console=ttyS0,115200 loglevel=8 ignore_loglevel' )
+            ;;
+        openwrt-arm)
+            qemu=$(qemu_binary qemu-system-arm)
+            kernel="$ARTIFACTS/openwrt-arm/kernel-${OPENWRT_VERSION}"
+            [[ -s "$kernel" ]] || die "OpenWrt ARMv7 kernel is missing; run prepare openwrt-arm"
+            qemu_args=( -M virt -cpu cortex-a15 -smp 1 -m 512M
+                -display none -monitor none -nic none
+                -no-reboot -no-shutdown -nodefaults -S -kernel "$kernel"
+                -append 'console=ttyAMA0,115200 earlycon=pl011,0x09000000 loglevel=8 ignore_loglevel nokaslr' )
+            ;;
+        openwrt-arm64)
+            qemu=$(qemu_binary qemu-system-aarch64)
+            kernel="$ARTIFACTS/openwrt-arm64/kernel-${OPENWRT_VERSION}"
+            [[ -s "$kernel" ]] || die "OpenWrt AArch64 kernel is missing; run prepare openwrt-arm64"
+            qemu_args=( -M virt -cpu cortex-a57 -smp 2 -m 512M
+                -display none -monitor none -nic none
+                -no-reboot -no-shutdown -nodefaults -S -kernel "$kernel"
+                -append 'console=ttyAMA0,115200 earlycon=pl011,0x09000000 loglevel=8 ignore_loglevel nokaslr' )
             ;;
         x86)
             qemu=$(qemu_binary qemu-system-x86_64)
@@ -1338,13 +1456,13 @@ debug_stage() {
             -ex 'set pagination off' -ex 'set confirm off' -ex 'set python print-stack full' -ex 'set remotetimeout 10' -ex 'set architecture i386:x86-64'
             -ex "target remote $DEBUG_GDB_SOCKET" -ex 'tbreak compat_start_thread' -ex continue )
     fi
-    if [[ "$target" == arm || "$target" == arm64 ]]; then
+    if [[ "$target" == arm || "$target" == arm64 || "$target" == openwrt-arm || "$target" == openwrt-arm64 ]]; then
         gdb_args+=( -ex 'thbreak ret_to_user' -ex continue )
     fi
-    if [[ "$target" == openwrt-malta-le ]]; then
+    if [[ "$target" == openwrt-malta-le || "$target" == openwrt-arm || "$target" == openwrt-arm64 ]]; then
         gdb_args+=( -ex "source $SCRIPT_DIR/gdb_user.py" -ex viros-ps
             -ex 'viros-user-info 1' -ex 'delete breakpoints'
-            -ex "viros-user-load 1 $ARTIFACTS/openwrt-malta-le/rootfs-${OPENWRT_VERSION}/bin/busybox"
+            -ex "viros-user-load 1 $ARTIFACTS/$target/rootfs-${OPENWRT_VERSION}/bin/busybox"
             -ex 'viros-user-tbreak entry' -ex continue )
     else
         gdb_args+=( -ex "source $helper" -ex lx-version -ex lx-ps
@@ -1362,8 +1480,13 @@ debug_stage() {
         fi
     fi
     gdb_args+=( -ex "source $SCRIPT_DIR/gdb_console.py" )
-    [[ "$target" == openwrt-malta-le ]] ||
+    [[ "$target" == openwrt-malta-le || "$target" == openwrt-arm || "$target" == openwrt-arm64 ]] ||
         gdb_args+=( -ex "source $SCRIPT_DIR/gdb_user.py" )
+    if [[ "$target" == arm || "$target" == arm64 ]]; then
+        gdb_args+=( -ex 'viros-user-info 1' -ex 'delete breakpoints'
+            -ex "viros-user-load 1 $ARTIFACTS/$target/init"
+            -ex 'viros-user-tbreak entry' -ex continue )
+    fi
     say "QEMU PID: $DEBUG_QEMU_PID"
     say "GDB socket: $DEBUG_GDB_SOCKET"
     say "interactive console socket: $DEBUG_CONSOLE_SOCKET"
@@ -1372,9 +1495,11 @@ debug_stage() {
     if [[ "$target" == mipsbe || "$target" == mmips || "$target" == smips ]]; then
         say "Temporary breakpoint 1: kernel start_thread (prove and inspect PID 1)"
         say "Temporary breakpoint 2: RouterOS /init ELF entry $init_entry (final prompt)"
-    elif [[ "$target" == openwrt-malta-le ]]; then
-        say "Temporary breakpoints: OpenWrt PID 1 start_thread, then its BusyBox ELF entry"
-        say "Local OpenWrt rootfs: $ARTIFACTS/openwrt-malta-le/rootfs-${OPENWRT_VERSION}"
+    elif [[ "$target" == arm || "$target" == arm64 ]]; then
+        say "Temporary breakpoints: PID 1 user return, then RouterOS /init ELF entry"
+    elif [[ "$target" == openwrt-malta-le || "$target" == openwrt-arm || "$target" == openwrt-arm64 ]]; then
+        say "Temporary breakpoints: OpenWrt PID 1 user return, then its BusyBox ELF entry"
+        say "Local OpenWrt rootfs: $ARTIFACTS/$target/rootfs-${OPENWRT_VERSION}"
     fi
     say "At the GDB prompt run 'viros-console'; press Ctrl-] to return to GDB"
     say "Starting exact-symbol GDB for $target; PID 1 must be printed before the prompt"
@@ -1401,6 +1526,8 @@ ppc-e500-smp    ppce500/e500v2     success: PID 1 inspected with matching Python
 ppc-e500        ppce500/RB1000     success: PID 1 inspected with matching Python GDB
 ppc-440         sam460ex/460EX      success: PID 1 inspected with matching Python GDB
 openwrt-malta-le Malta/24Kc         test success: /init, procd, PIE/PID debugging, console
+openwrt-arm     virt/cortex-a15     test success: /init, procd, PIE/PID debugging, console
+openwrt-arm64   virt/cortex-a57     test success: /init, procd, PIE/PID debugging, console
 ppc-83xx        —                  blocked: no MPC83xx QEMU machine
 tile            TILE KVM-only      blocked: no TCG and unfinished GDB stub
 EOF

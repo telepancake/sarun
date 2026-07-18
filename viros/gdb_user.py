@@ -55,7 +55,7 @@ def read_integer(address, size=None):
     try:
         data = gdb.selected_inferior().read_memory(address, size).tobytes()
         return struct.unpack(target_byte_order() + formats[size], data)[0]
-    except (gdb.error, MemoryError, KeyError, struct.error) as exc:
+    except (gdb.error, MemoryError, OverflowError, KeyError, struct.error) as exc:
         raise gdb.MemoryError("cannot read {:#x}".format(address)) from exc
 
 
@@ -105,7 +105,7 @@ def elf_symbol_size(path, wanted):
     return None
 
 
-def elf_has_section_table(path):
+def elf_has_symbol_table(path):
     try:
         with open(path, "rb") as elf:
             ident = elf.read(16)
@@ -119,7 +119,21 @@ def elf_has_section_table(path):
             header = struct.unpack(
                 header_format, elf.read(struct.calcsize(header_format))
             )
-            return header[5] != 0 and header[11] != 0
+            shoff, shentsize, shnum = header[5], header[10], header[11]
+            if not shoff or not shnum:
+                return False
+            section_format = endian + (
+                "IIQQQQIIQQ" if elf64 else "IIIIIIIIII"
+            )
+            section_size = struct.calcsize(section_format)
+            for index in range(shnum):
+                elf.seek(shoff + index * shentsize)
+                section = struct.unpack(
+                    section_format, elf.read(section_size)
+                )
+                if section[1] in (SHT_SYMTAB, SHT_DYNSYM):
+                    return True
+            return False
     except (OSError, struct.error):
         return False
 
@@ -241,8 +255,10 @@ class RawTask:
 
 class RawTaskLayout:
     def __init__(self, init_address, task_size, tasks_offset, pid_offset,
-                 comm_offset, mm_offset, auxv_offset):
+                 comm_offset, mm_offset, auxv_offset,
+                 linked_init_address=None):
         self.init_address = init_address
+        self.linked_init_address = linked_init_address or init_address
         self.task_size = task_size
         self.tasks_offset = tasks_offset
         self.pid_offset = pid_offset
@@ -268,8 +284,8 @@ def read_auxv_at(address, word_size=None):
     return result
 
 
-def find_auxv_offset(mm_address):
-    word_size = pointer_size()
+def find_auxv_offset(mm_address, word_size=None):
+    word_size = word_size or pointer_size()
     scan_size = 4096
     try:
         memory = gdb.selected_inferior().read_memory(
@@ -305,10 +321,40 @@ def printable_comm(memory, offset):
     return bool(raw) and len(raw) < 32 and all(0x20 <= byte < 0x7f for byte in raw)
 
 
+def locate_live_init_task(linked_address, task_size):
+    """Account for profile initramfs padding absent from reduced debug ELFs."""
+    inferior = gdb.selected_inferior()
+    # OpenWrt's kernel-debug archive can describe a generic profile while the
+    # runnable image was relinked with a slightly different embedded initramfs.
+    # Text remains exact, but subsequent data sections move by a 64 KiB-aligned
+    # amount.  Probe only one task-sized window at each possible data base;
+    # this avoids a large remote memory scan.
+    steps = [0]
+    for distance in range(1, 513):
+        steps.extend((distance, -distance))
+    for step in steps:
+        candidate = linked_address + step * 0x10000
+        try:
+            memory = inferior.read_memory(candidate, task_size).tobytes()
+        except (gdb.error, gdb.MemoryError, MemoryError):
+            continue
+        comm_offset = memory.find(b"swapper/0\0")
+        if comm_offset < 0:
+            comm_offset = memory.find(b"swapper\0")
+        if comm_offset >= 0:
+            if candidate != linked_address:
+                gdb.write(
+                    "Adjusted reduced-DWARF init_task by {:+#x} for the "
+                    "runnable kernel image.\n".format(candidate - linked_address)
+                )
+            return candidate, memory, comm_offset
+    raise gdb.GdbError("cannot locate init_task's command name")
+
+
 def infer_raw_task_layout():
     global RAW_LAYOUT
-    init_address = int(gdb.parse_and_eval("&init_task"))
-    if RAW_LAYOUT and RAW_LAYOUT.init_address == init_address:
+    linked_init_address = int(gdb.parse_and_eval("&init_task"))
+    if RAW_LAYOUT and RAW_LAYOUT.linked_init_address == linked_init_address:
         return RAW_LAYOUT
 
     filename = gdb.current_progspace().filename
@@ -319,12 +365,9 @@ def infer_raw_task_layout():
         )
     word_size = pointer_size()
     inferior = gdb.selected_inferior()
-    init_memory = inferior.read_memory(init_address, task_size).tobytes()
-    comm_offset = init_memory.find(b"swapper/0\0")
-    if comm_offset < 0:
-        comm_offset = init_memory.find(b"swapper\0")
-    if comm_offset < 0:
-        raise gdb.GdbError("cannot locate init_task's command name")
+    init_address, init_memory, comm_offset = locate_live_init_task(
+        linked_init_address, task_size
+    )
 
     candidates = []
     for tasks_offset in range(0, task_size - 2 * word_size, word_size):
@@ -377,7 +420,7 @@ def infer_raw_task_layout():
                 continue
             RAW_LAYOUT = RawTaskLayout(
                 init_address, task_size, tasks_offset, pid_offset,
-                comm_offset, mm_offset, auxv_offset
+                comm_offset, mm_offset, auxv_offset, linked_init_address
             )
             gdb.write(
                 "Kernel has reduced DWARF; inferred task offsets from the "
@@ -502,11 +545,21 @@ def selector_text(selector):
     return "{}:{}".format(selector[0], selector[1])
 
 
-def task_auxv(task):
+def task_auxv(task, word_size=None):
     if isinstance(task, RawTask):
         if not task.mm:
             raise gdb.GdbError("selected task has no userspace mm")
-        return read_auxv_at(task.mm + task.layout.auxv_offset)
+        if word_size is None or word_size == pointer_size():
+            offset = task.layout.auxv_offset
+            size = pointer_size()
+        else:
+            offset = find_auxv_offset(task.mm, word_size)
+            if offset is None:
+                raise gdb.GdbError(
+                    "cannot locate the selected task's compat saved auxv"
+                )
+            size = word_size
+        return read_auxv_at(task.mm + offset, size)
     mm_pointer = task["mm"]
     if int(mm_pointer) == 0:
         raise gdb.GdbError("selected task has no userspace mm")
@@ -523,16 +576,24 @@ def task_auxv(task):
     except gdb.error as exc:
         raise gdb.GdbError("saved_auxv is not an inspectable array") from exc
 
-    result = {}
-    index = low
-    while index + 1 <= high:
-        key = int(saved[index])
-        value = int(saved[index + 1])
-        if key == AT_NULL:
-            break
-        result[key] = value
-        index += 2
-    return result
+    address = int(saved.address)
+    sizes = [word_size] if word_size else [pointer_size()]
+    if word_size is None and pointer_size() == 8:
+        # Linux overlays a compat process's 32-bit elf_addr_t pairs onto the
+        # kernel-width saved_auxv array.  Try that packed representation when
+        # the native-width parse is not a plausible ELF auxiliary vector.
+        sizes.append(4)
+    last_error = None
+    for size in sizes:
+        try:
+            result = read_auxv_at(address, size)
+            if AT_PHDR in result and AT_PHENT in result and AT_ENTRY in result:
+                return result
+        except (gdb.error, gdb.GdbError, gdb.MemoryError) as exc:
+            last_error = exc
+    if last_error:
+        raise gdb.GdbError("cannot read the selected task's saved auxv") from last_error
+    raise gdb.GdbError("the selected task has no plausible saved auxv")
 
 
 def task_executable_name(task):
@@ -566,6 +627,8 @@ class UserSession:
         self.bias = None
         self.cookie_address = None
         self.cookie = None
+        self.address_space_register = None
+        self.address_space_register_value = None
 
     def unload(self):
         if self.symbol_file:
@@ -582,6 +645,8 @@ class UserSession:
         self.bias = None
         self.cookie_address = None
         self.cookie = None
+        self.address_space_register = None
+        self.address_space_register_value = None
 
     def capture_address_space_cookie(self, auxv):
         self.cookie_address = auxv.get(AT_RANDOM)
@@ -593,19 +658,50 @@ class UserSession:
                 )
                 self.cookie = memory.tobytes()
             except (gdb.error, MemoryError):
-                self.cookie_address = None
+                pass
+        if self.cookie is None:
+            # QEMU may not translate an EL0 address while stopped immediately
+            # before an AArch64 exception return.  Its XML system-register
+            # feature still exposes the active userspace page table.
+            for register in ("$TTBR0_EL1", "$TTBR0"):
+                try:
+                    value = int(gdb.parse_and_eval(register))
+                except (gdb.error, TypeError):
+                    continue
+                self.address_space_register = register
+                self.address_space_register_value = (
+                    self.normalize_address_space_register(register, value)
+                )
+                break
 
     @staticmethod
-    def address_space_matches(pid, cookie_address, cookie):
-        if cookie_address is not None:
-            if cookie is None:
-                return False
+    def normalize_address_space_register(register, value):
+        if register == "$TTBR0_EL1":
+            # AArch64 stores the ASID in TTBR0_EL1[63:48].  Linux can assign
+            # or refresh that tag while returning to EL0 without changing the
+            # userspace translation table identified by the low 48 bits.
+            return value & ((1 << 48) - 1)
+        return value
+
+    @staticmethod
+    def address_space_matches(pid, cookie_address, cookie,
+                              register=None, register_value=None):
+        if cookie_address is not None and cookie is not None:
             try:
                 memory = gdb.selected_inferior().read_memory(
                     cookie_address, len(cookie)
                 )
                 return memory.tobytes() == cookie
             except (gdb.error, MemoryError):
+                return False
+        if register is not None:
+            try:
+                current = int(gdb.parse_and_eval(register))
+                current = UserSession.normalize_address_space_register(
+                    register, current
+                )
+                return current == register_value
+            except (gdb.error, TypeError):
                 return False
         try:
             current_pid, _ = task_identity(current_task())
@@ -648,7 +744,7 @@ class FocusBreakpoint(gdb.Breakpoint):
         return self.matched
 
 
-def focus_task(selector):
+def focus_task(selector, auxv_word_size=None):
     matches = [task for task in linux_tasks() if selector_matches(selector, task)]
     if not matches:
         raise gdb.GdbError("No task matching {}".format(selector_text(selector)))
@@ -660,7 +756,7 @@ def focus_task(selector):
         )
     task = matches[0]
     pid, _ = task_identity(task)
-    auxv = task_auxv(task)
+    auxv = task_auxv(task, auxv_word_size)
     cookie_address = auxv.get(AT_RANDOM)
     cookie = None
     if cookie_address:
@@ -704,7 +800,7 @@ def load_user_symbols(task, executable, symbol_file=None):
     if not os.path.isfile(symbols):
         raise gdb.GdbError("userspace symbol file does not exist: " + symbols)
 
-    auxv = task_auxv(task)
+    auxv = task_auxv(task, layout.elf_class // 8)
     if AT_PHDR not in auxv:
         raise gdb.GdbError("the selected task's saved auxv has no AT_PHDR")
     bias = layout.load_bias(auxv[AT_PHDR])
@@ -717,7 +813,7 @@ def load_user_symbols(task, executable, symbol_file=None):
         )
 
     SESSION.unload()
-    symbols_loaded = elf_has_section_table(symbols)
+    symbols_loaded = elf_has_symbol_table(symbols)
     if symbols_loaded:
         gdb.execute("add-symbol-file {} -o {:#x}".format(
             gdb_quote(symbols), bias))
@@ -742,10 +838,18 @@ def load_user_symbols(task, executable, symbol_file=None):
             "require the matching unstripped or separate debug ELF.\n"
         )
     if SESSION.cookie is None:
-        gdb.write(
-            "Warning: AT_RANDOM could not be read; userspace breakpoints "
-            "cannot be filtered by address space on this stop.\n"
-        )
+        if SESSION.address_space_register is not None:
+            gdb.write(
+                "AT_RANDOM is not readable at this kernel boundary; using "
+                "{} to filter userspace breakpoints by address space.\n".format(
+                    SESSION.address_space_register[1:]
+                )
+            )
+        else:
+            gdb.write(
+                "Warning: AT_RANDOM could not be read; userspace breakpoints "
+                "cannot be filtered by address space on this stop.\n"
+            )
     if layout.elf_class == 32 and gdb.selected_frame().architecture().name().endswith("64"):
         gdb.write(
             "Warning: this is a compat 32-bit process under a 64-bit kernel; "
@@ -771,10 +875,26 @@ class ProcessBreakpoint(gdb.Breakpoint):
         self.pid = pid
         self.cookie_address = SESSION.cookie_address
         self.cookie = SESSION.cookie
+        self.address_space_register = SESSION.address_space_register
+        self.address_space_register_value = SESSION.address_space_register_value
 
     def stop(self):
+        if self.cookie is None and self.cookie_address is not None:
+            # Some QEMU targets cannot translate the EL0 stack while stopped
+            # at the kernel's return-to-user boundary.  The mapping is valid
+            # once the translated-code breakpoint fires at the userspace PC,
+            # so bind the breakpoint to the process cookie on that first hit.
+            try:
+                self.cookie = gdb.selected_inferior().read_memory(
+                    self.cookie_address, 16
+                ).tobytes()
+                SESSION.cookie = self.cookie
+                return True
+            except (gdb.error, MemoryError):
+                pass
         return SESSION.address_space_matches(
-            self.pid, self.cookie_address, self.cookie
+            self.pid, self.cookie_address, self.cookie,
+            self.address_space_register, self.address_space_register_value
         )
 
 
@@ -890,7 +1010,8 @@ viros-user-debug PID|COMM LOCAL-EXECUTABLE [LOCAL-SYMBOL-FILE]
                 "usage: viros-user-debug PID|COMM LOCAL-EXECUTABLE "
                 "[LOCAL-SYMBOL-FILE]"
             )
-        task = focus_task(parse_selector(argv[0]))
+        layout = read_elf_layout(argv[1])
+        task = focus_task(parse_selector(argv[0]), layout.elf_class // 8)
         load_user_symbols(task, argv[1], argv[2] if len(argv) == 3 else None)
 
 

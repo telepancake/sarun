@@ -28,6 +28,8 @@ stub alone are not success.
 ./viros.sh extract all
 ./viros.sh list
 ./viros.sh debug arm64
+./viros.sh debug openwrt-arm
+./viros.sh debug openwrt-arm64
 ```
 
 `doctor` checks only native bootstrap programs needed to build QEMU, GDB, and
@@ -39,7 +41,9 @@ bootstrap and the Python-enabled GDB build both use that interpreter and
 project-local environments populated from pinned wheels. GDB's GMP and MPFR
 prerequisites are likewise built from checksum-pinned source archives below
 the work directory, so their development headers need not be installed on the
-runner. The legacy QEMU 5.2 TILE translator is also forced to use this managed
+runner. A pinned project-local Expat build gives GDB the XML target-description
+support required for QEMU's ARM and AArch64 register sets. The legacy QEMU 5.2
+TILE translator is also forced to use this managed
 interpreter with its bundled Meson rather than discovering a host `python3`.
 Both QEMU builds disable the optional Linux AIO and io_uring backends, which
 are unnecessary for this lab and otherwise vary with runner-installed headers.
@@ -87,6 +91,8 @@ Useful individual stages and run modes are:
 ./viros.sh debug x86
 ./viros.sh run openwrt-malta-le
 ./viros.sh debug openwrt-malta-le
+./viros.sh debug openwrt-arm
+./viros.sh debug openwrt-arm64
 ```
 
 `debug` is the single-command source-level workflow: it starts target-specific
@@ -147,11 +153,13 @@ For a process already stopped at its entry point, `viros-user-load PID EXEC
 [DEBUG-FILE]` skips the scheduler wait. `viros-user-focus PID|COMM` waits at
 `finish_task_switch` until that task owns a QEMU CPU. `viros-user-break` and
 `viros-user-tbreak` filter breakpoint hits by Linux PID, which prevents another
-process with the same virtual address from causing a false stop. The filter is
-implemented without architecture-specific MMU registers: it fingerprints the
-selected process through the random bytes addressed by its saved `AT_RANDOM`
-entry, then checks that address through QEMU's currently active MMU on every
-breakpoint hit. A child immediately after `fork` still has the parent's copied
+process with the same virtual address from causing a false stop. The filter
+fingerprints the selected process through the random bytes addressed by its
+saved `AT_RANDOM` entry, then checks that address through QEMU's currently
+active MMU on every breakpoint hit. When AArch64 QEMU cannot translate the EL0
+stack at the kernel return boundary, the extension uses the normalized
+`TTBR0_EL1` translation-table identity until the cookie becomes readable at
+the first userspace instruction. A child immediately after `fork` still has the parent's copied
 fingerprint until it executes a new image; distinguishing that case requires
 a fuller inferior-aware remote stub.
 
@@ -162,21 +170,25 @@ exact guest build and retain its ELF program headers; the optional second file
 may be the unstripped executable or its separate debug file. Kernel and
 userspace symbols remain loaded together.
 
-The included OpenWrt Malta target provides a reproducible, long-running MIPS
-guest for this workflow. It uses OpenWrt's official initramfs kernel, matching
-`kernel-debug` archive, and default rootfs; it does not pretend that Malta is a
-RouterBOARD hardware model. A complete smoke test is:
+The included OpenWrt Malta, ARMv7, and AArch64 targets provide reproducible,
+long-running guests for this workflow. They use OpenWrt's official initramfs
+kernels, matching `kernel-debug` archives, and root filesystems. Malta is a
+MIPS regression target rather than a claimed RouterBOARD hardware model. A
+complete smoke test for any of the three native ABIs is:
 
 ```sh
 ./viros.sh download
 ./viros.sh build
 ./viros.sh debug openwrt-malta-le
+./viros.sh debug openwrt-arm
+./viros.sh debug openwrt-arm64
 ```
 
-The launcher uses PID 1's `start_thread` to infer its kernel task data, loads
-the published BusyBox ELF, and presents the initial GDB prompt at BusyBox's
-relocated entry without any guest-side server. The equivalent manual commands
-are:
+The launcher stops at the architecture's exact return-to-userspace path, uses
+PID 1 to infer its kernel task data, loads the published BusyBox ELF, and
+presents the initial GDB prompt at BusyBox's relocated entry without any
+guest-side server. Substitute `openwrt-arm` or `openwrt-arm64` in the paths
+below for those targets. The equivalent manual commands are:
 
 ```gdb
 viros-user-load 1 artifacts/openwrt-malta-le/rootfs-25.12.5/bin/busybox
@@ -224,6 +236,8 @@ are the intended first use case.
 | `x86` | PC/CHR disk | **Success:** production CHR reached login; rebuilt kernel started PID 1 and GDB stopped at `/init` entry |
 | `mmips` | patched Malta, 34Kf with MT7621 compatibility | **Success:** PID 1 and its executable were examined; GDB stopped at `/init` entry |
 | `openwrt-malta-le` | Malta, 24Kc | **Test target success:** official OpenWrt reached `/init` and `procd`; reduced-DWARF task enumeration, PIE relocation, PID-filtered breakpoints, and console switching were exercised |
+| `openwrt-arm` | `virt`, Cortex-A15 | **Test target success:** official ARMv7 OpenWrt reached `/init` and `procd`; GDB stopped at BusyBox's ELF entry and exercised process-aware PIE debugging and console switching |
+| `openwrt-arm64` | `virt`, Cortex-A57 | **Test target success:** official AArch64 OpenWrt reached `/init` and `procd`; GDB stopped at BusyBox's ELF entry and exercised process-aware PIE debugging and console switching |
 | `ppc-83xx` | none | **Blocked:** QEMU has no matching MPC83xx/RB333/RB600 machine |
 | `tile` | disclosed TILE-Gx KVM QEMU | **Blocked:** native TILE-Gx KVM only, no TCG system execution, and incomplete GDB hooks |
 
