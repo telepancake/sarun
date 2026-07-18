@@ -677,11 +677,26 @@ as executable mappings and mmap that genuinely need a host fd.
           real tools and replaying the actual `make -j10 V=s tools/install`
           graph in the captured box passes all four concurrent autoreconf jobs,
           builds and installs mklibs, then continues through MPFR, MPC, Bison,
-          erofs-utils, e2fsprogs, findutils, elfutils, and the later host-tool
-          wave. The earlier omission has therefore not reproduced as an engine
-          defect; the live checkpoint is being allowed to finish before
-          `world` resumes. The earlier nonfatal empty-operand arithmetic and
-          generated-config `sed` diagnostics also remain for attribution rather
+          erofs-utils, e2fsprogs, findutils, and elfutils. Elfutils exposed two
+          generic dependency-composition gaps: prerequisite-only explicit rules
+          such as `i386_lex.o: i386_parse.h` must compose with `.l.c` and `.c.o`,
+          and a pattern prerequisite may itself be produced by a suffix rule.
+          Kati now selects those chains after direct pattern candidates; the
+          real replay generates the parser and scanner, builds both `.o` and
+          `.os` variants, and passes their former link boundaries. Make/Brush
+          case 50 pins all three relation shapes. That replay then showed that
+          recursive `MAKEFLAGS` serialization collapsed OpenWrt's ordered set
+          of command-line `LIBS+=...` relations to its final member, omitting
+          `libgnu.a` from elfutils links. Accumulative command-line definitions
+          are now retained in order (without duplicating inherited entries at
+          every recursion), while ordinary assignments still replace earlier
+          values. Case 51 exercises late child-scope expansion of the preserved
+          appends. The static aarch64 build and complete 51-case suite pass; the
+          next checkpoint is the real elfutils link with the new binary, then
+          completion of `tools/install` and resumption of `world`. The earlier
+          omission has therefore not reproduced as an engine defect. The
+          earlier nonfatal empty-operand arithmetic and generated-config `sed`
+          diagnostics also remain for attribution rather
           than normalization.
     - [x] Complete the native-aarch64 FUSE Brush gate from a clean output tree.
           Linux 6.18 builds 823 objects with `-j10` (11 observed overlapping

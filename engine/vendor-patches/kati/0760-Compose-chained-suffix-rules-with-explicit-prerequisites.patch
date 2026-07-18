@@ -1,0 +1,144 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Sat, 18 Jul 2026 06:11:49 +0000
+Subject: [PATCH] Compose chained suffix rules with explicit prerequisites
+
+GNU make combines prerequisite-only explicit targets with suffix-rule recipes and can build their implied source through another suffix rule. Preserve pattern specificity by considering chained suffixes only after both pattern-rule tiers.
+
+---
+diff --git a/src-rs/dep.rs b/src-rs/dep.rs
+index 85394f1..37376d0 100644
+--- a/src-rs/dep.rs
++++ b/src-rs/dep.rs
+@@ -1035,6 +1035,56 @@ impl<'a> DepBuilder<'a> {
+         false
+     }
+ 
++    /// Can `sym` be made through one or more old-style suffix rules whose
++    /// eventual source already exists (or is explicitly mentioned)? Keep this
++    /// separate from pattern-rule producibility so a generic suffix chain does
++    /// not enter the existing-prerequisite tier ahead of a more-specific
++    /// pattern rule.
++    fn has_suffix_chain(&self, sym: Symbol, visiting: &mut HashSet<Symbol>) -> bool {
++        if !visiting.insert(sym) {
++            return false;
++        }
++        let sym_bytes = sym.as_bytes();
++        let Some(output_suffix) = get_ext(&sym_bytes).and_then(|s| s.strip_prefix(b".")) else {
++            return false;
++        };
++        let Some(rules) = self.suffix_rules.get(output_suffix) else {
++            return false;
++        };
++        for rule in rules {
++            if rule.inputs.len() != 1 {
++                continue;
++            }
++            let input = replace_suffix(sym, &rule.inputs[0]);
++            let mut branch = visiting.clone();
++            if self.exists(input)
++                || self.vpath_resolve(input).is_some()
++                || self.has_suffix_chain(input, &mut branch)
++            {
++                return true;
++            }
++        }
++        false
++    }
++
++    fn pick_suffix_rule(&self, output: Symbol, allow_chain: bool) -> Option<Arc<Rule>> {
++        let output_str = output.as_bytes();
++        let output_suffix = get_ext(&output_str)?.strip_prefix(b".")?;
++        let found = self.suffix_rules.get(output_suffix)?;
++        for rule in found {
++            assert!(rule.inputs.len() == 1);
++            let input = replace_suffix(output, &rule.inputs[0]);
++            let mut visiting = HashSet::new();
++            if self.exists(input)
++                || self.vpath_resolve(input).is_some()
++                || (allow_chain && self.has_suffix_chain(input, &mut visiting))
++            {
++                return Some(rule.clone());
++            }
++        }
++        None
++    }
++
+     fn can_pick_implicit_rule(
+         &mut self,
+         rule: &Rule,
+@@ -1078,8 +1128,11 @@ impl<'a> DepBuilder<'a> {
+                         // implicit-rule search, so defer the viability call
+                         // instead of rejecting the rule on a literal '$'.
+                         || (self.secondexpansion && input.as_bytes().contains(&b'$'))
+-                        || (allow_chain
+-                            && self.has_producing_rule_except(sym, &rule.output_patterns));
++                        || (allow_chain && {
++                            let mut suffix_visiting = HashSet::new();
++                            self.has_producing_rule_except(sym, &rule.output_patterns)
++                                || self.has_suffix_chain(sym, &mut suffix_visiting)
++                        });
+                     if !buildable {
+                         ok = false;
+                         break;
+@@ -1272,28 +1325,8 @@ impl<'a> DepBuilder<'a> {
+         // Old-style suffix rules (also existing-prereq only). On no match,
+         // fall through to the chained pattern-rule pass below rather than
+         // jumping straight to .DEFAULT.
+-        let suffix_pick = (|| {
+-            let output_suffix = get_ext(&output_str)?;
+-            if !output_suffix.starts_with(b".") {
+-                return None;
+-            }
+-            let output_suffix = &output_suffix[1..];
+-            let found = self.suffix_rules.get(output_suffix)?;
+-            for irule in found {
+-                assert!(irule.inputs.len() == 1);
+-                let input = replace_suffix(output, &irule.inputs[0]);
+-                // sarun: a prerequisite findable through VPATH counts as
+-                // existing, exactly as in can_pick_implicit_rule — automake
+-                // out-of-tree builds drive `.c.o` suffix rules whose implied
+-                // source lives in $(srcdir) via VPATH; without this the .o
+-                // silently got no commands and the link failed on it.
+-                if self.exists(input) || self.vpath_resolve(input).is_some() {
+-                    return Some(irule.clone());
+-                }
+-            }
+-            None
+-        })()
+-        .or_else(|| {
++        let suffix_pick = self.pick_suffix_rule(output, false)
++            .or_else(|| {
+             // Single-suffix rules (`.in:` == `%: %.in`): applicable to ANY
+             // target when target+suffix exists and the suffix made it into
+             // the final .SUFFIXES list (which weeds out .PHONY-shaped
+@@ -1374,6 +1407,29 @@ impl<'a> DepBuilder<'a> {
+             });
+         }
+ 
++        // GNU suffix rules can chain (`.l.c` / `.y.c` followed by `.c.o`).
++        // Consider that chain only after both pattern-rule tiers so a generic
++        // suffix candidate cannot outrank a more-specific pattern relation.
++        if let Some(rule) = self.pick_suffix_rule(output, true) {
++            if rule_merger.is_some() {
++                return Some(PickedRuleInfo {
++                    merger: rule_merger,
++                    pattern_rule: Some(rule),
++                    vars,
++                });
++            }
++            let mut vars = vars;
++            if vars.is_some() {
++                assert!(rule.outputs.len() == 1);
++                vars = self.merge_implicit_rule_vars(rule.outputs[0], vars);
++            }
++            return Some(PickedRuleInfo {
++                merger: None,
++                pattern_rule: Some(rule),
++                vars,
++            });
++        }
++
+         self.try_default_or_merger(rule_merger, output, vars)
+     }
+ 

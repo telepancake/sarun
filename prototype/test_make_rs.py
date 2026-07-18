@@ -1708,6 +1708,87 @@ printf '%s\n' "$src_flags" > result.txt
         check(stable == b"stable",
               f"case49: evaluation continues with the existing include; "
               f"got {stable!r}")
+        # ── CASE 50: prerequisite-only rules inherit suffix recipes ───────
+        # Elfutils' generated parser objects have extra explicit prerequisites
+        # but no explicit commands. GNU combines those prerequisites with the
+        # `.c.o` recipe, and may first make the missing C source through
+        # `.l.c`/`.y.c`. Both the declared and wholly implied intermediate
+        # forms must therefore traverse the ordinary suffix-rule chain.
+        sc = work / "suffix-chain-explicit-prereqs"
+        shutil.rmtree(sc, ignore_errors=True)
+        sc.mkdir(parents=True, exist_ok=True)
+        (sc / "declared.src").write_text("declared\n")
+        (sc / "implied.src").write_text("implied\n")
+        (sc / "paired.src").write_text("paired\n")
+        (sc / "marker").write_text("marker\n")
+        (sc / "Makefile").write_text(
+            ".SUFFIXES:\n"
+            ".SUFFIXES: .src .mid .o\n"
+            ".src.mid:\n"
+            "\t@cp $< $@\n"
+            ".mid.o:\n"
+            "\t@cp $< $@\n"
+            "%.pic: %.src %.o\n"
+            "\t@cp $< $@\n"
+            ".PHONY: all\n"
+            "all: declared.o implied.o paired.pic\n"
+            "\t@cat declared.o implied.o paired.pic > result.txt\n"
+            "declared.o: declared.mid marker\n"
+            "implied.o: marker\n")
+        r = run_make("MAKE50", sc, "-j10", "all")
+        check(r.returncode == 0,
+              f"case50: prerequisite-only targets compose with chained "
+              f"suffix recipes (got {r.returncode}: "
+              f"{(r.stdout+r.stderr)[-700:]})")
+        sp50 = latest_sqlar(m)
+        chained = m.sqlar_content(
+            sp50, str((sc / "result.txt").resolve()).lstrip("/"))
+        declared_mid = m.sqlar_content(
+            sp50, str((sc / "declared.mid").resolve()).lstrip("/"))
+        implied_mid = m.sqlar_content(
+            sp50, str((sc / "implied.mid").resolve()).lstrip("/"))
+        paired_object = m.sqlar_content(
+            sp50, str((sc / "paired.o").resolve()).lstrip("/"))
+        check(chained == b"declared\nimplied\npaired\n"
+              and declared_mid == b"declared\n"
+              and implied_mid == b"implied\n"
+              and paired_object == b"paired\n",
+              f"case50: declared/implied intermediates and a pattern's "
+              f"suffix-produced prerequisite were built; result={chained!r} "
+              f"mids={(declared_mid, implied_mid)!r} object={paired_object!r}")
+        # ── CASE 51: repeated command-line += survives recursion ──────────
+        # OpenWrt's elfutils host build passes a sequence of LIBS+= expressions
+        # which must all remain deferred until each Automake subdirectory sets
+        # `subdir`. Treating definitions as replace-by-name retained only the
+        # last wildcard and omitted libgnu.a from final links.
+        ca = work / "recursive-command-append"
+        shutil.rmtree(ca, ignore_errors=True)
+        (ca / "child").mkdir(parents=True)
+        (ca / "Makefile").write_text(
+            ".PHONY: all\n"
+            "all:\n"
+            "\t@$(MAKE) --no-print-directory -C child\n")
+        (ca / "child" / "xsize.o").write_text("object\n")
+        (ca / "child" / "Makefile").write_text(
+            "subdir := src\n"
+            ".PHONY: all\n"
+            "all:\n"
+            "\t@printf '%s\\n' '$(LIBS)' > result.txt\n")
+        r = run_make(
+            "MAKE51", ca, "-j10",
+            "LIBS+=base",
+            "LIBS+=$(if $(findstring src,$(subdir)),conditional)",
+            "LIBS+=$(wildcard xsize.o)",
+            "all")
+        check(r.returncode == 0,
+              f"case51: recursive command-line appends execute "
+              f"(got {r.returncode}: {(r.stdout+r.stderr)[-700:]})")
+        sp51 = latest_sqlar(m)
+        recursive_libs = m.sqlar_content(
+            sp51, str((ca / "child/result.txt").resolve()).lstrip("/"))
+        check(recursive_libs == b"base conditional xsize.o\n",
+              f"case51: every += is preserved and expanded in child scope; "
+              f"got {recursive_libs!r}")
     finally:
         if eng is not None and eng.poll() is None:
             eng.terminate()

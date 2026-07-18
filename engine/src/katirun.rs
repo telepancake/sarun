@@ -439,14 +439,32 @@ fn run_kati(
             };
             &def[..end]
         }
+        fn command_line_var_accumulates(def: &[u8]) -> bool {
+            let Some(eq) = def.iter().position(|&b| b == b'=') else {
+                return false;
+            };
+            eq > 0 && matches!(def[eq - 1], b'+' | b'?')
+        }
         for v in cl_vars {
-            // A recursive make's own `NAME=value` replaces the inherited
-            // definition of NAME; retaining both grows MAKEFLAGS at every
-            // level and, more importantly, lets a stale parent value win if a
-            // consumer replays the list in a different order.
-            let name = command_line_var_name(v);
-            fvars.retain(|old| command_line_var_name(old) != name);
-            fvars.push(v.clone());
+            if command_line_var_accumulates(v) {
+                // Repeated `NAME+=value` definitions are an ordered program,
+                // not alternate spellings of one override. OpenWrt passes a
+                // dozen LIBS+= expressions whose wildcards/conditionals must
+                // remain deferred and replay in each Automake subdirectory.
+                // Exact definitions already present in inherited MAKEFLAGS
+                // are not appended again at every recursive level.
+                if !fvars.contains(v) {
+                    fvars.push(v.clone());
+                }
+            } else {
+                // A recursive make's own `NAME=value` replaces the inherited
+                // definition of NAME; retaining both grows MAKEFLAGS at every
+                // level and, more importantly, lets a stale parent value win if a
+                // consumer replays the list in a different order.
+                let name = command_line_var_name(v);
+                fvars.retain(|old| command_line_var_name(old) != name);
+                fvars.push(v.clone());
+            }
         }
         let mut mf = BytesMut::new();
         for w in &fwords {
