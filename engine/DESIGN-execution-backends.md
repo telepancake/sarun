@@ -948,9 +948,19 @@ as executable mappings and mmap that genuinely need a host fd.
           directory stack, path cache, and status bookkeeping are cleared. The
           exact regression observes three split arguments, hidden unexported X,
           and preserved exported Y. All thirteen nested-shell integration cases,
-          vendor reconstruction, and the static aarch64 build pass. The tainted
-          module packages from the interrupted run must be cleaned and rebuilt
-          before the complete `world -j10` gate resumes.
+          vendor reconstruction, the static aarch64 build, and all 66
+          Make/Brush cases pass. The tainted module packages from the
+          interrupted run were then removed and rebuilt through Brush at
+          `-j10`. All 105 packaged modules and 96 kernel APKs were produced,
+          no `.tmp` module remained, and a sampled AArch64 module had neither a
+          `.comment` nor a `.note.gnu.build-id` section; no malformed `objcopy`
+          invocation recurred. The focused package rebuild took 779 seconds
+          wall while the runner itself used only 0.06 CPU seconds and the
+          server stayed near one core. Unlike the eliminated build-edge scans,
+          this remaining cost is dominated by the serialized stream of small
+          package-copy, metadata, overlay, and provenance operations through
+          the FUSE service. The complete `world -j10` gate can now resume from
+          the repaired package state.
           Earlier nonfatal empty-operand arithmetic and generated-config `sed`
           diagnostics stay recorded for attribution rather than normalization.
     - [x] Complete the native-aarch64 FUSE Brush gate from a clean output tree.
