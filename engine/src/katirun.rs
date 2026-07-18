@@ -468,6 +468,37 @@ fn run_kati(
                 fvars.push(v.clone());
             }
         }
+        // GNU make keeps the command-line-variable portion of MAKEFLAGS in
+        // MAKEOVERRIDES. A makefile can clear MAKEOVERRIDES before invoking a
+        // recursive make to stop those overrides at that boundary. GCC does
+        // this after passing a temporary CXX override into an intermediate
+        // make, allowing the configured CXX in the next layer to take over.
+        // Store the already MAKEFLAGS-quoted form; it is spliced back into
+        // MAKEFLAGS after parsing, like GNU's special-variable relationship.
+        let mut overrides = BytesMut::new();
+        for v in &fvars {
+            if !overrides.is_empty() {
+                overrides.put_u8(b' ');
+            }
+            overrides.put_slice(&kati::flags::Flags::quote_for_makeflags(v));
+        }
+        let makeoverrides = intern(b"MAKEOVERRIDES".to_vec());
+        if ev.lookup_var(makeoverrides)?.is_none() {
+            let value = overrides.freeze();
+            let val = Arc::new(Value::Literal(None, value.clone()));
+            ev.set_global_var(
+                makeoverrides,
+                Variable::new_recursive(
+                    val,
+                    VarOrigin::Default,
+                    Some(ev.current_frame()),
+                    None,
+                    value,
+                ),
+                false,
+                None,
+            )?;
+        }
         let mut mf = BytesMut::new();
         for w in &fwords {
             if !mf.is_empty() {
@@ -541,6 +572,44 @@ fn run_kati(
             anyhow::bail!("makefile not found");
         };
         ev.eval_stmts(&mk.stmts)?;
+    }
+
+    // Changing MAKEOVERRIDES rewrites only MAKEFLAGS' command-variable tail;
+    // ordinary flags (including makefile additions like `MAKEFLAGS += -rR`)
+    // survive. Reconcile that GNU make relationship before recipes and
+    // recursive makes see the exported value.
+    {
+        let makeflags = intern(b"MAKEFLAGS".to_vec());
+        let makeoverrides = intern(b"MAKEOVERRIDES".to_vec());
+        let current = ev.eval_var(makeflags)?;
+        let (flag_words, _) = kati::flags::Flags::split_makeflags(&current);
+        let overrides = ev.eval_var(makeoverrides)?;
+        let mut reconciled = BytesMut::new();
+        for word in flag_words {
+            if !reconciled.is_empty() {
+                reconciled.put_u8(b' ');
+            }
+            reconciled.put_slice(&word);
+        }
+        if !overrides.is_empty() {
+            if !reconciled.is_empty() {
+                reconciled.put_u8(b' ');
+            }
+            reconciled.put_slice(b"-- ");
+            reconciled.put_slice(&overrides);
+        }
+        let value = reconciled.freeze();
+        ev.set_global_var(
+            makeflags,
+            Variable::with_simple_string(
+                value,
+                VarOrigin::File,
+                Some(ev.current_frame()),
+                ev.loc.clone(),
+            ),
+            false,
+            None,
+        )?;
     }
 
     // sarun: GNU make's remake-the-makefile loop. Every included makefile is

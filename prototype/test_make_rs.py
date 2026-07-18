@@ -1988,6 +1988,40 @@ fi
         check(piped_result == b"from-pipe\n",
               f"case57: child recipe inherits make's logical stdin; "
               f"got {piped_result!r}")
+        # ── CASE 58: MAKEOVERRIDES stops command variables at a boundary ─
+        # GCC's top-level recursive build passes a temporary CXX override into
+        # an intermediate make, which clears MAKEOVERRIDES before descending
+        # into a configured subdirectory.  The leaf must see its file-origin
+        # compiler, not the now-empty parent command-line override.
+        mo = work / "recursive-makeoverrides-boundary"
+        shutil.rmtree(mo, ignore_errors=True)
+        (mo / "middle" / "leaf").mkdir(parents=True)
+        (mo / "Makefile").write_text(
+            ".PHONY: all\n"
+            "all:\n"
+            "\t@$(MAKE) --no-print-directory -C middle "
+            "'CXX=$$(MISSING_CXX)' all\n")
+        (mo / "middle" / "Makefile").write_text(
+            "MAKEOVERRIDES =\n"
+            ".PHONY: all\n"
+            "all:\n"
+            "\t@$(MAKE) --no-print-directory -C leaf all\n")
+        (mo / "middle" / "leaf" / "Makefile").write_text(
+            "CXX = configured-cxx\n"
+            ".PHONY: all\n"
+            "all:\n"
+            "\t@printf '%s|%s\\n' '$(CXX)' '$(origin CXX)' > result.txt\n")
+        r = run_make("MAKE58", mo, "-j10", "all")
+        check(r.returncode == 0,
+              f"case58: recursive MAKEOVERRIDES boundary completes "
+              f"(got {r.returncode}: {(r.stdout+r.stderr)[-700:]})")
+        sp58 = latest_sqlar(m)
+        overrides_result = m.sqlar_content(
+            sp58,
+            str((mo / "middle/leaf/result.txt").resolve()).lstrip("/"))
+        check(overrides_result == b"configured-cxx|file\n",
+              f"case58: leaf uses its configured file-origin compiler; "
+              f"got {overrides_result!r}")
     finally:
         if eng is not None and eng.poll() is None:
             eng.terminate()
