@@ -665,9 +665,24 @@ as executable mappings and mmap that genuinely need a host fd.
           which intentionally leaves its included target untouched; the full
           49-case suite passes. Replaying `tools/libtool/compile` in the same
           captured box now builds, links, installs, stamps, and exits zero. The
-          next boundary is resuming `world` from that state. The earlier
-          nonfatal empty-operand arithmetic diagnostics also remain for
-          attribution rather than normalization.
+          next boundary was resuming `world` from that state. That continuation
+          ran for about 42 minutes before `tools/mklibs` reached a missing
+          `configure`: its best-effort autoreconf had invoked the OpenWrt
+          `aclocal` wrapper without `STAGING_DIR_HOST`, resolving
+          `/bin/aclocal.real`. Patchelf, fakeroot, and flex showed the same
+          missing export concurrently, but retained shipped configure scripts.
+          An eight-way recursive-make stress fixture, including OpenWrt's exact
+          `scripts/time.pl` wrapper, preserves the export in every child and
+          completes every autoreconf. More importantly, cleaning those four
+          real tools and replaying the actual `make -j10 V=s tools/install`
+          graph in the captured box passes all four concurrent autoreconf jobs,
+          builds and installs mklibs, then continues through MPFR, MPC, Bison,
+          erofs-utils, e2fsprogs, findutils, elfutils, and the later host-tool
+          wave. The earlier omission has therefore not reproduced as an engine
+          defect; the live checkpoint is being allowed to finish before
+          `world` resumes. The earlier nonfatal empty-operand arithmetic and
+          generated-config `sed` diagnostics also remain for attribution rather
+          than normalization.
     - [x] Complete the native-aarch64 FUSE Brush gate from a clean output tree.
           Linux 6.18 builds 823 objects with `-j10` (11 observed overlapping
           clang processes), takes 162 s wall / 143 s compile, and records 2,797
