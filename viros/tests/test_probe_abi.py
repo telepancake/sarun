@@ -140,6 +140,96 @@ def minimal_aarch64_exec(base=0xffff800000100000, completion=True):
     return bytes(image), text
 
 
+def _elf32_sections(chunks, section_headers, names, *, elf_type, entry, flags):
+    image = bytearray(b"\0" * 52)
+    offsets = []
+    for contents, alignment in chunks:
+        cursor = (len(image) + alignment - 1) & -alignment
+        image.extend(b"\0" * (cursor - len(image)))
+        offsets.append(cursor)
+        image.extend(contents)
+    shoff = (len(image) + 3) & ~3
+    image.extend(b"\0" * (shoff - len(image)))
+    sections = [b"\0" * 40]
+    for header in section_headers(offsets):
+        sections.append(struct.pack("<IIIIIIIIII", *header))
+    image.extend(b"".join(sections))
+    header = b"\x7fELF" + bytes((1, 1, 1, 0)) + b"\0" * 8
+    header += struct.pack(
+        "<HHIIIIIHHHHHH", elf_type, 8, 1, entry, 0, shoff, flags,
+        52, 0, 0, 40, len(sections), names,
+    )
+    image[:52] = header
+    return bytes(image)
+
+
+def minimal_mmips_rel(*, flags=0x70001001, fp_abi=3, abi_flags1=1,
+                       abi_flags2=0, relocation=None, text_alignment=4):
+    names = b"\0.text\0.MIPS.abiflags\0.shstrtab\0.strtab\0.symtab\0.rel.text\0"
+    symbol_names = b"\0viros_probe_entry\0"
+    text = bytes.fromhex("0800e00300000000")  # jr ra; nop
+    abi_flags = struct.pack(
+        "<H6B4I", 0, 32, 2, 1, 0, 0, fp_abi, 0, 0,
+        abi_flags1, abi_flags2,
+    )
+    symbols = b"\0" * 16 + struct.pack(
+        "<IIIBBH", 1, 0, len(text), 0x12, 0, 1,
+    )
+    chunks = [(text, 4), (abi_flags, 8), (names, 1), (symbol_names, 1), (symbols, 4)]
+    if relocation is not None:
+        chunks.append((struct.pack("<II", 0, (1 << 8) | relocation), 4))
+
+    def headers(offsets):
+        result = [
+            (names.index(b".text"), 1, 0x6, 0, offsets[0], len(text),
+             0, 0, text_alignment, 0),
+            (names.index(b".MIPS.abiflags"), 0x7000002A, 0x2, 0,
+             offsets[1], len(abi_flags), 0, 0, 8, 24),
+            (names.index(b".shstrtab"), 3, 0, 0, offsets[2], len(names),
+             0, 0, 1, 0),
+            (names.index(b".strtab"), 3, 0, 0, offsets[3], len(symbol_names),
+             0, 0, 1, 0),
+            (names.index(b".symtab"), 2, 0, 0, offsets[4], len(symbols),
+             4, 1, 4, 16),
+        ]
+        if relocation is not None:
+            result.append((
+                names.index(b".rel.text"), 9, 0, 0, offsets[5], 8,
+                5, 1, 4, 8,
+            ))
+        return result
+
+    return _elf32_sections(
+        chunks, headers, 3, elf_type=1, entry=0, flags=flags,
+    )
+
+
+def minimal_mmips_exec(base=0x81000000, *, flags=0x70001001):
+    names = b"\0.text\0.shstrtab\0.strtab\0.symtab\0"
+    symbol_names = b"\0viros_probe_entry\0viros_probe_complete\0"
+    text = struct.pack("<II", 0x03E00008, (0x5650 << 6) | 0x0D)
+    symbols = b"\0" * 16
+    symbols += struct.pack("<IIIBBH", 1, base, 4, 0x12, 0, 1)
+    symbols += struct.pack("<IIIBBH", 19, base + 4, 4, 0x12, 0, 1)
+    chunks = [(text, 4), (names, 1), (symbol_names, 1), (symbols, 4)]
+
+    def headers(offsets):
+        return [
+            (names.index(b".text"), 1, 0x6, base, offsets[0], len(text),
+             0, 0, 4, 0),
+            (names.index(b".shstrtab"), 3, 0, 0, offsets[1], len(names),
+             0, 0, 1, 0),
+            (names.index(b".strtab"), 3, 0, 0, offsets[2], len(symbol_names),
+             0, 0, 1, 0),
+            (names.index(b".symtab"), 2, 0, 0, offsets[3], len(symbols),
+             3, 1, 4, 16),
+        ]
+
+    return _elf32_sections(
+        chunks, headers, 2, elf_type=2, entry=base, flags=flags,
+    ), text
+
+
 class ProbeAbiTests(unittest.TestCase):
     def test_fixed_layout_sizes(self):
         self.assertEqual(ctypes.sizeof(Request), 64)
@@ -176,6 +266,35 @@ class ProbeAbiTests(unittest.TestCase):
             path.write_bytes(minimal_aarch64_rel(entry=False))
             with self.assertRaisesRegex(PROBE_TOOL.AuditError, "viros_probe_entry"):
                 PROBE_TOOL.audit_object(path)
+
+    def test_auditor_accepts_pinned_mmips_soft_float_oddspreg_flags(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "probe.o"
+            # GCC 9.3's exact MIPS32r2 soft-float object records ODDSPREG in
+            # ABI flags1 even though it emits no floating-point instructions.
+            path.write_bytes(minimal_mmips_rel())
+            result = PROBE_TOOL.audit_object(path, "mmips")
+            self.assertEqual(result["arch"], "mmips")
+            self.assertEqual(result["elf_class"], 32)
+            self.assertEqual(result["byte_order"], "little")
+
+    def test_mmips_auditor_rejects_pic_hard_float_and_gp_relocations(self):
+        cases = (
+            (minimal_mmips_rel(flags=0x70001003), "non-PIC"),
+            (minimal_mmips_rel(fp_abi=1), "soft-float"),
+            (minimal_mmips_rel(abi_flags1=2), "unsupported ISA features"),
+            (minimal_mmips_rel(abi_flags2=1), "unsupported ISA features"),
+            (minimal_mmips_rel(relocation=7), "GP/GOT-relative"),
+            (minimal_mmips_rel(relocation=133), "MIPS16/microMIPS"),
+            (minimal_mmips_rel(text_alignment=2), "4-byte aligned"),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "probe.o"
+            for image, message in cases:
+                with self.subTest(message=message):
+                    path.write_bytes(image)
+                    with self.assertRaisesRegex(PROBE_TOOL.AuditError, message):
+                        PROBE_TOOL.audit_object(path, "mmips")
 
     def test_auditor_rejects_non_elf(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -262,9 +381,81 @@ class ProbeAbiTests(unittest.TestCase):
             self.assertEqual(loaded["abi_minor"], 2)
             self.assertEqual(loaded_binary, (output / "viros_probe.bin").resolve())
 
+    def test_mmips_package_is_snapshot_only_and_records_o32_registers(self):
+        base = 0x81000000
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            source = directory / "source.o"
+            source.write_bytes(minimal_mmips_rel())
+            build_manifest = directory / "probe.json"
+            build_manifest.write_text(json.dumps({
+                "schema": "viros-probe-build-v1",
+                "arch": "mmips",
+                "object": source.name,
+                "object_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+                "kernel": {
+                    "sha256": "2" * 64,
+                    "build_id": "0123456789abcdef",
+                },
+            }), encoding="utf-8")
+            output = directory / "package"
+            linked_image, flat = minimal_mmips_exec(base)
+            commands = []
+
+            def fake_run(command, check):
+                self.assertTrue(check)
+                commands.append(command)
+                if command[0] == "exact-mmips-ld":
+                    Path(command[command.index("-o") + 1]).write_bytes(linked_image)
+                elif command[0] == "exact-mmips-objcopy":
+                    Path(command[-1]).write_bytes(flat)
+                else:
+                    self.fail("unexpected tool: " + command[0])
+                return SimpleNamespace(returncode=0)
+
+            args = SimpleNamespace(
+                build_manifest=build_manifest, output_dir=output, load_address=base,
+                cross_ld="exact-mmips-ld", objcopy="exact-mmips-objcopy",
+                max_alloc=65536,
+            )
+            with mock.patch.object(PROBE_TOOL.subprocess, "run", side_effect=fake_run):
+                manifest = PROBE_TOOL.package_object(args)
+
+            self.assertEqual(commands[0][1:3], ["-m", "elf32ltsmip"])
+            self.assertEqual(manifest["arch"], "mmips")
+            self.assertEqual(manifest["capabilities"], ["snapshot-v1"])
+            self.assertEqual(
+                manifest["call_abi"]["argument_registers"], ["r4", "r5", "r6"],
+            )
+            self.assertEqual(manifest["call_abi"]["link_register"], "r31")
+            self.assertEqual(manifest["call_abi"]["result_register"], "r2")
+            self.assertEqual(manifest["call_abi"]["completion_trap"], "break-0x5650")
+            self.assertEqual(struct.unpack_from("<I", flat, 4)[0], 0x0015940D)
+            self.assertNotIn("translation_v1_bytes", manifest["abi_layout"])
+            self.assertNotIn("saved_regs_v1_bytes", manifest["abi_layout"])
+            self.assertNotIn("pgd_address_kind", manifest)
+            loaded, binary = PROBE_TOOL.load_probe_package(output / "package.json")
+            self.assertEqual(loaded["elf_abi"]["isa"], "mips32r2")
+            self.assertEqual(binary, (output / "viros_probe.bin").resolve())
+
+    def test_mmips_linked_image_rejects_pic_flags(self):
+        base = 0x81000000
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "probe.elf"
+            image, _ = minimal_mmips_exec(base, flags=0x70001003)
+            path.write_bytes(image)
+            with self.assertRaisesRegex(PROBE_TOOL.AuditError, "non-PIC"):
+                PROBE_TOOL.audit_linked_image(path, base, arch="mmips")
+
     def test_package_rejects_unaligned_address_before_tools(self):
         with self.assertRaisesRegex(PROBE_TOOL.AuditError, "16-byte aligned"):
             PROBE_TOOL.linker_script(0x1003)
+
+    def test_mmips_package_rejects_unaligned_or_64bit_address(self):
+        with self.assertRaisesRegex(PROBE_TOOL.AuditError, "4-byte aligned"):
+            PROBE_TOOL.linker_script(0x81000002, "mmips")
+        with self.assertRaisesRegex(PROBE_TOOL.AuditError, "32-bit"):
+            PROBE_TOOL.linker_script(0x100000000, "mmips")
 
     def test_exact_kbuild_must_contain_the_supplied_vmlinux(self):
         with tempfile.TemporaryDirectory() as directory:

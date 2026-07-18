@@ -22,7 +22,7 @@
 
 #include "viros_probe_abi.h"
 
-/* The launcher places this address in LR after linking the object. */
+/* The launcher places this address in the architecture link register. */
 #if defined(CONFIG_ARM64)
 asm(".pushsection .text.viros_probe_complete,\"ax\"\n"
     ".global viros_probe_complete\n"
@@ -30,6 +30,25 @@ asm(".pushsection .text.viros_probe_complete,\"ax\"\n"
     "viros_probe_complete:\n"
     "brk #0x5650\n"
     ".size viros_probe_complete, .-viros_probe_complete\n"
+    ".popsection\n");
+#elif defined(CONFIG_MIPS)
+/*
+ * The call gate installs a hardware breakpoint on this symbol, so the
+ * instruction normally is not executed.  Spell it as one fixed word anyway:
+ * an o32 return address must name a four-byte classic-MIPS instruction, never
+ * a MIPS16 or microMIPS encoding selected by assembler state.
+ */
+asm(".pushsection .text.viros_probe_complete,\"ax\"\n"
+    ".set push\n"
+    ".set noreorder\n"
+    ".set nomips16\n"
+    ".set nomicromips\n"
+    ".global viros_probe_complete\n"
+    ".type viros_probe_complete, %function\n"
+    "viros_probe_complete:\n"
+    ".word 0x0015940d\n" /* classic MIPS break 0x5650 */
+    ".size viros_probe_complete, .-viros_probe_complete\n"
+    ".set pop\n"
     ".popsection\n");
 #endif
 
@@ -176,12 +195,21 @@ static __always_inline void viros_init_response(
 #else
 	response->arch = VIROS_PROBE_ARCH_UNKNOWN;
 #endif
-#if defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
+#if defined(CONFIG_MIPS) && defined(CONFIG_CPU_LITTLE_ENDIAN)
+	response->endian = VIROS_PROBE_ENDIAN_LITTLE;
+#elif defined(CONFIG_MIPS) && defined(CONFIG_CPU_BIG_ENDIAN)
+	response->endian = VIROS_PROBE_ENDIAN_BIG;
+#elif defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
 	response->endian = VIROS_PROBE_ENDIAN_LITTLE;
 #else
 	response->endian = VIROS_PROBE_ENDIAN_BIG;
 #endif
+#if defined(CONFIG_MIPS)
+	/* This leaf is deliberately compiled with the o32 ABI. */
+	response->pointer_bits = 32;
+#else
 	response->pointer_bits = sizeof(void *) * 8;
+#endif
 	response->status = VIROS_PROBE_OK;
 	response->flags = 0;
 	response->record_count = 0;

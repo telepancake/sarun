@@ -226,6 +226,10 @@ static_assert(sizeof(struct viros_probe_translation_v1) ==
 	      VIROS_PROBE_TRANSLATION_V1_SIZE);
 static_assert(sizeof(struct viros_probe_saved_regs_v1) ==
 	      VIROS_PROBE_SAVED_REGS_V1_SIZE);
+#if defined(CONFIG_MIPS)
+/* viros_probe.c advertises MIPS as the o32, 32-bit-pointer snapshot target. */
+static_assert(sizeof(void *) * 8 == 32);
+#endif
 #endif
 
 #endif /* VIROS_PROBE_ABI_H */

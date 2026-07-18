@@ -25,6 +25,7 @@ from callgate.manifest import ManifestError, load_and_validate_manifest
 
 ET_REL = 1
 ET_EXEC = 2
+EM_MIPS = 8
 EM_AARCH64 = 183
 SHN_UNDEF = 0
 SHT_SYMTAB = 2
@@ -35,6 +36,45 @@ SHT_REL = 9
 SHT_NOTE = 7
 SHF_WRITE = 0x1
 SHF_ALLOC = 0x2
+SHF_EXECINSTR = 0x4
+SHF_MIPS_GPREL = 0x10000000
+
+SHT_MIPS_REGINFO = 0x70000006
+SHT_MIPS_ABIFLAGS = 0x7000002A
+
+EF_MIPS_NOREORDER = 0x00000001
+EF_MIPS_PIC = 0x00000002
+EF_MIPS_CPIC = 0x00000004
+EF_MIPS_ABI2 = 0x00000020
+EF_MIPS_MICROMIPS = 0x02000000
+EF_MIPS_ARCH_ASE_M16 = 0x04000000
+EF_MIPS_ABI_MASK = 0x0000F000
+EF_MIPS_ABI_O32 = 0x00001000
+EF_MIPS_ARCH_MASK = 0xF0000000
+EF_MIPS_ARCH_32R2 = 0x70000000
+MMIPS_ALLOWED_E_FLAGS = EF_MIPS_NOREORDER | EF_MIPS_ABI_O32 | EF_MIPS_ARCH_32R2
+
+AFL_REG_NONE = 0
+AFL_REG_32 = 1
+VAL_GNU_MIPS_ABI_FP_SOFT = 3
+MIPS_AFL_FLAGS1_ODDSPREG = 0x1
+
+# Relocations which obtain addresses through the ABI global pointer or GOT are
+# incompatible with a flat image injected without the normal MIPS loader.
+MIPS_GP_RELOCATIONS = frozenset({
+    7,   # R_MIPS_GPREL16
+    8,   # R_MIPS_LITERAL
+    9,   # R_MIPS_GOT16
+    11,  # R_MIPS_CALL16
+    12,  # R_MIPS_GPREL32
+    19, 20, 21, 22, 23,  # R_MIPS_GOT_DISP/PAGE/OFST/HI16/LO16
+    30, 31,  # R_MIPS_CALL_HI16/LO16
+    *range(38, 51),  # All MIPS TLS forms depend on loader/runtime state.
+})
+MIPS_COMPACT_ISA_RELOCATIONS = frozenset({
+    *range(100, 114),  # R_MIPS16_*
+    *range(133, 174),  # R_MICROMIPS_*
+})
 
 PROBE_PACKAGE_SCHEMA = "viros-probe-package-v1"
 PROBE_BUILD_SCHEMA = "viros-probe-build-v1"
@@ -220,7 +260,8 @@ class ElfObject:
         self.endian = "<" if encoding == 1 else ">"
         fmt = self.endian + ("HHIIIIIHHHHHH" if elf_class == 1 else "HHIQQQIHHHHHH")
         values = struct.unpack_from(fmt, self.data, 16)
-        self.elf_type, self.machine = values[0], values[1]
+        self.elf_type, self.machine, self.entry = values[0], values[1], values[3]
+        self.flags = values[6]
         self.shoff = values[5]
         self.shentsize, self.shnum, self.shstrndx = values[10:13]
         self.sections = self._read_sections()
@@ -247,7 +288,8 @@ class ElfObject:
             sections.append({
                 "index": index, "name": name, "type": item[1],
                 "flags": item[2], "addr": item[3], "offset": item[4], "size": item[5],
-                "link": item[6], "info": item[7], "entsize": item[9],
+                "link": item[6], "info": item[7], "addralign": item[8],
+                "entsize": item[9],
                 "raw": item,
             })
         return sections
@@ -279,25 +321,62 @@ class ElfObject:
                 end = strings.find(b"\0", name_offset)
                 name = strings[name_offset:end if end >= 0 else None].decode(errors="replace")
                 if self.elf_class == 32:
-                    value, symbol_size, info, shndx = item[1], item[2], item[3], item[5]
+                    value, symbol_size, info, other, shndx = (
+                        item[1], item[2], item[3], item[4], item[5]
+                    )
                 else:
-                    info, shndx, value, symbol_size = item[1], item[3], item[4], item[5]
+                    info, other, shndx, value, symbol_size = (
+                        item[1], item[2], item[3], item[4], item[5]
+                    )
                 result.append({"name": name, "shndx": shndx, "value": value,
                                "size": symbol_size, "binding": info >> 4,
-                               "type": info & 0xf})
+                               "type": info & 0xf, "other": other})
         return result
 
     def symbols(self):
         return [(item["name"], item["shndx"]) for item in self.symbol_records()]
 
+    def relocation_records(self):
+        """Return relocation types and symbol indexes from REL/RELA sections."""
 
-def gnu_build_id(path: Path) -> str:
-    """Return the GNU build ID embedded in an AArch64 ELF image."""
+        result = []
+        if self.elf_class == 32:
+            formats = {SHT_REL: self.endian + "II", SHT_RELA: self.endian + "IIi"}
+        else:
+            formats = {SHT_REL: self.endian + "QQ", SHT_RELA: self.endian + "QQq"}
+        for section in self.sections:
+            if section["type"] not in formats:
+                continue
+            fmt = formats[section["type"]]
+            size = struct.calcsize(fmt)
+            entsize = section["entsize"] or size
+            if entsize < size or section["size"] % entsize:
+                raise AuditError(f"{self.path}: malformed relocation section {section['name']}")
+            contents = self._section_bytes(section["raw"])
+            for offset in range(0, len(contents), entsize):
+                item = struct.unpack_from(fmt, contents, offset)
+                info = item[1]
+                if self.elf_class == 32:
+                    symbol_index, relocation_type = info >> 8, info & 0xff
+                else:
+                    symbol_index, relocation_type = info >> 32, info & 0xffffffff
+                result.append({
+                    "section": section["name"], "symbol_index": symbol_index,
+                    "type": relocation_type,
+                })
+        return result
+
+
+def gnu_build_id(path: Path, arch: str = "aarch64") -> str:
+    """Return the GNU build ID embedded in an ELF image for ``arch``."""
 
     elf = ElfObject(path)
-    if elf.machine != EM_AARCH64:
+    machines = {"aarch64": EM_AARCH64, "mmips": EM_MIPS}
+    if arch not in machines:
+        raise AuditError(f"build-ID support is not implemented for {arch}")
+    if elf.machine != machines[arch]:
         raise AuditError(
-            f"{path}: expected AArch64 machine {EM_AARCH64}, got {elf.machine}"
+            f"{path}: expected {arch} machine {machines[arch]}, got {elf.machine}"
         )
     identifiers: set[bytes] = set()
     for section in elf.sections:
@@ -346,8 +425,8 @@ def load_probe_build(path: Path) -> tuple[dict, Path]:
         raise AuditError("probe build manifest must be a JSON object")
     if document.get("schema") != PROBE_BUILD_SCHEMA:
         raise AuditError(f"probe build schema must be {PROBE_BUILD_SCHEMA!r}")
-    if document.get("arch") != "aarch64":
-        raise AuditError("only an aarch64 probe build can be packaged")
+    if document.get("arch") not in ("aarch64", "mmips"):
+        raise AuditError("probe build arch must be aarch64 or mmips")
     probe_object = _package_file(build_path, document.get("object"), "build.object")
     expected = _sha256_string(document.get("object_sha256"), "build.object_sha256")
     actual = _sha256_file(probe_object)
@@ -375,8 +454,9 @@ def load_probe_package(path: Path) -> tuple[dict, Path]:
         raise AuditError("probe package must be a JSON object")
     if document.get("schema") != PROBE_PACKAGE_SCHEMA:
         raise AuditError(f"probe package schema must be {PROBE_PACKAGE_SCHEMA!r}")
-    if document.get("arch") != "aarch64":
-        raise AuditError("only an aarch64 probe package can use this call gate")
+    arch = document.get("arch")
+    if arch not in ("aarch64", "mmips"):
+        raise AuditError("probe package arch must be aarch64 or mmips")
     minor = document.get("abi_minor")
     if document.get("abi_major") != PROBE_ABI_MAJOR or minor not in (0, 1, PROBE_ABI_MINOR):
         raise AuditError("probe package ABI is not a supported viros probe ABI 1.x")
@@ -408,25 +488,59 @@ def load_probe_package(path: Path) -> tuple[dict, Path]:
         "target_byte_order": "little",
     }
     capabilities = document.get("capabilities")
-    if ((minor == 0 and not legacy_layout)
-            or (minor == 1 and (
-                not translation_layout or capabilities != [
-                    "snapshot-v1", "translate-va-aarch64-v1"
-                ]))
-            or (minor == PROBE_ABI_MINOR and (
-                not current_layout or capabilities != [
-                    "snapshot-v1", "translate-va-aarch64-v1",
-                    "saved-regs-aarch64-v1",
-                ]))):
-        raise AuditError("probe package has an incompatible ABI layout")
-    call_abi = document.get("call_abi")
-    if not isinstance(call_abi, dict) or (
-        call_abi.get("name") != "aapcs64"
-        or call_abi.get("argument_registers") != ["x0", "x1", "x2"]
-        or call_abi.get("link_register") != "x30"
-        or call_abi.get("stack_alignment") != 16
+    mmips_layout = layout == {
+        "version": 1,
+        "request_v1_bytes": PROBE_REQUEST_SIZE,
+        "response_v1_header_bytes": PROBE_RESPONSE_SIZE,
+        "task_v1_bytes": PROBE_TASK_SIZE,
+        "target_byte_order": "little",
+    }
+    if arch == "aarch64":
+        if ((minor == 0 and not legacy_layout)
+                or (minor == 1 and (
+                    not translation_layout or capabilities != [
+                        "snapshot-v1", "translate-va-aarch64-v1"
+                    ]))
+                or (minor == PROBE_ABI_MINOR and (
+                    not current_layout or capabilities != [
+                        "snapshot-v1", "translate-va-aarch64-v1",
+                        "saved-regs-aarch64-v1",
+                    ]))):
+            raise AuditError("probe package has an incompatible ABI layout")
+    elif (
+        minor != PROBE_ABI_MINOR
+        or not mmips_layout
+        or capabilities != ["snapshot-v1"]
     ):
-        raise AuditError("probe package has an incompatible AArch64 call ABI")
+        raise AuditError("mmips probe package must advertise only snapshot-v1")
+    if arch == "mmips" and document.get("elf_abi") != {
+        "class": 32, "byte_order": "little", "machine": "EM_MIPS",
+        "isa": "mips32r2", "abi": "o32", "float": "soft",
+        "pic": False, "mips16": False, "micromips": False,
+    }:
+        raise AuditError("mmips probe package has incompatible ELF ABI metadata")
+    call_abi = document.get("call_abi")
+    if arch == "aarch64":
+        valid_call_abi = (
+            isinstance(call_abi, dict)
+            and call_abi.get("name") == "aapcs64"
+            and call_abi.get("argument_registers") == ["x0", "x1", "x2"]
+            and call_abi.get("link_register") == "x30"
+            and call_abi.get("stack_alignment") == 16
+        )
+        error = "probe package has an incompatible AArch64 call ABI"
+    else:
+        valid_call_abi = (
+            isinstance(call_abi, dict)
+            and call_abi.get("name") == "o32-soft-float"
+            and call_abi.get("argument_registers") == ["r4", "r5", "r6"]
+            and call_abi.get("result_register") == "r2"
+            and call_abi.get("link_register") == "r31"
+            and call_abi.get("stack_alignment") == 8
+        )
+        error = "probe package has an incompatible MMIPS o32 call ABI"
+    if not valid_call_abi:
+        raise AuditError(error)
 
     binary = _package_file(package_path, document.get("binary"), "package.binary")
     expected = _sha256_string(document.get("binary_sha256"), "package.binary_sha256")
@@ -447,10 +561,18 @@ def load_probe_package(path: Path) -> tuple[dict, Path]:
     completion_offset = _manifest_integer(
         document.get("completion_offset"), "package.completion_offset"
     )
-    if load_address >= 1 << 64 or load_address & 0xf:
-        raise AuditError("package.load_address must be an aligned 64-bit AArch64 address")
-    if image_start >= UINT64_LIMIT or image_end > UINT64_LIMIT:
-        raise AuditError("probe package linked image bounds do not fit in 64 bits")
+    address_limit = UINT64_LIMIT if arch == "aarch64" else 1 << 32
+    alignment = 16 if arch == "aarch64" else 4
+    if load_address >= address_limit or load_address & (alignment - 1):
+        raise AuditError(
+            f"package.load_address must be an aligned "
+            f"{64 if arch == 'aarch64' else 32}-bit {arch} address"
+        )
+    if image_start >= address_limit or image_end > address_limit:
+        raise AuditError(
+            f"probe package linked image bounds do not fit in "
+            f"{64 if arch == 'aarch64' else 32} bits"
+        )
     if image_start != load_address or image_end != image_start + size:
         raise AuditError("probe package linked image bounds are inconsistent")
     if any(offset >= size or offset & 3 for offset in (entry_offset, completion_offset)):
@@ -557,6 +679,10 @@ def create_callgate_manifest(args):
 
     package_path = Path(args.package).resolve()
     package, binary = load_probe_package(package_path)
+    if package["arch"] != "aarch64":
+        raise AuditError(
+            "callgate-manifest currently requires an aarch64 probe package"
+        )
     if (
         not isinstance(args.init_task, int) or isinstance(args.init_task, bool)
         or args.init_task <= 0 or args.init_task >= 1 << 64
@@ -717,20 +843,141 @@ def create_callgate_manifest(args):
     return document
 
 
+def _audit_mmips_identity(elf: ElfObject, *, require_abi_flags: bool) -> None:
+    if elf.elf_class != 32 or elf.endian != "<":
+        raise AuditError(f"{elf.path}: mmips requires ELF32 little-endian")
+    if elf.machine != EM_MIPS:
+        raise AuditError(f"{elf.path}: expected mmips machine {EM_MIPS}, got {elf.machine}")
+    if elf.flags & (EF_MIPS_PIC | EF_MIPS_CPIC):
+        raise AuditError(f"{elf.path}: MMIPS probe must be non-PIC/non-CPIC")
+    if elf.flags & (EF_MIPS_MICROMIPS | EF_MIPS_ARCH_ASE_M16):
+        raise AuditError(f"{elf.path}: MIPS16 and microMIPS code are not supported")
+    if elf.flags & EF_MIPS_ABI2 or elf.flags & EF_MIPS_ABI_MASK != EF_MIPS_ABI_O32:
+        raise AuditError(f"{elf.path}: MMIPS probe must use the o32 ABI")
+    if elf.flags & EF_MIPS_ARCH_MASK != EF_MIPS_ARCH_32R2:
+        raise AuditError(f"{elf.path}: MMIPS probe must target MIPS32r2")
+    unsupported = elf.flags & ~MMIPS_ALLOWED_E_FLAGS
+    if unsupported:
+        raise AuditError(f"{elf.path}: unsupported MIPS ELF flags {unsupported:#x}")
+
+    abi_sections = [
+        section for section in elf.sections
+        if section["type"] == SHT_MIPS_ABIFLAGS or section["name"] == ".MIPS.abiflags"
+    ]
+    if not abi_sections:
+        if require_abi_flags:
+            raise AuditError(f"{elf.path}: missing .MIPS.abiflags soft-float proof")
+        return
+    if len(abi_sections) != 1:
+        raise AuditError(f"{elf.path}: expected exactly one .MIPS.abiflags section")
+    section = abi_sections[0]
+    contents = elf._section_bytes(section["raw"])
+    if section["type"] != SHT_MIPS_ABIFLAGS or len(contents) != 24:
+        raise AuditError(f"{elf.path}: malformed .MIPS.abiflags section")
+    (
+        version, isa_level, isa_rev, gpr_size, cpr1_size, cpr2_size, fp_abi,
+        isa_ext, ases, flags1, flags2,
+    ) = struct.unpack(elf.endian + "H6B4I", contents)
+    if version != 0 or isa_level != 32 or isa_rev != 2:
+        raise AuditError(f"{elf.path}: .MIPS.abiflags does not describe MIPS32r2")
+    if (
+        gpr_size != AFL_REG_32
+        or cpr1_size != AFL_REG_NONE
+        or cpr2_size != AFL_REG_NONE
+        or fp_abi != VAL_GNU_MIPS_ABI_FP_SOFT
+    ):
+        raise AuditError(f"{elf.path}: .MIPS.abiflags does not prove o32 soft-float")
+    if isa_ext or ases or flags1 & ~MIPS_AFL_FLAGS1_ODDSPREG or flags2:
+        raise AuditError(f"{elf.path}: .MIPS.abiflags requests unsupported ISA features")
+
+
+def _audit_mmips_alloc_sections(elf: ElfObject, *, linked: bool) -> None:
+    for section in elf.sections:
+        if not section["size"] or not section["flags"] & SHF_ALLOC:
+            continue
+        name = section["name"]
+        if section["flags"] & SHF_MIPS_GPREL:
+            raise AuditError(f"{elf.path}: GP-relative alloc section {name}")
+        if section["flags"] & SHF_EXECINSTR:
+            if not name.startswith(".text"):
+                raise AuditError(f"{elf.path}: unexpected executable alloc section {name}")
+            if (
+                section["addr"] & 3
+                or section["offset"] & 3
+                or section["size"] & 3
+                or section["addralign"] < 4
+            ):
+                raise AuditError(f"{elf.path}: instruction section {name} is not 4-byte aligned")
+            continue
+        if name.startswith(".rodata"):
+            continue
+        if not linked and (
+            section["type"] in (SHT_MIPS_ABIFLAGS, SHT_MIPS_REGINFO)
+            or name in (".MIPS.abiflags", ".reginfo")
+        ):
+            continue
+        raise AuditError(f"{elf.path}: unexpected MMIPS alloc section {name}")
+
+    reginfo = [section for section in elf.sections
+               if section["type"] == SHT_MIPS_REGINFO or section["name"] == ".reginfo"]
+    for section in reginfo:
+        contents = elf._section_bytes(section["raw"])
+        if section["type"] != SHT_MIPS_REGINFO or len(contents) != 24:
+            raise AuditError(f"{elf.path}: malformed .reginfo section")
+        if struct.unpack(elf.endian + "IIIIII", contents)[-1] != 0:
+            raise AuditError(f"{elf.path}: .reginfo contains a nonzero GP value")
+
+
 def audit_object(path: Path, arch: str = "aarch64", max_alloc: int = 65536):
     elf = ElfObject(path)
-    machines = {"aarch64": EM_AARCH64}
+    machines = {"aarch64": EM_AARCH64, "mmips": EM_MIPS}
     if arch not in machines:
         raise AuditError(f"audit support is not implemented for {arch}")
     if elf.elf_type != ET_REL:
         raise AuditError(f"{path}: expected ET_REL, got ELF type {elf.elf_type}")
     if elf.machine != machines[arch]:
         raise AuditError(f"{path}: expected {arch} machine {machines[arch]}, got {elf.machine}")
+    if arch == "mmips":
+        _audit_mmips_identity(elf, require_abi_flags=True)
 
     symbols = elf.symbols()
     undefined = sorted(name for name, shndx in symbols if name and shndx == SHN_UNDEF)
     if undefined:
         raise AuditError(f"{path}: undefined symbols: {', '.join(undefined)}")
+    if arch == "mmips":
+        mode_symbols = sorted({
+            item["name"] for item in elf.symbol_records()
+            if item["name"] and item["other"] & 0xf0
+        })
+        if mode_symbols:
+            raise AuditError(
+                f"{path}: PIC/MIPS16/microMIPS symbol modes: "
+                + ", ".join(mode_symbols)
+            )
+        gp_symbols = sorted({
+            name for name, _ in symbols
+            if name in ("_gp", "_gp_disp", "__gnu_local_gp")
+        })
+        if gp_symbols:
+            raise AuditError(f"{path}: GP-relative symbols: {', '.join(gp_symbols)}")
+        gp_relocations = sorted({
+            item["type"] for item in elf.relocation_records()
+            if item["type"] in MIPS_GP_RELOCATIONS
+        })
+        if gp_relocations:
+            raise AuditError(
+                f"{path}: GP/GOT-relative MIPS relocations: "
+                + ", ".join(str(item) for item in gp_relocations)
+            )
+        compact_relocations = sorted({
+            item["type"] for item in elf.relocation_records()
+            if item["type"] in MIPS_COMPACT_ISA_RELOCATIONS
+        })
+        if compact_relocations:
+            raise AuditError(
+                f"{path}: MIPS16/microMIPS relocations: "
+                + ", ".join(str(item) for item in compact_relocations)
+            )
     defined = {name for name, shndx in symbols if name and shndx != SHN_UNDEF}
     if "viros_probe_entry" not in defined:
         raise AuditError(f"{path}: viros_probe_entry is not defined")
@@ -751,6 +998,8 @@ def audit_object(path: Path, arch: str = "aarch64", max_alloc: int = 65536):
                 == (SHF_ALLOC | SHF_WRITE)]
     if writable:
         raise AuditError(f"{path}: stateful writable sections: {', '.join(writable)}")
+    if arch == "mmips":
+        _audit_mmips_alloc_sections(elf, linked=False)
     return {
         "path": str(path), "arch": arch, "elf_class": elf.elf_class,
         "byte_order": "little" if elf.endian == "<" else "big",
@@ -760,7 +1009,30 @@ def audit_object(path: Path, arch: str = "aarch64", max_alloc: int = 65536):
     }
 
 
-def linker_script(load_address: int) -> str:
+def linker_script(load_address: int, arch: str = "aarch64") -> str:
+    if arch == "mmips":
+        if load_address < 0 or load_address > 0xffffffff:
+            raise AuditError("load address does not fit a 32-bit MMIPS address")
+        if load_address & 3:
+            raise AuditError("MMIPS probe load address must be 4-byte aligned")
+        return f"""/* Generated by probe_tool.py; do not edit. */
+ENTRY(viros_probe_entry)
+SECTIONS
+{{
+  . = 0x{load_address:x};
+  __viros_image_start = .;
+  .text : ALIGN(4) {{ *(.text .text.*) }}
+  .rodata : ALIGN(4) {{ *(.rodata .rodata.*) }}
+  .data : ALIGN(4) {{ *(.data .data.*) }}
+  .bss (NOLOAD) : ALIGN(4) {{ *(.bss .bss.* COMMON) }}
+  __viros_image_end = .;
+  ASSERT(SIZEOF(.data) == 0, "viros probe must not contain writable data")
+  ASSERT(SIZEOF(.bss) == 0, "viros probe must not contain bss")
+  /DISCARD/ : {{ *(.MIPS.abiflags) *(.reginfo) *(.pdr) *(.mdebug.*) *(.gnu.attributes) *(.comment) *(.note*) *(.eh_frame*) *(.debug*) *(.discard.*) }}
+}}
+"""
+    if arch != "aarch64":
+        raise AuditError(f"link support is not implemented for {arch}")
     if load_address < 0 or load_address > 0xffffffffffffffff:
         raise AuditError("load address does not fit an AArch64 address")
     if load_address & 0xf:
@@ -783,12 +1055,20 @@ SECTIONS
 """
 
 
-def audit_linked_image(path: Path, load_address: int, max_alloc: int = 65536):
+def audit_linked_image(
+    path: Path, load_address: int, max_alloc: int = 65536,
+    arch: str = "aarch64",
+):
     elf = ElfObject(path)
     if elf.elf_type != ET_EXEC:
         raise AuditError(f"{path}: expected linked ET_EXEC, got ELF type {elf.elf_type}")
-    if elf.machine != EM_AARCH64:
-        raise AuditError(f"{path}: expected AArch64 machine {EM_AARCH64}, got {elf.machine}")
+    machines = {"aarch64": EM_AARCH64, "mmips": EM_MIPS}
+    if arch not in machines:
+        raise AuditError(f"linked-image audit support is not implemented for {arch}")
+    if elf.machine != machines[arch]:
+        raise AuditError(f"{path}: expected {arch} machine {machines[arch]}, got {elf.machine}")
+    if arch == "mmips":
+        _audit_mmips_identity(elf, require_abi_flags=False)
     symbols = elf.symbol_records()
     undefined = sorted(item["name"] for item in symbols
                        if item["name"] and item["shndx"] == SHN_UNDEF)
@@ -816,6 +1096,8 @@ def audit_linked_image(path: Path, load_address: int, max_alloc: int = 65536):
     if nobits or writable:
         names = sorted(set(nobits + writable))
         raise AuditError(f"{path}: linked image is not a stateless flat blob: {', '.join(names)}")
+    if arch == "mmips":
+        _audit_mmips_alloc_sections(elf, linked=True)
     image_start = min(section["addr"] for section in alloc)
     image_end = max(section["addr"] + section["size"] for section in alloc)
     if image_start != load_address:
@@ -827,6 +1109,10 @@ def audit_linked_image(path: Path, load_address: int, max_alloc: int = 65536):
     for name, value in addresses.items():
         if not image_start <= value < image_end:
             raise AuditError(f"{path}: {name} at {value:#x} is outside the flat image")
+        if arch == "mmips" and value & 3:
+            raise AuditError(f"{path}: {name} does not select a 4-byte instruction")
+    if arch == "mmips" and elf.entry != addresses["viros_probe_entry"]:
+        raise AuditError(f"{path}: ELF entry does not match viros_probe_entry")
     return {
         "image_start": image_start, "image_end": image_end,
         "image_size": image_end - image_start,
@@ -839,17 +1125,25 @@ def audit_linked_image(path: Path, load_address: int, max_alloc: int = 65536):
 
 def package_object(args):
     build_manifest, source = load_probe_build(Path(args.build_manifest))
-    source_audit = audit_object(source, "aarch64", args.max_alloc)
+    arch = build_manifest["arch"]
+    source_audit = audit_object(source, arch, args.max_alloc)
     output = Path(args.output_dir).resolve()
     output.mkdir(parents=True, exist_ok=True)
     script_path = output / "viros_probe.lds"
     elf_path = output / "viros_probe.elf"
     binary_path = output / "viros_probe.bin"
-    script_path.write_text(linker_script(args.load_address))
-    subprocess.run([args.cross_ld, "-nostdlib", "-static", "--build-id=none",
-                    "-T", str(script_path), "-o", str(elf_path), str(source)],
-                   check=True)
-    linked = audit_linked_image(elf_path, args.load_address, args.max_alloc)
+    script_path.write_text(linker_script(args.load_address, arch))
+    linker_command = [args.cross_ld]
+    if arch == "mmips":
+        linker_command.extend(["-m", "elf32ltsmip"])
+    linker_command.extend([
+        "-nostdlib", "-static", "--build-id=none", "-T", str(script_path),
+        "-o", str(elf_path), str(source),
+    ])
+    subprocess.run(linker_command, check=True)
+    linked = audit_linked_image(
+        elf_path, args.load_address, args.max_alloc, arch=arch,
+    )
     subprocess.run([args.objcopy, "-O", "binary", str(elf_path), str(binary_path)],
                    check=True)
     binary = binary_path.read_bytes()
@@ -857,28 +1151,56 @@ def package_object(args):
         raise AuditError(
             f"flat binary is {len(binary)} bytes; linked alloc image is {linked['image_size']} bytes"
         )
-    manifest = {
-        "schema": PROBE_PACKAGE_SCHEMA, "arch": "aarch64",
-        "abi_major": 1, "abi_minor": PROBE_ABI_MINOR,
-        "abi_layout": {
+    if arch == "aarch64":
+        abi_layout = {
             "version": 1,
             "request_v1_bytes": 64, "response_v1_header_bytes": 64,
             "task_v1_bytes": 192, "translation_v1_bytes": 64,
             "saved_regs_v1_bytes": 304,
             "target_byte_order": "little",
-        },
-        "capabilities": [
+        }
+        capabilities = [
             "snapshot-v1", "translate-va-aarch64-v1",
             "saved-regs-aarch64-v1",
-        ],
-        "call_abi": {
+        ]
+        call_abi = {
             "name": "aapcs64", "argument_registers": ["x0", "x1", "x2"],
             "result_register": "x0", "link_register": "x30",
             "stack_alignment": 16, "completion_trap": "brk-0x5650",
-        },
+        }
+        architecture_metadata = {
+            "pgd_address_kind": "kernel-virtual-address",
+        }
+    else:
+        abi_layout = {
+            "version": 1,
+            "request_v1_bytes": 64, "response_v1_header_bytes": 64,
+            "task_v1_bytes": 192,
+            "target_byte_order": "little",
+        }
+        capabilities = ["snapshot-v1"]
+        call_abi = {
+            "name": "o32-soft-float",
+            "argument_registers": ["r4", "r5", "r6"],
+            "result_register": "r2", "link_register": "r31",
+            "stack_alignment": 8, "completion_trap": "break-0x5650",
+        }
+        architecture_metadata = {
+            "elf_abi": {
+                "class": 32, "byte_order": "little", "machine": "EM_MIPS",
+                "isa": "mips32r2", "abi": "o32", "float": "soft",
+                "pic": False, "mips16": False, "micromips": False,
+            },
+        }
+    manifest = {
+        "schema": PROBE_PACKAGE_SCHEMA, "arch": arch,
+        "abi_major": 1, "abi_minor": PROBE_ABI_MINOR,
+        "abi_layout": abi_layout,
+        "capabilities": capabilities,
+        "call_abi": call_abi,
         "load_address": args.load_address,
         **linked,
-        "pgd_address_kind": "kernel-virtual-address",
+        **architecture_metadata,
         "object_sha256": source_audit["sha256"],
         "linked_elf_sha256": hashlib.sha256(elf_path.read_bytes()).hexdigest(),
         "binary_sha256": hashlib.sha256(binary).hexdigest(),
@@ -932,7 +1254,7 @@ def build_object(args):
     shutil.copy2(root / "include" / "viros_probe_abi.h", source / "include" / "viros_probe_abi.h")
 
     env = os.environ.copy()
-    env["ARCH"] = {"aarch64": "arm64"}[args.arch]
+    env["ARCH"] = {"aarch64": "arm64", "mmips": "mips"}[args.arch]
     env["CROSS_COMPILE"] = args.cross_compile
     command = [args.make, "-C", str(linux_dir),
                f"M={kernel_source}", "viros_probe.o"]
@@ -947,7 +1269,7 @@ def build_object(args):
     result["kernel"] = {
         "vmlinux": _relative_file(vmlinux, output),
         "sha256": supplied_sha256,
-        "build_id": gnu_build_id(vmlinux),
+        "build_id": gnu_build_id(vmlinux, args.arch),
         **provenance,
     }
     manifest = output / "probe.json"
@@ -960,18 +1282,18 @@ def main(argv=None):
     subparsers = parser.add_subparsers(dest="command", required=True)
     audit = subparsers.add_parser("audit", help="validate a compiled ET_REL probe")
     audit.add_argument("object", type=Path)
-    audit.add_argument("--arch", choices=("aarch64",), default="aarch64")
+    audit.add_argument("--arch", choices=("aarch64", "mmips"), default="aarch64")
     audit.add_argument("--max-alloc", type=int, default=65536)
     build = subparsers.add_parser("build", help="compile through an exact kernel Kbuild")
     build.add_argument("--linux-dir", required=True)
     build.add_argument("--output-dir", required=True)
-    build.add_argument("--arch", choices=("aarch64",), default="aarch64")
+    build.add_argument("--arch", choices=("aarch64", "mmips"), default="aarch64")
     build.add_argument("--cross-compile", required=True)
     build.add_argument("--vmlinux", required=True)
     build.add_argument("--make", default="make")
     build.add_argument("--max-alloc", type=int, default=65536)
     package = subparsers.add_parser(
-        "package", help="absolute-link an audited AArch64 probe into a flat image")
+        "package", help="absolute-link an audited probe into a flat image")
     package.add_argument(
         "build_manifest", type=Path,
         help="probe.json emitted by the exact-Kbuild build stage",

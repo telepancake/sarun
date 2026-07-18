@@ -4,3 +4,10 @@ obj-m += viros_probe.o
 
 ccflags-y += -I$(src)/../include
 CFLAGS_viros_probe.o += -fno-stack-protector -fno-pic -fno-pie
+
+# The MMIPS call gate enters this symbol using the Linux MIPS o32 C ABI.  Keep
+# the whole leaf object in the four-byte MIPS32 instruction set: the injected
+# image has no ELF mode-switching veneer or ABI-call GOT setup.
+ifeq ($(CONFIG_MIPS),y)
+CFLAGS_viros_probe.o += -mabi=32 -mno-mips16 -mno-micromips
+endif
