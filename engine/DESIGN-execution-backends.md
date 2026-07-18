@@ -1065,9 +1065,16 @@ as executable mappings and mmap that genuinely need a host fd.
           projected argv[0], not from optional inherited state. The marker is
           removed from shell/make/ninja dispatch and appliance transport. An
           `env -i /usr/bin/make --version` Brush-box regression now stays in
-          embedded Kati and reports the native aarch64 build triple. The next
-          gate is repairing final GCC from its intact object files, then
-          resuming `world -j10`.
+          embedded Kati and reports the native aarch64 build triple. Replaying
+          final GCC from its intact object files now passes the complete member
+          lists to `ar`: the c++98/c++11/c++17/c++20 convenience archives have
+          44/58/12/2 members, respectively. The installed libstdc++.so exports
+          both `std::__throw_length_error` and `std::thread::join`, and the
+          installed cross g++ links a C++20 program as a 64-bit AArch64 musl
+          executable. The exact urngd target which exposed the corrupt library
+          now configures, links, and packages successfully. The next gate is
+          resuming and completing the clean `world -j10` graph, followed by
+          artifact, provenance, trace, and lower-layer-isolation validation.
           Earlier nonfatal empty-operand arithmetic and generated-config `sed`
           diagnostics stay recorded for attribution rather than normalization.
     - [x] Complete the native-aarch64 FUSE Brush gate from a clean output tree.
