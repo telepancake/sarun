@@ -1,0 +1,48 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Sat, 18 Jul 2026 23:25:00 +0000
+Subject: [PATCH] Ignore inline comments before classifying make syntax
+
+GNU make removes non-recipe comments before classifying a line as a rule or
+assignment.  Kati instead let `=` and `;` inside an inline rule comment alter
+that classification.  OpenSSL's generated `list-tests:` rule documents its
+`TESTS=<name>` argument in such a comment, causing the following recipe to be
+rejected as occurring before any target.
+
+Strip the comment after directives and before structural scanning.  Recipe
+lines retain their existing handling, and escaped hashes remain protected by
+the existing comment scanner.
+
+---
+diff --git a/src-rs/parser.rs b/src-rs/parser.rs
+index 2e86b4e..ce2bca6 100644
+--- a/src-rs/parser.rs
++++ b/src-rs/parser.rs
+@@ -178,0 +179,4 @@ impl Parser {
++        // Comments are not makefile syntax.  In particular, assignment and
++        // command separators inside an inline rule comment must not affect
++        // whether this line establishes a recipe context.
++        let line = line.slice_ref(trim_right_space(Parser::remove_comment(&line)));
+@@ -841,0 +846 @@ mod tests {
++    use crate::symtab::intern;
+@@ -853,0 +859,12 @@ mod tests {
++
++    #[test]
++    fn rule_comment_assignment_does_not_hide_recipe_context() {
++        let input = Bytes::from_static(
++            b"list-tests: ## invoke with TESTS=<name>\n\t@ :\n",
++        );
++        let loc = Loc {
++            filename: intern("comment-rule.mk"),
++            line: 0,
++        };
++        assert!(parse_buf_no_stats(&input, loc).is_ok());
++    }
+diff --git a/testcase/sarun_rule_inline_comment.mk b/testcase/sarun_rule_inline_comment.mk
+new file mode 100644
+index 0000000..bd4e66e
+--- /dev/null
++++ b/testcase/sarun_rule_inline_comment.mk
+@@ -0,0 +1,2 @@
++list-tests: ## List tests selected with TESTS=<name>
++	@echo ok

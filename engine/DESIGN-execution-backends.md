@@ -1072,9 +1072,21 @@ as executable mappings and mmap that genuinely need a host fd.
           both `std::__throw_length_error` and `std::thread::join`, and the
           installed cross g++ links a C++20 program as a 64-bit AArch64 musl
           executable. The exact urngd target which exposed the corrupt library
-          now configures, links, and packages successfully. The next gate is
-          resuming and completing the clean `world -j10` graph, followed by
-          artifact, provenance, trace, and lower-layer-isolation validation.
+          now configures, links, and packages successfully. The resumed world
+          graph reached a generated OpenSSL rule whose inline documentation
+          contained `TESTS=<name>`; Kati treated the comment's `=` as makefile
+          structure and then rejected the following recipe with `commands
+          commence before first target`. GNU make removes non-recipe comments
+          before classifying a line. The parser now does the same after
+          directive recognition and before its rule/assignment scan, while its
+          existing comment scanner continues to preserve escaped hashes and
+          recipe text. A parser unit and a GNU/Kati corpus case cover the
+          general rule-comment shape. All 48 Kati library tests, the focused
+          corpus comparison, vendor reconstruction, and the static aarch64
+          production build pass. The exact real OpenSSL package now configures,
+          builds, installs, and reaches `.openssl_installed`. The next gate is
+          completing the clean `world -j10` graph, followed by artifact,
+          provenance, trace, and lower-layer-isolation validation.
           Earlier nonfatal empty-operand arithmetic and generated-config `sed`
           diagnostics stay recorded for attribution rather than normalization.
     - [x] Complete the native-aarch64 FUSE Brush gate from a clean output tree.
