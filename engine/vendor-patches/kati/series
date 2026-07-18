@@ -85,3 +85,4 @@
 0850-Update-single-suffix-candidate-test.patch
 0860-Compose-appends-from-the-visible-make-scope.patch
 0870-Honor-silent-mode-for-no-op-root-diagnostics.patch
+0880-Honor-global--SILENT-semantics.patch

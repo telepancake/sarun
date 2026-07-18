@@ -2176,6 +2176,33 @@ fi
         check("Nothing to be done" not in r.stdout + r.stderr,
               f"case63: -s suppresses no-op root diagnostics; "
               f"got {(r.stdout+r.stderr)!r}")
+        # ── CASE 64: global .SILENT has GNU's makefile semantics ─────
+        # Kbuild selects quiet mode with `.SILENT:` rather than argv `-s`.
+        # Both recipe echo and the otherwise enormous current-root diagnostic
+        # stream must be suppressed by the ordinary make relation.
+        dotsilent = work / "global-dot-silent"
+        shutil.rmtree(dotsilent, ignore_errors=True)
+        dotsilent.mkdir(parents=True)
+        (dotsilent / "Makefile").write_text(
+            ".SILENT:\n"
+            ".PHONY: all\n"
+            "all: one two\n"
+            "\tprintf built > result.txt\n"
+            "one two:\n")
+        r = run_make("MAKE64", dotsilent, "all", "one", "two")
+        check(r.returncode == 0,
+              f"case64: global .SILENT build completes (got {r.returncode}: "
+              f"{(r.stdout+r.stderr)[-700:]})")
+        sp64 = latest_sqlar(m)
+        dotsilent_result = m.sqlar_content(
+            sp64, str((dotsilent / "result.txt").resolve()).lstrip("/"))
+        check(dotsilent_result == b"built",
+              f"case64: silent recipe still executes; got {dotsilent_result!r}")
+        check("printf built" not in r.stdout + r.stderr and
+              "Nothing to be done" not in r.stdout + r.stderr and
+              "doesn't support .SILENT" not in r.stdout + r.stderr,
+              f"case64: .SILENT suppresses echo/no-op diagnostics; "
+              f"got {(r.stdout+r.stderr)!r}")
     finally:
         if eng is not None and eng.poll() is None:
             eng.terminate()

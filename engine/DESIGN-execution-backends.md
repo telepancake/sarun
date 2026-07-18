@@ -872,14 +872,20 @@ as executable mappings and mmap that genuinely need a host fd.
           server stayed near one full core: this is a filesystem-service
           bottleneck, not a hidden rebuild or dependency-evaluator stall. Two
           independent amplifiers were found. First, Kati emitted one "Nothing
-          to be done" line per current root even under inherited `-s`, flooding
-          Brush capture; it now honors silent mode, and end-to-end Make/Brush
-          case 63 pins the behavior. Second, each ordinary lower lookup called
+          to be done" line per current root, flooding Brush capture. Case 63
+          pins explicit `-s`, but Kbuild selects the same makefile-wide mode
+          with a prerequisite-free `.SILENT:` special target. Global `.SILENT:`
+          now suppresses both recipe echo and no-op root diagnostics, while
+          target-specific `.SILENT` remains explicitly unsupported; end-to-end
+          Make/Brush case 64 pins the Kbuild form. Second, each ordinary lower lookup called
           `BackingStore::exists()` and then `BackingStore::attr()`, causing two
           complete root-to-leaf PassthroughFsRo walks. Attribute resolution now
           performs one metadata probe and reuses it for the merge decision and
           returned attributes. Vendor reconstruction, 47 Kati units, the static
-          aarch64 build, and all 63 Make/Brush cases pass. After the kernel the
+          aarch64 build, and all 63 Make/Brush cases pass. The `.SILENT:` change
+          passes vendor reconstruction and all 47 Kati unit tests; its static
+          aarch64 and full 64-case gates remain pending until the active
+          OpenWrt timing replay releases the engine binary. After the kernel the
           same run built and installed fwtool, usign, libjson-c, and GRUB; it
           exited 2 only because the deliberately offline fixture lacked the
           checksum-pinned Lua 5.1.5 and ncurses 6.4 archives. Both archives are
