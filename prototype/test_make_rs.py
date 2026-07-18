@@ -1547,6 +1547,53 @@ printf preserved > result.txt
               and bool(direct_tool),
               f"case44: both linked binaries ran; result={linked!r} "
               f"sizes={(len(object_tool) if object_tool else None, len(direct_tool) if direct_tool else None)}")
+        # ── CASE 45: GNU --touch refreshes targets without recipes ─────────
+        # OpenWrt's Autoconf host build relies on exactly this sequence to
+        # suppress maintainer-only manpage regeneration: recursive make first
+        # touches stale manuals, then the ordinary compile sees them current.
+        tr = work / "touch-mode"
+        shutil.rmtree(tr, ignore_errors=True)
+        tr.mkdir(parents=True, exist_ok=True)
+        (tr / "manual.1").write_text("shipped manual\n")
+        (tr / "source.in").write_text("patched source\n")
+        os.utime(tr / "manual.1", (1577836800, 1577836800))
+        os.utime(tr / "source.in", (1609459200, 1609459200))
+        (tr / "Touch.mk").write_text(
+            ".PHONY: install-man1 phony\n"
+            "install-man1: manual.1 phony\n"
+            "manual.1: source.in\n"
+            "\t@echo $(error TOUCH-EXPANDED-RECIPE) > recipe-ran\n"
+            "phony:\n"
+            "\t@echo PHONY-RAN > phony-ran\n"
+            "verify: manual.1\n"
+            "\t@test ! -e recipe-ran && test ! -e phony-ran\n"
+            "\t@printf verified > verified\n")
+        (tr / "Makefile").write_text(
+            ".PHONY: all\n"
+            "all:\n"
+            "\t@$(MAKE) --no-print-directory -f Touch.mk --touch install-man1\n"
+            "\t@$(MAKE) --no-print-directory -f Touch.mk verify\n")
+        r = run_make("MAKE45", tr, "-j10", "all")
+        check(r.returncode == 0,
+              f"case45: recursive --touch completes without expanding recipes "
+              f"(got {r.returncode}: {(r.stdout+r.stderr)[-700:]})")
+        check("touch manual.1" in (r.stdout + r.stderr),
+              f"case45: touch mode visibly updates the stale manual; "
+              f"output={(r.stdout+r.stderr)[-500:]!r}")
+        sp45 = latest_sqlar(m)
+        manual = m.sqlar_content(
+            sp45, str((tr / "manual.1").resolve()).lstrip("/"))
+        verified = m.sqlar_content(
+            sp45, str((tr / "verified").resolve()).lstrip("/"))
+        recipe_ran = m.sqlar_content(
+            sp45, str((tr / "recipe-ran").resolve()).lstrip("/"))
+        phony_ran = m.sqlar_content(
+            sp45, str((tr / "phony-ran").resolve()).lstrip("/"))
+        check(manual == b"shipped manual\n" and verified == b"verified"
+              and recipe_ran is None and phony_ran is None,
+              f"case45: content preserved, later make sees it current, and "
+              f"neither ordinary nor phony recipe ran; manual={manual!r} "
+              f"verified={verified!r} recipe={recipe_ran!r} phony={phony_ran!r}")
     finally:
         if eng is not None and eng.poll() is None:
             eng.terminate()

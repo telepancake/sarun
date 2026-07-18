@@ -117,7 +117,7 @@ fn kati_argv(argv: &[String]) -> Result<Vec<OsString>, String> {
             // -s silent, -r no-builtin-rules, -R no-builtin-variables,
             // -w print-directory, -k keep-going, -n dry-run (GNU: print,
             // don't execute), -i ignore-errors (GNU). Refuse anything else.
-            "-s" | "-r" | "-R" | "-w" | "-k" | "-n" | "-i" | "-B" | "-q"
+            "-s" | "-r" | "-R" | "-w" | "-k" | "-n" | "-i" | "-B" | "-q" | "-t"
             | "-l" => {
                 out.push(OsString::from(a));
                 i += 1;
@@ -320,6 +320,7 @@ fn run_kati(
     // -B would re-remake includes every pass and never converge).
     always_make: bool,
     question: bool,
+    touch: bool,
     // Optional includes known unmakeable from a previous remake pass —
     // don't queue them again.
     noremake: &std::collections::HashSet<Vec<u8>>,
@@ -648,10 +649,12 @@ fn run_kati(
         ev.dry_run = dry_run;
         ev.always_make = always_make;
         ev.question = question;
+        ev.touch = touch;
         kati::exec::exec(nodes, &mut ev)?;
         ev.dry_run = false;
         ev.always_make = false;
         ev.question = false;
+        ev.touch = false;
     }
     let would_run = ev.question_would_run;
     ev.finish()?;
@@ -1045,6 +1048,7 @@ Options (supported by sarun's embedded make):\n\
                               Search DIRECTORY for included makefiles.\n\
   -k                          Keep going when some targets can't be made.\n\
   -n                          Don't actually run any recipe; just print them.\n\
+  -t, --touch                 Touch out-of-date targets instead of remaking.\n\
   -s, --silent, --quiet       Don't echo recipes.\n\
   -r, --no-builtin-rules      Disable the built-in implicit rules.\n\
   -R, --no-builtin-variables  Disable the built-in variable settings.\n\
@@ -1203,7 +1207,7 @@ pub fn make_main(argv: &[String]) -> i32 {
                 .map(|s| s.to_vec())
                 .collect())
             .unwrap_or_default();
-    let run_result = match run_kati(&targets, &cl_vars, &makefile, &shadow_cwd, &seed_env, &include_dirs, flags.no_builtin_rules, flags.no_builtin_variables, &cmdline_flags, flags.is_dry_run, flags.is_ignore_errors, flags.is_trace, flags.is_always_make, flags.is_question, &noremake) {
+    let run_result = match run_kati(&targets, &cl_vars, &makefile, &shadow_cwd, &seed_env, &include_dirs, flags.no_builtin_rules, flags.no_builtin_variables, &cmdline_flags, flags.is_dry_run, flags.is_ignore_errors, flags.is_trace, flags.is_always_make, flags.is_question, flags.is_touch, &noremake) {
         Ok(r) => r,
         Err(e) => {
             // Recipe failure already printed its `*** [target] Error N`; just
@@ -1436,7 +1440,7 @@ pub fn make_builtin(
     // and re-run kati, up to a small cap — matching SARUN_KATI_REMAKE_DEPTH.
     let cmdline_flags = extract_long_flags(argv);
     let mut noremake: std::collections::HashSet<Vec<u8>> = Default::default();
-    let mut result = run_kati(&targets, &cl_vars, &makefile, &working_dir, seed_env, &include_dirs, flags.no_builtin_rules, flags.no_builtin_variables, &cmdline_flags, flags.is_dry_run, flags.is_ignore_errors, flags.is_trace, flags.is_always_make, flags.is_question, &noremake);
+    let mut result = run_kati(&targets, &cl_vars, &makefile, &working_dir, seed_env, &include_dirs, flags.no_builtin_rules, flags.no_builtin_variables, &cmdline_flags, flags.is_dry_run, flags.is_ignore_errors, flags.is_trace, flags.is_always_make, flags.is_question, flags.is_touch, &noremake);
     let mut remake_depth = 0u32;
     while matches!(&result, Ok(r) if r.remake_active) && remake_depth < 5 {
         remake_depth += 1;
@@ -1452,7 +1456,7 @@ pub fn make_builtin(
         // forever).
         kati::file_cache::clear();
         kati::fileutil::clear_glob_cache();
-        result = run_kati(&targets, &cl_vars, &makefile, &working_dir, seed_env, &include_dirs, flags.no_builtin_rules, flags.no_builtin_variables, &cmdline_flags, flags.is_dry_run, flags.is_ignore_errors, flags.is_trace, flags.is_always_make, flags.is_question, &noremake);
+        result = run_kati(&targets, &cl_vars, &makefile, &working_dir, seed_env, &include_dirs, flags.no_builtin_rules, flags.no_builtin_variables, &cmdline_flags, flags.is_dry_run, flags.is_ignore_errors, flags.is_trace, flags.is_always_make, flags.is_question, flags.is_touch, &noremake);
     }
 
     kati::exec::set_recipe_out(prev_out);

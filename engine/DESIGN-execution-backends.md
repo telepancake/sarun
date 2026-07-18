@@ -572,12 +572,28 @@ as executable mappings and mmap that genuinely need a host fd.
           uses statically linked mimalloc, whose empty-page purging fits this
           long-running, multithreaded allocation pattern. At the comparable
           four-minute point server RSS is 160 MiB instead of 1.10 GiB, with no
-          swap and the same 19 threads; the curve has flattened rather than
-          growing with every filesystem/provenance operation. The static
-          aarch64 build, all 44 Make/Brush cases, and the full FUSE/QEMU backend
-          equivalence/lifecycle suite pass with the reclamation change; the
-          mimalloc build also passes all 44 Make/Brush cases. The next boundary
-          is completing the in-progress clean `-j10 world` replay.
+          swap and the same 19 threads. The static aarch64 build, all 44
+          Make/Brush cases, and the full FUSE/QEMU backend equivalence/lifecycle
+          suite pass with the reclamation change; the mimalloc build also passes
+          all 44 Make/Brush cases. A subsequent clean `-j10 world` replay no
+          longer OOMed: it ran for about twenty minutes, passed ELFkickers,
+          xz/liblzma, lz4, mtools, squashfs4 and LibreSSL, and reached 20,105
+          processes, 46,680 build edges, a 427 MiB SQLar and 605 MiB live upper.
+          Peak server RSS was 2.56 GiB with no swap, so mimalloc is a large
+          improvement but not proof of a flat long-run memory curve; remaining
+          workload-proportional retention still needs measurement after the
+          correctness gate completes. That replay stopped at Autoconf because
+          OpenWrt intentionally runs `$(MAKE) --touch install-man1` before its
+          ordinary compile, while embedded Kati did not implement GNU `-t` /
+          `--touch`; the ignored preparatory failure left patched sources newer
+          than the shipped manuals and caused an unavailable `help2man` recipe
+          to run. Touch mode is now real engine behavior: it updates stale
+          non-phony targets without expanding or executing their recipes and
+          skips phony recipes, including in recursive makes and inherited
+          `MAKEFLAGS`. The exact OpenWrt two-pass shape is Make/Brush case 45;
+          the static aarch64 build and complete 45-case suite pass. The next
+          boundary is another clean `-j10 world` replay past Autoconf, followed
+          by a long-run RSS attribution if growth remains proportional.
     - [x] Complete the native-aarch64 FUSE Brush gate from a clean output tree.
           Linux 6.18 builds 823 objects with `-j10` (11 observed overlapping
           clang processes), takes 162 s wall / 143 s compile, and records 2,797

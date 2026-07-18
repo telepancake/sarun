@@ -1,0 +1,207 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Sat, 18 Jul 2026 01:10:47 +0000
+Subject: [PATCH] Implement GNU make touch mode
+
+Honor -t/--touch by updating out-of-date non-phony targets without expanding or running their recipes. This is required by OpenWrt host-tool builds that use a touch pass to suppress maintainer-only regeneration.
+
+---
+diff --git a/src-rs/eval.rs b/src-rs/eval.rs
+index f8e776c..8ac3d88 100644
+--- a/src-rs/eval.rs
++++ b/src-rs/eval.rs
+@@ -283,6 +283,8 @@ pub struct Evaluator {
+     /// run nothing, report via exit status). See flags.rs.
+     pub always_make: bool,
+     pub question: bool,
++    /// sarun: per-make GNU -t / --touch mode.
++    pub touch: bool,
+     /// sarun: set by the executor after a run — under -q, true iff any
+     /// recipe WOULD have run (drives the exit-1 status).
+     pub question_would_run: bool,
+@@ -403,6 +405,7 @@ impl Evaluator {
+             goal_trace: false,
+             always_make: false,
+             question: false,
++            touch: false,
+             question_would_run: false,
+             global_vars: Arc::new(Mutex::new(Vec::new())),
+             working_dir: std::env::current_dir().unwrap_or_default(),
+diff --git a/src-rs/exec.rs b/src-rs/exec.rs
+index b66960d..0798baa 100644
+--- a/src-rs/exec.rs
++++ b/src-rs/exec.rs
+@@ -153,6 +153,7 @@ struct Executor<'a> {
+     trace: bool,
+     always_make: bool,
+     question: bool,
++    touch: bool,
+     /// Suppress the "*** [target] Error N" banner (and no-rule notes) —
+     /// used when remaking OPTIONAL includes, whose failures GNU swallows
+     /// silently.
+@@ -241,6 +242,8 @@ struct RunReq {
+     dry_run: bool,
+     ignore_errors: bool,
+     question: bool,
++    /// GNU -t: touch the output and do not expand or execute its recipe.
++    touch: bool,
+ }
+ 
+ /// Build the `export NAME='value'` prefix (newline-terminated) for a target's
+@@ -315,6 +318,7 @@ fn run_node_commands(
+     // up-to-date) nodes are correctly left un-started. `req.output` is the node's
+     // primary output (== build_edges.outs[0], the engine's match key).
+     let output = req.output;
++    let touch = FLAGS.is_touch || req.touch;
+     let dry_run = FLAGS.is_dry_run || req.dry_run || req.question;
+     let report = !dry_run && !req.commands.is_empty();
+     if report {
+@@ -334,6 +338,38 @@ fn run_node_commands(
+         emit(b)
+     };
+     let emit = &mut emit as &mut dyn FnMut(&[u8]);
++    if touch {
++        let name = output.as_bytes();
++        emit(b"touch ");
++        emit(&name);
++        emit(b"\n");
++        let rel = Path::new(OsStr::from_bytes(&name));
++        let path = if rel.is_absolute() {
++            rel.to_path_buf()
++        } else {
++            Path::new(OsStr::from_bytes(&cwd)).join(rel)
++        };
++        let result = match std::fs::symlink_metadata(&path) {
++            Ok(meta) if meta.is_dir() => {
++                // GNU make reports directories but does not fail touch mode.
++                emit(format!("make: touch: open: {}: Is a directory\n",
++                            String::from_utf8_lossy(&name)).as_bytes());
++                Ok(())
++            }
++            Ok(_) => std::fs::File::open(&path)
++                .and_then(|f| f.set_modified(SystemTime::now())),
++            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
++                std::fs::OpenOptions::new().write(true).create(true).truncate(false)
++                    .open(&path).map(|_| ())
++            }
++            Err(e) => Err(e),
++        };
++        if let Err(e) = result {
++            emit(format!("make: touch: {}: {e}\n",
++                        String::from_utf8_lossy(&name)).as_bytes());
++            failure = Some((output, 1));
++        }
++    }
+     for command in req.commands {
+         // GNU -n prints every command line, INCLUDING @-silenced ones —
+         // that's the point of a dry run. GNU -q prints nothing at all.
+@@ -395,6 +431,7 @@ impl<'a> Executor<'a> {
+         let trace = ev.goal_trace;
+         let always_make = ev.always_make;
+         let question = ev.question;
++        let touch = ev.touch;
+         Ok(Executor {
+             ce: CommandEvaluator::new(ev)?,
+             shell,
+@@ -405,6 +442,7 @@ impl<'a> Executor<'a> {
+             trace,
+             always_make,
+             question,
++            touch,
+             quiet_failures: false,
+         })
+     }
+@@ -568,8 +606,18 @@ list of the rule for '{output}' at {loc}"));
+             }
+             return Ok((output_ts, None));
+         }
+-        let (commands, exports) = self.eval_node_commands(&n)?;
+-        if commands.is_empty() {
++        // GNU -t does not expand the recipe. Its raw presence is enough to
++        // decide that an out-of-date, non-phony target should be touched.
++        let touch = self.touch || FLAGS.is_touch;
++        let (commands, exports) = if touch {
++            if is_phony || n.lock().cmds.is_empty() {
++                return Ok((output_ts, None));
++            }
++            (Vec::new(), Vec::new())
++        } else {
++            self.eval_node_commands(&n)?
++        };
++        if commands.is_empty() && !touch {
+             if self.trace || FLAGS.is_trace {
+                 emit_recipe_err(&format!(
+                     "--trace: '{output}': skip — rule has no commands \
+@@ -595,7 +643,7 @@ list of the rule for '{output}' at {loc}"));
+             output_ts,
+             Some(RunReq { output, commands, exports, cwd, box_prefix, result_ts: output_ts,
+                           dry_run: self.dry_run, ignore_errors: self.ignore_errors,
+-                          question: self.question }),
++                          question: self.question, touch }),
+         ))
+     }
+ 
+diff --git a/src-rs/flags.rs b/src-rs/flags.rs
+index 69da25d..0f345e8 100644
+--- a/src-rs/flags.rs
++++ b/src-rs/flags.rs
+@@ -89,6 +89,9 @@ pub struct Flags {
+     /// goals are up to date, 1 if anything would be rebuilt. Used in
+     /// driver-script guards (`if make -q; then skip; fi`).
+     pub is_question: bool,
++    /// -t / --touch (GNU): mark out-of-date non-phony targets current instead
++    /// of expanding or executing their recipes.
++    pub is_touch: bool,
+     /// -k / --keep-going: on a recipe failure, keep building targets that
+     /// don't depend on the failed one; exit non-zero at the end.
+     pub is_keep_going: bool,
+@@ -295,6 +298,8 @@ impl Flags {
+                 self.is_dry_run = true;
+             } else if tok == b"--trace" {
+                 self.is_trace = true;
++            } else if tok == b"-t" || tok == b"--touch" {
++                self.is_touch = true;
+             } else if !tok.starts_with(b"-") && tok.contains(&b'=') {
+                 let var = Bytes::from(tok.to_vec());
+                 if !self.cl_vars.contains(&var) {
+@@ -314,6 +319,7 @@ impl Flags {
+                         b'n' => self.is_dry_run = true,
+                         b'B' => self.is_always_make = true,
+                         b'q' => self.is_question = true,
++                        b't' => self.is_touch = true,
+                         _ => {}
+                     }
+                 }
+@@ -372,6 +378,7 @@ impl Flags {
+                 b"--trace" => flags.is_trace = true,
+                 b"-B" | b"--always-make" => flags.is_always_make = true,
+                 b"-q" | b"--question" => flags.is_question = true,
++                b"-t" | b"--touch" => flags.is_touch = true,
+                 // -l/--load-average/--max-load: advisory load limiting; the
+                 // slip pool already bounds system-wide parallelism, so accept
+                 // and ignore. The limit argument is attached-only (getopt
+@@ -598,6 +605,7 @@ fn resolve_supported_gnu_long_option(arg: &[u8]) -> Option<&'static [u8]> {
+         b"--trace",
+         b"--always-make",
+         b"--question",
++        b"--touch",
+         b"--load-average",
+         b"--max-load",
+         b"--keep-going",
+diff --git a/testcase/sarun_flag_t_touch.mk b/testcase/sarun_flag_t_touch.mk
+new file mode 100644
+index 0000000..b195a73
+--- /dev/null
++++ b/testcase/sarun_flag_t_touch.mk
+@@ -0,0 +1,11 @@
++# GNU -t / --touch: update an out-of-date target without expanding its
++# recipe, and skip phony recipes. The recursive call exercises inherited
++# make semantics rather than kati's top-level-only flag path.
++$(shell rm -f old newer recipe-ran phony-ran)
++$(shell touch -t 202001010000 old)
++$(shell touch -t 202101010000 newer)
++$(shell printf 'old: newer\n\t@echo $$(error RECIPE-EXPANDED) > recipe-ran\n.PHONY: stamp\nstamp:\n\t@echo bad > phony-ran\ninstall: old stamp\n' > child.mk)
++
++test:
++	@$(MAKE) --no-print-directory -f child.mk --touch install
++	@test old -nt newer && test ! -e recipe-ran && test ! -e phony-ran && echo touch-clean
