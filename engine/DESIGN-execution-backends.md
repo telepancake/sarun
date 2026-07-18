@@ -738,9 +738,19 @@ as executable mappings and mmap that genuinely need a host fd.
           Binutils replay now passes end-to-end: it builds and links GProf,
           generates both AArch64 and 32-bit ARM linker emulations, installs the
           complete Binutils 2.44 toolchain, and exits zero under Brush at
-          `-j10`. The full `world` continuation is the next real gate. Earlier nonfatal
-          empty-operand arithmetic and generated-config `sed` diagnostics stay
-          recorded for attribution rather than normalization.
+          `-j10`. The resumed `world` graph reached initial GCC 14.3.0 and
+          exposed a generic pathname-expansion error: for
+          `gcc/*/config-lang.in`, Brush admitted the regular file
+          `gcc/ABOUT-GCC-NLS` as a wildcard prefix and appended the literal
+          suffix without proving the complete pathname existed. Glob expansion
+          now validates the final path with no-follow metadata, retaining valid
+          dangling-symlink matches while rejecting impossible literal suffixes.
+          A direct Brush-core unit and the real-box Bash comparison corpus pin
+          the GCC shape; vendor reproduction, the static aarch64 build, and all
+          47 Brush conformance probes pass. Focused GCC replay and the remaining
+          `world` graph are the next real gates. Earlier nonfatal empty-operand
+          arithmetic and generated-config `sed` diagnostics stay recorded for
+          attribution rather than normalization.
     - [x] Complete the native-aarch64 FUSE Brush gate from a clean output tree.
           Linux 6.18 builds 823 objects with `-j10` (11 observed overlapping
           clang processes), takes 162 s wall / 143 s compile, and records 2,797

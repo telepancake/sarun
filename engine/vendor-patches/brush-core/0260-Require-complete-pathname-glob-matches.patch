@@ -1,0 +1,63 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Sat, 18 Jul 2026 08:18:09 +0000
+Subject: [PATCH] Require complete pathname glob matches
+
+---
+diff --git a/src/patterns.rs b/src/patterns.rs
+index 9318284..f27667d 100644
+--- a/src/patterns.rs
++++ b/src/patterns.rs
+@@ -314,6 +314,13 @@ impl Pattern {
+ 
+         let results: Vec<_> = paths_so_far
+             .into_iter()
++            // A wildcard in an earlier component only establishes that the
++            // prefix exists.  Literal components appended after it must also
++            // resolve; otherwise `dir/*/leaf` incorrectly returns
++            // `dir/regular-file/leaf`.  Use no-follow metadata so a dangling
++            // symlink matched as the final component remains a valid glob
++            // result, as it is in other shells.
++            .filter(|path| std::fs::symlink_metadata(path).is_ok())
+             .filter_map(|path| {
+                 if let Some(filter) = path_filter
+                     && !filter(path.as_path())
+@@ -990,6 +997,38 @@ mod tests {
+         Ok(())
+     }
+ 
++    /// A literal suffix following a wildcard must exist below the matched
++    /// prefix. GCC's configure probes `gcc/*/config-lang.in`; a plain file
++    /// named `gcc/ABOUT-GCC-NLS` must not become the impossible pathname
++    /// `gcc/ABOUT-GCC-NLS/config-lang.in`.
++    #[test]
++    fn test_glob_with_literal_suffix_rejects_non_directory_prefixes() -> Result<()> {
++        let scratch = tempfile::tempdir()?;
++        let gcc = scratch.path().join("gcc");
++        std::fs::create_dir_all(gcc.join("c"))?;
++        std::fs::create_dir_all(gcc.join("cp"))?;
++        std::fs::write(gcc.join("c/config-lang.in"), "c")?;
++        std::fs::write(gcc.join("cp/config-lang.in"), "c++")?;
++        std::fs::write(gcc.join("ABOUT-GCC-NLS"), "not a directory")?;
++
++        let pattern = Pattern::from("gcc/*/config-lang.in").set_extended_globbing(false);
++        let result = pattern.expand::<fn(&Path) -> bool>(
++            scratch.path(),
++            None,
++            &FilenameExpansionOptions::default(),
++        )?;
++
++        assert_eq!(
++            expect_expanded(result)?,
++            vec![
++                "gcc/c/config-lang.in".to_string(),
++                "gcc/cp/config-lang.in".to_string(),
++            ]
++        );
++
++        Ok(())
++    }
++
+     /// Verifies absolute-pattern expansion still works after the prefix
+     /// handling changes.
+     #[test]

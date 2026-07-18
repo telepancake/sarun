@@ -191,6 +191,10 @@ eval "$cmd"''',
 echo gd/*.c
 echo gd/*.zz
 rm -rf gd''',
+    "glob_literal_suffix": '''mkdir -p gls/c gls/cp
+touch gls/ABOUT-GCC-NLS gls/c/config-lang.in gls/cp/config-lang.in
+printf '<%s>\n' gls/*/config-lang.in
+rm -rf gls''',
     "cmdsub_nest": '''echo "[$(echo $(echo inner))]"
 echo "[`echo back`]"''',
     "subshell_state": '''v=outer
