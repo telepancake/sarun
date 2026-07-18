@@ -1,0 +1,3 @@
+# SPDX-License-Identifier: GPL-2.0
+# This object must be built into vmlinux, never as a loadable module.
+obj-y += viros_scratch.o

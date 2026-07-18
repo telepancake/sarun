@@ -1,0 +1,6 @@
+# SPDX-License-Identifier: GPL-2.0
+# Build the leaf object directly: make -C $LINUX_DIR M=$PWD viros_probe.o
+obj-m += viros_probe.o
+
+ccflags-y += -I$(src)/../include
+CFLAGS_viros_probe.o += -fno-stack-protector -fno-pic -fno-pie

@@ -120,6 +120,9 @@ Stages:
   run <target> [-- ...] Prepare and run one target; extra args go to QEMU
   gdb <target> [remote] Launch debug workflow, or attach to explicit remote
   debug <target>        Boot matching debug kernel, stop after init, open GDB
+  inferiors openwrt-arm64 MANIFEST BOOTABLE_KERNEL
+                        Boot an exact local OpenWrt AArch64 build and expose
+                        its live task snapshot through the GDB RSP facade
 
 Information:
   list                  Print accepted run targets and their current status
@@ -1177,6 +1180,9 @@ gdb_stage() {
         -ex 'set confirm off' -ex 'set remotetimeout 10' )
     [[ -z "$helper" ]] || gdb_args+=( -ex "source $helper" )
     gdb_args+=( -ex "source $SCRIPT_DIR/gdb_user.py" )
+    if [[ "$target" == openwrt-arm64 ]]; then
+        gdb_args+=( -ex "source $SCRIPT_DIR/gdb_probe.py" )
+    fi
     if [[ "$target" == mipsbe || "$target" == mmips || "$target" == smips || "$target" == openwrt-malta-le ]]; then
         gdb_args+=( -ex 'set architecture mips' )
         [[ "$target" == mmips ]] && gdb_args+=( -ex 'set suppress-cli-notifications on' )
@@ -1207,6 +1213,193 @@ cleanup_debug_qemu() {
     DEBUG_QEMU_PID=
     DEBUG_GDB_SOCKET=
     DEBUG_CONSOLE_SOCKET=
+}
+
+INFERIORS_QEMU_PID=
+INFERIORS_FACADE_PID=
+INFERIORS_QEMU_SOCKET=
+INFERIORS_GDB_SOCKET=
+INFERIORS_CONSOLE_SOCKET=
+
+terminate_inferiors_child() {
+    local pid=${1:-} count
+    [[ -n "$pid" ]] || return 0
+    if kill -0 "$pid" 2>/dev/null; then
+        # Both children are session leaders.  Terminating the session's process
+        # group also covers a helper they might have started before failing.
+        kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+        for count in {1..30}; do
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 0.1
+        done
+        if kill -0 "$pid" 2>/dev/null; then
+            kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+        fi
+    fi
+    wait "$pid" 2>/dev/null || true
+}
+
+cleanup_inferiors() {
+    terminate_inferiors_child "$INFERIORS_FACADE_PID"
+    terminate_inferiors_child "$INFERIORS_QEMU_PID"
+    [[ -n "$INFERIORS_QEMU_SOCKET" ]] && rm -f -- "$INFERIORS_QEMU_SOCKET"
+    [[ -n "$INFERIORS_GDB_SOCKET" ]] && rm -f -- "$INFERIORS_GDB_SOCKET"
+    [[ -n "$INFERIORS_CONSOLE_SOCKET" ]] && rm -f -- "$INFERIORS_CONSOLE_SOCKET"
+    INFERIORS_FACADE_PID=
+    INFERIORS_QEMU_PID=
+    INFERIORS_QEMU_SOCKET=
+    INFERIORS_GDB_SOCKET=
+    INFERIORS_CONSOLE_SOCKET=
+}
+
+cleanup_inferiors_on_exit() {
+    local status=$?
+    trap - EXIT INT TERM
+    cleanup_inferiors
+    exit "$status"
+}
+
+inferiors_stage() {
+    local target=${1:-} manifest=${2:-} boot_kernel=${3:-}
+    local qemu gdb python vmlinux session_dir console_log qemu_log facade_log bootstrap_log manifest_log status deadline
+    local -a qemu_args bootstrap_args gdb_args
+
+    [[ "$target" == openwrt-arm64 ]] ||
+        die "inferiors currently requires: openwrt-arm64 MANIFEST BOOTABLE_KERNEL"
+    (($# == 3)) || die "usage: ./viros.sh inferiors openwrt-arm64 MANIFEST BOOTABLE_KERNEL"
+    [[ -f "$manifest" ]] || die "call-gate manifest is not a regular file: $manifest"
+    [[ -s "$boot_kernel" ]] || die "bootable OpenWrt AArch64 kernel is missing or empty: $boot_kernel"
+
+    qemu=$(qemu_binary qemu-system-aarch64)
+    gdb="$TOOLS/gdb/bin/gdb"
+    [[ -x "$gdb" ]] || die "Python-enabled GDB is missing; run download and build"
+    python=$(managed_python)
+    [[ -x "$python" ]] || die "managed Python is missing; run download"
+    need setsid
+    need timeout
+
+    session_dir="$ARTIFACTS/openwrt-arm64/inferiors-$$"
+    mkdir -p "$session_dir" "$BUILD"
+    console_log="$session_dir/console.log"
+    qemu_log="$session_dir/qemu.log"
+    facade_log="$session_dir/facade.log"
+    bootstrap_log="$session_dir/bootstrap-gdb.log"
+    manifest_log="$session_dir/manifest-validation.log"
+    : > "$console_log"
+    : > "$qemu_log"
+    : > "$facade_log"
+    : > "$bootstrap_log"
+    : > "$manifest_log"
+
+    # Validation also resolves the vmlinux relative to the manifest.  Nothing
+    # is launched until every manifest-bound file and hash has passed.
+    set +e
+    vmlinux=$(env PYTHONPATH="$SCRIPT_DIR" PYTHONNOUSERSITE=1 "$python" -c \
+        'import sys; from callgate.manifest import load_and_validate_manifest; print(load_and_validate_manifest(sys.argv[1]).kernel_file)' \
+        "$manifest" 2> "$manifest_log")
+    status=$?
+    set -e
+    if ((status != 0)) || [[ ! -s "$vmlinux" ]]; then
+        [[ -s "$manifest_log" ]] && tail -n 30 "$manifest_log" >&2
+        die "call-gate manifest validation failed"
+    fi
+
+    # Short names keep AF_UNIX paths usable even when VIROS_WORKDIR itself is
+    # fairly deep.  Logs remain in the per-run directory above.
+    INFERIORS_QEMU_SOCKET="$BUILD/iq-$$"
+    INFERIORS_GDB_SOCKET="$BUILD/ig-$$"
+    INFERIORS_CONSOLE_SOCKET="$BUILD/ic-$$"
+    ((${#INFERIORS_QEMU_SOCKET} <= 100)) || die "QEMU socket path is too long; use a shorter VIROS_WORKDIR"
+    ((${#INFERIORS_GDB_SOCKET} <= 100)) || die "facade socket path is too long; use a shorter VIROS_WORKDIR"
+    ((${#INFERIORS_CONSOLE_SOCKET} <= 100)) || die "console socket path is too long; use a shorter VIROS_WORKDIR"
+    rm -f -- "$INFERIORS_QEMU_SOCKET" "$INFERIORS_GDB_SOCKET" "$INFERIORS_CONSOLE_SOCKET"
+
+    qemu_args=( -M virt -cpu cortex-a57 -smp 2 -m 512M
+        -display none -monitor none -nic none -nodefaults
+        -no-reboot -no-shutdown -S -kernel "$boot_kernel"
+        -append 'console=ttyAMA0,115200 earlycon=pl011,0x09000000 loglevel=8 ignore_loglevel nokaslr'
+        -chardev "socket,id=viros-console,path=$INFERIORS_CONSOLE_SOCKET,server=on,wait=off,logfile=$console_log,logappend=on"
+        -serial chardev:viros-console
+        -gdb "unix:path=$INFERIORS_QEMU_SOCKET,server=on,wait=off" )
+
+    setsid "$qemu" "${qemu_args[@]}" 2> "$qemu_log" &
+    INFERIORS_QEMU_PID=$!
+    trap cleanup_inferiors_on_exit EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+
+    deadline=$((SECONDS + DEBUG_BOOT_TIMEOUT))
+    until [[ -S "$INFERIORS_QEMU_SOCKET" ]]; do
+        if ! kill -0 "$INFERIORS_QEMU_PID" 2>/dev/null; then
+            [[ -s "$qemu_log" ]] && tail -n 30 "$qemu_log" >&2
+            die "QEMU exited before opening its GDB socket"
+        fi
+        ((SECONDS < deadline)) || die "timed out waiting for QEMU's GDB socket"
+        sleep 0.1
+    done
+
+    # GDB owns QEMU only long enough to reach an EL1 return-to-userspace
+    # boundary.  `disconnect` closes RSP without sending QEMU a detach/resume
+    # packet, leaving the VM stopped for the facade's sole downstream session.
+    bootstrap_args=( -nx -q -batch -iex 'set auto-load safe-path /' "$vmlinux"
+        -ex 'set pagination off' -ex 'set confirm off' -ex 'set remotetimeout 10'
+        -ex "target remote $INFERIORS_QEMU_SOCKET"
+        -ex 'thbreak ret_to_user' -ex continue
+        -ex 'python assert int(gdb.parse_and_eval("$pc")) == int(gdb.parse_and_eval("&ret_to_user")), "unexpected bootstrap stop"'
+        -ex 'printf "viros-bootstrap: stopped at ret_to_user\\n"'
+        -ex 'delete breakpoints' -ex disconnect )
+    set +e
+    timeout --foreground --kill-after=2 "${DEBUG_BOOT_TIMEOUT}s" \
+        "$gdb" "${bootstrap_args[@]}" > "$bootstrap_log" 2>&1
+    status=$?
+    set -e
+    if ((status != 0)) || ! grep -q '^viros-bootstrap: stopped at ret_to_user$' "$bootstrap_log"; then
+        [[ -s "$bootstrap_log" ]] && tail -n 40 "$bootstrap_log" >&2
+        die "GDB bootstrap did not stop at ret_to_user"
+    fi
+    kill -0 "$INFERIORS_QEMU_PID" 2>/dev/null || die "QEMU exited after the bootstrap stop"
+
+    setsid env PYTHONPATH="$SCRIPT_DIR" PYTHONNOUSERSITE=1 \
+        "$python" -m inferiors.live_facade \
+        --qemu-socket "$INFERIORS_QEMU_SOCKET" \
+        --gdb-socket "$INFERIORS_GDB_SOCKET" \
+        --manifest "$manifest" > "$facade_log" 2>&1 &
+    INFERIORS_FACADE_PID=$!
+
+    deadline=$((SECONDS + DEBUG_BOOT_TIMEOUT))
+    until [[ -S "$INFERIORS_GDB_SOCKET" ]]; do
+        if ! kill -0 "$INFERIORS_FACADE_PID" 2>/dev/null; then
+            [[ -s "$facade_log" ]] && tail -n 40 "$facade_log" >&2
+            die "live-inferior facade exited before opening its GDB socket"
+        fi
+        if ! kill -0 "$INFERIORS_QEMU_PID" 2>/dev/null; then
+            [[ -s "$qemu_log" ]] && tail -n 30 "$qemu_log" >&2
+            die "QEMU exited while the live-inferior facade was starting"
+        fi
+        ((SECONDS < deadline)) || die "timed out waiting for the live-inferior facade"
+        sleep 0.1
+    done
+
+    say "QEMU PID: $INFERIORS_QEMU_PID"
+    say "facade PID: $INFERIORS_FACADE_PID"
+    say "facade GDB socket: $INFERIORS_GDB_SOCKET"
+    say "interactive console socket: $INFERIORS_CONSOLE_SOCKET"
+    say "session logs: $session_dir"
+    say "Use 'info inferiors' and 'inferior N'; use 'viros-console' and Ctrl-] to switch console/GDB"
+
+    gdb_args=( -nx -q -iex 'set auto-load safe-path /' "$vmlinux"
+        -ex 'set pagination off' -ex 'set confirm off' -ex 'set python print-stack full' -ex 'set remotetimeout 10'
+        -ex "source $SCRIPT_DIR/gdb_console.py"
+        -ex "target remote $INFERIORS_GDB_SOCKET" -ex 'info inferiors' )
+    set +e
+    VIROS_CONSOLE_SOCKET="$INFERIORS_CONSOLE_SOCKET" VIROS_CONSOLE_LOG="$console_log" \
+        "$gdb" "${gdb_args[@]}"
+    status=$?
+    set -e
+
+    cleanup_inferiors
+    trap - EXIT INT TERM
+    return "$status"
 }
 
 debug_qemu_failed() {
@@ -1480,6 +1673,9 @@ debug_stage() {
         fi
     fi
     gdb_args+=( -ex "source $SCRIPT_DIR/gdb_console.py" )
+    if [[ "$target" == openwrt-arm64 ]]; then
+        gdb_args+=( -ex "source $SCRIPT_DIR/gdb_probe.py" )
+    fi
     [[ "$target" == openwrt-malta-le || "$target" == openwrt-arm || "$target" == openwrt-arm64 ]] ||
         gdb_args+=( -ex "source $SCRIPT_DIR/gdb_user.py" )
     if [[ "$target" == arm || "$target" == arm64 ]]; then
@@ -1500,6 +1696,9 @@ debug_stage() {
     elif [[ "$target" == openwrt-malta-le || "$target" == openwrt-arm || "$target" == openwrt-arm64 ]]; then
         say "Temporary breakpoints: OpenWrt PID 1 user return, then its BusyBox ELF entry"
         say "Local OpenWrt rootfs: $ARTIFACTS/$target/rootfs-${OPENWRT_VERSION}"
+        if [[ "$target" == openwrt-arm64 ]]; then
+            say "Experimental AArch64 call gate: viros-probe-plan/run MANIFEST.json"
+        fi
     fi
     say "At the GDB prompt run 'viros-console'; press Ctrl-] to return to GDB"
     say "Starting exact-symbol GDB for $target; PID 1 must be printed before the prompt"
@@ -1590,6 +1789,7 @@ main() {
         run) run_stage "$@" ;;
         gdb) gdb_stage "$@" ;;
         debug) debug_stage "$@" ;;
+        inferiors) inferiors_stage "$@" ;;
         list) list_stage ;;
         doctor) doctor_stage ;;
         help|-h|--help) usage ;;

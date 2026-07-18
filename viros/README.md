@@ -222,6 +222,150 @@ compat-mode target description. Shared-library symbols are not loaded
 automatically yet; the main executable, static programs, and pre-libc failures
 are the intended first use case.
 
+### Experimental Linux-process inferiors
+
+There is also an experimental successor to `gdb_user.py` under
+`inferiors/`, `probe/`, and `callgate/`. Its intended boundary is a
+multiprocess GDB remote facade backed by a small probe compiled through the
+exact guest kernel's configured Kbuild tree. Unlike `viros-user-*`, that
+facade presents the probe's frozen Linux task snapshot as actual GDB
+inferiors. The code path is connected end to end for a locally built AArch64
+OpenWrt kernel; it is not a claim that the downloaded release kernel was
+probed live.
+
+Two independent pieces have been exercised so far:
+
+- stock GDB 17.2 recognized synthetic `pTGID.TID` identities from the facade
+  as separate inferiors; this test used a host-side test oracle, not live guest
+  tasks; and
+- the AArch64 call gate injected a small self-test into a stopped OpenWrt
+  guest, restored all scratch pages and registers byte-for-byte, and then let
+  that same VM continue through `/init` and `procd`.
+
+The exact-Kbuild task probe, its stable response ABI, and the host decoder are
+implemented and audited by unit tests. They were not compiled and run against
+the downloaded OpenWrt release here: the release debug archive contains
+`vmlinux`, but not its exact configured source/generated Kbuild tree. A local
+OpenWrt build provides that missing input. In particular,
+`build/probe-arm64-kbuild/source` is a Linux 5.6.3 portability build, while the
+tested official OpenWrt debug image identifies a Linux 6.12.94 build directory;
+those artifacts must not be combined. Given one matching local build, compile and
+absolute-link the probe with the matching tools as follows (the scratch code
+address is deliberately supplied by the caller):
+
+```sh
+python3 probe/probe_tool.py build \
+  --linux-dir /path/to/openwrt/build_dir/target-*/linux-*/linux-* \
+  --output-dir build/probe-openwrt-arm64 \
+  --arch aarch64 \
+  --cross-compile /path/to/openwrt/staging_dir/toolchain-*/bin/aarch64-openwrt-linux-musl- \
+  --vmlinux /path/to/matching/vmlinux
+
+python3 probe/probe_tool.py package \
+  build/probe-openwrt-arm64/probe.json \
+  --load-address 0xffff800000000000 \
+  --output-dir build/probe-openwrt-arm64/package \
+  --cross-ld /path/to/exact/aarch64-openwrt-linux-musl-ld \
+  --objcopy /path/to/exact/aarch64-openwrt-linux-musl-objcopy
+```
+
+Replace the example load address with an unused, mapped, page-aligned kernel
+scratch region reserved for the guest being debugged. Do not copy it verbatim.
+The package command deliberately accepts the `probe.json` build record, not a
+bare object file. The build record binds the object to the matching kernel's
+SHA-256 and GNU build ID; those identities are carried into `package.json`.
+
+Once three unused scratch mappings have been reserved, generate the strict
+runtime manifest from those explicit mappings:
+
+```sh
+python3 probe/probe_tool.py callgate-manifest \
+  build/probe-openwrt-arm64/package/package.json \
+  --vmlinux /path/to/matching/vmlinux \
+  --output build/probe-openwrt-arm64/callgate.json \
+  --code-gva 0xffff800000000000 --code-gpa 0x40000000 --code-size 0x1000 \
+  --data-gva 0xffff800000001000 --data-gpa 0x40001000 --data-size 0x10000 \
+  --stack-gva 0xffff800000011000 --stack-gpa 0x40011000 --stack-size 0x1000 \
+  --cpu 0 --init-task 0xffff800081234000
+```
+
+Every address in that command is an example, including `init_task`; obtain the
+real values from the exact stopped guest and matching symbols. The three
+regions must be distinct, page-aligned, no larger than 64 KiB, mapped at the
+declared physical addresses on the selected CPU, and genuinely unused. The
+packaged load address must equal `--code-gva`. The command verifies that
+`--vmlinux` has the SHA-256 and build ID carried from the exact-Kbuild stage,
+then validates and atomically publishes the manifest using a temporary file
+beside `--output`. Mapping discovery and reservation remain intentionally
+manual.
+
+`./viros.sh debug openwrt-arm64` and the attach form
+`./viros.sh gdb openwrt-arm64 REMOTE` now load the experimental commands:
+
+```gdb
+viros-probe-plan build/probe-openwrt-arm64/callgate.json
+viros-probe-run build/probe-openwrt-arm64/callgate.json
+```
+
+`viros-probe-plan` validates the manifest and shows the transaction without
+changing the guest. `viros-probe-run` performs the reversible AArch64
+transaction through GDB's Python API. That interactive backend cannot impose a
+wall-clock or instruction-budget timeout; if the injected probe does not reach
+its completion breakpoint, interrupt GDB with `Ctrl-C` so the transaction's
+cleanup restores the saved state. The live-facade launcher below instead owns
+QEMU's RSP socket directly and enforces `timeout_seconds` as a restoring host
+wall-clock timeout. Neither backend supplies an emulated-instruction budget.
+
+The runtime verifies that GDB loaded the exact manifest-bound `vmlinux` file
+and that QEMU reports every declared virtual-to-physical mapping. It does not
+yet independently read the running guest's build ID from memory, so use this
+only with a guest known to have booted that same kernel image.
+
+For an AArch64 initramfs kernel produced by that same local build, the complete
+launcher is:
+
+```sh
+./viros.sh inferiors openwrt-arm64 \
+  build/probe-openwrt-arm64/callgate.json \
+  /path/to/the-matching-openwrt-initramfs-kernel.bin
+```
+
+There is deliberately no default to the downloaded official OpenWrt image.
+The command validates the manifest-bound probe and `vmlinux` before starting
+anything, boots the supplied kernel stopped, uses the exact `vmlinux` in a
+short noninteractive GDB session to reach `ret_to_user`, and disconnects while
+the VM remains stopped. The live facade then becomes QEMU's sole RSP client,
+runs the restoring snapshot transaction, opens its own socket, and starts the
+project GDB against that socket. In GDB:
+
+```gdb
+info inferiors
+inferior 2
+viros-console
+```
+
+`viros-console` replays retained output and resumes the VM; `Ctrl-]` stops it
+and returns to GDB. Per-run logs are retained below
+`artifacts/openwrt-arm64/inferiors-PID/`. Both Unix sockets are below `build/`,
+and the launcher removes them and terminates/reaps QEMU and the facade on
+normal exit, failure, `SIGINT`, or `SIGTERM`.
+
+The live facade now refreshes task snapshots, exposes their multiprocess IDs,
+and, when the sealed probe advertises `translate-va-aarch64-v1`, supplies
+read-only selected-process virtual memory through checked page translation.
+It returns the stopped QEMU register block only for a task currently on a
+vCPU. Sleeping-task registers, process-memory writes, automatic userspace ELF
+symbol loading, ARMv7, and MIPS remain unimplemented. The facade's direct RSP
+call gate has a restoring wall-clock timeout, but it is not an emulated
+instruction budget and ordinary QEMU virtual time can advance during the
+transaction.
+
+The launcher and facade have lifecycle/unit coverage, but this repository has
+not run the exact-Kbuild probe against a matching locally built OpenWrt guest;
+that live proof requires the user's kernel build and manifest. The detailed
+invariants and remaining proof milestones are in
+[DESIGN-inferiors.md](DESIGN-inferiors.md).
+
 ## Strict status matrix
 
 | Target | Emulated machine | Strict status |
