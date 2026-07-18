@@ -10,7 +10,44 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Mapping
+from typing import Callable, Mapping
+
+
+OriginalStatePrecondition = Callable[[Mapping[str, int]], str | None]
+ControlStateDeriver = Callable[[int | None, Mapping[str, int]], int]
+
+
+def _accept_original_state(registers: Mapping[str, int]) -> str | None:
+    return None
+
+
+def _manifest_control_state(
+    manifest_value: int | None, registers: Mapping[str, int]
+) -> int:
+    if manifest_value is None:
+        raise ValueError("the architecture requires manifest control state")
+    return manifest_value
+
+
+MIPS_STATUS_IE = 1 << 0
+MIPS_STATUS_EXL = 1 << 1
+MIPS_STATUS_ERL = 1 << 2
+MIPS_STATUS_KSU = 3 << 3
+MIPS_GATE_STATUS_CLEAR = MIPS_STATUS_KSU | MIPS_STATUS_IE | MIPS_STATUS_ERL
+
+
+def _mips32_original_state(registers: Mapping[str, int]) -> str | None:
+    if registers["r0"] != 0:
+        return "MIPS r0 is not the architectural zero value"
+    return None
+
+
+def _mips32_gate_status(
+    manifest_value: int | None, registers: Mapping[str, int]
+) -> int:
+    if manifest_value is not None:
+        raise ValueError("MIPS gate status must not come from the manifest")
+    return (registers["status"] & ~MIPS_GATE_STATUS_CLEAR) | MIPS_STATUS_EXL
 
 
 @dataclass(frozen=True)
@@ -48,6 +85,10 @@ class ArchitectureDescriptor:
     control_state_value: int
     control_state_description: str
     control_state_plan_description: str
+    manifest_control_state: bool
+    original_state_precondition: OriginalStatePrecondition
+    control_state_deriver: ControlStateDeriver
+    entry_address_registers: tuple[str, ...]
     known_capabilities: frozenset[str]
     dependent_capabilities: frozenset[str]
 
@@ -112,6 +153,24 @@ class ArchitectureDescriptor:
             raise ValueError("architecture restore order must contain every core register once")
         if self.restore_order[-1] != self.pc_register:
             raise ValueError("architecture restore order must restore PC last")
+        if (
+            len(self.entry_address_registers) != len(set(self.entry_address_registers))
+            or not set(self.entry_address_registers).issubset(names)
+        ):
+            raise ValueError(
+                "architecture entry-address registers must be unique core registers"
+            )
+        reserved_entry_registers = {
+            self.pc_register,
+            self.sp_register,
+            self.link_register,
+            self.control_register,
+            *self.argument_registers,
+        }
+        if reserved_entry_registers.intersection(self.entry_address_registers):
+            raise ValueError(
+                "architecture entry-address registers must not overlap call ABI registers"
+            )
 
     @property
     def register_names(self) -> tuple[str, ...]:
@@ -130,10 +189,29 @@ class ArchitectureDescriptor:
         )
 
     def valid_control_state(self, value: int) -> bool:
+        if not self.manifest_control_state:
+            return False
         return (
             0 <= value < 1 << self.control_state_bits
             and value & self.control_state_mask == self.control_state_value
         )
+
+    def validate_original_state(self, registers: Mapping[str, int]) -> None:
+        """Reject an incomplete or unsafe selected-CPU snapshot."""
+
+        for register in self.core_registers:
+            value = registers.get(register.name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or not 0 <= value < 1 << register.bits
+            ):
+                raise ValueError(
+                    f"original {register.name} does not fit its {register.bits}-bit width"
+                )
+        reason = self.original_state_precondition(registers)
+        if reason is not None:
+            raise ValueError(reason)
 
     def entry_register_values(
         self,
@@ -142,20 +220,50 @@ class ArchitectureDescriptor:
         result_address: int,
         result_size: int,
         completion_address: int,
-        control_state: int,
+        control_state: int | None,
+        original_registers: Mapping[str, int],
         stack_pointer: int,
         entry_address: int,
     ) -> tuple[tuple[str, int], ...]:
         """Return register writes in the proven entry order."""
 
+        self.validate_original_state(original_registers)
+        derived_control_state = self.control_state_deriver(
+            control_state, original_registers
+        )
+        if not 0 <= derived_control_state < 1 << self.control_state_bits:
+            raise ValueError(
+                "derived control state does not fit its architectural width"
+            )
+        if (
+            self.manifest_control_state
+            and not self.valid_control_state(derived_control_state)
+        ):
+            raise ValueError(
+                "manifest control state does not satisfy the architecture policy"
+            )
         arguments = (request_address, result_address, result_size)
-        return (
+        values = (
             *tuple(zip(self.argument_registers, arguments)),
+            *tuple(
+                (register, entry_address)
+                for register in self.entry_address_registers
+            ),
             (self.link_register, completion_address),
-            (self.control_register, control_state),
+            (self.control_register, derived_control_state),
             (self.sp_register, stack_pointer),
             (self.pc_register, entry_address),
         )
+        for register, value in values:
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or not 0 <= value < 1 << self.register_bits(register)
+            ):
+                raise ValueError(
+                    f"entry value for {register} does not fit its architectural width"
+                )
+        return values
 
 
 _AARCH64_NAMES = tuple([f"x{number}" for number in range(31)] + ["sp", "pc", "cpsr"])
@@ -186,6 +294,10 @@ AARCH64 = ArchitectureDescriptor(
     control_state_value=0x3C5,
     control_state_description="EL1h with DAIF masked",
     control_state_plan_description="EL1h",
+    manifest_control_state=True,
+    original_state_precondition=_accept_original_state,
+    control_state_deriver=_manifest_control_state,
+    entry_address_registers=(),
     known_capabilities=frozenset({
         "snapshot-v1",
         "translate-va-aarch64-v1",
@@ -203,11 +315,11 @@ _MMIPS_REGISTER_NAMES = tuple(
     + ["status", "lo", "hi", "badvaddr", "cause", "pc"]
 )
 
-# Backend-only description of the legacy MMIPS QEMU stub's fixed MIPS32
-# register numbering.  CP1 is deliberately absent: a soft-float probe cannot
-# clobber it, and no-FPU targets reject those optional p packets.  This constant
-# is intentionally absent from ARCHITECTURES: no manifest, probe, or call-gate
-# support is implied by it.
+# Unregistered description of the legacy MMIPS QEMU stub's fixed MIPS32
+# register numbering and o32 helper-call policy.  CP1 is deliberately absent:
+# a soft-float helper cannot clobber it, and no-FPU targets reject those
+# optional p packets.  This constant remains absent from ARCHITECTURES until
+# matching manifest and packaged-helper prerequisites exist.
 MIPS32EL_MMIPS = ArchitectureDescriptor(
     name="mips32el-mmips-experimental",
     display_name="MIPS32 little-endian MMIPS",
@@ -232,8 +344,12 @@ MIPS32EL_MMIPS = ArchitectureDescriptor(
     control_state_bits=32,
     control_state_mask=0,
     control_state_value=0,
-    control_state_description="descriptor-only preserved kernel status",
-    control_state_plan_description="preserved kernel status",
+    control_state_description="status derived from the stopped CPU",
+    control_state_plan_description="derived kernel EXL status",
+    manifest_control_state=False,
+    original_state_precondition=_mips32_original_state,
+    control_state_deriver=_mips32_gate_status,
+    entry_address_registers=("r25",),
     known_capabilities=frozenset(),
     dependent_capabilities=frozenset(),
 )

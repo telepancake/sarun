@@ -57,6 +57,10 @@ def plan(manifest: ValidatedManifest) -> tuple[str, ...]:
     code = manifest.region(manifest.code_region)
     architecture = manifest.architecture
     arguments = architecture.argument_registers
+    entry_aliases = "".join(
+        f"{register}=entry {manifest.entry_address:#x}, "
+        for register in architecture.entry_address_registers
+    )
     return (
         f"verify stopped {architecture.display_name} target against {manifest.kernel_file}",
         f"verify {len(manifest.regions)} virtual-to-physical mappings on CPU {manifest.cpu}",
@@ -68,6 +72,7 @@ def plan(manifest: ValidatedManifest) -> tuple[str, ...]:
         f"{arguments[0]}=request {manifest.request_address:#x}, "
         f"{arguments[1]}=result {manifest.result_address:#x}, "
         f"{arguments[2]}={manifest.result_size:#x}, "
+        f"{entry_aliases}"
         f"{architecture.link_register}=completion {manifest.completion_address:#x}",
         f"resume only CPU {manifest.cpu} synchronously to {manifest.completion_address:#x}; "
         "host timeout is not yet enforceable through the stock QEMU packet set",
@@ -114,6 +119,23 @@ class CallGateTransaction:
             for cpu in cpus
             for register in architecture.register_names
         }
+        selected_registers = {
+            register: registers[(manifest.cpu, register)]
+            for register in architecture.register_names
+        }
+        try:
+            entry_register_values = architecture.entry_register_values(
+                request_address=manifest.request_address,
+                result_address=manifest.result_address,
+                result_size=manifest.result_size,
+                completion_address=manifest.completion_address,
+                control_state=manifest.pstate,
+                original_registers=selected_registers,
+                stack_pointer=manifest.stack_pointer,
+                entry_address=manifest.entry_address,
+            )
+        except ValueError as exc:
+            raise CallGateError(f"selected CPU state cannot enter call gate: {exc}") from exc
         code = manifest.region(manifest.code_region)
         occupants = [
             cpu for cpu in cpus
@@ -154,15 +176,7 @@ class CallGateTransaction:
             modified_registers.extend(
                 (manifest.cpu, name) for name in architecture.register_names
             )
-            for register, value in architecture.entry_register_values(
-                request_address=manifest.request_address,
-                result_address=manifest.result_address,
-                result_size=manifest.result_size,
-                completion_address=manifest.completion_address,
-                control_state=manifest.pstate,
-                stack_pointer=manifest.stack_pointer,
-                entry_address=manifest.entry_address,
-            ):
+            for register, value in entry_register_values:
                 target.write_register(manifest.cpu, register, value)
 
             target.run_cpu_until(

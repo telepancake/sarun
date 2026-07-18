@@ -113,7 +113,7 @@ class ValidatedManifest:
     data_region: str
     stack_region: str
     cpu: int
-    pstate: int
+    pstate: int | None
     stack_pointer: int
     request_address: int
     result_address: int
@@ -308,20 +308,35 @@ def load_and_validate_manifest(path: str | Path) -> ValidatedManifest:
 
     invocation = _mapping(root.get("invocation"), "invocation")
     cpu = _integer(invocation.get("cpu", 0), "invocation.cpu")
-    pstate = _integer(invocation.get("pstate"), "invocation.pstate")
     if cpu >= UINT32_LIMIT:
         raise ManifestError("invocation.cpu must fit in 32 bits")
-    if pstate >= 1 << architecture.control_state_bits:
-        raise ManifestError("invocation.pstate must fit in 32 bits")
-    if not architecture.valid_control_state(pstate):
-        raise ManifestError("invocation.pstate must select EL1h with DAIF masked")
+    if architecture.manifest_control_state:
+        pstate = _integer(invocation.get("pstate"), "invocation.pstate")
+        if pstate >= 1 << architecture.control_state_bits:
+            raise ManifestError(
+                f"invocation.pstate must fit in {architecture.control_state_bits} bits"
+            )
+        if not architecture.valid_control_state(pstate):
+            raise ManifestError(
+                "invocation.pstate must select "
+                + architecture.control_state_description
+            )
+    else:
+        if "pstate" in invocation:
+            raise ManifestError(
+                "invocation.pstate must be omitted when control state is derived "
+                "from the stopped CPU"
+            )
+        pstate = None
     stack_name = _string(invocation.get("stack_region"), "invocation.stack_region")
     if stack_name not in by_name or by_name[stack_name].role != "stack":
         raise ManifestError("invocation.stack_region must name a stack region")
     stack_region = by_name[stack_name]
     stack_pointer = _integer(invocation.get("stack_pointer"), "invocation.stack_pointer")
     if stack_pointer >= 1 << architecture.address_bits:
-        raise ManifestError("invocation.stack_pointer must fit in 64 bits")
+        raise ManifestError(
+            f"invocation.stack_pointer must fit in {architecture.address_bits} bits"
+        )
     if not (
         stack_region.virtual_address < stack_pointer <= stack_region.virtual_address + stack_region.size
     ) or stack_pointer % architecture.stack_alignment:

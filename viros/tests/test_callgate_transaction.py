@@ -5,9 +5,16 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 
-from callgate.architectures import AARCH64, architecture_by_name
+from callgate.architectures import (
+    AARCH64,
+    ARCHITECTURES,
+    MIPS32EL_MMIPS,
+    MIPS_GATE_STATUS_CLEAR,
+    MIPS_STATUS_EXL,
+    architecture_by_name,
+)
 from callgate.manifest import ManifestError, load_and_validate_manifest
 from callgate.transaction import (
     AARCH64_REGISTERS,
@@ -201,6 +208,61 @@ class FakeTarget:
         self.memory[data.physical_address][offset : offset + 8] = b"VIROSOK!"
 
 
+def mips_manifest(manifest, *, pstate=None):
+    virtual_addresses = {
+        "code": 0x80100000,
+        "data": 0x82000000,
+        "stack": 0x82001000,
+    }
+    regions = tuple(
+        replace(region, virtual_address=virtual_addresses[region.role])
+        for region in manifest.regions
+    )
+    code = next(region for region in regions if region.role == "code")
+    data = next(region for region in regions if region.role == "data")
+    stack = next(region for region in regions if region.role == "stack")
+    return replace(
+        manifest,
+        architecture=MIPS32EL_MMIPS,
+        regions=regions,
+        entry_address=code.virtual_address,
+        completion_address=code.virtual_address + 4,
+        pstate=pstate,
+        stack_pointer=stack.virtual_address + stack.size,
+        request_address=data.virtual_address + manifest.request_offset,
+        result_address=data.virtual_address + manifest.result_offset,
+    )
+
+
+class FakeMipsTarget(FakeTarget):
+    def __init__(self, manifest):
+        super().__init__(manifest)
+        self.registers = {
+            (cpu, register): cpu * 1000 + index
+            for cpu in (0, 1)
+            for index, register in enumerate(manifest.architecture.register_names)
+        }
+        self.registers[(0, "r0")] = 0
+        self.registers[(0, "status")] = 0x1040FF1D
+        self.registers[(0, "pc")] = 0x80001234
+        self.original_registers = dict(self.registers)
+
+    def run_cpu_until(self, cpu, address, timeout_seconds):
+        self.events.append(("run", cpu, address, timeout_seconds))
+        self.entry_registers = {
+            name: self.registers[(cpu, name)]
+            for name in ("r4", "r5", "r6", "r25", "r31", "status", "r29", "pc")
+        }
+        if self.fail_run:
+            raise self.fail_run
+        self.registers[(cpu, "r17")] = 0xDEADBEEF
+        stack = self.manifest.region(self.manifest.stack_region)
+        self.memory[stack.physical_address][-16:] = b"probe stack use!"
+        data = self.manifest.region(self.manifest.data_region)
+        offset = self.manifest.result_offset
+        self.memory[data.physical_address][offset : offset + 8] = b"VIROSOK!"
+
+
 class TransactionTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -352,6 +414,113 @@ class TransactionTests(unittest.TestCase):
         with self.assertRaisesRegex(CallGateError, "completion magic"):
             CallGateTransaction(self.target, self.manifest).execute()
         self.assert_restored()
+
+
+class MipsTransactionPolicyTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        path, _ = make_manifest(Path(self.temp.name))
+        self.manifest = mips_manifest(load_and_validate_manifest(path))
+        self.target = FakeMipsTarget(self.manifest)
+        self.before_memory = {
+            address: bytes(data) for address, data in self.target.memory.items()
+        }
+        self.before_registers = dict(self.target.registers)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def assert_restored(self):
+        self.assertEqual(
+            {address: bytes(data) for address, data in self.target.memory.items()},
+            self.before_memory,
+        )
+        self.assertEqual(self.target.registers, self.before_registers)
+        self.assertFalse(self.target.breakpoints)
+
+    def test_o32_entry_values_derive_status_and_restore_everything(self):
+        original_status = self.before_registers[(0, "status")]
+        expected_status = (
+            original_status & ~MIPS_GATE_STATUS_CLEAR
+        ) | MIPS_STATUS_EXL
+
+        result = CallGateTransaction(self.target, self.manifest).execute()
+
+        self.assertEqual(result.result, b"VIROSOK!")
+        self.assertEqual(
+            self.target.entry_registers,
+            {
+                "r4": self.manifest.request_address,
+                "r5": self.manifest.result_address,
+                "r6": self.manifest.result_size,
+                "r25": self.manifest.entry_address,
+                "r31": self.manifest.completion_address,
+                "status": expected_status,
+                "r29": self.manifest.stack_pointer,
+                "pc": self.manifest.entry_address,
+            },
+        )
+        self.assertEqual(
+            self.target.register_writes[:8],
+            [
+                (0, "r4", self.manifest.request_address),
+                (0, "r5", self.manifest.result_address),
+                (0, "r6", self.manifest.result_size),
+                (0, "r25", self.manifest.entry_address),
+                (0, "r31", self.manifest.completion_address),
+                (0, "status", expected_status),
+                (0, "r29", self.manifest.stack_pointer),
+                (0, "pc", self.manifest.entry_address),
+            ],
+        )
+        self.assertIn("76 register values: restored", result.audit)
+        self.assert_restored()
+
+    def test_status_formula_preserves_unrelated_original_bits(self):
+        for original_status in (0, 0x1D, 0x1040FF1D, 0xFFFFFFFF):
+            with self.subTest(original_status=original_status):
+                registers = {
+                    register: 0
+                    for register in MIPS32EL_MMIPS.register_names
+                }
+                registers["status"] = original_status
+                values = dict(MIPS32EL_MMIPS.entry_register_values(
+                    request_address=0x82000020,
+                    result_address=0x82000040,
+                    result_size=8,
+                    completion_address=0x80100004,
+                    control_state=None,
+                    original_registers=registers,
+                    stack_pointer=0x82002000,
+                    entry_address=0x80100000,
+                ))
+                self.assertEqual(
+                    values["status"],
+                    (original_status & ~MIPS_GATE_STATUS_CLEAR) | MIPS_STATUS_EXL,
+                )
+
+    def test_original_state_precondition_fails_before_any_write(self):
+        self.target.registers[(0, "r0")] = 1
+        with self.assertRaisesRegex(CallGateError, "r0.*zero"):
+            CallGateTransaction(self.target, self.manifest).execute()
+        self.assertEqual(self.target.writes, [])
+        self.assertEqual(self.target.register_writes, [])
+        self.assertFalse(self.target.breakpoints)
+
+    def test_manifest_status_is_never_accepted_for_mips(self):
+        manifest = replace(self.manifest, pstate=0x2)
+        target = FakeMipsTarget(manifest)
+        with self.assertRaisesRegex(CallGateError, "must not come from the manifest"):
+            CallGateTransaction(target, manifest).execute()
+        self.assertEqual(target.writes, [])
+        self.assertEqual(target.register_writes, [])
+
+    def test_descriptor_remains_unregistered_until_packaging_exists(self):
+        self.assertEqual(MIPS32EL_MMIPS.stack_alignment, 8)
+        self.assertEqual(MIPS32EL_MMIPS.argument_registers, ("r4", "r5", "r6"))
+        self.assertEqual(MIPS32EL_MMIPS.entry_address_registers, ("r25",))
+        self.assertFalse(MIPS32EL_MMIPS.manifest_control_state)
+        self.assertNotIn(MIPS32EL_MMIPS.name, ARCHITECTURES)
 
 
 class ManifestTests(unittest.TestCase):
