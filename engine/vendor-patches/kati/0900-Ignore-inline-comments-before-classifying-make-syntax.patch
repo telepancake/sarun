@@ -15,17 +15,21 @@ the existing comment scanner.
 
 ---
 diff --git a/src-rs/parser.rs b/src-rs/parser.rs
-index 2e86b4e..ce2bca6 100644
+index 6c3e20d..9f2f787 100644
 --- a/src-rs/parser.rs
 +++ b/src-rs/parser.rs
-@@ -178,0 +179,4 @@ impl Parser {
+@@ -179,1 +179,5 @@ impl Parser {
 +        // Comments are not makefile syntax.  In particular, assignment and
 +        // command separators inside an inline rule comment must not affect
 +        // whether this line establishes a recipe context.
 +        let line = line.slice_ref(trim_right_space(Parser::remove_comment(&line)));
-@@ -841,0 +846 @@ mod tests {
-+    use crate::symtab::intern;
-@@ -853,0 +859,12 @@ mod tests {
+         self.parse_rule_or_assign(line)
+@@ -849,6 +853,18 @@ mod tests {
+         assert_eq!(
+             Parser::get_directive(&Bytes::from_static(b"endif")),
+             Bytes::from_static(b"endif")
+         );
+     }
 +
 +    #[test]
 +    fn rule_comment_assignment_does_not_hide_recipe_context() {
@@ -33,11 +37,12 @@ index 2e86b4e..ce2bca6 100644
 +            b"list-tests: ## invoke with TESTS=<name>\n\t@ :\n",
 +        );
 +        let loc = Loc {
-+            filename: intern("comment-rule.mk"),
++            filename: crate::symtab::intern("comment-rule.mk"),
 +            line: 0,
 +        };
 +        assert!(parse_buf_no_stats(&input, loc).is_ok());
 +    }
+ }
 diff --git a/testcase/sarun_rule_inline_comment.mk b/testcase/sarun_rule_inline_comment.mk
 new file mode 100644
 index 0000000..bd4e66e
