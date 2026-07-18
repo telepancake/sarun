@@ -2245,13 +2245,17 @@ fi
         # recursive make.
         clear_mf = work / "clear-makeflags-boundary"
         shutil.rmtree(clear_mf, ignore_errors=True)
-        (clear_mf / "child").mkdir(parents=True)
+        (clear_mf / "middle/child").mkdir(parents=True)
         (clear_mf / "Makefile").write_text(
+            ".PHONY: all\n"
+            "all:\n"
+            "\t@$(MAKE) --no-print-directory -C middle all\n")
+        (clear_mf / "middle/Makefile").write_text(
             "override MAKEFLAGS=\n"
             ".PHONY: all\n"
             "all:\n"
             "\t@$(MAKE) --no-print-directory -C child all\n")
-        (clear_mf / "child/Makefile").write_text(
+        (clear_mf / "middle/child/Makefile").write_text(
             "V=5.1\n"
             ".PHONY: all\n"
             "all:\n"
@@ -2262,7 +2266,8 @@ fi
               f"{(r.stdout+r.stderr)[-700:]})")
         sp66 = latest_sqlar(m)
         clear_mf_result = m.sqlar_content(
-            sp66, str((clear_mf / "child/result.txt").resolve()).lstrip("/"))
+            sp66,
+            str((clear_mf / "middle/child/result.txt").resolve()).lstrip("/"))
         check(clear_mf_result == b"5.1|file\n",
               f"case66: child uses its file V after MAKEFLAGS clear; "
               f"got {clear_mf_result!r}")

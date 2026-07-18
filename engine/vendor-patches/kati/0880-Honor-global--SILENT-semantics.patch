@@ -65,7 +65,7 @@ index f87fd8a..b877251 100644
          for p in noop_for_us {
              // Touch the symbol so the rule is consumed; the "don't
 diff --git a/src-rs/eval.rs b/src-rs/eval.rs
-index 964efeb..c54b0cb 100644
+index 964efeb..f0427e8 100644
 --- a/src-rs/eval.rs
 +++ b/src-rs/eval.rs
 @@ -267,6 +267,12 @@ pub struct Evaluator {
@@ -90,6 +90,21 @@ index 964efeb..c54b0cb 100644
              dry_run: false,
              ignore_errors: false,
              goal_trace: false,
+@@ -1747,9 +1755,11 @@ impl Evaluator {
+             // GNU make always exports its final MAKEFLAGS value.
+             if let Some(var) = self.lookup_var(makeflags)? {
+                 let value = var.read().eval_to_buf(self)?;
+-                if !value.is_empty() {
+-                    emit_export(&mut prefix, b"MAKEFLAGS", &value);
+-                }
++                // Empty is meaningful: `override MAKEFLAGS=` must overwrite
++                // any ambient value in the fresh embedded recipe shell.
++                emit_export(&mut prefix, b"MAKEFLAGS", &value);
++            } else {
++                prefix.extend_from_slice(b"unset MAKEFLAGS\n");
+             }
+             Ok(Bytes::from(prefix))
+         })();
 diff --git a/src-rs/exec.rs b/src-rs/exec.rs
 index 999a546..05bd208 100644
 --- a/src-rs/exec.rs

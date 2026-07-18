@@ -906,7 +906,7 @@ as executable mappings and mmap that genuinely need a host fd.
           first few minutes instead of spending tens of minutes in database
           scans; the server can now serve concurrent compilation at more than
           one core. Vendor reconstruction, all 47 Kati units, the static
-          aarch64 build, and all 64 Make/Brush cases pass. After the kernel the
+          aarch64 build, and all 66 Make/Brush cases pass. After the kernel the
           same run built and installed fwtool, usign, libjson-c, and GRUB; it
           exited 2 only because the deliberately offline fixture lacked the
           checksum-pinned Lua 5.1.5 and ncurses 6.4 archives. Both archives are
@@ -920,10 +920,19 @@ as executable mappings and mmap that genuinely need a host fd.
           reinserted `MAKEOVERRIDES`, leaking top-level `V=s` into Lua's own
           `V=5.1` filename suffix and producing nonexistent `luas.1`. Overrides
           are now spliced back only while the evaluated MAKEFLAGS still contains
-          its `--` slot. Case 66 pins that exact package-boundary shape. The
-          static aarch64 build, all 47 Kati units, vendor reconstruction, and
-          all 66 Make/Brush cases pass; the next gate is resuming `world` in the
-          preserved box with these fixes.
+          its `--` slot. A first two-level regression was too shallow: the real
+          package evaluator did clear MAKEFLAGS, but its fresh embedded Brush
+          shell retained the top-level ambient value because an empty export was
+          omitted. Recipe prefixes now explicitly export an empty MAKEFLAGS (or
+          unset it when absent), so clearing the recursive boundary cannot leave
+          stale command variables in the shell. Case 66 now pins the real
+          three-level shape: top-level `V=s`, a middle makefile with `override
+          MAKEFLAGS=`, and Lua-like child `V=5.1`. Vendor reconstruction, all 47
+          Kati units, the static aarch64 build, and all 66 Make/Brush cases pass.
+          A clean rebuild of the actual OpenWrt Lua package through Brush also
+          compiles and installs `lua5.1`, `luac5.1`, headers, manuals, pkg-config
+          metadata, symlinks, and the host-package stamp. The next gate is
+          resuming `world -j10` in the preserved box with these fixes.
           Earlier nonfatal empty-operand arithmetic and generated-config `sed`
           diagnostics stay recorded for attribution rather than normalization.
     - [x] Complete the native-aarch64 FUSE Brush gate from a clean output tree.
