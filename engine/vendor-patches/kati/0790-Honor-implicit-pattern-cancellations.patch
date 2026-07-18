@@ -1,0 +1,78 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Sat, 18 Jul 2026 07:55:35 +0000
+Subject: [PATCH] Honor implicit pattern cancellations
+
+Recipe-less pattern rules cancel identical implicit rules; they are not viable empty recipes. This preserves Automake's suppression of built-in Objective-C patterns and lets valid suffix or alternate pattern relations build the target.
+
+---
+diff --git a/src-rs/dep.rs b/src-rs/dep.rs
+index 1140cb1..de64fbb 100644
+--- a/src-rs/dep.rs
++++ b/src-rs/dep.rs
+@@ -210,6 +210,18 @@ impl RuleTrie {
+         ret
+     }
+ 
++    fn cancel(&mut self, cancellation: &Rule) {
++        self.rules.retain(|entry| {
++            let candidate = &entry.rule;
++            candidate.output_patterns != cancellation.output_patterns
++                || candidate.inputs != cancellation.inputs
++                || candidate.order_only_inputs != cancellation.order_only_inputs
++        });
++        for child in self.children.values_mut() {
++            child.cancel(cancellation);
++        }
++    }
++
+     fn len(&self) -> usize {
+         self.rules.len() + self.children.values().map(|c| c.len()).sum::<usize>()
+     }
+@@ -975,6 +987,15 @@ impl<'a> DepBuilder<'a> {
+     }
+ 
+     fn populate_implicit_rule(&mut self, rule: Arc<Rule>) -> Result<()> {
++        // GNU make defines a recipe-less pattern rule as a cancellation of an
++        // otherwise identical implicit rule.  It is not itself a buildable
++        // relation.  Automake emits e.g. `%.o: %.m` to suppress make's built-in
++        // Objective-C rule; treating that line as a viable empty recipe leaves
++        // missing objects to be handed directly to the linker.
++        if rule.cmds.is_empty() {
++            self.implicit_rules.cancel(&rule);
++            return Ok(());
++        }
+         for output_pattern in &rule.output_patterns {
+             let op = output_pattern.as_bytes();
+             if op.as_ref() != b"%" || !Self::is_ignorable_implicit_rule(&rule) {
+diff --git a/testcase/sarun_cancel_implicit_pattern.mk b/testcase/sarun_cancel_implicit_pattern.mk
+new file mode 100644
+index 0000000..a1e33dd
+--- /dev/null
++++ b/testcase/sarun_cancel_implicit_pattern.mk
+@@ -0,0 +1,25 @@
++# A recipe-less pattern rule cancels an otherwise identical implicit rule; it
++# is not itself a usable empty recipe. Automake uses the first form below to
++# suppress make's built-in Objective-C rule while retaining its .c.o suffix
++# relation.
++$(shell printf 'from-c\n' > suffix.c)
++$(shell printf 'from-m\n' > suffix.m)
++$(shell printf 'from-good\n' > pattern.good)
++$(shell printf 'from-bad\n' > pattern.bad)
++
++.SUFFIXES:
++.SUFFIXES: .c .m .o
++
++.c.o:
++	@cp $< $@
++
++%.o: %.m
++
++%.out: %.good
++	@cp $< $@
++%.out: %.bad
++	@cp $< $@
++%.out: %.bad
++
++all: suffix.o pattern.out
++	@cat $^

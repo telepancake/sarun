@@ -723,13 +723,22 @@ as executable mappings and mmap that genuinely need a host fd.
           chains remain active. Make/Brush case 54 and a native Kati/GNU corpus
           fixture pin the shipped-generated-file behavior; vendor reproduction,
           the static aarch64 build, and the full 54-case suite pass. A focused
-          replay of both released toolchain targets has passed their former
-          `bfdsumm.stamp` failure and is compiling BFD in parallel. The
-          earlier omission has therefore not
-          reproduced as an engine defect. The earlier nonfatal empty-operand
-          arithmetic and generated-config `sed` diagnostics also remain for
-          attribution rather
-          than normalization.
+          replay of both released toolchain targets passed their former
+          `bfdsumm.stamp` failure; GDB then built and installed completely.
+          Binutils advanced through BFD and exposed the next generic GNU-make
+          relation at GProf: Automake's recipe-less `%.o: %.m` cancellation was
+          treated as a viable empty recipe, so three missing `*_bl.o` files
+          reached the linker instead of using the valid `.c.o` suffix rule.
+          Recipe-less patterns now remove an otherwise identical implicit rule
+          and never enter candidate selection themselves. A native Kati/GNU
+          corpus fixture covers both the Automake cancellation shape and
+          cancellation of an earlier user pattern; Make/Brush case 55 covers
+          the same relations at `-j10`. Vendor reproduction, the static
+          aarch64 build, and the complete 55-case suite pass. The focused
+          Binutils replay and full `world` continuation remain the next real
+          gates. Earlier nonfatal
+          empty-operand arithmetic and generated-config `sed` diagnostics stay
+          recorded for attribution rather than normalization.
     - [x] Complete the native-aarch64 FUSE Brush gate from a clean output tree.
           Linux 6.18 builds 823 objects with `-j10` (11 observed overlapping
           clang processes), takes 162 s wall / 143 s compile, and records 2,797

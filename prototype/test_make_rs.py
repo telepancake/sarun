@@ -1878,6 +1878,43 @@ fi
         check(shipped_manual == b"shipped manual\n" and generated_stamp is None,
               f"case54: existing generated source is consumed unchanged; "
               f"result={shipped_manual!r} stamp={generated_stamp!r}")
+        # ── CASE 55: recipe-less pattern rules are cancellations ─────────
+        # Automake emits `%.o: %.m` without a recipe to cancel make's
+        # built-in Objective-C relation. It is not a successful empty recipe:
+        # when both same-stem .m and .c files exist, the declared .c.o suffix
+        # rule must still compile the object. Cancellation also removes an
+        # earlier identical user pattern instead of leaving either candidate.
+        pc = work / "pattern-rule-cancellation"
+        shutil.rmtree(pc, ignore_errors=True)
+        pc.mkdir(parents=True)
+        (pc / "suffix.c").write_text("from-c\n")
+        (pc / "suffix.m").write_text("from-m\n")
+        (pc / "pattern.good").write_text("from-good\n")
+        (pc / "pattern.bad").write_text("from-bad\n")
+        (pc / "Makefile").write_text(
+            ".SUFFIXES:\n"
+            ".SUFFIXES: .c .m .o\n"
+            ".c.o:\n"
+            "\t@cp $< $@\n"
+            "%.o: %.m\n"
+            "%.out: %.good\n"
+            "\t@cp $< $@\n"
+            "%.out: %.bad\n"
+            "\t@cp $< $@\n"
+            "%.out: %.bad\n"
+            ".PHONY: all\n"
+            "all: suffix.o pattern.out\n"
+            "\t@cat $^ > result.txt\n")
+        r = run_make("MAKE55", pc, "-j10", "all")
+        check(r.returncode == 0,
+              f"case55: cancelled implicit patterns fall through to valid "
+              f"relations (got {r.returncode}: {(r.stdout+r.stderr)[-700:]})")
+        sp55 = latest_sqlar(m)
+        cancellation_result = m.sqlar_content(
+            sp55, str((pc / "result.txt").resolve()).lstrip("/"))
+        check(cancellation_result == b"from-c\nfrom-good\n",
+              f"case55: suffix and surviving pattern recipes produced the "
+              f"outputs; got {cancellation_result!r}")
     finally:
         if eng is not None and eng.poll() is None:
             eng.terminate()
