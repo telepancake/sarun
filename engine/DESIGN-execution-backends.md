@@ -735,8 +735,10 @@ as executable mappings and mmap that genuinely need a host fd.
           cancellation of an earlier user pattern; Make/Brush case 55 covers
           the same relations at `-j10`. Vendor reproduction, the static
           aarch64 build, and the complete 55-case suite pass. The focused
-          Binutils replay and full `world` continuation remain the next real
-          gates. Earlier nonfatal
+          Binutils replay now passes end-to-end: it builds and links GProf,
+          generates both AArch64 and 32-bit ARM linker emulations, installs the
+          complete Binutils 2.44 toolchain, and exits zero under Brush at
+          `-j10`. The full `world` continuation is the next real gate. Earlier nonfatal
           empty-operand arithmetic and generated-config `sed` diagnostics stay
           recorded for attribution rather than normalization.
     - [x] Complete the native-aarch64 FUSE Brush gate from a clean output tree.
