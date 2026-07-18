@@ -86,6 +86,82 @@ workdir_is_case_sensitive() {
     rm -rf -- "$check"
 }
 
+CASE_KBUILD_MIN_KIB=${VIROS_CASE_KBUILD_MIN_KIB:-4194304}
+
+case_kbuild_available_kib() {
+    awk '
+        $1 == "MemAvailable:" { memory = $2 }
+        $1 == "SwapFree:" { swap = $2 }
+        END { print memory + swap }
+    ' /proc/meminfo
+}
+
+case_kbuild_preflight() {
+    local available
+    need bwrap
+    [[ "$CASE_KBUILD_MIN_KIB" =~ ^[0-9]+$ ]] ||
+        die "VIROS_CASE_KBUILD_MIN_KIB must be a nonnegative integer"
+    available=$(case_kbuild_available_kib)
+    ((available >= CASE_KBUILD_MIN_KIB)) ||
+        die "case-sensitive Kbuild tmpfs needs at least $((CASE_KBUILD_MIN_KIB / 1024)) MiB available RAM+swap; found $((available / 1024)) MiB"
+}
+
+run_case_sensitive_workspace() {
+    local name=$1 export_directory=$2 mount parent export_path work_root bwrap_bin status retained_path=
+    local -a retained_bind=() retained_environment=()
+    shift 2
+    [[ "$name" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*$ ]] ||
+        die "invalid case-sensitive workspace name: $name"
+    (($#)) || die "case-sensitive workspace requires a command"
+    mkdir -p "$BUILD" "$DOWNLOADS" "$TOOLS" "$export_directory"
+    work_root=$(CDPATH= cd -- "$WORKDIR" && pwd -P)
+    parent=$(CDPATH= cd -- "$BUILD" && pwd -P)
+    mount="$parent/.case-kbuild-$name"
+    export_path=$(CDPATH= cd -- "$export_directory" && pwd -P)
+    case "$export_path/" in
+        "$work_root/"*) ;;
+        *) die "case-sensitive workspace output must be below VIROS_WORKDIR" ;;
+    esac
+    if [[ -n ${VIROS_KBUILD_RETAINED_BIND:-} ]]; then
+        retained_path=$(CDPATH= cd -- "$VIROS_KBUILD_RETAINED_BIND" && pwd -P)
+        case "$retained_path/" in
+            "$work_root/"*) ;;
+            *) die "retained Kbuild input must be below VIROS_WORKDIR" ;;
+        esac
+        retained_bind=(--dir "$mount/retained" --ro-bind "$retained_path" "$mount/retained")
+        retained_environment=(--setenv VIROS_KBUILD_RETAINED "$mount/retained")
+    fi
+    bwrap_bin=$(command -v bwrap) || die "required host command not found: bwrap"
+    mkdir "$mount" || die "case-sensitive workspace path already exists: $mount"
+    if "$bwrap_bin" --die-with-parent \
+        --ro-bind / / \
+        --dev-bind /dev /dev \
+        --proc /proc \
+        --tmpfs "$mount" \
+        --dir "$mount/downloads" \
+        --ro-bind "$(CDPATH= cd -- "$DOWNLOADS" && pwd -P)" "$mount/downloads" \
+        --dir "$mount/tools" \
+        --bind "$(CDPATH= cd -- "$TOOLS" && pwd -P)" "$mount/tools" \
+        --dir "$mount/sources" \
+        --dir "$mount/build" \
+        --dir "$mount/artifacts" \
+        --dir "$mount/images" \
+        "${retained_bind[@]}" \
+        --bind "$export_path" "$export_path" \
+        --setenv VIROS_WORKDIR "$mount" \
+        --setenv VIROS_ORIGINAL_WORKDIR "$WORKDIR" \
+        --setenv VIROS_KBUILD_TMPFS_ACTIVE 1 \
+        --setenv VIROS_KBUILD_EXPORT "$export_path" \
+        "${retained_environment[@]}" \
+        "$@"; then
+        status=0
+    else
+        status=$?
+    fi
+    rmdir -- "$mount" || die "case-sensitive workspace mount did not cleanly disappear: $mount"
+    return "$status"
+}
+
 host_is_supported() {
     [[ $(uname -s) == Linux && $(getconf LONG_BIT 2>/dev/null || printf 0) == 64 ]] || return 1
     [[ $(uname -m) == x86_64 || $(uname -m) == aarch64 ]]
@@ -115,6 +191,8 @@ Stages:
   download              Download pinned tools, current RouterOS, and OpenWrt
   build                 Build emulators, Python GDB, and debug kernel(s)
   kernel-debug <target> Build a MikroTik-configured vmlinux with GDB scripts
+  kernel-workspace TARGET WRITABLE-DIR -- COMMAND [ARG...]
+                        Run a foreground Kbuild command with matching source
   extract [arch|all]    Extract Linux images/initramfs from RouterOS NPKs
   prepare [arch|all]    Extract and create per-target raw ext2 disk images
   run <target> [-- ...] Prepare and run one target; extra args go to QEMU
@@ -130,7 +208,8 @@ Information:
 
 Configuration is via QEMU_VERSION, GDB_VERSION, ROUTEROS_VERSION,
 ROUTEROS_NPK, OPENWRT_VERSION, JOBS, DISK_SIZE, and VIROS_WORKDIR.  All output
-remains inside VIROS_WORKDIR.
+remains inside VIROS_WORKDIR.  On a case-insensitive work directory,
+kernel-debug automatically uses a short-lived bwrap tmpfs below build/.
 EOF
 }
 
@@ -488,9 +567,23 @@ mikrotik_kernel_source() {
 }
 
 prepare_mikrotik_source() {
-    local archive="$DOWNLOADS/mikrotik-gpl-${MIKROTIK_GPL_COMMIT}.tar.gz"
+    local archive="$DOWNLOADS/mikrotik-gpl-${MIKROTIK_GPL_COMMIT}.tar.gz" root destination
     [[ -s "$archive" ]] || die "MikroTik GPL source archive is missing; run download first"
-    unpack_source "$archive" "$SOURCES/mikrotik-gpl"
+    if [[ ${VIROS_KBUILD_TMPFS_ACTIVE:-0} == 1 ]]; then
+        # The full disclosed archive expands to roughly 1.2 GiB, while this
+        # build needs only the published Linux source update and configurations.
+        # Keep the bounded tmpfs workspace for the Linux source and output.
+        destination="$SOURCES/mikrotik-gpl/2025-03-19"
+        if [[ ! -f "$SOURCES/mikrotik-gpl/.unpacked" ]]; then
+            root="mikrotik-gpl-${MIKROTIK_GPL_COMMIT}/2025-03-19"
+            mkdir -p "$destination"
+            tar -xf "$archive" -C "$destination" --strip-components=2 \
+                "$root/linux-${LINUX_VERSION}.patch" "$root/configs"
+            : > "$SOURCES/mikrotik-gpl/.unpacked"
+        fi
+    else
+        unpack_source "$archive" "$SOURCES/mikrotik-gpl"
+    fi
     [[ -s "$SOURCES/mikrotik-gpl/2025-03-19/linux-${LINUX_VERSION}.patch" ]] || die "MikroTik Linux patch is absent from the GPL archive"
 }
 
@@ -503,18 +596,18 @@ prepare_mikrotik_kernel_source() {
     [[ -s "$archive" ]] || die "official Linux $LINUX_VERSION source is missing; run download first"
     if [[ ! -f "$src/.mikrotik-patched" ]]; then
         if [[ -e "$src" ]]; then
-            die "$src exists without a completed patch marker; move it aside and retry"
+            die "$src exists without a completed source-update marker; move it aside and retry"
         fi
         mkdir -p "$src"
         tar -xf "$archive" -C "$src" --strip-components=1
-        say "Applying MikroTik's disclosed Linux $LINUX_VERSION patch"
+        say "Applying MikroTik's published Linux $LINUX_VERSION source update"
         if ! patch --batch --forward -d "$src" -p1 < "$patchfile"; then
-            die "MikroTik kernel patch failed; remove the incomplete $src before retrying"
+            die "MikroTik's Linux source update could not be applied; remove the incomplete $src before retrying"
         fi
         : > "$src/.mikrotik-patched"
     fi
     [[ -f "$src/arch/arm/kernel/head.S" && -f "$src/arch/powerpc/kernel/head_44x.S" ]] ||
-        die "patched Linux source is incomplete"
+        die "published Linux source tree is incomplete"
 }
 
 X86_CROSS_PREFIX=
@@ -581,6 +674,236 @@ find_kernel_config() {
     die "none of the expected MikroTik configs were found: $*"
 }
 
+case_kbuild_identity_value() {
+    local identity=$1 field=$2 value
+    value=$(awk -v field="$field" '
+        $1 == field { count++; value = $2 }
+        END { if (count != 1) exit 1; print value }
+    ' "$identity") || die "invalid retained Kbuild identity field: $field"
+    printf '%s\n' "$value"
+}
+
+assert_casefold_portable_tree() {
+    local tree=$1 collision
+    collision=$(CDPATH= cd -- "$tree" && LC_ALL=C find . -mindepth 1 -printf '%P\n' |
+        LC_ALL=C awk '
+            {
+                folded = tolower($0)
+                if (collision == "" && folded in seen && seen[folded] != $0) {
+                    collision = seen[folded] " <> " $0
+                }
+                seen[folded] = $0
+            }
+            END { if (collision != "") print collision }
+        ')
+    [[ -z "$collision" ]] ||
+        die "retained Kbuild output has names that collide on a case-insensitive filesystem: $collision"
+}
+
+materialize_kernel_gdb_helpers() {
+    local out=$1 temporary="$1/.viros-gdb-copy-$$"
+    [[ -s "$out/vmlinux-gdb.py" && -d "$out/scripts/gdb" ]] ||
+        die "kernel build did not create its Linux GDB Python extension"
+    mkdir "$temporary"
+    cp -aL -- "$out/vmlinux-gdb.py" "$temporary/vmlinux-gdb.py"
+    mkdir "$temporary/scripts-gdb"
+    cp -aL -- "$out/scripts/gdb/." "$temporary/scripts-gdb/"
+    rm -rf -- "$out/scripts/gdb"
+    mkdir -p "$out/scripts"
+    mv -- "$temporary/scripts-gdb" "$out/scripts/gdb"
+    mv -f -- "$temporary/vmlinux-gdb.py" "$out/vmlinux-gdb.py"
+    rmdir -- "$temporary"
+    [[ -f "$out/vmlinux-gdb.py" && ! -L "$out/vmlinux-gdb.py" ]] ||
+        die "retained vmlinux-gdb.py is not a regular file"
+    [[ -z $(find "$out/scripts/gdb" -type l -print -quit) ]] ||
+        die "retained Linux GDB Python extension still contains source links"
+}
+
+retain_case_kbuild_workspace() {
+    local target=$1 out="$BUILD/kernel-$1" destination="$VIROS_KBUILD_EXPORT"
+    local linux_hash update_hash config_hash vmlinux_hash
+    [[ ${VIROS_KBUILD_TMPFS_ACTIVE:-0} == 1 && -n ${VIROS_KBUILD_EXPORT:-} ]] ||
+        die "case-sensitive Kbuild retention was invoked outside its workspace"
+    [[ -s "$out/vmlinux" && -s "$out/vmlinux-gdb.py" ]] ||
+        die "case-sensitive Kbuild output is incomplete"
+    materialize_kernel_gdb_helpers "$out"
+    ln -sfn -- "$out" "$out/.viros-original-output"
+    assert_casefold_portable_tree "$out"
+    assert_casefold_portable_tree "$ARTIFACTS/$target"
+    linux_hash=$(sha256sum "$DOWNLOADS/linux-${LINUX_VERSION}.tar.xz" | awk '{print $1}')
+    update_hash=$(sha256sum "$SOURCES/mikrotik-gpl/2025-03-19/linux-${LINUX_VERSION}.patch" | awk '{print $1}')
+    config_hash=$(sha256sum "$out/.config" | awk '{print $1}')
+    vmlinux_hash=$(sha256sum "$out/vmlinux" | awk '{print $1}')
+    {
+        printf 'format viros-case-kbuild-v2\n'
+        printf 'target %s\n' "$target"
+        printf 'linux_version %s\n' "$LINUX_VERSION"
+        printf 'gpl_commit %s\n' "$MIKROTIK_GPL_COMMIT"
+        printf 'linux_archive_sha256 %s\n' "$linux_hash"
+        printf 'linux_update_sha256 %s\n' "$update_hash"
+        printf 'config_sha256 %s\n' "$config_hash"
+        printf 'vmlinux_sha256 %s\n' "$vmlinux_hash"
+    } > "$out/.viros-case-kbuild"
+    mkdir -p "$destination/kernel-$target" "$destination/artifacts/$target"
+    cp -a -- "$out/." "$destination/kernel-$target/"
+    cp -a -- "$ARTIFACTS/$target/." "$destination/artifacts/$target/"
+}
+
+setup_kernel_build_context() {
+    local target=$1 arch prefix
+    case "$target" in
+        x86) arch=x86_64; setup_x86_cross; prefix=$X86_CROSS_PREFIX ;;
+        arm) arch=arm; setup_arm_cross; prefix=$ARM_CROSS_PREFIX ;;
+        arm64) arch=arm64; setup_aarch64_cross; prefix=$AARCH64_CROSS_PREFIX ;;
+        mipsbe|smips) arch=mips; setup_mipsbe_cross; prefix=$MIPSBE_CROSS_PREFIX ;;
+        mmips) arch=mips; setup_mmips_cross; prefix=$MMIPS_CROSS_PREFIX ;;
+        ppc-e500-smp|ppc-e500|ppc-440) arch=powerpc; setup_ppc_cross; prefix=$PPC_CROSS_PREFIX ;;
+        *) die "no retained published-kernel build context for $target" ;;
+    esac
+    export ARCH="$arch" CROSS_COMPILE="$prefix"
+}
+
+reconnect_retained_kbuild_output() {
+    local out=$1 src=$2 previous_source= previous_output= metadata
+    if [[ -L "$out/source" ]]; then
+        previous_source=$(readlink -- "$out/source")
+    fi
+    if [[ -L "$out/.viros-original-output" ]]; then
+        previous_output=$(readlink -- "$out/.viros-original-output")
+    fi
+    rm -f -- "$out/source"
+    rm -f -- "$out/.viros-original-output"
+    ln -s -- "$src" "$out/source"
+    (CDPATH= cd -- "$out" && "$src/scripts/mkmakefile" "$src")
+    if [[ ( -n "$previous_source" && "$previous_source" != "$src" ) ||
+          ( -n "$previous_output" && "$previous_output" != "$out" ) ]]; then
+        while IFS= read -r -d '' metadata; do
+            OLD_SOURCE="$previous_source" NEW_SOURCE="$src" \
+                OLD_OUTPUT="$previous_output" NEW_OUTPUT="$out" \
+                perl -pi -e '
+                    s/\Q$ENV{OLD_SOURCE}\E/$ENV{NEW_SOURCE}/g if length $ENV{OLD_SOURCE};
+                    s/\Q$ENV{OLD_OUTPUT}\E/$ENV{NEW_OUTPUT}/g if length $ENV{OLD_OUTPUT};
+                ' "$metadata"
+        done < <(find "$out" -type f \( -name '*.cmd' -o -name '*.d' \) -print0)
+    fi
+}
+
+rehydrate_case_kbuild_worker() {
+    local target=${1:-} identity src out expected
+    shift || true
+    [[ ${VIROS_KBUILD_TMPFS_ACTIVE:-0} == 1 && -n ${VIROS_KBUILD_RETAINED:-} ]] ||
+        die "internal retained Kbuild worker requires its case-sensitive workspace"
+    [[ -n "$target" && $# -gt 0 ]] ||
+        die "internal retained Kbuild worker requires a target and command"
+    identity="$VIROS_KBUILD_RETAINED/.viros-case-kbuild"
+    [[ -s "$identity" ]] || die "retained Kbuild identity is missing"
+    [[ $(case_kbuild_identity_value "$identity" format) == viros-case-kbuild-v2 ]] ||
+        die "unsupported retained Kbuild identity format"
+    [[ $(case_kbuild_identity_value "$identity" target) == "$target" ]] ||
+        die "retained Kbuild target does not match $target"
+    [[ $(case_kbuild_identity_value "$identity" linux_version) == "$LINUX_VERSION" ]] ||
+        die "retained Kbuild Linux version does not match $LINUX_VERSION"
+    [[ $(case_kbuild_identity_value "$identity" gpl_commit) == "$MIKROTIK_GPL_COMMIT" ]] ||
+        die "retained Kbuild published-source revision does not match"
+    expected=$(case_kbuild_identity_value "$identity" linux_archive_sha256)
+    verify_file "$expected" "$DOWNLOADS/linux-${LINUX_VERSION}.tar.xz"
+    prepare_mikrotik_kernel_source
+    src=$(mikrotik_kernel_source)
+    expected=$(case_kbuild_identity_value "$identity" linux_update_sha256)
+    verify_file "$expected" "$SOURCES/mikrotik-gpl/2025-03-19/linux-${LINUX_VERSION}.patch"
+    out="$BUILD/kernel-$target"
+    mkdir -p "$out"
+    cp -a -- "$VIROS_KBUILD_RETAINED/." "$out/"
+    expected=$(case_kbuild_identity_value "$identity" config_sha256)
+    verify_file "$expected" "$out/.config"
+    expected=$(case_kbuild_identity_value "$identity" vmlinux_sha256)
+    verify_file "$expected" "$out/vmlinux"
+    [[ -f "$out/vmlinux-gdb.py" && ! -L "$out/vmlinux-gdb.py" ]] ||
+        die "retained Linux GDB Python extension is not portable"
+    reconnect_retained_kbuild_output "$out" "$src"
+    setup_kernel_build_context "$target"
+    export VIROS_KERNEL_SOURCE="$src" VIROS_KERNEL_OUTPUT="$out"
+    CDPATH= cd -- "$VIROS_KBUILD_EXPORT"
+    "$@"
+}
+
+run_retained_kernel_workspace() {
+    (($# >= 4)) ||
+        die "usage: ./viros.sh kernel-workspace TARGET WRITABLE-DIR -- COMMAND [ARG...]"
+    local target=$1 writable=$2 retained work_root writable_path status
+    shift 2
+    [[ ${1:-} == -- ]] ||
+        die "usage: ./viros.sh kernel-workspace TARGET WRITABLE-DIR -- COMMAND [ARG...]"
+    shift
+    (($#)) || die "kernel-workspace requires a foreground command"
+    host_is_supported || die "kernel-workspace requires x86-64 or AArch64 Linux"
+    case "$target" in
+        x86|arm|arm64|mipsbe|mmips|smips|ppc-e500-smp|ppc-e500|ppc-440) ;;
+        *) die "no retained published-kernel build context for $target" ;;
+    esac
+    retained="$BUILD/kernel-$target"
+    [[ -s "$retained/.viros-case-kbuild" ]] ||
+        die "retained Kbuild output is missing; run: ./viros.sh kernel-debug $target"
+    mkdir -p -- "$writable"
+    work_root=$(CDPATH= cd -- "$WORKDIR" && pwd -P)
+    writable_path=$(CDPATH= cd -- "$writable" && pwd -P)
+    case "$writable_path/" in
+        "$work_root/"*) ;;
+        *) die "kernel-workspace writable directory must be below VIROS_WORKDIR" ;;
+    esac
+    [[ "$writable_path" != "$work_root" ]] ||
+        die "kernel-workspace requires a dedicated writable subdirectory"
+    case "$(CDPATH= cd -- "$retained" && pwd -P)/" in
+        "$writable_path/"*) die "kernel-workspace writable directory must not contain retained Kbuild output" ;;
+    esac
+    case_kbuild_preflight
+    say "Reconstructing the matching published Linux source in a project-local workspace"
+    if VIROS_KBUILD_RETAINED_BIND="$retained" \
+        run_case_sensitive_workspace "rehydrate-$target-$$" "$writable_path" \
+            "$SCRIPT_DIR/viros.sh" _case-kbuild-command "$target" "$@"; then
+        status=0
+    else
+        status=$?
+    fi
+    ((status == 0)) || die "foreground Kbuild command failed for $target"
+}
+
+case_kbuild_worker() {
+    local target=${1:-}
+    [[ ${VIROS_KBUILD_TMPFS_ACTIVE:-0} == 1 ]] ||
+        die "internal case-sensitive Kbuild worker requires bubblewrap tmpfs"
+    [[ -n "$target" ]] || die "internal case-sensitive Kbuild worker requires a target"
+    build_debug_kernel "$target"
+    retain_case_kbuild_workspace "$target"
+}
+
+build_debug_kernel_casefold() {
+    local target=$1 export_directory="$BUILD/.case-kbuild-export-$1-$$" status
+    case_kbuild_preflight
+    mkdir "$export_directory" || die "case-sensitive Kbuild export already exists: $export_directory"
+    say "Using a project-local case-sensitive tmpfs for Linux Kbuild"
+    if run_case_sensitive_workspace "kernel-$target-$$" "$export_directory" \
+        "$SCRIPT_DIR/viros.sh" _case-kbuild-worker "$target"; then
+        status=0
+    else
+        status=$?
+    fi
+    if ((status)); then
+        rm -rf -- "$export_directory"
+        die "case-sensitive Kbuild worker failed for $target"
+    fi
+    if [[ ! -s "$export_directory/kernel-$target/vmlinux" ||
+          ! -s "$export_directory/artifacts/$target/vmlinux.debug" ]]; then
+        rm -rf -- "$export_directory"
+        die "case-sensitive Kbuild worker did not retain complete output for $target"
+    fi
+    mkdir -p "$BUILD/kernel-$target" "$ARTIFACTS/$target"
+    cp -a -- "$export_directory/kernel-$target/." "$BUILD/kernel-$target/"
+    cp -a -- "$export_directory/artifacts/$target/." "$ARTIFACTS/$target/"
+    rm -rf -- "$export_directory"
+    say "Retained exact Kbuild output: $BUILD/kernel-$target"
+}
+
 build_debug_kernel() {
     local target=${1:-} src out config arch prefix= image= obj raw compiler_version
     local -a targets
@@ -589,8 +912,12 @@ build_debug_kernel() {
         x86|arm|arm64|mipsbe|mmips|smips|ppc-e500-smp|ppc-e500|ppc-440) ;;
         *) die "no validated matching debug-kernel boot for $target" ;;
     esac
-    workdir_is_case_sensitive ||
-        die "Linux debug kernels require a case-sensitive VIROS_WORKDIR; $WORKDIR is case-insensitive"
+    if ! workdir_is_case_sensitive; then
+        [[ ${VIROS_KBUILD_TMPFS_ACTIVE:-0} != 1 ]] ||
+            die "bubblewrap did not provide a case-sensitive Kbuild tmpfs"
+        build_debug_kernel_casefold "$target"
+        return
+    fi
     need flex; need bison; need bc; need perl
     prepare_mikrotik_kernel_source
     src=$(mikrotik_kernel_source)
@@ -657,7 +984,7 @@ build_debug_kernel() {
             --enable DEBUG_INFO_DWARF4 --enable KALLSYMS --enable KALLSYMS_ALL --enable IKCONFIG
     fi
     local make_args=( -C "$src" O="$out" ARCH="$arch" CROSS_COMPILE="$prefix" )
-    say "Building patched Linux $LINUX_VERSION for $target with MikroTik's published config"
+    say "Building published Linux $LINUX_VERSION source for $target with MikroTik's published config"
     make "${make_args[@]}" olddefconfig
     targets=(vmlinux scripts_gdb)
     [[ -n "$image" ]] && targets+=("$image")
@@ -1781,7 +2108,7 @@ EOF
 }
 
 doctor_stage() {
-    local failed=0 command host_bits name python uv_target
+    local failed=0 command host_bits name python uv_target available check bwrap_status
     for command in bash curl tar xz make gcc g++ m4 pkg-config ninja mkfs.ext2 truncate sha256sum flex bison bc perl dtc sed patch; do
         if command -v "$command" >/dev/null 2>&1; then
             printf 'ok       %s\n' "$command"
@@ -1811,8 +2138,30 @@ doctor_stage() {
     if workdir_is_case_sensitive; then
         printf 'ok       case-sensitive VIROS_WORKDIR\n'
     else
-        printf 'missing  case-sensitive VIROS_WORKDIR (required by the Linux source tree; found %s)\n' "$WORKDIR"
-        failed=1
+        check="$BUILD/.case-bwrap-doctor-$$"
+        mkdir -p "$check"
+        bwrap_status=1
+        if command -v bwrap >/dev/null 2>&1 &&
+            bwrap --die-with-parent --ro-bind / / --tmpfs "$check" /bin/true >/dev/null 2>&1; then
+            bwrap_status=0
+        fi
+        rmdir -- "$check" 2>/dev/null || true
+        if ((bwrap_status)); then
+            printf 'missing  usable bwrap for case-insensitive VIROS_WORKDIR fallback (found %s)\n' "$WORKDIR"
+            failed=1
+        else
+            available=$(case_kbuild_available_kib)
+            if [[ ! "$CASE_KBUILD_MIN_KIB" =~ ^[0-9]+$ ]]; then
+                printf 'missing  valid nonnegative VIROS_CASE_KBUILD_MIN_KIB value\n'
+                failed=1
+            elif ((available >= CASE_KBUILD_MIN_KIB)); then
+                printf 'ready    bwrap case-sensitive Kbuild tmpfs below VIROS_WORKDIR/build (%s MiB RAM+swap available)\n' "$((available / 1024))"
+            else
+                printf 'missing  %s MiB available RAM+swap for bwrap Kbuild tmpfs (found %s MiB)\n' \
+                    "$((CASE_KBUILD_MIN_KIB / 1024))" "$((available / 1024))"
+                failed=1
+            fi
+        fi
     fi
     for name in "$X86_TOOLCHAIN_NAME" "$ARM_TOOLCHAIN_NAME" "$AARCH64_TOOLCHAIN_NAME" \
         "$MIPSBE_TOOLCHAIN_NAME" "$MMIPS_TOOLCHAIN_NAME" "$PPC_TOOLCHAIN_NAME"; do
@@ -1832,12 +2181,15 @@ main() {
         download) download_stage "$@" ;;
         build) build_stage "$@" ;;
         kernel-debug) build_debug_kernel "$@" ;;
+        kernel-workspace) run_retained_kernel_workspace "$@" ;;
         extract) extract_stage "$@" ;;
         prepare) prepare_stage "$@" ;;
         run) run_stage "$@" ;;
         gdb) gdb_stage "$@" ;;
         debug) debug_stage "$@" ;;
         inferiors) inferiors_stage "$@" ;;
+        _case-kbuild-worker) case_kbuild_worker "$@" ;;
+        _case-kbuild-command) rehydrate_case_kbuild_worker "$@" ;;
         list) list_stage ;;
         doctor) doctor_stage ;;
         help|-h|--help) usage ;;
@@ -1845,4 +2197,6 @@ main() {
     esac
 }
 
-main "$@"
+if [[ ${VIROS_SOURCE_ONLY:-0} != 1 ]]; then
+    main "$@"
+fi

@@ -53,12 +53,49 @@ fetches checksum-pinned Bootlin toolchains for x86-64, ARM, AArch64, both MIPS
 endian variants, and PowerPC. Their host executables are x86-64: an x86-64
 Linux runner executes them directly, while an AArch64 Linux runner executes
 the identical archives through the `qemu-x86_64` user emulator built by the
-QEMU stage. Both host paths have been exercised. The work directory must be on
-a case-sensitive filesystem:
-Linux has source files whose names differ only by case, so its published patch
-cannot be represented correctly on a case-insensitive macOS-backed mount.
-`doctor` detects this before a kernel build starts; use a checkout or set
-`VIROS_WORKDIR` to a directory on a case-sensitive volume.
+QEMU stage. Both host paths have been exercised.
+
+Linux has source files whose names differ only by case, so its source tree
+cannot be represented directly on a case-insensitive macOS-backed mount. The
+normal path remains an ordinary out-of-tree build when `VIROS_WORKDIR` is case
+sensitive. Otherwise `kernel-debug` uses `bwrap` to mount a short-lived,
+case-sensitive tmpfs at an existing path below `VIROS_WORKDIR/build`, unpacks
+the already-downloaded pinned Linux source and published MikroTik source update there,
+and copies the finished output and provenance back below `VIROS_WORKDIR`.
+Nothing is placed in system `/tmp`, and the mount disappears with the build
+process. The retained `build/kernel-TARGET` tree includes generated headers,
+scripts, `.config`, `vmlinux`, and a `.viros-case-kbuild` identity record. The
+`vmlinux-gdb.py` loader and everything it imports are retained as regular files,
+so GDB does not depend on the expired source mount. Before copying the output,
+the script also rejects any filenames that would collide on case-insensitive
+storage.
+
+This fallback needs `bwrap` and, by default, at least 4 GiB of currently
+available RAM plus swap because the uncompressed source and output live in
+tmpfs together. `doctor` reports whether the direct path or fallback is ready
+before a real build starts. `VIROS_CASE_KBUILD_MIN_KIB` may adjust that
+preflight threshold for a known runner configuration; it does not limit the
+kernel build's actual memory use.
+
+To compile an out-of-tree Kbuild directory later, `kernel-workspace`
+reconstructs the matching published source, verifies it and the retained
+configuration and `vmlinux`, reconnects the retained output tree, and runs one
+foreground command. The supplied directory is the command's working directory
+and the only caller-selected writable path; the reconstructed source and output
+disappear when the command exits. For example:
+
+```sh
+mkdir -p work/my-module
+# Put the module Makefile and sources in work/my-module first.
+./viros.sh kernel-workspace arm work/my-module -- \
+  sh -c 'make -C "$VIROS_KERNEL_SOURCE" O="$VIROS_KERNEL_OUTPUT" \
+    ARCH="$ARCH" CROSS_COMPILE="$CROSS_COMPILE" M="$PWD" modules'
+```
+
+The command receives `VIROS_KERNEL_SOURCE`, `VIROS_KERNEL_OUTPUT`, `ARCH`, and
+`CROSS_COMPILE`. Tool setup is the other writable project path because an
+AArch64 runner may need to create its local adapters for the pinned x86-64
+compiler programs. Downloads and the retained Kbuild input are read-only.
 
 RouterOS defaults to the current stable version returned by MikroTik's
 `LATEST.7` endpoint. A reproducible run can pin it explicitly:
