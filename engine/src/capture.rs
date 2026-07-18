@@ -312,6 +312,9 @@ impl LayerMirror {
 pub struct BoxState {
     pub id: i64,
     pub conn: Mutex<Connection>,
+    /// High-rate provenance/build/output writes use a distinct WAL connection
+    /// so they cannot hold the filesystem metadata connection's Rust mutex.
+    pub(crate) recorder_conn: Mutex<Connection>,
     pub kinds: RwLock<LayerMirror>,
     /// Sparse metadata mirrors. Attribute lookup is the hottest filesystem
     /// path in a build; querying SQLite twice for every ordinary lower inode
@@ -626,9 +629,19 @@ impl BoxState {
         )?;
         conn.execute_batch(SCHEMA)?;
         conn.pragma_update(None, "user_version", 1)?;
+        let recorder_conn = Connection::open(&db)?;
+        recorder_conn.execute_batch(
+            "PRAGMA journal_mode=WAL; \
+             PRAGMA synchronous=OFF; \
+             PRAGMA journal_size_limit=67108864; \
+             PRAGMA wal_autocheckpoint=16384; \
+             PRAGMA busy_timeout=30000;",
+        )?;
+        conn.busy_timeout(std::time::Duration::from_secs(30))?;
         Ok(BoxState {
             id,
             conn: Mutex::new(conn),
+            recorder_conn: Mutex::new(recorder_conn),
             kinds: RwLock::new(LayerMirror::new()),
             atimes: RwLock::new(HashMap::new()),
             owners: RwLock::new(HashMap::new()),
@@ -1221,7 +1234,7 @@ impl BoxState {
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs_f64()).unwrap_or(0.0);
-        let conn = self.conn.lock().unwrap();
+        let conn = self.recorder_conn.lock().unwrap();
         let _ = conn.execute(
             "INSERT INTO outputs(ts,process_id,stream,content,brush_pipeline_id) \
              VALUES(?1,?2,?3,?4,?5)",
@@ -1235,7 +1248,7 @@ impl BoxState {
     /// with the correct pipeline. Scoped by timestamp (recipe start → now) and
     /// stream=1 (stderr).
     pub fn fixup_output_attribution(&self, start_ts: f64, pipeline_id: i64) {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.recorder_conn.lock().unwrap();
         let _ = conn.execute(
             "UPDATE outputs SET brush_pipeline_id=?1 \
              WHERE ts >= ?2 AND stream = 1 AND brush_pipeline_id IS NOT ?1",
@@ -1244,7 +1257,7 @@ impl BoxState {
 
     /// Look up the brushprov row id for a given uid. Returns 0 if not found.
     pub fn brushprov_id_for_uid(&self, uid: i64) -> i64 {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.recorder_conn.lock().unwrap();
         conn.query_row(
             "SELECT id FROM brushprov WHERE uid=?1",
             params![uid],
@@ -1263,7 +1276,7 @@ impl BoxState {
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs_f64()).unwrap_or(0.0);
-        let conn = self.conn.lock().unwrap();
+        let conn = self.recorder_conn.lock().unwrap();
         let _ = conn.execute(
             "INSERT INTO brushprov(ts,cmd,record,pipeline,spawn_ts,uid,parent_uid) \
              VALUES(?1,?2,?3,?4,?5,?6,?7)",
@@ -1286,7 +1299,7 @@ impl BoxState {
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs_f64()).unwrap_or(0.0);
-        let conn = self.conn.lock().unwrap();
+        let conn = self.recorder_conn.lock().unwrap();
         let _ = conn.execute(
             "INSERT INTO brushprov(ts,cmd,record,pipeline,spawn_ts,nested,uid,parent_uid) \
              VALUES(?1,?2,?3,?4,?5,1,?6,?7)",
@@ -1299,7 +1312,7 @@ impl BoxState {
     /// `uid` is the box-assigned per-pipeline id; matching is scoped to this box.
     pub fn mark_brushprov_done(&self, uids: &[i64], code: i64, done_ts: f64) {
         if uids.is_empty() { return; }
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.recorder_conn.lock().unwrap();
         let Ok(tx) = conn.transaction() else { return };
         for uid in uids {
             let _ = tx.execute(
@@ -1317,7 +1330,7 @@ impl BoxState {
     pub fn add_api_log(&self, ts: f64, method: &str, path: &str,
                        model: &str, status: i32, req: &[u8], resp: &[u8],
                        stream: bool) -> i64 {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.recorder_conn.lock().unwrap();
         let _ = conn.execute(
             "INSERT INTO api_log(ts,method,path,model,status,stream,req,resp) \
              VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
@@ -1336,7 +1349,7 @@ impl BoxState {
                            status: i32, mime: &str, req_headers: &str,
                            resp_headers: &str, req_body: &[u8],
                            resp_body: &[u8], truncated: bool) -> i64 {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.recorder_conn.lock().unwrap();
         let _ = conn.execute(
             "INSERT INTO webcap(ts,method,url,host,status,mime,\
              req_headers,resp_headers,req_body,resp_body,truncated) \
@@ -1356,7 +1369,7 @@ impl BoxState {
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs_f64()).unwrap_or(0.0);
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.recorder_conn.lock().unwrap();
         let Ok(tx) = conn.transaction() else { return 0 };
         let inserted = {
             let Ok(mut insert) = tx.prepare_cached(
@@ -1382,7 +1395,7 @@ impl BoxState {
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs_f64()).unwrap_or(0.0);
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.recorder_conn.lock().unwrap();
         let Ok(tx) = conn.transaction() else { return };
         for r in rows {
             let _ = tx.execute(
@@ -1401,7 +1414,7 @@ impl BoxState {
     /// is stamped — outputs/cmdlines are effectively unique per edge, so this
     /// resolves the one running edge. Best-effort (an unmatched key is a no-op).
     pub fn mark_build_edge_started(&self, out: Option<&str>, cmd: Option<&str>, ts: f64) {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.recorder_conn.lock().unwrap();
         if let Some(out) = out {
             let _ = conn.execute(
                 "UPDATE build_edges SET started_ts=?1 WHERE id=(\
@@ -1423,7 +1436,7 @@ impl BoxState {
     /// this output/cmd key), stamping `ended_ts` + `exit_code`. Best-effort.
     pub fn mark_build_edge_done(&self, out: Option<&str>, cmd: Option<&str>,
                                 code: i64, ts: f64, excerpt: Option<&str>) {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.recorder_conn.lock().unwrap();
         if let Some(out) = out {
             let _ = conn.execute(
                 "UPDATE build_edges SET ended_ts=?1, exit_code=?2, \

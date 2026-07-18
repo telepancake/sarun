@@ -1007,7 +1007,25 @@ as executable mappings and mmap that genuinely need a host fd.
           That recipe-phase sample exposed a separate historical-table scan:
           every stderr attribution fixup searched all `outputs` rows. The
           schema now indexes its `(stream, ts)` predicate, keeping attribution
-          work proportional to the current recipe's time window.
+          work proportional to the current recipe's time window. A subsequent
+          package-extraction sample found ordinary FUSE `flush` implemented as
+          `fsync`, forcing durability on every close. `flush` now mirrors
+          close with `dup`/`close`, as the upstream virtiofsd passthrough does;
+          explicit `fsync` remains the durability boundary. The resumed replay
+          contained no `fsync`/`sync_all` close stacks and advanced from host
+          tools into target kernel-module packaging in under five minutes.
+          At target-package concurrency, five provenance completions and FUSE
+          metadata readers could still wait behind one recorder append because
+          both domains shared a Rust mutex around one SQLite connection. WAL
+          could not provide read/write concurrency through that mutex. Capture
+          now retains one ordered recorder writer on a distinct WAL connection,
+          while filesystem metadata uses the original connection and reads its
+          last committed snapshot concurrently. A regression holds an
+          uncommitted recorder transaction, proves the overlay connection mutex
+          remains available, and proves the reader cannot see the uncommitted
+          row. The production binary, static aarch64 test harness, all eleven
+          depot tests, both merged-layer tests, the canonical virtio lifecycle
+          test, and the binary action socket test pass.
           Earlier nonfatal empty-operand arithmetic and generated-config `sed`
           diagnostics stay recorded for attribution rather than normalization.
     - [x] Complete the native-aarch64 FUSE Brush gate from a clean output tree.

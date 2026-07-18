@@ -1102,6 +1102,28 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    #[test]
+    fn recorder_transaction_does_not_block_overlay_reads() {
+        let _g = TEST_STATE_HOME_LOCK.lock().unwrap();
+        let (b, _id, tmp) = fresh_box("recorder-read-isolation");
+        let recorder = b.recorder_conn.lock().unwrap();
+        recorder.execute_batch(
+            "BEGIN IMMEDIATE; \
+             INSERT INTO brushprov(ts,cmd,record,pipeline) \
+             VALUES(1.0,'pending','{}',0);",
+        ).unwrap();
+        let overlay = b.conn.try_lock()
+            .expect("recorder must not hold the overlay connection mutex");
+        let count: i64 = overlay.query_row(
+            "SELECT count(*) FROM brushprov", [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(count, 0, "overlay reader observed an uncommitted recorder row");
+        drop(overlay);
+        recorder.execute_batch("ROLLBACK").unwrap();
+        drop(recorder);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     fn add_file(b: &BoxState, id: i64, rel: &str, content: &[u8]) -> std::path::PathBuf {
         let rid = b.ensure_file_row(rel, 0o100644, 0);
         let bp = blob_path(id, rid);
