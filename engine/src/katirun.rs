@@ -566,7 +566,38 @@ fn run_kati(
     // is called immediately before every parse-time $(shell ...) expansion.
     ev.refresh_box_export_prefix()?;
 
-    let mut remake_active = false;
+    // GNU make restarts only when an included makefile itself changed, not
+    // merely because some command in its dependency graph ran.  Autotools
+    // makefiles deliberately have rebuild recipes which inspect generated
+    // inputs and leave the makefile untouched when its embedded revision is
+    // already current.  Treating "executor ran anything" as "makefile was
+    // remade" makes those perfectly converged graphs restart forever.
+    //
+    // Match GNU's observable test: snapshot the included target's stat before
+    // its graph runs and compare it afterwards.  A missing file becoming
+    // present counts; an unchanged mtime/size does not.  Do not hash contents
+    // here -- this path is exercised for every included dependency file in
+    // large generated builds, and GNU itself uses filesystem timestamps.
+    fn include_stamp(
+        working_dir: &std::path::Path,
+        sym: Symbol,
+    ) -> Option<(std::time::SystemTime, u64)> {
+        let bytes = sym.as_bytes();
+        let path = std::path::Path::new(std::ffi::OsStr::from_bytes(&bytes));
+        let abs = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            working_dir.join(path)
+        };
+        let meta = std::fs::metadata(abs).ok()?;
+        Some((meta.modified().ok()?, meta.len()))
+    }
+
+    let before_stamps: std::collections::HashMap<Symbol, _> = remake_targets
+        .iter()
+        .map(|(sym, _)| (*sym, include_stamp(working_dir, *sym)))
+        .collect();
+    let mut successfully_checked = std::collections::HashSet::new();
     if !remake_targets.is_empty() {
         let remake_nodes = {
             let _frame = ev.enter(
@@ -592,15 +623,19 @@ fn run_kati(
             .partition(|(s, _)| required.contains(s));
         if !req_nodes.is_empty() {
             kati::exec::exec(req_nodes, &mut ev)?;
-            remake_active |= ev.question_would_run;
+            successfully_checked.extend(required.iter().copied());
         }
         for node in opt_nodes {
+            let sym = node.0;
             // GNU tolerates a failed remake of an optional included makefile.
             if kati::exec::exec_opts(vec![node], &mut ev, true).is_ok() {
-                remake_active |= ev.question_would_run;
+                successfully_checked.insert(sym);
             }
         }
     }
+    let remake_active = successfully_checked.into_iter().any(|sym| {
+        before_stamps.get(&sym).copied().flatten() != include_stamp(working_dir, sym)
+    });
     // Optional remake targets that did not materialize are reported back so
     // the re-run skips them (otherwise a permanently-unmakeable -include
     // would re-queue every pass until the depth cap).

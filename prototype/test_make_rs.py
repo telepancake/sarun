@@ -1680,6 +1680,34 @@ printf '%s\n' "$src_flags" > result.txt
         check(flags == b"-DKWSYS_STRING_C -DKWSYS_NAMESPACE=cmsys\n",
               f"case48: CMake source flags survive both expansion layers; "
               f"got {flags!r}")
+        # ── CASE 49: an unchanged remade makefile has converged ──────────
+        # Autotools attaches generated makefile fragments to rebuild recipes
+        # which can run, inspect an embedded revision, and intentionally leave
+        # the target untouched. GNU restarts only if the included makefile's
+        # timestamp changed; command execution somewhere in its dependency
+        # graph is not itself a reason to reparse forever.
+        ur = work / "unchanged-remade-include"
+        shutil.rmtree(ur, ignore_errors=True)
+        ur.mkdir(parents=True, exist_ok=True)
+        (ur / "generated.mk").write_text("VALUE := stable\n")
+        (ur / "GNUmakefile").write_text(
+            "include generated.mk\n"
+            ".PHONY: force all\n"
+            "generated.mk: force\n"
+            "\t@test '$(VALUE)' = stable\n"
+            "all:\n"
+            "\t@printf '%s' '$(VALUE)' > result.txt\n")
+        r = run_make("MAKE49", ur, "-j10", "all")
+        check(r.returncode == 0,
+              f"case49: unchanged included makefile does not exhaust the "
+              f"remake loop (got {r.returncode}: "
+              f"{(r.stdout+r.stderr)[-700:]})")
+        sp49 = latest_sqlar(m)
+        stable = m.sqlar_content(
+            sp49, str((ur / "result.txt").resolve()).lstrip("/"))
+        check(stable == b"stable",
+              f"case49: evaluation continues with the existing include; "
+              f"got {stable!r}")
     finally:
         if eng is not None and eng.poll() is None:
             eng.terminate()

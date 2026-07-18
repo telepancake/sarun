@@ -646,9 +646,28 @@ as executable mappings and mmap that genuinely need a host fd.
           OpenWrt CMake bootstrap now generates correct flags, compiles and
           links all 309 objects, completes its 109-second second-stage configure,
           and exits zero. The static aarch64 build, all 48 Make/Brush cases, and
-          the complete nested-shell suite pass. A new genuinely clean OpenWrt
-          replay is next. The earlier nonfatal empty-operand arithmetic
-          diagnostics also remain for attribution rather than normalization.
+          the complete nested-shell suite pass. A genuinely clean `-j10 world`
+          replay then ran for 1,691 seconds and reached 29,202 processes,
+          48,421 build edges, 391,767 Brush provenance rows, and 116,985
+          captured paths. Peak server RSS was 2,597,632 KiB with 1,734,276 KiB
+          swapped; the host was also running unrelated memory-heavy work, so
+          this is a pressure observation rather than an isolated benchmark.
+          CMake's full 309-object bootstrap, second-stage configure, optimized
+          build, and install all completed. The parallel Libtool branch exposed
+          a generic makefile-remake convergence bug: Kati restarted whenever
+          any command in an included makefile's dependency graph ran. Libtool's
+          revision recipe intentionally runs and leaves `m4/ltversion.m4` (and
+          therefore the included `Makefile`) unchanged when already current;
+          GNU make observes the unchanged makefile timestamp and proceeds, but
+          Kati exhausted its five-pass guard. Remake convergence now snapshots
+          each included target before execution and restarts only when its own
+          mtime/size changes. Make/Brush case 49 covers an always-run recipe
+          which intentionally leaves its included target untouched; the full
+          49-case suite passes. Replaying `tools/libtool/compile` in the same
+          captured box now builds, links, installs, stamps, and exits zero. The
+          next boundary is resuming `world` from that state. The earlier
+          nonfatal empty-operand arithmetic diagnostics also remain for
+          attribution rather than normalization.
     - [x] Complete the native-aarch64 FUSE Brush gate from a clean output tree.
           Linux 6.18 builds 823 objects with `-j10` (11 observed overlapping
           clang processes), takes 162 s wall / 143 s compile, and records 2,797
@@ -735,6 +754,10 @@ as executable mappings and mmap that genuinely need a host fd.
   kernel and host-QEMU artifacts. Vendored workspace license links are
   dereferenced during assembly, so the notice bundle cannot inherit the old
   broken `LICENSE -> ../LICENSE` links.
+- Completed Linux appliance object trees for both aarch64 and x86_64 have been
+  removed from the build cache after publication. The paired QEMU build trees
+  and the 730 MiB versioned appliance output remain; the obsolete 1.3 GiB
+  OpenWrt diagnostic fixture was also removed before the clean replay.
 
 ## Commit gates
 
