@@ -854,9 +854,18 @@ as executable mappings and mmap that genuinely need a host fd.
           flags and require the recursive child to receive the baseline plus
           the canary append. The 47 Kati units, vendor reproduction, static
           aarch64 build, and all 62 Make/Brush cases pass with that stronger
-          assertion. The next gate is again the preserved real kernel replay;
-          its first compiler command must contain both flag groups before the
-          build is allowed to proceed through modpost and back into `world`.
+          assertion. The preserved real kernel replay then recorded the full
+          baseline flags and all three canary flags in every invalidated Kbuild
+          command, rebuilt 9,129 affected compiler steps at `-j10`, crossed
+          `MODPOST` without an undefined `__stack_chk_guard`, linked the module
+          set and final `vmlinux`, and exited zero after 2,089 seconds. The
+          captured outputs include a 107,768,960-byte `vmlinux`, 20,472,320-byte
+          AArch64 `Image`, 8,377,549-byte `Image.gz`, 3,585,082-byte
+          `System.map`, and the `.modules` stamp, with concrete compiler/linker
+          writer records. At this checkpoint the box archive holds 148,537
+          processes, 2,037,330 Brush provenance rows, and 931,357 build edges.
+          The next gate is resuming the complete OpenWrt `world` target from
+          this successfully compiled kernel.
           Earlier nonfatal empty-operand arithmetic and generated-config `sed`
           diagnostics stay recorded for attribution rather than normalization.
     - [x] Complete the native-aarch64 FUSE Brush gate from a clean output tree.
