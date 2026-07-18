@@ -1789,6 +1789,62 @@ printf '%s\n' "$src_flags" > result.txt
         check(recursive_libs == b"base conditional xsize.o\n",
               f"case51: every += is preserved and expanded in child scope; "
               f"got {recursive_libs!r}")
+        # ── CASE 52: unquoted legacy backquotes retain escaped quotes ──────
+        # Quilt's configure asks a selected Bash to run a script containing a
+        # nested command substitution. In an unquoted legacy backquote, \"
+        # remains escaped command text; only a backquote inside double quotes
+        # consumes that escape. Treating both contexts alike made the inner
+        # `bash -c` text syntactically incomplete.
+        uq = work / "backquote-unquoted-escaped-quotes"
+        shutil.rmtree(uq, ignore_errors=True)
+        uq.mkdir(parents=True, exist_ok=True)
+        probe = uq / "probe.sh"
+        probe.write_text(r'''#!/bin/sh
+BASH=/bin/bash
+if test `$BASH -c "echo \"\\\$(set -- \\\$'a b'; echo \\\$#)\"" 2>/dev/null` = "1"; then
+  printf preserved > result.txt
+else
+  exit 23
+fi
+''')
+        probe.chmod(0o755)
+        (uq / "Makefile").write_text("all:\n\t@./probe.sh\n")
+        r = run_make("MAKE52", uq, "-j10", "all")
+        check(r.returncode == 0,
+              f"case52: Quilt-style unquoted backquote executes "
+              f"(got {r.returncode}: {(r.stdout+r.stderr)[-700:]})")
+        sp52 = latest_sqlar(m)
+        quote_result = m.sqlar_content(
+            sp52, str((uq / "result.txt").resolve()).lstrip("/"))
+        check(quote_result == b"preserved",
+              f"case52: nested Bash saw one positional parameter; "
+              f"got {quote_result!r}")
+        # ── CASE 53: function arguments preserve escaped recipe hashes ────
+        # U-Boot's filechk macro emits C preprocessor lines. GNU retains the
+        # backslash on `#` inside an $(if ...) argument until the shell parses
+        # the recipe; stripping it while parsing the function turns the rest
+        # of the one-line recipe into a shell comment and loses the closing
+        # subshell parenthesis.
+        fh = work / "function-escaped-hash"
+        shutil.rmtree(fh, ignore_errors=True)
+        fh.mkdir(parents=True, exist_ok=True)
+        (fh / "Makefile").write_text(
+            "define FRAGMENT\n"
+            "(echo \\#define DIRECT; "
+            "$(if yes,echo \\#include \\<configs/test.h\\>;))\n"
+            "endef\n"
+            "all:\n"
+            "\t@$(FRAGMENT) > result.txt\n")
+        r = run_make("MAKE53", fh, "-j10", "all")
+        check(r.returncode == 0,
+              f"case53: escaped hash survives nested make function "
+              f"(got {r.returncode}: {(r.stdout+r.stderr)[-700:]})")
+        sp53 = latest_sqlar(m)
+        header = m.sqlar_content(
+            sp53, str((fh / "result.txt").resolve()).lstrip("/"))
+        check(header == b"#define DIRECT\n#include <configs/test.h>\n",
+              f"case53: both direct and function-produced header lines "
+              f"reach the shell; got {header!r}")
     finally:
         if eng is not None and eng.poll() is None:
             eng.terminate()

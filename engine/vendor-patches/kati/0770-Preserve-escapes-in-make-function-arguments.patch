@@ -1,0 +1,56 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Sat, 18 Jul 2026 06:42:51 +0000
+Subject: [PATCH] Preserve escapes in make function arguments
+
+---
+diff --git a/src-rs/expr.rs b/src-rs/expr.rs
+index 0f2ec6b..155e85f 100644
+--- a/src-rs/expr.rs
++++ b/src-rs/expr.rs
+@@ -59,10 +59,12 @@ pub enum ParseExprOpt {
+     Normal,
+     Define,
+     Command,
++    // GNU function arguments preserve backslashes and treat `#` as data. The
++    // surrounding expression, rather than the argument parser, owns comment
++    // and escape removal.
+     Func,
+-    // Function arguments INSIDE a recipe line: function syntax is parsed
+-    // (like Func) but nothing is unescaped and `#` is not a comment
+-    // (like Command) — GNU strips comments/escapes only outside recipes.
++    // Function arguments inside a recipe line additionally propagate command
++    // context into nested expansions.
+     FuncCommand,
+ }
+ 
+@@ -308,7 +310,10 @@ fn close_paren(c: u8) -> Option<u8> {
+ fn should_handle_comments(opt: ParseExprOpt) -> bool {
+     !matches!(
+         opt,
+-        ParseExprOpt::Define | ParseExprOpt::Command | ParseExprOpt::FuncCommand
++        ParseExprOpt::Define
++            | ParseExprOpt::Command
++            | ParseExprOpt::Func
++            | ParseExprOpt::FuncCommand
+     )
+ }
+ 
+@@ -685,12 +690,13 @@ pub fn parse_expr_impl_ext(
+             }
+         }
+ 
+-        // FuncCommand (function args inside a recipe): backslash-newline is
+-        // still function-argument continuation (GNU collapses it to a
+-        // space), but `\\` and `\#` pass through to the shell unescaped.
++        // Function arguments preserve `\\` and `\#`. Backslash-newline is
++        // still function-argument continuation (GNU collapses it to a space).
+         if c == b'\\' && i + 1 < s.len() && opt != ParseExprOpt::Command {
+             let n = remaining[1];
+-            if n == b'\\' && opt != ParseExprOpt::FuncCommand {
++            if n == b'\\'
++                && !matches!(opt, ParseExprOpt::Func | ParseExprOpt::FuncCommand)
++            {
+                 i += 2;
+                 continue;
+             }

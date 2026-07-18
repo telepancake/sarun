@@ -691,12 +691,28 @@ as executable mappings and mmap that genuinely need a host fd.
           are now retained in order (without duplicating inherited entries at
           every recursion), while ordinary assignments still replace earlier
           values. Case 51 exercises late child-scope expansion of the preserved
-          appends. The static aarch64 build and complete 51-case suite pass; the
-          next checkpoint is the real elfutils link with the new binary, then
-          completion of `tools/install` and resumption of `world`. The earlier
-          omission has therefore not reproduced as an engine defect. The
-          earlier nonfatal empty-operand arithmetic and generated-config `sed`
-          diagnostics also remain for attribution rather
+          appends. The focused real replay now links all eight elfutils host
+          programs with `libgnu.a`, installs them, stamps the tool, and exits
+          zero. Resuming `tools/install` then exposed two adjacent escaping
+          contexts. Quilt's configure uses an unquoted legacy backquote whose
+          escaped double quotes must remain command text, while the earlier
+          CMake form places the backquote inside double quotes and consumes the
+          same escape. Brush's word relation now distinguishes those contexts.
+          U-Boot's `filechk_config_h` uses `\#include` inside `$(if ...)`; GNU
+          preserves function-argument escapes until the generated recipe is
+          parsed, but Kati had removed the slash and turned the rest of the
+          one-line recipe (including its closing parenthesis) into a comment.
+          Function arguments now preserve `\#` and `\\`, with escape/comment
+          handling owned by the surrounding expression. The exact Quilt and
+          U-Boot relations are cases 52 and 53. The real U-Boot target now
+          emits `include/config.h`, preprocesses `u-boot.cfg`, regenerates
+          `include/autoconf.mk`, and exits zero. The static aarch64 build,
+          parser units, vendor reproduction checks, and complete 53-case suite
+          pass. The next checkpoint is completion of `tools/install`, followed
+          by resumption of `world`. The earlier omission has therefore not
+          reproduced as an engine defect. The earlier nonfatal empty-operand
+          arithmetic and generated-config `sed` diagnostics also remain for
+          attribution rather
           than normalization.
     - [x] Complete the native-aarch64 FUSE Brush gate from a clean output tree.
           Linux 6.18 builds 823 objects with `-j10` (11 observed overlapping

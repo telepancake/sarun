@@ -1,0 +1,140 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Sat, 18 Jul 2026 06:37:50 +0000
+Subject: [PATCH] Distinguish quoted and unquoted legacy backquotes
+
+---
+diff --git a/src/word.rs b/src/word.rs
+index 3bef289..9ad1d2d 100644
+--- a/src/word.rs
++++ b/src/word.rs
+@@ -765,7 +765,7 @@ peg::parser! {
+             s:ansi_c_quoted_text() { WordPiece::AnsiCQuotedText(s.to_owned()) } /
+             s:gettext_double_quoted_sequence() { WordPiece::GettextDoubleQuotedSequence(s) } /
+             // Rules that match pieces starting with a dollar sign ('$').
+-            dollar_sign_word_piece() /
++            dollar_sign_word_piece(false /*in_double_quotes*/) /
+             // Rules that match unquoted text that doesn't start with an unescaped dollar sign.
+             normal_escape_sequence() /
+             // Allow tilde expression to be matched as a word piece (for tilde-after-colon expansion)
+@@ -773,16 +773,16 @@ peg::parser! {
+             // Finally, match unquoted literal text.
+             unquoted_literal_text(<stop_condition()>, in_command)
+ 
+-        rule dollar_sign_word_piece() -> WordPiece =
++        rule dollar_sign_word_piece(in_double_quotes: bool) -> WordPiece =
+             arithmetic_expansion() /
+             legacy_arithmetic_expansion() /
+-            command_substitution() /
++            command_substitution(in_double_quotes) /
+             parameter_expansion()
+ 
+         rule double_quoted_word_piece() -> WordPiece =
+             arithmetic_expansion() /
+             legacy_arithmetic_expansion() /
+-            command_substitution() /
++            command_substitution(true /*in_double_quotes*/) /
+             parameter_expansion() /
+             double_quoted_escape_sequence() /
+             double_quoted_text()
+@@ -849,7 +849,7 @@ peg::parser! {
+             s:double_quote_body_text() { WordPiece::Text(s.to_owned()) }
+ 
+         rule double_quote_body_text() -> &'input str =
+-            $((!double_quoted_escape_sequence() !dollar_sign_word_piece() [^'\"'])+)
++            $((!double_quoted_escape_sequence() !dollar_sign_word_piece(true /*in_double_quotes*/) [^'\"'])+)
+ 
+         // Heredoc body parsing: like double-quoted content, but " and ' are literal characters.
+         pub(crate) rule unexpanded_heredoc_word() -> Vec<WordPieceWithSource> =
+@@ -866,7 +866,7 @@ peg::parser! {
+         rule heredoc_word_piece() -> WordPiece =
+             arithmetic_expansion() /
+             legacy_arithmetic_expansion() /
+-            command_substitution() /
++            command_substitution(false /*in_double_quotes*/) /
+             parameter_expansion() /
+             heredoc_escape_sequence() /
+             heredoc_literal_text()
+@@ -875,7 +875,7 @@ peg::parser! {
+             s:$("\\" ['$' | '`' | '\\']) { WordPiece::EscapeSequence(s.to_owned()) }
+ 
+         rule heredoc_literal_text() -> WordPiece =
+-            s:$((!heredoc_escape_sequence() !dollar_sign_word_piece() [^'`'])+) {
++            s:$((!heredoc_escape_sequence() !dollar_sign_word_piece(false /*in_double_quotes*/) [^'`'])+) {
+                 WordPiece::Text(s.to_owned())
+             }
+ 
+@@ -1066,9 +1066,9 @@ peg::parser! {
+         rule variable_name() -> &'input str =
+             $(!['0'..='9'] ['_' | '0'..='9' | 'a'..='z' | 'A'..='Z']+)
+ 
+-        pub(crate) rule command_substitution() -> WordPiece =
++        pub(crate) rule command_substitution(in_double_quotes: bool) -> WordPiece =
+             "$(" c:command() ")" { WordPiece::CommandSubstitution(c.to_owned()) } /
+-            "`" c:backquoted_command() "`" { WordPiece::BackquotedCommandSubstitution(c) }
++            "`" c:backquoted_command(in_double_quotes) "`" { WordPiece::BackquotedCommandSubstitution(c) }
+ 
+         pub(crate) rule command() -> &'input str =
+             $(command_piece()*)
+@@ -1078,12 +1078,13 @@ peg::parser! {
+             ([' ' | '\t'])+ {} /
+             ['\'' | '`'] {}
+ 
+-        rule backquoted_command() -> String =
+-            chars:(backquoted_char()*) { chars.into_iter().collect() }
++        rule backquoted_command(in_double_quotes: bool) -> String =
++            chars:(backquoted_char(in_double_quotes)*) { chars.into_iter().collect() }
+ 
+-        rule backquoted_char() -> &'input str =
++        rule backquoted_char(in_double_quotes: bool) -> &'input str =
+             "\\`" { "`" } /
+-            "\\\"" { "\"" } /
++            is_true(in_double_quotes) "\\\"" { "\"" } /
++            "\\\"" { "\\\"" } /
+             "\\$" { "$" } /
+             "\\\\" { "\\" } /
+             s:$([^'`']) { s }
+@@ -1239,7 +1240,11 @@ mod tests {
+         super::expansion_parser::command_piece("echo", &ParserOptions::default())?;
+         super::expansion_parser::command_piece("hi", &ParserOptions::default())?;
+         super::expansion_parser::command("echo hi", &ParserOptions::default())?;
+-        super::expansion_parser::command_substitution("$(echo hi)", &ParserOptions::default())?;
++        super::expansion_parser::command_substitution(
++            "$(echo hi)",
++            &ParserOptions::default(),
++            false,
++        )?;
+ 
+         assert_ron_snapshot!(test_parse("$(echo hi)")?);
+ 
+@@ -1254,6 +1259,7 @@ mod tests {
+         super::expansion_parser::command_substitution(
+             r#"$(echo "hi")"#,
+             &ParserOptions::default(),
++            false,
+         )?;
+ 
+         assert_ron_snapshot!(test_parse(r#"$(echo "hi")"#)?);
+@@ -1343,6 +1349,22 @@ mod tests {
+         Ok(())
+     }
+ 
++    #[test]
++    fn unquoted_backquote_preserves_escaped_double_quotes() -> Result<()> {
++        let parsed = super::parse(
++            r#"`$BASH -c "echo \"\\\$(set -- \\\$'a b'; echo \\\$#)\"" 2>/dev/null`"#,
++            &ParserOptions::default(),
++        )?;
++        assert_matches!(
++            &parsed[..],
++            [WordPieceWithSource {
++                piece: WordPiece::BackquotedCommandSubstitution(command),
++                ..
++            }] if command == r#"$BASH -c "echo \"\$(set -- \$'a b'; echo \$#)\"" 2>/dev/null"#
++        );
++        Ok(())
++    }
++
+     #[test]
+     fn backquoted_command_expands_dollar_after_one_escape_layer() -> Result<()> {
+         let parsed = super::parse(
