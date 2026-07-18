@@ -95,7 +95,8 @@ CREATE TABLE IF NOT EXISTS atime(name TEXT PRIMARY KEY, ns INT);
 --   nested: 1 for a recipe a NESTED shell ran (a `sh -c` the box's command
 --   spawned, captured via the brush-sh shim) vs 0 for a TOP-LEVEL pipeline the
 --   box's own embedded brush ran. Queryable so a reader can tell the two apart.
---   uid: a process-global unique id the box assigns each pipeline. parent_uid:
+--   uid: a box-global identity composed from the exact producer-process
+--   incarnation and its local counter. parent_uid:
 --   the uid of the pipeline that ENCLOSED this one in-process (0 = a root), so a
 --   reader can render the otherwise-flat log as a tree (make → recipe → sh -c →
 --   …; xargs/subshells nest under their spawner). Both 0 for legacy boxes.
@@ -113,6 +114,15 @@ CREATE TABLE IF NOT EXISTS brushprov(id INTEGER PRIMARY KEY AUTOINCREMENT,
 -- dominant engine cost of the kernel's `make headers` (~60k page reads per
 -- header, O(n^2) over the build).
 CREATE INDEX IF NOT EXISTS idx_brushprov_uid ON brushprov(uid);
+-- Pipeline ids are allocated by each embedded Brush process.  A box can run
+-- many such processes concurrently (and can be reopened for another run), so
+-- the process-local counter is not itself a box-wide identity.  Give every
+-- exact host process incarnation a durable producer number; control.rs folds
+-- (producer, local pipeline id) into the positive 63-bit uid stored above.
+-- `host_start` is /proc/PID/stat field 22, making PID reuse unambiguous.
+CREATE TABLE IF NOT EXISTS brushproducer(id INTEGER PRIMARY KEY AUTOINCREMENT,
+ host_pid INT NOT NULL, host_start INT NOT NULL, created_ts REAL NOT NULL,
+ UNIQUE(host_pid,host_start));
 -- Phase 1 embedded-ninja: one row per parsed n2/ninja build edge, captured when
 -- the box's `ninja` (vendored n2 in-process) loads build.ninja — INCLUDING
 -- up-to-date targets that never execute. `outs`/`ins` are JSON arrays of
@@ -339,6 +349,10 @@ pub struct BoxState {
     // start_time a NEW row, never a dedup into a stale incarnation (PID-reuse proof).
     proc_cache: Mutex<HashMap<(u32, i64), i64>>,
     proc_current: Mutex<HashMap<u32, (i64, i64)>>,
+    /// Host process incarnation -> durable per-box Brush producer number.
+    /// Pipeline counters are process-local; this scope prevents concurrent
+    /// recipe shells (all starting at uid 1) from completing each other's rows.
+    brush_producers: Mutex<HashMap<(u32, i64), i64>>,
     // virtio-fs reports guest thread ids. PID 1 supplies the corresponding
     // guest thread-group identities over the appliance relation; these values
     // must never be looked up in the host's /proc namespace.
@@ -649,6 +663,7 @@ impl BoxState {
             proc_cache: Mutex::new(HashMap::new()),
             activity: Mutex::new(Vec::new()),
             proc_current: Mutex::new(HashMap::new()),
+            brush_producers: Mutex::new(HashMap::new()),
             guest_tgids: Mutex::new(HashMap::new()),
             roots: Mutex::new(std::collections::HashSet::new()),
             parent: std::sync::atomic::AtomicI64::new(0),
@@ -1263,6 +1278,38 @@ impl BoxState {
             params![uid],
             |row| row.get(0),
         ).unwrap_or(0)
+    }
+
+    /// Return the durable producer number for one exact Brush process
+    /// incarnation.  The table, rather than an in-memory counter, preserves
+    /// uniqueness when an existing box is reopened after an engine restart.
+    pub fn brush_producer(&self, host_pid: u32, host_start: i64) -> i64 {
+        if host_pid == 0 || host_start <= 0 {
+            return 0;
+        }
+        let key = (host_pid, host_start);
+        if let Some(id) = self.brush_producers.lock().unwrap().get(&key).copied() {
+            return id;
+        }
+        let created_ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64()).unwrap_or(0.0);
+        let conn = self.recorder_conn.lock().unwrap();
+        let _ = conn.execute(
+            "INSERT OR IGNORE INTO brushproducer(host_pid,host_start,created_ts) \
+             VALUES(?1,?2,?3)",
+            params![i64::from(host_pid), host_start, created_ts],
+        );
+        let id = conn.query_row(
+            "SELECT id FROM brushproducer WHERE host_pid=?1 AND host_start=?2",
+            params![i64::from(host_pid), host_start],
+            |row| row.get(0),
+        ).unwrap_or(0);
+        drop(conn);
+        if id > 0 {
+            self.brush_producers.lock().unwrap().insert(key, id);
+        }
+        id
     }
 
     /// Record one D9 brush-shell provenance frame: the exact command string

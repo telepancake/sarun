@@ -776,8 +776,14 @@ pub fn install_state_handle(s: State) {
 /// Record one D9 brush-shell provenance frame for box `id`: parse the JSON
 /// payload, write it into the live box's sqlar `brushprov` table, and broadcast
 /// a `brush_prov` event. Best-effort — a malformed payload is dropped quietly.
-fn record_brush_prov(state: &State, ov: &Option<crate::overlay::Overlay>, id: i64, payload: &[u8]) {
-    let Ok(rec) = serde_json::from_slice::<Value>(payload) else {
+fn record_brush_prov(
+    state: &State,
+    ov: &Option<crate::overlay::Overlay>,
+    id: i64,
+    producer: i64,
+    payload: &[u8],
+) {
+    let Ok(mut rec) = serde_json::from_slice::<Value>(payload) else {
         return;
     };
     let cmd = rec
@@ -792,8 +798,14 @@ fn record_brush_prov(state: &State, ov: &Option<crate::overlay::Overlay>, id: i6
     // (e.g. a redirect target's writer) can be materialized long after its pipeline.
     let seq = rec.get("seq").and_then(Value::as_i64).unwrap_or(0);
     let spawn_ts = rec.get("spawn_ts").and_then(Value::as_f64).unwrap_or(0.0);
-    let uid = rec.get("uid").and_then(Value::as_i64).unwrap_or(0);
-    let parent_uid = rec.get("parent_uid").and_then(Value::as_i64).unwrap_or(0);
+    let local_uid = rec.get("uid").and_then(Value::as_u64).unwrap_or(0);
+    let local_parent_uid = rec.get("parent_uid").and_then(Value::as_u64).unwrap_or(0);
+    let Ok(uid) = scoped_pipeline_id(producer, local_uid) else { return };
+    let Ok(parent_uid) = scoped_pipeline_id(producer, local_parent_uid) else { return };
+    if let Value::Object(fields) = &mut rec {
+        fields.insert("uid".into(), Value::from(uid));
+        fields.insert("parent_uid".into(), Value::from(parent_uid));
+    }
     let record_json = rec.to_string();
     let mut prov_id = 0i64;
     if let Some(ov) = ov.as_ref() {
@@ -833,21 +845,23 @@ fn brush_prov_nested(
     records: &[crate::generated_wire::PipelineProvenance],
     peer_pidfd: Option<i32>,
 ) -> Result<u64, String> {
-    let id = enclosing_box_from_pidfd(state, peer_pidfd)?;
+    let (id, producer) = enclosing_brush_scope_from_pidfd(state, peer_pidfd)?;
     let records = records.iter().map(|record| {
         if !record.nested { return Err("nested provenance record is not marked nested".into()); }
         let sequence = i64::try_from(record.sequence)
             .map_err(|_| "pipeline sequence exceeds SQLite range")?;
-        let uid = i64::try_from(record.uid)
-            .map_err(|_| "pipeline uid exceeds SQLite range")?;
-        let parent_uid = i64::try_from(record.parent_uid)
-            .map_err(|_| "parent pipeline uid exceeds SQLite range")?;
+        let uid = scoped_pipeline_id(producer, record.uid)?;
+        let parent_uid = scoped_pipeline_id(producer, record.parent_uid)?;
         let targets = record.output_targets.as_slice().iter().map(|target|
             std::str::from_utf8(target.as_slice()).map(str::to_owned)
                 .map_err(|_| "pipeline output target is not UTF-8".to_owned()))
             .collect::<Result<Vec<_>, _>>()?;
-        Ok((record.command.as_str().to_owned(),
-            crate::discover::pipeline_provenance_json(record).to_string(),
+        let mut relation = crate::discover::pipeline_provenance_json(record);
+        if let Value::Object(fields) = &mut relation {
+            fields.insert("uid".into(), Value::from(uid));
+            fields.insert("parent_uid".into(), Value::from(parent_uid));
+        }
+        Ok((record.command.as_str().to_owned(), relation.to_string(),
             sequence, record.spawned_at, uid, parent_uid, targets))
     }).collect::<Result<Vec<_>, String>>()?;
     let ov = lock(state).overlay.clone();
@@ -899,6 +913,64 @@ fn enclosing_box_from_pidfd(state: &State, peer_pidfd: Option<i32>) -> Result<i6
     derive_parent_box(state, host_pid).ok_or_else(|| "no enclosing box".into())
 }
 
+/// `/proc/PID/stat` field 22, parsed after the parenthesized comm field.
+/// Paired with the host pid, this names an exact process incarnation.
+fn host_process_start(pid: i32) -> i64 {
+    if pid <= 0 { return 0; }
+    let Ok(raw) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return 0;
+    };
+    raw.rfind(')')
+        .and_then(|end| raw.get(end + 1..))
+        .and_then(|rest| rest.split_whitespace().nth(19))
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Convert a process-local Brush pipeline counter into its exact box-wide
+/// identity. Producer occupies the high 31 bits and the local counter the low
+/// 32, so the mapping is reversible and always a positive SQLite INTEGER.
+fn scoped_pipeline_id(producer: i64, local: u64) -> Result<i64, String> {
+    if local == 0 { return Ok(0); }
+    let producer = u64::try_from(producer)
+        .map_err(|_| "invalid Brush producer id".to_owned())?;
+    if producer == 0 || producer > 0x7fff_ffff {
+        return Err("Brush producer id exceeds relation range".into());
+    }
+    if local > u64::from(u32::MAX) {
+        return Err("process-local pipeline id exceeds relation range".into());
+    }
+    i64::try_from((producer << 32) | local)
+        .map_err(|_| "scoped pipeline id exceeds SQLite range".into())
+}
+
+/// Resolve the enclosing box and allocate the stable producer scope for this
+/// exact sender process. Every Brush event carries its own pidfd, so identity
+/// is data from the ordinary transport relation rather than a timing guess.
+fn enclosing_brush_scope_from_pidfd(
+    state: &State,
+    peer_pidfd: Option<i32>,
+) -> Result<(i64, i64), String> {
+    let host_pid = peer_pidfd
+        .map(host_pid_from_pidfd)
+        .filter(|pid| *pid > 0)
+        .unwrap_or(0);
+    let host_start = host_process_start(host_pid);
+    if let Some(fd) = peer_pidfd {
+        unsafe { libc::close(fd); }
+    }
+    let id = derive_parent_box(state, host_pid).ok_or_else(|| "no enclosing box".to_owned())?;
+    let ov = lock(state).overlay.clone();
+    let producer = ov.as_ref()
+        .and_then(|overlay| overlay.live_box(id))
+        .map(|r#box| r#box.brush_producer(host_pid as u32, host_start))
+        .unwrap_or(0);
+    if producer <= 0 {
+        return Err("cannot establish Brush producer identity".into());
+    }
+    Ok((id, producer))
+}
+
 fn brush_prov_done(
     state: &State,
     pipelines: &[u64],
@@ -906,9 +978,8 @@ fn brush_prov_done(
     done_at: f64,
     peer_pidfd: Option<i32>,
 ) -> Result<(), String> {
-    let id = enclosing_box_from_pidfd(state, peer_pidfd)?;
-    let pipelines = pipelines.iter().map(|value| i64::try_from(*value)
-        .map_err(|_| "pipeline id exceeds SQLite range"))
+    let (id, producer) = enclosing_brush_scope_from_pidfd(state, peer_pidfd)?;
+    let pipelines = pipelines.iter().map(|value| scoped_pipeline_id(producer, *value))
         .collect::<Result<Vec<_>, _>>()?;
     let ov = lock(state).overlay.clone();
     if let Some(ov) = ov.as_ref() {
@@ -930,9 +1001,8 @@ fn recipe_fixup(
     started_at: f64,
     peer_pidfd: Option<i32>,
 ) -> Result<(), String> {
-    let id = enclosing_box_from_pidfd(state, peer_pidfd)?;
-    let pipelines = pipelines.iter().map(|value| i64::try_from(*value)
-        .map_err(|_| "pipeline id exceeds SQLite range"))
+    let (id, producer) = enclosing_brush_scope_from_pidfd(state, peer_pidfd)?;
+    let pipelines = pipelines.iter().map(|value| scoped_pipeline_id(producer, *value))
         .collect::<Result<Vec<_>, _>>()?;
     let ov = lock(state).overlay.clone();
     if let Some(ov) = ov.as_ref() {
@@ -1020,7 +1090,7 @@ fn make_vars(
     rows: &[crate::generated_wire::MakeVariable],
     peer_pidfd: Option<i32>,
 ) -> Result<(), String> {
-    let id = enclosing_box_from_pidfd(state, peer_pidfd)?;
+    let (id, producer) = enclosing_brush_scope_from_pidfd(state, peer_pidfd)?;
     let string = |value: &[u8], field: &str| std::str::from_utf8(value)
         .map(str::to_owned).map_err(|_| format!("make variable {field} is not UTF-8"));
     let rows = rows.iter().map(|row| Ok(MakeVarRow {
@@ -1030,7 +1100,7 @@ fn make_vars(
         make_dir: string(row.make_directory.as_slice(), "directory")?,
         edge_out: row.edge_output.as_ref().map(|value|
             string(value.as_slice(), "edge output")).transpose()?,
-        uid: i64::try_from(row.pipeline).map_err(|_| "make variable pipeline exceeds i64")?,
+        uid: scoped_pipeline_id(producer, row.pipeline)?,
         rhs: string(row.rhs.as_slice(), "rhs")?,
         refs: string(row.references.as_slice(), "references")?,
         flags: row.flags.as_str().to_owned(),
@@ -7283,6 +7353,7 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
             let mut fbuf = reader.buffer().to_vec();
             let mut pending_fd: Option<i32> = None;
             let mut muted_pid: Option<i32> = None;
+            let mut brush_producer = 0i64;
             loop {
                 let (frames, used) = crate::frames::decode(&fbuf);
                 for (ft, _) in &frames {
@@ -7290,6 +7361,7 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
                         crate::frames::FRAME_MUTE => {
                             if let Some(fd) = pending_fd.take() {
                                 let hp = host_pid_from_pidfd(fd);
+                                let host_start = host_process_start(hp);
                                 unsafe {
                                     libc::close(fd);
                                 }
@@ -7305,6 +7377,8 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
                                         if let Some(b) = ov.live_box(id) {
                                             if b.is_brush() {
                                                 b.set_brush_host_tgid(hp as u32);
+                                                brush_producer =
+                                                    b.brush_producer(hp as u32, host_start);
                                             }
                                         }
                                     }
@@ -7325,7 +7399,9 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
                 // broadcast a `brush_prov` event so live UIs see it.
                 for (ft, payload) in &frames {
                     if *ft == crate::frames::FRAME_PROV {
-                        record_brush_prov(&state, &ov, id, payload);
+                        record_brush_prov(
+                            &state, &ov, id, brush_producer, payload,
+                        );
                     }
                     if *ft == crate::frames::FRAME_GUEST_PROCESS {
                         record_guest_process_frame(&state, id, payload);
@@ -8447,6 +8523,22 @@ fn send_frame_with_fd(channel: &std::sync::Arc<Mutex<UnixStream>>, frame: &[u8],
 #[cfg(test)]
 mod verb_tests {
     use super::*;
+
+    #[test]
+    fn pipeline_identity_scopes_equal_local_counters_by_producer() {
+        let first = scoped_pipeline_id(41, 1).unwrap();
+        let second = scoped_pipeline_id(42, 1).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(first, (41i64 << 32) | 1);
+        assert_eq!(scoped_pipeline_id(41, 2).unwrap(), first + 1);
+        assert_eq!(scoped_pipeline_id(41, 0).unwrap(), 0);
+        assert!(scoped_pipeline_id(0, 1).is_err());
+        assert!(scoped_pipeline_id(1, u64::from(u32::MAX) + 1).is_err());
+        assert_eq!(
+            scoped_pipeline_id(0x7fff_ffff, u64::from(u32::MAX)).unwrap(),
+            i64::MAX,
+        );
+    }
 
     #[test]
     fn appliance_descriptor_frame_transfers_a_connected_endpoint() {

@@ -1124,6 +1124,37 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    #[test]
+    fn concurrent_brush_producers_cannot_complete_each_others_pipeline() {
+        let _g = TEST_STATE_HOME_LOCK.lock().unwrap();
+        let (b, _id, tmp) = fresh_box("brush-producer-scope");
+        let first_producer = b.brush_producer(1001, 5001);
+        let second_producer = b.brush_producer(1002, 5002);
+        assert!(first_producer > 0);
+        assert!(second_producer > 0);
+        assert_ne!(first_producer, second_producer);
+        assert_eq!(b.brush_producer(1001, 5001), first_producer);
+
+        // Both logical shell processes start their local counter at one.
+        let first_uid = (first_producer << 32) | 1;
+        let second_uid = (second_producer << 32) | 1;
+        b.add_brushprov_nested("false", "{}", 0, 1.0, first_uid, 0);
+        b.add_brushprov_nested("true", "{}", 0, 1.0, second_uid, 0);
+        b.mark_brushprov_done(&[first_uid], 7, 2.0);
+
+        let recorder = b.recorder_conn.lock().unwrap();
+        let statuses: Vec<(i64, i64)> = recorder
+            .prepare("SELECT uid,exit_code FROM brushprov ORDER BY id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(statuses, vec![(first_uid, 7), (second_uid, -1)]);
+        drop(recorder);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     fn add_file(b: &BoxState, id: i64, rel: &str, content: &[u8]) -> std::path::PathBuf {
         let rid = b.ensure_file_row(rel, 0o100644, 0);
         let bp = blob_path(id, rid);

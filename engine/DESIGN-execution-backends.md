@@ -1026,6 +1026,21 @@ as executable mappings and mmap that genuinely need a host fd.
           row. The production binary, static aarch64 test harness, all eleven
           depot tests, both merged-layer tests, the canonical virtio lifecycle
           test, and the binary action socket test pass.
+          The resumed full-world gate then exposed an independent record-
+          identity defect: every embedded Brush OS process starts its local
+          pipeline counter at one, while the database had treated that counter
+          as box-global. Concurrent recipe shells and later reruns therefore
+          overwrote one another's completion status and made the failure record
+          actively misleading. Pipeline identity is now the reversible pair
+          `(producer, local counter)`. A producer is allocated durably for the
+          exact `(host pid, /proc start tick)` incarnation named by the event's
+          pidfd; its 31-bit number and the 32-bit local counter form one positive
+          SQLite integer used consistently by starts, completions, attribution
+          fixups, parent links, stored relation JSON, and make-variable links.
+          PID reuse and equal counters in concurrent shells cannot alias. The
+          aarch64 unit regression covers the encoding limits, and a database
+          regression records two producers both using local id one, completes
+          only the first, and requires the second to remain pending.
           Earlier nonfatal empty-operand arithmetic and generated-config `sed`
           diagnostics stay recorded for attribution rather than normalization.
     - [x] Complete the native-aarch64 FUSE Brush gate from a clean output tree.
