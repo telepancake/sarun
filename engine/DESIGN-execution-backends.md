@@ -708,8 +708,11 @@ as executable mappings and mmap that genuinely need a host fd.
           emits `include/config.h`, preprocesses `u-boot.cfg`, regenerates
           `include/autoconf.mk`, and exits zero. The static aarch64 build,
           parser units, vendor reproduction checks, and complete 53-case suite
-          pass. The next checkpoint is completion of `tools/install`, followed
-          by resumption of `world`. The earlier omission has therefore not
+          pass. The full `make -j10 V=s tools/install` replay now configures,
+          builds, installs, and stamps both Quilt and U-Boot (including
+          `mkimage` and `mkenvimage`) and exits zero. The host-tool checkpoint
+          is complete; the next checkpoint is resumption of `world`. The
+          earlier omission has therefore not
           reproduced as an engine defect. The earlier nonfatal empty-operand
           arithmetic and generated-config `sed` diagnostics also remain for
           attribution rather
