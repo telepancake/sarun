@@ -16,9 +16,9 @@ from typing import Callable, Protocol
 from callgate.manifest import ValidatedManifest
 from callgate.transaction import CallGateResult, CallGateTransaction, Target
 from probe.abi import (
+    AARCH64_SNAPSHOT_ABI,
     ABI_MAJOR,
     ABI_MINOR,
-    ARCH_AARCH64,
     REQUEST_MAGIC,
     RESPONSE_MAGIC,
     RESPONSE_SIZE,
@@ -26,6 +26,8 @@ from probe.abi import (
     ProbeDecodeError,
     ProbePage,
     ProbeSnapshot,
+    SnapshotAbi,
+    build_snapshot_request,
     decode_paginated,
     decode_response,
 )
@@ -33,7 +35,7 @@ from probe.abi import (
 
 REQUEST_SIZE = 64
 OP_SNAPSHOT = 1
-_REQUEST_FORMAT = "<IHHHHIQQIIQQQ"
+_REQUEST_FORMAT = "IHHHHIQQIIQQQ"
 
 
 class ProbeRunnerError(ProbeDecodeError):
@@ -54,16 +56,21 @@ class SnapshotRequest:
     init_task: int
     max_records: int
     abi_minor: int
+    snapshot_abi: SnapshotAbi
 
 
-def _validate_request_template(manifest: ValidatedManifest) -> SnapshotRequest:
+def _validate_request_template(
+    manifest: ValidatedManifest, snapshot_abi: SnapshotAbi
+) -> SnapshotRequest:
     if not isinstance(manifest, ValidatedManifest) or not manifest.is_validated:
         raise ProbeRunnerError("a validated call-gate manifest is required")
+    if not isinstance(snapshot_abi, SnapshotAbi):
+        raise ProbeRunnerError("snapshot target ABI metadata is required")
     request = manifest.request_bytes
     if len(request) != REQUEST_SIZE:
         raise ProbeRunnerError("sealed probe request must be exactly 64 bytes")
     try:
-        fields = struct.unpack(_REQUEST_FORMAT, request)
+        fields = struct.unpack(snapshot_abi.byte_order + _REQUEST_FORMAT, request)
     except struct.error as exc:  # defensive: the exact length was checked above
         raise ProbeRunnerError("cannot decode sealed probe request") from exc
     (magic, major, minor, size, opcode, flags, init_task, cursor,
@@ -76,6 +83,11 @@ def _validate_request_template(manifest: ValidatedManifest) -> SnapshotRequest:
         raise ProbeRunnerError("sealed snapshot request has nonzero flags or reserved fields")
     if not init_task:
         raise ProbeRunnerError("sealed snapshot request has a zero init_task")
+    if init_task >= snapshot_abi.pointer_limit:
+        raise ProbeRunnerError(
+            "sealed init_task does not fit the configured "
+            f"{snapshot_abi.pointer_bits}-bit pointer width"
+        )
     if cursor:
         raise ProbeRunnerError("sealed snapshot request must begin with cursor zero")
     if not max_records:
@@ -92,7 +104,9 @@ def _validate_request_template(manifest: ValidatedManifest) -> SnapshotRequest:
         raise ProbeRunnerError("snapshot mailbox does not fit in the sealed data region")
     if max(request_start, result_start) < min(request_end, result_end):
         raise ProbeRunnerError("snapshot request and result buffers overlap")
-    if manifest.completion_magic != struct.pack("<I", RESPONSE_MAGIC):
+    if manifest.completion_magic != struct.pack(
+        snapshot_abi.byte_order + "I", RESPONSE_MAGIC
+    ):
         raise ProbeRunnerError("sealed completion magic must be the ABI-v1 response magic")
     capacity = (manifest.result_size - RESPONSE_SIZE) // TASK_V1_SIZE
     if capacity <= 0 or max_records > capacity:
@@ -100,7 +114,9 @@ def _validate_request_template(manifest: ValidatedManifest) -> SnapshotRequest:
             "sealed max_records does not fit the result buffer's ABI-v1 capacity"
         )
     return SnapshotRequest(
-        init_task=init_task, max_records=max_records, abi_minor=minor)
+        init_task=init_task, max_records=max_records, abi_minor=minor,
+        snapshot_abi=snapshot_abi,
+    )
 
 
 class ProbeSnapshotRunner:
@@ -117,10 +133,12 @@ class ProbeSnapshotRunner:
         target: Target,
         manifest: ValidatedManifest,
         transaction_factory: TransactionFactory = CallGateTransaction,
+        *,
+        snapshot_abi: SnapshotAbi = AARCH64_SNAPSHOT_ABI,
     ) -> None:
         self.target = target
         self.manifest = manifest
-        self.request = _validate_request_template(manifest)
+        self.request = _validate_request_template(manifest, snapshot_abi)
         self._transaction_factory = transaction_factory
         self._expected_cursor = 0
         self._metadata: tuple[int, int, str, int, int, int] | None = None
@@ -141,18 +159,23 @@ class ProbeSnapshotRunner:
         self._seen_cursors.clear()
 
     def _request_bytes(self, cursor: int) -> bytes:
-        return struct.pack(
-            _REQUEST_FORMAT,
-            REQUEST_MAGIC, ABI_MAJOR, self.request.abi_minor,
-            REQUEST_SIZE, OP_SNAPSHOT, 0,
-            self.request.init_task, cursor, self.request.max_records, 0, 0, 0, 0,
+        return build_snapshot_request(
+            self.request.init_task, cursor, self.request.max_records,
+            abi_minor=self.request.abi_minor,
+            snapshot_abi=self.request.snapshot_abi,
         )
 
     def _validate_page(self, page: ProbePage, cursor: int) -> None:
-        if page.abi_minor != self.request.abi_minor or page.arch != ARCH_AARCH64:
-            raise ProbeRunnerError("probe response is not the exact AArch64 ABI-v1 page")
-        if page.byte_order != "<" or page.pointer_bits != 64:
-            raise ProbeRunnerError("probe response does not match the sealed little-endian AArch64 ABI")
+        abi = self.request.snapshot_abi
+        if page.abi_minor != self.request.abi_minor:
+            raise ProbeRunnerError("probe response is not the exact sealed ABI-v1 page")
+        if (page.arch, page.byte_order, page.pointer_bits) != (
+            abi.arch, abi.byte_order, abi.pointer_bits
+        ):
+            raise ProbeRunnerError(
+                "probe response does not match the sealed "
+                f"{abi.name} snapshot ABI"
+            )
         if page.snapshot_root != self.request.init_task:
             raise ProbeRunnerError("probe response snapshot_root does not match sealed init_task")
         if not page.tasks or page.tasks[0].task != (cursor or self.request.init_task):
@@ -180,8 +203,14 @@ class ProbeSnapshotRunner:
     def fetch_page(self, cursor: int) -> bytes:
         """Execute, restore, decode, and validate one requested snapshot page."""
 
-        if isinstance(cursor, bool) or not isinstance(cursor, int) or not 0 <= cursor < 1 << 64:
-            raise ProbeRunnerError("snapshot cursor must be an unsigned 64-bit integer")
+        abi = self.request.snapshot_abi
+        if (isinstance(cursor, bool) or not isinstance(cursor, int)
+                or not 0 <= cursor < abi.pointer_limit):
+            if abi.pointer_bits == 64:
+                raise ProbeRunnerError("snapshot cursor must be an unsigned 64-bit integer")
+            raise ProbeRunnerError(
+                f"snapshot cursor must fit the configured {abi.pointer_bits}-bit pointer width"
+            )
         if cursor == 0:
             self._reset_sequence()
             self._seen_cursors.add(0)
@@ -198,7 +227,9 @@ class ProbeSnapshotRunner:
         )
         try:
             result = self._transaction_factory(self.target, page_manifest).execute()
-            page = decode_response(bytes(result.result))
+            page = decode_response(
+                bytes(result.result), expected_abi=self.request.snapshot_abi
+            )
             self._validate_page(page, cursor)
         except BaseException:
             self._reset_sequence()
@@ -218,7 +249,10 @@ class ProbeSnapshotRunner:
         """Return one complete decoded snapshot."""
 
         try:
-            return decode_paginated(self.fetch_page, max_pages=max_pages)
+            return decode_paginated(
+                self.fetch_page, max_pages=max_pages,
+                expected_abi=self.request.snapshot_abi,
+            )
         except BaseException:
             self._reset_sequence()
             raise

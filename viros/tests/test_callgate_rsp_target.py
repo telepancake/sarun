@@ -6,7 +6,13 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from callgate.architectures import AARCH64
+from callgate.architectures import (
+    AARCH64,
+    ARCHITECTURES,
+    MIPS32EL_MMIPS,
+    RegisterSpec,
+    architecture_by_name,
+)
 from callgate.rsp_target import RspQemuTarget, RspTargetError
 from callgate.transaction import AARCH64_REGISTERS
 
@@ -332,6 +338,106 @@ class RspQemuTargetTests(unittest.TestCase):
         # A synchronized stop leaves the target safe for the outer
         # transaction's register/page restoration.
         self.target.write_register(1, "pc", 0x1234)
+
+
+class MipsFixedRspTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.kernel = Path(self.temporary.name) / "vmlinux"
+        self.kernel.write_bytes(b"experimental MMIPS backend fixture")
+        self.client = FakeQemuClient()
+        self.client.xml = {}
+        self.client.registers = {
+            (thread, number): (thread_index * 0x1000 + number).to_bytes(
+                4, "little"
+            )
+            for thread_index, thread in enumerate(self.client.threads)
+            for number in range(38)
+        }
+        self.target = RspQemuTarget(
+            self.client,
+            self.kernel,
+            "12345678abcdef00",
+            MIPS32EL_MMIPS,
+        )
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def test_descriptor_is_explicitly_not_manifest_registered(self):
+        self.assertNotIn(MIPS32EL_MMIPS.name, ARCHITECTURES)
+        with self.assertRaises(LookupError):
+            architecture_by_name(MIPS32EL_MMIPS.name)
+        self.assertEqual(len(MIPS32EL_MMIPS.core_registers), 38)
+        self.assertTrue(all(
+            register.bits == 32
+            for register in MIPS32EL_MMIPS.core_registers
+        ))
+        self.assertEqual(
+            tuple(register.rsp_number for register in MIPS32EL_MMIPS.core_registers),
+            tuple(range(38)),
+        )
+        self.assertFalse(any(
+            register.name.startswith("f")
+            for register in MIPS32EL_MMIPS.core_registers
+        ))
+
+    def test_fixed_map_reads_and_writes_little_endian_p_packets_without_xml(self):
+        self.assertEqual(self.target.read_register(1, "status"), 0x1020)
+        self.assertIn(("read_register", "2", 32), self.client.calls)
+        self.target.write_register(1, "r4", 0x88776655)
+        self.assertEqual(self.client.registers[("2", 4)], b"\x55\x66\x77\x88")
+        self.assertIn(
+            ("write_register", "2", 4, b"\x55\x66\x77\x88"),
+            self.client.calls,
+        )
+        self.assertFalse(any(call[0] == "xfer" for call in self.client.calls))
+
+    def test_fixed_map_names_widths_and_regnums_are_exact(self):
+        expected_names = tuple(
+            [f"r{number}" for number in range(32)]
+            + ["status", "lo", "hi", "badvaddr", "cause", "pc"]
+        )
+        self.assertEqual(MIPS32EL_MMIPS.register_names, expected_names)
+        for number, name in enumerate(expected_names):
+            register = self.target._register(name)
+            self.assertEqual((register.number, register.bits), (number, 32))
+        calls = len(self.client.calls)
+        with self.assertRaisesRegex(
+            RspTargetError, "unsupported MIPS32 little-endian MMIPS core register: f0"
+        ):
+            self.target.read_register(0, "f0")
+        self.assertEqual(len(self.client.calls), calls)
+
+    def test_descriptor_validates_fixed_register_maps(self):
+        partial = (
+            replace(AARCH64.core_registers[0], rsp_number=0),
+            *AARCH64.core_registers[1:],
+        )
+        with self.assertRaisesRegex(ValueError, "cover every core register"):
+            replace(AARCH64, core_registers=partial)
+
+        duplicate = list(MIPS32EL_MMIPS.core_registers)
+        duplicate[1] = RegisterSpec("r1", 32, 0)
+        with self.assertRaisesRegex(ValueError, "numbers must be unique"):
+            replace(MIPS32EL_MMIPS, core_registers=tuple(duplicate))
+
+        negative = list(MIPS32EL_MMIPS.core_registers)
+        negative[1] = RegisterSpec("r1", 32, -1)
+        with self.assertRaisesRegex(ValueError, "nonnegative integers"):
+            replace(MIPS32EL_MMIPS, core_registers=tuple(negative))
+
+    def test_breakpoint_size_and_completion_pc_use_mips_descriptor(self):
+        address = 0x80123000
+        token = self.target.add_hardware_breakpoint(address)
+        self.assertEqual(token.size, 4)
+        self.assertEqual(self.client.breakpoint, (1, address, 4))
+        self.target.remove_breakpoint(token)
+
+        self.client.registers[("2", 37)] = address.to_bytes(4, "little")
+        self.target.run_cpu_until(1, address, 2.0)
+        self.assertIn(("read_register", "2", 37), self.client.calls)
+        self.assertIn(("resume_thread", "2", "1"), self.client.calls)
 
 
 if __name__ == "__main__":

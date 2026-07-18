@@ -4,6 +4,9 @@ import unittest
 from inferiors.linux_oracle import TaskId
 from inferiors.probe_oracle import ProbeOracle
 from probe.abi import (
+    ARCH_MIPS,
+    MIPS32BE_SNAPSHOT_ABI,
+    MIPS32EL_SNAPSHOT_ABI,
     ProbeDecodeError,
     ProbeStatusError,
     decode_paginated,
@@ -14,6 +17,7 @@ from probe.abi import (
 HEADER = "IHHHHHBBiIIIQQIIQ"
 TASK = "HHIQQQQQQQQIIIIIHH16s10Q"
 ROOT = 0xffff800001000000
+MIPS_ROOT = 0x81234000
 
 
 def task_bytes(*, task=ROOT, leader=ROOT, mm=0xffff800002000000,
@@ -42,12 +46,63 @@ def response(records, *, root=ROOT, more=False, cursor=0, status=0,
     return header + body
 
 
+def mips_task_bytes(byte_order, *, task=MIPS_ROOT):
+    return struct.pack(
+        byte_order + TASK, 192, 1, 3, task, task, 0x81233000,
+        0x82345000, 0x83456000, 0x1020304050607080,
+        0xfffffffffffffff0, 0x8877665544332211,
+        1, 1, 0, 0, 0, 32, 0,
+        b"init\0".ljust(16, b"\0"), *([0] * 10),
+    )
+
+
+def mips_response(snapshot_abi, records, *, root=MIPS_ROOT):
+    body = b"".join(records)
+    return struct.pack(
+        snapshot_abi.byte_order + HEADER,
+        0x56505253, 1, 0, 64, 192, ARCH_MIPS,
+        snapshot_abi.endian_code, 32, 0, 0, len(records), 64 + len(body),
+        0, root, 12, 0, 0,
+    ) + body
+
+
 class ProbeDecoderTests(unittest.TestCase):
     def test_native_aarch64_record(self):
         page = decode_response(response([task_bytes()]))
         self.assertEqual(page.tasks[0].pid, 1)
         self.assertEqual(page.tasks[0].abi_bits, 64)
         self.assertEqual(page.tasks[0].pgd_kernel_va, 0xffff800003000000)
+
+    def test_mips32_pointer_slots_decode_in_each_target_byte_order(self):
+        for snapshot_abi in (MIPS32EL_SNAPSHOT_ABI, MIPS32BE_SNAPSHOT_ABI):
+            with self.subTest(snapshot_abi=snapshot_abi.name):
+                page = decode_response(
+                    mips_response(
+                        snapshot_abi,
+                        [mips_task_bytes(snapshot_abi.byte_order)],
+                    ),
+                    expected_abi=snapshot_abi,
+                )
+                task = page.tasks[0]
+                self.assertEqual(
+                    (page.arch, page.byte_order, page.pointer_bits),
+                    (ARCH_MIPS, snapshot_abi.byte_order, 32),
+                )
+                self.assertEqual(
+                    (task.task, task.mm, task.pgd_kernel_va),
+                    (MIPS_ROOT, 0x82345000, 0x83456000),
+                )
+                # Non-pointer fields remain full-width even on a 32-bit target.
+                self.assertEqual(task.start_cookie, 0x1020304050607080)
+                self.assertEqual(task.task_flags, 0x8877665544332211)
+
+    def test_mips32_rejects_non_zero_extended_pointer_slots(self):
+        record = mips_task_bytes(">", task=(1 << 32) | MIPS_ROOT)
+        with self.assertRaisesRegex(ProbeDecodeError, r"task\[0\]\.task.*32-bit"):
+            decode_response(
+                mips_response(MIPS32BE_SNAPSHOT_ABI, [record]),
+                expected_abi=MIPS32BE_SNAPSHOT_ABI,
+            )
 
     def test_malformed_truncated_and_corrupt_responses(self):
         with self.assertRaisesRegex(ProbeDecodeError, "truncated"):

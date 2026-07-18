@@ -18,6 +18,7 @@ SAVED_REGS_V1_SIZE = 304
 ENDIAN_LITTLE = 1
 ENDIAN_BIG = 2
 ARCH_AARCH64 = 1
+ARCH_MIPS = 3
 OP_SNAPSHOT = 1
 OP_TRANSLATE_VA = 2
 OP_SAVED_REGS = 3
@@ -74,6 +75,48 @@ class ProbeInvalidRegistersError(ProbeStatusError):
 
 class ProbeCompatTaskError(ProbeStatusError):
     """The saved-register ABI deliberately does not expose compat32 frames."""
+
+
+@dataclass(frozen=True)
+class SnapshotAbi:
+    """Target metadata which fixes snapshot byte order and pointer width.
+
+    The frozen ABI deliberately keeps pointer-bearing request and response
+    fields at 64 bits on the wire.  A 32-bit target must therefore place a
+    zero-extended pointer in each of those fields.
+    """
+
+    name: str
+    arch: int
+    byte_order: str
+    pointer_bits: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.name, str) or not self.name:
+            raise ValueError("snapshot ABI name must be a nonempty string")
+        if self.byte_order not in {"<", ">"}:
+            raise ValueError("snapshot ABI byte order must be '<' or '>'")
+        if self.pointer_bits not in {32, 64}:
+            raise ValueError("snapshot ABI pointer width must be 32 or 64")
+        if (
+            not isinstance(self.arch, int)
+            or isinstance(self.arch, bool)
+            or self.arch <= 0
+        ):
+            raise ValueError("snapshot ABI architecture must be a positive integer")
+
+    @property
+    def endian_code(self) -> int:
+        return ENDIAN_LITTLE if self.byte_order == "<" else ENDIAN_BIG
+
+    @property
+    def pointer_limit(self) -> int:
+        return 1 << self.pointer_bits
+
+
+AARCH64_SNAPSHOT_ABI = SnapshotAbi("aarch64", ARCH_AARCH64, "<", 64)
+MIPS32EL_SNAPSHOT_ABI = SnapshotAbi("mips32el", ARCH_MIPS, "<", 32)
+MIPS32BE_SNAPSHOT_ABI = SnapshotAbi("mips32be", ARCH_MIPS, ">", 32)
 
 
 @dataclass(frozen=True)
@@ -161,6 +204,47 @@ class ProbeSavedRegisters:
         return bool(self.flags & REGS_VALID)
 
 
+_REQUEST_FORMAT = "IHHHHIQQIIQQQ"
+
+
+def _pointer(value: int, field: str, abi: SnapshotAbi) -> int:
+    if (isinstance(value, bool) or not isinstance(value, int)
+            or not 0 <= value < abi.pointer_limit):
+        raise ProbeDecodeError(
+            f"{field} does not fit the {abi.pointer_bits}-bit {abi.name} pointer width"
+        )
+    return value
+
+
+def build_snapshot_request(
+    init_task: int,
+    cursor_task: int,
+    max_records: int,
+    *,
+    abi_minor: int = ABI_MINOR,
+    snapshot_abi: SnapshotAbi = AARCH64_SNAPSHOT_ABI,
+) -> bytes:
+    """Pack one snapshot request for an explicitly selected target ABI."""
+
+    if not isinstance(snapshot_abi, SnapshotAbi):
+        raise ProbeDecodeError("snapshot request requires target ABI metadata")
+    init_task = _pointer(init_task, "init_task", snapshot_abi)
+    cursor_task = _pointer(cursor_task, "cursor_task", snapshot_abi)
+    if not init_task:
+        raise ProbeDecodeError("snapshot request has a zero init_task")
+    if (isinstance(max_records, bool) or not isinstance(max_records, int)
+            or not 0 < max_records < 1 << 32):
+        raise ProbeDecodeError("snapshot max_records must be a nonzero uint32")
+    if (isinstance(abi_minor, bool) or not isinstance(abi_minor, int)
+            or not 0 <= abi_minor <= ABI_MINOR):
+        raise ProbeDecodeError("snapshot request uses an unsupported ABI minor")
+    return struct.pack(
+        snapshot_abi.byte_order + _REQUEST_FORMAT,
+        REQUEST_MAGIC, ABI_MAJOR, abi_minor, 64, OP_SNAPSHOT, 0,
+        init_task, cursor_task, max_records, 0, 0, 0, 0,
+    )
+
+
 def _build_translation_request(
     task: ProbeTask, virtual_address: int, linear_map_offset: int,
     abi_minor: int = ABI_MINOR,
@@ -187,7 +271,8 @@ def _build_translation_request(
     if abi_minor not in (1, ABI_MINOR):
         raise ProbeDecodeError("translation requires probe ABI minor 1 or 2")
     return struct.pack(
-        "<IHHHHIQQIIQQQ", REQUEST_MAGIC, ABI_MAJOR, abi_minor, 64,
+        AARCH64_SNAPSHOT_ABI.byte_order + _REQUEST_FORMAT,
+        REQUEST_MAGIC, ABI_MAJOR, abi_minor, 64,
         OP_TRANSLATE_VA, 0, task.task, task.mm, 0, 0,
         task.start_cookie, virtual_address, linear_map_offset,
     )
@@ -207,7 +292,8 @@ def _build_saved_registers_request(task: ProbeTask) -> bytes:
     if task.probe_flags & TASK_ON_CPU:
         raise ProbeDecodeError("an on-CPU task has no authoritative saved frame")
     return struct.pack(
-        "<IHHHHIQQIIQQQ", REQUEST_MAGIC, ABI_MAJOR, ABI_MINOR, 64,
+        AARCH64_SNAPSHOT_ABI.byte_order + _REQUEST_FORMAT,
+        REQUEST_MAGIC, ABI_MAJOR, ABI_MINOR, 64,
         OP_SAVED_REGS, 0, task.task, task.mm, 0, 0,
         task.start_cookie, 0, 0,
     )
@@ -240,7 +326,9 @@ def _status_error(status: int) -> ProbeStatusError:
     return ProbeStatusError(status)
 
 
-def decode_response(data: bytes) -> ProbePage:
+def decode_response(
+    data: bytes, *, expected_abi: SnapshotAbi | None = None
+) -> ProbePage:
     if not isinstance(data, bytes):
         raise ProbeDecodeError("probe response must be bytes")
     if len(data) < RESPONSE_SIZE:
@@ -268,10 +356,22 @@ def decode_response(data: bytes) -> ProbePage:
         raise ProbeDecodeError(f"invalid response header size {header_size}")
     if record_size < TASK_V1_SIZE:
         raise ProbeDecodeError(f"task record size {record_size} is too small")
-    if arch != ARCH_AARCH64:
-        raise ProbeDecodeError(f"unsupported probe architecture {arch}")
     if pointer_bits not in (32, 64):
         raise ProbeDecodeError(f"invalid pointer width {pointer_bits}")
+    if expected_abi is None:
+        # Preserve the original AArch64-only default.  Additional target
+        # decoders must opt in with the exact expected metadata.
+        if arch != ARCH_AARCH64:
+            raise ProbeDecodeError(f"unsupported probe architecture {arch}")
+    elif not isinstance(expected_abi, SnapshotAbi):
+        raise ProbeDecodeError("response decoder requires target ABI metadata")
+    elif (arch, byte_order, pointer_bits) != (
+        expected_abi.arch, expected_abi.byte_order, expected_abi.pointer_bits
+    ):
+        raise ProbeDecodeError(
+            "probe response target metadata does not match expected "
+            f"{expected_abi.name} ABI"
+        )
     if not 10 <= page_shift <= 24:
         raise ProbeDecodeError(f"invalid page shift {page_shift}")
     if flags & ~RESP_MORE:
@@ -289,6 +389,9 @@ def decode_response(data: bytes) -> ProbePage:
         raise ProbeDecodeError("pagination flag and next cursor disagree")
     if not snapshot_root:
         raise ProbeDecodeError("snapshot root is zero")
+    if expected_abi is not None and expected_abi.pointer_bits == 32:
+        _pointer(snapshot_root, "snapshot_root", expected_abi)
+        _pointer(next_cursor, "next_cursor", expected_abi)
 
     tasks = []
     known_task_flags = TASK_HAS_MM | TASK_GROUP_LEADER | TASK_ON_CPU | TASK_AUX_VALID
@@ -305,8 +408,18 @@ def decode_response(data: bytes) -> ProbePage:
             raise ProbeDecodeError(f"task record {index} has unknown flags {probe_flags:#x}")
         if not task or not leader:
             raise ProbeDecodeError(f"task record {index} has a zero identity pointer")
+        if expected_abi is not None and expected_abi.pointer_bits == 32:
+            for field, value in (
+                ("task", task), ("group_leader", leader),
+                ("real_parent", parent), ("mm", mm), ("pgd", pgd),
+            ):
+                _pointer(value, f"task[{index}].{field}", expected_abi)
         if abi_bits not in (32, 64):
             raise ProbeDecodeError(f"task record {index} has invalid ABI width {abi_bits}")
+        if expected_abi is not None and abi_bits > expected_abi.pointer_bits:
+            raise ProbeDecodeError(
+                f"task record {index} ABI width exceeds the expected target pointer width"
+            )
         if auxv_valid & ~((1 << AUX_COUNT) - 1):
             raise ProbeDecodeError(f"task record {index} has invalid auxv mask")
         if bool(auxv_valid) != bool(probe_flags & TASK_AUX_VALID):
@@ -439,7 +552,12 @@ def decode_saved_registers_response(data: bytes) -> ProbeSavedRegisters:
         task, mm, start_cookie, x, sp, pc, pstate, flags)
 
 
-def decode_paginated(fetch: Callable[[int], bytes], max_pages: int = 4096) -> ProbeSnapshot:
+def decode_paginated(
+    fetch: Callable[[int], bytes],
+    max_pages: int = 4096,
+    *,
+    expected_abi: SnapshotAbi | None = None,
+) -> ProbeSnapshot:
     """Fetch and validate all pages from one frozen probe snapshot."""
 
     cursor = 0
@@ -448,7 +566,7 @@ def decode_paginated(fetch: Callable[[int], bytes], max_pages: int = 4096) -> Pr
     pages: list[ProbePage] = []
     tasks: list[ProbeTask] = []
     for _ in range(max_pages):
-        page = decode_response(fetch(cursor))
+        page = decode_response(fetch(cursor), expected_abi=expected_abi)
         if pages:
             first = pages[0]
             identity = (page.abi_minor, page.arch, page.byte_order,

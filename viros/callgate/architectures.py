@@ -19,6 +19,7 @@ class RegisterSpec:
 
     name: str
     bits: int
+    rsp_number: int | None = None
 
 
 @dataclass(frozen=True)
@@ -67,6 +68,23 @@ class ArchitectureDescriptor:
             for register in self.core_registers
         ):
             raise ValueError("architecture register widths must be positive whole bytes")
+        fixed_numbers = tuple(
+            register.rsp_number for register in self.core_registers
+        )
+        fixed = tuple(number for number in fixed_numbers if number is not None)
+        if fixed and len(fixed) != len(fixed_numbers):
+            raise ValueError(
+                "architecture fixed RSP register map must cover every core register"
+            )
+        if any(
+            isinstance(number, bool) or not isinstance(number, int) or number < 0
+            for number in fixed
+        ):
+            raise ValueError(
+                "architecture fixed RSP register numbers must be nonnegative integers"
+            )
+        if len(fixed) != len(set(fixed)):
+            raise ValueError("architecture fixed RSP register numbers must be unique")
         if self.target_byte_order not in {"little", "big"}:
             raise ValueError("architecture target byte order must be little or big")
         if (
@@ -104,6 +122,12 @@ class ArchitectureDescriptor:
             if register.name == name:
                 return register.bits
         raise KeyError(name)
+
+    @property
+    def has_fixed_rsp_registers(self) -> bool:
+        return bool(
+            self.core_registers and self.core_registers[0].rsp_number is not None
+        )
 
     def valid_control_state(self, value: int) -> bool:
         return (
@@ -171,6 +195,47 @@ AARCH64 = ArchitectureDescriptor(
         "translate-va-aarch64-v1",
         "saved-regs-aarch64-v1",
     }),
+)
+
+
+_MMIPS_REGISTER_NAMES = tuple(
+    [f"r{number}" for number in range(32)]
+    + ["status", "lo", "hi", "badvaddr", "cause", "pc"]
+)
+
+# Backend-only description of the legacy MMIPS QEMU stub's fixed MIPS32
+# register numbering.  CP1 is deliberately absent: a soft-float probe cannot
+# clobber it, and no-FPU targets reject those optional p packets.  This constant
+# is intentionally absent from ARCHITECTURES: no manifest, probe, or call-gate
+# support is implied by it.
+MIPS32EL_MMIPS = ArchitectureDescriptor(
+    name="mips32el-mmips-experimental",
+    display_name="MIPS32 little-endian MMIPS",
+    address_bits=32,
+    page_size=4096,
+    max_region_size=64 * 1024,
+    instruction_alignment=4,
+    stack_alignment=8,
+    target_byte_order="little",
+    qemu_architecture_names=("mips",),
+    breakpoint_size=4,
+    core_registers=tuple(
+        RegisterSpec(name, 32, number)
+        for number, name in enumerate(_MMIPS_REGISTER_NAMES)
+    ),
+    restore_order=_MMIPS_REGISTER_NAMES,
+    pc_register="pc",
+    sp_register="r29",
+    argument_registers=("r4", "r5", "r6"),
+    link_register="r31",
+    control_register="status",
+    control_state_bits=32,
+    control_state_mask=0,
+    control_state_value=0,
+    control_state_description="descriptor-only preserved kernel status",
+    control_state_plan_description="preserved kernel status",
+    known_capabilities=frozenset(),
+    dependent_capabilities=frozenset(),
 )
 
 

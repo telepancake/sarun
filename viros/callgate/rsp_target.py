@@ -200,6 +200,15 @@ class RspQemuTarget:
             ) from exc
 
     def _load_register_map(self) -> dict[str, _Register]:
+        if self.architecture.has_fixed_rsp_registers:
+            # Some legacy QEMU targets expose working p/P packets but no target
+            # description.  Only descriptors whose complete fixed map passed
+            # construction-time validation may use this path.
+            return {
+                register.name: _Register(register.rsp_number, register.bits)
+                for register in self.architecture.core_registers
+            }
+
         registers: dict[str, _Register] = {}
         visiting: set[str] = set()
         next_number = 0

@@ -10,7 +10,13 @@ import unittest
 
 from callgate.manifest import load_and_validate_manifest
 from callgate.transaction import CallGateResult
-from probe.abi import ProbeStatusError
+from probe.abi import (
+    ARCH_MIPS,
+    MIPS32BE_SNAPSHOT_ABI,
+    MIPS32EL_SNAPSHOT_ABI,
+    ProbeStatusError,
+    build_snapshot_request,
+)
 from probe.snapshot_runner import ProbeRunnerError, ProbeSnapshotRunner
 
 
@@ -19,6 +25,7 @@ TASK = "HHIQQQQQQQQIIIIIHH16s10Q"
 REQUEST = "IHHHHIQQIIQQQ"
 ROOT = 0xffff800081234000
 SECOND = ROOT + 0x1000
+MIPS_ROOT = 0x81234000
 
 
 def _sha256(path: Path) -> str:
@@ -42,6 +49,25 @@ def response(records, *, more=False, next_cursor=0, root=ROOT, status=0):
         next_cursor, root, 12, 0, 0,
     )
     return header + body
+
+
+def mips_task_bytes(byte_order):
+    return struct.pack(
+        byte_order + TASK, 192, 1, 3, MIPS_ROOT, MIPS_ROOT, 0,
+        0x82345000, 0x83456000, 123, 0, 0,
+        1, 1, 0, 0, 0, 32, 0, b"init\0".ljust(16, b"\0"),
+        *([0] * 10),
+    )
+
+
+def mips_response(snapshot_abi):
+    body = mips_task_bytes(snapshot_abi.byte_order)
+    return struct.pack(
+        snapshot_abi.byte_order + HEADER,
+        0x56505253, 1, 0, 64, 192, ARCH_MIPS,
+        snapshot_abi.endian_code, 32, 0, 0, 1, 64 + len(body),
+        0, MIPS_ROOT, 12, 0, 0,
+    ) + body
 
 
 def make_manifest(directory: Path, max_records=2):
@@ -126,6 +152,37 @@ class ProbeSnapshotRunnerTests(unittest.TestCase):
         request = struct.unpack("<" + REQUEST, factory.manifests[0].request_bytes)
         self.assertEqual((request[6], request[7], request[8]), (ROOT, 0, 2))
         self.assertEqual(runner.audits, (("restored",),))
+
+    def test_explicit_mips32_abi_packs_and_decodes_each_byte_order(self):
+        for snapshot_abi in (MIPS32EL_SNAPSHOT_ABI, MIPS32BE_SNAPSHOT_ABI):
+            with self.subTest(snapshot_abi=snapshot_abi.name):
+                request = build_snapshot_request(
+                    MIPS_ROOT, 0, 2, abi_minor=0, snapshot_abi=snapshot_abi
+                )
+                manifest = replace(
+                    self.manifest,
+                    request_bytes=request,
+                    completion_magic=struct.pack(
+                        snapshot_abi.byte_order + "I", 0x56505253
+                    ),
+                )
+                factory = RecordingFactory([mips_response(snapshot_abi)])
+                runner = ProbeSnapshotRunner(
+                    object(), manifest, factory, snapshot_abi=snapshot_abi
+                )
+                snapshot = runner.snapshot()
+
+                packed = struct.unpack(
+                    snapshot_abi.byte_order + REQUEST,
+                    factory.manifests[0].request_bytes,
+                )
+                self.assertEqual((packed[6], packed[7], packed[8]),
+                                 (MIPS_ROOT, 0, 2))
+                self.assertEqual(
+                    (snapshot.arch, snapshot.byte_order, snapshot.pointer_bits),
+                    (ARCH_MIPS, snapshot_abi.byte_order, 32),
+                )
+                self.assertEqual(snapshot.tasks[0].task, MIPS_ROOT)
 
     def test_pagination_runs_one_restoring_transaction_per_cursor(self):
         factory = RecordingFactory([
