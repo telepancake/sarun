@@ -784,8 +784,28 @@ as executable mappings and mmap that genuinely need a host fd.
           exits zero after 1,079.66 seconds, creates both `.built` and
           `.linux_installed`, and an independent box verifies the live symlink,
           generated header, and stamps. The complete 57-case Make/Brush suite
-          also passes against this engine. The remaining `world` graph is the
-          next real gate.
+          also passes against this engine. Resuming `world` reached final GCC
+          14.3.0, where a third-level recursive make incorrectly retained the
+          top-level command-line `CXX` after its middle makefile intentionally
+          set `MAKEOVERRIDES =`. Embedded Kati now seeds and reconciles
+          `MAKEOVERRIDES` at each parse boundary, so command-line variables cross
+          only the recursive boundaries selected by the makefiles. Make/Brush
+          case 58 pins the exact parent/middle/leaf origin transition. Removing
+          the failed real `array_type_info` object and replaying the focused GCC
+          target then emitted the complete `xgcc` command and rebuilt the object
+          successfully. The full OpenWrt final-GCC wrapper proceeded through
+          compilation and install, then exposed one more generic GNU built-in:
+          OpenWrt uses `$(RM)` without defining it, so an empty expansion tried
+          to execute `lib/libiberty.a`. Both embedded and standalone Kati now
+          provide GNU's default `RM=rm -f` unless built-in variables are disabled;
+          Make/Brush case 59 verifies the actual removal. Vendor reproduction,
+          the static aarch64 build, and all 59 Make/Brush cases pass. Replaying
+          the preserved final-GCC wrapper crossed the former boundary, patched
+          the toolchain specs, and created both `.built` and
+          `.gcc_final_installed`. An independent Brush box executed the installed
+          OpenWrt GCC 14.3.0 C++ driver and compiled a C++20 translation unit into
+          a 64-bit AArch64 ELF relocatable object. The remaining `world` graph is
+          the next real gate.
           Earlier nonfatal empty-operand arithmetic and generated-config `sed`
           diagnostics stay recorded for attribution rather than normalization.
     - [x] Complete the native-aarch64 FUSE Brush gate from a clean output tree.
