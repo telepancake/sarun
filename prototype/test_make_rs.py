@@ -2203,6 +2203,69 @@ fi
               "doesn't support .SILENT" not in r.stdout + r.stderr,
               f"case64: .SILENT suppresses echo/no-op diagnostics; "
               f"got {(r.stdout+r.stderr)!r}")
+        # ── CASE 65: target-specific .SILENT is selective ──────────
+        target_silent = work / "target-dot-silent"
+        shutil.rmtree(target_silent, ignore_errors=True)
+        target_silent.mkdir(parents=True)
+        (target_silent / "Makefile").write_text(
+            ".SILENT: quiet quiet-noop\n"
+            ".PHONY: all quiet loud\n"
+            "all: quiet loud\n"
+            "quiet:\n"
+            "\tprintf quiet > quiet.txt\n"
+            "loud:\n"
+            "\tprintf loud > loud.txt\n"
+            "quiet-noop loud-noop:\n")
+        r = run_make("MAKE65A", target_silent, "all")
+        check(r.returncode == 0,
+              f"case65: selective .SILENT recipes complete (got {r.returncode}: "
+              f"{(r.stdout+r.stderr)[-700:]})")
+        out65 = r.stdout + r.stderr
+        check("printf quiet" not in out65 and "printf loud" in out65 and
+              "doesn't support target-specific .SILENT" not in out65,
+              f"case65: only selected recipe echo is silent; got {out65!r}")
+        sp65 = latest_sqlar(m)
+        quiet_result = m.sqlar_content(
+            sp65, str((target_silent / "quiet.txt").resolve()).lstrip("/"))
+        loud_result = m.sqlar_content(
+            sp65, str((target_silent / "loud.txt").resolve()).lstrip("/"))
+        check(quiet_result == b"quiet" and loud_result == b"loud",
+              f"case65: both recipes execute; got quiet={quiet_result!r}, "
+              f"loud={loud_result!r}")
+        r = run_make("MAKE65B", target_silent, "quiet-noop", "loud-noop")
+        check(r.returncode == 0,
+              f"case65: selective .SILENT no-op goals complete (got {r.returncode}: "
+              f"{(r.stdout+r.stderr)[-700:]})")
+        out65 = r.stdout + r.stderr
+        check("for 'quiet-noop'" not in out65 and "for 'loud-noop'" in out65,
+              f"case65: only selected no-op diagnostic is silent; got {out65!r}")
+        # ── CASE 66: clearing MAKEFLAGS stops command-variable export ─
+        # OpenWrt clears MAKEFLAGS at package boundaries. Its top-level V=s
+        # must not become Lua's V (the 5.1 filename suffix) in the package's
+        # recursive make.
+        clear_mf = work / "clear-makeflags-boundary"
+        shutil.rmtree(clear_mf, ignore_errors=True)
+        (clear_mf / "child").mkdir(parents=True)
+        (clear_mf / "Makefile").write_text(
+            "override MAKEFLAGS=\n"
+            ".PHONY: all\n"
+            "all:\n"
+            "\t@$(MAKE) --no-print-directory -C child all\n")
+        (clear_mf / "child/Makefile").write_text(
+            "V=5.1\n"
+            ".PHONY: all\n"
+            "all:\n"
+            "\t@printf '%s|%s\\n' '$(V)' '$(origin V)' > result.txt\n")
+        r = run_make("MAKE66", clear_mf, "V=s", "all")
+        check(r.returncode == 0,
+              f"case66: cleared MAKEFLAGS boundary completes (got {r.returncode}: "
+              f"{(r.stdout+r.stderr)[-700:]})")
+        sp66 = latest_sqlar(m)
+        clear_mf_result = m.sqlar_content(
+            sp66, str((clear_mf / "child/result.txt").resolve()).lstrip("/"))
+        check(clear_mf_result == b"5.1|file\n",
+              f"case66: child uses its file V after MAKEFLAGS clear; "
+              f"got {clear_mf_result!r}")
     finally:
         if eng is not None and eng.poll() is None:
             eng.terminate()

@@ -583,6 +583,14 @@ fn run_kati(
         let makeflags = intern(b"MAKEFLAGS".to_vec());
         let makeoverrides = intern(b"MAKEOVERRIDES".to_vec());
         let current = ev.eval_var(makeflags)?;
+        // MAKEOVERRIDES is substituted into MAKEFLAGS only while MAKEFLAGS
+        // still contains its `--` command-variable slot. `override
+        // MAKEFLAGS=` deliberately removes that slot; OpenWrt uses this at
+        // package boundaries so its top-level `V=s` does not override an
+        // unrelated package makefile's own `V` (Lua's version suffix).
+        let has_override_slot = current
+            .split(|byte| byte.is_ascii_whitespace())
+            .any(|word| word == b"--");
         let (flag_words, _) = kati::flags::Flags::split_makeflags(&current);
         let overrides = ev.eval_var(makeoverrides)?;
         let mut reconciled = BytesMut::new();
@@ -592,7 +600,7 @@ fn run_kati(
             }
             reconciled.put_slice(&word);
         }
-        if !overrides.is_empty() {
+        if has_override_slot && !overrides.is_empty() {
             if !reconciled.is_empty() {
                 reconciled.put_u8(b' ');
             }

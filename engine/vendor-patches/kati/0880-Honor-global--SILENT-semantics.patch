@@ -7,20 +7,36 @@ Implement prerequisite-free global .SILENT so Kbuild recipe and no-op diagnostic
 
 ---
 diff --git a/src-rs/command.rs b/src-rs/command.rs
-index 98e6f42..fd5207d 100644
+index 98e6f42..c2d621b 100644
 --- a/src-rs/command.rs
 +++ b/src-rs/command.rs
-@@ -302,7 +302,7 @@ impl<'a> CommandEvaluator<'a> {
+@@ -289,11 +289,13 @@ impl<'a> CommandEvaluator<'a> {
+     pub fn eval(&mut self, n: &Arc<Mutex<DepNode>>) -> Result<Vec<Command>> {
+         let mut result: Vec<Command> = Vec::new();
+         let node_cmds;
++        let target_silent;
+         {
+             let node = n.lock();
+             self.ev.loc = node.loc.clone();
+             self.ev.current_scope = node.rule_vars.clone();
+             node_cmds = node.cmds.clone();
++            target_silent = self.ev.silent_targets.contains(&node.output);
+         }
+         self.ev.is_evaluating_command = true;
+         *self.current_dep_node.lock() = Some(n.clone());
+@@ -302,7 +304,9 @@ impl<'a> CommandEvaluator<'a> {
              self.ev.loc = v.loc();
              let cmds_buf = v.eval_to_buf(self.ev)?;
              let mut cmds = cmds_buf.clone();
 -            let mut global_echo = !FLAGS.is_silent_mode;
-+            let mut global_echo = !(FLAGS.is_silent_mode || self.ev.silent);
++            let mut global_echo = !(
++                FLAGS.is_silent_mode || self.ev.silent || target_silent
++            );
              let mut global_ignore_error = false;
              cmds = parse_command_prefixes(cmds, &mut global_echo, &mut global_ignore_error);
              if cmds.is_empty() {
 diff --git a/src-rs/dep.rs b/src-rs/dep.rs
-index f87fd8a..638c17e 100644
+index f87fd8a..b877251 100644
 --- a/src-rs/dep.rs
 +++ b/src-rs/dep.rs
 @@ -618,6 +618,16 @@ impl<'a> DepBuilder<'a> {
@@ -28,13 +44,13 @@ index f87fd8a..638c17e 100644
              self.ev.not_parallel = true;
          }
 +        // A prerequisite-free `.SILENT:` is GNU's makefile-level equivalent
-+        // of `-s`. Target-specific silence is distinct and remains diagnosed
-+        // until commands carry that per-target bit through the scheduler.
-+        if let Some((inputs, loc)) = self.get_rule_inputs(intern(".SILENT")) {
++        // of `-s`; prerequisites select the individual targets whose recipes
++        // and no-op goal diagnostics are quiet.
++        if let Some((inputs, _loc)) = self.get_rule_inputs(intern(".SILENT")) {
 +            if inputs.is_empty() {
 +                self.ev.silent = true;
 +            } else {
-+                warn_loc!(Some(&loc), "kati doesn't support target-specific .SILENT");
++                self.ev.silent_targets.extend(inputs);
 +            }
 +        }
          // sarun: .EXPORT_ALL_VARIABLES isn't a rule whose recipe runs —
@@ -49,56 +65,63 @@ index f87fd8a..638c17e 100644
          for p in noop_for_us {
              // Touch the symbol so the rule is consumed; the "don't
 diff --git a/src-rs/eval.rs b/src-rs/eval.rs
-index 964efeb..16e9325 100644
+index 964efeb..c54b0cb 100644
 --- a/src-rs/eval.rs
 +++ b/src-rs/eval.rs
-@@ -267,6 +267,9 @@ pub struct Evaluator {
+@@ -267,6 +267,12 @@ pub struct Evaluator {
      /// sarun: `.NOTPARALLEL:` was seen — this make's recipes run serially
      /// even when -j / a jobserver is in effect.
      pub not_parallel: bool,
 +    /// sarun: a prerequisite-free `.SILENT:` special target suppresses recipe
 +    /// echo and no-op root diagnostics for this make invocation.
 +    pub silent: bool,
++    /// Targets listed as prerequisites of `.SILENT`. GNU make suppresses
++    /// recipe echo and no-op goal diagnostics for exactly these targets.
++    pub silent_targets: HashSet<Symbol>,
      /// sarun: per-make GNU `-n` (dry run) / `-i` (ignore-errors). Carried on
      /// the Evaluator — NOT the process-global FLAGS — because many in-process
      /// makes share one process and only the FIRST argv installs FLAGS; a
-@@ -404,6 +407,7 @@ impl Evaluator {
+@@ -404,6 +410,8 @@ impl Evaluator {
              rule_vars: HashMap::new(),
              vpath_patterns: Vec::new(),
              not_parallel: false,
 +            silent: false,
++            silent_targets: HashSet::new(),
              dry_run: false,
              ignore_errors: false,
              goal_trace: false,
 diff --git a/src-rs/exec.rs b/src-rs/exec.rs
-index 999a546..828a5e0 100644
+index 999a546..05bd208 100644
 --- a/src-rs/exec.rs
 +++ b/src-rs/exec.rs
-@@ -160,6 +160,7 @@ struct Executor<'a> {
+@@ -160,6 +160,8 @@ struct Executor<'a> {
      always_make: bool,
      question: bool,
      touch: bool,
 +    silent: bool,
++    silent_targets: std::collections::HashSet<Symbol>,
      /// Logical stdin inherited by this make invocation. This must travel with
      /// the executor because parallel recipe workers do not inherit thread-local
      /// state from the thread which parsed the makefile.
-@@ -444,6 +445,7 @@ impl<'a> Executor<'a> {
+@@ -444,6 +446,8 @@ impl<'a> Executor<'a> {
          let always_make = ev.always_make;
          let question = ev.question;
          let touch = ev.touch;
 +        let silent = ev.silent;
++        let silent_targets = ev.silent_targets.clone();
          let recipe_stdin = ev.recipe_stdin.clone();
          Ok(Executor {
              ce: CommandEvaluator::new(ev)?,
-@@ -456,6 +458,7 @@ impl<'a> Executor<'a> {
+@@ -456,6 +460,8 @@ impl<'a> Executor<'a> {
              always_make,
              question,
              touch,
 +            silent,
++            silent_targets,
              recipe_stdin,
              quiet_failures: false,
          })
-@@ -1022,7 +1025,11 @@ pub fn exec_opts(
+@@ -1022,10 +1028,14 @@ pub fn exec_opts(
      let would_run = executor.num_commands > 0;
      // sarun: emit "Nothing to be done" only for roots whose rule has no
      // commands at all (or which had no rule) — and never under -q.
@@ -110,4 +133,8 @@ index 999a546..828a5e0 100644
 +    {
          for (sym, root) in roots {
              let node = root.lock();
-             if node.cmds.is_empty() {
+-            if node.cmds.is_empty() {
++            if node.cmds.is_empty() && !executor.silent_targets.contains(&sym) {
+                 // Through the LOGICAL stdout (the recipe sink) — println!
+                 // writes the process fd and escapes the caller's redirects;
+                 // and GNU's wording, which makefiles/tools grep for.

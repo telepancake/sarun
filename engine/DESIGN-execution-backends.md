@@ -875,9 +875,11 @@ as executable mappings and mmap that genuinely need a host fd.
           to be done" line per current root, flooding Brush capture. Case 63
           pins explicit `-s`, but Kbuild selects the same makefile-wide mode
           with a prerequisite-free `.SILENT:` special target. Global `.SILENT:`
-          now suppresses both recipe echo and no-op root diagnostics, while
-          target-specific `.SILENT` remains explicitly unsupported; end-to-end
-          Make/Brush case 64 pins the Kbuild form. Second, each ordinary lower lookup called
+          now suppresses both recipe echo and no-op root diagnostics;
+          target-specific `.SILENT: target ...` is carried as an ordinary set
+          of target identities through recipe evaluation and no-op reporting.
+          End-to-end Make/Brush cases 64 and 65 pin the global and selective
+          forms. Second, each ordinary lower lookup called
           `BackingStore::exists()` and then `BackingStore::attr()`, causing two
           complete root-to-leaf PassthroughFsRo walks. Attribute resolution now
           performs one metadata probe and reuses it for the merge decision and
@@ -910,8 +912,18 @@ as executable mappings and mmap that genuinely need a host fd.
           checksum-pinned Lua 5.1.5 and ncurses 6.4 archives. Both archives are
           now present in the persistent lower `dl/` cache with OpenWrt's exact
           expected SHA-256 values. The resumed `world` run, with host networking
-          available for any further cache misses, is currently past
-          `target/linux/compile` and building host packages in parallel.
+          available for any further cache misses, crossed
+          `target/linux/compile` and built host ncurses, Lua, libubox, GRUB,
+          fwtool, usign, and libjson-c in parallel. Lua install then exposed a
+          recursive-make environment bug: OpenWrt's `override MAKEFLAGS=` had
+          removed the command-variable slot, but reconciliation unconditionally
+          reinserted `MAKEOVERRIDES`, leaking top-level `V=s` into Lua's own
+          `V=5.1` filename suffix and producing nonexistent `luas.1`. Overrides
+          are now spliced back only while the evaluated MAKEFLAGS still contains
+          its `--` slot. Case 66 pins that exact package-boundary shape. The
+          static aarch64 build, all 47 Kati units, vendor reconstruction, and
+          all 66 Make/Brush cases pass; the next gate is resuming `world` in the
+          preserved box with these fixes.
           Earlier nonfatal empty-operand arithmetic and generated-config `sed`
           diagnostics stay recorded for attribution rather than normalization.
     - [x] Complete the native-aarch64 FUSE Brush gate from a clean output tree.
