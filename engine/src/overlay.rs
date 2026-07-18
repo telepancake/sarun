@@ -2744,6 +2744,32 @@ impl SarunFs {
         }
     }
 
+    /// FUSE FLUSH is issued for every close of a duplicated guest descriptor;
+    /// it is not fsync. Mirror close(2) so delayed close errors are reported,
+    /// while explicit FSYNC remains the only operation that forces durability.
+    fn flush_file_node(&self, handle: u64) -> Result<(), Errno> {
+        let handle = self.inner.handles.get(handle).ok_or(Errno::EBADF)?;
+        if matches!(&*handle, Handle::Jobserver { .. }) {
+            return Ok(());
+        }
+        let Handle::File(handle) = &*handle else {
+            return Err(Errno::EBADF);
+        };
+        let handle = handle.lock().unwrap();
+        let FileData::Native(file) = &handle.inner.data else {
+            return Ok(());
+        };
+        let duplicate = unsafe { libc::dup(file.as_raw_fd()) };
+        if duplicate < 0 {
+            return Err(Errno::from(std::io::Error::last_os_error()));
+        }
+        if unsafe { libc::close(duplicate) } < 0 {
+            Err(Errno::from(std::io::Error::last_os_error()))
+        } else {
+            Ok(())
+        }
+    }
+
     fn lseek_node(&self, handle: u64, offset: u64, whence: u32) -> Result<u64, Errno> {
         if whence != libc::SEEK_DATA as u32 && whence != libc::SEEK_HOLE as u32 {
             return Err(Errno::EINVAL);
@@ -3557,7 +3583,7 @@ impl virtiofsd::filesystem::FileSystem for SarunFs {
         handle: u64,
         lock_owner: u64,
     ) -> std::io::Result<()> {
-        self.sync_file_node(handle, false).map_err(virtio_error)?;
+        self.flush_file_node(handle).map_err(virtio_error)?;
         self.release_lock_owner(handle, lock_owner, false);
         Ok(())
     }
