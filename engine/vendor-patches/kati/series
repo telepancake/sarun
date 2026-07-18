@@ -75,3 +75,4 @@
 0750-Canonicalize-command-line-make-goals.patch
 0760-Compose-chained-suffix-rules-with-explicit-prerequisites.patch
 0770-Preserve-escapes-in-make-function-arguments.patch
+0780-Validate-complete-implicit-rule-chains.patch

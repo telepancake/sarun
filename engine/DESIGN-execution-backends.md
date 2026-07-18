@@ -711,7 +711,20 @@ as executable mappings and mmap that genuinely need a host fd.
           pass. The full `make -j10 V=s tools/install` replay now configures,
           builds, installs, and stamps both Quilt and U-Boot (including
           `mkimage` and `mkenvimage`) and exits zero. The host-tool checkpoint
-          is complete; the next checkpoint is resumption of `world`. The
+          is complete; the next checkpoint is resumption of `world`. That
+          resumed graph reached the parallel GDB 16.3 and Binutils 2.44 target
+          toolchain builds, then both BFD copies tried to remake the shipped
+          `doc/bfdsumm.texi` through `doc/%.texi: doc/%.stamp`. Kati's shallow
+          chain test saw matching `doc/%.stamp: %.c` and `: %.h` rules and
+          selected the outer relation without proving that either terminal
+          `bfdsumm.c` or `bfdsumm.h` existed. Implicit-rule viability now walks
+          the complete candidate chain, with per-branch cycle/rule guards,
+          before admitting it to the graph. Valid same-stem BFD documentation
+          chains remain active. Make/Brush case 54 and a native Kati/GNU corpus
+          fixture pin the shipped-generated-file behavior; vendor reproduction,
+          the static aarch64 build, and the full 54-case suite pass. A focused
+          replay of both released toolchain targets has passed their former
+          `bfdsumm.stamp` failure and is compiling BFD in parallel. The
           earlier omission has therefore not
           reproduced as an engine defect. The earlier nonfatal empty-operand
           arithmetic and generated-config `sed` diagnostics also remain for

@@ -1845,6 +1845,39 @@ fi
         check(header == b"#define DIRECT\n#include <configs/test.h>\n",
               f"case53: both direct and function-produced header lines "
               f"reach the shell; got {header!r}")
+        # ── CASE 54: reject incomplete implicit-rule chains ───────────────
+        # Binutils and GDB ship generated Texinfo sources alongside rules that
+        # can regenerate most other manuals from a same-stem C or header file.
+        # A matching intermediate pattern is not sufficient: GNU verifies the
+        # entire chain before selecting it. The shipped bfdsumm.texi must stay
+        # an ordinary existing file when neither bfdsumm.c nor bfdsumm.h exists.
+        iv = work / "implicit-chain-viability"
+        shutil.rmtree(iv, ignore_errors=True)
+        (iv / "doc").mkdir(parents=True)
+        (iv / "doc/manual.texi").write_text("shipped manual\n")
+        (iv / "Makefile").write_text(
+            ".PHONY: all\n"
+            "all: doc/manual.texi\n"
+            "\t@cat $< > result.txt\n"
+            ".PRECIOUS: doc/%.stamp\n"
+            "doc/%.texi: doc/%.stamp ; @true\n"
+            "doc/%.stamp: %.c\n"
+            "\t@cp $< $@\n"
+            "doc/%.stamp: %.h\n"
+            "\t@cp $< $@\n")
+        r = run_make("MAKE54", iv, "-j10", "all")
+        check(r.returncode == 0,
+              f"case54: incomplete implicit chain is rejected before it "
+              f"enters the graph (got {r.returncode}: "
+              f"{(r.stdout+r.stderr)[-700:]})")
+        sp54 = latest_sqlar(m)
+        shipped_manual = m.sqlar_content(
+            sp54, str((iv / "result.txt").resolve()).lstrip("/"))
+        generated_stamp = m.sqlar_content(
+            sp54, str((iv / "doc/manual.stamp").resolve()).lstrip("/"))
+        check(shipped_manual == b"shipped manual\n" and generated_stamp is None,
+              f"case54: existing generated source is consumed unchanged; "
+              f"result={shipped_manual!r} stamp={generated_stamp!r}")
     finally:
         if eng is not None and eng.poll() is None:
             eng.terminate()

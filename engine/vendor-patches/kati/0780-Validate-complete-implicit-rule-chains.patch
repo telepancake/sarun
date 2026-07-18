@@ -1,0 +1,146 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Sat, 18 Jul 2026 07:07:46 +0000
+Subject: [PATCH] Validate complete implicit rule chains
+
+Verify that every prerequisite in an implicit-rule chain is ultimately buildable before selecting the outer rule. This keeps shipped generated files such as Binutils and GDB Texinfo sources from acquiring impossible regeneration prerequisites.
+
+---
+diff --git a/src-rs/dep.rs b/src-rs/dep.rs
+index 37376d0..1140cb1 100644
+--- a/src-rs/dep.rs
++++ b/src-rs/dep.rs
+@@ -1035,6 +1035,77 @@ impl<'a> DepBuilder<'a> {
+         false
+     }
+ 
++    /// Return whether a missing prerequisite can actually be produced by a
++    /// complete implicit-rule chain. Merely finding another matching pattern
++    /// rule is not enough: that rule's own prerequisites must ultimately
++    /// resolve to existing files (or explicitly declared targets).
++    ///
++    /// GNU make performs this viability search before it selects an implicit
++    /// rule. Without it, a chain such as
++    ///
++    ///   doc/%.texi: doc/%.stamp
++    ///   doc/%.stamp: %.c
++    ///
++    /// is selected for an already-present `doc/manual.texi` even when the
++    /// terminal `manual.c` does not exist. The rejected intermediate rule then
++    /// leaks a nonexistent prerequisite into the real build graph.
++    fn has_implicit_chain(
++        &self,
++        sym: Symbol,
++        visiting: &mut HashSet<Symbol>,
++        used_rules: &mut HashSet<*const Rule>,
++    ) -> bool {
++        if self.exists(sym) || self.vpath_resolve(sym).is_some() {
++            return true;
++        }
++
++        // An explicitly mentioned target "ought to exist" in GNU make's
++        // implicit-rule search. Its own dependency diagnostics remain the
++        // responsibility of the ordinary graph builder.
++        if self.rules.contains_key(&sym) {
++            return true;
++        }
++        if !visiting.insert(sym) {
++            return false;
++        }
++
++        let output = sym.as_bytes();
++        for rule in self.implicit_rules.get(&output) {
++            let rule_id = Arc::as_ptr(&rule);
++            if used_rules.contains(&rule_id) {
++                continue;
++            }
++            for output_pattern in &rule.output_patterns {
++                let pat = Pattern::new(output_pattern.as_bytes());
++                if !pat.matches(&output) {
++                    continue;
++                }
++
++                used_rules.insert(rule_id);
++                let viable = rule.inputs.iter().all(|input| {
++                    let prerequisite = intern(
++                        pat.append_subst(&output, &input.as_bytes()));
++                    let mut branch_visiting = visiting.clone();
++                    let mut branch_rules = used_rules.clone();
++                    self.has_implicit_chain(
++                        prerequisite,
++                        &mut branch_visiting,
++                        &mut branch_rules,
++                    ) || {
++                        let mut suffix_visiting = HashSet::new();
++                        self.has_suffix_chain(prerequisite, &mut suffix_visiting)
++                    }
++                });
++                used_rules.remove(&rule_id);
++                if viable {
++                    return true;
++                }
++            }
++        }
++
++        false
++    }
++
+     /// Can `sym` be made through one or more old-style suffix rules whose
+     /// eventual source already exists (or is explicitly mentioned)? Keep this
+     /// separate from pattern-rule producibility so a generic suffix chain does
+@@ -1087,7 +1158,7 @@ impl<'a> DepBuilder<'a> {
+ 
+     fn can_pick_implicit_rule(
+         &mut self,
+-        rule: &Rule,
++        rule: &Arc<Rule>,
+         output: Symbol,
+         n: Arc<Mutex<DepNode>>,
+         allow_chain: bool,
+@@ -1129,9 +1200,14 @@ impl<'a> DepBuilder<'a> {
+                         // instead of rejecting the rule on a literal '$'.
+                         || (self.secondexpansion && input.as_bytes().contains(&b'$'))
+                         || (allow_chain && {
+-                            let mut suffix_visiting = HashSet::new();
+-                            self.has_producing_rule_except(sym, &rule.output_patterns)
+-                                || self.has_suffix_chain(sym, &mut suffix_visiting)
++                            let mut visiting = HashSet::new();
++                            let mut used_rules = HashSet::new();
++                            used_rules.insert(Arc::as_ptr(rule));
++                            self.has_implicit_chain(sym, &mut visiting, &mut used_rules)
++                                || {
++                                    let mut suffix_visiting = HashSet::new();
++                                    self.has_suffix_chain(sym, &mut suffix_visiting)
++                                }
+                         });
+                     if !buildable {
+                         ok = false;
+@@ -1147,7 +1223,7 @@ impl<'a> DepBuilder<'a> {
+         }
+         let matched = matched?;
+ 
+-        let mut rule = rule.clone();
++        let mut rule = (**rule).clone();
+         if rule.output_patterns.len() > 1 {
+             // We should mark all other output patterns as used.
+             let pat = Pattern::new(matched.as_bytes());
+diff --git a/testcase/sarun_implicit_chain_viability.mk b/testcase/sarun_implicit_chain_viability.mk
+new file mode 100644
+index 0000000..aaf547b
+--- /dev/null
++++ b/testcase/sarun_implicit_chain_viability.mk
+@@ -0,0 +1,14 @@
++# A matching intermediate pattern rule is not viable unless one of its own
++# prerequisites can ultimately be built. Binutils/GDB use this shape for
++# shipped Texinfo files which have no same-stem C or header source.
++$(shell mkdir -p doc && printf 'shipped manual\n' > doc/manual.texi)
++
++all: doc/manual.texi
++	@cat $<
++
++.PRECIOUS: doc/%.stamp
++doc/%.texi: doc/%.stamp ; @true
++doc/%.stamp: %.c
++	@cp $< $@
++doc/%.stamp: %.h
++	@cp $< $@
