@@ -1296,12 +1296,14 @@ impl BoxState {
     /// `uid` is the box-assigned per-pipeline id; matching is scoped to this box.
     pub fn mark_brushprov_done(&self, uids: &[i64], code: i64, done_ts: f64) {
         if uids.is_empty() { return; }
-        let conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().unwrap();
+        let Ok(tx) = conn.transaction() else { return };
         for uid in uids {
-            let _ = conn.execute(
+            let _ = tx.execute(
                 "UPDATE brushprov SET done_ts=?1, exit_code=?2 WHERE uid=?3 AND uid!=0",
                 params![done_ts, code, uid]);
         }
+        let _ = tx.commit();
     }
 
     /// Record one oaita-proxy API call into this box's `api_log` table.
@@ -1342,37 +1344,52 @@ impl BoxState {
         conn.last_insert_rowid()
     }
 
-    /// Record one parsed n2/ninja build edge (Phase 1 embedded-ninja). `outs`
-    /// and `ins` are serialized JSON arrays; `cmd` is the recipe command line
-    /// (None for a phony edge). Returns the inserted row id (0 on failure).
-    pub fn add_build_edge(&self, outs_json: &str, ins_json: &str,
-                          cmd: Option<&str>) -> i64 {
+    /// Record one complete parsed make/ninja graph. The wire protocol already
+    /// carries the graph as one frame, so preserve that batching through the
+    /// durable boundary instead of turning every edge into an autocommit.
+    /// Returns the number of rows committed; failure commits no partial graph.
+    pub fn add_build_edges(&self, edges: &[(String, String, Option<String>)]) -> usize {
+        if edges.is_empty() { return 0; }
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs_f64()).unwrap_or(0.0);
-        let conn = self.conn.lock().unwrap();
-        let _ = conn.execute(
-            "INSERT INTO build_edges(ts,outs,ins,cmd) VALUES(?1,?2,?3,?4)",
-            params![ts, outs_json, ins_json, cmd]);
-        conn.last_insert_rowid()
+        let mut conn = self.conn.lock().unwrap();
+        let Ok(tx) = conn.transaction() else { return 0 };
+        let inserted = {
+            let Ok(mut insert) = tx.prepare_cached(
+                "INSERT INTO build_edges(ts,outs,ins,cmd) VALUES(?1,?2,?3,?4)",
+            ) else { return 0 };
+            let mut inserted = 0;
+            for (outputs, inputs, command) in edges {
+                if insert.execute(params![ts, outputs, inputs, command]).is_err() {
+                    return 0;
+                }
+                inserted += 1;
+            }
+            inserted
+        };
+        if tx.commit().is_ok() { inserted } else { 0 }
     }
 
     /// Record a batch of makefile variable assignments (make_vars frame).
     /// INSERT OR IGNORE: the unique key collapses identical repeats across
     /// sub-makes, keeping the table proportional to distinct assignments.
     pub fn add_makevars(&self, rows: &[crate::control::MakeVarRow]) {
+        if rows.is_empty() { return; }
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs_f64()).unwrap_or(0.0);
-        let conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().unwrap();
+        let Ok(tx) = conn.transaction() else { return };
         for r in rows {
-            let _ = conn.execute(
+            let _ = tx.execute(
                 "INSERT OR IGNORE INTO makevar\
                  (ts,name,loc,value,make_dir,edge_out,uid,rhs,refs,flags) \
                  VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
                 params![ts, r.name, r.loc, r.value, r.make_dir, r.edge_out,
                         r.uid, r.rhs, r.refs, r.flags]);
         }
+        let _ = tx.commit();
     }
 
     /// Mark a build edge as STARTED running. The edge is identified by either

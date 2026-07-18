@@ -986,10 +986,17 @@ as executable mappings and mmap that genuinely need a host fd.
           recovery, avoids WAL checkpoint state, and removes the exact commit
           syscall seen in the stack. Its policy regression, all nine depot
           tests, both merged-layer tests, and the static aarch64 build pass.
-          The next replay measures what serialization remains; if the single
-          connection is still material, provenance transitions must be
-          coalesced without weakening filesystem capture or inventing an
-          optional recording mode.
+          A 296.0 s PERSIST replay confirmed the journal unlink was gone, but
+          the hot handler still committed individual database pages while its
+          peer waited on the connection mutex; it added more than 300,000 graph
+          rows in roughly two minutes. The wire boundary already sends each
+          complete Kati/ninja graph, make-variable set, and pipeline-completion
+          set as a batch. Capture now preserves those batches as atomic SQLite
+          transactions instead of exploding them into per-row autocommits.
+          The production static aarch64 build, its static test harness, all nine
+          depot tests, and both merged-layer tests pass. The next replay
+          measures the remaining single-event pipeline traffic before deciding
+          whether its wire representation also needs batching.
           Earlier nonfatal empty-operand arithmetic and generated-config `sed`
           diagnostics stay recorded for attribution rather than normalization.
     - [x] Complete the native-aarch64 FUSE Brush gate from a clean output tree.

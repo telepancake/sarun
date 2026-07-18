@@ -1181,8 +1181,18 @@ mod tests {
     fn build_edge_transitions_use_the_newest_indexed_graph() {
         let _g = TEST_STATE_HOME_LOCK.lock().unwrap();
         let (b, _id, tmp) = fresh_box("build-edge-index");
-        let old = b.add_build_edge(r#"["same"]"#, "[]", Some("same command"));
-        let current = b.add_build_edge(r#"["same"]"#, "[]", Some("same command"));
+        assert_eq!(b.add_build_edges(&[
+            (r#"["same"]"#.into(), "[]".into(), Some("same command".into())),
+            (r#"["same"]"#.into(), "[]".into(), Some("same command".into())),
+        ]), 2);
+        let (old, current): (i64, i64) = {
+            let conn = b.conn.lock().unwrap();
+            conn.query_row(
+                "SELECT min(id),max(id) FROM build_edges",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            ).unwrap()
+        };
 
         b.mark_build_edge_started(Some("same"), None, 10.0);
         b.mark_build_edge_done(Some("same"), None, 0, 20.0, Some("done"));

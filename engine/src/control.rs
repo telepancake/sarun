@@ -977,10 +977,8 @@ fn build_edges(
     let mut count = 0u64;
     if let Some(ov) = ov.as_ref() {
         if let Some(b) = ov.live_box(id) {
-            for (outputs, inputs, command) in &edges {
-                b.add_build_edge(outputs, inputs, command.as_deref());
-                count += 1;
-            }
+            count = u64::try_from(b.add_build_edges(&edges))
+                .map_err(|_| "build graph row count exceeds wire range")?;
         }
     }
     if let Ok(r#box) = u64::try_from(id) {
