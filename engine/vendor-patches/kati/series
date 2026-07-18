@@ -86,3 +86,4 @@
 0860-Compose-appends-from-the-visible-make-scope.patch
 0870-Honor-silent-mode-for-no-op-root-diagnostics.patch
 0880-Honor-global--SILENT-semantics.patch
+0890-Provide-GNU-default-ARFLAGS-variable.patch

@@ -166,6 +166,7 @@ fn read_bootstrap_makefile(
             bootstrap.put_slice(b"CXX?=g++\n");
         }
         bootstrap.put_slice(b"AR?=ar\n");
+        bootstrap.put_slice(b"ARFLAGS?=-rv\n");
         bootstrap.put_slice(b"AS?=as\n");
         bootstrap.put_slice(b"CPP?=$(CC) -E\n");
         bootstrap.put_slice(b"COMPILE.c?=$(CC) $(CFLAGS) $(CPPFLAGS) $(TARGET_ARCH) -c\n");

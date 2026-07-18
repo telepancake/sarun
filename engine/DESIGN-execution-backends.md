@@ -1041,6 +1041,17 @@ as executable mappings and mmap that genuinely need a host fd.
           aarch64 unit regression covers the encoding limits, and a database
           regression records two producers both using local id one, completes
           only the first, and requires the second to remain pending.
+          A serial verbose replay then reproduced the first real package
+          failure without concurrency: Dropbear's vendored libtommath invokes
+          `$(AR) $(ARFLAGS)`, but Kati omitted GNU make's built-in
+          `ARFLAGS=-rv`, so the cross `gcc-ar` received the archive name as its
+          operation and rejected it. The embedded and standalone bootstraps
+          now provide that exact default only when built-in variables are
+          enabled; file assignments still override it. A focused GNU/Kati
+          corpus case checks both the default and override, and a direct `-R`
+          comparison checks that the variable remains undefined when built-ins
+          are disabled. The next gate is the repaired Dropbear compile followed
+          by the resumed clean `world -j10` build.
           Earlier nonfatal empty-operand arithmetic and generated-config `sed`
           diagnostics stay recorded for attribution rather than normalization.
     - [x] Complete the native-aarch64 FUSE Brush gate from a clean output tree.

@@ -1,0 +1,31 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Sat, 18 Jul 2026 22:06:47 +0000
+Subject: [PATCH] Provide GNU default ARFLAGS variable
+
+GNU make defines ARFLAGS=-rv unless built-in variables are disabled. Projects including Dropbear's libtommath rely on that default when invoking an overridden cross-toolchain AR.
+
+---
+diff --git a/src-rs/main.rs b/src-rs/main.rs
+index 6637d37..ca6ad9d 100644
+--- a/src-rs/main.rs
++++ b/src-rs/main.rs
+@@ -58,6 +58,7 @@ fn read_bootstrap_makefile(targets: &[Symbol]) -> Result<Arc<Mutex<Vec<Stmt>>>>
+             bootstrap.put_slice(b"CXX?=g++\n");
+         }
+         bootstrap.put_slice(b"AR?=ar\n");
++        bootstrap.put_slice(b"ARFLAGS?=-rv\n");
+         bootstrap.put_slice(b"AS?=as\n");
+         bootstrap.put_slice(b"CPP?=$(CC) -E\n");
+         bootstrap.put_slice(b"COMPILE.c?=$(CC) $(CFLAGS) $(CPPFLAGS) $(TARGET_ARCH) -c\n");
+diff --git a/testcase/sarun_builtin_arflags.mk b/testcase/sarun_builtin_arflags.mk
+new file mode 100644
+index 0000000..cfd4985
+--- /dev/null
++++ b/testcase/sarun_builtin_arflags.mk
+@@ -0,0 +1,5 @@
++$(info default=$(ARFLAGS))
++ARFLAGS=custom
++$(info override=$(ARFLAGS))
++
++all: ; @:
