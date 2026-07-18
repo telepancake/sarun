@@ -1407,10 +1407,10 @@ fn record_guest_process_frame(state: &State, id: i64, payload: &[u8]) {
     }
 }
 
-/// Direct typed registration used by the QEMU launcher.  The request and
-/// reply are generated binary values; after the reply, the connection is the
-/// runner's lifetime channel exactly like the established FUSE/SUD channel.
-fn handle_binary_registration(
+/// Direct generated binary ui.sock request handling. Ordinary actions receive
+/// one typed reply and close. QEMU registration then hands the same connection
+/// over to the runner's lifetime channel, exactly like FUSE/SUD registration.
+fn handle_binary_request(
     state: State,
     mut conn: UnixStream,
     peer_pidfd: Option<std::os::fd::OwnedFd>,
@@ -1422,6 +1422,14 @@ fn handle_binary_registration(
 ) {
     use crate::generated_wire::{ConnectionMode, RequestEnvelope, RunBackend, TransportRequest};
     let request = match crate::socket_wire::read_request(&mut conn) {
+        Ok(RequestEnvelope::Action(request)) => {
+            let mode = match dispatch_action(&state, request) {
+                Ok(success) => crate::socket_wire::action_reply(success),
+                Err(error) => binary_error(error),
+            };
+            let _ = crate::socket_wire::write_mode(&mut conn, &mode);
+            return;
+        }
         Ok(RequestEnvelope::Transport(request @ TransportRequest::Register {
             backend: RunBackend::Qemu,
             ..
@@ -1429,7 +1437,7 @@ fn handle_binary_registration(
         Ok(_) => {
             let _ = crate::socket_wire::write_mode(
                 &mut conn,
-                &binary_error("this binary lifecycle endpoint requires qemu register".into()),
+                &binary_error("unsupported binary ui.sock transport request".into()),
             );
             return;
         }
@@ -6644,7 +6652,7 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
     // requests start with `{`.  Branch before BufReader so a binary atom is
     // never line-buffered or interpreted as UTF-8.
     if first_data_byte(&conn).is_some_and(|byte| byte != b'{') {
-        handle_binary_registration(
+        handle_binary_request(
             state,
             conn,
             peer_pidfd.take().map(|fd| unsafe {
@@ -8502,23 +8510,25 @@ mod verb_tests {
     }
 
     #[test]
-    fn binary_lifecycle_endpoint_rejects_non_qemu_requests_in_binary() {
-        use crate::generated_wire::{ActionRequest, ConnectionMode, RequestEnvelope,
-            TransportResponse};
+    fn binary_ui_sock_dispatches_generated_actions() {
+        use crate::generated_wire::{ActionRequest, ActionSuccess, ConnectionMode,
+            RequestEnvelope, TransportResponse};
         let (server, mut client) = UnixStream::pair().unwrap();
         let state: State = Default::default();
         let thread = std::thread::spawn(move || {
-            handle_binary_registration(state, server, None, None, None, None, None, None)
+            handle_binary_request(state, server, None, None, None, None, None, None)
         });
         crate::socket_wire::write_request(
             &mut client,
             &RequestEnvelope::Action(ActionRequest::Ping),
         ).unwrap();
         match crate::socket_wire::read_mode(&mut client).unwrap() {
-            ConnectionMode::Reply { response: TransportResponse::Error { message, .. } } => {
-                assert!(message.as_str().contains("requires qemu register"));
-            }
-            other => panic!("unexpected binary lifecycle response: {other:?}"),
+            ConnectionMode::Reply {
+                response: TransportResponse::Action {
+                    value: ActionSuccess::Ping { value: () },
+                },
+            } => {}
+            other => panic!("unexpected binary action response: {other:?}"),
         }
         drop(client);
         thread.join().unwrap();
