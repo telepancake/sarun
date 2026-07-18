@@ -3190,6 +3190,11 @@ pub fn run_recipe_in_process_prefixed(
                     return (127, vec![]);
                 }
             };
+            // A make/ninja recipe is a fresh logical `/bin/sh` process even
+            // though Sarun executes it inside the engine. In particular,
+            // `exec cmd` must terminate this recipe shell after `cmd`; it must
+            // never execve over the engine and abandon the enclosing graph.
+            shell.mark_as_embedded_subshell();
             match stderr {
                 RecipeStderr::Merge => {
                     let w2 = match writer.try_clone() {

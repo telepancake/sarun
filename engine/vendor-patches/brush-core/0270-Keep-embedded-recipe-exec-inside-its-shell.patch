@@ -1,0 +1,27 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Sat, 18 Jul 2026 09:22:03 +0000
+Subject: [PATCH] Keep embedded recipe exec inside its shell
+
+Mark freshly-created embedded recipe shells as logical subshells so the exec builtin cannot replace the host engine process.
+
+---
+diff --git a/src/shell.rs b/src/shell.rs
+index b3ccbb2..4773c97 100644
+--- a/src/shell.rs
++++ b/src/shell.rs
+@@ -293,6 +293,14 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
+ }
+ 
+ impl<SE: extensions::ShellExtensions> Shell<SE> {
++    /// Mark a freshly-created shell as a logical subprocess of an embedding
++    /// host. An `exec` builtin may replace a true root shell's process image,
++    /// but must only terminate this logical shell when many shells share one
++    /// process (for example, build recipes executed in-process by Sarun).
++    pub fn mark_as_embedded_subshell(&mut self) {
++        self.depth = self.depth.max(1);
++    }
++
+     /// sarun (NOT upstream brush): stamp a SNOOPED script's subshell with the
+     /// identity a freshly-forked interpreter would have had — `$0`, the
+     /// positional parameters, and a unique synthetic `$$`/`BASHPID`. Used by the

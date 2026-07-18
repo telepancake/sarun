@@ -1915,6 +1915,51 @@ fi
         check(cancellation_result == b"from-c\nfrom-good\n",
               f"case55: suffix and surviving pattern recipes produced the "
               f"outputs; got {cancellation_result!r}")
+        # ── CASE 56: recursive make completes every sibling prerequisite ──
+        # OpenWrt wraps recursive makes in an external timing program.  The
+        # child `compile` aggregate has both a build stamp and an install stamp;
+        # its parent may proceed only after BOTH recipes have completed.  This
+        # exercises the process-shadow door (the external wrapper resolves
+        # `make` through Sarun's FUSE shadow), not merely a directly invoked
+        # in-process MakeBuiltin.
+        ri = work / "recursive-install-boundary"
+        shutil.rmtree(ri, ignore_errors=True)
+        (ri / "child" / "grand").mkdir(parents=True)
+        (ri / "Makefile").write_text(
+            ".PHONY: all bootstrap\n"
+            "all: bootstrap\n"
+            "\t@test -f child/installed; cat child/installed > result.txt\n"
+            "bootstrap:\n"
+            "\t@python3 -c 'import subprocess,sys; "
+            "sys.exit(subprocess.call(sys.argv[1:]))' "
+            "make --no-print-directory -C child -j10 compile\n")
+        (ri / "child" / "Makefile").write_text(
+            ".NOTPARALLEL:\n"
+            "define BuildRules\n"
+            ".PHONY: compile aggregate\n"
+            "compile: aggregate\n"
+            "aggregate: built installed\n"
+            "built:\n"
+            "\t@+$$(MAKE) --no-print-directory -C grand all\n"
+            "\t@sleep 0.2; printf built > $$@\n"
+            "installed: built\n"
+            "\t@sleep 0.2; printf installed > $$@\n"
+            "endef\n"
+            "$(eval $(call BuildRules))\n")
+        (ri / "child" / "grand" / "Makefile").write_text(
+            ".PHONY: all\n"
+            "all:\n"
+            "\t@exec true\n")
+        r = run_make("MAKE56", ri, "-j10", "all")
+        check(r.returncode == 0,
+              f"case56: wrapped recursive make waits through install "
+              f"boundary (got {r.returncode}: {(r.stdout+r.stderr)[-700:]})")
+        sp56 = latest_sqlar(m)
+        install_result = m.sqlar_content(
+            sp56, str((ri / "result.txt").resolve()).lstrip("/"))
+        check(install_result == b"installed",
+              f"case56: parent observes child install result; "
+              f"got {install_result!r}")
     finally:
         if eng is not None and eng.poll() is None:
             eng.terminate()
