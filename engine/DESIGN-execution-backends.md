@@ -841,7 +841,22 @@ as executable mappings and mmap that genuinely need a host fd.
           The complete 47-test Kati unit suite (including its corrected
           single-suffix candidate expectation), static aarch64 build, vendor
           reproduction check, and all 62 Make/Brush cases pass. The next gate
-          remains the real kernel replay and modpost.
+          remains the real kernel replay and modpost. That replay did cross the
+          phony boundary and re-enter Kbuild with all three per-task canary
+          options, but exposed a second half of the assignment relation: the
+          appended options replaced the previously visible global
+          `KBUILD_CFLAGS`, dropping `-O2`, `-std=gnu11`, and
+          `-Wno-address-of-packed-member`. Kati's `+=` now reads from the full
+          variable view while writing to the assignment's declared scope. This
+          matches GNU make for both recipe-time global eval and target-specific
+          append, and detaches the value when the visible and destination
+          bindings differ. Cases 61 and 62 now initialize realistic baseline
+          flags and require the recursive child to receive the baseline plus
+          the canary append. The 47 Kati units, vendor reproduction, static
+          aarch64 build, and all 62 Make/Brush cases pass with that stronger
+          assertion. The next gate is again the preserved real kernel replay;
+          its first compiler command must contain both flag groups before the
+          build is allowed to proceed through modpost and back into `world`.
           Earlier nonfatal empty-operand arithmetic and generated-config `sed`
           diagnostics stay recorded for attribution rather than normalization.
     - [x] Complete the native-aarch64 FUSE Brush gate from a clean output tree.

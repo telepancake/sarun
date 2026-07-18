@@ -2093,6 +2093,7 @@ fi
         shutil.rmtree(evalexport, ignore_errors=True)
         (evalexport / "sub").mkdir(parents=True)
         (evalexport / "Makefile").write_text(
+            "KBUILD_CFLAGS := -O2 -Wno-address-of-packed-member\n"
             "export KBUILD_CFLAGS\n"
             ".PHONY: all prepare stack_protector_prepare prepare0\n"
             "prepare: stack_protector_prepare\n"
@@ -2114,8 +2115,9 @@ fi
         evalexport_result = m.sqlar_content(
             sp61, str((evalexport / "sub/result.txt").resolve()).lstrip("/"))
         check(evalexport_result ==
+              b"-O2 -Wno-address-of-packed-member "
               b"-mstack-protector-guard=sysreg|environment\n",
-              f"case61: recipe eval refreshes the exported child value; "
+              f"case61: recipe eval composes and exports the child value; "
               f"got {evalexport_result!r}")
         # ── CASE 62: shared prepare gates multiple top-level goals ───
         # Kbuild invokes `all modules` together. Both roots share `prepare`,
@@ -2125,6 +2127,7 @@ fi
         shutil.rmtree(multigoal, ignore_errors=True)
         (multigoal / "sub").mkdir(parents=True)
         (multigoal / "Makefile").write_text(
+            "KBUILD_CFLAGS := -O2 -Wno-address-of-packed-member\n"
             "export KBUILD_CFLAGS\n"
             ".PHONY: all modules modpost modules_prepare prepare "
             "stack_protector_prepare prepare0 FORCE\n"
@@ -2153,6 +2156,7 @@ fi
         multigoal_result = m.sqlar_content(
             sp62, str((multigoal / "sub/result.txt").resolve()).lstrip("/"))
         check(multigoal_result ==
+              b"-O2 -Wno-address-of-packed-member "
               b"-mstack-protector-guard=sysreg|environment\n",
               f"case62: recursive build branch sees eval before modpost; "
               f"got {multigoal_result!r}")

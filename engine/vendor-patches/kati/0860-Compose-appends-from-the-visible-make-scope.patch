@@ -1,0 +1,141 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Sat, 18 Jul 2026 14:03:47 +0000
+Subject: [PATCH] Compose appends from the visible make scope
+
+GNU make reads += from the complete variable view but writes the result to the assignment's declared scope. Preserve the visible baseline across recipe-time eval and target-specific assignments without mutating the source binding.
+
+---
+diff --git a/src-rs/command.rs b/src-rs/command.rs
+index a000455..98e6f42 100644
+--- a/src-rs/command.rs
++++ b/src-rs/command.rs
+@@ -33,6 +33,7 @@ use crate::{
+     var::Variable,
+ };
+ 
++#[derive(Clone)]
+ pub struct AutoCommandVar {
+     typ: AutoCommand,
+     sym: Symbol,
+diff --git a/src-rs/eval.rs b/src-rs/eval.rs
+index ed8f899..964efeb 100644
+--- a/src-rs/eval.rs
++++ b/src-rs/eval.rs
+@@ -25,7 +25,7 @@ use std::sync::{Arc, LazyLock, Weak};
+ use anyhow::{Context, Result};
+ use bytes::{Buf, Bytes};
+ use memchr::{memchr, memchr2};
+-use parking_lot::Mutex;
++use parking_lot::{Mutex, RwLock};
+ 
+ use crate::expr::Evaluable;
+ use crate::expr::Value;
+@@ -665,6 +665,7 @@ impl Evaluator {
+         orig_rhs: Bytes,
+         op: AssignOp,
+         is_override: bool,
++        assign_in_current_scope: bool,
+     ) -> Result<(Var, bool)> {
+         let (origin, current_frame) = if self.is_bootstrap {
+             (VarOrigin::Default, None)
+@@ -702,7 +703,14 @@ impl Evaluator {
+                 );
+             }
+             AssignOp::PlusEq => {
+-                prev = self.lookup_var_in_current_scope(lhs)?;
++                // `+=` reads the value visible at the assignment site, but
++                // writes to the kind of binding named by the statement.  In
++                // particular, a target-specific append starts from a visible
++                // global value without modifying it, while `$(eval X += ...)`
++                // in a recipe writes a global value even when a target-local
++                // X supplied the starting value.  GNU make relies on both
++                // halves of this distinction.
++                prev = self.lookup_var(lhs)?;
+                 if let Some(prev) = prev.clone() {
+                     if prev.read().readonly {
+                         error_loc!(
+@@ -710,7 +718,24 @@ impl Evaluator {
+                             "*** cannot assign to readonly variable: {lhs}"
+                         );
+                     }
+-                    result = prev;
++                    let destination = if assign_in_current_scope {
++                        self.current_scope.as_ref().and_then(|scope| scope.peek(lhs))
++                    } else {
++                        self.peek_global_var(lhs)
++                    };
++                    if destination
++                        .as_ref()
++                        .is_some_and(|destination| Arc::ptr_eq(destination, &prev))
++                    {
++                        result = prev;
++                        needs_assign = false;
++                    } else {
++                        // The visible binding belongs to the other scope.
++                        // Detach before appending so the source binding keeps
++                        // its value and the caller can install the composed
++                        // value in the assignment's destination scope.
++                        result = Arc::new(RwLock::new(prev.read().clone()));
++                    }
+                     if result.read().immediate_eval() {
+                         let buf = rhs_v.eval_to_buf(self)?;
+                         result.write().append_str(&buf, self.current_frame())?;
+@@ -721,7 +746,6 @@ impl Evaluator {
+                             self.loc.as_ref(),
+                         )?;
+                     }
+-                    needs_assign = false;
+                 } else {
+                     result = Variable::new_recursive(
+                         rhs_v,
+@@ -733,7 +757,10 @@ impl Evaluator {
+                 }
+             }
+             AssignOp::QuestionEq => {
+-                prev = self.lookup_var_in_current_scope(lhs)?;
++                // Definition is tested against the complete visible scope;
++                // a global binding therefore suppresses a target-specific
++                // `?=`, just as it does in GNU make.
++                prev = self.lookup_var(lhs)?;
+                 if let Some(prev) = prev.clone() {
+                     result = prev;
+                     needs_assign = false;
+@@ -810,6 +837,7 @@ impl Evaluator {
+             stmt.orig_rhs.clone(),
+             stmt.op,
+             is_override,
++            false,
+         )?;
+         if needs_assign {
+             let mut readonly = false;
+@@ -981,6 +1009,7 @@ impl Evaluator {
+                     Bytes::from_static(b"*TODO*"),
+                     assign.op,
+                     false,
++                    true,
+                 )?;
+                 if needs_assign {
+                     let mut readonly = false;
+diff --git a/src-rs/var.rs b/src-rs/var.rs
+index d4d7fd0..03daa4e 100644
+--- a/src-rs/var.rs
++++ b/src-rs/var.rs
+@@ -67,7 +67,7 @@ pub fn get_origin_str(origin: VarOrigin) -> &'static str {
+ 
+ pub type Var = Arc<RwLock<Variable>>;
+ 
+-#[derive(Debug)]
++#[derive(Debug, Clone)]
+ pub struct Variable {
+     loc: Option<Loc>,
+ 
+@@ -89,7 +89,7 @@ pub struct Variable {
+     value: InnerVar,
+ }
+ 
+-#[derive(Debug)]
++#[derive(Debug, Clone)]
+ pub enum InnerVar {
+     Simple(Vec<u8>),
+     Recursive { v: Arc<Value>, orig: Bytes },
