@@ -1626,6 +1626,31 @@ printf '%s\n' "$dep" > result.txt
         check(quoted == b"start <Source/header with space.hxx>\n",
               f"case46: CMake-style nested argument is one unquoted value; "
               f"got {quoted!r}")
+        # ── CASE 47: leading ./ goals match canonical rule targets ───────
+        # Libtool's bootstrap asks a recursive make to build
+        # `./libltdl/Makefile.am`; GNU canonicalizes that spelling to the same
+        # identity as the makefile's `libltdl/Makefile.am:` rule.
+        cg = work / "canonical-goal"
+        shutil.rmtree(cg, ignore_errors=True)
+        (cg / "libltdl").mkdir(parents=True)
+        (cg / "Makefile").write_text(
+            ".PHONY: all\n"
+            "all:\n"
+            "\t@$(MAKE) --no-print-directory ./libltdl/Makefile.am\n"
+            "libltdl/Makefile.am:\n"
+            "\t@printf 'goal=<%s> at=<%s>\\n' "
+            "'$(MAKECMDGOALS)' '$@' > $@\n")
+        r = run_make("MAKE47", cg, "-j10", "all")
+        check(r.returncode == 0,
+              f"case47: recursive leading-./ goal selects its declared rule "
+              f"(got {r.returncode}: {(r.stdout+r.stderr)[-700:]})")
+        sp47 = latest_sqlar(m)
+        canonical = m.sqlar_content(
+            sp47, str((cg / "libltdl/Makefile.am").resolve()).lstrip("/"))
+        check(canonical ==
+              b"goal=<libltdl/Makefile.am> at=<libltdl/Makefile.am>\n",
+              f"case47: command goal and automatic target share GNU's "
+              f"canonical identity; got {canonical!r}")
     finally:
         if eng is not None and eng.poll() is None:
             eng.terminate()

@@ -22,3 +22,4 @@
 0220-classify-optimized-external-command-registrations.patch
 0230-virtualize-shell-umask-across-concurrent-subshells.patch
 0240-Preserve-cross-standard-fd-redirections-for-external-command.patch
+0250-Schedule-interposed-pipeline-stages-concurrently.patch

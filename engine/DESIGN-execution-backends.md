@@ -620,12 +620,26 @@ as executable mappings and mmap that genuinely need a host fd.
           `build.ninja`. Legacy-backquote parsing now removes the escape and
           lets those quotes group the nested command's argument. The focused
           parser test and CMake-shaped end-to-end Make/Brush case 46 pass on the
-          static aarch64 engine. Libtool independently failed while recursively
-          generating its bootstrap files; its makefile graph is valid under
-          both GNU make and a fresh embedded dry run, so the next boundary is
-          isolating state retained across its maintainer-clean/bootstrap make
-          invocations, fixing that generically, then replaying the affected
-          CMake and Libtool stages. The earlier nonfatal empty-operand arithmetic
+          static aarch64 engine. Libtool's independent recursive-bootstrap
+          failure came from treating the command-line goal
+          `./libltdl/Makefile.am` as distinct from its normalized
+          `libltdl/Makefile.am:` rule. Kati now gives command-line goals the same
+          leading-`./` canonical identity as parsed rule targets; focused case
+          47 and Libtool's real `bootstrap-deps` invocation pass. That exposed a
+          second generic boundary in `ltmain.sh` generation: an interposed
+          shebang script used as a non-final pipeline stage was awaited before
+          Brush spawned its reader, so output larger than a pipe buffer
+          deadlocked. Eligible interposed pipeline stages now return a waitable
+          task and execute concurrently. The released-binary nested-shell test
+          sends 220,000 bytes through such a producer, and the real Libtool
+          bootstrap now generates `libltdl/Makefile.am`, `m4/ltversion.m4`, and
+          `build-aux/ltmain.sh`. The static aarch64 build, all 47 Make/Brush
+          cases, and the complete nested-shell suite pass. With the legacy
+          backquote fix, CMake bootstrap now generates valid Ninja dependencies
+          and compiles all 309 objects; its final bootstrap link still lacks
+          `cmsysString_strcasecmp` and `cmsysString_strncasecmp`, despite listing
+          `String.o`. That generic generation/compile boundary is next, before a
+          new clean OpenWrt replay. The earlier nonfatal empty-operand arithmetic
           diagnostics also remain for attribution rather than normalization.
     - [x] Complete the native-aarch64 FUSE Brush gate from a clean output tree.
           Linux 6.18 builds 823 objects with `-j10` (11 observed overlapping

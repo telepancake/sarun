@@ -72,3 +72,4 @@
 0720-Provide-GNU-core-compile-and-link-variables.patch
 0730-Connect-GNU-core-implicit-link-rules.patch
 0740-Implement-GNU-make-touch-mode.patch
+0750-Canonicalize-command-line-make-goals.patch

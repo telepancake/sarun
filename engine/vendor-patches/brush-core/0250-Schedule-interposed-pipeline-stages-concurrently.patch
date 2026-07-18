@@ -1,0 +1,85 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Sat, 18 Jul 2026 02:41:48 +0000
+Subject: [PATCH] Schedule interposed pipeline stages concurrently
+
+---
+diff --git a/src/commands.rs b/src/commands.rs
+index 4c4761d..8c96417 100644
+--- a/src/commands.rs
++++ b/src/commands.rs
+@@ -146,6 +146,14 @@ pub trait ExecInterposer<SE: extensions::ShellExtensions>: Send + Sync {
+     /// stat-sized check — anything heavier taxes every forked command.
+     fn wants(&self, resolved: &Path) -> bool;
+
++    /// Full synchronous eligibility check after the cheap path filter matched.
++    /// This may inspect argv or the candidate script. Pipeline stages use it
++    /// before moving execution to a worker thread, where declining would be too
++    /// late to fall back to an ordinary external exec.
++    fn can_run(&self, _resolved: &Path, _argv: &[String]) -> bool {
++        true
++    }
++
+     /// Run the command in-process on the provided subshell clone (which carries
+     /// the caller's env/cwd/fds plus a clone of this interposer, so commands the
+     /// script itself spawns interpose too). `params` carries the caller's
+@@ -552,29 +560,55 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
+     /// runs a `/bin/sh` script that resolves to its own bind-shadowed binary
+     /// in-process instead of re-forking+re-execing itself, while preserving the
+     /// caller's logical fds (passed via `params`) and emitting provenance.
+-    async fn try_interpose_exec(&self, resolved: &Path) -> Option<ExecutionResult> {
++    async fn try_interpose_exec(&self, resolved: &Path) -> Option<ExecutionSpawnResult> {
+         let interposer = self.shell.exec_interposer.clone()?;
+         if !interposer.wants(resolved) {
+             return None;
+         }
+         let sub: Shell<SE> = (*self.shell).clone();
+         let argv: Vec<String> = self.args.iter().map(ToString::to_string).collect();
++        if !interposer.can_run(resolved, &argv) {
++            return None;
++        }
+         let params = self.params.clone();
++        let resolved = resolved.to_path_buf();
++
++        // Every non-last stage owns a cloned shell and must be started before
++        // the next stage. An in-process interposer can perform blocking writes
++        // just like a builtin/function/compound stage; awaiting it here fills
++        // the pipe before the reader is even spawned. Run it on a real worker
++        // thread and return a waitable task so pipeline construction continues.
++        if matches!(&self.shell, ShellForCommand::OwnedShell { .. }) {
++            let join_handle = tokio::task::spawn_blocking(move || {
++                let rt = tokio::runtime::Builder::new_current_thread()
++                    .enable_all()
++                    .build()?;
++                rt.block_on(async move {
++                    Ok(interposer
++                        .run(sub, resolved, argv, params)
++                        .await
++                        .unwrap_or_else(ExecutionResult::general_error))
++                })
++            });
++            return Some(ExecutionSpawnResult::StartedTask(join_handle));
++        }
++
+         interposer
+-            .run(sub, resolved.to_path_buf(), argv, params)
++            .run(sub, resolved, argv, params)
+             .await
++            .map(ExecutionSpawnResult::Completed)
+     }
+
+     /// Finish an interposed (in-process) command: mirror `execute_via_external`'s
+     /// `$_` update + optional `post_execute` hook, then wrap the result.
+-    fn finish_interposed(self, result: ExecutionResult) -> ExecutionSpawnResult {
++    fn finish_interposed(self, result: ExecutionSpawnResult) -> ExecutionSpawnResult {
+         let mut shell = self.shell;
+         let last_arg = Self::take_last_arg(&self.args);
+         shell.update_last_arg_variable(last_arg);
+         if let Some(post_execute) = self.post_execute {
+             let _ = post_execute(&mut shell);
+         }
+-        ExecutionSpawnResult::Completed(result)
++        result
+     }
+
+     /// Extracts the owned string representation of the last argument of a

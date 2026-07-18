@@ -90,7 +90,8 @@ def main():
                                     "/root/vars.txt", "/root/bad.txt",
                                     "/root/neg.txt", "/root/f.txt",
                                     "/root/bash.txt", "/root/shbad.txt",
-                                    "/root/dashdash.txt")]
+                                    "/root/dashdash.txt", "/root/producer.sh",
+                                    "/root/pipeline-count.txt")]
     for h in host_paths: h.unlink(missing_ok=True)
     try:
         eng = subprocess.Popen([str(BIN), "serve"],
@@ -350,6 +351,31 @@ def main():
         check("sarun-definitely-not-present" not in r.stderr,
               f"case11: redirected stderr did NOT leak to terminal "
               f"(stderr={r.stderr[-300:]!r})")
+
+        # CASE 12: interposed script stages start before pipe readers.
+        # Libtool's inline-source is a shebang script whose external awk can
+        # emit more than one pipe buffer. The script is interposed in-process,
+        # but it is still an ordinary pipeline stage: Brush must return a
+        # waitable task and spawn the downstream reader before awaiting it.
+        script = r'''cat > /root/producer.sh <<'EOF'
+#!/bin/sh
+awk 'BEGIN { for (i = 0; i < 20000; i++) print "1234567890" }'
+EOF
+chmod +x /root/producer.sh
+/root/producer.sh | wc -c > /root/pipeline-count.txt
+'''
+        r = subprocess.run(
+            [str(BIN), "run", "-b", "INTERPOSEPIPE", "--",
+             "sh", "-c", script],
+            capture_output=True, text=True, timeout=120)
+        check(r.returncode == 0,
+              f"case12: large-output interposed script pipeline completes "
+              f"(got {r.returncode}: {r.stderr[-500:]})")
+        sp12 = latest_sqlar(m)
+        count = m.sqlar_content(sp12, "root/pipeline-count.txt")
+        check(count == b"220000\n",
+              f"case12: downstream stage consumed every producer byte; "
+              f"count={count!r}")
 
         # ── CASE 4 (negative): non-brush box ───────────────────────────────
         # No -b → no shadow binds, no SARUN_BRUSH_SH. The nested /bin/sh is the

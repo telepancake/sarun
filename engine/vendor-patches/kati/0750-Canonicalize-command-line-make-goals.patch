@@ -1,0 +1,50 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Sat, 18 Jul 2026 02:31:25 +0000
+Subject: [PATCH] Canonicalize command-line make goals
+
+---
+diff --git a/src-rs/flags.rs b/src-rs/flags.rs
+index 0f345e8..5e57c37 100644
+--- a/src-rs/flags.rs
++++ b/src-rs/flags.rs
+@@ -23,7 +23,7 @@ use std::{
+ };
+
+ use crate::{
+-    strutil::{Pattern, word_scanner},
++    strutil::{Pattern, trim_leading_curdir, word_scanner},
+     symtab::intern,
+ };
+ use bytes::Bytes;
+@@ -569,7 +569,13 @@ impl Flags {
+                     } else {
+                         should_propagate = false;
+                         let arg = Bytes::from(arg.as_bytes().to_vec());
+-                        flags.targets.push(intern(arg));
++                        // GNU make canonicalizes leading `./` on command-line
++                        // goals just as it does on rule targets. Keeping the
++                        // argv spelling here created a distinct rule-less node
++                        // for `make ./dir/file` even when `dir/file:` had a
++                        // recipe (Libtool's bootstrap uses exactly that form).
++                        let target = arg.slice_ref(trim_leading_curdir(&arg));
++                        flags.targets.push(intern(target));
+                     }
+                 }
+             }
+@@ -676,4 +682,15 @@ mod tests {
+         assert_eq!(flags.targets, vec![intern("all")]);
+         assert_eq!(flags.subkati_args, vec![OsString::from("make")]);
+     }
++
++    #[test]
++    fn test_command_line_goals_trim_leading_curdir() {
++        let flags = Flags::from_args(
++            vec!["make", "./libltdl/Makefile.am"]
++                .into_iter()
++                .map(Into::into)
++                .collect(),
++        );
++        assert_eq!(flags.targets, vec![intern("libltdl/Makefile.am")]);
++    }
+ }

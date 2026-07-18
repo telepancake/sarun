@@ -2574,6 +2574,10 @@ impl brush_core::commands::ExecInterposer<brush_core::extensions::DefaultShellEx
         shebang_interp(resolved).is_some_and(|i| is_self_exe(&i))
     }
 
+    fn can_run(&self, resolved: &std::path::Path, argv: &[String]) -> bool {
+        parse_snoop(resolved, argv).is_some()
+    }
+
     fn run<'a>(
         &'a self,
         mut sub: brush_core::Shell,
