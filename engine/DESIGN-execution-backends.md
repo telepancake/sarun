@@ -995,8 +995,19 @@ as executable mappings and mmap that genuinely need a host fd.
           transactions instead of exploding them into per-row autocommits.
           The production static aarch64 build, its static test harness, all nine
           depot tests, and both merged-layer tests pass. The next replay
-          measures the remaining single-event pipeline traffic before deciding
-          whether its wire representation also needs batching.
+          showed that remaining single-event pipeline traffic still copied
+          database pages into the PERSIST rollback journal while FUSE and
+          recorder handlers waited on the same connection. The live recorder
+          now has one WAL policy: writes append without rollback-page copying,
+          automatic checkpoints operate in 64 MiB batches, and SQLite recovers
+          an interrupted engine from the WAL. There is no runtime mode or
+          compatibility branch. In the aarch64 OpenWrt `world -j10` replay the
+          WAL stayed at its checkpoint boundary, rollback-journal stacks
+          disappeared, and host-package recipes began running concurrently.
+          That recipe-phase sample exposed a separate historical-table scan:
+          every stderr attribution fixup searched all `outputs` rows. The
+          schema now indexes its `(stream, ts)` predicate, keeping attribution
+          work proportional to the current recipe's time window.
           Earlier nonfatal empty-operand arithmetic and generated-config `sed`
           diagnostics stay recorded for attribution rather than normalization.
     - [x] Complete the native-aarch64 FUSE Brush gate from a clean output tree.

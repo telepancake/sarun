@@ -78,6 +78,7 @@ CREATE TABLE IF NOT EXISTS process(id INTEGER PRIMARY KEY AUTOINCREMENT,
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS outputs(id INTEGER PRIMARY KEY AUTOINCREMENT,
  ts REAL, process_id INT, stream INT, content BLOB, brush_pipeline_id INT);
+CREATE INDEX IF NOT EXISTS idx_outputs_stream_ts ON outputs(stream, ts);
 -- Rust-engine extensions (additive; the Python readers ignore them):
 CREATE TABLE IF NOT EXISTS xattr(name TEXT, key TEXT, value BLOB,
  PRIMARY KEY(name,key));
@@ -606,20 +607,22 @@ impl BoxState {
         // synchronous=OFF is deliberate, not an oversight. This sqlar holds a
         // box's captured writes in escrow for review; the host is never touched
         // until an explicit apply. Avoiding an fsync per captured write is
-        // essential for builds, while the rollback journal still makes an
+        // essential for builds, while SQLite's journal still makes an
         // interrupted engine process recoverable on its next open.
         //
-        // PERSIST is equally deliberate. Provenance arrives as many small
-        // transactions from concurrent control connections. DELETE made every
-        // event create and unlink the rollback journal, and those commits
-        // serialized the handlers on the connection mutex. PERSIST zeros and
-        // reuses one bounded journal instead. Unlike WAL it keeps the at-rest
-        // box a single database plus its recoverable rollback companion and
-        // does not introduce a separate checkpoint lifecycle.
+        // WAL is equally deliberate. Provenance arrives as many small
+        // transactions from concurrent control connections. Rollback journals
+        // made every event copy its old database pages before writing the new
+        // ones, and those commits serialized FUSE mutations behind the
+        // connection mutex. WAL appends those events and checkpoints them in
+        // coarse 64 MiB batches. The WAL is part of the live box record, not an
+        // optional mode; SQLite recovers it with the database after an
+        // interrupted engine and folds it back into the sqlar on clean close.
         conn.execute_batch(
-            "PRAGMA journal_mode=PERSIST; \
+            "PRAGMA journal_mode=WAL; \
              PRAGMA synchronous=OFF; \
-             PRAGMA journal_size_limit=8388608;",
+             PRAGMA journal_size_limit=67108864; \
+             PRAGMA wal_autocheckpoint=16384;",
         )?;
         conn.execute_batch(SCHEMA)?;
         conn.pragma_update(None, "user_version", 1)?;

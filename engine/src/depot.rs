@@ -1062,16 +1062,42 @@ mod tests {
     }
 
     #[test]
-    fn capture_database_reuses_a_bounded_rollback_journal() {
+    fn capture_database_uses_a_bounded_write_ahead_log() {
         let _g = TEST_STATE_HOME_LOCK.lock().unwrap();
-        let (b, _id, tmp) = fresh_box("persistent-journal");
+        let (b, _id, tmp) = fresh_box("write-ahead-log");
         let conn = b.conn.lock().unwrap();
         let mode: String = conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))
             .unwrap();
         let limit: i64 = conn.query_row("PRAGMA journal_size_limit", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(mode, "persist");
-        assert_eq!(limit, 8 * 1024 * 1024);
+        let checkpoint_pages: i64 = conn.query_row(
+            "PRAGMA wal_autocheckpoint", [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(mode, "wal");
+        assert_eq!(limit, 64 * 1024 * 1024);
+        assert_eq!(checkpoint_pages, 16 * 1024);
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn output_attribution_fixup_uses_its_time_window_index() {
+        let _g = TEST_STATE_HOME_LOCK.lock().unwrap();
+        let (b, _id, tmp) = fresh_box("output-attribution-index");
+        let conn = b.conn.lock().unwrap();
+        let mut plan = conn.prepare(
+            "EXPLAIN QUERY PLAN UPDATE outputs SET brush_pipeline_id=1 \
+             WHERE ts >= 0.0 AND stream=1 AND brush_pipeline_id IS NOT 1",
+        ).unwrap();
+        let details: Vec<String> = plan.query_map([], |row| row.get(3))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert!(
+            details.iter().any(|detail| detail.contains("idx_outputs_stream_ts")),
+            "output attribution plan does not use its index: {details:?}",
+        );
+        drop(plan);
         drop(conn);
         let _ = std::fs::remove_dir_all(&tmp);
     }
