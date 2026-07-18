@@ -1,0 +1,61 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Sat, 18 Jul 2026 13:46:25 +0000
+Subject: [PATCH] Propagate phony prerequisite freshness
+
+A phony prerequisite is always newer than its consumers, even when it has no concrete recipe after expansion. Preserve that fact in the parallel scheduler instead of collapsing it to a missing or pre-run filesystem timestamp. Linux Kbuild uses a commandless phony prepare target to force the existing '.' directory target to launch its recursive object build after recipe-time flag setup.
+
+---
+diff --git a/src-rs/exec.rs b/src-rs/exec.rs
+index 6d07f33..5c44770 100644
+--- a/src-rs/exec.rs
++++ b/src-rs/exec.rs
+@@ -122,11 +122,17 @@ impl std::error::Error for BuildFailed {}
+ pub enum ExecStatus {
+     Processing,
+     Timestamp(Option<SystemTime>),
++    /// A phony prerequisite was considered. It is always newer than a real
++    /// filesystem timestamp, so every consumer is out of date.
++    Updated,
+ }
+ 
+ impl PartialOrd for ExecStatus {
+     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+         match (self, other) {
++            (ExecStatus::Updated, ExecStatus::Updated) => Some(std::cmp::Ordering::Equal),
++            (ExecStatus::Updated, _) => Some(std::cmp::Ordering::Greater),
++            (_, ExecStatus::Updated) => Some(std::cmp::Ordering::Less),
+             (ExecStatus::Processing, ExecStatus::Processing) => Some(std::cmp::Ordering::Equal),
+             (ExecStatus::Processing, ExecStatus::Timestamp(Some(_))) => {
+                 Some(std::cmp::Ordering::Less)
+@@ -619,7 +625,7 @@ list of the rule for '{output}' at {loc}"));
+         let touch = self.touch || FLAGS.is_touch;
+         let (commands, exports) = if touch {
+             if is_phony || n.lock().cmds.is_empty() {
+-                return Ok((output_ts, None));
++                return Ok((if is_phony { ExecStatus::Updated } else { output_ts }, None));
+             }
+             (Vec::new(), Vec::new())
+         } else {
+@@ -631,7 +637,7 @@ list of the rule for '{output}' at {loc}"));
+                     "--trace: '{output}': skip — rule has no commands \
+ (phony={is_phony}, exists={})", !matches!(output_ts, ExecStatus::Timestamp(None))));
+             }
+-            return Ok((output_ts, None));
++            return Ok((if is_phony { ExecStatus::Updated } else { output_ts }, None));
+         }
+         if self.trace || FLAGS.is_trace {
+             let why = if matches!(output_ts, ExecStatus::Timestamp(None)) {
+@@ -647,9 +653,10 @@ list of the rule for '{output}' at {loc}"));
+         }
+         let cwd = Bytes::from(self.ce.ev.working_dir.as_os_str().as_bytes().to_vec());
+         let box_prefix = self.ce.ev.box_export_prefix.clone();
++        let result_ts = if is_phony { ExecStatus::Updated } else { output_ts };
+         Ok((
+-            output_ts,
+-            Some(RunReq { output, commands, exports, cwd, box_prefix, result_ts: output_ts,
++            result_ts,
++            Some(RunReq { output, commands, exports, cwd, box_prefix, result_ts,
+                           dry_run: self.dry_run, ignore_errors: self.ignore_errors,
+                           question: self.question, touch }),
+         ))

@@ -81,3 +81,5 @@
 0810-Provide-GNU-default-RM-variable.patch
 0820-Accept-tabs-after-make-function-names.patch
 0830-Refresh-exports-after-recipe-eval.patch
+0840-Propagate-phony-prerequisite-freshness.patch
+0850-Update-single-suffix-candidate-test.patch

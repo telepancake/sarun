@@ -1,0 +1,23 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Sat, 18 Jul 2026 13:47:56 +0000
+Subject: [PATCH] Update single suffix candidate test
+
+Single-dot targets are deliberately admitted as single-suffix-rule candidates since the engine gained GNU single-suffix relations. Update the old parser-level assertion; final .SUFFIXES membership remains checked during rule selection.
+
+---
+diff --git a/src-rs/dep.rs b/src-rs/dep.rs
+index de64fbb..f87fd8a 100644
+--- a/src-rs/dep.rs
++++ b/src-rs/dep.rs
+@@ -2151,7 +2151,9 @@ mod tests {
+     fn test_is_suffix_rule() {
+         assert!(is_suffix_rule(&intern(".c.o")));
+         assert!(!is_suffix_rule(&intern("foo")));
+-        assert!(!is_suffix_rule(&intern(".co")));
++        // A one-dot name is a single-suffix-rule candidate. The final
++        // .SUFFIXES membership check happens when the rule is selected.
++        assert!(is_suffix_rule(&intern(".co")));
+         assert!(!is_suffix_rule(&intern(".c.o.b")));
+     }
+ }

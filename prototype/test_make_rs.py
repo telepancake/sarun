@@ -2117,6 +2117,45 @@ fi
               b"-mstack-protector-guard=sysreg|environment\n",
               f"case61: recipe eval refreshes the exported child value; "
               f"got {evalexport_result!r}")
+        # ── CASE 62: shared prepare gates multiple top-level goals ───
+        # Kbuild invokes `all modules` together. Both roots share `prepare`,
+        # while the object-building recursive make hangs below a literal `.`
+        # target and modpost reaches it through another branch.
+        multigoal = work / "recipe-eval-multigoal"
+        shutil.rmtree(multigoal, ignore_errors=True)
+        (multigoal / "sub").mkdir(parents=True)
+        (multigoal / "Makefile").write_text(
+            "export KBUILD_CFLAGS\n"
+            ".PHONY: all modules modpost modules_prepare prepare "
+            "stack_protector_prepare prepare0 FORCE\n"
+            "all: built\n"
+            "modules: modpost modules_prepare\n"
+            "modpost: built\n"
+            "modules_prepare: prepare\n"
+            "built: .\n"
+            ".: prepare\n"
+            "\t@$(MAKE) --no-print-directory -C sub all\n"
+            "\t@touch built\n"
+            "prepare: stack_protector_prepare prepare0\n"
+            "stack_protector_prepare: prepare0\n"
+            "\t$(eval KBUILD_CFLAGS += -mstack-protector-guard=sysreg)\n"
+            "prepare0:\n")
+        (multigoal / "sub" / "Makefile").write_text(
+            ".PHONY: all\n"
+            "all:\n"
+            "\t@printf '%s|%s\\n' '$(KBUILD_CFLAGS)' "
+            "'$(origin KBUILD_CFLAGS)' > result.txt\n")
+        r = run_make("MAKE62", multigoal, "-j10", "all", "modules")
+        check(r.returncode == 0,
+              f"case62: shared prepare multi-goal graph completes "
+              f"(got {r.returncode}: {(r.stdout+r.stderr)[-700:]})")
+        sp62 = latest_sqlar(m)
+        multigoal_result = m.sqlar_content(
+            sp62, str((multigoal / "sub/result.txt").resolve()).lstrip("/"))
+        check(multigoal_result ==
+              b"-mstack-protector-guard=sysreg|environment\n",
+              f"case62: recursive build branch sees eval before modpost; "
+              f"got {multigoal_result!r}")
     finally:
         if eng is not None and eng.poll() is None:
             eng.terminate()

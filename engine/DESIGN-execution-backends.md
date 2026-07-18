@@ -830,7 +830,18 @@ as executable mappings and mmap that genuinely need a host fd.
           static aarch64 build and all 61 cases pass. The next gate is replaying
           the target kernel so Kbuild's command-change tracking recompiles the
           affected objects with per-task stack-canary flags, then crossing
-          modpost and resuming `world`.
+          modpost and resuming `world`. The first replay exposed the adjacent
+          scheduler relation: the commandless phony `prepare` target completed
+          as a missing filesystem timestamp, so its existing-directory consumer
+          `.` was considered current and the recursive object build did not run.
+          A phony completion now has explicit freshness newer than every real
+          timestamp, including when its recipe expands to nothing; consumers
+          are consequently rebuilt as GNU requires. Case 62 pins Kbuild's exact
+          `all modules` / shared prepare / literal `.` / recursive-build shape.
+          The complete 47-test Kati unit suite (including its corrected
+          single-suffix candidate expectation), static aarch64 build, vendor
+          reproduction check, and all 62 Make/Brush cases pass. The next gate
+          remains the real kernel replay and modpost.
           Earlier nonfatal empty-operand arithmetic and generated-config `sed`
           diagnostics stay recorded for attribution rather than normalization.
     - [x] Complete the native-aarch64 FUSE Brush gate from a clean output tree.
