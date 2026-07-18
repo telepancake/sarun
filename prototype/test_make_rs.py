@@ -1651,6 +1651,35 @@ printf '%s\n' "$dep" > result.txt
               b"goal=<libltdl/Makefile.am> at=<libltdl/Makefile.am>\n",
               f"case47: command goal and automatic target share GNU's "
               f"canonical identity; got {canonical!r}")
+        # ── CASE 48: legacy backquote escape layers around eval ───────────
+        # CMake selects source-specific bootstrap flags through a dynamically
+        # named variable. The doubled escape keeps the outer parameter literal
+        # for eval, while the single escape lets ${a} expand in the command
+        # substitution. Losing either layer silently compiles empty objects.
+        be = work / "backquote-eval-flags"
+        shutil.rmtree(be, ignore_errors=True)
+        be.mkdir(parents=True, exist_ok=True)
+        probe = be / "probe.sh"
+        probe.write_text(r'''#!/bin/sh
+cmake_c_flags_String=-DKWSYS_STRING_C
+for a in String; do
+  src_flags="`eval echo \\${cmake_c_flags_\${a}}` -DKWSYS_NAMESPACE=cmsys"
+done
+test "$src_flags" = '-DKWSYS_STRING_C -DKWSYS_NAMESPACE=cmsys' || exit 22
+printf '%s\n' "$src_flags" > result.txt
+''')
+        probe.chmod(0o755)
+        (be / "Makefile").write_text("all:\n\t@./probe.sh\n")
+        r = run_make("MAKE48", be, "-j10", "all")
+        check(r.returncode == 0,
+              f"case48: nested legacy escapes feed eval a dynamic variable "
+              f"name (got {r.returncode}: {(r.stdout+r.stderr)[-700:]})")
+        sp48 = latest_sqlar(m)
+        flags = m.sqlar_content(
+            sp48, str((be / "result.txt").resolve()).lstrip("/"))
+        check(flags == b"-DKWSYS_STRING_C -DKWSYS_NAMESPACE=cmsys\n",
+              f"case48: CMake source flags survive both expansion layers; "
+              f"got {flags!r}")
     finally:
         if eng is not None and eng.poll() is None:
             eng.terminate()

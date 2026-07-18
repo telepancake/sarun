@@ -1,0 +1,47 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Sat, 18 Jul 2026 02:55:00 +0000
+Subject: [PATCH] Honor escaped dollars in legacy backquotes
+
+---
+diff --git a/src/word.rs b/src/word.rs
+index cf29b4a..3bef289 100644
+--- a/src/word.rs
++++ b/src/word.rs
+@@ -1084,6 +1084,7 @@ peg::parser! {
+         rule backquoted_char() -> &'input str =
+             "\\`" { "`" } /
+             "\\\"" { "\"" } /
++            "\\$" { "$" } /
+             "\\\\" { "\\" } /
+             s:$([^'`']) { s }
+
+@@ -1342,6 +1343,28 @@ mod tests {
+         Ok(())
+     }
+
++    #[test]
++    fn backquoted_command_expands_dollar_after_one_escape_layer() -> Result<()> {
++        let parsed = super::parse(
++            r#""`eval echo \\${cmake_c_flags_\${a}}`""#,
++            &ParserOptions::default(),
++        )?;
++        assert_matches!(
++            &parsed[..],
++            [WordPieceWithSource {
++                piece: WordPiece::DoubleQuotedSequence(pieces),
++                ..
++            }] if matches!(
++                &pieces[..],
++                [WordPieceWithSource {
++                    piece: WordPiece::BackquotedCommandSubstitution(command),
++                    ..
++                }] if command == r"eval echo \${cmake_c_flags_${a}}"
++            )
++        );
++        Ok(())
++    }
++
+     #[test]
+     fn parse_extglob_with_embedded_parameter() -> Result<()> {
+         assert_ron_snapshot!(test_parse("+([$var])")?);

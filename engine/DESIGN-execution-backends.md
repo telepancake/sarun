@@ -633,13 +633,21 @@ as executable mappings and mmap that genuinely need a host fd.
           task and execute concurrently. The released-binary nested-shell test
           sends 220,000 bytes through such a producer, and the real Libtool
           bootstrap now generates `libltdl/Makefile.am`, `m4/ltversion.m4`, and
-          `build-aux/ltmain.sh`. The static aarch64 build, all 47 Make/Brush
-          cases, and the complete nested-shell suite pass. With the legacy
-          backquote fix, CMake bootstrap now generates valid Ninja dependencies
-          and compiles all 309 objects; its final bootstrap link still lacks
-          `cmsysString_strcasecmp` and `cmsysString_strncasecmp`, despite listing
-          `String.o`. That generic generation/compile boundary is next, before a
-          new clean OpenWrt replay. The earlier nonfatal empty-operand arithmetic
+          `build-aux/ltmain.sh`. CMake then exposed the other half of legacy
+          backquote escape processing. Its source-specific bootstrap flags use
+          ``eval echo \\${cmake_c_flags_\${a}}``: the doubled escape must keep
+          the outer parameter literal for `eval`, while the single escape must
+          let `${a}` expand in the command substitution. Brush preserved both,
+          leaving literal `${cmake_c_flags_String}` in `build.ninja`; `String.c`
+          consequently compiled as an empty object without
+          `-DKWSYS_STRING_C`. Legacy backquotes now remove the single escaped
+          dollar as Bash/dash do. The exact parser unit and released-binary
+          Make/Brush case 48 pass. From an empty `Bootstrap.cmk`, the real
+          OpenWrt CMake bootstrap now generates correct flags, compiles and
+          links all 309 objects, completes its 109-second second-stage configure,
+          and exits zero. The static aarch64 build, all 48 Make/Brush cases, and
+          the complete nested-shell suite pass. A new genuinely clean OpenWrt
+          replay is next. The earlier nonfatal empty-operand arithmetic
           diagnostics also remain for attribution rather than normalization.
     - [x] Complete the native-aarch64 FUSE Brush gate from a clean output tree.
           Linux 6.18 builds 823 objects with `-j10` (11 observed overlapping
