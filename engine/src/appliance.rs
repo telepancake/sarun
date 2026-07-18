@@ -747,12 +747,6 @@ pub fn wire_command(
     let mut environment = wire_environment()?;
     if brush {
         environment.insert(
-            crate::wire::BoundedBytes::new(b"SARUN_BRUSH_SH".to_vec())
-                .expect("fixed environment name is bounded"),
-            crate::wire::BoundedBytes::new(b"1".to_vec())
-                .expect("fixed environment value is bounded"),
-        );
-        environment.insert(
             crate::wire::BoundedBytes::new(b"SARUN_EXE".to_vec())
                 .expect("fixed environment name is bounded"),
             crate::wire::BoundedBytes::new(b"/init".to_vec())
@@ -1512,7 +1506,7 @@ mod tests {
                 .find(|(key, _)| key.as_slice() == name)
                 .map(|(_, value)| value.as_slice())
         };
-        assert_eq!(value(b"SARUN_BRUSH_SH"), Some(b"1".as_slice()));
+        assert_eq!(value(b"SARUN_BRUSH_SH"), None);
         assert_eq!(value(b"SARUN_EXE"), Some(b"/init".as_slice()));
         assert_eq!(command.cwd.as_ref().map(|value| value.as_slice()),
                    Some(b"/work".as_slice()));

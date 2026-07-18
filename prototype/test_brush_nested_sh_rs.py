@@ -22,7 +22,7 @@ Cases verified (all real, against the released engine binary):
   3. Visible failure / no fallback: a nested `sh -c` containing process
      substitution `<(…)` — which brush-core sh-mode does NOT parse — exits
      non-zero with a stderr message; NO /bin/sh fallback runs the recipe.
-  4. Negative: a non-brush box has no shadow binds; its /bin/sh is the real
+  4. Negative: a non-brush box has no shadow projection; its /bin/sh is the real
      system shell (no brushprov rows on the box).
   5. Sanity: a top-level -b box still runs end-to-end (writes captured,
      top-level brushprov rows present).
@@ -402,8 +402,25 @@ IFS=:
               "case13: fresh interpreter resets IFS, hides unexported X, "
               f"and imports exported Y (content={fresh!r})")
 
+        # CASE 14: the projected program identity survives environment
+        # sanitization. GCC recursively invokes make under carefully rebuilt
+        # environments. Depending on an inherited SARUN_* marker made the
+        # projected /usr/bin/make fall through to sarun's normal CLI, which
+        # launched a non-Brush nested box and mixed Brush feature detection
+        # with host dash execution.
+        r = subprocess.run(
+            [str(BIN), "run", "-b", "ENVLESSMAKE", "--",
+             "env", "-i", "PATH=/usr/bin:/bin", "/usr/bin/make", "--version"],
+            capture_output=True, text=True, timeout=120)
+        check(r.returncode == 0,
+              f"case14: env-less projected make exits 0 (got {r.returncode}: "
+              f"{r.stderr[-500:]})")
+        check(r.stdout.startswith("GNU Make 4.3\n"),
+              "case14: env-less /usr/bin/make retains embedded make identity "
+              f"(stdout={r.stdout[:200]!r})")
+
         # ── CASE 4 (negative): non-brush box ───────────────────────────────
-        # No -b → no shadow binds, no SARUN_BRUSH_SH. The nested /bin/sh is the
+        # No -b → no shadow projection. The nested /bin/sh is the
         # real system shell directly, and the box has NO brushprov rows.
         r = subprocess.run(
             [str(BIN), "run", "NEG", "--",

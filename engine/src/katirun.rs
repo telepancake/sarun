@@ -1,6 +1,5 @@
 // Phase 2 — embedded `make`. In a -b brush box the runner shadows make/gmake
-// (and /usr/bin/make, /bin/make) with the ENGINE binary (gated on SARUN_BRUSH_SH
-// =1, exactly like the ninja/sh shadows). main() detects argv0 basename == make
+// (and /usr/bin/make, /bin/make) with the ENGINE binary. main() detects argv0 basename == make
 // /gmake BEFORE its normal dispatch and lands here, which:
 //   1. drives a vendored fork of kati (github.com/google/kati src-rs/) IN-PROCESS
 //      to PARSE the box's Makefile, run dependency analysis, and EXECUTE the dep
@@ -42,12 +41,10 @@ use kati::symtab::{Symbol, intern, join_symbols};
 use kati::var::{VarOrigin, Variable};
 use parking_lot::Mutex;
 
-/// True when this engine invocation should act as the embedded-make entry:
-/// SARUN_BRUSH_SH=1 (a -b brush box) AND argv[0]'s basename is `make`/`gmake`.
+/// True when this engine invocation carries a projected `make`/`gmake` identity.
+/// Program identity, not inherited environment, selects the multicall role;
+/// recursive builds commonly sanitize their environment.
 pub fn is_make_invocation() -> bool {
-    if std::env::var("SARUN_BRUSH_SH").as_deref() != Ok("1") {
-        return false;
-    }
     let arg0 = std::env::args().next().unwrap_or_default();
     let base = std::path::Path::new(&arg0)
         .file_name()
@@ -1221,7 +1218,7 @@ pub fn make_main(argv: &[String]) -> i32 {
     for a in argv.iter().skip(1) {
         if a == "--version" || a == "-v" {
             println!("GNU Make 4.3");
-            println!("Built for x86_64-pc-linux-gnu");
+            println!("Built for {}-pc-linux-gnu", std::env::consts::ARCH);
             println!("Copyright (C) 1988-2020 Free Software Foundation, Inc.");
             println!("License GPLv3+: GNU GPL version 3 or later <http://gnu.org/licenses/gpl.html>");
             println!("This is free software: you are free to change and redistribute it.");
@@ -1451,7 +1448,7 @@ pub fn make_builtin(
     for a in argv.iter().skip(1) {
         if a == "--version" || a == "-v" {
             let _ = writeln!(out, "GNU Make 4.3");
-            let _ = writeln!(out, "Built for x86_64-pc-linux-gnu");
+            let _ = writeln!(out, "Built for {}-pc-linux-gnu", std::env::consts::ARCH);
             let _ = writeln!(out, "Copyright (C) 1988-2020 Free Software Foundation, Inc.");
             let _ = writeln!(out, "License GPLv3+: GNU GPL version 3 or later <http://gnu.org/licenses/gpl.html>");
             let _ = writeln!(out, "This is free software: you are free to change and redistribute it.");

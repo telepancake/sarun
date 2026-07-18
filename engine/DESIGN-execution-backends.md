@@ -1050,8 +1050,24 @@ as executable mappings and mmap that genuinely need a host fd.
           enabled; file assignments still override it. A focused GNU/Kati
           corpus case checks both the default and override, and a direct `-R`
           comparison checks that the variable remains undefined when built-ins
-          are disabled. The next gate is the repaired Dropbear compile followed
-          by the resumed clean `world -j10` build.
+          are disabled. The repaired real Dropbear compile then emitted
+          `gcc-ar -rv`, linked, and packaged successfully. The resumed clean
+          `world -j10` exposed a separate shell-identity failure in the earlier
+          final-GCC output: its generated libtool selected Brush's supported
+          `name+=value` implementation during configure, but a recursively
+          projected `make` lost the `SARUN_BRUSH_SH` environment marker, fell
+          through to sarun's ordinary CLI, and launched a non-Brush nested box.
+          Host dash then ran that same libtool; every `func_append` failed and
+          the c++98/c++11/c++17/c++20 convenience archives were created empty,
+          leaving the staged libstdc++ with its own public symbols undefined.
+          The projection itself already chooses Brush mode and is unavailable
+          in non-Brush boxes, so multicall dispatch must derive solely from the
+          projected argv[0], not from optional inherited state. The marker is
+          removed from shell/make/ninja dispatch and appliance transport. An
+          `env -i /usr/bin/make --version` Brush-box regression now stays in
+          embedded Kati and reports the native aarch64 build triple. The next
+          gate is repairing final GCC from its intact object files, then
+          resuming `world -j10`.
           Earlier nonfatal empty-operand arithmetic and generated-config `sed`
           diagnostics stay recorded for attribution rather than normalization.
     - [x] Complete the native-aarch64 FUSE Brush gate from a clean output tree.

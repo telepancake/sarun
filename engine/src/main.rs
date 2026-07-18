@@ -565,15 +565,15 @@ fn main() {
     // D9 follow-on — brush-sh shim. When a -b box shadows /bin/sh (etc.) with
     // this engine binary, a nested `sh -c RECIPE` execs us under the original
     // program name. Detect that BEFORE normal subcommand dispatch (argv[0]'s
-    // basename is a shell name AND SARUN_BRUSH_SH=1), emit the recipe's
-    // provenance, then exec the REAL shell with the original argv unchanged.
+    // basename is a shell name), emit the recipe's provenance, then execute it
+    // with embedded Brush.
     if brush::is_brush_sh_invocation() {
         let full: Vec<String> = std::env::args().collect();
         std::process::exit(brush::brush_sh(&full));
     }
     // Phase 1 — embedded ninja. A -b box shadows /bin/ninja with this engine
     // binary; when the box runs `ninja`, we land HERE (argv[0] basename ==
-    // "ninja" && SARUN_BRUSH_SH=1) and run the vendored n2 in-process, executing
+    // "ninja") and run the vendored n2 in-process, executing
     // each recipe through embedded brush. Detected BEFORE normal dispatch.
     if n2run::is_ninja_invocation() {
         let full: Vec<String> = std::env::args().collect();
@@ -581,7 +581,7 @@ fn main() {
     }
     // Phase 2 — embedded make. A -b box shadows make/gmake (and /usr/bin/make,
     // /bin/make) with this engine binary; when the box runs `make`, we land HERE
-    // (argv[0] basename == "make"/"gmake" && SARUN_BRUSH_SH=1) and run vendored
+    // (argv[0] basename == "make"/"gmake") and run vendored
     // kati in-process to PARSE the Makefile → ninja graph, then hand that graph
     // to the embedded n2 to EXECUTE (recipes through brush). Detected BEFORE
     // normal dispatch, like the ninja path.

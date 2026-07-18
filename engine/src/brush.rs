@@ -1865,15 +1865,14 @@ pub fn inner_brush(conn_fd: i32, cmd: Vec<String>) -> i32 {
 
 // ── brush-sh shim (D9 follow-on: nested shells are brush) ────────────────────
 // runner::run shadows /bin/sh, /usr/bin/sh, /bin/bash, /usr/bin/bash with the
-// engine binary and sets SARUN_BRUSH_SH=1. When a nested tool execs
-// `/bin/sh -c RECIPE` it lands here; brush-core runs the recipe directly.
+// engine binary. When a nested tool execs `/bin/sh -c RECIPE` it lands here;
+// brush-core runs the recipe directly. The projected executable's argv[0] is
+// the authority: build scripts may clear their environment, and doing so must
+// not turn the same synthetic /bin/sh into the host's shell.
 
-/// True when SARUN_BRUSH_SH=1 and argv[0] basename is a shell name.
+/// True when argv[0] basename is one of the projected shell identities.
 /// Checked by main() before normal subcommand dispatch.
 pub fn is_brush_sh_invocation() -> bool {
-    if std::env::var("SARUN_BRUSH_SH").as_deref() != Ok("1") {
-        return false;
-    }
     let arg0 = std::env::args().next().unwrap_or_default();
     let base = std::path::Path::new(&arg0)
         .file_name().and_then(|s| s.to_str()).unwrap_or("");

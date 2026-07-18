@@ -1,7 +1,6 @@
 // n2/ninja embedded build (Phase 1). When a -b brush box runs `ninja`, the
-// runner shadows /bin/ninja and /usr/bin/ninja with the ENGINE binary (gated on
-// SARUN_BRUSH_SH=1, same as the /bin/sh shadow). main() detects that BEFORE its
-// normal dispatch (argv[0] basename == "ninja" && SARUN_BRUSH_SH=1) and lands
+// runner shadows /bin/ninja and /usr/bin/ninja with the ENGINE binary. main()
+// detects that BEFORE its normal dispatch (argv[0] basename == "ninja") and lands
 // here, which:
 //   1. installs the in-process recipe executor (brush::n2_executor) into the
 //      vendored n2 — so n2 NEVER posix_spawns /bin/sh; every recipe runs through
@@ -19,12 +18,10 @@
 
 use serde_json::json;
 
-/// True when this engine invocation should act as the embedded-ninja entry:
-/// SARUN_BRUSH_SH=1 (a -b brush box) AND argv[0]'s basename is `ninja`.
+/// True when this engine invocation carries the projected `ninja` identity.
+/// The identity cannot depend on inherited environment: sanitized build
+/// environments must keep executing the same projection.
 pub fn is_ninja_invocation() -> bool {
-    if std::env::var("SARUN_BRUSH_SH").as_deref() != Ok("1") {
-        return false;
-    }
     let arg0 = std::env::args().next().unwrap_or_default();
     let base = std::path::Path::new(&arg0)
         .file_name().and_then(|s| s.to_str()).unwrap_or("");

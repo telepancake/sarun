@@ -668,21 +668,16 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
     bwrap.args(["--setenv", "SARUN_EXE", &inner_exe]);
     // D9 follow-on — NESTED shell IS brush (brush boxes, capture on only).
     // We shadow the box's /bin/sh, /bin/bash (and /usr/bin/{sh,bash}) with the
-    // ENGINE binary: the shim (brush_sh, gated on SARUN_BRUSH_SH=1) RUNS the
+    // ENGINE binary: the shim selected by that projected argv[0] RUNS the
     // nested `sh -c RECIPE` THROUGH embedded brush-core — there is NO real-shell
     // fallback, no stash. A construct brush cannot run is a VISIBLE error and a
     // non-zero exit, matching the D9 no-silent-downgrade rule that already
     // governs the top-level brush body. Non-brush boxes are NOT touched (their
     // /bin/sh is the real system shell).
-    if brush && capture_on {
-        // The /bin/sh, /usr/bin/make, /bin/ninja etc. shadowing is
-        // applied LAZILY by the FUSE overlay at lookup time (it
-        // reads shadow_*.glob and matches each open against the
-        // patterns). No pre-enumeration of the host filesystem here.
-        // We still need to tell the box that the shim should kick in
-        // when it gets exec'd as /bin/sh.
-        bwrap.args(["--setenv", "SARUN_BRUSH_SH", "1"]);
-    }
+    // The /bin/sh, /usr/bin/make, /bin/ninja etc. shadowing is applied lazily
+    // by the FUSE overlay at lookup time for Brush boxes. No environment marker
+    // selects the role: build tools routinely use `env -i`, so the synthetic
+    // executable's argv[0] remains authoritative.
     // D-oci: apply the image config's Env (PATH, etc.) so a /bin/sh inside the
     // closed image actually finds /usr/bin/* and the user's command resolves
     // without needing `-C / env PATH=...` boilerplate. Each `KEY=VALUE` from
@@ -1735,7 +1730,7 @@ pub fn inner(conn_fd: i32, capture: bool, pty: bool, brush: bool,
         // the two instead: allocate the pty (inner_pty — winsize + SIGWINCH
         // propagation, capture at the master) and have the pty child exec
         // the box-shadowed shell. In a -b box /bin/sh IS the brush shim
-        // (SARUN_BRUSH_SH), so the command still runs through embedded
+        // executable identity, so the command still runs through embedded
         // brush with nested provenance — but on a real tty on fds 0/1/2.
         if pty {
             let script = crate::brush::script_from_argv(&cmd);
