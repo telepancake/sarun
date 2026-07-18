@@ -13,9 +13,11 @@
 #include <linux/sched.h>
 #include <linux/sched/signal.h>
 #include <linux/sched/task.h>
+#include <linux/sched/task_stack.h>
 #include <linux/version.h>
 #include <asm/page.h>
 #include <asm/pgtable.h>
+#include <asm/ptrace.h>
 #include <asm/thread_info.h>
 
 #include "viros_probe_abi.h"
@@ -157,11 +159,12 @@ static __always_inline void viros_fill_task(
 }
 
 static __always_inline void viros_init_response(
-	volatile struct viros_probe_response_v1 *response, vp_u16 record_size)
+	volatile struct viros_probe_response_v1 *response, vp_u16 record_size,
+	vp_u16 abi_minor)
 {
 	response->magic = VIROS_PROBE_RESPONSE_MAGIC;
 	response->abi_major = VIROS_PROBE_ABI_MAJOR;
-	response->abi_minor = VIROS_PROBE_ABI_MINOR;
+	response->abi_minor = abi_minor;
 	response->header_size = VIROS_PROBE_RESPONSE_SIZE;
 	response->record_size = record_size;
 #if defined(CONFIG_ARM64)
@@ -268,7 +271,8 @@ static __always_inline long viros_translate_va(
 	if (output_bytes < VIROS_PROBE_RESPONSE_SIZE +
 	    VIROS_PROBE_TRANSLATION_V1_SIZE || !request->init_task ||
 	    !request->cursor_task || request->flags || request->max_records ||
-	    request->abi_minor != VIROS_PROBE_ABI_MINOR ||
+	    request->abi_minor < 1 ||
+	    request->abi_minor > VIROS_PROBE_ABI_MINOR ||
 	    request->reserved0 || !request->reserved3 ||
 	    (request->reserved3 & (PAGE_SIZE - 1))) {
 		response->status = VIROS_PROBE_BAD_REQUEST;
@@ -346,6 +350,84 @@ not_present:
 	response->status = VIROS_PROBE_NOT_PRESENT;
 	return VIROS_PROBE_NOT_PRESENT;
 }
+
+static __always_inline long viros_saved_regs(
+	const struct viros_probe_request_v1 *request,
+	volatile struct viros_probe_response_v1 *response, vp_u32 output_bytes)
+{
+	volatile struct viros_probe_saved_regs_v1 *record;
+	struct task_struct *task;
+	struct mm_struct *mm;
+	struct pt_regs *regs;
+	unsigned long stack, regs_address;
+	unsigned int i;
+
+	if (output_bytes < VIROS_PROBE_RESPONSE_SIZE +
+	    VIROS_PROBE_SAVED_REGS_V1_SIZE || request->abi_minor < 2 ||
+	    !request->init_task || !request->cursor_task || request->flags ||
+	    request->max_records || request->reserved0 || request->reserved2 ||
+	    request->reserved3) {
+		response->status = VIROS_PROBE_BAD_REQUEST;
+		return VIROS_PROBE_BAD_REQUEST;
+	}
+	task = (struct task_struct *)(unsigned long)request->init_task;
+	mm = (struct mm_struct *)(unsigned long)request->cursor_task;
+	if ((vp_u64)task->start_time != request->reserved1 || task->mm != mm) {
+		response->status = VIROS_PROBE_STALE_TASK;
+		return VIROS_PROBE_STALE_TASK;
+	}
+	if (!mm || (task->flags & PF_KTHREAD)) {
+		response->status = VIROS_PROBE_UNSUPPORTED;
+		return VIROS_PROBE_UNSUPPORTED;
+	}
+	if (viros_task_abi_bits(task) != 64) {
+		response->status = VIROS_PROBE_COMPAT_TASK;
+		return VIROS_PROBE_COMPAT_TASK;
+	}
+	/* A task executing on any CPU has no authoritative saved EL0 frame. */
+	if (task == current
+#ifdef CONFIG_SMP
+	    || task->on_cpu
+#endif
+	) {
+		response->status = VIROS_PROBE_TASK_RUNNING;
+		return VIROS_PROBE_TASK_RUNNING;
+	}
+
+	stack = (unsigned long)task_stack_page(task);
+	regs = task_pt_regs(task);
+	regs_address = (unsigned long)regs;
+	if (!stack || stack + THREAD_SIZE < stack || regs_address < stack ||
+	    regs_address + sizeof(*regs) < regs_address ||
+	    regs_address + sizeof(*regs) > stack + THREAD_SIZE ||
+	    (regs_address & (sizeof(vp_u64) - 1)) || !user_mode(regs) ||
+	    (regs->pstate & PSR_MODE_MASK) != PSR_MODE_EL0t ||
+	    (vp_u64)regs->pstate >= (1ULL << 32) ||
+	    (vp_u64)regs->sp >= (1ULL << 63) ||
+	    (vp_u64)regs->pc >= (1ULL << 63)) {
+		response->status = VIROS_PROBE_INVALID_REGS;
+		return VIROS_PROBE_INVALID_REGS;
+	}
+
+	record = (volatile struct viros_probe_saved_regs_v1 *)
+		((volatile vp_u8 *)response + VIROS_PROBE_RESPONSE_SIZE);
+	record->record_size = VIROS_PROBE_SAVED_REGS_V1_SIZE;
+	record->record_version = 1;
+	record->saved_regs_flags = VIROS_PROBE_REGS_VALID |
+		VIROS_PROBE_REGS_USER | VIROS_PROBE_REGS_AARCH64_64;
+	record->task = (vp_u64)(unsigned long)task;
+	record->mm = (vp_u64)(unsigned long)mm;
+	record->start_cookie = (vp_u64)task->start_time;
+	for (i = 0; i < 31; ++i)
+		record->x[i] = (vp_u64)regs->regs[i];
+	record->sp = (vp_u64)regs->sp;
+	record->pc = (vp_u64)regs->pc;
+	record->pstate = (vp_u64)regs->pstate;
+	response->record_count = 1;
+	response->bytes_written += VIROS_PROBE_SAVED_REGS_V1_SIZE;
+	response->snapshot_root = request->init_task;
+	return VIROS_PROBE_OK;
+}
 #endif
 
 /*
@@ -365,7 +447,11 @@ long viros_probe_entry(const struct viros_probe_request_v1 *request,
 		return VIROS_PROBE_SHORT_BUFFER;
 	viros_init_response(response,
 		request && request->opcode == VIROS_PROBE_OP_TRANSLATE_VA ?
-		VIROS_PROBE_TRANSLATION_V1_SIZE : VIROS_PROBE_TASK_V1_SIZE);
+		VIROS_PROBE_TRANSLATION_V1_SIZE :
+		request && request->opcode == VIROS_PROBE_OP_SAVED_REGS ?
+		VIROS_PROBE_SAVED_REGS_V1_SIZE : VIROS_PROBE_TASK_V1_SIZE,
+		request && request->abi_minor <= VIROS_PROBE_ABI_MINOR ?
+		request->abi_minor : VIROS_PROBE_ABI_MINOR);
 
 	if (!request || request->magic != VIROS_PROBE_REQUEST_MAGIC ||
 	    request->abi_major != VIROS_PROBE_ABI_MAJOR ||
@@ -377,6 +463,14 @@ long viros_probe_entry(const struct viros_probe_request_v1 *request,
 	if (request->opcode == VIROS_PROBE_OP_TRANSLATE_VA) {
 #if defined(CONFIG_ARM64)
 		return viros_translate_va(request, response, output_bytes);
+#else
+		response->status = VIROS_PROBE_UNSUPPORTED;
+		return VIROS_PROBE_UNSUPPORTED;
+#endif
+	}
+	if (request->opcode == VIROS_PROBE_OP_SAVED_REGS) {
+#if defined(CONFIG_ARM64)
+		return viros_saved_regs(request, response, output_bytes);
 #else
 		response->status = VIROS_PROBE_UNSUPPORTED;
 		return VIROS_PROBE_UNSUPPORTED;

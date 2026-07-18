@@ -155,6 +155,16 @@ def select_scratch_mode(args: SimpleNamespace, scratch: Path) -> None:
 
 
 class ProbeManifestTests(unittest.TestCase):
+    def test_translation_abi_1_1_package_remains_loadable(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            args = manifest_args(Path(temporary))
+            loaded, _ = PROBE_TOOL.load_probe_package(args.package)
+            self.assertEqual(loaded["abi_minor"], 1)
+            self.assertEqual(
+                loaded["capabilities"],
+                ["snapshot-v1", "translate-va-aarch64-v1"],
+            )
+
     def test_snapshot_only_abi_1_0_package_remains_loadable(self):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)

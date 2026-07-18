@@ -72,9 +72,11 @@ class ProbeMemoryReader:
             request = struct.unpack("<IHHHHIQQIIQQQ", manifest.request_bytes)
         except struct.error as exc:
             raise ProbeMemoryError("cannot decode the sealed snapshot request") from exc
-        if request[:5] != (0x56505251, ABI_MAJOR, ABI_MINOR, 64, OP_SNAPSHOT):
+        if (request[:2] != (0x56505251, ABI_MAJOR)
+                or request[2] not in (1, ABI_MINOR)
+                or request[3:5] != (64, OP_SNAPSHOT)):
             raise ProbeMemoryError(
-                "memory reads require a sealed ABI-v1.1 snapshot request")
+                "memory reads require a sealed ABI-v1.1/v1.2 snapshot request")
         if (isinstance(max_read_bytes, bool) or not isinstance(max_read_bytes, int)
                 or max_read_bytes <= 0):
             raise ProbeMemoryError("max_read_bytes must be a positive integer")
@@ -82,6 +84,7 @@ class ProbeMemoryReader:
         self.manifest = manifest
         self.transaction_factory = transaction_factory
         self.max_read_bytes = max_read_bytes
+        self._abi_minor = request[2]
         self._tasks: dict[int, ProbeTask] = {}
         self._linear_offsets: dict[int, int] = {}
         self._snapshot_linear_offset: int | None = None
@@ -96,11 +99,11 @@ class ProbeMemoryReader:
 
         if not isinstance(snapshot, ProbeSnapshot):
             raise ProbeMemoryError("memory reader requires a decoded probe snapshot")
-        if (snapshot.abi_minor != ABI_MINOR or snapshot.arch != 1
+        if (snapshot.abi_minor != self._abi_minor or snapshot.arch != 1
                 or snapshot.byte_order != "<" or snapshot.pointer_bits != 64
                 or snapshot.page_shift != 12):
             raise ProbeMemoryError(
-                "memory reader requires an AArch64 4K-page ABI-v1.1 snapshot")
+                "memory reader requires an AArch64 4K-page ABI-v1.1/v1.2 snapshot")
         tasks: dict[int, ProbeTask] = {}
         for record in snapshot.tasks:
             if not record.mm or record.pid <= 0 or record.tgid <= 0:
@@ -161,7 +164,7 @@ class ProbeMemoryReader:
 
         record = self._record(task)
         request = _build_translation_request(
-            record, virtual_address, self._linear_offset(record))
+            record, virtual_address, self._linear_offset(record), self._abi_minor)
         # ``replace`` preserves the loader's validation seal; the only mutation
         # is an ABI request assembled from a bound snapshot record and checked VA.
         transaction_manifest = replace(self.manifest, request_bytes=request)

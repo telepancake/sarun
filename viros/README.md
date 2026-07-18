@@ -116,7 +116,10 @@ when the console resumes. Console output is also retained in the target's
 while GDB is continuing interrupts the remote target instead of terminating
 the VM process. ARM's QEMU `virt` machine uses the PL011 console
 `ttyAMA0`; the other kernel command lines select their target's corresponding
-serial device.
+serial device. A launcher watchdog also follows QEMU's lifetime: if the remote
+VM disappears while GDB is still attached, the associated GDB is terminated
+(and forcibly reaped after a short grace period) instead of being left in a
+remote-event CPU loop.
 You can inspect the retained output without resuming the VM as well:
 
 ```sh
@@ -353,12 +356,15 @@ normal exit, failure, `SIGINT`, or `SIGTERM`.
 The live facade now refreshes task snapshots, exposes their multiprocess IDs,
 and, when the sealed probe advertises `translate-va-aarch64-v1`, supplies
 read-only selected-process virtual memory through checked page translation.
-It returns the stopped QEMU register block only for a task currently on a
-vCPU. Sleeping-task registers, process-memory writes, automatic userspace ELF
-symbol loading, ARMv7, and MIPS remain unimplemented. The facade's direct RSP
-call gate has a restoring wall-clock timeout, but it is not an emulated
-instruction budget and ordinary QEMU virtual time can advance during the
-transaction.
+For a current task it returns QEMU's stopped-vCPU register block. When the
+sealed ABI 1.2 package also advertises `saved-regs-aarch64-v1`, a sleeping
+native AArch64 task instead gets its validated saved EL0 x0-x30, SP, PC, and
+PSTATE frame; GDB receives literal `x` digits for unavailable FP/system
+registers rather than invented values. Saved compat32 frames, register and
+process-memory writes, automatic userspace ELF symbol loading, ARMv7, and MIPS
+remain unimplemented. The facade's direct RSP call gate has a restoring
+wall-clock timeout, but it is not an emulated instruction budget and ordinary
+QEMU virtual time can advance during the transaction.
 
 The launcher and facade have lifecycle/unit coverage, but this repository has
 not run the exact-Kbuild probe against a matching locally built OpenWrt guest;

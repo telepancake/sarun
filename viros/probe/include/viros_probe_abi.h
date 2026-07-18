@@ -27,18 +27,20 @@ typedef uint64_t vp_u64;
 #define VIROS_PROBE_REQUEST_MAGIC  0x56505251U /* VPRQ */
 #define VIROS_PROBE_RESPONSE_MAGIC 0x56505253U /* VPRS */
 #define VIROS_PROBE_ABI_MAJOR 1U
-#define VIROS_PROBE_ABI_MINOR 1U
+#define VIROS_PROBE_ABI_MINOR 2U
 
 #define VIROS_PROBE_REQUEST_SIZE  64U
 #define VIROS_PROBE_RESPONSE_SIZE 64U
 #define VIROS_PROBE_TASK_V1_SIZE  192U
 #define VIROS_PROBE_TRANSLATION_V1_SIZE 64U
+#define VIROS_PROBE_SAVED_REGS_V1_SIZE 304U
 #define VIROS_PROBE_COMM_SIZE 16U
 #define VIROS_PROBE_AUX_COUNT 10U
 
 enum viros_probe_opcode {
 	VIROS_PROBE_OP_SNAPSHOT = 1,
 	VIROS_PROBE_OP_TRANSLATE_VA = 2,
+	VIROS_PROBE_OP_SAVED_REGS = 3,
 };
 
 enum viros_probe_status {
@@ -49,6 +51,9 @@ enum viros_probe_status {
 	VIROS_PROBE_UNSUPPORTED = -4,
 	VIROS_PROBE_STALE_TASK = -5,
 	VIROS_PROBE_NOT_PRESENT = -6,
+	VIROS_PROBE_TASK_RUNNING = -7,
+	VIROS_PROBE_INVALID_REGS = -8,
+	VIROS_PROBE_COMPAT_TASK = -9,
 };
 
 enum viros_probe_arch {
@@ -83,6 +88,12 @@ enum viros_probe_translation_flags {
 	VIROS_PROBE_XLATE_SPECIAL = 1U << 5,
 	/* Host physical reads are permitted only when this conservative bit is set. */
 	VIROS_PROBE_XLATE_SAFE_READ = 1U << 6,
+};
+
+enum viros_probe_saved_regs_flags {
+	VIROS_PROBE_REGS_VALID = 1U << 0,
+	VIROS_PROBE_REGS_USER = 1U << 1,
+	VIROS_PROBE_REGS_AARCH64_64 = 1U << 2,
 };
 
 /* Indices in task_v1.auxv and bits in task_v1.auxv_valid. */
@@ -186,12 +197,35 @@ struct viros_probe_translation_v1 {
 	vp_u16 reserved0;
 };
 
+/*
+ * SAVED_REGS request field assignment (ABI 1.2 and later):
+ *   init_task=task pointer, cursor_task=expected mm pointer,
+ *   reserved1=start_cookie.  Every other payload field and flags are zero.
+ * The identity triple must come from one frozen snapshot.  A successful
+ * record is available only for a 64-bit AArch64 userspace task which is not
+ * current or on a CPU; it describes the task's saved EL0 exception frame.
+ */
+struct viros_probe_saved_regs_v1 {
+	vp_u16 record_size;
+	vp_u16 record_version;
+	vp_u32 saved_regs_flags;
+	vp_u64 task;
+	vp_u64 mm;
+	vp_u64 start_cookie;
+	vp_u64 x[31];
+	vp_u64 sp;
+	vp_u64 pc;
+	vp_u64 pstate;
+};
+
 #ifdef __KERNEL__
 static_assert(sizeof(struct viros_probe_request_v1) == VIROS_PROBE_REQUEST_SIZE);
 static_assert(sizeof(struct viros_probe_response_v1) == VIROS_PROBE_RESPONSE_SIZE);
 static_assert(sizeof(struct viros_probe_task_v1) == VIROS_PROBE_TASK_V1_SIZE);
 static_assert(sizeof(struct viros_probe_translation_v1) ==
 	      VIROS_PROBE_TRANSLATION_V1_SIZE);
+static_assert(sizeof(struct viros_probe_saved_regs_v1) ==
+	      VIROS_PROBE_SAVED_REGS_V1_SIZE);
 #endif
 
 #endif /* VIROS_PROBE_ABI_H */

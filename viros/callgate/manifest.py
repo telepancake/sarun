@@ -232,17 +232,25 @@ def load_and_validate_manifest(path: str | Path) -> ValidatedManifest:
     probe_capabilities = tuple(raw_capabilities)
     if len(set(probe_capabilities)) != len(probe_capabilities):
         raise ManifestError("probe.capabilities must not contain duplicates")
-    known_capabilities = {"snapshot-v1", "translate-va-aarch64-v1"}
+    known_capabilities = {
+        "snapshot-v1",
+        "translate-va-aarch64-v1",
+        "saved-regs-aarch64-v1",
+    }
     unknown_capabilities = set(probe_capabilities) - known_capabilities
     if unknown_capabilities:
         raise ManifestError(
             "probe.capabilities contains unsupported values: "
             + ", ".join(sorted(unknown_capabilities))
         )
-    if "translate-va-aarch64-v1" in probe_capabilities and (
+    dependent_capabilities = {
+        "translate-va-aarch64-v1",
+        "saved-regs-aarch64-v1",
+    }
+    if dependent_capabilities.intersection(probe_capabilities) and (
         "snapshot-v1" not in probe_capabilities
     ):
-        raise ManifestError("probe translation capability requires snapshot-v1")
+        raise ManifestError("probe task operations require snapshot-v1")
     code_region_name = _string(probe.get("code_region"), "probe.code_region")
     if code_region_name not in by_name or by_name[code_region_name].role != "code":
         raise ManifestError("probe.code_region must name a code region")

@@ -10,17 +10,22 @@ from typing import Callable
 REQUEST_MAGIC = 0x56505251
 RESPONSE_MAGIC = 0x56505253
 ABI_MAJOR = 1
-ABI_MINOR = 1
+ABI_MINOR = 2
 RESPONSE_SIZE = 64
 TASK_V1_SIZE = 192
 TRANSLATION_V1_SIZE = 64
+SAVED_REGS_V1_SIZE = 304
 ENDIAN_LITTLE = 1
 ENDIAN_BIG = 2
 ARCH_AARCH64 = 1
 OP_SNAPSHOT = 1
 OP_TRANSLATE_VA = 2
+OP_SAVED_REGS = 3
 STATUS_STALE_TASK = -5
 STATUS_NOT_PRESENT = -6
+STATUS_TASK_RUNNING = -7
+STATUS_INVALID_REGS = -8
+STATUS_COMPAT_TASK = -9
 RESP_MORE = 1 << 0
 TASK_HAS_MM = 1 << 0
 TASK_GROUP_LEADER = 1 << 1
@@ -33,6 +38,9 @@ XLATE_EXECUTABLE = 1 << 3
 XLATE_BLOCK = 1 << 4
 XLATE_SPECIAL = 1 << 5
 XLATE_SAFE_READ = 1 << 6
+REGS_VALID = 1 << 0
+REGS_USER = 1 << 1
+REGS_AARCH64_64 = 1 << 2
 AUX_COUNT = 10
 
 AUX_TAGS = (3, 4, 5, 6, 7, 9, 25, 33, 31, 23)
@@ -54,6 +62,18 @@ class ProbeStaleTaskError(ProbeStatusError):
 
 class ProbeNotPresentError(ProbeStatusError):
     """The requested userspace virtual address is not presently mapped."""
+
+
+class ProbeTaskRunningError(ProbeStatusError):
+    """The task is current/on-CPU, so its saved exception frame is stale."""
+
+
+class ProbeInvalidRegistersError(ProbeStatusError):
+    """The task does not contain a well-formed saved EL0 register frame."""
+
+
+class ProbeCompatTaskError(ProbeStatusError):
+    """The saved-register ABI deliberately does not expose compat32 frames."""
 
 
 @dataclass(frozen=True)
@@ -125,10 +145,27 @@ class ProbeTranslation:
     flags: int
 
 
+@dataclass(frozen=True)
+class ProbeSavedRegisters:
+    task: int
+    mm: int
+    start_cookie: int
+    x: tuple[int, ...]
+    sp: int
+    pc: int
+    pstate: int
+    flags: int
+
+    @property
+    def valid(self) -> bool:
+        return bool(self.flags & REGS_VALID)
+
+
 def _build_translation_request(
-    task: ProbeTask, virtual_address: int, linear_map_offset: int
+    task: ProbeTask, virtual_address: int, linear_map_offset: int,
+    abi_minor: int = ABI_MINOR,
 ) -> bytes:
-    """Build an internal ABI-v1.1 request from already-bound values.
+    """Build an internal ABI-v1.1/v1.2 request from already-bound values.
 
     The linear-map offset is security-sensitive and must be derived from
     QEMU's translation of this decoded task's ``mm->pgd``.  Keeping this
@@ -147,16 +184,39 @@ def _build_translation_request(
     if (isinstance(linear_map_offset, bool) or not isinstance(linear_map_offset, int)
             or not 0 < linear_map_offset < 1 << 64 or linear_map_offset & 0xfff):
         raise ProbeDecodeError("linear-map offset must be a nonzero page-aligned uint64")
+    if abi_minor not in (1, ABI_MINOR):
+        raise ProbeDecodeError("translation requires probe ABI minor 1 or 2")
     return struct.pack(
-        "<IHHHHIQQIIQQQ", REQUEST_MAGIC, ABI_MAJOR, ABI_MINOR, 64,
+        "<IHHHHIQQIIQQQ", REQUEST_MAGIC, ABI_MAJOR, abi_minor, 64,
         OP_TRANSLATE_VA, 0, task.task, task.mm, 0, 0,
         task.start_cookie, virtual_address, linear_map_offset,
+    )
+
+
+def _build_saved_registers_request(task: ProbeTask) -> bytes:
+    """Build an ABI-v1.2 request bound to one frozen snapshot record."""
+
+    if not isinstance(task, ProbeTask):
+        raise ProbeDecodeError(
+            "saved registers require a decoded frozen-snapshot task")
+    if not task.task or not task.mm:
+        raise ProbeDecodeError(
+            "saved-register task has no stable user address space identity")
+    if task.abi_bits != 64:
+        raise ProbeDecodeError("compat32 saved registers are not supported")
+    if task.probe_flags & TASK_ON_CPU:
+        raise ProbeDecodeError("an on-CPU task has no authoritative saved frame")
+    return struct.pack(
+        "<IHHHHIQQIIQQQ", REQUEST_MAGIC, ABI_MAJOR, ABI_MINOR, 64,
+        OP_SAVED_REGS, 0, task.task, task.mm, 0, 0,
+        task.start_cookie, 0, 0,
     )
 
 
 _HEADER_FORMAT = "IHHHHHBBiIIIQQIIQ"
 _TASK_FORMAT = "HHIQQQQQQQQIIIIIHH16s10Q"
 _TRANSLATION_FORMAT = "HHIQQQQQQIHH"
+_SAVED_REGS_FORMAT = "HHIQQQ31Q3Q"
 
 
 def _unpack(fmt: str, byte_order: str, data: bytes, offset: int = 0):
@@ -171,6 +231,12 @@ def _status_error(status: int) -> ProbeStatusError:
         return ProbeStaleTaskError(status)
     if status == STATUS_NOT_PRESENT:
         return ProbeNotPresentError(status)
+    if status == STATUS_TASK_RUNNING:
+        return ProbeTaskRunningError(status)
+    if status == STATUS_INVALID_REGS:
+        return ProbeInvalidRegistersError(status)
+    if status == STATUS_COMPAT_TASK:
+        return ProbeCompatTaskError(status)
     return ProbeStatusError(status)
 
 
@@ -275,7 +341,7 @@ def decode_translation_response(data: bytes) -> ProbeTranslation:
     (magic, major, minor, header_size, record_size, arch, encoded_endian,
      pointer_bits, status, response_flags, record_count, bytes_written,
      next_cursor, snapshot_root, header_page_shift, reserved0, reserved1) = fields
-    if magic != RESPONSE_MAGIC or major != ABI_MAJOR or minor != ABI_MINOR:
+    if magic != RESPONSE_MAGIC or major != ABI_MAJOR or minor not in (1, ABI_MINOR):
         raise ProbeDecodeError("translation response has incompatible magic or ABI")
     if encoded_endian != endian_code or byte_order != "<":
         raise ProbeDecodeError("translation response is not little-endian AArch64")
@@ -319,6 +385,58 @@ def decode_translation_response(data: bytes) -> ProbeTranslation:
         task, mm, virtual_address, physical_address, contiguous_bytes,
         mapping_bytes, page_shift, level, flags,
     )
+
+
+def decode_saved_registers_response(data: bytes) -> ProbeSavedRegisters:
+    """Decode one identity-bound, non-current AArch64 EL0 saved frame."""
+
+    if not isinstance(data, bytes):
+        raise ProbeDecodeError("probe response must be bytes")
+    if len(data) < RESPONSE_SIZE:
+        raise ProbeDecodeError("truncated probe response header")
+    endian_code = data[14]
+    if endian_code != ENDIAN_LITTLE:
+        raise ProbeDecodeError("saved-register response is not little-endian")
+    fields = _unpack(_HEADER_FORMAT, "<", data)
+    (magic, major, minor, header_size, record_size, arch, encoded_endian,
+     pointer_bits, status, response_flags, record_count, bytes_written,
+     next_cursor, snapshot_root, page_shift, reserved0, reserved1) = fields
+    if (magic != RESPONSE_MAGIC or major != ABI_MAJOR or minor != ABI_MINOR
+            or encoded_endian != endian_code):
+        raise ProbeDecodeError("saved-register response has incompatible magic or ABI")
+    if (header_size != RESPONSE_SIZE or record_size != SAVED_REGS_V1_SIZE
+            or arch != ARCH_AARCH64 or pointer_bits != 64):
+        raise ProbeDecodeError(
+            "saved-register response has incompatible target/layout metadata")
+    if not 10 <= page_shift <= 24:
+        raise ProbeDecodeError(f"invalid page shift {page_shift}")
+    if response_flags or next_cursor or reserved0 or reserved1:
+        raise ProbeDecodeError(
+            "saved-register response has nonzero reserved/pagination fields")
+    if status:
+        if record_count or bytes_written != RESPONSE_SIZE:
+            raise ProbeDecodeError("failed saved-register response contains a record")
+        raise _status_error(status)
+    if (record_count != 1
+            or bytes_written != RESPONSE_SIZE + SAVED_REGS_V1_SIZE
+            or bytes_written > len(data) or not snapshot_root):
+        raise ProbeDecodeError(
+            "saved-register response does not contain exactly one record")
+    values = _unpack(_SAVED_REGS_FORMAT, "<", data, RESPONSE_SIZE)
+    own_size, version, flags, task, mm, start_cookie, *registers = values
+    expected_flags = REGS_VALID | REGS_USER | REGS_AARCH64_64
+    if own_size != SAVED_REGS_V1_SIZE or version != 1 or flags != expected_flags:
+        raise ProbeDecodeError(
+            "saved-register record has incompatible size/version/validity flags")
+    if not task or not mm or task != snapshot_root:
+        raise ProbeDecodeError("saved-register record has invalid task identity")
+    x = tuple(registers[:31])
+    sp, pc, pstate = registers[31:]
+    if (len(x) != 31 or sp >= 1 << 63 or pc >= 1 << 63
+            or pstate >= 1 << 32 or pstate & 0xf):
+        raise ProbeDecodeError("saved-register record is not a valid AArch64 EL0t frame")
+    return ProbeSavedRegisters(
+        task, mm, start_cookie, x, sp, pc, pstate, flags)
 
 
 def decode_paginated(fetch: Callable[[int], bytes], max_pages: int = 4096) -> ProbeSnapshot:

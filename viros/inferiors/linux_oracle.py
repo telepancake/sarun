@@ -10,6 +10,28 @@ from dataclasses import dataclass
 from typing import Protocol
 
 
+@dataclass(frozen=True)
+class RegisterRead:
+    """An already encoded, unframed GDB ``g``-packet reply.
+
+    Literal ``x`` digits mark described registers whose values are unavailable.
+    ``complete`` converts an ordinary raw register block into the same form.
+    """
+
+    payload: bytes
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.payload, bytes) or len(self.payload) % 2
+                or any(byte not in b"0123456789abcdefx" for byte in self.payload)):
+            raise ValueError("register reply must contain lowercase hex/x digit pairs")
+
+    @classmethod
+    def complete(cls, data: bytes) -> "RegisterRead":
+        if not isinstance(data, bytes):
+            raise TypeError("complete register data must be bytes")
+        return cls(data.hex().encode("ascii"))
+
+
 @dataclass(frozen=True, order=True)
 class TaskId:
     """A GDB multiprocess identity: Linux TGID is PID, Linux PID is TID."""
@@ -64,8 +86,8 @@ class LinuxOracle(Protocol):
     def write_memory(self, task: TaskSnapshot, address: int, data: bytes) -> None:
         """Write virtual memory in TASK's address space."""
 
-    def read_registers(self, task: TaskSnapshot) -> bytes:
-        """Return the target-description-ordered general register block."""
+    def read_registers(self, task: TaskSnapshot) -> RegisterRead | bytes:
+        """Return an encoded reply, or a legacy complete raw register block."""
 
     def write_registers(self, task: TaskSnapshot, data: bytes) -> None:
         """Replace the available general register block for TASK."""

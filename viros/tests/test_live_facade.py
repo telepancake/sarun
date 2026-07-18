@@ -14,11 +14,13 @@ from inferiors.live_facade import (
     load_target_descriptions,
 )
 from inferiors.linux_oracle import TaskId
+from inferiors.partial_registers import AARCH64_USER_REGISTERS
 from inferiors.probe_oracle import ProbeOracle
 from inferiors.qemu_rsp import QemuRspClient
 from inferiors.rsp_proxy import RspFacade
 from inferiors.rsp_transport import RspStream
 from inferiors.rsp_server import qemu_cpu_stop_resolver
+from probe.abi import ProbeSavedRegisters
 from test_rsp_support import memory_duplex_pair
 
 
@@ -178,6 +180,40 @@ class FakeProgramMemoryReader:
         return bytes((address + offset) & 0xff for offset in range(length))
 
 
+class FakeSavedRegisterReader:
+    def __init__(self):
+        self.bound = ()
+        self.reads = []
+
+    def bind_snapshot(self, snapshot):
+        self.bound = tuple(task.stable_cookie for task in snapshot.tasks)
+
+    def read_registers(self, task):
+        self.reads.append((task.identity, task.task_cookie))
+        if task.task_cookie not in self.bound:
+            raise OSError("stale task")
+        return ProbeSavedRegisters(
+            task=task.task_cookie >> 64,
+            mm=ROOT + 0x500000,
+            start_cookie=task.task_cookie & ((1 << 64) - 1),
+            x=tuple(range(31)),
+            sp=0x1020304050607080,
+            pc=0x405060,
+            pstate=0,
+            flags=7,
+        )
+
+
+def _full_core_xml(extra: bytes = b"") -> bytes:
+    registers = []
+    for regnum, name in enumerate(AARCH64_USER_REGISTERS):
+        bits = 32 if name == "cpsr" else 64
+        registers.append(
+            f'<reg name="{name}" bitsize="{bits}" regnum="{regnum}"/>'
+        )
+    return ("<feature>" + "".join(registers)).encode() + extra + b"</feature>"
+
+
 class FakePcTarget:
     def __init__(self, pc):
         self.pc = pc
@@ -203,7 +239,7 @@ class LiveFacadeTests(unittest.TestCase):
         sleeping, current = tasks
         with self.assertRaisesRegex(OSError, "sleeping-task"):
             oracle.read_registers(sleeping)
-        self.assertEqual(oracle.read_registers(current), bytes.fromhex("01020304"))
+        self.assertEqual(oracle.read_registers(current).payload, b"01020304")
         self.assertEqual(client.register_reads, ["2"])
         with self.assertRaisesRegex(OSError, "virtual memory"):
             oracle.read_memory(current, 0x400000, 4)
@@ -349,6 +385,55 @@ class LiveFacadeTests(unittest.TestCase):
                 )
                 self.assertEqual(memory.reads[-1][0], TaskId(42, 42))
                 self.assertEqual(memory.reads[-1][2:], (0x400ffe, 6))
+            finally:
+                live.close()
+
+    def test_advertised_saved_registers_make_sleeping_task_readable(self):
+        with tempfile.TemporaryDirectory(dir=".") as directory_text:
+            directory = Path(directory_text)
+            manifest = _manifest(directory)
+            document = json.loads(manifest.read_text(encoding="utf-8"))
+            document["probe"]["capabilities"] = [
+                "snapshot-v1", "translate-va-aarch64-v1",
+                "saved-regs-aarch64-v1",
+            ]
+            request = bytearray.fromhex(document["mailbox"]["request_hex"])
+            request[6:8] = (2).to_bytes(2, "little")
+            document["mailbox"]["request_hex"] = request.hex()
+            manifest.write_text(json.dumps(document), encoding="utf-8")
+            client = FakeClient()
+            client.xml["core.xml"] = _full_core_xml(
+                b'<reg name="system_test" bitsize="64" regnum="34"/>')
+            saved = FakeSavedRegisterReader()
+
+            class Abi12Runner(FrozenRunner):
+                def __call__(self, cursor):
+                    response = bytearray(super().__call__(cursor))
+                    response[6:8] = (2).to_bytes(2, "little")
+                    return bytes(response)
+
+            live = build_live_facade(
+                qemu_socket=str(directory / "qemu.sock"),
+                gdb_socket=str(directory / "gdb.sock"),
+                manifest_path=manifest,
+                client_factory=lambda path, timeout: client,
+                runner_factory=lambda target, sealed: Abi12Runner(),
+                memory_reader_factory=lambda target, sealed: FakeProgramMemoryReader(),
+                register_reader_factory=lambda target, sealed: saved,
+            )
+            try:
+                self.assertEqual(live.facade.handle(b"Hgp1.1"), b"OK")
+                reply = live.facade.handle(b"g")
+                values = {f"x{index}": index for index in range(31)}
+                values.update(sp=0x1020304050607080, pc=0x405060, cpsr=0)
+                expected = b"".join(
+                    values[name]
+                    .to_bytes(4 if name == "cpsr" else 8, "little")
+                    .hex().encode()
+                    for name in AARCH64_USER_REGISTERS
+                )
+                self.assertEqual(reply, expected + b"x" * 16)
+                self.assertEqual(saved.reads[-1][0], TaskId(1, 1))
             finally:
                 live.close()
 

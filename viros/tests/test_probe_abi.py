@@ -57,6 +57,16 @@ class Task(ctypes.LittleEndianStructure):
     ]
 
 
+class SavedRegs(ctypes.LittleEndianStructure):
+    _fields_ = [
+        ("record_size", ctypes.c_uint16), ("record_version", ctypes.c_uint16),
+        ("saved_regs_flags", ctypes.c_uint32), ("task", ctypes.c_uint64),
+        ("mm", ctypes.c_uint64), ("start_cookie", ctypes.c_uint64),
+        ("x", ctypes.c_uint64 * 31), ("sp", ctypes.c_uint64),
+        ("pc", ctypes.c_uint64), ("pstate", ctypes.c_uint64),
+    ]
+
+
 def minimal_aarch64_rel(entry=True, undefined=False):
     """Construct a small ET_REL sufficient to exercise the pure-Python auditor."""
     names = b"\0.text\0.shstrtab\0.strtab\0.symtab\0"
@@ -135,6 +145,7 @@ class ProbeAbiTests(unittest.TestCase):
         self.assertEqual(ctypes.sizeof(Request), 64)
         self.assertEqual(ctypes.sizeof(Response), 64)
         self.assertEqual(ctypes.sizeof(Task), 192)
+        self.assertEqual(ctypes.sizeof(SavedRegs), 304)
         self.assertEqual(Task.auxv.offset, 112)
 
     def test_header_declares_the_same_sizes(self):
@@ -142,6 +153,7 @@ class ProbeAbiTests(unittest.TestCase):
         self.assertIn("VIROS_PROBE_REQUEST_SIZE  64U", header)
         self.assertIn("VIROS_PROBE_RESPONSE_SIZE 64U", header)
         self.assertIn("VIROS_PROBE_TASK_V1_SIZE  192U", header)
+        self.assertIn("VIROS_PROBE_SAVED_REGS_V1_SIZE 304U", header)
 
     def test_auditor_accepts_minimal_aarch64_rel(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -231,19 +243,24 @@ class ProbeAbiTests(unittest.TestCase):
             self.assertEqual(manifest["pgd_address_kind"], "kernel-virtual-address")
             self.assertEqual(manifest["kernel"]["sha256"], "1" * 64)
             self.assertEqual(manifest["call_abi"]["argument_registers"], ["x0", "x1", "x2"])
-            self.assertEqual(manifest["abi_minor"], 1)
+            self.assertEqual(manifest["abi_minor"], 2)
             self.assertEqual(manifest["abi_layout"]["version"], 1)
             self.assertEqual(manifest["abi_layout"]["task_v1_bytes"], 192)
             self.assertEqual(manifest["abi_layout"]["translation_v1_bytes"], 64)
+            self.assertEqual(manifest["abi_layout"]["saved_regs_v1_bytes"], 304)
             self.assertEqual(
                 manifest["capabilities"],
-                ["snapshot-v1", "translate-va-aarch64-v1"],
+                ["snapshot-v1", "translate-va-aarch64-v1",
+                 "saved-regs-aarch64-v1"],
             )
             self.assertEqual((output / "viros_probe.bin").read_bytes(), flat)
             self.assertEqual(
                 __import__("json").loads((output / "package.json").read_text())["load_address"],
                 base,
             )
+            loaded, loaded_binary = PROBE_TOOL.load_probe_package(output / "package.json")
+            self.assertEqual(loaded["abi_minor"], 2)
+            self.assertEqual(loaded_binary, (output / "viros_probe.bin").resolve())
 
     def test_package_rejects_unaligned_address_before_tools(self):
         with self.assertRaisesRegex(PROBE_TOOL.AuditError, "16-byte aligned"):

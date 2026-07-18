@@ -37,6 +37,11 @@ The first ABI supplies:
 - ELF auxiliary-vector values needed for executable relocation; and
 - target pointer width, byte order and userspace ABI width.
 
+Capability-gated follow-on operations translate checked userspace mappings and
+read a non-current native AArch64 task's saved EL0 x0-x30, SP, PC, and PSTATE
+frame. The latter rejects current/on-CPU tasks, kernel threads, compat32 tasks,
+stale task/mm/start-cookie identities, and malformed exception frames.
+
 List links and record counts are validated.  A snapshot interrupted during a
 list update is rejected and retried at another safe kernel boundary rather
 than exposed as a partially plausible process list.
@@ -99,9 +104,9 @@ The first all-stop facade implements the packet and selection layer for:
 - `qSupported`, `qXfer:threads`, `qfThreadInfo`, `qC`, `qAttached`, and `T`;
 - `Hg`/`Hc` logical process selection;
 - `qXfer:auxv` and `qXfer:exec-file` from the frozen snapshot;
-- registers for the task currently stopped on a vCPU, and checked read-only
-  selected-process memory when the sealed probe advertises its AArch64
-  translation capability;
+- QEMU's complete registers for a current task, saved native AArch64 core
+  registers for a sleeping task, and checked read-only selected-process memory
+  when the sealed probe advertises the corresponding capabilities;
 - ref-counted global QEMU breakpoints with per-process ownership; and
 - `vCont;c` plus current-task-only single stepping.
 
@@ -140,6 +145,11 @@ Completed:
 7. The live facade connects snapshot enumeration and optional checked,
    read-only AArch64 process-memory translation to the multiprocess RSP layer.
    Mock lifecycle and unit tests cover this path.
+8. ABI 1.2 reads validated native AArch64 saved EL0 frames for sleeping tasks.
+   The facade maps those core values into QEMU's target-description order and
+   uses GDB's literal-`x` unavailable encoding for every FP/system register it
+   cannot honestly supply. ABI 1.0/1.1 packages remain listing/translation
+   compatible and do not advertise this operation.
 
 Remaining:
 
@@ -147,10 +157,10 @@ Remaining:
    workflow against that exact bootable kernel.  The downloaded official
    release lacks the matching configured/generated Kbuild tree and is not this
    proof.
-2. Supply saved registers for sleeping tasks; current-vCPU registers are the
-   only register state currently exposed.
-3. Prove that `info inferiors` lists live init/procd/other guest tasks and that
+2. Prove that `info inferiors` lists live init/procd/other guest tasks and that
    selecting sleeping procd reads its ELF header from its own address space.
+3. Prove that selecting sleeping procd also yields its saved core register
+   frame through real GDB against the exact locally built kernel.
 4. Prove that identical virtual-address breakpoints stop only for their owning
    inferior.
 5. Port the call gate and register conversion to ARMv7, then MIPS.

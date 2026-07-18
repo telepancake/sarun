@@ -8,6 +8,7 @@ from typing import Callable, Protocol
 from probe.abi import (
     AUX_TAGS,
     TASK_ON_CPU,
+    ProbeSavedRegisters,
     ProbeTask,
     decode_paginated,
 )
@@ -22,6 +23,11 @@ ExecutableResolver = Callable[[ProbeTask], str]
 class MemoryReader(Protocol):
     def bind_snapshot(self, snapshot) -> None: ...
     def read_memory(self, task: TaskSnapshot, address: int, length: int) -> bytes: ...
+
+
+class RegisterReader(Protocol):
+    def bind_snapshot(self, snapshot) -> None: ...
+    def read_registers(self, task: TaskSnapshot) -> ProbeSavedRegisters: ...
 
 
 def _auxv_bytes(task: ProbeTask, byte_order: str) -> bytes:
@@ -49,10 +55,12 @@ class ProbeOracle:
         fetch_page: PageFetcher,
         executable_resolver: ExecutableResolver | None = None,
         memory_reader: MemoryReader | None = None,
+        register_reader: RegisterReader | None = None,
     ) -> None:
         self.fetch_page = fetch_page
         self.executable_resolver = executable_resolver or (lambda task: "")
         self.memory_reader = memory_reader
+        self.register_reader = register_reader
         self._generation = 0
         self._pgd_kernel_va: dict[TaskId, int] = {}
 
@@ -60,6 +68,8 @@ class ProbeOracle:
         probe = decode_paginated(self.fetch_page)
         if self.memory_reader is not None:
             self.memory_reader.bind_snapshot(probe)
+        if self.register_reader is not None:
+            self.register_reader.bind_snapshot(probe)
         tasks = []
         pgds: dict[TaskId, int] = {}
         for record in probe.tasks:
@@ -102,8 +112,11 @@ class ProbeOracle:
     def write_memory(self, task: TaskSnapshot, address: int, data: bytes) -> None:
         raise NotImplementedError("the frozen probe is read-only and has no memory-write backend")
 
-    def read_registers(self, task: TaskSnapshot) -> bytes:
-        raise NotImplementedError("probe v1 does not yet capture sleeping-task registers")
+    def read_registers(self, task: TaskSnapshot) -> ProbeSavedRegisters:
+        if self.register_reader is None:
+            raise NotImplementedError(
+                "probe package does not provide saved sleeping-task registers")
+        return self.register_reader.read_registers(task)
 
     def write_registers(self, task: TaskSnapshot, data: bytes) -> None:
         raise NotImplementedError("probe v1 does not yet provide a register-write backend")

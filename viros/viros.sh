@@ -1193,10 +1193,56 @@ gdb_stage() {
 }
 
 DEBUG_QEMU_PID=
+DEBUG_QEMU_WATCHDOG_PID=
 DEBUG_GDB_SOCKET=
 DEBUG_CONSOLE_SOCKET=
+
+debug_gdb_children() {
+    local launcher_pid=$1 child comm children_file
+    children_file="/proc/$launcher_pid/task/$launcher_pid/children"
+    [[ -r "$children_file" ]] || return 0
+    read -r -a children < "$children_file" || return 0
+    for child in "${children[@]}"; do
+        [[ -r "/proc/$child/comm" ]] || continue
+        read -r comm < "/proc/$child/comm" || continue
+        [[ "$comm" == gdb ]] && printf '%s\n' "$child"
+    done
+}
+
+terminate_debug_gdb_children() {
+    local launcher_pid=$1 child count
+    local -a children=()
+    mapfile -t children < <(debug_gdb_children "$launcher_pid")
+    ((${#children[@]})) || return 0
+    kill -TERM "${children[@]}" 2>/dev/null || true
+    for count in {1..30}; do
+        children=()
+        mapfile -t children < <(debug_gdb_children "$launcher_pid")
+        ((${#children[@]})) || return 0
+        sleep 0.1
+    done
+    kill -KILL "${children[@]}" 2>/dev/null || true
+}
+
+watch_debug_qemu() {
+    local launcher_pid=$1 qemu_pid=$2
+    while kill -0 "$qemu_pid" 2>/dev/null; do
+        sleep 0.2
+    done
+    # A lost QEMU remote has caused some GDB versions to spin in their main
+    # thread instead of returning to the prompt.  Bound that failure even if
+    # GDB no longer processes its ordinary termination signal.
+    terminate_debug_gdb_children "$launcher_pid"
+}
+
 cleanup_debug_qemu() {
     local count
+    if [[ -n "$DEBUG_QEMU_WATCHDOG_PID" ]]; then
+        kill "$DEBUG_QEMU_WATCHDOG_PID" 2>/dev/null || true
+        wait "$DEBUG_QEMU_WATCHDOG_PID" 2>/dev/null || true
+        DEBUG_QEMU_WATCHDOG_PID=
+    fi
+    terminate_debug_gdb_children "$$"
     if [[ -n "$DEBUG_QEMU_PID" ]] && kill -0 "$DEBUG_QEMU_PID" 2>/dev/null; then
         kill "$DEBUG_QEMU_PID" 2>/dev/null || true
         for count in {1..20}; do
@@ -1702,6 +1748,8 @@ debug_stage() {
     fi
     say "At the GDB prompt run 'viros-console'; press Ctrl-] to return to GDB"
     say "Starting exact-symbol GDB for $target; PID 1 must be printed before the prompt"
+    watch_debug_qemu "$$" "$DEBUG_QEMU_PID" &
+    DEBUG_QEMU_WATCHDOG_PID=$!
     set +e
     VIROS_CONSOLE_SOCKET="$DEBUG_CONSOLE_SOCKET" VIROS_CONSOLE_LOG="$console_log" \
         "$gdb" "${gdb_args[@]}"

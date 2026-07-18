@@ -42,11 +42,12 @@ SCRATCH_REGIONS_SCHEMA = "viros-scratch-regions-v1"
 PROBE_REQUEST_MAGIC = 0x56505251
 PROBE_RESPONSE_MAGIC = 0x56505253
 PROBE_ABI_MAJOR = 1
-PROBE_ABI_MINOR = 1
+PROBE_ABI_MINOR = 2
 PROBE_REQUEST_SIZE = 64
 PROBE_RESPONSE_SIZE = 64
 PROBE_TASK_SIZE = 192
 PROBE_TRANSLATION_SIZE = 64
+PROBE_SAVED_REGS_SIZE = 304
 PROBE_OP_SNAPSHOT = 1
 UINT64_LIMIT = 1 << 64
 
@@ -377,7 +378,7 @@ def load_probe_package(path: Path) -> tuple[dict, Path]:
     if document.get("arch") != "aarch64":
         raise AuditError("only an aarch64 probe package can use this call gate")
     minor = document.get("abi_minor")
-    if document.get("abi_major") != PROBE_ABI_MAJOR or minor not in (0, PROBE_ABI_MINOR):
+    if document.get("abi_major") != PROBE_ABI_MAJOR or minor not in (0, 1, PROBE_ABI_MINOR):
         raise AuditError("probe package ABI is not a supported viros probe ABI 1.x")
     layout = document.get("abi_layout")
     legacy_layout = (
@@ -389,7 +390,7 @@ def load_probe_package(path: Path) -> tuple[dict, Path]:
         and layout.get("translation_record_bytes", PROBE_TRANSLATION_SIZE)
         == PROBE_TRANSLATION_SIZE
     )
-    current_layout = layout == {
+    translation_layout = layout == {
         "version": 1,
         "request_v1_bytes": PROBE_REQUEST_SIZE,
         "response_v1_header_bytes": PROBE_RESPONSE_SIZE,
@@ -397,11 +398,25 @@ def load_probe_package(path: Path) -> tuple[dict, Path]:
         "translation_v1_bytes": PROBE_TRANSLATION_SIZE,
         "target_byte_order": "little",
     }
+    current_layout = layout == {
+        "version": 1,
+        "request_v1_bytes": PROBE_REQUEST_SIZE,
+        "response_v1_header_bytes": PROBE_RESPONSE_SIZE,
+        "task_v1_bytes": PROBE_TASK_SIZE,
+        "translation_v1_bytes": PROBE_TRANSLATION_SIZE,
+        "saved_regs_v1_bytes": PROBE_SAVED_REGS_SIZE,
+        "target_byte_order": "little",
+    }
     capabilities = document.get("capabilities")
     if ((minor == 0 and not legacy_layout)
+            or (minor == 1 and (
+                not translation_layout or capabilities != [
+                    "snapshot-v1", "translate-va-aarch64-v1"
+                ]))
             or (minor == PROBE_ABI_MINOR and (
                 not current_layout or capabilities != [
-                    "snapshot-v1", "translate-va-aarch64-v1"
+                    "snapshot-v1", "translate-va-aarch64-v1",
+                    "saved-regs-aarch64-v1",
                 ]))):
         raise AuditError("probe package has an incompatible ABI layout")
     call_abi = document.get("call_abi")
@@ -849,9 +864,13 @@ def package_object(args):
             "version": 1,
             "request_v1_bytes": 64, "response_v1_header_bytes": 64,
             "task_v1_bytes": 192, "translation_v1_bytes": 64,
+            "saved_regs_v1_bytes": 304,
             "target_byte_order": "little",
         },
-        "capabilities": ["snapshot-v1", "translate-va-aarch64-v1"],
+        "capabilities": [
+            "snapshot-v1", "translate-va-aarch64-v1",
+            "saved-regs-aarch64-v1",
+        ],
         "call_abi": {
             "name": "aapcs64", "argument_registers": ["x0", "x1", "x2"],
             "result_register": "x0", "link_register": "x30",

@@ -8,7 +8,7 @@ from enum import Enum, auto
 from html import escape
 from typing import Protocol
 
-from .linux_oracle import LinuxOracle, Snapshot, TaskId, TaskSnapshot
+from .linux_oracle import LinuxOracle, RegisterRead, Snapshot, TaskId, TaskSnapshot
 
 
 class QemuBackend(Protocol):
@@ -281,7 +281,11 @@ class RspFacade:
             if task is None:
                 return b"E01"
             try:
-                return self.oracle.read_registers(task).hex().encode()
+                registers = self.oracle.read_registers(task)
+                if isinstance(registers, RegisterRead):
+                    return registers.payload
+                # Backwards-compatible boundary for simple test/host oracles.
+                return registers.hex().encode()
             except (NotImplementedError, OSError):
                 return b"E14"
         if payload.startswith(b"p"):

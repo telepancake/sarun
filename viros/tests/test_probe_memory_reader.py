@@ -157,7 +157,7 @@ class ProbeTranslationTests(unittest.TestCase):
         fields = struct.unpack(
             "<" + REQUEST,
             _build_translation_request(probe_task(), 0x1234, LINEAR_OFFSET))
-        self.assertEqual(fields[:6], (0x56505251, 1, 1, 64, 2, 0))
+        self.assertEqual(fields[:6], (0x56505251, 1, 2, 64, 2, 0))
         self.assertEqual((fields[6], fields[7], fields[8], fields[9]),
                          (TASK_PTR, MM_PTR, 0, 0))
         self.assertEqual((fields[10], fields[11], fields[12]),
