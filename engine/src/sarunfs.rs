@@ -92,10 +92,12 @@ struct Inodes {
 
 /// Stable virtual inode identities plus kernel lookup reference counts.
 ///
-/// Zero-count entries deliberately remain interned.  An open-but-unlinked
-/// file may still receive requests, and retaining the identity is both safe
-/// and cheap.  Reclamation can later use handle counts without changing the
-/// protocol contract.
+/// A `FORGET` that releases the last kernel lookup reference also releases the
+/// path identity. Open file and directory descriptions have independent
+/// protocol handles and do not need the node id to remain interned; their
+/// read/write/release paths resolve through `HandleTable`. Keeping forgotten
+/// paths forever is not cheap for configure/build scans that visit hundreds of
+/// thousands of names.
 #[derive(Debug)]
 pub(crate) struct InodeTable {
     state: RwLock<Inodes>,
@@ -193,8 +195,28 @@ impl InodeTable {
 
     pub(crate) fn forget(&self, inode: u64, count: u64) {
         let mut state = self.state.write().unwrap();
-        let current = state.lookups.entry(inode).or_default();
-        *current = current.saturating_sub(count);
+        if inode == 1 {
+            return;
+        }
+        let remaining = state
+            .lookups
+            .get(&inode)
+            .copied()
+            .unwrap_or(0)
+            .saturating_sub(count);
+        if remaining != 0 {
+            state.lookups.insert(inode, remaining);
+            return;
+        }
+        state.lookups.remove(&inode);
+        if let Some(key) = state.by_inode.remove(&inode) {
+            // A detach followed by recreation can already have assigned this
+            // key a newer inode. Never remove that newer identity when the
+            // kernel forgets the old one.
+            if state.by_key.get(&key) == Some(&inode) {
+                state.by_key.remove(&key);
+            }
+        }
     }
 
     /// Remove a name from the intern table without invalidating the inode.
@@ -399,7 +421,7 @@ mod tests {
     }
 
     #[test]
-    fn identity_is_stable_and_forget_saturates() {
+    fn identity_is_stable_until_the_last_lookup_is_forgotten() {
         let table = InodeTable::new((0, String::new()));
         let key = (7, "a/b".to_owned());
         let inode = table.intern(&key);
@@ -410,6 +432,9 @@ mod tests {
         assert_eq!(table.lookup_count(inode), 1);
         table.forget(inode, 20);
         assert_eq!(table.lookup_count(inode), 0);
+        assert_eq!(table.key(inode), None);
+        assert_eq!(table.inode(&key), None);
+        assert_ne!(table.intern(&key), inode);
     }
 
     #[test]
