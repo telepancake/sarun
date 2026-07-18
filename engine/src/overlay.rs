@@ -4846,7 +4846,7 @@ mod chain_tests {
             .any(|(name, kind)| name == "init" && *kind == 'f'));
         let error = fs.box_write_file(id, "init", b"overwrite").unwrap_err();
         assert_eq!(error.raw_os_error(), Some(libc::EROFS));
-        assert!(!state.kinds.read().unwrap().contains_key("init"));
+        assert!(state.kinds.read().unwrap().get("init").is_none());
 
         fs.remove_box(id);
         assert_eq!(fs.inner.synthetic.projection_count(), 0);

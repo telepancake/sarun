@@ -959,8 +959,27 @@ as executable mappings and mmap that genuinely need a host fd.
           server stayed near one core. Unlike the eliminated build-edge scans,
           this remaining cost is dominated by the serialized stream of small
           package-copy, metadata, overlay, and provenance operations through
-          the FUSE service. The complete `world -j10` gate can now resume from
-          the repaired package state.
+          the FUSE service. A resumed `world -j10` ran for 5,023 seconds before
+          the server exited and left its process tree waiting on the aborted
+          mount. SQLite recovered the interrupted 6.8 MB rollback journal and
+          `PRAGMA quick_check` found the 4.6 GB archive intact. A bounded live
+          server backtrace then separated the remaining costs precisely:
+          multiple FUSE workers were simultaneously in
+          `BoxState::children_of`, scanning every captured path with string
+          prefix tests for each directory open. The layer mirror now maintains
+          a direct-child index alongside exact-path lookup; creation, node-kind
+          replacement, removal, rename, subtree reparent, reload, and full
+          hydration all keep it coherent. Directory enumeration is therefore
+          proportional to immediate children rather than the complete layer.
+          All eight depot tests, both merged-layer tests, the focused child
+          transition/reload regression, and the static aarch64 build pass. In
+          the indexed real-workload replay every FUSE worker was idle in
+          `poll`; the newly exposed bottleneck was a single SQLite autocommit
+          deleting the rollback journal while seven provenance/build-edge
+          handlers waited on the per-box connection mutex. The next
+          performance step is to remove per-event rollback-journal churn and
+          batch durable provenance transitions before the complete world gate
+          continues.
           Earlier nonfatal empty-operand arithmetic and generated-config `sed`
           diagnostics stay recorded for attribution rather than normalization.
     - [x] Complete the native-aarch64 FUSE Brush gate from a clean output tree.

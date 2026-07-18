@@ -711,25 +711,7 @@ impl BoxDepot for BoxState {
 
     /// Direct overlay children of dir `rel`: (whiteout names, present names).
     fn children_of(&self, rel: &str) -> (Vec<String>, Vec<String>, Vec<String>) {
-        let prefix = if rel.is_empty() { String::new() } else { format!("{rel}/") };
-        let mut white = vec![];
-        let mut present = vec![];
-        let mut holes = vec![];
-        for (p, e) in self.kinds.read().unwrap().iter() {
-            if !p.starts_with(&prefix) || p.len() == prefix.len() {
-                continue;
-            }
-            let tail = &p[prefix.len()..];
-            if tail.contains('/') {
-                continue;
-            }
-            match e {
-                Entry::Whiteout => white.push(tail.to_string()),
-                Entry::Hole => holes.push(tail.to_string()),
-                _ => present.push(tail.to_string()),
-            }
-        }
-        (white, present, holes)
+        self.kinds.read().unwrap().children_of(rel)
     }
 }
 
@@ -1086,6 +1068,55 @@ mod tests {
         std::fs::write(&bp, content).unwrap();
         b.finalize_file(rel, content.len() as i64, 0, 0);
         bp
+    }
+
+    fn sorted_children(b: &BoxState, rel: &str) -> (Vec<String>, Vec<String>, Vec<String>) {
+        let (mut whiteouts, mut present, mut holes) = b.children_of(rel);
+        whiteouts.sort();
+        present.sort();
+        holes.sort();
+        (whiteouts, present, holes)
+    }
+
+    #[test]
+    fn direct_child_index_tracks_kind_replacement_moves_and_reload() {
+        let _g = TEST_STATE_HOME_LOCK.lock().unwrap();
+        let (b, id, tmp) = fresh_box("child-index");
+        b.set_dir("tree", 0o755, 1);
+        add_file(&b, id, "tree/file", b"file");
+        add_file(&b, id, "tree/deep/file", b"deep");
+        b.set_whiteout("tree/gone", 2);
+        b.kinds.write().unwrap().insert("tree/hole".into(), Entry::Hole);
+
+        assert_eq!(
+            sorted_children(&b, "tree"),
+            (vec!["gone".into()], vec!["file".into()], vec!["hole".into()]),
+            "a descendant must not become an immediate child",
+        );
+
+        // Replacing a tombstone changes its directory-index class in place.
+        b.set_symlink("tree/gone", std::path::Path::new("target"), 3);
+        b.rename_row("tree/file", "tree/renamed");
+        b.drop_row("tree/hole");
+        assert_eq!(
+            sorted_children(&b, "tree"),
+            (vec![], vec!["gone".into(), "renamed".into()], vec![]),
+        );
+
+        // A full mirror reload must remove stale in-memory paths as well as
+        // repopulate the direct-child index from durable rows.
+        {
+            let conn = b.conn.lock().unwrap();
+            conn.execute("DELETE FROM sqlar WHERE name='tree/renamed'", [])
+                .unwrap();
+        }
+        b.load_mirror();
+        assert_eq!(
+            sorted_children(&b, "tree"),
+            (vec![], vec!["gone".into()], vec![]),
+        );
+        assert!(b.kinds.read().unwrap().get("tree/renamed").is_none());
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

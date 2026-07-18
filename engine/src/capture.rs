@@ -207,10 +207,111 @@ pub enum Entry {
     Hole,
 }
 
+#[derive(Clone, Copy)]
+enum ChildState {
+    Present,
+    Whiteout,
+    Hole,
+}
+
+/// In-memory index of one captured layer.
+///
+/// `entries` answers exact-path lookups. `children` is the complementary
+/// directory index: a directory listing must be proportional to that
+/// directory's immediate children, not to every path ever captured in the
+/// box. OpenWrt grows a layer to hundreds of thousands of paths; scanning the
+/// full exact-path map for every opendir made extraction and configure work
+/// effectively quadratic.
+pub struct LayerMirror {
+    entries: HashMap<String, Entry>,
+    children: HashMap<String, Vec<(String, ChildState)>>,
+}
+
+impl LayerMirror {
+    fn new() -> Self {
+        Self { entries: HashMap::new(), children: HashMap::new() }
+    }
+
+    fn parent_name(path: &str) -> Option<(&str, &str)> {
+        if path.is_empty() {
+            None
+        } else {
+            Some(path.rsplit_once('/').unwrap_or(("", path)))
+        }
+    }
+
+    fn child_state(entry: &Entry) -> ChildState {
+        match entry {
+            Entry::Whiteout => ChildState::Whiteout,
+            Entry::Hole => ChildState::Hole,
+            _ => ChildState::Present,
+        }
+    }
+
+    pub fn insert(&mut self, path: String, entry: Entry) -> Option<Entry> {
+        if let Some((parent, name)) = Self::parent_name(&path) {
+            let state = Self::child_state(&entry);
+            let siblings = self.children.entry(parent.to_owned()).or_default();
+            if let Some((_, old_state)) = siblings.iter_mut()
+                .find(|(old_name, _)| old_name == name)
+            {
+                *old_state = state;
+            } else {
+                siblings.push((name.to_owned(), state));
+            }
+        }
+        self.entries.insert(path, entry)
+    }
+
+    pub fn remove(&mut self, path: &str) -> Option<Entry> {
+        if let Some((parent, name)) = Self::parent_name(path) {
+            let mut remove_parent = false;
+            if let Some(siblings) = self.children.get_mut(parent) {
+                siblings.retain(|(old_name, _)| old_name != name);
+                remove_parent = siblings.is_empty();
+            }
+            if remove_parent {
+                self.children.remove(parent);
+            }
+        }
+        self.entries.remove(path)
+    }
+
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        self.children.clear();
+    }
+
+    pub fn get(&self, path: &str) -> Option<&Entry> {
+        self.entries.get(path)
+    }
+
+    pub fn get_mut(&mut self, path: &str) -> Option<&mut Entry> {
+        self.entries.get_mut(path)
+    }
+
+    pub fn children_of(&self, parent: &str) -> (Vec<String>, Vec<String>, Vec<String>) {
+        let Some(children) = self.children.get(parent) else {
+            return (Vec::new(), Vec::new(), Vec::new());
+        };
+        let mut whiteouts = Vec::new();
+        let mut present = Vec::new();
+        let mut holes = Vec::new();
+        for (name, state) in children {
+            match state {
+                ChildState::Present => present.push(name.clone()),
+                ChildState::Whiteout => whiteouts.push(name.clone()),
+                ChildState::Hole => holes.push(name.clone()),
+            }
+        }
+        (whiteouts, present, holes)
+    }
+}
+
 pub struct BoxState {
     pub id: i64,
     pub conn: Mutex<Connection>,
-    pub kinds: RwLock<HashMap<String, Entry>>,
+    pub kinds: RwLock<LayerMirror>,
     /// Sparse metadata mirrors. Attribute lookup is the hottest filesystem
     /// path in a build; querying SQLite twice for every ordinary lower inode
     /// made an absent override vastly more expensive than the backing stat.
@@ -517,7 +618,7 @@ impl BoxState {
         Ok(BoxState {
             id,
             conn: Mutex::new(conn),
-            kinds: RwLock::new(HashMap::new()),
+            kinds: RwLock::new(LayerMirror::new()),
             atimes: RwLock::new(HashMap::new()),
             owners: RwLock::new(HashMap::new()),
             event_sink: Mutex::new(None),
@@ -580,6 +681,7 @@ impl BoxState {
             }
         }
         let mut kinds = self.kinds.write().unwrap();
+        kinds.clear();
         if let Ok(mut st) = conn.prepare("SELECT name,mode,sz,data FROM sqlar") {
             let rows = st.query_map([], |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u32,
