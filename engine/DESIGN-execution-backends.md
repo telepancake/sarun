@@ -747,12 +747,24 @@ as executable mappings and mmap that genuinely need a host fd.
           dangling-symlink matches while rejecting impossible literal suffixes.
           A direct Brush-core unit and the real-box Bash comparison corpus pin
           the GCC shape; vendor reproduction, the static aarch64 build, and all
-          47 Brush conformance probes pass. The focused GCC replay now passes
-          end-to-end under Brush/Kati at `-j10`, building GCC 14.3's initial
-          AArch64 cross compiler and target libgcc and exiting zero. The
-          remaining `world` graph is the next real gate. Earlier nonfatal empty-operand
-          arithmetic and generated-config `sed` diagnostics stay recorded for
-          attribution rather than normalization.
+          47 Brush conformance probes pass. The first focused GCC replay appeared
+          to exit zero, but artifact inspection correctly rejected that result:
+          GCC recipes use `exec`, and Sarun had created each embedded recipe as
+          a root Brush shell. Brush therefore replaced the entire engine process
+          at a nested `exec`, silently abandoning the outer build and install
+          recipes. Embedded make/ninja recipe shells are now explicitly logical
+          subprocesses, so `exec` terminates only that recipe shell. Make/Brush
+          case 56 exercises the external-wrapper, recursive-make, nested-`exec`,
+          build-stamp, and install-stamp boundary; all 56 cases pass and the
+          Brush vendor series reproduces exactly. The real OpenWrt focused
+          replay then ran for 240 seconds at `-j10`, built and installed GCC
+          14.3's initial AArch64 cross compiler and target libgcc, created both
+          `.built` and `.gcc_initial_installed`, and a separate box invocation
+          executed the installed 2,156,368-byte
+          `aarch64-openwrt-linux-musl-gcc`. The remaining `world` graph is the
+          next real gate. Earlier nonfatal empty-operand arithmetic and
+          generated-config `sed` diagnostics stay recorded for attribution
+          rather than normalization.
     - [x] Complete the native-aarch64 FUSE Brush gate from a clean output tree.
           Linux 6.18 builds 823 objects with `-j10` (11 observed overlapping
           clang processes), takes 162 s wall / 143 s compile, and records 2,797
