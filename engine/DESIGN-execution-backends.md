@@ -563,14 +563,21 @@ as executable mappings and mmap that genuinely need a host fd.
           server. A controlled clean `-j4` replay with five-second telemetry
           showed anonymous server RSS growing from 40 MiB to 1.10 GiB in four
           minutes while its thread count stayed at 17--19: this was not a
-          connection-thread leak. The canonical inode table retained every path
-          identity forever after the kernel released its last lookup reference;
-          configure/build tree scans therefore accumulated unbounded anonymous
-          memory. `FORGET` now reclaims zero-reference path identities while
-          preserving the root and independent open-handle lifetime. The static
+          connection-thread leak. The canonical inode table did retain path
+          identities after the kernel released its last lookup reference, so
+          `FORGET` now reclaims zero-reference identities while preserving the
+          root and independent open-handle lifetime. A clean replay showed that
+          this was a real but secondary retention source: static musl's allocator
+          still kept hundreds of freed size-class mappings resident. Sarun now
+          uses statically linked mimalloc, whose empty-page purging fits this
+          long-running, multithreaded allocation pattern. At the comparable
+          four-minute point server RSS is 160 MiB instead of 1.10 GiB, with no
+          swap and the same 19 threads; the curve has flattened rather than
+          growing with every filesystem/provenance operation. The static
           aarch64 build, all 44 Make/Brush cases, and the full FUSE/QEMU backend
-          equivalence/lifecycle suite pass with the reclamation change. The next
-          boundary is a clean telemetry-backed `world` replay with the fix.
+          equivalence/lifecycle suite pass with the reclamation change; the
+          mimalloc build also passes all 44 Make/Brush cases. The next boundary
+          is completing the in-progress clean `-j10 world` replay.
     - [x] Complete the native-aarch64 FUSE Brush gate from a clean output tree.
           Linux 6.18 builds 823 objects with `-j10` (11 observed overlapping
           clang processes), takes 162 s wall / 143 s compile, and records 2,797

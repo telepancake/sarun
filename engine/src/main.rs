@@ -19,6 +19,9 @@ use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::time::Duration;
 
+#[global_allocator]
+static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 pub use net::NetMode;
 
 mod brush;

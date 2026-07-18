@@ -10,6 +10,11 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0"
+# The static-musl system allocator retains the FUSE/capture workload's freed
+# size-class pages indefinitely: a clean OpenWrt build drove anonymous RSS past
+# a gigabyte in four minutes and eventually triggered the OOM killer. Mimalloc
+# eagerly purges empty pages while remaining a fully static global allocator.
+mimalloc = { version = "0.1.52", default-features = false }
 # The depot node model + canonical layer codec (gimir workspace; pure Rust,
 # std-only). `crate::depot` is the engine's seam module; the model crate is
 # aliased `depot_model` to keep the two distinguishable at use sites.
