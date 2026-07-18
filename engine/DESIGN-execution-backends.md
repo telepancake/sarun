@@ -747,8 +747,10 @@ as executable mappings and mmap that genuinely need a host fd.
           dangling-symlink matches while rejecting impossible literal suffixes.
           A direct Brush-core unit and the real-box Bash comparison corpus pin
           the GCC shape; vendor reproduction, the static aarch64 build, and all
-          47 Brush conformance probes pass. Focused GCC replay and the remaining
-          `world` graph are the next real gates. Earlier nonfatal empty-operand
+          47 Brush conformance probes pass. The focused GCC replay now passes
+          end-to-end under Brush/Kati at `-j10`, building GCC 14.3's initial
+          AArch64 cross compiler and target libgcc and exiting zero. The
+          remaining `world` graph is the next real gate. Earlier nonfatal empty-operand
           arithmetic and generated-config `sed` diagnostics stay recorded for
           attribution rather than normalization.
     - [x] Complete the native-aarch64 FUSE Brush gate from a clean output tree.
