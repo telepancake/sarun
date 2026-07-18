@@ -1,4 +1,4 @@
-"""Strict validation for kernel-bound AArch64 call-gate manifests."""
+"""Strict validation for kernel-bound call-gate manifests."""
 
 from __future__ import annotations
 
@@ -9,11 +9,15 @@ from pathlib import Path
 import re
 from typing import Any
 
+from .architectures import AARCH64, ArchitectureDescriptor, architecture_by_name
+
 
 FORMAT = "viros-callgate-v1"
-ARCHITECTURE = "aarch64"
-PAGE_SIZE = 4096
-MAX_REGION_SIZE = 64 * 1024
+# Compatibility constants retained for callers which imported the original
+# AArch64-only loader's public module values.
+ARCHITECTURE = AARCH64.name
+PAGE_SIZE = AARCH64.page_size
+MAX_REGION_SIZE = AARCH64.max_region_size
 UINT32_LIMIT = 1 << 32
 UINT64_LIMIT = 1 << 64
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -94,6 +98,7 @@ class ValidatedManifest:
     """A manifest that has passed file, layout, and invocation validation."""
 
     source: Path
+    architecture: ArchitectureDescriptor
     kernel_file: Path
     kernel_sha256: str
     kernel_build_id: str
@@ -141,7 +146,9 @@ def _decode_hex(value: Any, field: str) -> bytes:
         raise ManifestError(f"{field} must be even-length hexadecimal") from exc
 
 
-def _validate_regions(raw: Any) -> tuple[Region, ...]:
+def _validate_regions(
+    raw: Any, architecture: ArchitectureDescriptor
+) -> tuple[Region, ...]:
     if not isinstance(raw, list) or len(raw) < 3:
         raise ManifestError("regions must contain at least code, data, and stack")
     regions: list[Region] = []
@@ -162,15 +169,22 @@ def _validate_regions(raw: Any) -> tuple[Region, ...]:
         virtual = _integer(obj.get("virtual_address"), f"regions[{index}].virtual_address")
         physical = _integer(obj.get("physical_address"), f"regions[{index}].physical_address")
         size = _integer(obj.get("size"), f"regions[{index}].size")
-        if not size or size > MAX_REGION_SIZE or size % PAGE_SIZE:
+        if (
+            not size
+            or size > architecture.max_region_size
+            or size % architecture.page_size
+        ):
             raise ManifestError(
-                f"regions[{index}].size must be a nonzero page multiple no larger than {MAX_REGION_SIZE}"
+                f"regions[{index}].size must be a nonzero page multiple no larger than "
+                f"{architecture.max_region_size}"
             )
-        if virtual % PAGE_SIZE or physical % PAGE_SIZE:
+        if virtual % architecture.page_size or physical % architecture.page_size:
             raise ManifestError(f"regions[{index}] addresses must be page-aligned")
-        if virtual >= UINT64_LIMIT or virtual + size > UINT64_LIMIT:
+        address_limit = 1 << architecture.address_bits
+        if virtual >= address_limit or virtual + size > address_limit:
             raise ManifestError(
-                f"regions[{index}] virtual address range does not fit in 64 bits"
+                f"regions[{index}] virtual address range does not fit in "
+                f"{architecture.address_bits} bits"
             )
         if physical >= UINT64_LIMIT or physical + size > UINT64_LIMIT:
             raise ManifestError(
@@ -202,7 +216,9 @@ def load_and_validate_manifest(path: str | Path) -> ValidatedManifest:
     root = _mapping(raw, "manifest")
     if root.get("format") != FORMAT:
         raise ManifestError(f"format must be {FORMAT!r}")
-    if root.get("architecture") != ARCHITECTURE:
+    try:
+        architecture = architecture_by_name(root.get("architecture"))
+    except LookupError:
         raise ManifestError("only the aarch64 call gate is supported")
     if root.get("allow_transient_guest_modification") is not True:
         raise ManifestError("allow_transient_guest_modification must be true")
@@ -216,7 +232,7 @@ def load_and_validate_manifest(path: str | Path) -> ValidatedManifest:
     if not re.fullmatch(r"[0-9a-f]{8,128}", build_id):
         raise ManifestError("kernel.build_id must be 8-128 lowercase hex digits")
 
-    regions = _validate_regions(root.get("regions"))
+    regions = _validate_regions(root.get("regions"), architecture)
     by_name = {region.name: region for region in regions}
     probe = _mapping(root.get("probe"), "probe")
     probe_file = _checked_file(
@@ -232,22 +248,13 @@ def load_and_validate_manifest(path: str | Path) -> ValidatedManifest:
     probe_capabilities = tuple(raw_capabilities)
     if len(set(probe_capabilities)) != len(probe_capabilities):
         raise ManifestError("probe.capabilities must not contain duplicates")
-    known_capabilities = {
-        "snapshot-v1",
-        "translate-va-aarch64-v1",
-        "saved-regs-aarch64-v1",
-    }
-    unknown_capabilities = set(probe_capabilities) - known_capabilities
+    unknown_capabilities = set(probe_capabilities) - architecture.known_capabilities
     if unknown_capabilities:
         raise ManifestError(
             "probe.capabilities contains unsupported values: "
             + ", ".join(sorted(unknown_capabilities))
         )
-    dependent_capabilities = {
-        "translate-va-aarch64-v1",
-        "saved-regs-aarch64-v1",
-    }
-    if dependent_capabilities.intersection(probe_capabilities) and (
+    if architecture.dependent_capabilities.intersection(probe_capabilities) and (
         "snapshot-v1" not in probe_capabilities
     ):
         raise ManifestError("probe task operations require snapshot-v1")
@@ -261,9 +268,15 @@ def load_and_validate_manifest(path: str | Path) -> ValidatedManifest:
     completion_offset = _integer(
         probe.get("completion_offset"), "probe.completion_offset"
     )
-    if entry_offset >= len(probe_bytes) or entry_offset % 4:
+    if (
+        entry_offset >= len(probe_bytes)
+        or entry_offset % architecture.instruction_alignment
+    ):
         raise ManifestError("probe.entry_offset must select an aligned instruction")
-    if completion_offset >= len(probe_bytes) or completion_offset % 4:
+    if (
+        completion_offset >= len(probe_bytes)
+        or completion_offset % architecture.instruction_alignment
+    ):
         raise ManifestError("probe.completion_offset must select an aligned instruction")
     if entry_offset == completion_offset:
         raise ManifestError("probe entry and completion instructions must be distinct")
@@ -298,20 +311,20 @@ def load_and_validate_manifest(path: str | Path) -> ValidatedManifest:
     pstate = _integer(invocation.get("pstate"), "invocation.pstate")
     if cpu >= UINT32_LIMIT:
         raise ManifestError("invocation.cpu must fit in 32 bits")
-    if pstate >= UINT32_LIMIT:
+    if pstate >= 1 << architecture.control_state_bits:
         raise ManifestError("invocation.pstate must fit in 32 bits")
-    if pstate & 0xF != 0x5 or pstate & 0x3C0 != 0x3C0:
+    if not architecture.valid_control_state(pstate):
         raise ManifestError("invocation.pstate must select EL1h with DAIF masked")
     stack_name = _string(invocation.get("stack_region"), "invocation.stack_region")
     if stack_name not in by_name or by_name[stack_name].role != "stack":
         raise ManifestError("invocation.stack_region must name a stack region")
     stack_region = by_name[stack_name]
     stack_pointer = _integer(invocation.get("stack_pointer"), "invocation.stack_pointer")
-    if stack_pointer >= UINT64_LIMIT:
+    if stack_pointer >= 1 << architecture.address_bits:
         raise ManifestError("invocation.stack_pointer must fit in 64 bits")
     if not (
         stack_region.virtual_address < stack_pointer <= stack_region.virtual_address + stack_region.size
-    ) or stack_pointer % 16:
+    ) or stack_pointer % architecture.stack_alignment:
         raise ManifestError("invocation.stack_pointer must be aligned inside the stack region")
     request_address = data_region.virtual_address + request_offset
     result_address = data_region.virtual_address + result_offset
@@ -333,6 +346,7 @@ def load_and_validate_manifest(path: str | Path) -> ValidatedManifest:
 
     return ValidatedManifest(
         source=source,
+        architecture=architecture,
         kernel_file=kernel_file,
         kernel_sha256=kernel_sha256,
         kernel_build_id=build_id,

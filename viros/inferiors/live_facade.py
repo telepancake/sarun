@@ -4,9 +4,11 @@ This module owns QEMU's sole GDB connection.  It uses the reversible probe to
 enumerate tasks and, when sealed package capabilities permit, to read
 selected-process memory and a sleeping task's saved native AArch64 EL0 frame.
 Current tasks use QEMU's complete stopped-vCPU register block; sleeping tasks
-mark every unavailable FP/system register explicitly.  Register and process-
-memory writes, compat saved frames, and reads from legacy snapshot-only
-packages fail with an RSP error instead of returning invented state.
+use the exact core ``g``-packet prefix observed from QEMU.  Supplemental
+FP/system registers remain unavailable through per-register reads.  Register
+and process-memory writes, compat saved frames, and reads from legacy
+snapshot-only packages fail with an RSP error instead of returning invented
+state.
 """
 
 from __future__ import annotations
@@ -229,8 +231,14 @@ def build_live_facade(
         partial_registers = None
         if "saved-regs-aarch64-v1" in manifest.probe_capabilities:
             register_reader = register_reader_factory(target, manifest)
+            if not cpu_threads:
+                raise RspRemoteError(b"QEMU exposed no CPU register thread")
+            observed_g_bytes = len(qemu.read_register_block(cpu_threads[0]))
             partial_registers = Aarch64PartialRegisterLayout.from_target_descriptions(
-                descriptions, byte_order="little")
+                descriptions,
+                byte_order="little",
+                observed_g_bytes=observed_g_bytes,
+            )
         probe = ProbeOracle(
             runner,
             memory_reader=memory_reader,

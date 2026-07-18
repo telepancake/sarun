@@ -2,10 +2,10 @@
 
 GDB permits a remote stub to return literal ``x`` digits for a register that
 exists but is unavailable.  This module uses that representation to combine a
-captured userspace core-register set with the complete register layout QEMU
-advertised in its recursively fetched target descriptions.  In particular,
-optional floating-point and system registers are never represented by made-up
-zeroes.
+captured userspace core-register set with the exact ``g``-packet prefix QEMU
+actually returned.  QEMU advertises supplemental floating-point and system
+registers in its target descriptions without including them in ``g``; the
+observed byte count keeps those registers out of a sleeping task's reply.
 
 Target-description XML does not carry target byte order.  The caller therefore
 has to supply it explicitly; this also keeps integer serialization independent
@@ -61,6 +61,7 @@ class Aarch64PartialRegisterLayout:
         descriptions: Mapping[bytes | str, bytes | str],
         *,
         byte_order: str,
+        observed_g_bytes: int,
     ) -> "Aarch64PartialRegisterLayout":
         """Parse ``target.xml`` and its includes in target-description order.
 
@@ -68,10 +69,23 @@ class Aarch64PartialRegisterLayout:
         the live facade's recursive QEMU target-description loader.  Annex
         names may be bytes or ASCII strings.  Register numbers omitted in XML
         follow GDB's global previous-register rule across feature includes.
+
+        QEMU's target description includes supplemental registers which its
+        core ``g`` packet omits.  ``observed_g_bytes`` must therefore end at
+        one unambiguous described-register boundary.  Only that prefix is
+        retained for encoding sleeping-task replies.
         """
 
         if byte_order not in {"little", "big"}:
             raise PartialRegisterError("byte_order must be 'little' or 'big'")
+        if (
+            not isinstance(observed_g_bytes, int)
+            or isinstance(observed_g_bytes, bool)
+            or observed_g_bytes <= 0
+        ):
+            raise PartialRegisterError(
+                "observed_g_bytes must be a positive integer"
+            )
 
         documents: dict[str, bytes] = {}
         for raw_name, raw_document in descriptions.items():
@@ -286,11 +300,31 @@ class Aarch64PartialRegisterLayout:
                 "target architecture explicitly says little-endian"
             )
 
-        by_name = {register.name: register for register in registers}
+        ordered = tuple(sorted(registers, key=lambda item: item.regnum))
+        prefix_end: int | None = None
+        described_bytes = 0
+        for index, register in enumerate(ordered, 1):
+            described_bytes += register.bitsize // 8
+            if described_bytes == observed_g_bytes:
+                prefix_end = index
+                break
+            if described_bytes > observed_g_bytes:
+                raise PartialRegisterError(
+                    f"observed {observed_g_bytes}-byte g packet ends inside "
+                    f"register {register.name!r}"
+                )
+        if prefix_end is None:
+            raise PartialRegisterError(
+                f"observed {observed_g_bytes}-byte g packet exceeds the "
+                f"{described_bytes}-byte described register layout"
+            )
+        core_registers = ordered[:prefix_end]
+
+        by_name = {register.name: register for register in core_registers}
         missing = [name for name in AARCH64_USER_REGISTERS if name not in by_name]
         if missing:
             raise PartialRegisterError(
-                "target description lacks required AArch64 registers: "
+                "observed g-packet prefix lacks required AArch64 registers: "
                 + ", ".join(missing)
             )
         for name, expected in _EXPECTED_BITS.items():
@@ -300,15 +334,16 @@ class Aarch64PartialRegisterLayout:
                     f"target describes {name!r} as {actual} bits, expected {expected}"
                 )
 
-        return cls(tuple(sorted(registers, key=lambda item: item.regnum)), byte_order)
+        return cls(core_registers, byte_order)
 
     def encode_g_packet(self, values: Mapping[str, int]) -> bytes:
         """Return an unframed ASCII reply payload for an RSP ``g`` request.
 
         Every required AArch64 userspace core register must be supplied as an
-        unsigned integer.  All other registers in the target description are
-        encoded as one literal ``x`` per nybble, GDB's specified marker for a
-        known register whose value cannot be accessed.
+        unsigned integer.  Any other register in QEMU's observed core prefix
+        is encoded as one literal ``x`` per nybble, GDB's specified marker for
+        a known register whose value cannot be accessed.  Supplemental
+        registers beyond that prefix are absent, exactly as in QEMU's reply.
         """
 
         supplied = set(values)

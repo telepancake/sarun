@@ -1,4 +1,4 @@
-"""All-or-restore transaction for an injected AArch64 call gate."""
+"""All-or-restore transaction for an injected kernel call gate."""
 
 from __future__ import annotations
 
@@ -6,12 +6,12 @@ from dataclasses import dataclass
 from typing import Any, Protocol, Sequence
 
 from .manifest import ValidatedManifest
+from .architectures import AARCH64
 
 
-AARCH64_REGISTERS = tuple([f"x{number}" for number in range(31)] + ["sp", "pc", "cpsr"])
-AARCH64_RESTORE_ORDER = tuple(
-    [f"x{number}" for number in range(31)] + ["sp", "cpsr", "pc"]
-)
+# Compatibility aliases used by the existing target backends and their tests.
+AARCH64_REGISTERS = AARCH64.register_names
+AARCH64_RESTORE_ORDER = AARCH64.restore_order
 
 
 class CallGateError(RuntimeError):
@@ -55,15 +55,20 @@ def plan(manifest: ValidatedManifest) -> tuple[str, ...]:
     if not isinstance(manifest, ValidatedManifest) or not manifest.is_validated:
         raise CallGateError("a validated call-gate manifest is required")
     code = manifest.region(manifest.code_region)
+    architecture = manifest.architecture
+    arguments = architecture.argument_registers
     return (
-        f"verify stopped AArch64 target against {manifest.kernel_file}",
+        f"verify stopped {architecture.display_name} target against {manifest.kernel_file}",
         f"verify {len(manifest.regions)} virtual-to-physical mappings on CPU {manifest.cpu}",
         f"snapshot {sum(region.size for region in manifest.regions)} bytes of guest RAM",
-        f"snapshot {len(AARCH64_REGISTERS)} core registers on every vCPU",
+        f"snapshot {len(architecture.core_registers)} core registers on every vCPU",
         f"overlay {len(manifest.probe_bytes)} probe bytes at {code.physical_address:#x}",
-        f"set CPU {manifest.cpu} PC={manifest.entry_address:#x}, SP={manifest.stack_pointer:#x}, EL1h; "
-        f"x0=request {manifest.request_address:#x}, x1=result {manifest.result_address:#x}, "
-        f"x2={manifest.result_size:#x}, x30=completion {manifest.completion_address:#x}",
+        f"set CPU {manifest.cpu} PC={manifest.entry_address:#x}, SP={manifest.stack_pointer:#x}, "
+        f"{architecture.control_state_plan_description}; "
+        f"{arguments[0]}=request {manifest.request_address:#x}, "
+        f"{arguments[1]}=result {manifest.result_address:#x}, "
+        f"{arguments[2]}={manifest.result_size:#x}, "
+        f"{architecture.link_register}=completion {manifest.completion_address:#x}",
         f"resume only CPU {manifest.cpu} synchronously to {manifest.completion_address:#x}; "
         "host timeout is not yet enforceable through the stock QEMU packet set",
         "read and validate the mailbox result",
@@ -88,6 +93,7 @@ class CallGateTransaction:
 
         manifest = self.manifest
         target = self.target
+        architecture = manifest.architecture
         target.assert_stopped()
         target.verify_kernel(
             str(manifest.kernel_file), manifest.kernel_sha256, manifest.kernel_build_id
@@ -106,12 +112,12 @@ class CallGateTransaction:
         registers = {
             (cpu, register): target.read_register(cpu, register)
             for cpu in cpus
-            for register in AARCH64_REGISTERS
+            for register in architecture.register_names
         }
         code = manifest.region(manifest.code_region)
         occupants = [
             cpu for cpu in cpus
-            if code.virtual_address <= registers[(cpu, "pc")]
+            if code.virtual_address <= registers[(cpu, architecture.pc_register)]
             < code.virtual_address + code.size
         ]
         if occupants:
@@ -145,15 +151,17 @@ class CallGateTransaction:
             breakpoint = target.add_hardware_breakpoint(manifest.completion_address)
             # Once PC can be redirected, the probe is free to clobber every
             # caller-saved and callee-saved core register.
-            modified_registers.extend((manifest.cpu, name) for name in AARCH64_REGISTERS)
-            for register, value in (
-                ("x0", manifest.request_address),
-                ("x1", manifest.result_address),
-                ("x2", manifest.result_size),
-                ("x30", manifest.completion_address),
-                ("cpsr", manifest.pstate),
-                ("sp", manifest.stack_pointer),
-                ("pc", manifest.entry_address),
+            modified_registers.extend(
+                (manifest.cpu, name) for name in architecture.register_names
+            )
+            for register, value in architecture.entry_register_values(
+                request_address=manifest.request_address,
+                result_address=manifest.result_address,
+                result_size=manifest.result_size,
+                completion_address=manifest.completion_address,
+                control_state=manifest.pstate,
+                stack_pointer=manifest.stack_pointer,
+                entry_address=manifest.entry_address,
             ):
                 target.write_register(manifest.cpu, register, value)
 
@@ -179,7 +187,7 @@ class CallGateTransaction:
             modified_set = set(modified_registers)
             restore_order = [
                 (manifest.cpu, register)
-                for register in AARCH64_RESTORE_ORDER
+                for register in architecture.restore_order
                 if (manifest.cpu, register) in modified_set
             ]
             for cpu, register in restore_order:

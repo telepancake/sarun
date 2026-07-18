@@ -5,13 +5,16 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from dataclasses import FrozenInstanceError
 
+from callgate.architectures import AARCH64, architecture_by_name
 from callgate.manifest import ManifestError, load_and_validate_manifest
 from callgate.transaction import (
     AARCH64_REGISTERS,
     CallGateError,
     CallGateTransaction,
     RestorationError,
+    plan,
 )
 
 
@@ -236,6 +239,42 @@ class TransactionTests(unittest.TestCase):
         self.assertEqual(set(self.target.restore_counts.values()), {1})
         self.assert_restored()
 
+    def test_descriptor_preserves_exact_legacy_entry_write_order(self):
+        CallGateTransaction(self.target, self.manifest).execute()
+        self.assertIs(self.manifest.architecture, AARCH64)
+        self.assertEqual(AARCH64_REGISTERS, AARCH64.register_names)
+        self.assertEqual(
+            self.target.register_writes[:7],
+            [
+                (0, "x0", self.manifest.request_address),
+                (0, "x1", self.manifest.result_address),
+                (0, "x2", self.manifest.result_size),
+                (0, "x30", self.manifest.completion_address),
+                (0, "cpsr", self.manifest.pstate),
+                (0, "sp", self.manifest.stack_pointer),
+                (0, "pc", self.manifest.entry_address),
+            ],
+        )
+
+    def test_descriptor_preserves_exact_legacy_plan(self):
+        self.assertEqual(
+            plan(self.manifest),
+            (
+                f"verify stopped AArch64 target against {self.manifest.kernel_file}",
+                "verify 3 virtual-to-physical mappings on CPU 0",
+                "snapshot 12288 bytes of guest RAM",
+                "snapshot 34 core registers on every vCPU",
+                "overlay 12 probe bytes at 0x40100000",
+                "set CPU 0 PC=0xffff800080100000, SP=0xffff800082002000, EL1h; "
+                "x0=request 0xffff800082000020, x1=result 0xffff800082000040, "
+                "x2=0x8, x30=completion 0xffff800080100004",
+                "resume only CPU 0 synchronously to 0xffff800080100004; "
+                "host timeout is not yet enforceable through the stock QEMU packet set",
+                "read and validate the mailbox result",
+                "restore pages, registers, and breakpoint in finally; then byte-audit state",
+            ),
+        )
+
     def test_sp_is_restored_before_cpsr_and_pc_with_pc_last(self):
         self.target.reject_sp_restore_after_pc = True
         CallGateTransaction(self.target, self.manifest).execute()
@@ -316,6 +355,13 @@ class TransactionTests(unittest.TestCase):
 
 
 class ManifestTests(unittest.TestCase):
+    def test_aarch64_descriptor_registry_is_immutable(self):
+        self.assertIs(architecture_by_name("aarch64"), AARCH64)
+        self.assertEqual(AARCH64.register_bits("cpsr"), 32)
+        self.assertEqual(AARCH64.register_bits("pc"), 64)
+        with self.assertRaises(FrozenInstanceError):
+            AARCH64.stack_alignment = 8
+
     def test_legacy_argument_address_must_match_derived_request_pointer(self):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)

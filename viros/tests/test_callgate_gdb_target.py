@@ -4,6 +4,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
+from callgate.architectures import AARCH64
 from callgate.gdb_target import (
     GdbQemuTarget,
     GdbTargetError,
@@ -241,9 +242,20 @@ class GdbTargetTests(unittest.TestCase):
         self.assertEqual(self.target.read_register(1, "x7"), 0xCAFE)
         self.assertIs(self.gdb.selected, original)
 
+    def test_constructor_defaults_to_frozen_aarch64_descriptor(self):
+        self.assertIs(self.target.architecture, AARCH64)
+        explicit = GdbQemuTarget(self.gdb, AARCH64)
+        self.assertIs(explicit.architecture, AARCH64)
+
     def test_negative_gdb_register_value_is_normalized_to_uint64(self):
         self.gdb.registers[(1, "x8")] = -1
         self.assertEqual(self.target.read_register(0, "x8"), (1 << 64) - 1)
+
+    def test_descriptor_width_controls_register_normalization_and_writes(self):
+        self.gdb.registers[(1, "cpsr")] = -1
+        self.assertEqual(self.target.read_register(0, "cpsr"), (1 << 32) - 1)
+        with self.assertRaisesRegex(GdbTargetError, "invalid value for register cpsr"):
+            self.target.write_register(0, "cpsr", 1 << 32)
 
     def test_hardware_breakpoint_lifetime_is_owned_and_idempotent(self):
         token = self.target.add_hardware_breakpoint(0xFFFF000000100004)

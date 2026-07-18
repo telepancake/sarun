@@ -19,7 +19,7 @@ import xml.etree.ElementTree as ET
 
 from inferiors.qemu_rsp import QemuRspClient
 
-from .transaction import AARCH64_REGISTERS
+from .architectures import AARCH64, ArchitectureDescriptor
 
 
 _GPA = re.compile(r"\bgpa:\s*(0x[0-9a-fA-F]+)\b")
@@ -39,7 +39,7 @@ class _Register:
 @dataclass
 class RspHardwareBreakpoint:
     address: int
-    size: int = 4
+    size: int
     removed: bool = False
 
 
@@ -52,7 +52,7 @@ def _sha256_file(path: Path) -> str:
 
 
 class RspQemuTarget:
-    """Stopped all-stop AArch64 QEMU controlled through normal RSP packets."""
+    """Stopped all-stop QEMU controlled through normal RSP packets."""
 
     # This is a host wall-clock bound: direct socket ownership lets this
     # backend send ^C and wait for the corresponding stop packet.  It is not
@@ -64,10 +64,14 @@ class RspQemuTarget:
         client: QemuRspClient,
         kernel_file: str | Path,
         kernel_build_id: str,
+        architecture: ArchitectureDescriptor = AARCH64,
     ) -> None:
+        if not isinstance(architecture, ArchitectureDescriptor):
+            raise TypeError("architecture must be an ArchitectureDescriptor")
         self.client = client
         self.kernel_file = Path(kernel_file).resolve()
         self.kernel_build_id = kernel_build_id.lower()
+        self.architecture = architecture
         self._threads: tuple[str, ...] | None = None
         self._register_map: dict[str, _Register] | None = None
         self._stop_synchronized = True
@@ -269,17 +273,18 @@ class RspQemuTarget:
             visiting.remove(annex)
 
         visit("target.xml")
-        if architecture not in {"aarch64", "aarch64:little"}:
+        if architecture not in self.architecture.qemu_architecture_names:
             raise RspTargetError(
-                f"QEMU target architecture is {architecture!r}, expected AArch64"
+                f"QEMU target architecture is {architecture!r}, expected "
+                f"{self.architecture.display_name}"
             )
-        missing = set(AARCH64_REGISTERS) - registers.keys()
+        missing = set(self.architecture.register_names) - registers.keys()
         if missing:
             raise RspTargetError(
                 "QEMU target description lacks registers: " + ", ".join(sorted(missing))
             )
-        for name in AARCH64_REGISTERS:
-            expected = 32 if name == "cpsr" else 64
+        for name in self.architecture.register_names:
+            expected = self.architecture.register_bits(name)
             if registers[name].bits != expected:
                 raise RspTargetError(
                     f"QEMU describes {name} as {registers[name].bits} bits, expected {expected}"
@@ -287,8 +292,10 @@ class RspQemuTarget:
         return registers
 
     def _register(self, name: str) -> _Register:
-        if name not in AARCH64_REGISTERS:
-            raise RspTargetError(f"unsupported AArch64 core register: {name}")
+        if name not in self.architecture.register_names:
+            raise RspTargetError(
+                f"unsupported {self.architecture.display_name} core register: {name}"
+            )
         if self._register_map is None:
             self._register_map = self._load_register_map()
         return self._register_map[name]
@@ -326,7 +333,7 @@ class RspQemuTarget:
             raise RspTargetError(
                 f"QEMU returned {len(raw)} bytes for {name}, expected {register.bits // 8}"
             )
-        return int.from_bytes(raw, "little")
+        return int.from_bytes(raw, self.architecture.target_byte_order)
 
     def write_register(self, cpu: int, name: str, value: int) -> None:
         self._require_stop_synchronized()
@@ -341,14 +348,17 @@ class RspQemuTarget:
         try:
             with self._selected_general_cpu(cpu):
                 self.client.write_register(
-                    register.number, value.to_bytes(register.bits // 8, "little")
+                    register.number,
+                    value.to_bytes(
+                        register.bits // 8, self.architecture.target_byte_order
+                    ),
                 )
         except Exception as exc:
             raise RspTargetError(f"cannot write CPU {cpu} register {name}: {exc}") from exc
 
     def add_hardware_breakpoint(self, address: int) -> RspHardwareBreakpoint:
         self._require_stop_synchronized()
-        token = RspHardwareBreakpoint(address)
+        token = RspHardwareBreakpoint(address, self.architecture.breakpoint_size)
         try:
             self.client.insert_breakpoint(1, address, token.size)
         except Exception as exc:
@@ -419,7 +429,7 @@ class RspQemuTarget:
                         "call-gate timeout; interrupted"
                     ) from exc
                 raise
-            actual = self.read_register(cpu, "pc")
+            actual = self.read_register(cpu, self.architecture.pc_register)
             if actual != address:
                 raise RspTargetError(
                     f"QEMU CPU {cpu} stopped at {actual:#x}, expected {address:#x}"

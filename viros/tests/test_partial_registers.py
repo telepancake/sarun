@@ -26,6 +26,9 @@ def values():
     return result
 
 
+CORE_G_BYTES = 31 * 8 + 8 + 8 + 4
+
+
 class PartialRegisterLayoutTests(unittest.TestCase):
     def descriptions(self, *, core=None, extra=b""):
         return {
@@ -40,14 +43,15 @@ class PartialRegisterLayoutTests(unittest.TestCase):
             **({b"features/extra.xml": extra} if extra else {}),
         }
 
-    def test_encodes_core_and_marks_every_extra_register_unavailable(self):
+    def test_encodes_only_observed_core_prefix(self):
         extra = (
             b'<feature><reg name="fpsr" bitsize="32"/>'
             b'<reg name="fpcr" bitsize="32"/>'
             b'<reg name="tag_ctl" bitsize="64"/></feature>'
         )
         layout = Aarch64PartialRegisterLayout.from_target_descriptions(
-            self.descriptions(extra=extra), byte_order="little"
+            self.descriptions(extra=extra), byte_order="little",
+            observed_g_bytes=CORE_G_BYTES,
         )
         payload = layout.encode_g_packet(values())
 
@@ -58,13 +62,13 @@ class PartialRegisterLayoutTests(unittest.TestCase):
             .encode()
             for name in AARCH64_USER_REGISTERS
         )
-        # GDB's `g` reply uses literal x digits, two per unavailable byte.
-        self.assertEqual(payload, expected_core + b"x" * (8 + 8 + 16))
-        self.assertNotIn(b"00" * 8, payload[len(expected_core):])
+        self.assertEqual(payload, expected_core)
+        self.assertEqual(len(layout.registers), len(AARCH64_USER_REGISTERS))
 
     def test_big_endian_is_explicit_and_host_independent(self):
         layout = Aarch64PartialRegisterLayout.from_target_descriptions(
-            self.descriptions(), byte_order="big"
+            self.descriptions(), byte_order="big",
+            observed_g_bytes=CORE_G_BYTES,
         )
         payload = layout.encode_g_packet(values())
         x0_offset = 0
@@ -91,24 +95,23 @@ class PartialRegisterLayoutTests(unittest.TestCase):
             "core.xml": core_xml(explicit=False),
         }
         layout = Aarch64PartialRegisterLayout.from_target_descriptions(
-            descriptions, byte_order="little"
+            descriptions, byte_order="little", observed_g_bytes=CORE_G_BYTES,
         )
-        self.assertEqual(layout.registers[-1].name, "after_core")
-        self.assertEqual(layout.registers[-1].regnum, 34)
-        self.assertTrue(layout.encode_g_packet(values()).endswith(b"xxxx"))
+        self.assertEqual(layout.registers[-1].name, "cpsr")
+        self.assertEqual(layout.registers[-1].regnum, 33)
+        self.assertEqual(len(layout.encode_g_packet(values())), CORE_G_BYTES * 2)
 
     def test_sparse_regnums_order_described_registers_without_gap_padding(self):
         # Remote protocol positions are sorted by protocol register number;
         # absent numbers have no described size and therefore no packet bytes.
         extra = b'<feature><reg name="far_system" bitsize="24" regnum="99"/></feature>'
         layout = Aarch64PartialRegisterLayout.from_target_descriptions(
-            self.descriptions(extra=extra), byte_order="little"
+            self.descriptions(extra=extra), byte_order="little",
+            observed_g_bytes=CORE_G_BYTES,
         )
-        self.assertEqual(layout.registers[-1].regnum, 99)
+        self.assertEqual(layout.registers[-1].regnum, 33)
         payload = layout.encode_g_packet(values())
-        core_bytes = 31 * 8 + 8 + 8 + 4
-        self.assertEqual(len(payload), core_bytes * 2 + 6)
-        self.assertTrue(payload.endswith(b"xxxxxx"))
+        self.assertEqual(len(payload), CORE_G_BYTES * 2)
 
     def test_explicit_regnum_controls_packet_order_not_xml_order(self):
         descriptions = self.descriptions(
@@ -135,7 +138,8 @@ class PartialRegisterLayoutTests(unittest.TestCase):
             b"</target>"
         )
         layout = Aarch64PartialRegisterLayout.from_target_descriptions(
-            descriptions, byte_order="little"
+            descriptions, byte_order="little",
+            observed_g_bytes=CORE_G_BYTES + 2,
         )
         self.assertEqual(layout.registers[0].name, "early_system")
         self.assertTrue(layout.encode_g_packet(values()).startswith(b"xxxx"))
@@ -148,7 +152,7 @@ class PartialRegisterLayoutTests(unittest.TestCase):
             b'<xi:include href="features/core.xml"/></target>'
         )
         layout = Aarch64PartialRegisterLayout.from_target_descriptions(
-            descriptions, byte_order="little"
+            descriptions, byte_order="little", observed_g_bytes=CORE_G_BYTES,
         )
         self.assertEqual(len(layout.registers), 34)
 
@@ -156,37 +160,67 @@ class PartialRegisterLayoutTests(unittest.TestCase):
         duplicate_name = core_xml()[:-10] + b'<reg name="x0" bitsize="64"/></feature>'
         with self.assertRaisesRegex(PartialRegisterError, "duplicate.*name"):
             Aarch64PartialRegisterLayout.from_target_descriptions(
-                self.descriptions(core=duplicate_name), byte_order="little"
+                self.descriptions(core=duplicate_name), byte_order="little",
+                observed_g_bytes=CORE_G_BYTES,
             )
 
         duplicate_number = core_xml()[:-10] + b'<reg name="other" bitsize="64" regnum="0"/></feature>'
         with self.assertRaisesRegex(PartialRegisterError, "duplicate.*number"):
             Aarch64PartialRegisterLayout.from_target_descriptions(
-                self.descriptions(core=duplicate_number), byte_order="little"
+                self.descriptions(core=duplicate_number), byte_order="little",
+                observed_g_bytes=CORE_G_BYTES,
             )
 
     def test_rejects_missing_or_wrong_width_required_register(self):
         missing = core_xml().replace(b'<reg name="pc" bitsize="64" regnum="32"/>', b"")
         with self.assertRaisesRegex(PartialRegisterError, "lacks required.*pc"):
             Aarch64PartialRegisterLayout.from_target_descriptions(
-                self.descriptions(core=missing), byte_order="little"
+                self.descriptions(core=missing), byte_order="little",
+                observed_g_bytes=CORE_G_BYTES - 8,
             )
 
         with self.assertRaisesRegex(PartialRegisterError, "cpsr.*16 bits"):
             Aarch64PartialRegisterLayout.from_target_descriptions(
-                self.descriptions(core=core_xml(bad_bits=16)), byte_order="little"
+                self.descriptions(core=core_xml(bad_bits=16)), byte_order="little",
+                observed_g_bytes=CORE_G_BYTES - 2,
             )
 
     def test_rejects_non_byte_sized_extra_register(self):
         extra = b'<feature><reg name="odd" bitsize="7"/></feature>'
         with self.assertRaisesRegex(PartialRegisterError, "non-byte-sized"):
             Aarch64PartialRegisterLayout.from_target_descriptions(
-                self.descriptions(extra=extra), byte_order="little"
+                self.descriptions(extra=extra), byte_order="little",
+                observed_g_bytes=CORE_G_BYTES,
+            )
+
+    def test_rejects_non_boundary_short_and_oversize_observations(self):
+        descriptions = self.descriptions(
+            extra=b'<feature><reg name="system" bitsize="64"/></feature>'
+        )
+        with self.assertRaisesRegex(PartialRegisterError, "ends inside"):
+            Aarch64PartialRegisterLayout.from_target_descriptions(
+                descriptions, byte_order="little",
+                observed_g_bytes=CORE_G_BYTES - 1,
+            )
+        with self.assertRaisesRegex(PartialRegisterError, "prefix lacks.*cpsr"):
+            Aarch64PartialRegisterLayout.from_target_descriptions(
+                descriptions, byte_order="little",
+                observed_g_bytes=CORE_G_BYTES - 4,
+            )
+        with self.assertRaisesRegex(PartialRegisterError, "exceeds"):
+            Aarch64PartialRegisterLayout.from_target_descriptions(
+                descriptions, byte_order="little",
+                observed_g_bytes=CORE_G_BYTES + 9,
+            )
+        with self.assertRaisesRegex(PartialRegisterError, "positive integer"):
+            Aarch64PartialRegisterLayout.from_target_descriptions(
+                descriptions, byte_order="little", observed_g_bytes=True,
             )
 
     def test_rejects_incomplete_or_invalid_supplied_values(self):
         layout = Aarch64PartialRegisterLayout.from_target_descriptions(
-            self.descriptions(), byte_order="little"
+            self.descriptions(), byte_order="little",
+            observed_g_bytes=CORE_G_BYTES,
         )
         incomplete = values()
         incomplete.pop("pc")

@@ -14,7 +14,10 @@ from inferiors.live_facade import (
     load_target_descriptions,
 )
 from inferiors.linux_oracle import TaskId
-from inferiors.partial_registers import AARCH64_USER_REGISTERS
+from inferiors.partial_registers import (
+    AARCH64_USER_REGISTERS,
+    PartialRegisterError,
+)
 from inferiors.probe_oracle import ProbeOracle
 from inferiors.qemu_rsp import QemuRspClient
 from inferiors.rsp_proxy import RspFacade
@@ -102,6 +105,7 @@ class FakeClient:
         self.register_reads = []
         self.breakpoints = []
         self.resumes = 0
+        self.register_block = bytes.fromhex("01020304")
         self.xml = {
             "target.xml": (
                 b'<target xmlns:xi="http://www.w3.org/2001/XInclude">'
@@ -130,7 +134,7 @@ class FakeClient:
 
     def read_register_block(self, thread):
         self.register_reads.append(thread)
-        return bytes.fromhex("01020304")
+        return self.register_block
 
     def close(self):
         self.closed = True
@@ -404,6 +408,7 @@ class LiveFacadeTests(unittest.TestCase):
             client = FakeClient()
             client.xml["core.xml"] = _full_core_xml(
                 b'<reg name="system_test" bitsize="64" regnum="34"/>')
+            client.register_block = bytes(range(256)) + bytes(range(12))
             saved = FakeSavedRegisterReader()
 
             class Abi12Runner(FrozenRunner):
@@ -422,6 +427,12 @@ class LiveFacadeTests(unittest.TestCase):
                 register_reader_factory=lambda target, sealed: saved,
             )
             try:
+                # A current task remains a byte-for-byte forwarding of QEMU's
+                # raw core block, independent of the sleeping-task encoder.
+                self.assertEqual(
+                    live.facade.handle(b"g"),
+                    client.register_block.hex().encode("ascii"),
+                )
                 self.assertEqual(live.facade.handle(b"Hgp1.1"), b"OK")
                 reply = live.facade.handle(b"g")
                 values = {f"x{index}": index for index in range(31)}
@@ -432,10 +443,43 @@ class LiveFacadeTests(unittest.TestCase):
                     .hex().encode()
                     for name in AARCH64_USER_REGISTERS
                 )
-                self.assertEqual(reply, expected + b"x" * 16)
+                self.assertEqual(reply, expected)
                 self.assertEqual(saved.reads[-1][0], TaskId(1, 1))
+                # CPU 0 supplied the observed size during construction; CPU 1
+                # supplied the unchanged current-task block.  The sleeping
+                # read itself used only the probe.
+                self.assertEqual(client.register_reads, ["1", "2"])
             finally:
                 live.close()
+
+    def test_saved_register_builder_rejects_nonprefix_qemu_g_size(self):
+        with tempfile.TemporaryDirectory(dir=".") as directory_text:
+            directory = Path(directory_text)
+            manifest = _manifest(directory)
+            document = json.loads(manifest.read_text(encoding="utf-8"))
+            document["probe"]["capabilities"] = [
+                "snapshot-v1", "saved-regs-aarch64-v1",
+            ]
+            request = bytearray.fromhex(document["mailbox"]["request_hex"])
+            request[6:8] = (2).to_bytes(2, "little")
+            document["mailbox"]["request_hex"] = request.hex()
+            manifest.write_text(json.dumps(document), encoding="utf-8")
+            client = FakeClient()
+            client.xml["core.xml"] = _full_core_xml()
+            client.register_block = bytes(31 * 8 + 8 + 8 + 3)
+
+            with self.assertRaisesRegex(PartialRegisterError, "ends inside"):
+                build_live_facade(
+                    qemu_socket=str(directory / "qemu.sock"),
+                    gdb_socket=str(directory / "gdb.sock"),
+                    manifest_path=manifest,
+                    client_factory=lambda path, timeout: client,
+                    runner_factory=lambda target, sealed: FrozenRunner(),
+                    register_reader_factory=lambda target, sealed: (
+                        FakeSavedRegisterReader()),
+                )
+            self.assertTrue(client.closed)
+            self.assertEqual(client.register_reads, ["1"])
 
     def test_unadvertised_legacy_manifest_never_constructs_memory_reader(self):
         with tempfile.TemporaryDirectory(dir=".") as directory_text:

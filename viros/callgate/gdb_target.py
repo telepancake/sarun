@@ -12,7 +12,7 @@ from pathlib import Path
 import re
 from typing import Any, Iterator, Sequence
 
-from .transaction import AARCH64_REGISTERS
+from .architectures import AARCH64, ArchitectureDescriptor
 
 
 _GPA = re.compile(r"\bgpa:\s*(0x[0-9a-fA-F]+)\b")
@@ -59,8 +59,12 @@ class GdbQemuTarget:
     def __init__(
         self,
         gdb_module: Any,
+        architecture: ArchitectureDescriptor = AARCH64,
     ):
+        if not isinstance(architecture, ArchitectureDescriptor):
+            raise TypeError("architecture must be an ArchitectureDescriptor")
         self.gdb = gdb_module
+        self.architecture = architecture
 
     def _inferior(self):
         inferior = self.gdb.selected_inferior()
@@ -277,26 +281,34 @@ class GdbQemuTarget:
                 ) from exc
 
     def read_register(self, cpu: int, name: str) -> int:
-        if name not in AARCH64_REGISTERS:
-            raise GdbTargetError(f"unsupported AArch64 core register: {name}")
+        try:
+            bits = self.architecture.register_bits(name)
+        except KeyError as exc:
+            raise GdbTargetError(
+                f"unsupported {self.architecture.display_name} core register: {name}"
+            ) from exc
         with self._selected_cpu(cpu):
             try:
                 self._select_innermost_frame()
                 # GDB exposes registers with their target-defined signedness;
                 # kernel pointers commonly arrive as negative Python ints.
-                # Preserve the architectural 64-bit bit pattern.
-                return int(self.gdb.parse_and_eval("$" + name)) & ((1 << 64) - 1)
+                # Preserve the descriptor-declared architectural bit pattern.
+                return int(self.gdb.parse_and_eval("$" + name)) & ((1 << bits) - 1)
             except Exception as exc:
                 raise GdbTargetError(f"cannot read CPU {cpu} register {name}: {exc}") from exc
 
     def write_register(self, cpu: int, name: str, value: int) -> None:
-        if name not in AARCH64_REGISTERS:
-            raise GdbTargetError(f"unsupported AArch64 core register: {name}")
+        try:
+            bits = self.architecture.register_bits(name)
+        except KeyError as exc:
+            raise GdbTargetError(
+                f"unsupported {self.architecture.display_name} core register: {name}"
+            ) from exc
         if (
             not isinstance(value, int)
             or isinstance(value, bool)
             or value < 0
-            or value >= 1 << 64
+            or value >= 1 << bits
         ):
             raise GdbTargetError(f"invalid value for register {name}: {value!r}")
         with self._selected_cpu(cpu):
@@ -366,7 +378,7 @@ class GdbQemuTarget:
                 # but cannot be enforced until QEMU provides a bounded-run
                 # packet or the backend gains a safe out-of-band interrupter.
                 self.gdb.execute("continue", from_tty=False, to_string=True)
-                actual = self.read_register(cpu, "pc")
+                actual = self.read_register(cpu, self.architecture.pc_register)
                 if actual != address:
                     raise GdbTargetError(
                         f"QEMU CPU {cpu} stopped at {actual:#x}, expected {address:#x}"

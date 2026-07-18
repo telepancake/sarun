@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import hashlib
+from dataclasses import replace
 from pathlib import Path
 import tempfile
 import unittest
 
+from callgate.architectures import AARCH64
 from callgate.rsp_target import RspQemuTarget, RspTargetError
 from callgate.transaction import AARCH64_REGISTERS
 
@@ -180,9 +182,74 @@ class RspQemuTargetTests(unittest.TestCase):
         self.assertIn(("xfer", "features", "target.xml"), self.client.calls)
         self.assertIn(("xfer", "features", "aarch64-core.xml"), self.client.calls)
 
+    def test_constructor_default_and_explicit_descriptor_are_compatible(self):
+        self.assertIs(self.target.architecture, AARCH64)
+        explicit = RspQemuTarget(
+            self.client, self.kernel, self.build_id, AARCH64
+        )
+        self.assertIs(explicit.architecture, AARCH64)
+
+    def test_target_name_and_byte_order_come_from_descriptor(self):
+        descriptor = replace(
+            AARCH64,
+            display_name="Synthetic",
+            target_byte_order="big",
+            qemu_architecture_names=("synthetic",),
+        )
+        self.client.xml["target.xml"] = self.client.xml["target.xml"].replace(
+            b"<architecture>aarch64</architecture>",
+            b"<architecture>synthetic</architecture>",
+        )
+        target = RspQemuTarget(
+            self.client, self.kernel, self.build_id, descriptor
+        )
+        pc_number = AARCH64_REGISTERS.index("pc")
+        self.client.registers[("1", pc_number)] = (0x1020304050607080).to_bytes(
+            8, "big"
+        )
+        self.assertEqual(target.read_register(0, "pc"), 0x1020304050607080)
+        target.write_register(0, "x3", 0x1122334455667788)
+        self.assertEqual(
+            self.client.registers[("1", 3)], bytes.fromhex("1122334455667788")
+        )
+
+    def test_breakpoint_size_comes_from_descriptor(self):
+        descriptor = replace(AARCH64, breakpoint_size=8)
+        target = RspQemuTarget(
+            self.client, self.kernel, self.build_id, descriptor
+        )
+        token = target.add_hardware_breakpoint(0xFFFF000000123000)
+        self.assertEqual(token.size, 8)
+        self.assertEqual(
+            self.client.breakpoint, (1, 0xFFFF000000123000, 8)
+        )
+        target.remove_breakpoint(token)
+
     def test_register_description_rejects_missing_core_register(self):
         self.client.xml["aarch64-core.xml"] = core_xml(omit="pc")
         with self.assertRaisesRegex(RspTargetError, "lacks registers: pc"):
+            self.target.read_register(0, "pc")
+
+    def test_register_description_rejects_wrong_target_name_and_width(self):
+        self.client.xml["target.xml"] = self.client.xml["target.xml"].replace(
+            b"<architecture>aarch64</architecture>",
+            b"<architecture>wrong</architecture>",
+        )
+        with self.assertRaisesRegex(RspTargetError, "expected AArch64"):
+            self.target.read_register(0, "pc")
+
+        self.target._register_map = None
+        self.client.xml["target.xml"] = self.client.xml["target.xml"].replace(
+            b"<architecture>wrong</architecture>",
+            b"<architecture>aarch64</architecture>",
+        )
+        self.client.xml["aarch64-core.xml"] = core_xml().replace(
+            b'<reg name="pc" bitsize="64"/>',
+            b'<reg name="pc" bitsize="32"/>',
+        )
+        with self.assertRaisesRegex(
+            RspTargetError, "describes pc as 32 bits, expected 64"
+        ):
             self.target.read_register(0, "pc")
 
     def test_register_description_resolves_nested_relative_includes(self):
