@@ -864,8 +864,28 @@ as executable mappings and mmap that genuinely need a host fd.
           `System.map`, and the `.modules` stamp, with concrete compiler/linker
           writer records. At this checkpoint the box archive holds 148,537
           processes, 2,037,330 Brush provenance rows, and 931,357 build edges.
-          The next gate is resuming the complete OpenWrt `world` target from
-          this successfully compiled kernel.
+          A complete `world` continuation then re-entered the already-built
+          kernel. Its incremental `target/linux/compile` completed and relinked
+          `vmlinux`, `Image`, and `Image.gz`, but took 2,373 seconds wall for
+          only 44 seconds user and 56 seconds system time in the wrapper. The
+          recursive Kati process accumulated about 81 seconds of CPU while the
+          server stayed near one full core: this is a filesystem-service
+          bottleneck, not a hidden rebuild or dependency-evaluator stall. Two
+          independent amplifiers were found. First, Kati emitted one "Nothing
+          to be done" line per current root even under inherited `-s`, flooding
+          Brush capture; it now honors silent mode, and end-to-end Make/Brush
+          case 63 pins the behavior. Second, each ordinary lower lookup called
+          `BackingStore::exists()` and then `BackingStore::attr()`, causing two
+          complete root-to-leaf PassthroughFsRo walks. Attribute resolution now
+          performs one metadata probe and reuses it for the merge decision and
+          returned attributes. Vendor reconstruction, 47 Kati units, the static
+          aarch64 build, and all 63 Make/Brush cases pass. After the kernel the
+          same run built and installed fwtool, usign, libjson-c, and GRUB; it
+          exited 2 only because the deliberately offline fixture lacked the
+          checksum-pinned Lua 5.1.5 and ncurses 6.4 archives. Both archives are
+          now present in the persistent lower `dl/` cache with OpenWrt's exact
+          expected SHA-256 values. The next gate is resuming `world` in the
+          same box with host networking available for any further cache misses.
           Earlier nonfatal empty-operand arithmetic and generated-config `sed`
           diagnostics stay recorded for attribution rather than normalization.
     - [x] Complete the native-aarch64 FUSE Brush gate from a clean output tree.

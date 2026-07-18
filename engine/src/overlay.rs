@@ -1364,18 +1364,24 @@ impl SarunFs {
     /// (the merged listing clears accumulated names at the opaque-marker box
     /// before applying its own present/whiteout contributions).
     fn resolve(&self, bid: i64, rel: &str) -> Layer {
+        self.resolve_with_lower_presence(bid, rel, self.inner.backing.exists(rel))
+    }
+
+    /// Resolve against an already-probed lower path. Attribute lookup needs
+    /// both the merge decision and the lower metadata; passing the result of
+    /// that single metadata probe here avoids walking every path component
+    /// once for `exists()` and then a second time for `attr()`.
+    fn resolve_with_lower_presence(
+        &self, bid: i64, rel: &str, lower_exists: bool,
+    ) -> Layer {
         let chain = self.chain_of(bid);
         crate::sarunfs::layers::resolve(
             bid,
             rel,
             self.box_of(bid).is_some_and(|origin| origin.is_api()),
             &chain,
-            self.inner.backing.exists(rel),
+            lower_exists,
         )
-    }
-
-    fn lower_attr(&self, ino: u64, rel: &str) -> Option<NodeAttr> {
-        self.inner.backing.attr(rel).ok().map(|attr| attr.node_attr(ino))
     }
 
     fn attr_from_md(&self, ino: u64, md: &std::fs::Metadata) -> NodeAttr {
@@ -1433,7 +1439,12 @@ impl SarunFs {
             attr.kind = NodeKind::RegularFile;
             return Some(attr);
         }
-        let layer = self.resolve(b.id, rel);
+        // The lower probe is required even when an upper layer wins because
+        // lower presence participates in the merge decision. Keep its attrs so
+        // the overwhelmingly common lower case does not repeat a root-to-leaf
+        // PassthroughFsRo traversal after resolving the layer.
+        let lower_attr = self.inner.backing.attr(rel).ok();
+        let layer = self.resolve_with_lower_presence(b.id, rel, lower_attr.is_some());
         // --api substitute: same FUSE-shadow trick as brush, but the target
         // is the safe-for-box oaita.toml the engine pre-wrote at startup.
         // Only when the box was launched with --api AND the rel is the host
@@ -1499,7 +1510,7 @@ impl SarunFs {
         }
         let mut attr = match layer {
             Layer::Absent => None,
-            Layer::Lower => self.lower_attr(ino, rel),
+            Layer::Lower => lower_attr.map(|attr| attr.node_attr(ino)),
             Layer::UpperFile { owner, rowid, mode } => {
                 let bp = blob_path(owner, rowid);
                 let md = bp.metadata().ok()?;
