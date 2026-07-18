@@ -967,8 +967,7 @@ impl brush_core::builtins::SimpleCommand for MakeBuiltin {
         let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
         let recipe_out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
         let recipe_err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
-        let stdin: Option<Box<dyn std::io::Read>> =
-            context.try_fd(0).map(|f| Box::new(f) as Box<dyn std::io::Read>);
+        let stdin = context.try_fd(0);
         let code = crate::katirun::make_builtin(
             &argv, &cwd, &seed_env, out, err, Box::new(recipe_out), Box::new(recipe_err),
             stdin,
@@ -3133,7 +3132,7 @@ pub fn run_recipe_in_process_opt(
     output_cb: &mut dyn FnMut(&[u8]),
     stderr: RecipeStderr,
 ) -> i32 {
-    run_recipe_in_process_prefixed("", cmdline, output_cb, stderr)
+    run_recipe_in_process_prefixed("", cmdline, output_cb, stderr, None)
 }
 
 /// Like run_recipe_in_process_opt, with a make export PREFIX that runs in the
@@ -3145,6 +3144,7 @@ pub fn run_recipe_in_process_prefixed(
     cmdline: &str,
     output_cb: &mut dyn FnMut(&[u8]),
     stderr: RecipeStderr,
+    stdin: Option<std::os::fd::OwnedFd>,
 ) -> i32 {
     let prefix_owned = prefix.to_string();
     let recipe = double_trailing_backslash(unwrap_sh_c(cmdline));
@@ -3195,6 +3195,15 @@ pub fn run_recipe_in_process_prefixed(
             // `exec cmd` must terminate this recipe shell after `cmd`; it must
             // never execve over the engine and abandon the enclosing graph.
             shell.mark_as_embedded_subshell();
+            // A recipe inherits the stdin of the make invocation which owns
+            // it. For an embedded make in `producer | make`, that is Brush's
+            // logical pipe reader, not the engine process's terminal fd 0.
+            if let Some(fd) = stdin {
+                shell.open_files_mut().set_fd(
+                    0,
+                    brush_core::openfiles::OpenFile::from(std::fs::File::from(fd)),
+                );
+            }
             match stderr {
                 RecipeStderr::Merge => {
                     let w2 = match writer.try_clone() {

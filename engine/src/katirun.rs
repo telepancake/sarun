@@ -298,6 +298,7 @@ fn run_kati(
     // variables here — many makes share one engine process, so that would mix
     // their environments.
     seed_env: &[(std::ffi::OsString, std::ffi::OsString)],
+    recipe_stdin: Option<std::sync::Arc<std::os::fd::OwnedFd>>,
     include_dirs: &[OsString],
     no_builtin_rules: bool,
     no_builtin_variables: bool,
@@ -326,6 +327,7 @@ fn run_kati(
     noremake: &std::collections::HashSet<Vec<u8>>,
 ) -> anyhow::Result<RunKatiResult> {
     let mut ev = Evaluator::new();
+    ev.recipe_stdin = recipe_stdin;
     ev.ignore_errors = ignore_errors;
     ev.goal_trace = trace;
     if trace {
@@ -1036,7 +1038,7 @@ fn spool_stdin_makefile(
 fn install_make_recipe_runner() {
     install_var_recorder();
     start_activity_reporting();
-    kati::fileutil::install_recipe_runner(Arc::new(|shell, _shellflag, prefix, cmd, cwd, redirect_stderr, output_cb| {
+    kati::fileutil::install_recipe_runner(Arc::new(|shell, _shellflag, prefix, cmd, cwd, stdin, redirect_stderr, output_cb| {
         use kati::fileutil::RecipeRunnerDecision;
         let posix_shell = kati::fileutil::is_posix_shell_command(shell);
         if !posix_shell {
@@ -1061,7 +1063,9 @@ fn install_make_recipe_runner() {
             kati::fileutil::RedirectStderr::None => crate::brush::RecipeStderr::Inherit,
             kati::fileutil::RedirectStderr::DevNull => crate::brush::RecipeStderr::Null,
         };
-        let code = crate::brush::run_recipe_in_process_prefixed(&p, &s, output_cb, stderr_mode);
+        let stdin = stdin.and_then(|fd| fd.try_clone().ok());
+        let code = crate::brush::run_recipe_in_process_prefixed(
+            &p, &s, output_cb, stderr_mode, stdin);
         crate::brush::set_box_recipe_cwd(prev);
         RecipeRunnerDecision::Ran { code }
     }));
@@ -1121,6 +1125,12 @@ visibly rather than falling back to a real make.\n";
 /// `make`/`gmake`). Returns the process exit code.
 pub fn make_main(argv: &[String]) -> i32 {
     install_make_recipe_runner();
+    use std::os::fd::AsFd as _;
+    let recipe_stdin = std::io::stdin()
+        .as_fd()
+        .try_clone_to_owned()
+        .ok()
+        .map(std::sync::Arc::new);
 
     // 2. Recognized make pseudo-actions BEFORE kati's flags parser sees them
     //    (kati panics on anything it doesn't recognize, e.g. --version). The
@@ -1260,7 +1270,11 @@ pub fn make_main(argv: &[String]) -> i32 {
                 .map(|s| s.to_vec())
                 .collect())
             .unwrap_or_default();
-    let run_result = match run_kati(&targets, &cl_vars, &makefile, &shadow_cwd, &seed_env, &include_dirs, flags.no_builtin_rules, flags.no_builtin_variables, &cmdline_flags, flags.is_dry_run, flags.is_ignore_errors, flags.is_trace, flags.is_always_make, flags.is_question, flags.is_touch, &noremake) {
+    let run_result = match run_kati(&targets, &cl_vars, &makefile, &shadow_cwd,
+        &seed_env, recipe_stdin, &include_dirs, flags.no_builtin_rules,
+        flags.no_builtin_variables, &cmdline_flags, flags.is_dry_run,
+        flags.is_ignore_errors, flags.is_trace, flags.is_always_make,
+        flags.is_question, flags.is_touch, &noremake) {
         Ok(r) => r,
         Err(e) => {
             // Recipe failure already printed its `*** [target] Error N`; just
@@ -1345,9 +1359,13 @@ pub fn make_builtin(
     recipe_out: Box<dyn std::io::Write>,
     recipe_err: Box<dyn std::io::Write>,
     // The builtin's logical stdin (fd 0), for `make -f -`.
-    mut stdin: Option<Box<dyn std::io::Read>>,
+    mut stdin: Option<brush_core::openfiles::OpenFile>,
 ) -> i32 {
     install_make_recipe_runner();
+
+    let recipe_stdin = stdin.as_ref().and_then(|input| {
+        input.try_borrow_as_fd().ok()?.try_clone_to_owned().ok()
+    }).map(std::sync::Arc::new);
 
     // make pseudo-actions handled before kati's flag parser (which panics on
     // unknown flags). --version short-circuits to the gnu-shaped banner.
@@ -1493,7 +1511,11 @@ pub fn make_builtin(
     // and re-run kati, up to a small cap — matching SARUN_KATI_REMAKE_DEPTH.
     let cmdline_flags = extract_long_flags(argv);
     let mut noremake: std::collections::HashSet<Vec<u8>> = Default::default();
-    let mut result = run_kati(&targets, &cl_vars, &makefile, &working_dir, seed_env, &include_dirs, flags.no_builtin_rules, flags.no_builtin_variables, &cmdline_flags, flags.is_dry_run, flags.is_ignore_errors, flags.is_trace, flags.is_always_make, flags.is_question, flags.is_touch, &noremake);
+    let mut result = run_kati(&targets, &cl_vars, &makefile, &working_dir,
+        seed_env, recipe_stdin.clone(), &include_dirs, flags.no_builtin_rules,
+        flags.no_builtin_variables, &cmdline_flags, flags.is_dry_run,
+        flags.is_ignore_errors, flags.is_trace, flags.is_always_make,
+        flags.is_question, flags.is_touch, &noremake);
     let mut remake_depth = 0u32;
     while matches!(&result, Ok(r) if r.remake_active) && remake_depth < 5 {
         remake_depth += 1;
@@ -1509,7 +1531,12 @@ pub fn make_builtin(
         // forever).
         kati::file_cache::clear();
         kati::fileutil::clear_glob_cache();
-        result = run_kati(&targets, &cl_vars, &makefile, &working_dir, seed_env, &include_dirs, flags.no_builtin_rules, flags.no_builtin_variables, &cmdline_flags, flags.is_dry_run, flags.is_ignore_errors, flags.is_trace, flags.is_always_make, flags.is_question, flags.is_touch, &noremake);
+        result = run_kati(&targets, &cl_vars, &makefile, &working_dir,
+            seed_env, recipe_stdin.clone(), &include_dirs,
+            flags.no_builtin_rules, flags.no_builtin_variables,
+            &cmdline_flags, flags.is_dry_run, flags.is_ignore_errors,
+            flags.is_trace, flags.is_always_make, flags.is_question,
+            flags.is_touch, &noremake);
     }
 
     kati::exec::set_recipe_out(prev_out);

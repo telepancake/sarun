@@ -1,0 +1,134 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Sat, 18 Jul 2026 09:39:20 +0000
+Subject: [PATCH] Propagate make stdin into embedded recipes
+
+Carry the invoking make stage stdin through Kati executor workers and the recipe-runner boundary so pipeline-fed recipes read the logical pipe instead of the engine terminal.
+
+---
+diff --git a/src-rs/eval.rs b/src-rs/eval.rs
+index 8ac3d88..ed8f899 100644
+--- a/src-rs/eval.rs
++++ b/src-rs/eval.rs
+@@ -285,6 +285,10 @@ pub struct Evaluator {
+     pub question: bool,
+     /// sarun: per-make GNU -t / --touch mode.
+     pub touch: bool,
++    /// sarun: the invoking make process's logical stdin. Embedded makes may be
++    /// pipeline stages, so this is not necessarily the engine process's fd 0.
++    /// Recipe workers clone the descriptor and pass it to the recipe runner.
++    pub recipe_stdin: Option<Arc<std::os::fd::OwnedFd>>,
+     /// sarun: set by the executor after a run — under -q, true iff any
+     /// recipe WOULD have run (drives the exit-1 status).
+     pub question_would_run: bool,
+@@ -406,6 +410,7 @@ impl Evaluator {
+             always_make: false,
+             question: false,
+             touch: false,
++            recipe_stdin: None,
+             question_would_run: false,
+             global_vars: Arc::new(Mutex::new(Vec::new())),
+             working_dir: std::env::current_dir().unwrap_or_default(),
+diff --git a/src-rs/exec.rs b/src-rs/exec.rs
+index 0798baa..6d07f33 100644
+--- a/src-rs/exec.rs
++++ b/src-rs/exec.rs
+@@ -154,6 +154,10 @@ struct Executor<'a> {
+     always_make: bool,
+     question: bool,
+     touch: bool,
++    /// Logical stdin inherited by this make invocation. This must travel with
++    /// the executor because parallel recipe workers do not inherit thread-local
++    /// state from the thread which parsed the makefile.
++    recipe_stdin: Option<Arc<std::os::fd::OwnedFd>>,
+     /// Suppress the "*** [target] Error N" banner (and no-rule notes) —
+     /// used when remaking OPTIONAL includes, whose failures GNU swallows
+     /// silently.
+@@ -291,6 +295,7 @@ enum RunMsg {
+ fn run_node_commands(
+     shell: &[u8],
+     shellflag: &'static [u8],
++    recipe_stdin: Option<Arc<std::os::fd::OwnedFd>>,
+     req: RunReq,
+     emit: &mut dyn FnMut(&[u8]),
+ ) -> NodeRun {
+@@ -387,6 +392,7 @@ fn run_node_commands(
+         let (ok, code) =
+             if let Some(code) = run_with_installed_runner(
+                 shell, shellflag, &prefix, &command.cmd, &cwd,
++                recipe_stdin.as_deref(),
+                 RedirectStderr::Stdout, emit)
+             {
+                 (code == 0, code)
+@@ -432,6 +438,7 @@ impl<'a> Executor<'a> {
+         let always_make = ev.always_make;
+         let question = ev.question;
+         let touch = ev.touch;
++        let recipe_stdin = ev.recipe_stdin.clone();
+         Ok(Executor {
+             ce: CommandEvaluator::new(ev)?,
+             shell,
+@@ -443,6 +450,7 @@ impl<'a> Executor<'a> {
+             always_make,
+             question,
+             touch,
++            recipe_stdin,
+             quiet_failures: false,
+         })
+     }
+@@ -843,6 +851,7 @@ list of the rule for '{output}' at {loc}"));
+                 let req = reqs.remove(&sym).unwrap();
+                 let shell = self.shell.clone();
+                 let shellflag = self.shellflag;
++                let recipe_stdin = self.recipe_stdin.clone();
+                 let txc = tx.clone();
+                 // Large stack: a recipe may be a recursive sub-make whose kati
+                 // parse/eval recurses deeply on big Makefiles (busybox/kernel).
+@@ -856,7 +865,8 @@ list of the rule for '{output}' at {loc}"));
+                         let mut emit = |b: &[u8]| { let _ = txc.send(RunMsg::Chunk(b.to_vec())); };
+                         let _act = crate::fileutil::ActivityGuard::new(
+                             format!("recipe of '{}'", req.output));
+-                        let r = run_node_commands(&shell, shellflag, req, &mut emit);
++                        let r = run_node_commands(
++                            &shell, shellflag, recipe_stdin, req, &mut emit);
+                         let _ = txc.send(RunMsg::Done(r, slip));
+                     })
+                     .expect("spawn recipe worker");
+diff --git a/src-rs/fileutil.rs b/src-rs/fileutil.rs
+index 6d353ae..5cf8416 100644
+--- a/src-rs/fileutil.rs
++++ b/src-rs/fileutil.rs
+@@ -97,6 +97,7 @@ pub type RecipeRunner = Arc<
+             &[u8], /* prov-free prefix (make's export lines — run, not recorded) */
+             &[u8], /* cmd */
+             &[u8], /* recipe cwd (the make's working_dir, as path bytes) */
++            Option<&std::os::fd::OwnedFd>, /* invoking make's logical stdin */
+             RedirectStderr, /* stderr disposition (merge into output / inherit / discard) */
+             &mut dyn FnMut(&[u8]),
+         ) -> RecipeRunnerDecision
+@@ -133,6 +134,7 @@ pub fn run_with_installed_runner(
+     prefix: &[u8],
+     cmd: &[u8],
+     cwd: &[u8],
++    stdin: Option<&std::os::fd::OwnedFd>,
+     redirect_stderr: RedirectStderr,
+     out_cb: &mut dyn FnMut(&[u8]),
+ ) -> Option<i32> {
+@@ -140,7 +142,7 @@ pub fn run_with_installed_runner(
+     // runner may run a recursive in-process make whose recipes re-enter here;
+     // holding this non-reentrant lock across the call would deadlock.
+     let runner = RECIPE_RUNNER.lock().as_ref()?.clone();
+-    match runner(shell, shellflag, prefix, cmd, cwd, redirect_stderr, out_cb) {
++    match runner(shell, shellflag, prefix, cmd, cwd, stdin, redirect_stderr, out_cb) {
+         RecipeRunnerDecision::Ran { code } => Some(code),
+         RecipeRunnerDecision::Passthrough => None,
+     }
+@@ -246,7 +248,7 @@ pub fn run_command_prefixed(
+     if !cwd.is_empty() {
+         let mut output = Vec::new();
+         if let Some(code) = run_with_installed_runner(
+-            shell, shellflag, prefix, cmd, cwd, redirect_stderr,
++            shell, shellflag, prefix, cmd, cwd, None, redirect_stderr,
+             &mut |b| output.extend_from_slice(b))
+         {
+             return Ok((ExitStatus::from_raw((code & 0xff) << 8), output));

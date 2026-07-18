@@ -1960,6 +1960,34 @@ fi
         check(install_result == b"installed",
               f"case56: parent observes child install result; "
               f"got {install_result!r}")
+        # ── CASE 57: pipeline stdin crosses an embedded make boundary ──
+        # OpenWrt configures kernel headers with `yes '' | make oldconfig`.
+        # The make builtin is a Brush pipeline stage, and recipes launched by
+        # its parallel scheduler must inherit that logical pipe reader rather
+        # than the engine process's terminal stdin.
+        pi = work / "recursive-pipeline-stdin"
+        shutil.rmtree(pi, ignore_errors=True)
+        (pi / "child").mkdir(parents=True)
+        (pi / "Makefile").write_text(
+            ".PHONY: all\n"
+            "all:\n"
+            "\t@printf 'from-pipe\\n' | $(MAKE) --no-print-directory "
+            "-C child result\n"
+            "\t@cat child/result > observed\n")
+        (pi / "child" / "Makefile").write_text(
+            ".PHONY: result\n"
+            "result:\n"
+            "\t@IFS= read -r value; printf '%s\\n' \"$$value\" > result\n")
+        r = run_make("MAKE57", pi, "-j10", "all")
+        check(r.returncode == 0,
+              f"case57: piped recursive make completes (got {r.returncode}: "
+              f"{(r.stdout+r.stderr)[-700:]})")
+        sp57 = latest_sqlar(m)
+        piped_result = m.sqlar_content(
+            sp57, str((pi / "observed").resolve()).lstrip("/"))
+        check(piped_result == b"from-pipe\n",
+              f"case57: child recipe inherits make's logical stdin; "
+              f"got {piped_result!r}")
     finally:
         if eng is not None and eng.poll() is None:
             eng.terminate()
