@@ -4403,10 +4403,18 @@ mod chain_tests {
             b"created",
         );
         let hardlink_name = CString::new("hardlink").unwrap();
+        // The create lookup was explicitly forgotten above. A FUSE client
+        // must reacquire the name before using its inode in a later LINK;
+        // passing a forgotten numeric id tests stale-id use, not hard links.
+        let created_for_link =
+            <SarunFs as virtiofsd::filesystem::FileSystem>::lookup(
+                &fs, ctx, entry.inode, &created_name,
+            )
+            .unwrap();
         let hardlink = <SarunFs as virtiofsd::filesystem::FileSystem>::link(
             &fs,
             ctx,
-            created.inode,
+            created_for_link.inode,
             entry.inode,
             &hardlink_name,
         )
@@ -4437,7 +4445,7 @@ mod chain_tests {
             &fs, ctx, entry.inode, &renamed_name,
         )
         .unwrap();
-        assert_eq!(renamed.inode, created.inode);
+        assert_eq!(renamed.inode, created_for_link.inode);
         <SarunFs as virtiofsd::filesystem::FileSystem>::unlink(
             &fs, ctx, entry.inode, &link_name,
         )
@@ -4497,7 +4505,12 @@ mod chain_tests {
             b"worker-4", b"worker-5", b"worker-6", b"worker-7",
         ];
         let mut workers = Vec::new();
-        let canonical_root = entry.inode;
+        let canonical_root =
+            <SarunFs as virtiofsd::filesystem::FileSystem>::lookup(
+                &fs, ctx, 1, &name,
+            )
+            .unwrap()
+            .inode;
         for index in 0..8 {
             let fs = fs.clone();
             workers.push(std::thread::spawn(move || {
@@ -4548,7 +4561,7 @@ mod chain_tests {
         }
 
         let stat = <SarunFs as virtiofsd::filesystem::FileSystem>::statfs(
-            &fs, ctx, entry.inode,
+            &fs, ctx, canonical_root,
         )
         .unwrap();
         assert!(stat.f_bsize > 0);

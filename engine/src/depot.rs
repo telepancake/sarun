@@ -259,6 +259,28 @@ fn move_node_metadata(conn: &Connection, old: &str, new: &str) {
     }
 }
 
+fn clear_metadata_mirrors(state: &BoxState, rel: &str) {
+    state.atimes.write().unwrap().remove(rel);
+    state.owners.write().unwrap().remove(rel);
+}
+
+fn move_metadata_mirrors(state: &BoxState, old: &str, new: &str) {
+    {
+        let mut atimes = state.atimes.write().unwrap();
+        atimes.remove(new);
+        if let Some(value) = atimes.remove(old) {
+            atimes.insert(new.to_owned(), value);
+        }
+    }
+    {
+        let mut owners = state.owners.write().unwrap();
+        owners.remove(new);
+        if let Some(value) = owners.remove(old) {
+            owners.insert(new.to_owned(), value);
+        }
+    }
+}
+
 impl BoxDepot for BoxState {
 
     /// Upsert the file row for `rel` (data stays NULL — D4) and return its
@@ -280,6 +302,7 @@ impl BoxDepot for BoxState {
             .query_row("SELECT rowid FROM sqlar WHERE name=?1", [rel], |r| r.get(0))
             .unwrap_or(0);
         drop(conn);
+        clear_metadata_mirrors(self, rel);
         self.kinds.write().unwrap()
             .insert(rel.to_string(), Entry::File { rowid, mode });
         rowid
@@ -363,14 +386,12 @@ impl BoxDepot for BoxState {
              ON CONFLICT(name) DO UPDATE SET ns=excluded.ns",
             rusqlite::params![rel, atime_ns],
         );
+        drop(conn);
+        self.atimes.write().unwrap().insert(rel.to_owned(), atime_ns);
     }
 
     fn atime_of(&self, rel: &str) -> Option<i64> {
-        self.conn
-            .lock()
-            .unwrap()
-            .query_row("SELECT ns FROM atime WHERE name=?1", [rel], |row| row.get(0))
-            .ok()
+        self.atimes.read().unwrap().get(rel).copied()
     }
 
     /// chown: stored in a side table (the box squashes to one uid in-namespace,
@@ -381,12 +402,12 @@ impl BoxDepot for BoxState {
             "INSERT INTO ownership(name,uid,gid) VALUES(?1,?2,?3)
              ON CONFLICT(name) DO UPDATE SET uid=excluded.uid, gid=excluded.gid",
             rusqlite::params![rel, uid, gid]);
+        drop(conn);
+        self.owners.write().unwrap().insert(rel.to_owned(), (uid, gid));
     }
 
     fn owner_of(&self, rel: &str) -> Option<(u32, u32)> {
-        self.conn.lock().unwrap().query_row(
-            "SELECT uid,gid FROM ownership WHERE name=?1", [rel],
-            |r| Ok((r.get::<_, i64>(0)? as u32, r.get::<_, i64>(1)? as u32))).ok()
+        self.owners.read().unwrap().get(rel).copied()
     }
 
     // ── xattr (side table; the box's processes get real getfattr/setfattr) ──
@@ -527,6 +548,7 @@ impl BoxDepot for BoxState {
             params![rel, 0o120777u32, now_ns(), t.len() as i64, t, writer],
         );
         drop(conn);
+        clear_metadata_mirrors(self, rel);
         if let Some(rowid) = stale_rowid {
             let _ = std::fs::remove_file(blob_path(self.id, rowid));
         }
@@ -546,6 +568,14 @@ impl BoxDepot for BoxState {
             "SELECT mode,sz,data FROM sqlar WHERE name=?1", [rel],
             |r| Ok((r.get::<_, i64>(0)? as u32, r.get::<_, i64>(1)?,
                     r.get::<_, Option<Vec<u8>>>(2)?))).ok();
+        let atime = conn.query_row(
+            "SELECT ns FROM atime WHERE name=?1", [rel], |r| r.get::<_, i64>(0),
+        ).ok();
+        let owner = conn.query_row(
+            "SELECT uid,gid FROM ownership WHERE name=?1", [rel],
+            |r| Ok((r.get::<_, i64>(0)? as u32,
+                   r.get::<_, i64>(1)? as u32)),
+        ).ok();
         let mut kinds = self.kinds.write().unwrap();
         match row {
             Some((mode, sz, data)) => {
@@ -555,6 +585,15 @@ impl BoxDepot for BoxState {
             None => {
                 kinds.remove(rel);
             }
+        }
+        drop(kinds);
+        match atime {
+            Some(value) => { self.atimes.write().unwrap().insert(rel.to_owned(), value); }
+            None => { self.atimes.write().unwrap().remove(rel); }
+        }
+        match owner {
+            Some(value) => { self.owners.write().unwrap().insert(rel.to_owned(), value); }
+            None => { self.owners.write().unwrap().remove(rel); }
         }
     }
 
@@ -572,6 +611,7 @@ impl BoxDepot for BoxState {
             params![rel, S_IFCHR, writer],
         );
         drop(conn);
+        clear_metadata_mirrors(self, rel);
         if let Some(rid) = stale_rowid {
             let _ = std::fs::remove_file(blob_path(self.id, rid));
         }
@@ -596,6 +636,7 @@ impl BoxDepot for BoxState {
             let _ = conn.execute("UPDATE sqlar SET name=?2 WHERE name=?1",
                                  params![old, new]);
         }
+        move_metadata_mirrors(self, old, new);
         if let Some(rid) = stale_rowid {
             let _ = std::fs::remove_file(blob_path(self.id, rid));
         }
@@ -632,6 +673,11 @@ impl BoxDepot for BoxState {
         }
         drop(kinds);
         drop(conn);
+        for name in &names {
+            let nn = if name == old { new.to_string() }
+                     else { format!("{new}/{}", &name[op.len()..]) };
+            move_metadata_mirrors(self, name, &nn);
+        }
         let mut k = self.kinds.write().unwrap();
         for name in names {
             let nn = if name == old { new.to_string() }
@@ -653,6 +699,7 @@ impl BoxDepot for BoxState {
         clear_node_metadata(&conn, rel);
         let _ = conn.execute("DELETE FROM sqlar WHERE name=?1", [rel]);
         drop(conn);
+        clear_metadata_mirrors(self, rel);
         if let Some(rid) = rowid {
             let _ = std::fs::remove_file(blob_path(self.id, rid));
         }
@@ -1039,6 +1086,76 @@ mod tests {
         std::fs::write(&bp, content).unwrap();
         b.finalize_file(rel, content.len() as i64, 0, 0);
         bp
+    }
+
+    #[test]
+    fn sparse_metadata_mirrors_follow_persistent_mutations() {
+        let _g = TEST_STATE_HOME_LOCK.lock().unwrap();
+        let (b, id, tmp) = fresh_box("metadata-mirror");
+        add_file(&b, id, "src", b"source");
+        add_file(&b, id, "dst", b"destination");
+        b.set_atime("src", 123);
+        b.set_owner("src", 1000, 1001);
+        b.set_atime("dst", 999);
+        b.set_owner("dst", 2000, 2001);
+        assert_eq!(b.atime_of("src"), Some(123));
+        assert_eq!(b.owner_of("src"), Some((1000, 1001)));
+
+        b.rename_row("src", "dst");
+        assert_eq!(b.atime_of("src"), None);
+        assert_eq!(b.owner_of("src"), None);
+        assert_eq!(b.atime_of("dst"), Some(123));
+        assert_eq!(b.owner_of("dst"), Some((1000, 1001)));
+
+        // Reopening restores the sparse mirrors from their durable tables.
+        let reopened = BoxState::create(id).unwrap();
+        reopened.load_mirror();
+        assert_eq!(reopened.atime_of("dst"), Some(123));
+        assert_eq!(reopened.owner_of("dst"), Some((1000, 1001)));
+
+        // An offline metadata update enters a live box through reload_entry.
+        {
+            let conn = reopened.conn.lock().unwrap();
+            conn.execute("UPDATE atime SET ns=456 WHERE name='dst'", [])
+                .unwrap();
+            conn.execute("UPDATE ownership SET uid=42,gid=43 WHERE name='dst'", [])
+                .unwrap();
+        }
+        reopened.reload_entry("dst");
+        assert_eq!(reopened.atime_of("dst"), Some(456));
+        assert_eq!(reopened.owner_of("dst"), Some((42, 43)));
+
+        reopened.set_whiteout("dst", 0);
+        assert_eq!(reopened.atime_of("dst"), None);
+        assert_eq!(reopened.owner_of("dst"), None);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn build_edge_transitions_use_the_newest_indexed_graph() {
+        let _g = TEST_STATE_HOME_LOCK.lock().unwrap();
+        let (b, _id, tmp) = fresh_box("build-edge-index");
+        let old = b.add_build_edge(r#"["same"]"#, "[]", Some("same command"));
+        let current = b.add_build_edge(r#"["same"]"#, "[]", Some("same command"));
+
+        b.mark_build_edge_started(Some("same"), None, 10.0);
+        b.mark_build_edge_done(Some("same"), None, 0, 20.0, Some("done"));
+        let conn = b.conn.lock().unwrap();
+        let state = |id| conn.query_row(
+            "SELECT started_ts,ended_ts FROM build_edges WHERE id=?1", [id],
+            |row| Ok((row.get::<_, Option<f64>>(0)?,
+                      row.get::<_, Option<f64>>(1)?)),
+        ).unwrap();
+        assert_eq!(state(old), (None, None));
+        assert_eq!(state(current), (Some(10.0), Some(20.0)));
+        for name in ["idx_build_edges_primary_out", "idx_build_edges_cmd"] {
+            assert_eq!(conn.query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='index' AND name=?1",
+                [name], |row| row.get::<_, i64>(0),
+            ).unwrap(), 1, "missing transition index {name}");
+        }
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

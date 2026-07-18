@@ -881,17 +881,37 @@ as executable mappings and mmap that genuinely need a host fd.
           `BackingStore::exists()` and then `BackingStore::attr()`, causing two
           complete root-to-leaf PassthroughFsRo walks. Attribute resolution now
           performs one metadata probe and reuses it for the merge decision and
-          returned attributes. Vendor reconstruction, 47 Kati units, the static
-          aarch64 build, and all 63 Make/Brush cases pass. The `.SILENT:` change
-          passes vendor reconstruction and all 47 Kati unit tests; its static
-          aarch64 and full 64-case gates remain pending until the active
-          OpenWrt timing replay releases the engine binary. After the kernel the
+          returned attributes. A timing replay then exposed another
+          per-attribute tax: `atime_of` and `owner_of` each queried the growing
+          sqlar database even when no override existed. Atime and ownership now
+          have coherent in-RAM mirrors,
+          populated once on box hydration and maintained by create, reload,
+          rename, subtree reparent, replacement, and deletion paths; SQLite
+          remains their durable representation rather than their lookup path.
+          A focused mutation/reopen/reload regression pins mirror coherence.
+          The decisive remaining cost was recipe-state attribution rather than
+          inode lookup: the archive contained about 1.4 million `build_edges`,
+          while every start/done event searched the JSON primary output or
+          command without an index. At 22 minutes the server had performed 272
+          million read syscalls and 1.1 TB of logical reads against the 3.4 GB
+          archive while Kati itself had used only 37 CPU seconds. Expression
+          indexes now cover primary-output and command transitions. Transition
+          updates also select the newest matching edge, fixing attribution when
+          a rerun appends a graph containing the same output or command as a
+          historical graph. A focused regression pins both the indexes and
+          newest-graph semantics. On the resumed real workload recursive Kati
+          rose from roughly 3% to 85% CPU and crossed the kernel phase in the
+          first few minutes instead of spending tens of minutes in database
+          scans; the server can now serve concurrent compilation at more than
+          one core. Vendor reconstruction, all 47 Kati units, the static
+          aarch64 build, and all 64 Make/Brush cases pass. After the kernel the
           same run built and installed fwtool, usign, libjson-c, and GRUB; it
           exited 2 only because the deliberately offline fixture lacked the
           checksum-pinned Lua 5.1.5 and ncurses 6.4 archives. Both archives are
           now present in the persistent lower `dl/` cache with OpenWrt's exact
-          expected SHA-256 values. The next gate is resuming `world` in the
-          same box with host networking available for any further cache misses.
+          expected SHA-256 values. The resumed `world` run, with host networking
+          available for any further cache misses, is currently past
+          `target/linux/compile` and building host packages in parallel.
           Earlier nonfatal empty-operand arithmetic and generated-config `sed`
           diagnostics stay recorded for attribution rather than normalization.
     - [x] Complete the native-aarch64 FUSE Brush gate from a clean output tree.

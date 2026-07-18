@@ -124,6 +124,12 @@ CREATE INDEX IF NOT EXISTS idx_brushprov_uid ON brushprov(uid);
 CREATE TABLE IF NOT EXISTS build_edges(id INTEGER PRIMARY KEY AUTOINCREMENT,
  ts REAL, outs TEXT, ins TEXT, cmd TEXT,
  started_ts REAL, ended_ts REAL, exit_code INT, output_excerpt TEXT);
+-- Recipe transitions arrive on separate short-lived control connections and
+-- identify their edge by primary output (kati) or command (n2). Without these
+-- indexes every start/done event scans the complete historical graph.
+CREATE INDEX IF NOT EXISTS idx_build_edges_primary_out
+ ON build_edges(json_extract(outs,'$[0]'), id DESC);
+CREATE INDEX IF NOT EXISTS idx_build_edges_cmd ON build_edges(cmd, id DESC);
 -- oaita `--api` proxy log: one row per request the engine forwarded on this
 -- box's behalf. Routed AROUND the network proxy (the API call leaves through
 -- the engine's HOST-namespace upstream connection, not the box's netns or
@@ -205,6 +211,13 @@ pub struct BoxState {
     pub id: i64,
     pub conn: Mutex<Connection>,
     pub kinds: RwLock<HashMap<String, Entry>>,
+    /// Sparse metadata mirrors. Attribute lookup is the hottest filesystem
+    /// path in a build; querying SQLite twice for every ordinary lower inode
+    /// made an absent override vastly more expensive than the backing stat.
+    /// The sqlar side tables remain authoritative on disk, while mutations
+    /// keep these mirrors coherent just like `kinds`.
+    pub(crate) atimes: RwLock<HashMap<String, i64>>,
+    pub(crate) owners: RwLock<HashMap<String, (u32, u32)>>,
     /// Optional shared engine->UI event queue. The overlay calls
     /// set_event_sink() in add_box() with its own Arc-wrapped queue,
     /// so when record_proc inserts a NEW process row it can push a
@@ -505,6 +518,8 @@ impl BoxState {
             id,
             conn: Mutex::new(conn),
             kinds: RwLock::new(HashMap::new()),
+            atimes: RwLock::new(HashMap::new()),
+            owners: RwLock::new(HashMap::new()),
             event_sink: Mutex::new(None),
             proc_cache: Mutex::new(HashMap::new()),
             activity: Mutex::new(Vec::new()),
@@ -578,6 +593,29 @@ impl BoxState {
                 }
             }
         }
+        drop(kinds);
+        let mut atimes = self.atimes.write().unwrap();
+        atimes.clear();
+        if let Ok(mut st) = conn.prepare("SELECT name,ns FROM atime") {
+            if let Ok(rows) = st.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            }) {
+                atimes.extend(rows.flatten());
+            }
+        }
+        drop(atimes);
+        let mut owners = self.owners.write().unwrap();
+        owners.clear();
+        if let Ok(mut st) = conn.prepare("SELECT name,uid,gid FROM ownership") {
+            if let Ok(rows) = st.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?,
+                    (row.get::<_, i64>(1)? as u32,
+                     row.get::<_, i64>(2)? as u32)))
+            }) {
+                owners.extend(rows.flatten());
+            }
+        }
+        drop(owners);
         // Repopulate the incarnation caches + hierarchy roots from any rows recorded
         // by earlier runs of this box (rerun reopens the same db). ORDER BY id ASC so
         // proc_current keeps the highest-id incarnation per tgid as "current".
@@ -1239,14 +1277,14 @@ impl BoxState {
                 "UPDATE build_edges SET started_ts=?1 WHERE id=(\
                    SELECT id FROM build_edges \
                    WHERE json_extract(outs,'$[0]')=?2 AND started_ts IS NULL \
-                   ORDER BY id LIMIT 1)",
+                   ORDER BY id DESC LIMIT 1)",
                 params![ts, out]);
         } else if let Some(cmd) = cmd {
             let _ = conn.execute(
                 "UPDATE build_edges SET started_ts=?1 WHERE id=(\
                    SELECT id FROM build_edges \
                    WHERE cmd=?2 AND started_ts IS NULL \
-                   ORDER BY id LIMIT 1)",
+                   ORDER BY id DESC LIMIT 1)",
                 params![ts, cmd]);
         }
     }
@@ -1263,7 +1301,7 @@ impl BoxState {
                    SELECT id FROM build_edges \
                    WHERE json_extract(outs,'$[0]')=?3 \
                      AND started_ts IS NOT NULL AND ended_ts IS NULL \
-                   ORDER BY id LIMIT 1)",
+                   ORDER BY id DESC LIMIT 1)",
                 params![ts, code, out, excerpt]);
         } else if let Some(cmd) = cmd {
             let _ = conn.execute(
@@ -1272,7 +1310,7 @@ impl BoxState {
                    SELECT id FROM build_edges \
                    WHERE cmd=?3 \
                      AND started_ts IS NOT NULL AND ended_ts IS NULL \
-                   ORDER BY id LIMIT 1)",
+                   ORDER BY id DESC LIMIT 1)",
                 params![ts, code, cmd, excerpt]);
         }
     }
