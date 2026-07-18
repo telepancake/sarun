@@ -1,0 +1,26 @@
+From: sarun
+Subject: [PATCH] Honor silent mode for no-op root diagnostics
+
+GNU make suppresses its "Nothing to be done" diagnostics under `-s`.
+Kbuild uses silent recursive makes with many already-current explicit roots;
+emitting a line for every root needlessly floods Brush capture and makes an
+incremental kernel traversal substantially more expensive.
+
+---
+ src-rs/exec.rs | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src-rs/exec.rs b/src-rs/exec.rs
+index 43e541c..d8cf25e 100644
+--- a/src-rs/exec.rs
++++ b/src-rs/exec.rs
+@@ -1023,6 +1023,6 @@ pub fn exec_opts(
+     // sarun: emit "Nothing to be done" only for roots whose rule has no
+     // commands at all (or which had no rule) — and never under -q.
+-    if executor.num_commands == 0 && !executor.question {
++    if executor.num_commands == 0 && !executor.question && !FLAGS.is_silent_mode {
+         for (sym, root) in roots {
+             let node = root.lock();
+             if node.cmds.is_empty() {
+-- 
+2.43.0

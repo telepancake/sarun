@@ -2160,6 +2160,22 @@ fi
               b"-mstack-protector-guard=sysreg|environment\n",
               f"case62: recursive build branch sees eval before modpost; "
               f"got {multigoal_result!r}")
+        # ── CASE 63: silent make suppresses no-op root diagnostics ───
+        # Kbuild passes -s to its recursive makes. GNU make does not emit
+        # "Nothing to be done" for their many already-current explicit roots;
+        # doing so floods Brush capture and turns an incremental kernel scan
+        # into thousands of unnecessary output records.
+        silent = work / "silent-noop-roots"
+        shutil.rmtree(silent, ignore_errors=True)
+        silent.mkdir(parents=True)
+        (silent / "Makefile").write_text("one two:\n")
+        r = run_make("MAKE63", silent, "-s", "one", "two")
+        check(r.returncode == 0,
+              f"case63: silent no-op roots complete (got {r.returncode}: "
+              f"{(r.stdout+r.stderr)[-700:]})")
+        check("Nothing to be done" not in r.stdout + r.stderr,
+              f"case63: -s suppresses no-op root diagnostics; "
+              f"got {(r.stdout+r.stderr)!r}")
     finally:
         if eng is not None and eng.poll() is None:
             eng.terminate()
