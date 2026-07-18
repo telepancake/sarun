@@ -817,6 +817,20 @@ as executable mappings and mmap that genuinely need a host fd.
           real Linux tree now completes `ARCH=arm64 stack_protector_prepare`
           with the eval consumed as make syntax. The next real gate is the
           parallel `target/linux/compile` continuation, followed by `world`.
+          That continuation compiled the complete built-in and module object
+          graph, created `vmlinux.a`, and reached `MODPOST` after about 28
+          minutes. Modpost then found `__stack_chk_guard` references in the
+          modules: recipe-time `$(eval)` had updated Kati's variable store, but
+          recursive makes still inherited the exported-variable prefix
+          materialized after parsing. Kati now refreshes that evaluator-owned
+          prefix immediately after an eval, preserving the exact GNU sequence
+          point without process-global environment writes. Make/Brush case 61
+          exports a variable, changes it from a prerequisite recipe, and checks
+          its value and environment origin in a later recursive make. The
+          static aarch64 build and all 61 cases pass. The next gate is replaying
+          the target kernel so Kbuild's command-change tracking recompiles the
+          affected objects with per-task stack-canary flags, then crossing
+          modpost and resuming `world`.
           Earlier nonfatal empty-operand arithmetic and generated-config `sed`
           diagnostics stay recorded for attribution rather than normalization.
     - [x] Complete the native-aarch64 FUSE Brush gate from a clean output tree.

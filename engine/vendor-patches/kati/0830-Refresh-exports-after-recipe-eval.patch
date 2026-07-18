@@ -1,0 +1,36 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Sat, 18 Jul 2026 17:00:00 +0000
+Subject: [PATCH] Refresh exports after recipe eval
+
+GNU make permits `$(eval ...)` during recipe expansion. If it changes an
+exported variable, recipes sequenced after that expansion and recursive makes
+must inherit the new value. The in-process runner materializes exports as an
+evaluator-owned shell prefix rather than mutating the process environment, so
+refresh that prefix immediately after the eval statements run.
+
+Linux arm64 uses this relation to append its per-task stack-canary flags in the
+`stack_protector_prepare` recipe before recursive Kbuild makes compile objects.
+Leaving the parse-time prefix unchanged compiled modules against the global
+`__stack_chk_guard` and failed at modpost.
+
+---
+diff --git a/src-rs/func.rs b/src-rs/func.rs
+index 4ec6501..278361d 100644
+--- a/src-rs/func.rs
++++ b/src-rs/func.rs
+@@ -556,7 +556,11 @@ fn eval_func(args: &[Arc<Value>], ev: &mut Evaluator, _out: &mut dyn BufMut) ->
+         );
+     }
+     let stmts = parse_buf(&text, ev.loc.clone().unwrap_or_default())?;
+-    ev.eval_stmts(&stmts)
++    ev.eval_stmts(&stmts)?;
++    // A recipe-time eval can change an exported variable. Recipes and
++    // in-process recursive makes use the evaluator-owned environment prefix,
++    // so materialize the new state at the same sequence point as GNU make.
++    ev.refresh_box_export_prefix()
+ }
+ 
+ // A hack for Android build. We need to evaluate things like $((3+4))
+-- 
+2.43.0

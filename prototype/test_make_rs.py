@@ -2084,6 +2084,39 @@ fi
               b"-mstack-protector-guard-offset=1224\n",
               f"case60: eval consumes the recipe and appends the shell result; "
               f"got {tab_result!r}")
+        # ── CASE 61: recipe eval refreshes recursive-make exports ───
+        # Linux exports KBUILD_CFLAGS, then its stack_protector_prepare recipe
+        # appends the per-task canary options with $(eval). A later recursive
+        # Kbuild must inherit that new value, not the prefix snapshotted after
+        # parsing; otherwise modules reference the global __stack_chk_guard.
+        evalexport = work / "recipe-eval-export"
+        shutil.rmtree(evalexport, ignore_errors=True)
+        (evalexport / "sub").mkdir(parents=True)
+        (evalexport / "Makefile").write_text(
+            "export KBUILD_CFLAGS\n"
+            ".PHONY: all prepare stack_protector_prepare prepare0\n"
+            "prepare: stack_protector_prepare\n"
+            "stack_protector_prepare: prepare0\n"
+            "\t$(eval KBUILD_CFLAGS += -mstack-protector-guard=sysreg)\n"
+            "prepare0:\n"
+            "all: prepare\n"
+            "\t@$(MAKE) --no-print-directory -C sub all\n")
+        (evalexport / "sub" / "Makefile").write_text(
+            ".PHONY: all\n"
+            "all:\n"
+            "\t@printf '%s|%s\\n' '$(KBUILD_CFLAGS)' "
+            "'$(origin KBUILD_CFLAGS)' > result.txt\n")
+        r = run_make("MAKE61", evalexport, "-j10", "all")
+        check(r.returncode == 0,
+              f"case61: recursive make after recipe eval completes "
+              f"(got {r.returncode}: {(r.stdout+r.stderr)[-700:]})")
+        sp61 = latest_sqlar(m)
+        evalexport_result = m.sqlar_content(
+            sp61, str((evalexport / "sub/result.txt").resolve()).lstrip("/"))
+        check(evalexport_result ==
+              b"-mstack-protector-guard=sysreg|environment\n",
+              f"case61: recipe eval refreshes the exported child value; "
+              f"got {evalexport_result!r}")
     finally:
         if eng is not None and eng.poll() is None:
             eng.terminate()
