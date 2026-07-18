@@ -1,0 +1,47 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Sat, 18 Jul 2026 02:24:50 +0000
+Subject: [PATCH] Parse escaped quotes inside legacy backquotes
+
+---
+diff --git a/src/word.rs b/src/word.rs
+index 5544b3d..cf29b4a 100644
+--- a/src/word.rs
++++ b/src/word.rs
+@@ -1083,6 +1083,7 @@ peg::parser! {
+ 
+         rule backquoted_char() -> &'input str =
+             "\\`" { "`" } /
++            "\\\"" { "\"" } /
+             "\\\\" { "\\" } /
+             s:$([^'`']) { s }
+ 
+@@ -1319,6 +1320,28 @@ mod tests {
+         Ok(())
+     }
+ 
++    #[test]
++    fn backquoted_command_turns_escaped_quotes_into_command_syntax() -> Result<()> {
++        let parsed = super::parse(
++            r#""`cmake_escape_artifact \"${h}\"`""#,
++            &ParserOptions::default(),
++        )?;
++        assert_matches!(
++            &parsed[..],
++            [WordPieceWithSource {
++                piece: WordPiece::DoubleQuotedSequence(pieces),
++                ..
++            }] if matches!(
++                &pieces[..],
++                [WordPieceWithSource {
++                    piece: WordPiece::BackquotedCommandSubstitution(command),
++                    ..
++                }] if command == r#"cmake_escape_artifact "${h}""#
++            )
++        );
++        Ok(())
++    }
++
+     #[test]
+     fn parse_extglob_with_embedded_parameter() -> Result<()> {
+         assert_ron_snapshot!(test_parse("+([$var])")?);

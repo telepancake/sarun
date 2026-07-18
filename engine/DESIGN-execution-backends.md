@@ -607,10 +607,26 @@ as executable mappings and mmap that genuinely need a host fd.
           child slot. The exact external-Perl/shadow-sh regression passes in the
           released-binary nested-shell suite, all 45 Make/Brush cases still
           pass, the static aarch64 build passes, and the captured OpenWrt box
-          now configures and builds `tools/automake`. The next boundary is a
-          fresh `-j10 world` replay, followed by attribution of the remaining
-          workload-proportional RSS and investigation of the earlier nonfatal
-          empty-operand arithmetic diagnostics rather than normalizing them.
+          now configures and builds `tools/automake`. A subsequent genuinely
+          clean `-j10 world` replay ran for 21m55s and reached 20,789 processes,
+          48,012 build edges, 382,806 Brush provenance rows, and 101,918 paths.
+          Peak server RSS was 2,495,700 KiB; the end state retained 2,382,128
+          KiB RSS and used 240,164 KiB swap, so workload-proportional retention
+          remains an explicit investigation after the correctness gate. That
+          replay passed both Autoconf and Automake, then exposed two independent
+          host-tool failures. CMake's bootstrap uses legacy backquotes around
+          `cmake_escape_artifact \"${h}\"`; Brush kept the escaped quotes as
+          literal argument bytes, producing quoted dependency path names in
+          `build.ninja`. Legacy-backquote parsing now removes the escape and
+          lets those quotes group the nested command's argument. The focused
+          parser test and CMake-shaped end-to-end Make/Brush case 46 pass on the
+          static aarch64 engine. Libtool independently failed while recursively
+          generating its bootstrap files; its makefile graph is valid under
+          both GNU make and a fresh embedded dry run, so the next boundary is
+          isolating state retained across its maintainer-clean/bootstrap make
+          invocations, fixing that generically, then replaying the affected
+          CMake and Libtool stages. The earlier nonfatal empty-operand arithmetic
+          diagnostics also remain for attribution rather than normalization.
     - [x] Complete the native-aarch64 FUSE Brush gate from a clean output tree.
           Linux 6.18 builds 823 objects with `-j10` (11 observed overlapping
           clang processes), takes 162 s wall / 143 s compile, and records 2,797

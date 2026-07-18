@@ -1594,6 +1594,38 @@ printf preserved > result.txt
               f"case45: content preserved, later make sees it current, and "
               f"neither ordinary nor phony recipe ran; manual={manual!r} "
               f"verified={verified!r} recipe={recipe_ran!r} phony={phony_ran!r}")
+        # ── CASE 46: escaped quotes inside legacy backquotes are syntax ─────
+        # CMake's bootstrap emits Ninja dependencies through precisely this
+        # construct. POSIX legacy backquotes remove the escape before parsing
+        # the nested command, so the quotes group one argument but do not
+        # become literal quote bytes in that argument.
+        eq = work / "backquote-escaped-quotes"
+        shutil.rmtree(eq, ignore_errors=True)
+        eq.mkdir(parents=True, exist_ok=True)
+        probe = eq / "probe.sh"
+        probe.write_text(r'''#!/bin/sh
+show_arg() {
+  test "$#" = 1 || exit 20
+  printf '<%s>' "$1"
+}
+h='Source/header with space.hxx'
+dep="start `show_arg \"${h}\"`"
+test "$dep" = 'start <Source/header with space.hxx>' || exit 21
+printf '%s\n' "$dep" > result.txt
+''')
+        probe.chmod(0o755)
+        (eq / "Makefile").write_text("all:\n\t@./probe.sh\n")
+        r = run_make("MAKE46", eq, "-j10", "all")
+        check(r.returncode == 0,
+              f"case46: escaped quotes group the nested backquote argument "
+              f"without becoming data (got {r.returncode}: "
+              f"{(r.stdout+r.stderr)[-700:]})")
+        sp46 = latest_sqlar(m)
+        quoted = m.sqlar_content(
+            sp46, str((eq / "result.txt").resolve()).lstrip("/"))
+        check(quoted == b"start <Source/header with space.hxx>\n",
+              f"case46: CMake-style nested argument is one unquoted value; "
+              f"got {quoted!r}")
     finally:
         if eng is not None and eng.poll() is None:
             eng.terminate()
