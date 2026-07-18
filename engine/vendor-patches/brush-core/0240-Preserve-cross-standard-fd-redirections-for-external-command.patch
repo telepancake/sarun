@@ -1,0 +1,29 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Sat, 18 Jul 2026 01:47:06 +0000
+Subject: [PATCH] Preserve cross-standard-fd redirections for external commands
+
+---
+diff --git a/src/openfiles.rs b/src/openfiles.rs
+index f51ece0..1cc2538 100644
+--- a/src/openfiles.rs
++++ b/src/openfiles.rs
+@@ -238,6 +238,18 @@ impl TryFrom<OpenFile> for Stdio {
+         // fail (e.g. under descriptor exhaustion), so the conversion is fallible and the error is
+         // surfaced to the caller rather than silently degrading the child's streams.
+         match open_file {
++            // A standard-stream *value* is not necessarily being installed in
++            // the matching child slot.  For example, `2>&1` stores an
++            // `OpenFile::Stdout` in logical fd 2.  `Stdio::inherit()` here
++            // inherits child fd 2 from parent fd 2 and silently loses that
++            // cross-fd duplication.  Materialize a duplicate of the stream's
++            // actual descriptor; compose_std_command already skips this
++            // conversion for unchanged stdin/stdout/stderr mappings.
++            #[cfg(unix)]
++            standard @ (OpenFile::Stdin(_) | OpenFile::Stdout(_) | OpenFile::Stderr(_)) => {
++                Ok(standard.try_clone_to_owned()?.into())
++            }
++            #[cfg(not(unix))]
+             OpenFile::Stdin(_) | OpenFile::Stdout(_) | OpenFile::Stderr(_) => Ok(Self::inherit()),
+             OpenFile::File(f) => Ok(f.try_clone()?.into()),
+             OpenFile::PipeReader(r) => Ok(r.try_clone()?.into()),

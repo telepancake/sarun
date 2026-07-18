@@ -592,8 +592,25 @@ as executable mappings and mmap that genuinely need a host fd.
           skips phony recipes, including in recursive makes and inherited
           `MAKEFLAGS`. The exact OpenWrt two-pass shape is Make/Brush case 45;
           the static aarch64 build and complete 45-case suite pass. The next
-          boundary is another clean `-j10 world` replay past Autoconf, followed
-          by a long-run RSS attribution if growth remains proportional.
+          clean `-j10 world` replay passed that Autoconf boundary and ran for
+          1,201 seconds, reaching 20,173 processes, 47,138 build edges, 374,270
+          Brush provenance rows and 69,984 captured paths. Peak server RSS was
+          2,511,472 KiB with only 1,348 KiB swapped. It then exposed Automake's
+          external-parent shell shape: autom4te uses Perl backticks to capture
+          `sh -c 'm4 2>&1 >/dev/null'`. Brush represented `2>&1` correctly in
+          its logical fd table, but conversion of an `OpenFile::Stdout` stored
+          in child fd 2 used `Stdio::inherit()`, which re-inherited parent fd 2
+          instead of duplicating the actual fd 1 pipe. The m4 definitions leaked
+          to the terminal and Perl received an empty string, making Automake
+          falsely report a missing `AM_INIT_AUTOMAKE`. Standard-stream values
+          now materialize their actual descriptor when installed in a different
+          child slot. The exact external-Perl/shadow-sh regression passes in the
+          released-binary nested-shell suite, all 45 Make/Brush cases still
+          pass, the static aarch64 build passes, and the captured OpenWrt box
+          now configures and builds `tools/automake`. The next boundary is a
+          fresh `-j10 world` replay, followed by attribution of the remaining
+          workload-proportional RSS and investigation of the earlier nonfatal
+          empty-operand arithmetic diagnostics rather than normalizing them.
     - [x] Complete the native-aarch64 FUSE Brush gate from a clean output tree.
           Linux 6.18 builds 823 objects with `-j10` (11 observed overlapping
           clang processes), takes 162 s wall / 143 s compile, and records 2,797

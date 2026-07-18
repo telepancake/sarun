@@ -326,6 +326,31 @@ def main():
         check(m.sqlar_content(sp10, "root/dashdash.txt") == b"OK\n",
               "case10: recipe after `-c --` actually ran (dashdash.txt is 'OK')")
 
+        # ── CASE 11: external parent + shadow shell preserves `2>&1` ───────
+        # Automake's autom4te uses Perl backticks to run
+        #   sh -c '... 2>&1 >/dev/null'
+        # and capture a tool's stderr.  The shadow shell starts with fd 1
+        # already attached to Perl's pipe.  Brush must duplicate that actual
+        # inherited fd for `2>&1`; treating OpenFile::Stdout as generic
+        # `Stdio::inherit()` instead leaves the child on fd 2, leaks the text
+        # to the terminal, and gives Perl an empty result.
+        r = subprocess.run(
+            [str(BIN), "run", "-b", "PARENTPIPE", "--",
+             "sh", "-c",
+             "perl -e '$x=`/bin/ls /sarun-definitely-not-present "
+             "2>&1 >/dev/null`; print length($x) ? \"CAPTURED\\n\" : "
+             "\"EMPTY\\n\"'"],
+            capture_output=True, text=True, timeout=120)
+        check(r.returncode == 0,
+              f"case11: external-parent fd probe exits 0 (got {r.returncode}: "
+              f"{r.stderr[-300:]})")
+        check(r.stdout == "CAPTURED\n",
+              f"case11: Perl captured external stderr through shadow sh "
+              f"(stdout={r.stdout!r})")
+        check("sarun-definitely-not-present" not in r.stderr,
+              f"case11: redirected stderr did NOT leak to terminal "
+              f"(stderr={r.stderr[-300:]!r})")
+
         # ── CASE 4 (negative): non-brush box ───────────────────────────────
         # No -b → no shadow binds, no SARUN_BRUSH_SH. The nested /bin/sh is the
         # real system shell directly, and the box has NO brushprov rows.
