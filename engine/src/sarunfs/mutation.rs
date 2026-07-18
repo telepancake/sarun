@@ -175,7 +175,7 @@ mod tests {
 
         let box_state = BoxState::create(9831).unwrap();
         let journal = MutationJournal::new();
-        let capture = journal.writer(&box_state, std::process::id());
+        let capture = journal.writer(&box_state, std::process::id(), false);
         capture.set_dir("work", 0o755);
         capture.ensure_file("work/result", 0o100644);
         capture.finalize_file("work/result", 17, 23);
@@ -201,7 +201,7 @@ mod tests {
         assert_eq!(box_state.get_xattr("work/result", "user.test"), None);
 
         journal
-            .writer(&box_state, std::process::id())
+            .writer(&box_state, std::process::id(), false)
             .delete("work/final");
         assert!(matches!(
             box_state.entry("work/final"),

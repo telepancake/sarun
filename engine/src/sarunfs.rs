@@ -426,7 +426,7 @@ mod tests {
         let key = (7, "a/b".to_owned());
         let inode = table.intern(&key);
         assert_eq!(inode, table.intern(&key));
-        assert_eq!(table.key(inode), Some(key));
+        assert_eq!(table.key(inode), Some(key.clone()));
         table.acquire(inode, 3);
         table.forget(inode, 2);
         assert_eq!(table.lookup_count(inode), 1);

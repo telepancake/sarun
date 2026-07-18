@@ -761,10 +761,33 @@ as executable mappings and mmap that genuinely need a host fd.
           14.3's initial AArch64 cross compiler and target libgcc, created both
           `.built` and `.gcc_initial_installed`, and a separate box invocation
           executed the installed 2,156,368-byte
-          `aarch64-openwrt-linux-musl-gcc`. The remaining `world` graph is the
-          next real gate. Earlier nonfatal empty-operand arithmetic and
-          generated-config `sed` diagnostics stay recorded for attribution
-          rather than normalization.
+          `aarch64-openwrt-linux-musl-gcc`. Resuming `world` then exposed that
+          embedded recipes inherited the host terminal as fd 0 instead of the
+          make invocation's logical stdin: OpenWrt's `yes '' | make oldconfig`
+          blocked forever with `yes` filling its unread pipe. Logical make
+          stdin now follows the Evaluator/Executor boundary into parallel Kati
+          workers and is installed as each Brush recipe's fd 0. Make/Brush case
+          57 covers an exact piped recursive-make/read shape; all 57 cases and
+          both vendor reproduction checks pass. The real OpenWrt questionnaire
+          now consumes the pipe and completes. Its next kernel-header pass found
+          a filesystem type-replacement bug rather than a make rule failure:
+          tar unlinked then recreated
+          `arch/arm64/tools/syscall_64.tbl`, but `set_symlink` updated only the
+          old whiteout row's payload and size, leaving its mode as a tombstone.
+          Symlink replacement now clears stale node metadata and resets all
+          type-bearing SQLar columns, provenance, and opacity; replacing a
+          regular file also removes its stale blob. A focused depot regression
+          covers both whiteout and regular-file replacement. In a clean real
+          extraction the relative syscall-table symlink is visible, `oldconfig`
+          completes, `SYSHDR` generates `unistd_64.h`, and `headers_install`
+          consumes the generated AArch64 ABI headers. The clean focused target
+          exits zero after 1,079.66 seconds, creates both `.built` and
+          `.linux_installed`, and an independent box verifies the live symlink,
+          generated header, and stamps. The complete 57-case Make/Brush suite
+          also passes against this engine. The remaining `world` graph is the
+          next real gate.
+          Earlier nonfatal empty-operand arithmetic and generated-config `sed`
+          diagnostics stay recorded for attribution rather than normalization.
     - [x] Complete the native-aarch64 FUSE Brush gate from a clean output tree.
           Linux 6.18 builds 823 objects with `-j10` (11 observed overlapping
           clang processes), takes 162 s wall / 143 s compile, and records 2,797

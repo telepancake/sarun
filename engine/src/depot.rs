@@ -506,16 +506,30 @@ impl BoxDepot for BoxState {
 
     fn set_symlink(&self, rel: &str, target: &std::path::Path, writer: i64) {
         let t = target.as_os_str().as_encoded_bytes();
+        let stale_rowid = match self.kinds.read().unwrap().get(rel) {
+            Some(Entry::File { rowid, .. }) => Some(*rowid),
+            _ => None,
+        };
         let conn = self.conn.lock().unwrap();
+        clear_node_metadata(&conn, rel);
         // Raw bytes with sz == len: the Python reader treats len(data)==sz as
-        // "not deflated" and returns the bytes as-is.
+        // "not deflated" and returns the bytes as-is. A pathname may already
+        // have a whiteout row (unlink followed by recreation, as tar commonly
+        // does). Replacing a node kind must restore every type-bearing column;
+        // merely changing data/size leaves the row looking like a tombstone.
         let _ = conn.execute(
             "INSERT INTO sqlar(name,mode,mtime,sz,data,writer,last_writer)
              VALUES(?1,?2,?3,?4,?5,?6,?6)
-             ON CONFLICT(name) DO UPDATE SET data=excluded.data, sz=excluded.sz",
+             ON CONFLICT(name) DO UPDATE SET
+               mode=excluded.mode, mtime=excluded.mtime,
+               sz=excluded.sz, data=excluded.data, opaque=0,
+               last_writer=excluded.last_writer",
             params![rel, 0o120777u32, now_ns(), t.len() as i64, t, writer],
         );
         drop(conn);
+        if let Some(rowid) = stale_rowid {
+            let _ = std::fs::remove_file(blob_path(self.id, rowid));
+        }
         self.kinds.write().unwrap()
             .insert(rel.to_string(), Entry::Symlink { target: target.to_path_buf() });
     }
@@ -1047,6 +1061,35 @@ mod tests {
         assert!(bp.exists());
         b.set_whiteout("victim", 0);
         assert!(!bp.exists(), "set_whiteout orphaned the blob");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn set_symlink_replaces_whiteout_and_overwritten_blob() {
+        let _g = TEST_STATE_HOME_LOCK.lock().unwrap();
+        let (b, id, tmp) = fresh_box("symlink-replace");
+
+        b.set_whiteout("link", 11);
+        b.set_symlink("link", std::path::Path::new("../../../scripts/syscall.tbl"), 12);
+        {
+            let conn = b.conn.lock().unwrap();
+            let (mode, data, last_writer): (u32, Vec<u8>, i64) = conn.query_row(
+                "SELECT mode,data,last_writer FROM sqlar WHERE name='link'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            ).unwrap();
+            assert_eq!(mode & 0o170000, 0o120000,
+                       "recreated symlink retained the whiteout type");
+            assert_eq!(data, b"../../../scripts/syscall.tbl");
+            assert_eq!(last_writer, 12);
+        }
+        assert!(matches!(b.kinds.read().unwrap().get("link"),
+                         Some(Entry::Symlink { .. })));
+
+        let blob = add_file(&b, id, "file-to-link", b"stale blob");
+        assert!(blob.exists());
+        b.set_symlink("file-to-link", std::path::Path::new("target"), 13);
+        assert!(!blob.exists(), "replacing a file with a symlink orphaned its blob");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
