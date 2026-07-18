@@ -1,14 +1,12 @@
 //! Private mount-owner namespace for the FUSE execution backend.
 //!
 //! The engine serves the raw FUSE connection, but never retains the mount in
-//! its host mount namespace.  `fusermount3` creates the superblock there so
-//! every canonical uid/gid remains representable.  A small, single-threaded
-//! child immediately clones that mount into an identity-mapped user namespace
-//! plus its private mount namespace; a normal (propagating) unmount removes
-//! every outer startup copy before FUSE workers or the accept loop start.  A
-//! top-level FUSE runner joins those namespaces before any worker thread
-//! exists; bubblewrap consequently sees the private root without an
-//! outside-in mount operation.
+//! its host mount namespace. A small, single-threaded child enters a user
+//! namespace containing the canonical Unix uid/gid range, creates a private
+//! mount namespace, mounts FUSE there, and returns only the connection fd to
+//! the engine. A top-level FUSE runner joins those namespaces before any
+//! worker thread exists; bubblewrap consequently sees the private root and
+//! ordinary ownership syscalls without an outside-in mount operation.
 
 use std::fs::File;
 use std::io::{self, IoSlice, IoSliceMut, Read, Write};
@@ -32,6 +30,8 @@ const FUSERMOUNT_COMM_FD: &str = "_FUSE_COMMFD";
 const RUNNER_ENTERED_ENV: &str = "SARUN_FUSE_NAMESPACE_ENTERED";
 const REQUEST_NAMESPACES: u8 = b'N';
 const REQUEST_SHUTDOWN: u8 = b'Q';
+const REQUEST_ID_MAP: u8 = b'M';
+const REPLY_ID_MAP: u8 = b'I';
 const REPLY_READY: u8 = b'R';
 const REPLY_DONE: u8 = b'D';
 const REPLY_ERROR: u8 = b'E';
@@ -100,39 +100,11 @@ struct FuseBroker {
 impl FuseBroker {
     fn start(mountpoint: &Path) -> io::Result<(Self, File)> {
         let mountpoint = mountpoint.canonicalize()?;
-        let device = mount_with_helper(&mountpoint)?;
-        let broker = match Self::clone_private_mount(&mountpoint) {
-            Ok(broker) => broker,
-            Err(error) => {
-                let _ = unmount_with_helper(&mountpoint);
-                return Err(error);
-            }
-        };
-        if let Err(error) = unmount_with_helper(&mountpoint) {
-            let _ = broker.shutdown();
-            let _ = unmount_with_helper(&mountpoint);
-            return Err(io::Error::other(format!(
-                "cannot detach outer FUSE startup mount: {error}"
-            )));
-        }
-        match mountinfo_contains(&mountpoint) {
-            Ok(false) => {}
-            Ok(true) => {
-                let _ = broker.shutdown();
-                return Err(io::Error::other(
-                    "outer FUSE startup mount remained visible after handoff",
-                ));
-            }
-            Err(error) => {
-                let _ = broker.shutdown();
-                return Err(error);
-            }
-        }
-        Ok((broker, device))
+        Self::create_private_mount(&mountpoint)
     }
 
-    fn clone_private_mount(mountpoint: &Path) -> io::Result<Self> {
-        let (parent, child_socket) = UnixStream::pair()?;
+    fn create_private_mount(mountpoint: &Path) -> io::Result<(Self, File)> {
+        let (mut parent, child_socket) = UnixStream::pair()?;
         let fd = child_socket.as_raw_fd();
         let executable = broker_executable()?;
         let socket_path = crate::paths::fuse_broker_socket();
@@ -158,7 +130,7 @@ impl FuseBroker {
         }
         let mut child = command.spawn()?;
         drop(child_socket);
-        let (reply, fds) = match receive_fds(&parent, 0) {
+        let (map_request, fds) = match receive_fds(&parent, 0) {
             Ok(reply) => reply,
             Err(error) => {
                 let _ = child.kill();
@@ -166,26 +138,44 @@ impl FuseBroker {
                 return Err(error);
             }
         };
-        if reply != [REPLY_READY] || !fds.is_empty() {
-            let detail = if reply.first() == Some(&REPLY_ERROR) {
-                String::from_utf8_lossy(&reply[1..]).trim().to_owned()
-            } else {
-                format!(
-                    "invalid startup reply {:?} with {} descriptors",
-                    reply,
-                    fds.len()
-                )
-            };
+        if map_request != [REQUEST_ID_MAP] || !fds.is_empty() {
+            let detail = startup_reply_error(&map_request, fds.len(), "ID-map request");
             drop(fds);
             let _ = child.kill();
             let _ = child.wait();
             return Err(io::Error::other(format!("FUSE mount broker: {detail}")));
         }
-        Ok(Self {
+        if let Err(error) = configure_id_maps(child.id()) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(io::Error::other(format!("FUSE mount broker: {error}")));
+        }
+        if let Err(error) = parent.write_all(&[REPLY_ID_MAP]) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+        let (reply, mut fds) = match receive_fds(&parent, 1) {
+            Ok(reply) => reply,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
+        };
+        if reply != [REPLY_READY] || fds.len() != 1 {
+            let detail = startup_reply_error(&reply, fds.len(), "mount reply");
+            drop(fds);
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(io::Error::other(format!("FUSE mount broker: {detail}")));
+        }
+        let device = fds.pop().unwrap();
+        Ok((Self {
             child,
             control: parent,
             socket_path,
-        })
+        }, device))
     }
 
     fn shutdown(mut self) -> io::Result<()> {
@@ -312,20 +302,22 @@ pub fn child_main() -> i32 {
 }
 
 fn child_run(control: &mut UnixStream) -> io::Result<()> {
-    create_private_namespace()?;
+    create_private_namespace(control)?;
     let mountpoint = std::env::var_os(MOUNTPOINT_ENV)
         .map(PathBuf::from)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing broker mountpoint"))?;
+    let device = mount_with_helper(&mountpoint)?;
     if !mountinfo_contains(&mountpoint)? {
         return Err(io::Error::other(
-            "FUSE mount was not inherited into broker namespace",
+            "FUSE mount was not created in broker namespace",
         ));
     }
     let socket_path = crate::paths::fuse_broker_socket();
     let _ = std::fs::remove_file(&socket_path);
     let listener = UnixListener::bind(&socket_path)?;
     std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))?;
-    send_fds(control, &[REPLY_READY], &[])?;
+    send_fds(control, &[REPLY_READY], &[device.as_raw_fd()])?;
+    drop(device);
 
     let result = broker_loop(control, &listener);
     let _ = std::fs::remove_file(&socket_path);
@@ -342,21 +334,23 @@ fn control_fd() -> io::Result<RawFd> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid broker control fd"))
 }
 
-fn create_private_namespace() -> io::Result<()> {
+fn create_private_namespace(control: &mut UnixStream) -> io::Result<()> {
     let tasks = std::fs::read_dir("/proc/self/task")?.count();
     if tasks != 1 {
         return Err(io::Error::other(format!(
             "broker started with {tasks} threads"
         )));
     }
-    let uid = unsafe { libc::getuid() };
-    let gid = unsafe { libc::getgid() };
     if unsafe { libc::unshare(libc::CLONE_NEWUSER) } != 0 {
         return Err(io::Error::last_os_error());
     }
     let _ = std::fs::write("/proc/self/setgroups", "deny");
-    std::fs::write("/proc/self/uid_map", format!("{uid} {uid} 1"))?;
-    std::fs::write("/proc/self/gid_map", format!("{gid} {gid} 1"))?;
+    control.write_all(&[REQUEST_ID_MAP])?;
+    let mut reply = [0u8; 1];
+    control.read_exact(&mut reply)?;
+    if reply != [REPLY_ID_MAP] {
+        return Err(io::Error::other("parent rejected broker ID map"));
+    }
     if unsafe { libc::unshare(libc::CLONE_NEWNS) } != 0 {
         return Err(io::Error::last_os_error());
     }
@@ -377,6 +371,91 @@ fn create_private_namespace() -> io::Result<()> {
     Ok(())
 }
 
+const CANONICAL_ID_COUNT: u32 = 65_536;
+
+fn startup_reply_error(reply: &[u8], descriptors: usize, expected: &str) -> String {
+    if reply.first() == Some(&REPLY_ERROR) {
+        String::from_utf8_lossy(&reply[1..]).trim().to_owned()
+    } else {
+        format!("invalid {expected} {reply:?} with {descriptors} descriptors")
+    }
+}
+
+fn configure_id_maps(pid: u32) -> io::Result<()> {
+    let uid = unsafe { libc::getuid() };
+    let gid = unsafe { libc::getgid() };
+    if unsafe { libc::geteuid() } == 0 {
+        std::fs::write(format!("/proc/{pid}/uid_map"),
+                       format!("0 0 {CANONICAL_ID_COUNT}\n"))?;
+        std::fs::write(format!("/proc/{pid}/gid_map"),
+                       format!("0 0 {CANONICAL_ID_COUNT}\n"))?;
+        return Ok(());
+    }
+    let uid_range = subordinate_range("/etc/subuid", uid)?;
+    let gid_range = subordinate_range("/etc/subgid", gid)?;
+    run_id_mapper("newuidmap", pid, mapping_arguments(uid, uid_range))?;
+    run_id_mapper("newgidmap", pid, mapping_arguments(gid, gid_range))
+}
+
+fn subordinate_range(path: &str, id: u32) -> io::Result<u32> {
+    let numeric = id.to_string();
+    let user = std::fs::read_to_string("/etc/passwd").ok()
+        .and_then(|passwd| passwd.lines().find_map(|line| {
+            let fields: Vec<_> = line.split(':').collect();
+            (fields.len() > 2 && fields[2] == numeric).then(|| fields[0].to_owned())
+        }))
+        .unwrap_or_else(|| numeric.clone());
+    let contents = std::fs::read_to_string(path).map_err(|error| {
+        io::Error::new(error.kind(), format!(
+            "cannot read {path}; install `uidmap` and provision at least \
+             {CANONICAL_ID_COUNT} subordinate IDs for {user}: {error}"))
+    })?;
+    contents.lines().find_map(|line| {
+        let mut fields = line.split(':');
+        let owner = fields.next()?;
+        let start = fields.next()?.parse::<u32>().ok()?;
+        let count = fields.next()?.parse::<u32>().ok()?;
+        ((owner == user || owner == numeric) && count >= CANONICAL_ID_COUNT)
+            .then_some(start)
+    }).ok_or_else(|| io::Error::new(io::ErrorKind::PermissionDenied, format!(
+        "{path} has no {CANONICAL_ID_COUNT}-ID range for {user}; \
+         canonical FUSE ownership requires subordinate IDs")))
+}
+
+fn mapping_arguments(identity: u32, subordinate: u32) -> Vec<String> {
+    let mut result = Vec::new();
+    let canonical_before = identity.min(CANONICAL_ID_COUNT);
+    if canonical_before != 0 {
+        result.extend(["0".into(), subordinate.to_string(), canonical_before.to_string()]);
+    }
+    result.extend([identity.to_string(), identity.to_string(), "1".into()]);
+    if identity < CANONICAL_ID_COUNT - 1 {
+        let start = identity + 1;
+        result.extend([
+            start.to_string(),
+            (subordinate + start).to_string(),
+            (CANONICAL_ID_COUNT - start).to_string(),
+        ]);
+    } else if identity >= CANONICAL_ID_COUNT {
+        result.extend([
+            "0".into(), subordinate.to_string(), CANONICAL_ID_COUNT.to_string(),
+        ]);
+    }
+    result
+}
+
+fn run_id_mapper(program: &str, pid: u32, arguments: Vec<String>) -> io::Result<()> {
+    let output = Command::new(program).arg(pid.to_string()).args(arguments).output()
+        .map_err(|error| io::Error::new(error.kind(), format!(
+            "cannot run {program}; install the `uidmap` package: {error}")))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!("{program} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim())))
+    }
+}
+
 fn fusermount_binary() -> String {
     if let Some(path) = std::env::var_os("FUSERMOUNT_PATH") {
         return path.to_string_lossy().into_owned();
@@ -388,11 +467,10 @@ fn fusermount_binary() -> String {
     }
 }
 
-/// Create the superblock while the caller still belongs to the initial user
-/// namespace.  This is not merely a privilege workaround: FUSE translates
-/// every protocol uid/gid through the creating user namespace, so creating it
-/// in the broker's one-id namespace would make all other canonical owners
-/// invalid and Linux would reject writes before they reached the daemon.
+/// Create the superblock in the broker's complete canonical-ID namespace.
+/// FUSE translates protocol uid/gid values through this creating namespace;
+/// the parent therefore establishes its subordinate map before this call and
+/// receives only the connection descriptor afterward.
 fn mount_with_helper(mountpoint: &Path) -> io::Result<File> {
     let (child_socket, receive_socket) = UnixStream::pair()?;
     let fd = child_socket.as_raw_fd();
@@ -453,26 +531,6 @@ fn mount_with_helper(mountpoint: &Path) -> io::Result<File> {
         unsafe { libc::fcntl(device.as_raw_fd(), libc::F_SETFD, flags | libc::FD_CLOEXEC) };
     }
     Ok(device)
-}
-
-fn unmount_with_helper(mountpoint: &Path) -> io::Result<()> {
-    let output = Command::new(fusermount_binary())
-        // This must be a propagating, non-lazy unmount. A lazy detach removes
-        // only this namespace's attachment and can strand propagated copies
-        // when the mountpoint lives below a shared host mount.
-        .args(["-u", "-q", "--"])
-        .arg(mountpoint)
-        .output()?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        Err(io::Error::other(if detail.is_empty() {
-            format!("fusermount exited {}", output.status)
-        } else {
-            detail
-        }))
-    }
 }
 
 fn mountinfo_contains(mountpoint: &Path) -> io::Result<bool> {
@@ -627,6 +685,23 @@ fn receive_fds(socket: &UnixStream, expected: usize) -> io::Result<(Vec<u8>, Vec
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subordinate_map_preserves_canonical_ids_and_the_calling_identity() {
+        assert_eq!(mapping_arguments(501, 100_000), vec![
+            "0", "100000", "501",
+            "501", "501", "1",
+            "502", "100502", "65034",
+        ]);
+    }
+
+    #[test]
+    fn identity_outside_canonical_range_uses_a_separate_extent() {
+        assert_eq!(mapping_arguments(70_000, 100_000), vec![
+            "70000", "70000", "1",
+            "0", "100000", "65536",
+        ]);
+    }
 
     #[test]
     fn early_backend_selection_respects_last_explicit_selector() {

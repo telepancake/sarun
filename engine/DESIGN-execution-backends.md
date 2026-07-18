@@ -169,24 +169,23 @@ as executable mappings and mmap that genuinely need a host fd.
         `setns(user)`/`setns(mount)` descent works and that a subsequent bwrap
         sees mounts private to the broker; it avoids inventing a terminal and
         signal relay protocol merely to reproduce inherited Unix semantics.
-  - [x] Preserve the complete canonical uid/gid space while privatizing the
-        mount. A FUSE superblock translates protocol IDs through its creating
-        user namespace; creating it in the broker's one-ID namespace makes
-        every other owner invalid and Linux rejects writes before FUSE sees
-        them. Therefore `fusermount3` creates the superblock in the initial
-        user namespace, the broker immediately clones it by unsharing its
-        identity-mapped user+mount namespaces, and the outer startup copy is
-        removed with a propagating, non-lazy unmount before workers, the
-        control accept loop, or any runner become ready. The broker then owns
-        the sole live mount, serves authenticated
-        namespace-fd handoffs, and unmounts on ordered shutdown or engine EOF.
-        Assert the engine/ordinary host mountinfo has no steady-state FUSE
-        entry; do not normalize or collapse ownership to fit a one-ID map.
-        The aarch64 raw-transport fixture reads through the broker namespace
-        while asserting both engine and caller host mountinfo stay clean. The
-        portable backend equivalence, 32-bit appliance, nested/flat QEMU,
-        live-runner shutdown, Tap capture, and real developer workload gates
-        all pass with the broker active; FUSE and QEMU observations match.
+  - [x] Preserve canonical uid/gid values while privatizing the mount. A FUSE
+        superblock translates protocol IDs through its creating user namespace;
+        a one-ID broker therefore makes every other owner invalid and Linux
+        rejects `chown` before FUSE sees it. The parent now provisions the
+        broker with the ordinary 65,536-ID subordinate uid and gid ranges plus
+        a separate extent for the caller's identity, using `newuidmap` and
+        `newgidmap`. Only then does the broker create its private mount
+        namespace and invoke `fusermount3`, returning the connection descriptor
+        to the engine. Protocol and database IDs consequently stay canonical;
+        no host-ID normalization exists. Startup fails with the missing
+        `uidmap` or `/etc/subuid`/`/etc/subgid` prerequisite instead of exposing
+        a filesystem with false ownership semantics. Ordinary machine boxes
+        start as namespace uid/gid zero with capabilities confined to that user
+        namespace, while an explicit numeric OCI `User` remains authoritative.
+        The broker owns the sole live mount, serves authenticated namespace-fd
+        handoffs, and unmounts on ordered shutdown or engine EOF; engine and
+        ordinary host mountinfo retain no steady-state entry.
 
 ### 3. SUD cutover
 
@@ -1084,8 +1083,23 @@ as executable mappings and mmap that genuinely need a host fd.
           general rule-comment shape. All 48 Kati library tests, the focused
           corpus comparison, vendor reconstruction, and the static aarch64
           production build pass. The exact real OpenSSL package now configures,
-          builds, installs, and reaches `.openssl_installed`. The next gate is
-          completing the clean `world -j10` graph, followed by artifact,
+          builds, installs, and reaches `.openssl_installed`. The resumed
+          `world -j10` then reached image assembly; serial replay showed all 167
+          APKs install but every ownership-preservation call fail, ending with
+          APK exit 99. A direct box fixture proved `chown 0:0` returned `EINVAL`
+          and `/proc/self/uid_map` contained only the developer's one identity:
+          the kernel rejected the unmapped owner before dispatching FUSE. The
+          repaired broker uses the subordinate-ID topology described above and
+          mounts only after its map exists. The static aarch64 production build
+          and all 48 Kati library tests pass. A root-owned live namespace gate
+          additionally runs the new binary as namespace root, changes an
+          overlay file to uid 1234/gid 2345, reads those exact IDs back, finds
+          the canonical pair in `ownership`, passes SQLite `quick_check`, and
+          proves no lower file escaped. The unprivileged live/OpenWrt replay is
+          now gated on installing `uidmap` and provisioning this host's absent
+          `/etc/subuid` and `/etc/subgid` ranges; startup reports that prerequisite
+          directly. After provisioning, the next gate is the exact ownership
+          fixture and resumed clean `world -j10`, followed by artifact,
           provenance, trace, and lower-layer-isolation validation.
           Earlier nonfatal empty-operand arithmetic and generated-config `sed`
           diagnostics stay recorded for attribution rather than normalization.

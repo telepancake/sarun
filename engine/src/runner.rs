@@ -693,11 +693,13 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
     // "uid[:gid]" or a name we don't try to resolve (containers usually
     // ship a numeric uid in their config). Skipping the parse on a name
     // keeps us safe rather than crashing on a non-numeric User.
+    let mut box_uid = None;
     if let Some(u) = &oci_user {
         let (uid, gid) = u.split_once(':')
             .map(|(a, b)| (a, Some(b)))
             .unwrap_or((u.as_str(), None));
         if let Ok(uid_n) = uid.parse::<u32>() {
+            box_uid = Some(uid_n);
             // Hold the formatted strings in locals so they outlive the .args() call.
             let uid_s = uid_n.to_string();
             bwrap.args(["--uid", &uid_s]);
@@ -706,6 +708,18 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
                 bwrap.args(["--gid", &gid_s]);
             }
         }
+    }
+    // A machine root is root, independently of the host developer's numeric
+    // identity.  The broker's subordinate-ID namespace makes every ordinary
+    // Unix owner representable; run the default box as its uid/gid zero and
+    // retain capabilities only inside that private user namespace.  An OCI
+    // image's explicit numeric User above remains authoritative.
+    if box_uid.is_none() {
+        bwrap.args(["--uid", "0", "--gid", "0"]);
+        box_uid = Some(0);
+    }
+    if box_uid == Some(0) {
+        bwrap.args(["--cap-add", "ALL"]);
     }
     // --api: the in-box oaita HTTP client dials the FD broker (SARUN_
     // BROKER, already in env) to get a fresh engine conn, then sends the
