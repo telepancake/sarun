@@ -605,14 +605,22 @@ impl BoxState {
         let conn = Connection::open(&db)?;
         // synchronous=OFF is deliberate, not an oversight. This sqlar holds a
         // box's captured writes in escrow for review; the host is never touched
-        // until an explicit apply. An OS crash/power loss can therefore only
-        // lose or corrupt an in-progress, re-runnable box — never host data — so
-        // crash-durability is not a requirement here. OFF avoids an fsync per
-        // write on the hot capture path (a build copies up tens of thousands of
-        // files); WAL/NORMAL would add fsync latency plus -wal/-shm side files
-        // (extra peak disk, no longer a single file while live) to buy
-        // durability this store does not need.
-        conn.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=OFF;")?;
+        // until an explicit apply. Avoiding an fsync per captured write is
+        // essential for builds, while the rollback journal still makes an
+        // interrupted engine process recoverable on its next open.
+        //
+        // PERSIST is equally deliberate. Provenance arrives as many small
+        // transactions from concurrent control connections. DELETE made every
+        // event create and unlink the rollback journal, and those commits
+        // serialized the handlers on the connection mutex. PERSIST zeros and
+        // reuses one bounded journal instead. Unlike WAL it keeps the at-rest
+        // box a single database plus its recoverable rollback companion and
+        // does not introduce a separate checkpoint lifecycle.
+        conn.execute_batch(
+            "PRAGMA journal_mode=PERSIST; \
+             PRAGMA synchronous=OFF; \
+             PRAGMA journal_size_limit=8388608;",
+        )?;
         conn.execute_batch(SCHEMA)?;
         conn.pragma_update(None, "user_version", 1)?;
         Ok(BoxState {

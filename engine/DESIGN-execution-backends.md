@@ -971,15 +971,25 @@ as executable mappings and mmap that genuinely need a host fd.
           replacement, removal, rename, subtree reparent, reload, and full
           hydration all keep it coherent. Directory enumeration is therefore
           proportional to immediate children rather than the complete layer.
-          All eight depot tests, both merged-layer tests, the focused child
+          All nine depot tests, both merged-layer tests, the focused child
           transition/reload regression, and the static aarch64 build pass. In
           the indexed real-workload replay every FUSE worker was idle in
           `poll`; the newly exposed bottleneck was a single SQLite autocommit
           deleting the rollback journal while seven provenance/build-edge
-          handlers waited on the per-box connection mutex. The next
-          performance step is to remove per-event rollback-journal churn and
-          batch durable provenance transitions before the complete world gate
-          continues.
+          handlers waited on the per-box connection mutex. After 631.8 s that
+          replay had accumulated 3,592,064 build-edge rows and 2,331,703
+          pipeline rows, occupied one full engine core, and left actual package
+          recipes stalled for more than five minutes. The recorder, not FUSE
+          transport, was the limiting work. Box databases now use one bounded
+          PERSIST rollback journal instead of creating and unlinking a DELETE
+          journal for every event. This retains interrupted-process rollback
+          recovery, avoids WAL checkpoint state, and removes the exact commit
+          syscall seen in the stack. Its policy regression, all nine depot
+          tests, both merged-layer tests, and the static aarch64 build pass.
+          The next replay measures what serialization remains; if the single
+          connection is still material, provenance transitions must be
+          coalesced without weakening filesystem capture or inventing an
+          optional recording mode.
           Earlier nonfatal empty-operand arithmetic and generated-config `sed`
           diagnostics stay recorded for attribution rather than normalization.
     - [x] Complete the native-aarch64 FUSE Brush gate from a clean output tree.

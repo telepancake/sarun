@@ -1061,6 +1061,21 @@ mod tests {
         (b, id, tmp)
     }
 
+    #[test]
+    fn capture_database_reuses_a_bounded_rollback_journal() {
+        let _g = TEST_STATE_HOME_LOCK.lock().unwrap();
+        let (b, _id, tmp) = fresh_box("persistent-journal");
+        let conn = b.conn.lock().unwrap();
+        let mode: String = conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        let limit: i64 = conn.query_row("PRAGMA journal_size_limit", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode, "persist");
+        assert_eq!(limit, 8 * 1024 * 1024);
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     fn add_file(b: &BoxState, id: i64, rel: &str, content: &[u8]) -> std::path::PathBuf {
         let rid = b.ensure_file_row(rel, 0o100644, 0);
         let bp = blob_path(id, rid);
