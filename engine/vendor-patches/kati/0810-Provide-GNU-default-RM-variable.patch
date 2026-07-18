@@ -1,0 +1,26 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Sat, 18 Jul 2026 15:20:00 +0000
+Subject: [PATCH] Provide GNU default RM variable
+
+GNU make defines RM as `rm -f` unless built-in variables are disabled. Real
+makefiles, including OpenWrt's final GCC install, use it without a project
+definition. Keep the standalone Kati bootstrap aligned with the embedded
+engine bootstrap.
+
+---
+diff --git a/src-rs/main.rs b/src-rs/main.rs
+index f16fbba..c9f7ef1 100644
+--- a/src-rs/main.rs
++++ b/src-rs/main.rs
+@@ -72,6 +72,7 @@ fn read_bootstrap_makefile(targets: &[Symbol]) -> Result<Arc<Mutex<Vec<Stmt>>>> {
+         bootstrap.put_slice(b"LINK.cpp?=$(LINK.cc)\n");
+         bootstrap.put_slice(b"LINK.C?=$(LINK.cc)\n");
+         bootstrap.put_slice(b"OUTPUT_OPTION?=-o $@\n");
++        bootstrap.put_slice(b"RM?=rm -f\n");
+     }
+     // sarun: upstream pins 4.2.1 for Android-build stability; we declared
+     // GNU make 4.3 (Ubuntu 22.04 LTS) as our compat target, so report that.
+-- 
+2.43.0
+

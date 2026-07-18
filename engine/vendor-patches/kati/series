@@ -78,3 +78,4 @@
 0780-Validate-complete-implicit-rule-chains.patch
 0790-Honor-implicit-pattern-cancellations.patch
 0800-Propagate-make-stdin-into-embedded-recipes.patch
+0810-Provide-GNU-default-RM-variable.patch

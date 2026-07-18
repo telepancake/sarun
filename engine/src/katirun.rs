@@ -180,6 +180,7 @@ fn read_bootstrap_makefile(
         bootstrap.put_slice(b"LINK.cpp?=$(LINK.cc)\n");
         bootstrap.put_slice(b"LINK.C?=$(LINK.cc)\n");
         bootstrap.put_slice(b"OUTPUT_OPTION?=-o $@\n");
+        bootstrap.put_slice(b"RM?=rm -f\n");
     }
     // sarun: report GNU make 4.3 (matches our compat target); Makefiles
     // gated on `ifeq ($(MAKE_VERSION),4.x)` see what they expect.

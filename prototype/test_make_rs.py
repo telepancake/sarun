@@ -2022,6 +2022,31 @@ fi
         check(overrides_result == b"configured-cxx|file\n",
               f"case58: leaf uses its configured file-origin compiler; "
               f"got {overrides_result!r}")
+        # ── CASE 59: GNU's default RM variable is available ─────────
+        # OpenWrt uses $(RM) in final toolchain install recipes without defining
+        # it itself. GNU make's built-in value is `rm -f`; an empty value turns
+        # the following pathname into a command and fails after a long build.
+        rmv = work / "default-rm-variable"
+        shutil.rmtree(rmv, ignore_errors=True)
+        rmv.mkdir(parents=True)
+        (rmv / "Makefile").write_text(
+            ".PHONY: all\n"
+            "all:\n"
+            "\t@printf old > victim\n"
+            "\t@$(RM) victim\n"
+            "\t@test ! -e victim; printf removed > result.txt\n")
+        r = run_make("MAKE59", rmv, "-j10", "all")
+        check(r.returncode == 0,
+              f"case59: default RM recipe completes (got {r.returncode}: "
+              f"{(r.stdout+r.stderr)[-700:]})")
+        sp59 = latest_sqlar(m)
+        rm_result = m.sqlar_content(
+            sp59, str((rmv / "result.txt").resolve()).lstrip("/"))
+        victim = m.sqlar_content(
+            sp59, str((rmv / "victim").resolve()).lstrip("/"))
+        check(rm_result == b"removed" and victim is None,
+              f"case59: $(RM) removes the requested file; "
+              f"result={rm_result!r} victim={victim!r}")
     finally:
         if eng is not None and eng.poll() is None:
             eng.terminate()
