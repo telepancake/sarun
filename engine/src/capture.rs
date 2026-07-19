@@ -68,8 +68,6 @@ CREATE TABLE IF NOT EXISTS sqlar(name TEXT PRIMARY KEY, mode INT, mtime INT,
 -- of files pays an O(n) sqlar scan per file written (O(n^2) over the build) —
 -- this is what actually made a ~1min native build take ~20min in a box.
 CREATE INDEX IF NOT EXISTS idx_sqlar_mtime ON sqlar(mtime);
-CREATE TABLE IF NOT EXISTS provenance(path TEXT PRIMARY KEY, pid INT, ppid INT,
- exe TEXT, argv TEXT);
 CREATE TABLE IF NOT EXISTS env(id INTEGER PRIMARY KEY AUTOINCREMENT,
  hash TEXT UNIQUE, env TEXT);
 CREATE TABLE IF NOT EXISTS process(id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -641,8 +639,19 @@ impl BoxState {
              PRAGMA journal_size_limit=67108864; \
              PRAGMA wal_autocheckpoint=16384;",
         )?;
+        let schema_version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
         conn.execute_batch(SCHEMA)?;
-        conn.pragma_update(None, "user_version", 1)?;
+        if schema_version < 2 {
+            // Version 1 retained the pre-process-table path→argv duplicate.
+            // Writer identity is normalized as sqlar.writer/last_writer →
+            // process; nothing in the Rust engine ever read or wrote this
+            // table. Remove it during the existing-box migration instead of
+            // carrying a permanently empty compatibility surface.
+            conn.execute_batch("DROP TABLE IF EXISTS provenance;")?;
+        }
+        if schema_version < 2 {
+            conn.pragma_update(None, "user_version", 2)?;
+        }
         let recorder_conn = Connection::open(&db)?;
         recorder_conn.execute_batch(
             "PRAGMA journal_mode=WAL; \
@@ -1602,6 +1611,46 @@ impl BoxState {
 #[cfg(test)]
 mod ro_attachment_tests {
     use super::*;
+
+    #[test]
+    fn version_two_removes_duplicate_path_provenance_table() {
+        let _guard = crate::depot::TEST_STATE_HOME_LOCK.lock().unwrap();
+        let temp = std::env::temp_dir().join(format!(
+            "sarun-schema-v2-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id(),
+        ));
+        let _ = std::fs::remove_dir_all(&temp);
+        // SAFETY: every state-home-dependent test is serialized by the shared
+        // test lock.
+        unsafe { std::env::set_var("XDG_STATE_HOME", &temp) };
+        let home = crate::paths::state_home();
+        std::fs::create_dir_all(&home).unwrap();
+        let db = home.join("9841.sqlar");
+        let legacy = rusqlite::Connection::open(&db).unwrap();
+        legacy.execute_batch(
+            "CREATE TABLE provenance(path TEXT PRIMARY KEY, pid INT, ppid INT, \
+             exe TEXT, argv TEXT); PRAGMA user_version=1;",
+        ).unwrap();
+        drop(legacy);
+
+        let state = BoxState::create(9841).unwrap();
+        let connection = state.conn.lock().unwrap();
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        let duplicate: i64 = connection.query_row(
+            "SELECT count(*) FROM sqlite_master \
+             WHERE type='table' AND name='provenance'",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(version, 2);
+        assert_eq!(duplicate, 0);
+        drop(connection);
+        drop(state);
+        let _ = std::fs::remove_dir_all(temp);
+    }
 
     // The untagged serde is the compat contract: historical Vec<i64>
     // metas parse, and int-only lists serialize byte-identically so a

@@ -509,7 +509,7 @@ as executable mappings and mmap that genuinely need a host fd.
           thread-local uucore context. A 100-way nested-umask/mkdir fixture keeps
           its parent at 0022 while producing 0700 directories and 0600 external
           files; OpenWrt's parallel proper-umask prerequisite now passes.
-    - [ ] Complete the OpenWrt 25.12.5 `armsr/armv8` clean `make -j10 world`
+    - [x] Complete the OpenWrt 25.12.5 `armsr/armv8` clean `make -j10 world`
           FUSE/Brush gate. The source is pinned at tag/commit
           `v25.12.5`/`f0a60eee2fe051741c643ea6118718aae1ef17fb`, with all 87
           required archives cached. Prerequisite checking has progressed into
@@ -1104,9 +1104,17 @@ as executable mappings and mmap that genuinely need a host fd.
           chown/readback/database/no-escape sequence a regression and passes on
           native aarch64 FUSE, aarch64 QEMU, and cross-architecture x86_64 QEMU,
           including nested and lifecycle gates. The static aarch64 production
-          build and all 48 Kati library tests pass. The next gate is the resumed
-          clean `world -j10`, followed by artifact, provenance, trace, and
-          lower-layer-isolation validation.
+          build and all 48 Kati library tests pass. A clean OpenWrt 25.12.5
+          `world -j10` now completes through Brush with rc 0. Its box records
+          695,495 captured paths, 214,817 processes, 2,885,577 Brush provenance
+          rows, 9,763,472 build edges, and 244,287 output writes; all captured
+          paths retain both first- and last-writer process keys. Final
+          kernel, initramfs, rootfs, and combined EFI artifacts are present with
+          process attribution, SQLite `quick_check` passes, and no build output
+          or owner-map fixture escaped into the lower source tree. Schema v2
+          removes the obsolete empty `provenance` table inherited from the
+          retired Python overlay: writer identity has one normalized source,
+          `sqlar.writer`/`last_writer` → `process`.
           Earlier nonfatal empty-operand arithmetic and generated-config `sed`
           diagnostics stay recorded for attribution rather than normalization.
     - [x] Complete the native-aarch64 FUSE Brush gate from a clean output tree.

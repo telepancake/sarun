@@ -557,7 +557,7 @@ def sqlar_path(box_id) -> Path:
     # The box's single db, named by its stable integer id: <box_id>.sqlar.
     return state_home() / (str(box_id) + ".sqlar")
 
-_SQLAR_SCHEMA_VERSION = 1  # marks the one-time DDL as applied (no migrations — unreleased)
+_SQLAR_SCHEMA_VERSION = 2
 
 class _DbHandle:
     __slots__ = ("conn", "lock", "pinned", "last_used", "closed")
@@ -605,8 +605,7 @@ def _open_raw(path) -> "sqlite3.Connection":
             "CREATE TABLE IF NOT EXISTS sqlar"
             "(name TEXT PRIMARY KEY, mode INT, mtime INT, sz INT, data BLOB,"
             " opaque INT DEFAULT 0, writer INT, last_writer INT);"
-            "CREATE TABLE IF NOT EXISTS provenance"
-            "(path TEXT PRIMARY KEY, pid INT, ppid INT, exe TEXT, argv TEXT);"
+            "DROP TABLE IF EXISTS provenance;"
             "CREATE TABLE IF NOT EXISTS env"
             "(id INTEGER PRIMARY KEY AUTOINCREMENT, hash TEXT UNIQUE, env TEXT);"
             # process: one row per process INCARNATION, identified by (tgid,start) so a
@@ -743,11 +742,6 @@ def _sqlar_put_file(conn, name, content: bytes, mode, mtime_ns) -> None:
                  " mtime=excluded.mtime, sz=excluded.sz, data=excluded.data",
                  (name, int(mode), int(mtime_ns), sz, sqlite3.Binary(data)))
 
-def _sqlar_put_provenance(conn, name, prov: dict) -> None:
-    conn.execute("INSERT OR REPLACE INTO provenance VALUES(?,?,?,?,?)",
-                 (name, int(prov.get("pid") or 0), int(prov.get("ppid") or 0),
-                  prov.get("exe") or "", json.dumps(prov.get("argv") or [])))
-
 def _sqlar_put_symlink(conn, name, target: bytes, mtime_ns) -> None:
     """`mtime_ns` is integer nanoseconds (st_mtime_ns); stored as-is."""
     conn.execute("INSERT INTO sqlar(name,mode,mtime,sz,data) VALUES(?,?,?,?,?)"
@@ -841,7 +835,7 @@ def sqlar_remove(path, name) -> int:
     conn = _sqlar_open(path)
     try:
         conn.execute("DELETE FROM sqlar WHERE name=?", (name,))
-        conn.execute("DELETE FROM provenance WHERE path=?", (name,)); conn.commit()
+        conn.commit()
         left = conn.execute("SELECT EXISTS(SELECT 1 FROM sqlar)").fetchone()[0]
     except sqlite3.Error as e:
         print(f"slopbox: sqlar_remove {path} {name}: {e}", file=sys.stderr)
@@ -872,10 +866,10 @@ def _drop_sqlar_row_and_blob(path, box_id, rel) -> None:
         if box_id is not None and row is not None and row[1] is None:
             try: bp = blob_path(int(box_id), row[0])
             except (ValueError, TypeError): bp = None
-        # Delete the row (and its provenance), then check emptiness — mirrors sqlar_remove
+        # Delete the row, then check emptiness — mirrors sqlar_remove.
         try:
-            conn.execute("DELETE FROM sqlar WHERE name=?", (name := rel,))
-            conn.execute("DELETE FROM provenance WHERE path=?", (name,)); conn.commit()
+            conn.execute("DELETE FROM sqlar WHERE name=?", (rel,))
+            conn.commit()
             left = conn.execute("SELECT EXISTS(SELECT 1 FROM sqlar)").fetchone()[0]
         except sqlite3.Error: left = 1
     finally: conn.close()
@@ -1903,8 +1897,9 @@ def consolidate(shm_dir, session_id: str, index: "Index | None" = None,
     at creation — no fold walk); each regular file picks a per-file rest form by size
     (small → folded sqlar blob; large → kept as a PERMANENT pool file, the row left
     resident with data NULL); deletions/opacity become tombstone rows. Writer
-    provenance per path is recorded. Afterwards the sqlar (plus any kept pool files) is
-    the box's complete at-rest form and the backing tree can be freed. Idempotent.
+    provenance is already normalized through each row's writer/last_writer process
+    keys. Afterwards the sqlar (plus any kept pool files) is the box's complete
+    at-rest form and the backing tree can be freed. Idempotent.
 
     Apply/discard of file rules is NOT done here — those run on box DELETE or on an
     explicit UI action (ChangeReview.apply/discard), never on box stop. So consolidate
@@ -1927,8 +1922,6 @@ def consolidate(shm_dir, session_id: str, index: "Index | None" = None,
         if sq.execute("SELECT changes()").fetchone()[0] == 0:
             # No pre-existing row (orphaned overlay with no live index): create it.
             _sqlar_put_file(sq, rel, content, mode, mtime_ns)
-    def _prov(rel):
-        return idx.writer_provenance(rel) if idx is not None else None
     moved = []
     blob_paths_to_evict = []
     try:
@@ -1952,8 +1945,6 @@ def consolidate(shm_dir, session_id: str, index: "Index | None" = None,
                     # but handle it gracefully (fold it in, then remove).
                     st = ap.stat()
                     _set_blob(rel, ap.read_bytes(), st.st_mode, st.st_mtime_ns)
-                    p = _prov(rel)
-                    if p: _sqlar_put_provenance(sq, rel, p)
                 else:
                     continue                                 # dirs handled by cleanup
             except OSError:
@@ -1994,20 +1985,15 @@ def consolidate(shm_dir, session_id: str, index: "Index | None" = None,
                 except OSError: continue
                 _set_blob(rel, content, mode, mtime_ns)
                 blob_paths_to_evict.append(bp)
-            p = _prov(rel)
-            if p: _sqlar_put_provenance(sq, rel, p)
         # 2) deletions (whiteouts) from the index -> tombstone rows (already present, but
-        #    re-assert for the orphaned-overlay path) + provenance.
+        #    re-assert for the orphaned-overlay path).
         if idx is not None:
             for rel in idx.deletions():
                 host = Path("/") / rel
                 if host.exists() or host.is_symlink():
                     _sqlar_put_tombstone(sq, rel)
-                    p = _prov(rel)
-                    if p: _sqlar_put_provenance(sq, rel, p)
                 else:
                     sq.execute("DELETE FROM sqlar WHERE name=?", (rel,))
-                    sq.execute("DELETE FROM provenance WHERE path=?", (rel,))
             # 3) opaque dirs: expand into per-lower-child tombstones for children not
             #    re-materialized in the upper or the pool.
             for drel in idx.opaque_dirs():
