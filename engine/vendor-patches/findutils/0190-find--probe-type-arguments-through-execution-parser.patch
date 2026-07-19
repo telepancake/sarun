@@ -1,0 +1,896 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Sun, 19 Jul 2026 17:47:23 +0000
+Subject: [PATCH] find: probe type arguments through execution parser
+
+Add an effect-free, Find-owned argument probe for starting paths and the -type/-xtype slice. Exact and assist inputs replay parse_args, build_matcher_tree, and type_creator; unsupported expression arms are rejected before parse-time effects.
+
+---
+diff --git a/src/find/matchers/mod.rs b/src/find/matchers/mod.rs
+index 2c1ad62..2cc7722 100644
+--- a/src/find/matchers/mod.rs
++++ b/src/find/matchers/mod.rs
+@@ -342,7 +342,24 @@ pub fn build_top_level_matcher_with_input(
+     config: &mut Config,
+     input: &mut dyn Read,
+ ) -> Result<Box<dyn Matcher>, Box<dyn Error>> {
+-    let (_, top_level_matcher) = (build_matcher_tree(args, config, 0, false, input))?;
++    build_top_level_matcher_with_input_observed(
++        args,
++        config,
++        input,
++        &mut super::IgnoreParseObservations,
++        0,
++    )
++}
++
++pub(super) fn build_top_level_matcher_with_input_observed(
++    args: &[&str],
++    config: &mut Config,
++    input: &mut dyn Read,
++    observer: &mut dyn super::ParseObserver,
++    argument_offset: usize,
++) -> Result<Box<dyn Matcher>, Box<dyn Error>> {
++    let (_, top_level_matcher) =
++        build_matcher_tree(args, config, 0, false, input, observer, argument_offset)?;
+ 
+     // if the matcher doesn't have any side-effects, then we default to printing
+     if !top_level_matcher.has_side_effects() {
+@@ -502,6 +519,8 @@ fn build_matcher_tree(
+     arg_index: usize,
+     mut expecting_bracket: bool,
+     input: &mut dyn Read,
++    observer: &mut dyn super::ParseObserver,
++    argument_offset: usize,
+ ) -> Result<(usize, Box<dyn Matcher>), Box<dyn Error>> {
+     let mut top_level_matcher = ListMatcherBuilder::new();
+ 
+@@ -515,23 +534,41 @@ fn build_matcher_tree(
+     let mut invert_next_matcher = false;
+     while i < args.len() {
+         let file_type_predicate = crate::find::syntax::file_type_predicate(args[i]);
++        if !observer.expression(argument_offset + i, args[i], file_type_predicate) {
++            return Err(Box::new(super::ParseObservationRejected));
++        }
+         let possible_submatcher = match args[i] {
+             _ if file_type_predicate.is_some() => {
+                 let predicate = file_type_predicate.expect("guarded by is_some");
++                observer.file_type_predicate(argument_offset + i, predicate);
+                 if i >= args.len() - 1 {
++                    observer.missing_file_type_operand(argument_offset + i + 1, predicate);
+                     return Err(From::from(format!(
+                         "missing argument to {}",
+                         predicate.surface
+                     )));
+                 }
+                 i += 1;
++                observer.file_type_operand(argument_offset + i, predicate, args[i]);
+                 match predicate.identity {
+-                    crate::find::syntax::FileTypePredicateIdentity::Type => {
+-                        Some(TypeMatcher::new(args[i])?.into_box())
+-                    }
+-                    crate::find::syntax::FileTypePredicateIdentity::Xtype => {
+-                        Some(XtypeMatcher::new(args[i])?.into_box())
+-                    }
++                    crate::find::syntax::FileTypePredicateIdentity::Type => Some(
++                        TypeMatcher::new_observed(
++                            args[i],
++                            predicate,
++                            argument_offset + i,
++                            observer,
++                        )?
++                        .into_box(),
++                    ),
++                    crate::find::syntax::FileTypePredicateIdentity::Xtype => Some(
++                        XtypeMatcher::new_observed(
++                            args[i],
++                            predicate,
++                            argument_offset + i,
++                            observer,
++                        )?
++                        .into_box(),
++                    ),
+                 }
+             }
+             "-print" => Some(Printer::new(PrintDelimiter::Newline, None).into_box()),
+@@ -913,8 +950,15 @@ fn build_matcher_tree(
+                 None
+             }
+             "(" => {
+-                let (new_arg_index, sub_matcher) =
+-                    build_matcher_tree(args, config, i + 1, true, input)?;
++                let (new_arg_index, sub_matcher) = build_matcher_tree(
++                    args,
++                    config,
++                    i + 1,
++                    true,
++                    input,
++                    observer,
++                    argument_offset,
++                )?;
+                 i = new_arg_index;
+                 Some(sub_matcher)
+             }
+diff --git a/src/find/matchers/type_matcher.rs b/src/find/matchers/type_matcher.rs
+index 4bc14f7..845e51c 100644
+--- a/src/find/matchers/type_matcher.rs
++++ b/src/find/matchers/type_matcher.rs
+@@ -5,7 +5,9 @@
+ // https://opensource.org/licenses/MIT.
+ 
+ use super::{FileType, Follow, Matcher, MatcherIO, WalkEntry};
+-use crate::find::syntax::{FileTypePredicate, TYPE_PREDICATE, XTYPE_PREDICATE};
++use crate::find::syntax::FileTypePredicate;
++#[cfg(test)]
++use crate::find::syntax::{TYPE_PREDICATE, XTYPE_PREDICATE};
+ use std::collections::HashSet;
+ use std::error::Error;
+ 
+@@ -30,12 +32,29 @@ fn parse(type_string: &str, predicate: &FileTypePredicate) -> Result<FileType, B
+ }
+ 
+ impl TypeMatcher {
++    #[cfg(test)]
+     pub fn new(type_string: &str) -> Result<Self, Box<dyn Error>> {
+-        let main_file_type = type_creator(type_string, &TYPE_PREDICATE)?;
++        let main_file_type = type_creator(
++            type_string,
++            &TYPE_PREDICATE,
++            0,
++            &mut crate::find::IgnoreParseObservations,
++        )?;
+         Ok(Self {
+             file_type: main_file_type,
+         })
+     }
++
++    pub(super) fn new_observed(
++        type_string: &str,
++        predicate: &FileTypePredicate,
++        argument: usize,
++        observer: &mut dyn crate::find::ParseObserver,
++    ) -> Result<Self, Box<dyn Error>> {
++        Ok(Self {
++            file_type: type_creator(type_string, predicate, argument, observer)?,
++        })
++    }
+ }
+ 
+ impl Matcher for TypeMatcher {
+@@ -50,12 +69,29 @@ pub struct XtypeMatcher {
+ }
+ 
+ impl XtypeMatcher {
++    #[cfg(test)]
+     pub fn new(type_string: &str) -> Result<Self, Box<dyn Error>> {
+-        let main_file_type = type_creator(type_string, &XTYPE_PREDICATE)?;
++        let main_file_type = type_creator(
++            type_string,
++            &XTYPE_PREDICATE,
++            0,
++            &mut crate::find::IgnoreParseObservations,
++        )?;
+         Ok(Self {
+             file_type: main_file_type,
+         })
+     }
++
++    pub(super) fn new_observed(
++        type_string: &str,
++        predicate: &FileTypePredicate,
++        argument: usize,
++        observer: &mut dyn crate::find::ParseObserver,
++    ) -> Result<Self, Box<dyn Error>> {
++        Ok(Self {
++            file_type: type_creator(type_string, predicate, argument, observer)?,
++        })
++    }
+ }
+ impl Matcher for XtypeMatcher {
+     fn matches(&self, file_info: &WalkEntry, _: &mut MatcherIO) -> bool {
+@@ -84,6 +120,8 @@ impl Matcher for XtypeMatcher {
+ fn type_creator(
+     type_string: &str,
+     predicate: &FileTypePredicate,
++    argument: usize,
++    observer: &mut dyn crate::find::ParseObserver,
+ ) -> Result<HashSet<FileType>, Box<dyn Error>> {
+     let mut file_types = std::collections::HashSet::new();
+ 
+@@ -99,6 +137,9 @@ fn type_creator(
+                     predicate.surface
+                 )));
+             }
++            let value = crate::find::syntax::file_type_value(part)
++                .expect("parse accepted only an execution-owned value");
++            observer.file_type_value(argument, predicate, value);
+         }
+     } else {
+         if type_string.len() > 1 {
+@@ -107,7 +148,11 @@ fn type_creator(
+                 predicate.surface, predicate.separator
+             )));
+         }
+-        file_types.insert(parse(type_string, predicate)?);
++        let file_type = parse(type_string, predicate)?;
++        file_types.insert(file_type);
++        let value = crate::find::syntax::file_type_value(type_string)
++            .expect("parse accepted only an execution-owned value");
++        observer.file_type_value(argument, predicate, value);
+     }
+ 
+     Ok(file_types)
+diff --git a/src/find/mod.rs b/src/find/mod.rs
+index 14ac790..15d5fce 100644
+--- a/src/find/mod.rs
++++ b/src/find/mod.rs
+@@ -5,6 +5,7 @@
+ // https://opensource.org/licenses/MIT.
+ 
+ pub mod matchers;
++pub mod probe;
+ pub mod syntax;
+ 
+ use matchers::{Follow, WalkEntry};
+@@ -226,12 +227,77 @@ struct ParsedInfo {
+     config: Config,
+ }
+ 
++trait ParseObserver {
++    fn top_level_option(&mut self, _argument: usize, _surface: &str) -> bool {
++        true
++    }
++
++    fn starting_path(&mut self, _argument: usize, _surface: &str) {}
++
++    fn expression(
++        &mut self,
++        _argument: usize,
++        _surface: &str,
++        _file_type_predicate: Option<&syntax::FileTypePredicate>,
++    ) -> bool {
++        true
++    }
++
++    fn file_type_predicate(&mut self, _argument: usize, _predicate: &syntax::FileTypePredicate) {}
++
++    fn file_type_operand(
++        &mut self,
++        _argument: usize,
++        _predicate: &syntax::FileTypePredicate,
++        _surface: &str,
++    ) {
++    }
++
++    fn file_type_value(
++        &mut self,
++        _argument: usize,
++        _predicate: &syntax::FileTypePredicate,
++        _value: &syntax::FileTypeValue,
++    ) {
++    }
++
++    fn missing_file_type_operand(
++        &mut self,
++        _argument: usize,
++        _predicate: &syntax::FileTypePredicate,
++    ) {
++    }
++}
++
++struct IgnoreParseObservations;
++
++impl ParseObserver for IgnoreParseObservations {}
++
++#[derive(Debug)]
++struct ParseObservationRejected;
++
++impl std::fmt::Display for ParseObservationRejected {
++    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        formatter.write_str("argument rejected by parse observer")
++    }
++}
++
++impl Error for ParseObservationRejected {}
++
+ /// Function to generate a `ParsedInfo` from the strings supplied on the command-line.
+ ///
+ /// `input` is the source for any `-files0-from -` bulk stdin read; the caller
+ /// supplies the logical stdin (real `stdin` for the standalone binary, the
+ /// shell's logical stdin for the in-process builtin).
+ fn parse_args(args: &[&str], input: &mut dyn Read) -> Result<ParsedInfo, Box<dyn Error>> {
++    parse_args_observed(args, input, &mut IgnoreParseObservations)
++}
++
++fn parse_args_observed(
++    args: &[&str],
++    input: &mut dyn Read,
++    observer: &mut dyn ParseObserver,
++) -> Result<ParsedInfo, Box<dyn Error>> {
+     let mut paths = vec![];
+     let mut i = 0;
+     let mut config = Config::default();
+@@ -239,12 +305,26 @@ fn parse_args(args: &[&str], input: &mut dyn Read) -> Result<ParsedInfo, Box<dyn
+     while i < args.len() {
+         match args[i] {
+             "-O0" | "-O1" | "-O2" | "-O3" => {
++                if !observer.top_level_option(i, args[i]) {
++                    return Err(Box::new(ParseObservationRejected));
++                }
+                 // GNU find optimization level flag (ignored)
+             }
+-            "-H" => config.follow = Follow::Roots,
+-            "-L" => config.follow = Follow::Always,
+-            "-P" => config.follow = Follow::Never,
++            "-H" | "-L" | "-P" => {
++                if !observer.top_level_option(i, args[i]) {
++                    return Err(Box::new(ParseObservationRejected));
++                }
++                config.follow = match args[i] {
++                    "-H" => Follow::Roots,
++                    "-L" => Follow::Always,
++                    "-P" => Follow::Never,
++                    _ => unreachable!(),
++                };
++            }
+             "--" => {
++                if !observer.top_level_option(i, args[i]) {
++                    return Err(Box::new(ParseObservationRejected));
++                }
+                 // End of flags
+                 i += 1;
+                 break;
+@@ -261,13 +341,20 @@ fn parse_args(args: &[&str], input: &mut dyn Read) -> Result<ParsedInfo, Box<dyn
+         && args[i] != "!"
+         && args[i] != "("
+     {
++        observer.starting_path(i, args[i]);
+         paths.push(args[i].to_string());
+         i += 1;
+     }
+     if i == paths_start {
+         paths.push(".".to_string());
+     }
+-    let matcher = matchers::build_top_level_matcher_with_input(&args[i..], &mut config, input)?;
++    let matcher = matchers::build_top_level_matcher_with_input_observed(
++        &args[i..],
++        &mut config,
++        input,
++        observer,
++        i,
++    )?;
+     if let Some(new_paths) = &config.new_paths {
+         if paths.len() == 1 && paths[0] == "." {
+             paths.clone_from(new_paths);
+diff --git a/src/find/probe.rs b/src/find/probe.rs
+new file mode 100644
+index 0000000..d78b40e
+--- /dev/null
++++ b/src/find/probe.rs
+@@ -0,0 +1,513 @@
++//! Effect-free argument probing through find's execution parser.
++//!
++//! This deliberately covers only starting paths and `-type`/`-xtype`. Every
++//! other expression is stopped before its parser arm can perform work and is
++//! reported as [`ProbeStatus::Unsupported`].
++
++use super::matchers::FileType;
++use super::syntax::{
++    FileTypePredicate, FileTypePredicateIdentity, FileTypeValue, FILE_TYPE_PREDICATES,
++};
++use super::{parse_args_observed, ParseObserver};
++use std::collections::HashSet;
++
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub enum ProbeArgument<'a> {
++    Exact(&'a str),
++    Assist { prefix: &'a str, suffix: &'a str },
++}
++
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub enum ProbeStatus {
++    Complete,
++    Incomplete,
++    Rejected,
++    Unsupported,
++}
++
++#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
++pub enum ArgumentIdentity {
++    StartingPath,
++    FileTypePredicate(FileTypePredicateIdentity),
++    FileTypeValue {
++        predicate: FileTypePredicateIdentity,
++        value: FileType,
++    },
++}
++
++#[derive(Clone, Debug, Eq, PartialEq)]
++pub struct ArgumentMatch {
++    pub argument: usize,
++    pub identity: ArgumentIdentity,
++}
++
++#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
++pub enum Expectation {
++    StartingPath,
++    FileTypePredicate,
++    FileTypeValue(FileTypePredicateIdentity),
++}
++
++#[derive(Clone, Debug, Eq, PartialEq)]
++pub struct Completion {
++    /// Text inserted at the tear; the supplied prefix and suffix stay intact.
++    pub insertion: String,
++    pub display: &'static str,
++    pub help: &'static str,
++    pub identity: ArgumentIdentity,
++    pub matches: Vec<ArgumentMatch>,
++}
++
++/// Find-owned evidence, independent of Brush, Clap, and Prolog.
++#[derive(Clone, Debug, Eq, PartialEq)]
++pub struct ProbeOutput {
++    pub status: ProbeStatus,
++    pub matches: Vec<ArgumentMatch>,
++    pub expectations: Vec<Expectation>,
++    pub completions: Vec<Completion>,
++}
++
++#[derive(Default)]
++struct Recorder {
++    matches: Vec<ArgumentMatch>,
++    expectations: Vec<(usize, Expectation)>,
++    unsupported: Option<usize>,
++}
++
++impl Recorder {
++    fn has(&self, argument: usize, identity: ArgumentIdentity) -> bool {
++        self.matches
++            .iter()
++            .any(|item| item.argument == argument && item.identity == identity)
++    }
++
++    fn expects(&self, argument: usize, expectation: Expectation) -> bool {
++        self.expectations.contains(&(argument, expectation))
++    }
++}
++
++impl ParseObserver for Recorder {
++    fn top_level_option(&mut self, argument: usize, _surface: &str) -> bool {
++        self.unsupported = Some(argument);
++        false
++    }
++
++    fn starting_path(&mut self, argument: usize, _surface: &str) {
++        self.matches.push(ArgumentMatch {
++            argument,
++            identity: ArgumentIdentity::StartingPath,
++        });
++    }
++
++    fn expression(
++        &mut self,
++        argument: usize,
++        _surface: &str,
++        file_type_predicate: Option<&FileTypePredicate>,
++    ) -> bool {
++        if file_type_predicate.is_some() {
++            true
++        } else {
++            self.unsupported = Some(argument);
++            false
++        }
++    }
++
++    fn file_type_predicate(&mut self, argument: usize, predicate: &FileTypePredicate) {
++        self.matches.push(ArgumentMatch {
++            argument,
++            identity: ArgumentIdentity::FileTypePredicate(predicate.identity),
++        });
++    }
++
++    fn file_type_operand(
++        &mut self,
++        argument: usize,
++        predicate: &FileTypePredicate,
++        _surface: &str,
++    ) {
++        self.expectations
++            .push((argument, Expectation::FileTypeValue(predicate.identity)));
++    }
++
++    fn file_type_value(
++        &mut self,
++        argument: usize,
++        predicate: &FileTypePredicate,
++        value: &FileTypeValue,
++    ) {
++        self.matches.push(ArgumentMatch {
++            argument,
++            identity: ArgumentIdentity::FileTypeValue {
++                predicate: predicate.identity,
++                value: value.identity,
++            },
++        });
++    }
++
++    fn missing_file_type_operand(&mut self, argument: usize, predicate: &FileTypePredicate) {
++        self.expectations
++            .push((argument, Expectation::FileTypeValue(predicate.identity)));
++    }
++}
++
++fn replay(arguments: &[String]) -> (bool, Recorder) {
++    let refs = arguments.iter().map(String::as_str).collect::<Vec<_>>();
++    let mut recorder = Recorder::default();
++    let accepted = parse_args_observed(&refs, &mut std::io::empty(), &mut recorder).is_ok();
++    (accepted, recorder)
++}
++
++fn unsupported() -> ProbeOutput {
++    ProbeOutput {
++        status: ProbeStatus::Unsupported,
++        matches: Vec::new(),
++        expectations: Vec::new(),
++        completions: Vec::new(),
++    }
++}
++
++fn exact(arguments: &[ProbeArgument<'_>]) -> ProbeOutput {
++    let concrete = arguments
++        .iter()
++        .map(|argument| match argument {
++            ProbeArgument::Exact(surface) => (*surface).to_owned(),
++            ProbeArgument::Assist { .. } => unreachable!(),
++        })
++        .collect::<Vec<_>>();
++    let (accepted, recorder) = replay(&concrete);
++    if recorder.unsupported.is_some() {
++        return unsupported();
++    }
++    let status = if accepted {
++        ProbeStatus::Complete
++    } else if !recorder.expectations.is_empty()
++        && recorder
++            .expectations
++            .iter()
++            .any(|(argument, _)| *argument == arguments.len())
++    {
++        ProbeStatus::Incomplete
++    } else {
++        ProbeStatus::Rejected
++    };
++    ProbeOutput {
++        status,
++        matches: recorder.matches,
++        expectations: recorder
++            .expectations
++            .into_iter()
++            .map(|(_, expectation)| expectation)
++            .collect(),
++        completions: Vec::new(),
++    }
++}
++
++fn replace_tear(arguments: &[ProbeArgument<'_>], tear: usize, replacement: &str) -> Vec<String> {
++    arguments
++        .iter()
++        .enumerate()
++        .map(|(index, argument)| match argument {
++            ProbeArgument::Exact(surface) => (*surface).to_owned(),
++            ProbeArgument::Assist { .. } if index == tear => replacement.to_owned(),
++            ProbeArgument::Assist { .. } => unreachable!(),
++        })
++        .collect()
++}
++
++fn compatible_insertion<'a>(prefix: &str, suffix: &str, complete: &'a str) -> Option<&'a str> {
++    complete
++        .strip_prefix(prefix)
++        .and_then(|rest| rest.strip_suffix(suffix))
++}
++
++fn operand_insertions(
++    prefix: &str,
++    suffix: &str,
++    predicate: &FileTypePredicate,
++) -> Vec<(String, &'static FileTypeValue)> {
++    let segment_prefix = prefix
++        .rsplit_once(predicate.separator)
++        .map_or(prefix, |(_, segment)| segment);
++    let segment_suffix = suffix
++        .split_once(predicate.separator)
++        .map_or(suffix, |(segment, _)| segment);
++    let mut candidates = Vec::new();
++    for value in predicate.values {
++        if let Some(insertion) = compatible_insertion(segment_prefix, segment_suffix, value.surface)
++        {
++            candidates.push((insertion.to_owned(), value));
++        }
++    }
++
++    // A complete list at the tear can continue with one remaining value.
++    // `type_creator` below remains the authority for uniqueness.
++    if suffix.is_empty() {
++        let parts = prefix.split(predicate.separator).collect::<Vec<_>>();
++        let complete = !parts.is_empty()
++            && parts
++                .iter()
++                .all(|part| predicate.values.iter().any(|value| value.surface == *part));
++        if complete {
++            for value in predicate.values {
++                candidates.push((format!("{}{}", predicate.separator, value.surface), value));
++            }
++        }
++    }
++    candidates
++}
++
++fn assist(arguments: &[ProbeArgument<'_>], tear: usize) -> ProbeOutput {
++    let (prefix, suffix) = match arguments[tear] {
++        ProbeArgument::Assist { prefix, suffix } => (prefix, suffix),
++        ProbeArgument::Exact(_) => unreachable!(),
++    };
++    let mut output = ProbeOutput {
++        status: ProbeStatus::Incomplete,
++        matches: Vec::new(),
++        expectations: Vec::new(),
++        completions: Vec::new(),
++    };
++    let mut proved_role = false;
++    let mut unsupported_outside_tear = false;
++    let mut seen_insertions = HashSet::new();
++
++    // Ask parse_args whether this position can be a starting path. No path
++    // catalog exists here; filesystem completion remains an external context.
++    let path_surface = if prefix.is_empty() && suffix.is_empty() {
++        ".".to_owned()
++    } else {
++        format!("{prefix}{suffix}")
++    };
++    let (_, path_recorder) = replay(&replace_tear(arguments, tear, &path_surface));
++    unsupported_outside_tear |= path_recorder
++        .unsupported
++        .is_some_and(|argument| argument != tear);
++    if path_recorder.unsupported.is_none()
++        && path_recorder.has(tear, ArgumentIdentity::StartingPath)
++    {
++        proved_role = true;
++        output.expectations.push(Expectation::StartingPath);
++        output.matches = path_recorder.matches;
++    }
++
++    // Replay each execution-owned predicate spelling. The actual expression
++    // dispatch decides whether the tear is a predicate position.
++    for predicate in FILE_TYPE_PREDICATES {
++        let (_, recorder) = replay(&replace_tear(arguments, tear, predicate.surface));
++        unsupported_outside_tear |= recorder
++            .unsupported
++            .is_some_and(|argument| argument != tear);
++        let identity = ArgumentIdentity::FileTypePredicate(predicate.identity);
++        if recorder.unsupported.is_some() || !recorder.has(tear, identity) {
++            continue;
++        }
++        proved_role = true;
++        output.expectations.push(Expectation::FileTypePredicate);
++        if output.matches.is_empty() {
++            output.matches.clone_from(&recorder.matches);
++        }
++        let Some(insertion) = compatible_insertion(prefix, suffix, predicate.surface) else {
++            continue;
++        };
++        if !seen_insertions.insert(insertion.to_owned()) {
++            continue;
++        }
++        output.completions.push(Completion {
++            insertion: insertion.to_owned(),
++            display: predicate.surface,
++            help: predicate.description,
++            identity,
++            matches: recorder.matches,
++        });
++    }
++
++    // Replay finite operand values to let the real predicate branch establish
++    // the context. Candidate lists are then replayed through type_creator,
++    // which alone decides value validity and uniqueness.
++    for predicate in FILE_TYPE_PREDICATES {
++        let representative = predicate.values[0];
++        let (_, role_recorder) = replay(&replace_tear(arguments, tear, representative.surface));
++        unsupported_outside_tear |= role_recorder
++            .unsupported
++            .is_some_and(|argument| argument != tear);
++        let expectation = Expectation::FileTypeValue(predicate.identity);
++        if role_recorder.unsupported.is_some() || !role_recorder.expects(tear, expectation) {
++            continue;
++        }
++        proved_role = true;
++        output.expectations.push(expectation);
++        if output.matches.is_empty() {
++            output.matches.clone_from(&role_recorder.matches);
++        }
++        for (insertion, value) in operand_insertions(prefix, suffix, predicate) {
++            if seen_insertions.contains(&insertion) {
++                continue;
++            }
++            let completed = format!("{prefix}{insertion}{suffix}");
++            let (accepted, recorder) = replay(&replace_tear(arguments, tear, &completed));
++            let identity = ArgumentIdentity::FileTypeValue {
++                predicate: predicate.identity,
++                value: value.identity,
++            };
++            if accepted
++                && recorder.unsupported.is_none()
++                && recorder.has(tear, identity)
++                && seen_insertions.insert(insertion.clone())
++            {
++                output.completions.push(Completion {
++                    insertion,
++                    display: value.surface,
++                    help: value.description,
++                    identity,
++                    matches: recorder.matches,
++                });
++            }
++        }
++    }
++
++    if !proved_role {
++        return unsupported();
++    }
++    if unsupported_outside_tear {
++        return unsupported();
++    }
++    output
++        .expectations
++        .sort_by_key(|expectation| match expectation {
++            Expectation::StartingPath => (0, 0),
++            Expectation::FileTypePredicate => (1, 0),
++            Expectation::FileTypeValue(FileTypePredicateIdentity::Type) => (2, 0),
++            Expectation::FileTypeValue(FileTypePredicateIdentity::Xtype) => (2, 1),
++        });
++    output.expectations.dedup();
++    output
++}
++
++/// Parse or assist Find arguments without walking the filesystem.
++///
++/// Every exact input and synthesized candidate traverses `parse_args`,
++/// `build_matcher_tree`, and, for operands, `type_creator`.
++pub fn probe(arguments: &[ProbeArgument<'_>]) -> ProbeOutput {
++    let tears = arguments
++        .iter()
++        .enumerate()
++        .filter_map(|(index, argument)| {
++            matches!(argument, ProbeArgument::Assist { .. }).then_some(index)
++        })
++        .collect::<Vec<_>>();
++    match tears.as_slice() {
++        [] => exact(arguments),
++        [tear] => assist(arguments, *tear),
++        _ => unsupported(),
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn exact(surface: &str) -> ProbeArgument<'_> {
++        ProbeArgument::Exact(surface)
++    }
++
++    fn tear<'a>(prefix: &'a str, suffix: &'a str) -> ProbeArgument<'a> {
++        ProbeArgument::Assist { prefix, suffix }
++    }
++
++    #[test]
++    fn exact_valid_invalid_and_missing_operand_use_execution_parser() {
++        let valid = probe(&[exact("src"), exact("-type"), exact("f,d")]);
++        assert_eq!(valid.status, ProbeStatus::Complete);
++        assert_eq!(valid.matches.len(), 4);
++
++        let invalid = probe(&[exact("."), exact("-xtype"), exact("f,f")]);
++        assert_eq!(invalid.status, ProbeStatus::Rejected);
++
++        let missing = probe(&[exact("."), exact("-type")]);
++        assert_eq!(missing.status, ProbeStatus::Incomplete);
++        assert_eq!(
++            missing.expectations,
++            [Expectation::FileTypeValue(FileTypePredicateIdentity::Type)]
++        );
++    }
++
++    #[test]
++    fn predicate_tear_preserves_prefix_and_suffix() {
++        let output = probe(&[exact("."), tear("-t", "e"), exact("f")]);
++        assert_eq!(output.completions.len(), 1);
++        assert_eq!(output.completions[0].insertion, "yp");
++        assert_eq!(output.completions[0].display, "-type");
++    }
++
++    #[test]
++    fn operand_tear_records_actual_type_creator_match() {
++        let output = probe(&[exact("."), exact("-xtype"), tear("", "")]);
++        assert_eq!(output.completions.len(), 7);
++        assert!(output.completions.iter().all(|completion| {
++            completion
++                .matches
++                .iter()
++                .any(|evidence| evidence.argument == 2 && evidence.identity == completion.identity)
++        }));
++    }
++
++    #[test]
++    fn comma_list_only_offers_remaining_unique_values() {
++        let output = probe(&[exact("."), exact("-type"), tear("f,", "")]);
++        assert_eq!(
++            output
++                .completions
++                .iter()
++                .map(|completion| completion.insertion.as_str())
++                .collect::<Vec<_>>(),
++            ["b", "c", "d", "l", "p", "s"]
++        );
++
++        let continuation = probe(&[exact("."), exact("-type"), tear("f", "")]);
++        assert!(continuation
++            .completions
++            .iter()
++            .any(|completion| completion.insertion.is_empty()));
++        assert!(continuation
++            .completions
++            .iter()
++            .any(|completion| completion.insertion == ",d"));
++        assert!(!continuation
++            .completions
++            .iter()
++            .any(|completion| completion.insertion == ",f"));
++    }
++
++    #[test]
++    fn incompatible_suffix_retains_real_expectation_without_candidates() {
++        let predicate = probe(&[exact("."), tear("-ty", "x"), exact("f")]);
++        assert_eq!(predicate.status, ProbeStatus::Incomplete);
++        assert_eq!(predicate.expectations, [Expectation::FileTypePredicate]);
++        assert!(predicate.completions.is_empty());
++
++        let value = probe(&[exact("."), exact("-type"), tear("", "x")]);
++        assert_eq!(
++            value.expectations,
++            [Expectation::FileTypeValue(FileTypePredicateIdentity::Type)]
++        );
++        assert!(value.completions.is_empty());
++    }
++
++    #[test]
++    fn unsupported_expression_is_stopped_before_its_arm() {
++        for arguments in [
++            vec![exact("."), exact("-print")],
++            vec![exact("."), exact("-name"), exact("*.rs")],
++            vec![
++                exact("."),
++                exact("-type"),
++                exact("f"),
++                exact("-fprint"),
++                exact("x"),
++            ],
++        ] {
++            assert_eq!(probe(&arguments).status, ProbeStatus::Unsupported);
++        }
++    }
++}
+diff --git a/src/find/syntax.rs b/src/find/syntax.rs
+index 2b1a85f..583a4df 100644
+--- a/src/find/syntax.rs
++++ b/src/find/syntax.rs
+@@ -7,7 +7,7 @@
+ use super::matchers::FileType;
+ 
+ /// Stable semantic identity of a file-type predicate.
+-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+ pub enum FileTypePredicateIdentity {
+     Type,
+     Xtype,

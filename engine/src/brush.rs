@@ -1140,10 +1140,9 @@ fn box_builtins<SE: brush_core::extensions::ShellExtensions>(
     m.insert("sarun".to_string(), simple_builtin::<EngineSelfCommand, SE>());
     m.insert("oaita".to_string(), simple_builtin::<EngineSelfCommand, SE>());
     // find/xargs: vendored findutils fork; always present (see find_builtin/xargs_builtin).
-    m.insert(
-        "find".to_string(),
-        builtin::<crate::find_builtin::FindBuiltin, SE>(),
-    );
+    let mut find = builtin::<crate::find_builtin::FindBuiltin, SE>();
+    find.parser_func = Some(crate::find_builtin::parser);
+    m.insert("find".to_string(), find);
     m.insert(
         "xargs".to_string(),
         builtin::<crate::xargs_builtin::XargsBuiltin, SE>(),
@@ -3101,6 +3100,7 @@ mod builtin_boundary_tests {
             .expect("typed edit builtin parser probe");
 
         let missing = parser(BuiltinParserInput {
+            tear: true,
             before: vec!["edit".into()],
             prefix: String::new(),
             suffix: String::new(),
@@ -3115,6 +3115,7 @@ mod builtin_boundary_tests {
         );
 
         let consumed = parser(BuiltinParserInput {
+            tear: true,
             before: vec!["edit".into()],
             prefix: "./test1.sh".into(),
             suffix: String::new(),
@@ -3125,6 +3126,7 @@ mod builtin_boundary_tests {
         assert_eq!(consumed.tear_arguments[0].id, "path");
 
         let excess = parser(BuiltinParserInput {
+            tear: true,
             before: vec!["edit".into()],
             prefix: "./test1.sh".into(),
             suffix: String::new(),
@@ -3147,6 +3149,7 @@ mod builtin_boundary_tests {
             .expect("typed bind builtin parser probe");
 
         let gap = parser(BuiltinParserInput {
+            tear: true,
             before: vec!["bind".into()],
             prefix: String::new(),
             suffix: String::new(),
@@ -3173,6 +3176,7 @@ mod builtin_boundary_tests {
         );
 
         let partial_value = parser(BuiltinParserInput {
+            tear: true,
             before: vec!["bind".into(), "-m".into()],
             prefix: "emacs-".into(),
             suffix: String::new(),
@@ -3182,6 +3186,7 @@ mod builtin_boundary_tests {
         assert_eq!(partial_value.expected[0].id, "keymap");
 
         let concrete_suffix = parser(BuiltinParserInput {
+            tear: true,
             before: vec!["bind".into(), "-m".into()],
             prefix: "em".into(),
             suffix: "-standard".into(),
@@ -3192,6 +3197,7 @@ mod builtin_boundary_tests {
         assert_eq!(concrete_suffix.expected[0].finite_values, ["emacs"]);
 
         let incompatible_suffix = parser(BuiltinParserInput {
+            tear: true,
             before: vec!["bind".into(), "-m".into()],
             prefix: "em".into(),
             suffix: "-not-a-keymap".into(),
@@ -3204,6 +3210,7 @@ mod builtin_boundary_tests {
         assert!(incompatible_suffix.expected.is_empty());
 
         let concrete_value = parser(BuiltinParserInput {
+            tear: true,
             before: vec!["bind".into(), "-m".into()],
             prefix: "emacs-standard".into(),
             suffix: String::new(),
@@ -3316,9 +3323,14 @@ mod builtin_boundary_tests {
             &crate::parser::FilesystemContext::new(&dir),
         );
         assert!(completions.iter().any(|completion| {
-            completion.insert == "./test1.sh"
-                && completion.replace_start == 5
-                && completion.replace_end == 8
+            completion.replace_start <= completion.replace_end
+                && completion.replace_end <= "edit ./t".len()
+                && format!(
+                    "{}{}{}",
+                    &"edit ./t"[..completion.replace_start],
+                    completion.insert,
+                    &"edit ./t"[completion.replace_end..]
+                ) == "edit ./test1.sh"
         }));
     }
 

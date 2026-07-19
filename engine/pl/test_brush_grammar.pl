@@ -17,6 +17,7 @@ test_name(assignment_tear_survives_as_later_local_value).
 test_name(local_variable_name_completion_comes_from_ordinary_use_step).
 test_name(provider_variable_completion_survives_sibling_parse_observations).
 test_name(command_projection_is_cooked_rich_symbolic_argv).
+test_name(unresolved_state_materializer_is_not_forwarded_to_nested_relation).
 test_name(generic_text_application_completes_required_suffix_at_tear).
 test_name(generic_text_application_constrains_earlier_local_value_hole).
 test_name(generic_text_application_uses_state_at_command_position).
@@ -326,6 +327,21 @@ run_test(command_projection_is_cooked_rich_symbolic_argv) :-
     Steps = [apply(_, given_grammar(builtin_grammar),
                    [binding(argv,
                             state_resolved(symbolic_argv(ExpectedWords)))])].
+
+run_test(unresolved_state_materializer_is_not_forwarded_to_nested_relation) :-
+    brush_relation_grammar(Grammar),
+    transform(
+        request(Grammar,
+                given([binding(source,
+                               text_source("echo $PERS", exact, brush_test)),
+                       binding(initial_state,
+                               local_state([scope(root, [])], [])),
+                       binding(builtin_grammar,
+                               registered_relation(test_builtin_parser))]),
+                want([status, completions]), observations([]),
+                limits(32, 4096, 1048576)),
+        reply(_, Queries, _, [])),
+    \+ list_member(query(_, ask(_, registered_relation(_), _)), Queries).
 
 run_test(generic_text_application_completes_required_suffix_at_tear) :-
     tool_analysis("tool", span(4, 4), Solutions),

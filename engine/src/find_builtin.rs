@@ -100,6 +100,167 @@ pub(crate) struct FindBuiltin {
     args: Vec<String>,
 }
 
+/// Observe Find arguments through the parser that execution enters after the
+/// outer Brush registration has collected raw argv. The vendored probe is
+/// intentionally Find-owned and returns `Unsupported` outside the slice whose
+/// real parse path is instrumented.
+pub(crate) fn parser(
+    input: brush_core::builtins::BuiltinParserInput,
+) -> brush_core::builtins::BuiltinParserObservation {
+    use brush_core::builtins::{
+        BuiltinParseStatus, BuiltinParserObservation, ParserArgumentEvidence,
+        ParserDiagnostic, ParserLiteralContinuation,
+    };
+    use findutils::find::probe::{ArgumentIdentity, ProbeArgument, ProbeStatus};
+
+    let Some((_command, before)) = input.before.split_first() else {
+        return unsupported_parser_observation();
+    };
+    if !input.tear
+        && (!input.prefix.is_empty() || !input.suffix.is_empty() || !input.after.is_empty())
+    {
+        return unsupported_parser_observation();
+    }
+
+    let mut arguments = before
+        .iter()
+        .map(|argument| ProbeArgument::Exact(argument.as_str()))
+        .collect::<Vec<_>>();
+    if input.tear {
+        arguments.push(ProbeArgument::Assist {
+            prefix: &input.prefix,
+            suffix: &input.suffix,
+        });
+        arguments.extend(
+            input
+                .after
+                .iter()
+                .map(|argument| ProbeArgument::Exact(argument.as_str())),
+        );
+    }
+
+    let output = findutils::find::probe::probe(&arguments);
+    let tear_argument = before.len();
+    let evidence = |identity: ArgumentIdentity| parser_argument_evidence(identity);
+    let expected = output
+        .expectations
+        .iter()
+        .copied()
+        .map(expectation_evidence)
+        .collect::<Vec<_>>();
+    let tear_arguments = output
+        .matches
+        .iter()
+        .filter(|matched| input.tear && matched.argument == tear_argument)
+        .map(|matched| evidence(matched.identity))
+        .collect::<Vec<_>>();
+    let literal_continuations = output
+        .completions
+        .into_iter()
+        .map(|completion| ParserLiteralContinuation {
+            literal: format!("{}{}", input.prefix, completion.insertion),
+            argument: ParserArgumentEvidence {
+                display: completion.display.into(),
+                help: Some(completion.help.into()),
+                ..evidence(completion.identity)
+            },
+            expected: Vec::new(),
+        })
+        .collect();
+    let status = match output.status {
+        ProbeStatus::Complete => BuiltinParseStatus::Complete,
+        ProbeStatus::Incomplete => BuiltinParseStatus::Incomplete,
+        ProbeStatus::Rejected => BuiltinParseStatus::Rejected(ParserDiagnostic {
+            code: "invalid_value".into(),
+            message: "find rejected the argument sequence".into(),
+        }),
+        ProbeStatus::Unsupported => BuiltinParseStatus::Unsupported,
+    };
+    BuiltinParserObservation {
+        status,
+        tear_arguments,
+        expected,
+        literal_continuations,
+    }
+}
+
+fn unsupported_parser_observation() -> brush_core::builtins::BuiltinParserObservation {
+    brush_core::builtins::BuiltinParserObservation {
+        status: brush_core::builtins::BuiltinParseStatus::Unsupported,
+        tear_arguments: Vec::new(),
+        expected: Vec::new(),
+        literal_continuations: Vec::new(),
+    }
+}
+
+fn expectation_evidence(
+    expectation: findutils::find::probe::Expectation,
+) -> brush_core::builtins::ParserArgumentEvidence {
+    use findutils::find::probe::{ArgumentIdentity, Expectation};
+    match expectation {
+        Expectation::StartingPath => parser_argument_evidence(ArgumentIdentity::StartingPath),
+        Expectation::FileTypePredicate => brush_core::builtins::ParserArgumentEvidence {
+            id: "file_type_predicate".into(),
+            display: "-type or -xtype".into(),
+            help: Some("select a file-type predicate".into()),
+            value_domain: None,
+            finite_values: Vec::new(),
+        },
+        Expectation::FileTypeValue(predicate) => {
+            let (id, help) = match predicate {
+                findutils::find::syntax::FileTypePredicateIdentity::Type => {
+                    ("type_value", "file type")
+                }
+                findutils::find::syntax::FileTypePredicateIdentity::Xtype => {
+                    ("xtype_value", "referent file type")
+                }
+            };
+            brush_core::builtins::ParserArgumentEvidence {
+                id: id.into(),
+                display: "TYPE".into(),
+                help: Some(help.into()),
+                value_domain: None,
+                finite_values: Vec::new(),
+            }
+        }
+    }
+}
+
+fn parser_argument_evidence(
+    identity: findutils::find::probe::ArgumentIdentity,
+) -> brush_core::builtins::ParserArgumentEvidence {
+    use findutils::find::probe::ArgumentIdentity;
+    let (id, display, help, value_domain) = match identity {
+        ArgumentIdentity::StartingPath => (
+            "starting_path",
+            "PATH",
+            "starting path",
+            Some("filesystem_path".into()),
+        ),
+        ArgumentIdentity::FileTypePredicate(_) => (
+            "file_type_predicate",
+            "-type or -xtype",
+            "file-type predicate",
+            None,
+        ),
+        ArgumentIdentity::FileTypeValue { predicate, .. } => match predicate {
+            findutils::find::syntax::FileTypePredicateIdentity::Type => {
+                ("type_value", "TYPE", "file type", None)
+            }
+            findutils::find::syntax::FileTypePredicateIdentity::Xtype => {
+                ("xtype_value", "TYPE", "referent file type", None)
+            }
+        },
+    };
+    brush_core::builtins::ParserArgumentEvidence {
+        id: id.into(),
+        display: display.into(),
+        help: Some(help.into()),
+        value_domain,
+        finite_values: Vec::new(),
+    }
+}
+
 impl brush_core::builtins::Command for FindBuiltin {
     type Error = brush_core::error::Error;
 
@@ -164,4 +325,39 @@ impl brush_core::builtins::Command for FindBuiltin {
 /// 0..=255 → 255 (generic failure), never masquerading as a valid status.
 fn exit_code_to_u8(code: i32) -> u8 {
     u8::try_from(code).unwrap_or(255)
+}
+
+#[cfg(test)]
+mod parser_tests {
+    use super::*;
+    use brush_core::builtins::{BuiltinParseStatus, BuiltinParserInput};
+
+    #[test]
+    fn registered_parser_maps_real_find_type_evidence() {
+        let assist = parser(BuiltinParserInput {
+            tear: true,
+            before: vec!["find".into(), ".".into(), "-type".into()],
+            prefix: String::new(),
+            suffix: String::new(),
+            after: Vec::new(),
+        });
+        assert_eq!(assist.status, BuiltinParseStatus::Incomplete);
+        assert_eq!(
+            assist
+                .literal_continuations
+                .iter()
+                .map(|continuation| continuation.literal.as_str())
+                .collect::<Vec<_>>(),
+            ["b", "c", "d", "f", "l", "p", "s"]
+        );
+
+        let exact = parser(BuiltinParserInput {
+            tear: false,
+            before: vec!["find".into(), ".".into(), "-type".into(), "f,d".into()],
+            prefix: String::new(),
+            suffix: String::new(),
+            after: Vec::new(),
+        });
+        assert_eq!(exact.status, BuiltinParseStatus::Complete);
+    }
 }

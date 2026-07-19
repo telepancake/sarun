@@ -1,0 +1,30 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Sun, 19 Jul 2026 17:52:41 +0000
+Subject: [PATCH] Represent builtin parser tears explicitly
+
+---
+diff --git a/src/builtins.rs b/src/builtins.rs
+index 6a0a000..d5a19d4 100644
+--- a/src/builtins.rs
++++ b/src/builtins.rs
+@@ -38,6 +38,9 @@ pub type CommandContentFunc =
+ /// is compatible with the concrete remainder of the word.
+ #[derive(Clone, Debug, Default, PartialEq, Eq)]
+ pub struct BuiltinParserInput {
++    /// Whether this request contains an edit tear. Exact parsing sets this to
++    /// false even when `prefix`, `suffix`, and `after` are all empty.
++    pub tear: bool,
+     pub before: Vec<String>,
+     pub prefix: String,
+     pub suffix: String,
+@@ -708,8 +711,7 @@ fn parser_diagnostic(error: &clap::Error) -> ParserDiagnostic {
+ fn command_probe<T: Command>(input: BuiltinParserInput) -> BuiltinParserObservation {
+     let mut command = T::command();
+     command.build();
+-    let current_prefix =
+-        (!input.prefix.is_empty() || !input.suffix.is_empty()).then_some(input.prefix.as_str());
++    let current_prefix = input.tear.then_some(input.prefix.as_str());
+     let current_argv = argv_with_prefix(&input, current_prefix);
+     let (status, mut expected) = typed_parse_status::<T>(&input, current_prefix, &command);
+ 

@@ -438,6 +438,7 @@ materialize_application_bindings(
     [binding(Name, state_text_source(Expression))|Bindings], State,
     Observations, Origin,
     [binding(Name, Source)|Materialized]) :-
+    !,
     atom(Name),
     symbolic_text_source(Expression, State, Origin, Source),
     materialize_application_bindings(Bindings, State, Observations, Origin,
@@ -446,6 +447,7 @@ materialize_application_bindings(
 materialize_application_bindings(
     [binding(Name, state_resolved(Value))|Bindings], State, Observations,
     Origin, [binding(Name, Resolved)|Materialized]) :-
+    !,
     atom(Name),
     resolve_state_value(Value, State, Observations, Resolved),
     materialize_application_bindings(Bindings, State, Observations, Origin,

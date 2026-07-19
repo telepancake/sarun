@@ -17,3 +17,4 @@
 0160-xargs-find--exec-children-inherit-the-logical-shell-env.patch
 0170-find--honor-logical-TZ-for--printf--T--A--C-and--daystart-wi.patch
 0180-find--expose-shared-file-type-syntax-catalog.patch
+0190-find--probe-type-arguments-through-execution-parser.patch

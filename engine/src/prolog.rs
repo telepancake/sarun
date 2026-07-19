@@ -2792,12 +2792,15 @@ mod tests {
     use super::*;
 
     fn find_file_type_completions(source: &str, assist: Span) -> std::collections::BTreeSet<String> {
-        analyze_brush_document(&BrushDocumentRequest {
-            source: source.into(),
-            assist: Some(assist),
-            initial_bindings: vec![],
-            observations: vec![],
-        })
+        crate::parser::analyze_brush_document_resolved(
+            &BrushDocumentRequest {
+                source: source.into(),
+                assist: Some(assist),
+                initial_bindings: vec![],
+                observations: vec![],
+            },
+            &crate::parser::EmptyContext,
+        )
         .unwrap()
         .candidates
         .iter()
@@ -2807,7 +2810,11 @@ mod tests {
                 && completion
                     .alternatives
                     .iter()
-                    .any(|alternative| alternative.syntax == "find_file_type")
+                    .any(|alternative| {
+                        alternative.syntax == "builtin_argument"
+                            && alternative.provider == "builtin_parser"
+                            && alternative.semantic.contains("type_value")
+                    })
         })
         .map(|completion| completion.insert.clone())
         .collect()
@@ -3481,7 +3488,10 @@ mod tests {
                     end: partial.len(),
                 },
             ),
-            ["f"].into_iter().map(str::to_string).collect()
+            ["f", "f,b", "f,c", "f,d", "f,l", "f,p", "f,s"]
+                .into_iter()
+                .map(str::to_string)
+                .collect()
         );
 
         let xtype = "find . -xtype ";
@@ -3502,33 +3512,32 @@ mod tests {
 
     #[test]
     fn ordinary_find_type_relation_rejects_invalid_duplicate_and_trailing_values() {
-        let parse = |source: &str| {
-            global()
-                .unwrap()
-                .transform(&RelationRequest {
-                    grammar: builtin_command_grammar_handle(),
-                    given: vec![RelationBinding {
-                        name: "source".into(),
-                        value: rv_compound(
-                            "text_source",
-                            vec![rv_string(source), rv_atom("exact"), rv_atom("rust_test")],
-                        ),
-                    }],
-                    wanted: vec!["status".into()],
-                    observations: vec![],
-                    limits: RelationLimits::default(),
-                })
-                .unwrap()
+        let parse = |arguments: &[&str]| {
+            crate::find_builtin::parser(brush_core::builtins::BuiltinParserInput {
+                tear: false,
+                before: std::iter::once("find".to_string())
+                    .chain(arguments.iter().map(|argument| (*argument).to_string()))
+                    .collect(),
+                prefix: String::new(),
+                suffix: String::new(),
+                after: Vec::new(),
+            })
+            .status
         };
-        assert!(!parse("find . -type f,d").solutions.is_empty());
-        assert!(!parse("find . -typewriter").solutions.is_empty());
+        assert_eq!(
+            parse(&[".", "-type", "f,d"]),
+            brush_core::builtins::BuiltinParseStatus::Complete
+        );
         for invalid in [
-            "find . -type x",
-            "find . -type f,f",
-            "find . -type f,",
+            vec![".", "-type", "x"],
+            vec![".", "-type", "f,f"],
+            vec![".", "-type", "f,"],
         ] {
             assert!(
-                parse(invalid).solutions.is_empty(),
+                matches!(
+                    parse(&invalid),
+                    brush_core::builtins::BuiltinParseStatus::Rejected(_)
+                ),
                 "ordinary grammar accepted {invalid:?}"
             );
         }
@@ -3592,7 +3601,11 @@ mod tests {
                     && completion
                         .alternatives
                         .iter()
-                        .any(|alternative| alternative.syntax == "find_file_type")
+                        .any(|alternative| {
+                            alternative.syntax == "builtin_argument"
+                                && alternative.provider == "builtin_parser"
+                                && alternative.semantic.contains("type_value")
+                        })
             })
             .map(|completion| completion.insert.as_str())
             .collect::<std::collections::BTreeSet<_>>();

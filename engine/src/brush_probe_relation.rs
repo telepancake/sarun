@@ -52,6 +52,7 @@ struct ProbeAtTear {
     replace: ByteSpan,
     edit_id: String,
     tear_surface_len: usize,
+    command_gap: bool,
 }
 
 #[derive(Debug)]
@@ -99,6 +100,7 @@ impl Adapter for BuiltinProbeAdapter {
         match tears.as_slice() {
             [] => {
                 let observation = probe(BuiltinParserInput {
+                    tear: false,
                     before: words.into_iter().map(|word| word.text).collect(),
                     prefix: String::new(),
                     suffix: String::new(),
@@ -140,9 +142,10 @@ fn decode_symbolic_argv(value: &RelationValue) -> Result<Vec<CookedWord>, ArgvDe
         ));
     };
     if name != "symbolic_argv" || fields.len() != 1 {
-        return Err(ArgvDecodeError::Invalid(
-            "typed builtin argv has an invalid shape".into(),
-        ));
+        return Err(ArgvDecodeError::Invalid(format!(
+            "typed builtin argv has an invalid shape: {name}/{}",
+            fields.len()
+        )));
     }
     let RelationValue::List(words) = &fields[0] else {
         return Err(ArgvDecodeError::Invalid(
@@ -408,21 +411,38 @@ fn probe_from_symbolic_tear(
         return Err("typed builtin tear has an invalid cooked offset".into());
     }
     Ok(ProbeAtTear {
-        input: BuiltinParserInput {
-            before: words[..word_index]
-                .iter()
-                .map(|word| word.text.clone())
-                .collect(),
-            prefix: word.text[..tear.offset].into(),
-            suffix: word.text[tear.offset..].into(),
-            after: words[word_index + 1..]
-                .iter()
-                .map(|word| word.text.clone())
-                .collect(),
+        input: if word_index == 0
+            && tear.offset == word.text.len()
+            && tear.surface_len == 0
+        {
+            BuiltinParserInput {
+                tear: true,
+                before: vec![word.text.clone()],
+                prefix: String::new(),
+                suffix: String::new(),
+                after: words[1..].iter().map(|word| word.text.clone()).collect(),
+            }
+        } else {
+            BuiltinParserInput {
+                tear: true,
+                before: words[..word_index]
+                    .iter()
+                    .map(|word| word.text.clone())
+                    .collect(),
+                prefix: word.text[..tear.offset].into(),
+                suffix: word.text[tear.offset..].into(),
+                after: words[word_index + 1..]
+                    .iter()
+                    .map(|word| word.text.clone())
+                    .collect(),
+            }
         },
         replace: tear.replace,
         edit_id: tear.edit_id.clone(),
         tear_surface_len: tear.surface_len,
+        command_gap: word_index == 0
+            && tear.offset == word.text.len()
+            && tear.surface_len == 0,
     })
 }
 
@@ -435,7 +455,7 @@ fn exact_reply(
             solution_reply(request, RelationValue::Atom("complete".into()), Vec::new())
         }
         BuiltinParseStatus::Incomplete | BuiltinParseStatus::Unsupported => Ok(no_solution()),
-        BuiltinParseStatus::Rejected(_) => Ok(diagnostic("parser_rejected")),
+        BuiltinParseStatus::Rejected(_) => Ok(no_solution()),
     }
 }
 
@@ -446,22 +466,47 @@ fn assist_reply(
     observation: BuiltinParserObservation,
 ) -> Result<RelationReply, String> {
     match observation.status {
-        BuiltinParseStatus::Rejected(_) => return Ok(diagnostic("parser_rejected")),
+        BuiltinParseStatus::Rejected(_) => return Ok(no_solution()),
         BuiltinParseStatus::Unsupported => return Ok(no_solution()),
         BuiltinParseStatus::Complete | BuiltinParseStatus::Incomplete => {}
     }
     let mut candidates = Vec::<(String, Vec<RelationValue>)>::new();
     let mut context_queries = Vec::new();
     for continuation in observation.literal_continuations {
-        let literal = continuation.literal;
+        let parser_literal = continuation.literal;
+        let mut literal = parser_literal.clone();
+        if at_tear.command_gap {
+            literal.insert(0, ' ');
+        }
         candidates.push((
-            literal.clone(),
+            if !continuation.expected.is_empty() && at_tear.input.suffix.is_empty() {
+                format!("{literal} ")
+            } else {
+                literal.clone()
+            },
             vec![parser_alternative(
                 command_name,
                 &continuation.argument,
-                &literal,
+                &parser_literal,
             )],
         ));
+        if at_tear.input.suffix.is_empty() {
+            for expected in &continuation.expected {
+                for value in &expected.finite_values {
+                    candidates.push((
+                        format!("{literal} {value}"),
+                        vec![
+                            parser_alternative(
+                                command_name,
+                                &continuation.argument,
+                                &parser_literal,
+                            ),
+                            parser_alternative(command_name, expected, value),
+                        ],
+                    ));
+                }
+            }
+        }
     }
     let mut arguments = observation.expected;
     arguments.extend(observation.tear_arguments);
@@ -516,6 +561,7 @@ fn assist_reply(
         .enumerate()
         .filter_map(|(rank, (candidate, alternatives))| {
             completion_insertion(&candidate, &at_tear)
+                .filter(|insert| !insert.is_empty())
                 .map(|insert| completion_value(at_tear.replace, insert, alternatives, rank + 1))
         })
         .collect();
@@ -679,18 +725,6 @@ fn no_solution() -> RelationReply {
         context_queries: vec![],
         dependency_keys: vec![],
         diagnostics: vec![],
-    }
-}
-
-fn diagnostic(name: &str) -> RelationReply {
-    RelationReply {
-        solutions: vec![],
-        context_queries: vec![],
-        dependency_keys: vec![],
-        diagnostics: vec![RelationValue::Compound(
-            "diagnostic".into(),
-            vec![RelationValue::Atom(name.into())],
-        )],
     }
 }
 
@@ -921,13 +955,7 @@ mod tests {
             .transform(&request(incompatible, &["status", "completions"]))
             .unwrap();
         assert!(reply.solutions.is_empty());
-        assert_eq!(
-            reply.diagnostics,
-            [RelationValue::Compound(
-                "diagnostic".into(),
-                vec![RelationValue::Atom("parser_rejected".into())],
-            )]
-        );
+        assert!(reply.diagnostics.is_empty());
     }
 
     #[test]
@@ -944,6 +972,22 @@ mod tests {
             completion_texts(&reply),
             ["acs-ctlx", "acs-meta", "acs-standard"]
         );
+    }
+
+    #[test]
+    fn command_end_tear_composes_following_option_and_value_evidence() {
+        let argv_input = argv(vec![word(
+            0,
+            4,
+            vec![literal(0, 4, "bind"), tear(4, 4, "")],
+        )]);
+        let reply = BuiltinProbeAdapter
+            .transform(&request(argv_input, &["status", "completions"]))
+            .unwrap();
+        let completions = completion_texts(&reply);
+        for expected in [" -m ", " -m emacs-standard", " -m vi-insert"] {
+            assert!(completions.iter().any(|completion| completion == expected));
+        }
     }
 
     #[test]

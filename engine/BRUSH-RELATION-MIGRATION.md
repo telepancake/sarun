@@ -331,19 +331,40 @@ Implementation order:
        projection for this input, maps to relation no-solution, and never
        invokes another parser or fallback. Find must produce this evidence
        directly rather than manufacture fake Clap metadata.
-   [ ] Add Find-owned rich argv/probe types and make execution and assist enter
+   [x] Add Find-owned rich argv/probe types and make execution and assist enter
        the same internal parser. The current derived `FindBuiltin` Clap parser
        accepts an opaque trailing `Vec<String>`; it is not Find's grammar. The
        real seam is `findutils::find::parse_args` followed by
-       `matchers::build_top_level_matcher_with_input`.
-   [ ] Refactor the first real Find slice through a small argument cursor and
-       recording/suspending parse environment: starting-path/expression
-       classification, `-type`/`-xtype`, and their unique comma-list operand.
-       Concrete input keeps the current execution behavior. A tear records
-       compatible literals/value expectations and each candidate is replayed
-       through that same parser with its concrete suffix. This must restore
+       `matchers::build_top_level_matcher_with_input`. The neutral Find-owned
+       input, status, semantic identity, expectation, match, and completion
+       types have no Brush, Clap, Prolog, or engine dependency.
+   [x] Instrument the first real Find slice at its actual parser match sites:
+       starting paths, expression dispatch, `-type`/`-xtype`, and their unique
+       comma-list operand. Exact and assist candidates replay `parse_args`,
+       `build_matcher_tree`, and `type_creator`; there is no adjacent argument
+       cursor or syntax parser. The probe rejects every other expression before
+       entering its parser arm, so an input outside this effect-free slice is
+       explicitly `Unsupported`. Tears retain prefix and concrete suffix;
+       candidate replay enforces missing operands, accepted values, and
+       uniqueness. Six Find-owned tests cover exact valid/invalid/incomplete,
+       predicate and operand tears, comma continuations, incompatible suffixes,
+       and effectful unsupported expressions.
+   [x] Map the Find-owned evidence into the neutral registered-parser ABI and
+       install its command-owned parser function in the ordinary builtin
+       registration map. The relation adapter still dispatches only through
+       the opaque `builtin_parser` handle and contains no Find branch. This
+       restores
        `find . -type |` and `A="|"; find . -type $A` without a metadata table in
        sarun, Prolog, or the generic adapter.
+   [x] Make tear presence explicit in the parser-neutral input and repair the
+       rich-argv seams exposed by production tests. A tear immediately after
+       argv[0] is projected as an ordinary following-word gap, with separators
+       derived from accepted parser continuations. Failed
+       `state_resolved(...)` materialization can no longer fall through as a
+       literal wrapper into a registered parser request. Rejected ambiguous
+       parser branches are relation no-solutions rather than global backend
+       diagnostics. Minimal suffix edits, including selected valid values and
+       valid comma-list continuations, are asserted by their applied result.
    [ ] Move Find's parse-time effects behind explicit environment operations:
        output file creation, `-files0-from`, stat/time references, NSS
        user/group resolution, and clock access. Assist emits typed

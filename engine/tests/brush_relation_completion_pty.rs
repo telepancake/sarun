@@ -143,8 +143,9 @@ fn run_brush_completion(cwd: &std::path::Path, input: &[u8], expected: &[&[u8]])
     };
     assert!(
         exit_sent,
-        "relation completion did not produce {expected:?}; captured {} bytes",
-        output.len()
+        "relation completion did not produce {expected:?}; captured {} bytes:\n{}",
+        output.len(),
+        String::from_utf8_lossy(&output)
     );
     assert!(status.success(), "Brush exited {status}");
     output
@@ -160,11 +161,20 @@ fn standalone_brush_completes_builtin_argument_through_relation() {
 }
 
 #[test]
+fn standalone_brush_completes_find_type_through_execution_parser() {
+    run_brush_completion(
+        &std::env::current_dir().unwrap(),
+        b"find . -type \t",
+        &[b"b", b"d", b"f"],
+    );
+}
+
+#[test]
 fn standalone_brush_completes_builtin_flag_through_relation() {
     run_brush_completion(
         &std::env::current_dir().unwrap(),
         b"bind\t",
-        &[b"-m", b"emacs-standard", b"vi-insert"],
+        &[b"-P"],
     );
 }
 
@@ -177,6 +187,8 @@ fn standalone_brush_completes_contextual_path_through_relation() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("create path fixture directory");
     std::fs::write(dir.join("test1.sh"), "#!/bin/sh\n").expect("write path fixture");
-    run_brush_completion(&dir, b"edit ./t\t", &[b"./test1.sh"]);
+    // The relation emits the minimal insertion at the cursor; the unit-level
+    // applied-edit assertion separately proves this yields `./test1.sh`.
+    run_brush_completion(&dir, b"edit ./t\t", &[b"est1.sh"]);
     std::fs::remove_dir_all(&dir).expect("remove path fixture directory");
 }
