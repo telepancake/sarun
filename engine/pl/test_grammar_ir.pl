@@ -108,7 +108,8 @@ run_test(separated_list_bounds_and_uniqueness_are_closed_data) :-
     Item = literal("x", x, presentation([])),
     valid_grammar(
         grammar(source(text(utf8)), root,
-                [rule(root, separated(1, 4, Separator, unique, Item))], [])),
+                [rule(root,
+                      separated(1, 4, Separator, unique(value), Item))], [])),
     valid_grammar(
         grammar(source(text(utf8)), root,
                 [rule(root,
@@ -116,7 +117,12 @@ run_test(separated_list_bounds_and_uniqueness_are_closed_data) :-
                                 Item))], [])),
     \+ valid_grammar(
            grammar(source(text(utf8)), root,
-                   [rule(root, separated(2, 1, Separator, unique, Item))], [])),
+                   [rule(root,
+                         separated(2, 1, Separator, unique(value), Item))],
+                   [])),
+    \+ valid_grammar(
+           grammar(source(text(utf8)), root,
+                   [rule(root, separated(1, 4, Separator, unique, Item))], [])),
     \+ valid_grammar(
            grammar(source(text(utf8)), root,
                    [rule(root, separated(1, 4, Separator, distinct, Item))],

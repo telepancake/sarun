@@ -146,7 +146,10 @@ valid_maximum(Maximum, Minimum) :-
     integer(Maximum),
     Maximum >= Minimum.
 
-valid_uniqueness(unique).
+% `value` names the compared projection explicitly.  The engine compares the
+% complete parsed value, including source spans embedded by field/ref nodes;
+% grammars wanting a source-insensitive identity must project that value first.
+valid_uniqueness(unique(value)).
 valid_uniqueness(allow_duplicates).
 
 valid_associativity(none).

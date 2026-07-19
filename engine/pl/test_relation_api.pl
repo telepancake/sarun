@@ -21,6 +21,7 @@ test_name(raw_terminal_tear_is_an_ordinary_symbolic_parse_value).
 test_name(every_tested_parse_prefix_exposes_an_ordinary_completion).
 test_name(lookahead_does_not_consume_tear_or_hide_valid_sequence_suffix).
 test_name(separated_list_parsing_rendering_and_completion_are_one_relation).
+test_name(separated_unique_value_includes_embedded_source_spans).
 test_name(context_backed_text_is_one_parse_relation).
 test_name(sibling_exact_and_tear_context_queries_have_distinct_identities).
 test_name(virtual_context_tear_maps_to_physical_source_span).
@@ -647,7 +648,7 @@ run_test(lookahead_does_not_consume_tear_or_hide_valid_sequence_suffix) :-
     solution_has_completion(Solutions, " alpha").
 
 run_test(separated_list_parsing_rendering_and_completion_are_one_relation) :-
-    separated_list_grammar(unique, Grammar),
+    separated_list_grammar(unique(value), Grammar),
     limits(Limits),
     raw_text_parses(Grammar, Limits, "f,d"),
     \+ raw_text_parses(Grammar, Limits, "f,f"),
@@ -664,6 +665,29 @@ run_test(separated_list_parsing_rendering_and_completion_are_one_relation) :-
     \+ list_contains(",f", ContinuationTexts),
     separated_list_grammar(allow_duplicates, DuplicateGrammar),
     raw_text_parses(DuplicateGrammar, Limits, "f,f").
+
+run_test(separated_unique_value_includes_embedded_source_spans) :-
+    Grammar = grammar(
+        source(text(utf8)), root,
+        [rule(root,
+              separated(
+                  2, 2, literal(",", comma, presentation([])), unique(value),
+                  field(item, literal("x", same, presentation([])))))],
+        []),
+    limits(Limits),
+    transform(
+        request(Grammar,
+                given([binding(source,
+                               text_source("x,x", exact, foreign_text))]),
+                want([ast]), observations([]), Limits),
+        reply([solution(
+                   [binding(
+                        ast,
+                        node(root, span(0, 3),
+                             separated([
+                                 field(item, span(0, 1), literal(same)),
+                                 field(item, span(2, 3), literal(same))])))],
+                   0)], [], [], [])).
 
 run_test(context_backed_text_is_one_parse_relation) :-
     PathCodepoint = terminal(
@@ -879,7 +903,7 @@ run_test(opaque_handle_resolves_install_once_grammar) :-
         reply([], [], [], [diagnostic(invalid_request)])).
 
 run_test(supplied_grammar_resolves_install_once_handle) :-
-    separated_list_grammar(unique, Grammar),
+    separated_list_grammar(unique(value), Grammar),
     install_grammar(supplied_raw_text_test, Grammar),
     limits(Limits),
     transform(

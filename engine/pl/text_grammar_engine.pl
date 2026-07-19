@@ -747,7 +747,9 @@ match_separated_next(Count, Item, Separator, Rules, Text, Context, Maximum,
     append(BeforeItem, ItemEvidence, Evidence).
 
 separated_value_allowed(allow_duplicates, _, _).
-separated_value_allowed(unique, Value, Seen) :-
+% Variant identity is exact parsed-value identity.  In particular, spans in a
+% field/ref value remain observable and therefore participate in uniqueness.
+separated_value_allowed(unique(value), Value, Seen) :-
     \+ variant_member(Value, Seen).
 
 variant_member(Value, [Seen|_]) :- Value =@= Seen.
