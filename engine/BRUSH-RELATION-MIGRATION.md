@@ -185,6 +185,33 @@ Do not implement these as Brush-specific engine branches:
 
 ## Work sequence
 
+### Restart audit (2026-07-19)
+
+The editor and Reedline completion paths prove the boundary is executable, but
+the defining composition gate is currently red. The builtin grammar is applied
+once to the whole document instead of at every `command_words` node, and
+`find` still exposes opaque raw argv rather than an ordinary supplied grammar.
+The next implementation order is fixed:
+
+1. Add grammar-neutral AST-node relation application with the local-state
+   snapshot visible at that node.
+2. Lower symbolic local references to virtual command text while preserving
+   the physical source tear/replacement span; delete the whole-document
+   builtin-grammar shortcut.
+3. Prove the engine with a foreign supplied grammar, multiple command
+   positions, state timing, direct/propagated tears, unknown commands, and
+   UTF-8 spans before using a sarun builtin.
+4. Make `find` expose the same declarative argument grammar used by execution;
+   do not add `find` knowledge to Rust adapters or the generic engine.
+5. Add an immutable Brush semantic snapshot, composite provider, and one
+   resolved/dependency-keyed analysis service shared by editor and Reedline.
+
+The mandatory baseline includes the focused Prolog suites, the static Rust
+relation/editor tests, and every native aarch64 PTY binary. Building test
+binaries without executing them is not a gate. At this audit the production
+backward-completion test, editor unit test, and editor PTY are all intentionally
+recorded red until steps 1--4 land.
+
 ### 0. Preserve and measure the reference
 
 - [x] Inventory every `Shell::parse_string`, `run_string`, `run_program`,
@@ -237,8 +264,9 @@ Do not implement these as Brush-specific engine branches:
       whitespace-separated simple commands, pipelines, `&&`/`||`, `;`, newline,
       backgrounding, and operator/trivia highlighting. Lexical maximality keeps
       adjacent codepoints in one word while trivia separates command words.
-- [ ] Add lists, pipelines, `&&`/`||`, backgrounding, compound commands,
-      functions, assignments, redirections, and parser-option gates.
+- [ ] Add compound commands, functions, full assignment forms, redirections,
+      and parser-option gates. The initial lists, pipelines, `&&`/`||`, and
+      backgrounding slice is already covered above.
 - [ ] Add heredoc delimiter queues, `<<-`, quoted delimiter semantics, multiple
       heredocs, and nested heredocs in command substitution.
 - [ ] Prove highlighting and completion inside expandable heredoc bodies use
@@ -260,17 +288,12 @@ Do not implement these as Brush-specific engine branches:
       foreign `let λ; use λ; use z` fixture proves that only `z` escapes to an
       external query. The same boundary now carries the initial Brush rules
       described below.
-- [ ] Encode shell-local variables/scopes as pure relation inputs and outputs.
-      First executable slice: the installed Brush handle is a generic
-      enrichment of its syntax grammar; assignment-only commands emit escaping
-      variable deltas after RHS traversal, later simple parameters resolve
-      locally, and only unresolved parameters emit `one` queries. Prefix
-      assignments, functions, compound scopes, braced operators, and special
-      parameters remain.
-      Returned observations are now consumed by the same state projection:
-      successful `one` observations bind the external value, missing or
-      ambiguous `one` observations remove the semantic solution, and every
-      consumed observation yields a provenance-free dependency key.
+- [x] Encode assignment-only shell variables and simple parameters as pure
+      relation inputs/outputs. Escaping deltas, later local resolution,
+      unresolved `one` queries, observations, and dependency keys are covered.
+- [ ] Extend shell-local state to prefix assignments, functions, compound
+      scopes, braced operators, special parameters, aliases, and parser-option
+      effects.
 - [x] Add a grammar-independent symbolic text constraint relation over scoped
       state. A later `reference(Domain, Name)` resolves through the local scope
       chain to an earlier source hole, and a finite typed value relation emits
