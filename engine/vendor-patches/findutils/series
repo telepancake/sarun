@@ -16,3 +16,4 @@
 0150-xargs-restore-GNU-exit-codes-for-not-found-signal-death-audi.patch
 0160-xargs-find--exec-children-inherit-the-logical-shell-env.patch
 0170-find--honor-logical-TZ-for--printf--T--A--C-and--daystart-wi.patch
+0180-find--expose-shared-file-type-syntax-catalog.patch

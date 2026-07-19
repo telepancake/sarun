@@ -1,0 +1,384 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Sun, 19 Jul 2026 11:12:13 +0000
+Subject: [PATCH] find: expose shared file-type syntax catalog
+
+Define the -type and -xtype predicates, their finite native value domain, list separator, and uniqueness rule in immutable find-owned metadata. Make top-level parsing and execution validation consume that same catalog so grammar importers cannot drift from runtime acceptance.
+
+---
+diff --git a/src/find/matchers/mod.rs b/src/find/matchers/mod.rs
+index c9a7e78..2c1ad62 100644
+--- a/src/find/matchers/mod.rs
++++ b/src/find/matchers/mod.rs
+@@ -514,7 +514,26 @@ fn build_matcher_tree(
+     let mut i = arg_index;
+     let mut invert_next_matcher = false;
+     while i < args.len() {
++        let file_type_predicate = crate::find::syntax::file_type_predicate(args[i]);
+         let possible_submatcher = match args[i] {
++            _ if file_type_predicate.is_some() => {
++                let predicate = file_type_predicate.expect("guarded by is_some");
++                if i >= args.len() - 1 {
++                    return Err(From::from(format!(
++                        "missing argument to {}",
++                        predicate.surface
++                    )));
++                }
++                i += 1;
++                match predicate.identity {
++                    crate::find::syntax::FileTypePredicateIdentity::Type => {
++                        Some(TypeMatcher::new(args[i])?.into_box())
++                    }
++                    crate::find::syntax::FileTypePredicateIdentity::Xtype => {
++                        Some(XtypeMatcher::new(args[i])?.into_box())
++                    }
++                }
++            }
+             "-print" => Some(Printer::new(PrintDelimiter::Newline, None).into_box()),
+             "-print0" => Some(Printer::new(PrintDelimiter::Null, None).into_box()),
+             "-printf" => {
+@@ -611,20 +630,6 @@ fn build_matcher_tree(
+                 i += 1;
+                 Some(RegexMatcher::new(regex_type, args[i], true)?.into_box())
+             }
+-            "-type" => {
+-                if i >= args.len() - 1 {
+-                    return Err(From::from(format!("missing argument to {}", args[i])));
+-                }
+-                i += 1;
+-                Some(TypeMatcher::new(args[i])?.into_box())
+-            }
+-            "-xtype" => {
+-                if i >= args.len() - 1 {
+-                    return Err(From::from(format!("missing argument to {}", args[i])));
+-                }
+-                i += 1;
+-                Some(XtypeMatcher::new(args[i])?.into_box())
+-            }
+             "-fstype" => {
+                 if i >= args.len() - 1 {
+                     return Err(From::from(format!("missing argument to {}", args[i])));
+diff --git a/src/find/matchers/type_matcher.rs b/src/find/matchers/type_matcher.rs
+index a1af488..4bc14f7 100644
+--- a/src/find/matchers/type_matcher.rs
++++ b/src/find/matchers/type_matcher.rs
+@@ -5,6 +5,7 @@
+ // https://opensource.org/licenses/MIT.
+ 
+ use super::{FileType, Follow, Matcher, MatcherIO, WalkEntry};
++use crate::find::syntax::{FileTypePredicate, TYPE_PREDICATE, XTYPE_PREDICATE};
+ use std::collections::HashSet;
+ use std::error::Error;
+ 
+@@ -13,45 +14,24 @@ pub struct TypeMatcher {
+     file_type: HashSet<FileType>,
+ }
+ 
+-fn parse(type_string: &str, mode: &str) -> Result<FileType, Box<dyn Error>> {
+-    let file_type = match type_string {
+-        "f" => FileType::Regular,
+-        "d" => FileType::Directory,
+-        "l" => FileType::Symlink,
+-        "b" => FileType::BlockDevice,
+-        "c" => FileType::CharDevice,
+-        "p" => FileType::Fifo, // named pipe (FIFO)
+-        "s" => FileType::Socket,
+-        // D: door (Solaris)
+-        "D" => {
+-            #[cfg(not(target_os = "solaris"))]
+-            {
+-                return Err(From::from(format!("{mode} D is not supported because Solaris doors are not supported on the platform find was compiled on.")));
+-            }
+-            #[cfg(target_os = "solaris")]
+-            {
+-                return Err(From::from(format!(
+-                    "Type argument {type_string} not supported yet"
+-                )));
+-            }
+-        }
+-        "" => {
+-            return Err(From::from(format!(
+-                "Arguments to {mode} should contain at least one letter"
+-            )))
+-        }
+-        _ => {
+-            return Err(From::from(format!(
+-                "Unrecognised type argument {type_string}"
+-            )))
+-        }
+-    };
+-    Ok(file_type)
++fn parse(type_string: &str, predicate: &FileTypePredicate) -> Result<FileType, Box<dyn Error>> {
++    if type_string.is_empty() {
++        return Err(From::from(format!(
++            "Arguments to {} should contain at least one letter",
++            predicate.surface
++        )));
++    }
++    predicate
++        .values
++        .iter()
++        .find(|value| value.surface == type_string)
++        .map(|value| value.identity)
++        .ok_or_else(|| From::from(format!("Unrecognised type argument {type_string}")))
+ }
+ 
+ impl TypeMatcher {
+     pub fn new(type_string: &str) -> Result<Self, Box<dyn Error>> {
+-        let main_file_type = type_creator(type_string, "-type")?;
++        let main_file_type = type_creator(type_string, &TYPE_PREDICATE)?;
+         Ok(Self {
+             file_type: main_file_type,
+         })
+@@ -71,7 +51,7 @@ pub struct XtypeMatcher {
+ 
+ impl XtypeMatcher {
+     pub fn new(type_string: &str) -> Result<Self, Box<dyn Error>> {
+-        let main_file_type = type_creator(type_string, "-xtype")?;
++        let main_file_type = type_creator(type_string, &XTYPE_PREDICATE)?;
+         Ok(Self {
+             file_type: main_file_type,
+         })
+@@ -101,28 +81,33 @@ impl Matcher for XtypeMatcher {
+     }
+ }
+ 
+-fn type_creator(type_string: &str, mode: &str) -> Result<HashSet<FileType>, Box<dyn Error>> {
++fn type_creator(
++    type_string: &str,
++    predicate: &FileTypePredicate,
++) -> Result<HashSet<FileType>, Box<dyn Error>> {
+     let mut file_types = std::collections::HashSet::new();
+ 
+-    if type_string.contains(',') {
+-        for part in type_string.split(',') {
++    if type_string.contains(predicate.separator) {
++        for part in type_string.split(predicate.separator) {
+             if part.is_empty() {
+-                return Err(From::from(format!("find: Last file type in list argument to {mode} is missing, i.e., list is ending on: ','")));
++                return Err(From::from(format!("find: Last file type in list argument to {} is missing, i.e., list is ending on: '{}'", predicate.surface, predicate.separator)));
+             }
+-            let file_type = parse(part, mode)?;
+-            if !file_types.insert(file_type) {
++            let file_type = parse(part, predicate)?;
++            if predicate.values_must_be_unique && !file_types.insert(file_type) {
+                 return Err(From::from(format!(
+-                    "Duplicate file type '{part}' in the argument list to {mode}"
++                    "Duplicate file type '{part}' in the argument list to {}",
++                    predicate.surface
+                 )));
+             }
+         }
+     } else {
+         if type_string.len() > 1 {
+             return Err(From::from(format!(
+-                "Must separate multiple arguments to {mode} using: ','"
++                "Must separate multiple arguments to {} using: '{}'",
++                predicate.surface, predicate.separator
+             )));
+         }
+-        file_types.insert(parse(type_string, mode)?);
++        file_types.insert(parse(type_string, predicate)?);
+     }
+ 
+     Ok(file_types)
+@@ -132,6 +117,7 @@ fn type_creator(type_string: &str, mode: &str) -> Result<HashSet<FileType>, Box<
+ mod tests {
+     use super::*;
+     use crate::find::matchers::tests::get_dir_entry_for;
++    use crate::find::syntax::{FILE_TYPE_PREDICATES, NATIVE_FILE_TYPE_VALUES};
+     use crate::find::tests::FakeDependencies;
+     use std::io::ErrorKind;
+ 
+@@ -141,6 +127,40 @@ mod tests {
+     #[cfg(unix)]
+     use crate::find::matchers::tests::get_dir_entry_follow;
+ 
++    #[test]
++    #[cfg(target_os = "linux")]
++    fn execution_acceptance_exactly_matches_native_catalog() {
++        let surfaces = NATIVE_FILE_TYPE_VALUES
++            .iter()
++            .map(|value| value.surface)
++            .collect::<Vec<_>>();
++        assert_eq!(surfaces, ["b", "c", "d", "f", "l", "p", "s"]);
++        for surface in &surfaces {
++            assert!(
++                TypeMatcher::new(surface).is_ok(),
++                "-type rejected {surface}"
++            );
++            assert!(
++                XtypeMatcher::new(surface).is_ok(),
++                "-xtype rejected {surface}"
++            );
++        }
++        let all = surfaces.join(",");
++        assert!(TypeMatcher::new(&all).is_ok());
++        assert!(XtypeMatcher::new(&all).is_ok());
++        for invalid in ["", "x", "f,f", "f,", "f,x", "fd"] {
++            assert!(
++                TypeMatcher::new(invalid).is_err(),
++                "-type accepted {invalid:?}"
++            );
++            assert!(
++                XtypeMatcher::new(invalid).is_err(),
++                "-xtype accepted {invalid:?}"
++            );
++        }
++        assert_eq!(FILE_TYPE_PREDICATES.len(), 2);
++    }
++
+     #[cfg(windows)]
+     use std::os::windows::fs::{symlink_dir, symlink_file};
+ 
+diff --git a/src/find/mod.rs b/src/find/mod.rs
+index 9e8b3a2..14ac790 100644
+--- a/src/find/mod.rs
++++ b/src/find/mod.rs
+@@ -5,6 +5,7 @@
+ // https://opensource.org/licenses/MIT.
+ 
+ pub mod matchers;
++pub mod syntax;
+ 
+ use matchers::{Follow, WalkEntry};
+ use std::cell::RefCell;
+diff --git a/src/find/syntax.rs b/src/find/syntax.rs
+new file mode 100644
+index 0000000..2b1a85f
+--- /dev/null
++++ b/src/find/syntax.rs
+@@ -0,0 +1,133 @@
++//! Immutable syntax metadata shared by find's parser and external grammar
++//! importers.
++//!
++//! Keep accepted spellings and finite value domains here. Execution consumes
++//! the same values an importer sees; this is not a second help/completion table.
++
++use super::matchers::FileType;
++
++/// Stable semantic identity of a file-type predicate.
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub enum FileTypePredicateIdentity {
++    Type,
++    Xtype,
++}
++
++/// One accepted value in the `-type`/`-xtype` comma-list domain.
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub struct FileTypeValue {
++    pub surface: &'static str,
++    pub identity: FileType,
++    pub description: &'static str,
++}
++
++/// Declarative syntax of a predicate whose operand is a file-type list.
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub struct FileTypePredicate {
++    pub surface: &'static str,
++    pub identity: FileTypePredicateIdentity,
++    pub description: &'static str,
++    pub values: &'static [FileTypeValue],
++    pub separator: char,
++    pub values_must_be_unique: bool,
++}
++
++/// Native file types accepted by this find implementation.
++pub static NATIVE_FILE_TYPE_VALUES: &[FileTypeValue] = &[
++    FileTypeValue {
++        surface: "b",
++        identity: FileType::BlockDevice,
++        description: "block device",
++    },
++    FileTypeValue {
++        surface: "c",
++        identity: FileType::CharDevice,
++        description: "character device",
++    },
++    FileTypeValue {
++        surface: "d",
++        identity: FileType::Directory,
++        description: "directory",
++    },
++    FileTypeValue {
++        surface: "f",
++        identity: FileType::Regular,
++        description: "regular file",
++    },
++    FileTypeValue {
++        surface: "l",
++        identity: FileType::Symlink,
++        description: "symbolic link",
++    },
++    FileTypeValue {
++        surface: "p",
++        identity: FileType::Fifo,
++        description: "named pipe",
++    },
++    FileTypeValue {
++        surface: "s",
++        identity: FileType::Socket,
++        description: "socket",
++    },
++];
++
++pub const TYPE_PREDICATE: FileTypePredicate = FileTypePredicate {
++    surface: "-type",
++    identity: FileTypePredicateIdentity::Type,
++    description: "match the entry's file type",
++    values: NATIVE_FILE_TYPE_VALUES,
++    separator: ',',
++    values_must_be_unique: true,
++};
++
++pub const XTYPE_PREDICATE: FileTypePredicate = FileTypePredicate {
++    surface: "-xtype",
++    identity: FileTypePredicateIdentity::Xtype,
++    description: "match the referent type, reversing symlink following",
++    values: NATIVE_FILE_TYPE_VALUES,
++    separator: ',',
++    values_must_be_unique: true,
++};
++
++pub static FILE_TYPE_PREDICATES: &[FileTypePredicate] = &[TYPE_PREDICATE, XTYPE_PREDICATE];
++
++pub fn file_type_predicate(surface: &str) -> Option<&'static FileTypePredicate> {
++    FILE_TYPE_PREDICATES
++        .iter()
++        .find(|predicate| predicate.surface == surface)
++}
++
++pub fn file_type_value(surface: &str) -> Option<&'static FileTypeValue> {
++    NATIVE_FILE_TYPE_VALUES
++        .iter()
++        .find(|value| value.surface == surface)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    #[cfg(target_os = "linux")]
++    fn native_linux_file_type_catalog_is_exact() {
++        assert_eq!(
++            NATIVE_FILE_TYPE_VALUES
++                .iter()
++                .map(|value| value.surface)
++                .collect::<Vec<_>>(),
++            ["b", "c", "d", "f", "l", "p", "s"]
++        );
++        assert_eq!(
++            FILE_TYPE_PREDICATES
++                .iter()
++                .map(|predicate| predicate.surface)
++                .collect::<Vec<_>>(),
++            ["-type", "-xtype"]
++        );
++        assert!(FILE_TYPE_PREDICATES.iter().all(|predicate| {
++            predicate.values == NATIVE_FILE_TYPE_VALUES
++                && predicate.separator == ','
++                && predicate.values_must_be_unique
++        }));
++    }
++}
