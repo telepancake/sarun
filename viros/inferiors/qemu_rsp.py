@@ -28,6 +28,7 @@ class RspRestorationError(RuntimeError):
 
 
 _THREAD_ID = re.compile(r"(?:-1|0|[0-9a-fA-F]+|p[0-9a-fA-F]+\.(?:-1|0|[0-9a-fA-F]+))\Z")
+MAX_VIRTUAL_READ_BYTES = 16 * 1024 * 1024
 
 
 class QemuRspClient:
@@ -252,6 +253,85 @@ class QemuRspClient:
             if primary is not None:
                 raise primary
             return result
+
+    def read_virtual_memory(
+        self,
+        thread_id: str,
+        address: int,
+        length: int,
+        *,
+        address_bits: int,
+        max_read_bytes: int = MAX_VIRTUAL_READ_BYTES,
+    ) -> bytes:
+        """Read bounded virtual memory while restoring mode and ``Hg`` state."""
+
+        if not isinstance(thread_id, str) or not _THREAD_ID.fullmatch(thread_id):
+            raise ValueError("invalid RSP thread ID")
+        if (
+            isinstance(address_bits, bool)
+            or not isinstance(address_bits, int)
+            or not 0 < address_bits <= 64
+        ):
+            raise ValueError("virtual address width must be between 1 and 64 bits")
+        if (
+            isinstance(max_read_bytes, bool)
+            or not isinstance(max_read_bytes, int)
+            or max_read_bytes <= 0
+        ):
+            raise ValueError("virtual memory read limit must be positive")
+        if (
+            isinstance(address, bool)
+            or not isinstance(address, int)
+            or isinstance(length, bool)
+            or not isinstance(length, int)
+            or address < 0
+            or length < 0
+        ):
+            raise ValueError("invalid virtual memory read")
+        if length > max_read_bytes:
+            raise ValueError(
+                f"virtual memory read exceeds the {max_read_bytes}-byte limit"
+            )
+        address_limit = 1 << address_bits
+        if address >= address_limit or address + length > address_limit:
+            raise ValueError(
+                f"virtual memory read exceeds the {address_bits}-bit address width"
+            )
+        if length == 0:
+            return b""
+        with self._lock:
+            previous = self.current_thread()
+            previous_physical_mode = self.query_physical_mode()
+            primary: BaseException | None = None
+            result = bytearray()
+            try:
+                self.select_thread("g", thread_id)
+                # Set explicitly so a successful reply acknowledges that the
+                # following ``m`` packets use virtual-address translation.
+                self.set_physical_mode(False)
+                while len(result) < length:
+                    size = min(0x400, length - len(result))
+                    result.extend(self._read_memory(address + len(result), size))
+            except BaseException as exc:
+                primary = exc
+            finally:
+                cleanup: BaseException | None = None
+                try:
+                    self.set_physical_mode(previous_physical_mode)
+                except BaseException as exc:
+                    cleanup = exc
+                try:
+                    self.select_thread("g", previous)
+                except BaseException as exc:
+                    if cleanup is None:
+                        cleanup = exc
+                    else:
+                        cleanup = RspRestorationError(cleanup, exc)
+                if cleanup is not None:
+                    raise RspRestorationError(primary, cleanup) from cleanup
+            if primary is not None:
+                raise primary
+            return bytes(result)
 
     def write_register(self, register_number: int, value: bytes) -> None:
         if register_number < 0 or not value:

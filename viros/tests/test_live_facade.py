@@ -23,7 +23,11 @@ from inferiors.partial_registers import (
     PartialRegisterError,
 )
 from inferiors.probe_oracle import ProbeOracle
-from inferiors.qemu_rsp import QemuRspClient, RspRemoteError
+from inferiors.qemu_rsp import (
+    QemuRspClient,
+    RspRemoteError,
+    RspRestorationError,
+)
 from inferiors.rsp_proxy import RspFacade
 from inferiors.rsp_transport import RspStream
 from inferiors.rsp_server import qemu_cpu_stop_resolver
@@ -180,6 +184,7 @@ class FakeClient:
         self.breakpoints = []
         self.resumes = 0
         self.register_block = bytes.fromhex("01020304")
+        self.virtual_memory_reads = []
         self.xml = {
             "target.xml": (
                 b'<target xmlns:xi="http://www.w3.org/2001/XInclude">'
@@ -209,6 +214,10 @@ class FakeClient:
     def read_register_block(self, thread):
         self.register_reads.append(thread)
         return self.register_block
+
+    def read_virtual_memory(self, thread, address, length, *, address_bits):
+        self.virtual_memory_reads.append((thread, address, length, address_bits))
+        return bytes((address + offset) & 0xff for offset in range(length))
 
     def close(self):
         self.closed = True
@@ -485,6 +494,12 @@ class LiveFacadeTests(unittest.TestCase):
                     live.facade.handle(b"g"),
                     client.register_block.hex().encode("ascii"),
                 )
+                self.assertEqual(
+                    live.facade.handle(b"m803d8b34,4"), b"34353637"
+                )
+                self.assertEqual(
+                    client.virtual_memory_reads, [("1", 0x803D8B34, 4, 32)]
+                )
                 root = ET.fromstring(live.descriptions[b"target.xml"])
                 self.assertEqual(root.findtext("architecture"), "mips")
                 registers = {
@@ -504,6 +519,46 @@ class LiveFacadeTests(unittest.TestCase):
             # Construction checked both stopped CPUs; the forwarded current
             # task register read then selected CPU 0 once more.
             self.assertEqual(client.register_reads, ["1", "2", "1"])
+
+    def test_mmips_current_cpu_memory_route_rejects_a_sleeping_task(self):
+        client = FakeClient()
+        oracle = CurrentCpuProbeOracle(
+            ProbeOracle(FrozenRunner()),
+            client,
+            ("1", "2"),
+            qemu_current_memory_address_bits=32,
+        )
+        sleeping, current = oracle.snapshot().tasks
+        with self.assertRaisesRegex(OSError, "virtual memory"):
+            oracle.read_memory(sleeping, 0x803D8B34, 4)
+        self.assertEqual(
+            oracle.read_memory(current, 0x803D8B34, 4), b"4567"
+        )
+        self.assertEqual(
+            client.virtual_memory_reads, [("2", 0x803D8B34, 4, 32)]
+        )
+
+    def test_mmips_memory_restoration_failure_is_terminal(self):
+        client = FakeClient()
+        restoration = RspRestorationError(
+            RspRemoteError(b"E14"), RspRemoteError(b"E01")
+        )
+
+        def failed_read(thread, address, length, *, address_bits):
+            raise restoration
+
+        client.read_virtual_memory = failed_read
+        oracle = CurrentCpuProbeOracle(
+            ProbeOracle(FrozenRunner()),
+            client,
+            ("1", "2"),
+            qemu_current_memory_address_bits=32,
+        )
+        _, current = oracle.snapshot().tasks
+
+        with self.assertRaises(RspRestorationError) as caught:
+            oracle.read_memory(current, 0x803D8B34, 4)
+        self.assertIs(caught.exception, restoration)
 
     def test_xml_less_mmips_rejects_a_nonstandard_g_packet_size(self):
         with tempfile.TemporaryDirectory(dir=".") as directory_text:

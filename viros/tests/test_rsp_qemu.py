@@ -1,7 +1,12 @@
 import threading
 import unittest
 
-from inferiors.qemu_rsp import QemuRspClient, RspRemoteError, RspRestorationError
+from inferiors.qemu_rsp import (
+    MAX_VIRTUAL_READ_BYTES,
+    QemuRspClient,
+    RspRemoteError,
+    RspRestorationError,
+)
 from inferiors.rsp_transport import RspStream
 from test_rsp_support import memory_duplex_pair
 
@@ -215,6 +220,109 @@ class QemuRspClientTests(unittest.TestCase):
         )
         self.assertEqual(result, bytes.fromhex("01020304"))
         self.assertEqual(seen, [command for command, _ in script])
+
+    def test_virtual_memory_read_selects_cpu_chunks_and_restores_selection(self):
+        first = bytes((index & 0xFF for index in range(0x400)))
+        script = [
+            (b"qC", b"QC2"),
+            (b"qqemu.PhyMemMode", b"0"),
+            (b"Hg1", b"OK"),
+            (b"Qqemu.PhyMemMode:0", b"OK"),
+            (b"m803d8b34,400", first.hex().encode()),
+            (b"m803d8f34,1", b"aa"),
+            (b"Qqemu.PhyMemMode:0", b"OK"),
+            (b"Hg2", b"OK"),
+        ]
+        result, seen = self.run_script(
+            script,
+            lambda client: client.read_virtual_memory(
+                "1", 0x803D8B34, 0x401, address_bits=32
+            ),
+        )
+        self.assertEqual(result, first + b"\xaa")
+        self.assertEqual(seen, [command for command, _ in script])
+
+    def test_virtual_memory_read_restores_selection_after_remote_error(self):
+        script = [
+            (b"qC", b"QC2"),
+            (b"qqemu.PhyMemMode", b"0"),
+            (b"Hg1", b"OK"),
+            (b"Qqemu.PhyMemMode:0", b"OK"),
+            (b"m803d8b34,4", b"E14"),
+            (b"Qqemu.PhyMemMode:0", b"OK"),
+            (b"Hg2", b"OK"),
+        ]
+
+        def operation(client):
+            with self.assertRaises(RspRemoteError):
+                client.read_virtual_memory(
+                    "1", 0x803D8B34, 4, address_bits=32
+                )
+
+        _, seen = self.run_script(script, operation)
+        self.assertEqual(seen, [command for command, _ in script])
+
+    def test_virtual_memory_read_forces_virtual_mode_and_restores_physical_mode(self):
+        script = [
+            (b"qC", b"QC2"),
+            (b"qqemu.PhyMemMode", b"1"),
+            (b"Hg1", b"OK"),
+            (b"Qqemu.PhyMemMode:0", b"OK"),
+            (b"m803d8b34,4", b"01020304"),
+            (b"Qqemu.PhyMemMode:1", b"OK"),
+            (b"Hg2", b"OK"),
+        ]
+
+        result, seen = self.run_script(
+            script,
+            lambda client: client.read_virtual_memory(
+                "1", 0x803D8B34, 4, address_bits=32
+            ),
+        )
+        self.assertEqual(result, b"\x01\x02\x03\x04")
+        self.assertEqual(seen, [command for command, _ in script])
+
+    def test_virtual_memory_read_attempts_both_restorations_after_failures(self):
+        script = [
+            (b"qC", b"QC2"),
+            (b"qqemu.PhyMemMode", b"1"),
+            (b"Hg1", b"OK"),
+            (b"Qqemu.PhyMemMode:0", b"OK"),
+            (b"m803d8b34,4", b"E14"),
+            (b"Qqemu.PhyMemMode:1", b"E01"),
+            (b"Hg2", b"E02"),
+        ]
+
+        def operation(client):
+            with self.assertRaises(RspRestorationError) as caught:
+                client.read_virtual_memory(
+                    "1", 0x803D8B34, 4, address_bits=32
+                )
+            self.assertIsInstance(caught.exception.primary, RspRemoteError)
+            combined = caught.exception.cleanup
+            self.assertIsInstance(combined, RspRestorationError)
+            self.assertIsInstance(combined.primary, RspRemoteError)
+            self.assertIsInstance(combined.cleanup, RspRemoteError)
+
+        _, seen = self.run_script(script, operation)
+        self.assertEqual(seen, [command for command, _ in script])
+
+    def test_virtual_memory_read_rejects_wraparound_and_oversize_before_rsp(self):
+        invalid = (
+            (1 << 32, 1),
+            ((1 << 32) - 1, 2),
+            (0, MAX_VIRTUAL_READ_BYTES + 1),
+        )
+        for address, length in invalid:
+            with self.subTest(address=address, length=length):
+                def operation(client):
+                    with self.assertRaises(ValueError):
+                        client.read_virtual_memory(
+                            "1", address, length, address_bits=32
+                        )
+
+                _, seen = self.run_script([], operation)
+                self.assertEqual(seen, [])
 
 
 if __name__ == "__main__":

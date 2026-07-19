@@ -3,12 +3,12 @@
 This module owns QEMU's sole GDB connection.  It uses the reversible probe to
 enumerate tasks and, on AArch64 when sealed package capabilities permit, to
 read selected-process memory and a sleeping task's saved native EL0 frame.
-Current tasks use QEMU's complete stopped-vCPU register block; sleeping tasks
-use the exact core ``g``-packet prefix observed from QEMU.  Supplemental
-FP/system registers remain unavailable through per-register reads.  Register
-and process-memory writes, compat saved frames, and reads from legacy
-snapshot-only packages fail with an RSP error instead of returning invented
-state.
+Current tasks use QEMU's complete stopped-vCPU register block.  MMIPS also
+uses that stopped vCPU for current-task and kernel memory reads; sleeping
+tasks remain snapshot-only.  Supplemental FP/system registers remain
+unavailable through per-register reads.  Register and process-memory writes,
+compat saved frames, and unsupported reads fail with an RSP error instead of
+returning invented state.
 """
 
 from __future__ import annotations
@@ -44,7 +44,7 @@ from .partial_registers import (
     PartialRegisterError,
 )
 from .probe_oracle import ProbeOracle
-from .qemu_rsp import QemuRspClient, RspRemoteError
+from .qemu_rsp import QemuRspClient, RspRemoteError, RspRestorationError
 from .rsp_proxy import RspFacade
 from .rsp_server import UnixRspServer, qemu_cpu_stop_resolver
 
@@ -210,11 +210,13 @@ class CurrentCpuProbeOracle:
         qemu: QemuRspClient,
         cpu_threads: tuple[str, ...],
         partial_registers: Aarch64PartialRegisterLayout | None = None,
+        qemu_current_memory_address_bits: int | None = None,
     ) -> None:
         self.probe = probe
         self.qemu = qemu
         self.cpu_threads = cpu_threads
         self.partial_registers = partial_registers
+        self.qemu_current_memory_address_bits = qemu_current_memory_address_bits
 
     def snapshot(self) -> Snapshot:
         return self.probe.snapshot()
@@ -251,7 +253,30 @@ class CurrentCpuProbeOracle:
         try:
             return self.probe.read_memory(task, address, length)
         except NotImplementedError as exc:
-            raise self._unsupported("process virtual memory") from exc
+            if (
+                self.qemu_current_memory_address_bits is None
+                or task.current_cpu is None
+            ):
+                raise self._unsupported("process virtual memory") from exc
+            cpu = task.current_cpu
+            if not 0 <= cpu < len(self.cpu_threads):
+                raise OSError(f"probe reported nonexistent QEMU CPU {cpu}") from exc
+            try:
+                return self.qemu.read_virtual_memory(
+                    self.cpu_threads[cpu],
+                    address,
+                    length,
+                    address_bits=self.qemu_current_memory_address_bits,
+                )
+            except RspRestorationError:
+                # Continuing after downstream selection or mode restoration
+                # failed would make later reads ambiguous.  Let the server
+                # close this debugger connection instead of returning E14.
+                raise
+            except Exception as qemu_error:
+                raise OSError(
+                    f"cannot read stopped QEMU CPU {cpu} memory"
+                ) from qemu_error
 
     def write_memory(self, task: TaskSnapshot, address: int, data: bytes) -> None:
         raise self._unsupported("process virtual-memory writes")
@@ -360,7 +385,16 @@ def build_live_facade(
             snapshot_abi=snapshot_abi,
         )
         oracle = CurrentCpuProbeOracle(
-            probe, qemu, cpu_threads, partial_registers)
+            probe,
+            qemu,
+            cpu_threads,
+            partial_registers,
+            qemu_current_memory_address_bits=(
+                manifest.architecture.address_bits
+                if manifest.architecture is MIPS32EL_MMIPS
+                else None
+            ),
+        )
         facade = RspFacade(
             oracle,
             qemu,

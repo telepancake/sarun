@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import os
 from pathlib import Path
+import re
 import subprocess
 import tarfile
 import tempfile
@@ -129,7 +130,11 @@ class CaseKbuildTests(unittest.TestCase):
             self.assertIn(str(retained), arguments)
             self.assertIn("VIROS_KBUILD_RETAINED", arguments)
             self.assertIn("TMPDIR", arguments)
-            self.assertIn(str(work / "build/.case-kbuild-fixture/tmp"), arguments)
+            self.assertRegex(
+                arguments,
+                re.escape(str(work / "build/.case-kbuild-fixture."))
+                + r"[A-Za-z0-9]+/tmp",
+            )
             self.assertNotIn("/tmp", arguments.splitlines())
 
     def test_case_insensitive_build_routes_before_source_or_toolchain_setup(self):
@@ -145,6 +150,117 @@ class CaseKbuildTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, result.stdout)
             self.assertIn("routed:arm", result.stdout)
+
+    def test_scratch_link_anchor_is_scoped_and_migrates_old_block(self):
+        with tempfile.TemporaryDirectory(prefix="scratch-link-", dir=PROJECT) as raw:
+            work = Path(raw)
+            result = self.run_shell(
+                work,
+                r"""
+                SCRIPT_DIR=$(dirname -- "$1")
+                src="$WORKDIR/source"
+                mkdir -p "$src/kernel"
+                : > "$src/kernel/Makefile"
+                printf '%s\n' \
+                    '# viros debugger workspace link anchor' \
+                    'KBUILD_LDFLAGS += --undefined=__viros_scratch_code_start' \
+                    > "$src/Makefile"
+                install_kernel_scratch_source "$src"
+                install_kernel_scratch_source "$src"
+                test "$(grep -c '^# viros debugger workspace link anchor$' "$src/Makefile")" -eq 1
+                test "$(grep -c '^ifeq ($(VIROS_SCRATCH),1)$' "$src/Makefile")" -eq 1
+                test "$(grep -c '^# viros built-in debugger workspace$' "$src/kernel/Makefile")" -eq 1
+                printf '\n.PHONY: show\nshow:\n\t@printf "%%s\\n" "$(KBUILD_LDFLAGS)"\n' \
+                    >> "$src/Makefile"
+                without=$(make --no-print-directory -s -f "$src/Makefile" VIROS_SCRATCH=0 show)
+                with=$(make --no-print-directory -s -f "$src/Makefile" VIROS_SCRATCH=1 show)
+                test -z "$without"
+                test "$with" = '--undefined=__viros_scratch_code_start --undefined=__viros_scratch_data_start --undefined=__viros_scratch_stack_start'
+                """,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout)
+
+    def test_worker_preserves_failure_status_while_requesting_seed_retention(self):
+        with tempfile.TemporaryDirectory(prefix="case-seed-", dir=PROJECT) as raw:
+            work = Path(raw)
+            result = self.run_shell(
+                work,
+                r"""
+                export VIROS_KBUILD_TMPFS_ACTIVE=1
+                mkdir -p "$BUILD/kernel-mmips"
+                printf 'config\n' > "$BUILD/kernel-mmips/.config"
+                build_debug_kernel() {
+                    VIROS_CASE_KBUILD_RETAIN_READY=1
+                    false
+                    printf 'errexit was disabled\n' > "$WORKDIR/unreachable"
+                }
+                retain_case_kbuild_workspace() {
+                    printf '%s\n' "$2" > "$WORKDIR/retention-mode"
+                }
+                case_kbuild_worker mmips
+                """,
+            )
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertEqual(
+                (work / "retention-mode").read_text(encoding="utf-8").strip(),
+                "seed",
+            )
+            self.assertFalse((work / "unreachable").exists())
+
+    def test_worker_does_not_retain_an_early_rejected_seed(self):
+        with tempfile.TemporaryDirectory(prefix="case-reject-", dir=PROJECT) as raw:
+            work = Path(raw)
+            result = self.run_shell(
+                work,
+                r"""
+                export VIROS_KBUILD_TMPFS_ACTIVE=1
+                mkdir -p "$BUILD/kernel-mmips"
+                printf 'config\n' > "$BUILD/kernel-mmips/.config"
+                build_debug_kernel() { false; }
+                retain_case_kbuild_workspace() {
+                    : > "$WORKDIR/retention-was-called"
+                }
+                case_kbuild_worker mmips
+                """,
+            )
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertFalse((work / "retention-was-called").exists())
+
+    def test_reconstructed_source_times_are_stable_only_inside_workspace(self):
+        with tempfile.TemporaryDirectory(prefix="case-time-", dir=PROJECT) as raw:
+            work = Path(raw)
+            result = self.run_shell(
+                work,
+                r"""
+                mkdir -p "$WORKDIR/source"
+                printf 'source\n' > "$WORKDIR/source/file.c"
+                normalize_case_kbuild_source_times "$WORKDIR/source"
+                test "$(stat -c %Y "$WORKDIR/source/file.c")" != 946684800
+                export VIROS_KBUILD_TMPFS_ACTIVE=1
+                normalize_case_kbuild_source_times "$WORKDIR/source"
+                test "$(stat -c %Y "$WORKDIR/source/file.c")" = 946684800
+                """,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout)
+
+    def test_mips32_symbol_address_accepts_canonical_elf_forms(self):
+        with tempfile.TemporaryDirectory(prefix="mips-symbol-", dir=PROJECT) as raw:
+            work = Path(raw)
+            result = self.run_shell(
+                work,
+                r"""
+                test "$(normalize_mips32_symbol_address 803d87a0)" = 0x803d87a0
+                test "$(normalize_mips32_symbol_address ffffffff803d87a0)" = 0x803d87a0
+                test "$(normalize_mips32_symbol_address 00000000803d87a0)" = 0x803d87a0
+                """,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout)
+
+            rejected = self.run_shell(
+                work,
+                "normalize_mips32_symbol_address 12345678803d87a0",
+            )
+            self.assertNotEqual(rejected.returncode, 0, rejected.stdout)
 
     def test_doctor_accepts_usable_case_sensitive_fallback(self):
         with tempfile.TemporaryDirectory(prefix="case-doctor-", dir=PROJECT) as raw:
@@ -339,6 +455,7 @@ class CaseKbuildTests(unittest.TestCase):
                 "\n".join(
                     [
                         "format viros-case-kbuild-v2",
+                        "config_revision 1",
                         "target arm",
                         "linux_version 5.6.3",
                         "gpl_commit c3e110db1d35886c96ee14e16fc5a06bcac59692",

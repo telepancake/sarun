@@ -113,6 +113,7 @@ the downloaded package lookup without copying or renaming the input:
 
 ```sh
 ROUTEROS_NPK=/path/to/routeros-mmips.npk ./viros.sh debug mmips
+ROUTEROS_NPK=/path/to/routeros-mmips.npk ./viros.sh inferiors mmips
 ```
 
 Useful individual stages and run modes are:
@@ -383,9 +384,20 @@ the exact-Kbuild snapshot package and portable manifest automatically:
 The retained inputs are below `artifacts/mmips/inferiors/`. The launcher uses
 the same Malta/34Kf/MT7621 shape as `debug mmips`, proves that the kernel has
 started `/init`, then opens GDB on the snapshot facade with `info inferiors`
-already displayed. MMIPS currently provides task enumeration and current-CPU
-registers; its package deliberately does not advertise process-memory or
-sleeping-task register operations.
+already displayed. MMIPS provides task enumeration plus the stopped current
+CPU's registers and virtual-memory view. This is sufficient for the matching
+kernel's stock `lx-ps` helper and for examining the current `/init` process.
+Its package deliberately does not advertise saved registers or address-space
+translation for sleeping tasks, so those reads fail explicitly.
+
+At the initial GDB prompt, the current task is PID 1 and the matching Linux
+helpers are already loaded:
+
+```gdb
+info inferiors
+lx-ps
+viros-console
+```
 
 There is deliberately no default to the downloaded official OpenWrt image.
 The command validates the manifest-bound probe and `vmlinux` before starting

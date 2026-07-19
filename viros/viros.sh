@@ -67,6 +67,7 @@ UV_X86_64_SHA256=${UV_X86_64_SHA256:-8c88519b0ef0af9801fcdee419bbb12116bd9e6b18e
 JOBS=${JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || printf '2')}
 DISK_SIZE=${DISK_SIZE:-64M}
 DEBUG_BOOT_TIMEOUT=${DEBUG_BOOT_TIMEOUT:-30}
+DEBUG_KERNEL_CONFIG_REVISION=1
 
 ARCHES=(x86 arm arm64 mipsbe mmips smips ppc tile)
 RUN_TARGETS=(x86 arm arm64 mipsbe mmips smips ppc-e500-smp ppc-e500 ppc-440 ppc-83xx tile openwrt-malta-le openwrt-arm openwrt-arm64)
@@ -116,7 +117,6 @@ run_case_sensitive_workspace() {
     mkdir -p "$BUILD" "$DOWNLOADS" "$TOOLS" "$export_directory"
     work_root=$(CDPATH= cd -- "$WORKDIR" && pwd -P)
     parent=$(CDPATH= cd -- "$BUILD" && pwd -P)
-    mount="$parent/.case-kbuild-$name"
     export_path=$(CDPATH= cd -- "$export_directory" && pwd -P)
     case "$export_path/" in
         "$work_root/"*) ;;
@@ -128,11 +128,14 @@ run_case_sensitive_workspace() {
             "$work_root/"*) ;;
             *) die "retained Kbuild input must be below VIROS_WORKDIR" ;;
         esac
+    fi
+    mount=$(mktemp -d "$parent/.case-kbuild-$name.XXXXXX") ||
+        die "cannot create case-sensitive workspace path"
+    if [[ -n "$retained_path" ]]; then
         retained_bind=(--dir "$mount/retained" --ro-bind "$retained_path" "$mount/retained")
         retained_environment=(--setenv VIROS_KBUILD_RETAINED "$mount/retained")
     fi
     bwrap_bin=$(command -v bwrap) || die "required host command not found: bwrap"
-    mkdir "$mount" || die "case-sensitive workspace path already exists: $mount"
     if "$bwrap_bin" --die-with-parent \
         --ro-bind / / \
         --dev-bind /dev /dev \
@@ -515,7 +518,7 @@ setup_uv() {
 download_managed_python() {
     setup_uv
     say "Installing pinned managed CPython $UV_PYTHON_VERSION below VIROS_WORKDIR"
-    UV_CACHE_DIR="$DOWNLOADS/uv-cache" \
+    UV_CACHE_DIR="$TOOLS/uv-cache" \
     UV_PYTHON_INSTALL_DIR="$TOOLS/python" \
     UV_PYTHON_INSTALL_BIN=0 \
         "$UV" python install --managed-python --no-bin --no-progress "$UV_PYTHON_VERSION"
@@ -523,7 +526,7 @@ download_managed_python() {
 
 managed_python() {
     setup_uv
-    UV_CACHE_DIR="$DOWNLOADS/uv-cache" \
+    UV_CACHE_DIR="$TOOLS/uv-cache" \
     UV_PYTHON_INSTALL_DIR="$TOOLS/python" \
     UV_PYTHON_DOWNLOADS=never \
         "$UV" python find --managed-python --no-python-downloads "$UV_PYTHON_VERSION"
@@ -546,9 +549,9 @@ setup_build_python() {
             die "pinned Python bootstrap wheel is missing: $wheel_name; run download first"
         verify_file "$wheel_sha" "$DOWNLOADS/$wheel_name"
     done
-    UV_CACHE_DIR="$DOWNLOADS/uv-cache" UV_PYTHON_DOWNLOADS=never \
+    UV_CACHE_DIR="$TOOLS/uv-cache" UV_PYTHON_DOWNLOADS=never \
         "$UV" venv --no-project --no-python-downloads --clear --python "$python" "$bootstrap"
-    UV_CACHE_DIR="$DOWNLOADS/uv-cache" UV_PYTHON_DOWNLOADS=never \
+    UV_CACHE_DIR="$TOOLS/uv-cache" UV_PYTHON_DOWNLOADS=never \
         "$UV" pip install --python "$bootstrap/bin/python" --no-index \
         "$DOWNLOADS/$PIP_WHEEL_NAME" "$DOWNLOADS/$SETUPTOOLS_WHEEL_NAME" \
         "$DOWNLOADS/$PACKAGING_WHEEL_NAME" "$DOWNLOADS/$WHEEL_WHEEL_NAME"
@@ -677,6 +680,7 @@ install_kernel_scratch_source() {
     local src=$1 destination="$1/kernel/viros"
     local makefile="$1/kernel/Makefile"
     local marker='# viros built-in debugger workspace'
+    local link_marker='# viros debugger workspace link anchor'
     mkdir -p -- "$destination"
     cp -f -- "$SCRIPT_DIR/probe/scratch/kernel/Kbuild" "$destination/Kbuild"
     cp -f -- "$SCRIPT_DIR/probe/scratch/kernel/viros_scratch.S" \
@@ -688,6 +692,36 @@ install_kernel_scratch_source() {
             printf 'obj-$(CONFIG_MIPS) += viros/\n'
         } >> "$makefile"
     fi
+    if grep -qxF "$link_marker" "$src/Makefile" &&
+        ! grep -qxF 'ifeq ($(VIROS_SCRATCH),1)' "$src/Makefile"; then
+        sed -i '/^KBUILD_LDFLAGS += --undefined=__viros_scratch_code_start$/c\
+ifeq ($(VIROS_SCRATCH),1)\
+KBUILD_LDFLAGS += --undefined=__viros_scratch_code_start --undefined=__viros_scratch_data_start --undefined=__viros_scratch_stack_start\
+endif' "$src/Makefile"
+    elif ! grep -qxF "$link_marker" "$src/Makefile"; then
+        {
+            printf '\n%s\n' "$link_marker"
+            printf 'ifeq ($(VIROS_SCRATCH),1)\n'
+            printf '%s\n' 'KBUILD_LDFLAGS += --undefined=__viros_scratch_code_start --undefined=__viros_scratch_data_start --undefined=__viros_scratch_stack_start'
+            printf 'endif\n'
+        } >> "$src/Makefile"
+    elif grep -qxF 'KBUILD_LDFLAGS += --undefined=__viros_scratch_code_start' \
+        "$src/Makefile"; then
+        sed -i 's/^KBUILD_LDFLAGS += --undefined=__viros_scratch_code_start$/KBUILD_LDFLAGS += --undefined=__viros_scratch_code_start --undefined=__viros_scratch_data_start --undefined=__viros_scratch_stack_start/' \
+            "$src/Makefile"
+    fi
+}
+
+normalize_case_kbuild_source_times() {
+    local src=$1
+    if [[ ${VIROS_KBUILD_TMPFS_ACTIVE:-0} != 1 ]]; then
+        return 0
+    fi
+    # The reconstructed source content is pinned by archive/update hashes (and
+    # the scratch-source hash for MMIPS).  Give it a stable old timestamp so a
+    # matching retained object tree is not rebuilt merely because the update
+    # was applied in a new temporary workspace.
+    find "$src" -type f -exec touch -d '@946684800' -- {} +
 }
 
 verify_kernel_scratch_symbols() {
@@ -703,9 +737,22 @@ verify_kernel_scratch_symbols() {
     done
 }
 
+normalize_mips32_symbol_address() {
+    local raw=${1#0x}
+    if [[ "$raw" =~ ^[0-9a-fA-F]{8}$ ]]; then
+        printf '0x%s\n' "$raw"
+    elif [[ "$raw" =~ ^ffffffff([89a-fA-F][0-9a-fA-F]{7})$ ]]; then
+        printf '0x%s\n' "${BASH_REMATCH[1]}"
+    elif [[ "$raw" =~ ^00000000([0-9a-fA-F]{8})$ ]]; then
+        printf '0x%s\n' "${BASH_REMATCH[1]}"
+    else
+        die "non-canonical 32-bit MIPS symbol address: $1"
+    fi
+}
+
 build_mmips_inferiors_artifacts() {
     local out=$1 prefix=$2 destination="$ARTIFACTS/mmips/inferiors"
-    local python code_gva init_task
+    local python code_gva init_task init_task_raw
     python=$(managed_python)
     [[ -x "$python" ]] || die "managed Python is missing; run download"
     rm -rf -- "$destination"
@@ -718,10 +765,11 @@ build_mmips_inferiors_artifacts() {
     code_gva=$(env PYTHONNOUSERSITE=1 "$python" -c \
         'import json,sys; print(hex(json.load(open(sys.argv[1]))["regions"]["code"]["gva"]))' \
         "$destination/scratch.json")
-    init_task=$("${prefix}nm" -n "$out/vmlinux" | awk '
+    init_task_raw=$("${prefix}nm" -n "$out/vmlinux" | awk '
         $3 == "init_task" { count++; value = $1 }
-        END { if (count != 1) exit 1; print "0x" value }
+        END { if (count != 1) exit 1; print value }
     ') || die "matching MMIPS vmlinux does not define exactly one init_task"
+    init_task=$(normalize_mips32_symbol_address "$init_task_raw")
 
     env PYTHONPATH="$SCRIPT_DIR" PYTHONNOUSERSITE=1 "$python" \
         "$SCRIPT_DIR/probe/probe_tool.py" build \
@@ -833,13 +881,22 @@ materialize_kernel_gdb_helpers() {
 }
 
 retain_case_kbuild_workspace() {
-    local target=$1 out="$BUILD/kernel-$1" destination="$VIROS_KBUILD_EXPORT"
+    local target=$1 mode=${2:-complete} out="$BUILD/kernel-$1" destination="$VIROS_KBUILD_EXPORT"
     local linux_hash update_hash config_hash vmlinux_hash
     [[ ${VIROS_KBUILD_TMPFS_ACTIVE:-0} == 1 && -n ${VIROS_KBUILD_EXPORT:-} ]] ||
         die "case-sensitive Kbuild retention was invoked outside its workspace"
-    [[ -s "$out/vmlinux" && -s "$out/vmlinux-gdb.py" ]] ||
-        die "case-sensitive Kbuild output is incomplete"
-    materialize_kernel_gdb_helpers "$out"
+    [[ -s "$out/.config" ]] || die "case-sensitive Kbuild output has no configuration"
+    if [[ "$mode" == complete ]]; then
+        [[ -s "$out/vmlinux" && -s "$out/vmlinux-gdb.py" ]] ||
+            die "case-sensitive Kbuild output is incomplete"
+        materialize_kernel_gdb_helpers "$out"
+    elif [[ "$mode" == seed ]]; then
+        if [[ -s "$out/vmlinux-gdb.py" && -d "$out/scripts/gdb" ]]; then
+            materialize_kernel_gdb_helpers "$out"
+        fi
+    else
+        die "unknown case-sensitive Kbuild retention mode: $mode"
+    fi
     ln -sfn -- "$out" "$out/.viros-original-output"
     # Linux contains a few differently-cased built-in object names.  Their
     # generated intermediates cannot coexist on a case-insensitive checkout,
@@ -848,13 +905,19 @@ retain_case_kbuild_workspace() {
     # files before the portable copy.
     prune_casefold_colliding_intermediates "$out"
     assert_casefold_portable_tree "$out"
-    assert_casefold_portable_tree "$ARTIFACTS/$target"
+    [[ ! -d "$ARTIFACTS/$target" ]] || assert_casefold_portable_tree "$ARTIFACTS/$target"
     linux_hash=$(sha256sum "$DOWNLOADS/linux-${LINUX_VERSION}.tar.xz" | awk '{print $1}')
     update_hash=$(sha256sum "$SOURCES/mikrotik-gpl/2025-03-19/linux-${LINUX_VERSION}.patch" | awk '{print $1}')
     config_hash=$(sha256sum "$out/.config" | awk '{print $1}')
-    vmlinux_hash=$(sha256sum "$out/vmlinux" | awk '{print $1}')
+    if [[ -s "$out/vmlinux" ]]; then
+        vmlinux_hash=$(sha256sum "$out/vmlinux" | awk '{print $1}')
+    else
+        vmlinux_hash=-
+    fi
     {
         printf 'format viros-case-kbuild-v2\n'
+        printf 'state %s\n' "$mode"
+        printf 'config_revision %s\n' "$DEBUG_KERNEL_CONFIG_REVISION"
         printf 'target %s\n' "$target"
         printf 'linux_version %s\n' "$LINUX_VERSION"
         printf 'gpl_commit %s\n' "$MIKROTIK_GPL_COMMIT"
@@ -868,7 +931,9 @@ retain_case_kbuild_workspace() {
     } > "$out/.viros-case-kbuild"
     mkdir -p "$destination/kernel-$target" "$destination/artifacts/$target"
     cp -a -- "$out/." "$destination/kernel-$target/"
-    cp -a -- "$ARTIFACTS/$target/." "$destination/artifacts/$target/"
+    if [[ -d "$ARTIFACTS/$target" ]]; then
+        cp -a -- "$ARTIFACTS/$target/." "$destination/artifacts/$target/"
+    fi
 }
 
 setup_kernel_build_context() {
@@ -923,6 +988,8 @@ rehydrate_case_kbuild_worker() {
         die "unsupported retained Kbuild identity format"
     [[ $(case_kbuild_identity_value "$identity" target) == "$target" ]] ||
         die "retained Kbuild target does not match $target"
+    [[ $(case_kbuild_identity_value "$identity" config_revision) == "$DEBUG_KERNEL_CONFIG_REVISION" ]] ||
+        die "retained Kbuild debug configuration revision does not match"
     [[ $(case_kbuild_identity_value "$identity" linux_version) == "$LINUX_VERSION" ]] ||
         die "retained Kbuild Linux version does not match $LINUX_VERSION"
     [[ $(case_kbuild_identity_value "$identity" gpl_commit) == "$MIKROTIK_GPL_COMMIT" ]] ||
@@ -996,27 +1063,58 @@ run_retained_kernel_workspace() {
     ((status == 0)) || die "foreground Kbuild command failed for $target"
 }
 
+preserve_failed_case_kbuild() {
+    local status=$1 target=${VIROS_CASE_KBUILD_TARGET:-}
+    trap - EXIT
+    if [[ ${VIROS_CASE_KBUILD_RETAIN_READY:-0} == 1 && -n "$target" &&
+          -s "$BUILD/kernel-$target/.config" ]]; then
+        say "Preserving reusable Kbuild output after the late build failure"
+        retain_case_kbuild_workspace "$target" seed
+    fi
+    exit "$status"
+}
+
 case_kbuild_worker() {
     local target=${1:-}
     [[ ${VIROS_KBUILD_TMPFS_ACTIVE:-0} == 1 ]] ||
         die "internal case-sensitive Kbuild worker requires bubblewrap tmpfs"
     [[ -n "$target" ]] || die "internal case-sensitive Kbuild worker requires a target"
+    if [[ -n ${VIROS_KBUILD_RETAINED:-} ]]; then
+        mkdir -p "$BUILD/kernel-$target"
+        cp -a -- "$VIROS_KBUILD_RETAINED/." "$BUILD/kernel-$target/"
+    fi
+    VIROS_CASE_KBUILD_TARGET=$target
+    VIROS_CASE_KBUILD_RETAIN_READY=0
+    trap 'preserve_failed_case_kbuild "$?"' EXIT
     build_debug_kernel "$target"
     retain_case_kbuild_workspace "$target"
+    trap - EXIT
 }
 
 build_debug_kernel_casefold() {
-    local target=$1 export_directory="$BUILD/.case-kbuild-export-$1-$$" status
+    local target=$1 export_directory status retained=
     case_kbuild_preflight
-    mkdir "$export_directory" || die "case-sensitive Kbuild export already exists: $export_directory"
+    export_directory=$(mktemp -d "$BUILD/.case-kbuild-export-$target.XXXXXX") ||
+        die "cannot create case-sensitive Kbuild export directory"
     say "Using a project-local case-sensitive tmpfs for Linux Kbuild"
-    if run_case_sensitive_workspace "kernel-$target-$$" "$export_directory" \
+    if [[ -s "$BUILD/kernel-$target/.viros-case-kbuild" ]]; then
+        retained="$BUILD/kernel-$target"
+        say "Seeding the case-sensitive workspace from retained matching Kbuild output"
+    fi
+    if VIROS_KBUILD_RETAINED_BIND="$retained" \
+        run_case_sensitive_workspace "kernel-$target-$$" "$export_directory" \
         "$SCRIPT_DIR/viros.sh" _case-kbuild-worker "$target"; then
         status=0
     else
         status=$?
     fi
     if ((status)); then
+        if [[ -s "$export_directory/kernel-$target/.viros-case-kbuild" ]]; then
+            rm -rf -- "$BUILD/kernel-$target"
+            mkdir -p "$BUILD/kernel-$target"
+            cp -a -- "$export_directory/kernel-$target/." "$BUILD/kernel-$target/"
+            say "Retained reusable Kbuild output: $BUILD/kernel-$target"
+        fi
         rm -rf -- "$export_directory"
         die "case-sensitive Kbuild worker failed for $target"
     fi
@@ -1033,7 +1131,8 @@ build_debug_kernel_casefold() {
 }
 
 build_debug_kernel() {
-    local target=${1:-} src out config arch prefix= image= obj raw compiler_version
+    local target=${1:-} src out config arch prefix= image= obj raw compiler_version identity expected
+    local scratch=0 retained_config=0 retained_vmlinux=0
     local -a targets
     host_is_supported || die "debug-kernel build requires x86-64 or AArch64 Linux"
     case "$target" in
@@ -1050,6 +1149,38 @@ build_debug_kernel() {
     prepare_mikrotik_kernel_source
     src=$(mikrotik_kernel_source)
     out="$BUILD/kernel-$target"
+    if [[ ${VIROS_KBUILD_TMPFS_ACTIVE:-0} == 1 &&
+          -s "$out/.viros-case-kbuild" ]]; then
+        identity="$out/.viros-case-kbuild"
+        [[ $(case_kbuild_identity_value "$identity" format) == viros-case-kbuild-v2 ]] ||
+            die "unsupported retained Kbuild seed format"
+        [[ $(case_kbuild_identity_value "$identity" target) == "$target" ]] ||
+            die "retained Kbuild seed target mismatch"
+        [[ $(case_kbuild_identity_value "$identity" linux_version) == "$LINUX_VERSION" ]] ||
+            die "retained Kbuild seed Linux version mismatch"
+        [[ $(case_kbuild_identity_value "$identity" gpl_commit) == "$MIKROTIK_GPL_COMMIT" ]] ||
+            die "retained Kbuild seed published-source revision mismatch"
+        [[ $(case_kbuild_identity_value "$identity" config_revision) == "$DEBUG_KERNEL_CONFIG_REVISION" ]] ||
+            die "retained Kbuild seed debug configuration revision mismatch"
+        expected=$(case_kbuild_identity_value "$identity" linux_archive_sha256)
+        verify_file "$expected" "$DOWNLOADS/linux-${LINUX_VERSION}.tar.xz"
+        expected=$(case_kbuild_identity_value "$identity" linux_update_sha256)
+        verify_file "$expected" "$SOURCES/mikrotik-gpl/2025-03-19/linux-${LINUX_VERSION}.patch"
+        expected=$(case_kbuild_identity_value "$identity" config_sha256)
+        verify_file "$expected" "$out/.config"
+        expected=$(case_kbuild_identity_value "$identity" vmlinux_sha256)
+        if [[ "$expected" != - ]]; then
+            verify_file "$expected" "$out/vmlinux"
+            retained_vmlinux=1
+        fi
+        if [[ "$target" == mmips ]]; then
+            [[ $(case_kbuild_identity_value "$identity" scratch_source_sha256) == \
+               "$(kernel_scratch_source_hash)" ]] ||
+                die "retained MMIPS Kbuild seed source does not match this checkout"
+        fi
+        reconnect_retained_kbuild_output "$out" "$src"
+        retained_config=1
+    fi
     case "$target" in
         x86)
             arch=x86_64
@@ -1101,25 +1232,37 @@ build_debug_kernel() {
     if [[ "$target" == mmips ]]; then
         install_kernel_scratch_source "$src"
     fi
-    cp -f -- "$config" "$out/.config"
-    "$src/scripts/config" --file "$out/.config" \
-        --enable GDB_SCRIPTS --enable DEBUG_INFO \
-        --disable DEBUG_INFO_REDUCED --disable DEBUG_INFO_SPLIT --disable DEBUG_INFO_DWARF4
-    if [[ "$target" == x86 ]]; then
-        # The published path names an out-of-tree build input.  The extractor
-        # supplies that exact production initramfs to QEMU instead.
-        "$src/scripts/config" --file "$out/.config" --set-str INITRAMFS_SOURCE '' \
-            --enable KALLSYMS --enable KALLSYMS_ALL --enable IKCONFIG
-    elif [[ "$target" == smips || "$target" == mipsbe || "$target" == mmips ]]; then
+    normalize_case_kbuild_source_times "$src"
+    if ((retained_config)); then
+        say "Reusing the hash-verified retained kernel configuration"
+    else
+        cp -f -- "$config" "$out/.config"
         "$src/scripts/config" --file "$out/.config" \
-            --enable DEBUG_INFO_DWARF4 --enable KALLSYMS --enable KALLSYMS_ALL --enable IKCONFIG
+            --enable GDB_SCRIPTS --enable DEBUG_INFO \
+            --disable DEBUG_INFO_REDUCED --disable DEBUG_INFO_SPLIT --disable DEBUG_INFO_DWARF4
+        if [[ "$target" == x86 ]]; then
+            # The published path names an out-of-tree build input.  The extractor
+            # supplies that exact production initramfs to QEMU instead.
+            "$src/scripts/config" --file "$out/.config" --set-str INITRAMFS_SOURCE '' \
+                --enable KALLSYMS --enable KALLSYMS_ALL --enable IKCONFIG
+        elif [[ "$target" == smips || "$target" == mipsbe || "$target" == mmips ]]; then
+            "$src/scripts/config" --file "$out/.config" \
+                --enable DEBUG_INFO_DWARF4 --enable KALLSYMS --enable KALLSYMS_ALL --enable IKCONFIG
+        fi
     fi
-    local make_args=( -C "$src" O="$out" ARCH="$arch" CROSS_COMPILE="$prefix" )
-    say "Building published Linux $LINUX_VERSION source for $target with MikroTik's published config"
-    make "${make_args[@]}" olddefconfig
-    targets=(vmlinux scripts_gdb)
-    [[ -n "$image" ]] && targets+=("$image")
-    make "${make_args[@]}" -j "$JOBS" "${targets[@]}"
+    VIROS_CASE_KBUILD_RETAIN_READY=1
+    [[ "$target" == mmips ]] && scratch=1
+    local make_args=( -C "$src" O="$out" ARCH="$arch" CROSS_COMPILE="$prefix"
+        "VIROS_SCRATCH=$scratch" )
+    if ((retained_vmlinux)); then
+        say "Reusing the hash-verified retained vmlinux"
+    else
+        say "Building published Linux $LINUX_VERSION source for $target with MikroTik's published config"
+        make "${make_args[@]}" olddefconfig
+        targets=(vmlinux scripts_gdb)
+        [[ -n "$image" ]] && targets+=("$image")
+        make "${make_args[@]}" -j "$JOBS" "${targets[@]}"
+    fi
     if [[ "$target" == mmips ]]; then
         verify_kernel_scratch_symbols "$out" "$prefix"
         build_mmips_inferiors_artifacts "$out" "$prefix"
