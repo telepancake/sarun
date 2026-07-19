@@ -192,3 +192,16 @@ fn standalone_brush_completes_contextual_path_through_relation() {
     run_brush_completion(&dir, b"edit ./t\t", &[b"est1.sh"]);
     std::fs::remove_dir_all(&dir).expect("remove path fixture directory");
 }
+
+#[test]
+fn standalone_brush_completes_test_file_through_execution_parser() {
+    let dir = std::env::temp_dir().join(format!(
+        "sarun-brush-relation-test-file-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create test parser fixture directory");
+    std::fs::write(dir.join("candidate.txt"), "candidate\n").expect("write test parser fixture");
+    run_brush_completion(&dir, b"test -f ./c\t", &[b"andidate.txt"]);
+    std::fs::remove_dir_all(&dir).expect("remove test parser fixture directory");
+}

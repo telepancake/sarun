@@ -5,3 +5,4 @@
 0050-wait--implement-waiting-on-process-IDs.patch
 0060-discover-optimized-external-commands-through-PATH.patch
 0070-store-umask-in-logical-shell-state.patch
+0080-Expose-test-execution-parser-through-builtin-relation.patch

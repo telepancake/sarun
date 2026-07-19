@@ -1,0 +1,304 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Sun, 19 Jul 2026 18:36:32 +0000
+Subject: [PATCH] Expose test execution parser through builtin relation
+
+---
+diff --git a/src/factory.rs b/src/factory.rs
+index 99eeb8e..7faf08b 100644
+--- a/src/factory.rs
++++ b/src/factory.rs
+@@ -173,9 +173,17 @@ pub fn default_builtins<SE: brush_core::ShellExtensions>(
+         #[cfg(all(feature = "builtin.suspend", unix))]
+         m.insert("suspend".into(), builtin::<suspend::SuspendCommand, SE>());
+         #[cfg(feature = "builtin.test")]
+-        m.insert("test".into(), builtin::<test::TestCommand, SE>());
++        {
++            let mut registration = builtin::<test::TestCommand, SE>();
++            registration.parser_func = Some(test::parser);
++            m.insert("test".into(), registration);
++        }
+         #[cfg(feature = "builtin.test")]
+-        m.insert("[".into(), builtin::<test::TestCommand, SE>());
++        {
++            let mut registration = builtin::<test::TestCommand, SE>();
++            registration.parser_func = Some(test::parser);
++            m.insert("[".into(), registration);
++        }
+         #[cfg(feature = "builtin.declare")]
+         m.insert(
+             "typeset".into(),
+diff --git a/src/test.rs b/src/test.rs
+index e9846b2..51a552b 100644
+--- a/src/test.rs
++++ b/src/test.rs
+@@ -13,6 +13,205 @@ pub(crate) struct TestCommand {
+     args: Vec<String>,
+ }
+ 
++pub(crate) fn parser(
++    input: brush_core::builtins::BuiltinParserInput,
++) -> brush_core::builtins::BuiltinParserObservation {
++    use brush_core::builtins::{
++        BuiltinParseStatus, BuiltinParserObservation, ParserArgumentEvidence, ParserDiagnostic,
++        ParserLiteralContinuation,
++    };
++
++    let Some(command_name) = input.before.first().map(String::as_str) else {
++        return unsupported_parser_observation();
++    };
++    if !matches!(command_name, "test" | "[") {
++        return unsupported_parser_observation();
++    }
++
++    if !input.tear {
++        let mut arguments = input.before[1..].to_vec();
++        if command_name == "[" {
++            if arguments.last().is_none_or(|word| word != "]") {
++                return rejected("missing_closing_bracket", "[: missing ']'");
++            }
++            arguments.pop();
++        }
++        return match brush_parser::test_command::parse(&arguments) {
++            Ok(_) => BuiltinParserObservation {
++                status: BuiltinParseStatus::Complete,
++                tear_arguments: Vec::new(),
++                expected: Vec::new(),
++                literal_continuations: Vec::new(),
++            },
++            Err(error) => rejected("invalid_test_expression", error.to_string()),
++        };
++    }
++
++    let mut after = input.after;
++    let missing_closing_bracket = command_name == "["
++        && if after.last().is_some_and(|word| word == "]") {
++            after.pop();
++            false
++        } else {
++            true
++        };
++    let observation = brush_parser::test_command::probe(&brush_parser::test_command::ProbeInput {
++        before: input.before[1..].to_vec(),
++        prefix: input.prefix,
++        suffix: input.suffix,
++        after,
++    });
++    let tear_arguments = observation
++        .arguments
++        .into_iter()
++        .map(test_argument_evidence)
++        .collect::<Vec<_>>();
++    let literal_continuations = observation
++        .literal_continuations
++        .into_iter()
++        .map(|continuation| ParserLiteralContinuation {
++            literal: continuation.literal,
++            argument: ParserArgumentEvidence {
++                id: "test_operator".into(),
++                display: "TEST_OPERATOR".into(),
++                help: Some("Operator accepted by the test expression parser".into()),
++                value_domain: None,
++                finite_values: Vec::new(),
++            },
++            expected: Vec::new(),
++        })
++        .collect::<Vec<_>>();
++    let status = if observation.accepted && !missing_closing_bracket {
++        BuiltinParseStatus::Complete
++    } else if observation.accepted
++        || !tear_arguments.is_empty()
++        || !literal_continuations.is_empty()
++        || missing_closing_bracket
++    {
++        BuiltinParseStatus::Incomplete
++    } else {
++        BuiltinParseStatus::Rejected(ParserDiagnostic {
++            code: "invalid_test_expression".into(),
++            message: observation
++                .diagnostic
++                .unwrap_or_else(|| "invalid test expression".into()),
++        })
++    };
++    BuiltinParserObservation {
++        status,
++        tear_arguments,
++        expected: Vec::new(),
++        literal_continuations,
++    }
++}
++
++fn test_argument_evidence(
++    argument: brush_parser::test_command::TearArgument,
++) -> brush_core::builtins::ParserArgumentEvidence {
++    use brush_parser::test_command::TearArgument;
++    let (id, display, help, value_domain, finite_values) = match argument {
++        TearArgument::Literal | TearArgument::Text => (
++            "test_text",
++            "TEXT",
++            "String operand accepted by the test expression parser",
++            None,
++            Vec::new(),
++        ),
++        TearArgument::FilesystemPath => (
++            "test_path",
++            "PATH",
++            "Filesystem path tested by this predicate",
++            Some("filesystem_path"),
++            Vec::new(),
++        ),
++        TearArgument::FilesystemFile => (
++            "test_file",
++            "FILE",
++            "Regular file tested by this predicate",
++            Some("filesystem_file"),
++            Vec::new(),
++        ),
++        TearArgument::FilesystemDirectory => (
++            "test_directory",
++            "DIRECTORY",
++            "Directory tested by this predicate",
++            Some("filesystem_directory"),
++            Vec::new(),
++        ),
++        TearArgument::FilesystemExecutable => (
++            "test_executable",
++            "EXECUTABLE",
++            "Executable path tested by this predicate",
++            Some("filesystem_executable"),
++            Vec::new(),
++        ),
++        TearArgument::ShellVariable => (
++            "test_shell_variable",
++            "VARIABLE",
++            "Shell variable tested by this predicate",
++            Some("shell_variable"),
++            Vec::new(),
++        ),
++        TearArgument::ShellOption => (
++            "test_shell_option",
++            "OPTION",
++            "set -o option tested by this predicate",
++            None,
++            brush_core::namedoptions::options(brush_core::namedoptions::ShellOptionKind::SetO)
++                .iter()
++                .map(|option| option.name.to_owned())
++                .collect(),
++        ),
++        TearArgument::FileDescriptor => (
++            "test_file_descriptor",
++            "FD",
++            "File descriptor tested by this predicate",
++            None,
++            Vec::new(),
++        ),
++        TearArgument::Integer => (
++            "test_integer",
++            "INTEGER",
++            "Integer operand accepted by this predicate",
++            None,
++            Vec::new(),
++        ),
++    };
++    brush_core::builtins::ParserArgumentEvidence {
++        id: id.into(),
++        display: display.into(),
++        help: Some(help.into()),
++        value_domain: value_domain.map(str::to_owned),
++        finite_values,
++    }
++}
++
++fn rejected(
++    code: impl Into<String>,
++    message: impl Into<String>,
++) -> brush_core::builtins::BuiltinParserObservation {
++    brush_core::builtins::BuiltinParserObservation {
++        status: brush_core::builtins::BuiltinParseStatus::Rejected(
++            brush_core::builtins::ParserDiagnostic {
++                code: code.into(),
++                message: message.into(),
++            },
++        ),
++        tear_arguments: Vec::new(),
++        expected: Vec::new(),
++        literal_continuations: Vec::new(),
++    }
++}
++
++fn unsupported_parser_observation() -> brush_core::builtins::BuiltinParserObservation {
++    brush_core::builtins::BuiltinParserObservation {
++        status: brush_core::builtins::BuiltinParseStatus::Unsupported,
++        tear_arguments: Vec::new(),
++        expected: Vec::new(),
++        literal_continuations: Vec::new(),
++    }
++}
++
+ impl builtins::Command for TestCommand {
+     type Error = brush_core::Error;
+ 
+@@ -65,3 +264,63 @@ fn execute_test(
+         brush_parser::test_command::parse(args).map_err(ErrorKind::TestCommandParseError)?;
+     tests::eval_expr(&test_command, shell, params)
+ }
++
++#[cfg(test)]
++mod probe_tests {
++    use super::*;
++    use brush_core::builtins::{BuiltinParseStatus, BuiltinParserInput};
++
++    #[test]
++    fn real_parser_exposes_regular_file_operand() {
++        let observation = parser(BuiltinParserInput {
++            tear: true,
++            before: vec!["test".into(), "-f".into()],
++            prefix: "./c".into(),
++            suffix: String::new(),
++            after: Vec::new(),
++        });
++        assert_eq!(observation.status, BuiltinParseStatus::Complete);
++        assert_eq!(observation.tear_arguments.len(), 1);
++        assert_eq!(
++            observation.tear_arguments[0].value_domain.as_deref(),
++            Some("filesystem_file")
++        );
++    }
++
++    #[test]
++    fn bracket_exact_parse_requires_and_consumes_closing_bracket() {
++        let missing = parser(BuiltinParserInput {
++            tear: false,
++            before: vec!["[".into(), "-f".into(), "file".into()],
++            prefix: String::new(),
++            suffix: String::new(),
++            after: Vec::new(),
++        });
++        assert!(matches!(missing.status, BuiltinParseStatus::Rejected(_)));
++
++        let complete = parser(BuiltinParserInput {
++            tear: false,
++            before: vec!["[".into(), "-f".into(), "file".into(), "]".into()],
++            prefix: String::new(),
++            suffix: String::new(),
++            after: Vec::new(),
++        });
++        assert_eq!(complete.status, BuiltinParseStatus::Complete);
++    }
++
++    #[test]
++    fn bracket_assist_preserves_later_closing_bracket() {
++        let observation = parser(BuiltinParserInput {
++            tear: true,
++            before: vec!["[".into(), "-f".into()],
++            prefix: "./c".into(),
++            suffix: String::new(),
++            after: vec!["]".into()],
++        });
++        assert_eq!(observation.status, BuiltinParseStatus::Complete);
++        assert_eq!(
++            observation.tear_arguments[0].value_domain.as_deref(),
++            Some("filesystem_file")
++        );
++    }
++}

@@ -365,6 +365,18 @@ Implementation order:
        parser branches are relation no-solutions rather than global backend
        diagnostics. Minimal suffix edits, including selected valid values and
        valid comma-list continuations, are asserted by their applied result.
+   [x] Instrument Brush's existing non-extended `test`/`[` PEG parser as the
+       next non-Clap producer. The PEG grammar's own literal terminals record
+       prefix/suffix-compatible tear matches, its operand reductions record
+       semantic value roles, and every literal candidate is replayed through
+       that same parser. There is no operator catalog or adapter-side AST-shape
+       inference. Both builtin registrations carry the same neutral parser
+       function; exact `[` parsing still requires and consumes its final `]`.
+       The first contextual projection is a regular-file operand, covered by a
+       native PTY `test -f ./c|` fixture. Context names are currently safe for
+       this slice because every filename is syntactically admissible; generic
+       context-candidate replay remains required before domains whose returned
+       strings can alter parser structure are exposed.
    [ ] Move Find's parse-time effects behind explicit environment operations:
        output file creation, `-files0-from`, stat/time references, NSS
        user/group resolution, and clock access. Assist emits typed
@@ -372,6 +384,12 @@ Implementation order:
        never substitutes empty/default answers. Then introduce a neutral
        `FindPlan`/`FindExpr` compile boundary and remove vendor patch 0180's
        temporary file-type syntax catalog rather than expanding it.
+       [x] Defer `-fprint`, `-fprintf`, `-fprint0`, and `-fls` output creation
+           through recursive `FindOperations` preparation. Parsing and probing
+           cannot create or truncate output files, a later syntax error leaves
+           existing files untouched, and relative destinations resolve through
+           the injected logical cwd. Filesystem reads, NSS, and clock queries
+           remain to be separated, so the parent item remains open.
 
 Commands whose execution parser does not yet expose a probe deliberately have
 no argument projection. The next adapters must expose their existing parser or

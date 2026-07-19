@@ -3221,6 +3221,51 @@ mod builtin_boundary_tests {
     }
 
     #[test]
+    fn registered_test_parser_exposes_real_regular_file_operand() {
+        use brush_core::builtins::{BuiltinParseStatus, BuiltinParserInput};
+
+        let parser = super::builtin_parser("test").expect("registered test expression parser");
+        let observation = parser(BuiltinParserInput {
+            tear: true,
+            before: vec!["test".into(), "-f".into()],
+            prefix: "./c".into(),
+            suffix: String::new(),
+            after: Vec::new(),
+        });
+        assert_eq!(observation.status, BuiltinParseStatus::Complete);
+        assert_eq!(observation.tear_arguments.len(), 1);
+        assert_eq!(observation.tear_arguments[0].id, "test_file");
+        assert_eq!(
+            observation.tear_arguments[0].value_domain.as_deref(),
+            Some("filesystem_file")
+        );
+    }
+
+    #[test]
+    fn registered_bracket_parser_preserves_closing_delimiter() {
+        use brush_core::builtins::{BuiltinParseStatus, BuiltinParserInput};
+
+        let parser = super::builtin_parser("[").expect("registered bracket expression parser");
+        let missing = parser(BuiltinParserInput {
+            tear: false,
+            before: vec!["[".into(), "-f".into(), "file".into()],
+            prefix: String::new(),
+            suffix: String::new(),
+            after: Vec::new(),
+        });
+        assert!(matches!(missing.status, BuiltinParseStatus::Rejected(_)));
+
+        let complete = parser(BuiltinParserInput {
+            tear: false,
+            before: vec!["[".into(), "-f".into(), "file".into(), "]".into()],
+            prefix: String::new(),
+            suffix: String::new(),
+            after: Vec::new(),
+        });
+        assert_eq!(complete.status, BuiltinParseStatus::Complete);
+    }
+
+    #[test]
     fn self_shadowed_bash_version_is_a_successful_compatibility_probe() {
         assert_eq!(
             super::brush_sh(&["bash".to_string(), "--version".to_string()]),

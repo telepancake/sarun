@@ -3,3 +3,4 @@
 0030-Parse-escaped-quotes-inside-legacy-backquotes.patch
 0040-Honor-escaped-dollars-in-legacy-backquotes.patch
 0050-Distinguish-quoted-and-unquoted-legacy-backquotes.patch
+0060-Observe-test-grammar-matches-at-edit-tears.patch
