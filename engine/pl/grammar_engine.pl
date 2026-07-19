@@ -99,21 +99,24 @@ transform_relation(given_grammar(Name), Given, Wanted, Observations, Limits,
 % A host-registered relation is invoked through the ordinary explicit context
 % protocol.  The engine knows only its opaque handle and the standard relation
 % envelope; it has no parser kind, command name, or client-specific callback.
-% The host returns one immutable, revisioned `result(Reply)` entry.  This first
-% executable slice deliberately accepts context-free replies only.  Adapters
-% which themselves suspend on context will extend this same data protocol with
-% continuation queries rather than performing hidden provider access.
+% The host returns one immutable, revisioned `result(Reply)` entry.  Context
+% queries in that reply are scoped into the surrounding graph.  Their exact
+% observations are then included in the next pure adapter request, so replay
+% and suspension never grant the host hidden access to a semantic provider.
 transform_relation(registered_relation(Handle), Given, Wanted, Observations,
                    Limits, Reply) :-
     atom(Handle),
-    Request = relation_request(Given, Wanted, Limits),
+    Key = registered_relation(Handle),
+    scoped_observations(Key, Observations, AdapterObservations),
+    Request = relation_request(Given, Wanted, AdapterObservations, Limits),
     Id = registered_relation_call(Handle),
     Query = ask(one, registered_relation(Handle), where(Request)),
     Graph = [query(Id, Query)],
-    project_observations(Graph, Observations, AdapterObservations),
-    stage_context(Graph, AdapterObservations, Ready, Dependencies),
-    registered_relation_reply(Handle, Id, Query, AdapterObservations, Ready,
-                              Dependencies, Wanted, Reply).
+    project_observations(Graph, Observations, HostObservations),
+    stage_context(Graph, HostObservations, Ready, HostDependencies),
+    registered_relation_reply(Handle, Key, Id, Query, HostObservations, Ready,
+                              HostDependencies, AdapterObservations, Wanted,
+                              Reply).
 
 transform_relation(ast_state_grammar(Rules), Given, Wanted, Observations,
                    Limits,
@@ -298,22 +301,58 @@ transform_relation(
     Available = [binding(highlights, Highlights)],
     requested_bindings(Wanted, Available, Bindings).
 
-registered_relation_reply(_, _, _, [], Ready, Dependencies, _,
-                          reply([], Ready, Dependencies, [])) :- !.
+registered_relation_reply(_, Key, _, _, [], Ready, HostDependencies,
+                          AdapterObservations, _,
+                          reply([], Ready, Dependencies, [])) :-
+    observation_dependency_keys(AdapterObservations, AdapterDependencies0),
+    scope_dependencies(Key, AdapterDependencies0, AdapterDependencies),
+    append(HostDependencies, AdapterDependencies, Dependencies0),
+    sort(Dependencies0, Dependencies),
+    !.
 registered_relation_reply(
-    _, Id, Query,
+    Handle, Key, Id, Query,
     [observed(Id, Query, _,
               some(one(entry(_, _, _, result(AdapterReply), _))))],
-    [], Dependencies, Wanted,
-    reply(Solutions, [], Dependencies, Diagnostics)) :-
-    AdapterReply = reply(Solutions, [], [], Diagnostics),
+    [], HostDependencies, AdapterObservations, Wanted, Reply) :-
+    AdapterReply = reply(Solutions, InnerGraph, [], Diagnostics),
     valid_registered_solutions(Solutions, Wanted),
     proper_ground_list(Diagnostics),
+    valid_query_graph(InnerGraph),
+    project_observations(InnerGraph, AdapterObservations,
+                         InnerObservations),
+    stage_context(InnerGraph, InnerObservations, InnerReady,
+                  _CurrentDependencies),
+    observation_dependency_keys(AdapterObservations,
+                                AdapterDependencies0),
+    scope_dependencies(Key, AdapterDependencies0, AdapterDependencies),
+    append(HostDependencies, AdapterDependencies, Dependencies0),
+    sort(Dependencies0, Dependencies),
+    registered_relation_inner_reply(Handle, Key, Solutions, InnerGraph,
+                                    InnerReady, Dependencies, Diagnostics,
+                                    Reply),
     !.
-registered_relation_reply(Handle, _, _, [_], [], Dependencies, _,
+registered_relation_reply(Handle, _, _, _, [_], [], Dependencies, _, _,
                           reply([], [], Dependencies,
                                 [diagnostic(registered_relation_unavailable(
                                     Handle))])).
+
+registered_relation_inner_reply(_, _, Solutions, [], [], Dependencies,
+                                Diagnostics,
+                                reply(Solutions, [], Dependencies,
+                                      Diagnostics)) :- !.
+registered_relation_inner_reply(_, Key, Solutions, [_|_], InnerReady,
+                                Dependencies, Diagnostics,
+                                reply(Solutions, Ready, Dependencies,
+                                      Diagnostics)) :-
+    InnerReady = [_|_],
+    scope_queries(Key, InnerReady, Ready),
+    !.
+registered_relation_inner_reply(Handle, _, _, [_|_], [], Dependencies,
+                                Diagnostics,
+                                reply([], [], Dependencies, AllDiagnostics)) :-
+    append(Diagnostics,
+           [diagnostic(registered_relation_stalled(Handle))],
+           AllDiagnostics).
 
 valid_registered_solutions([], _).
 valid_registered_solutions([solution(Bindings, Preference)|Solutions], Wanted) :-

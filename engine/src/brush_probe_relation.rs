@@ -492,6 +492,7 @@ mod tests {
                 ),
             }],
             wanted: wanted.iter().map(|value| (*value).into()).collect(),
+            observations: vec![],
             limits: RelationLimits::default(),
         }
     }

@@ -629,7 +629,7 @@ impl Prolog {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(BrushDocumentAnalysis {
             candidates,
-            context_queries: decode_context_graph_values(&reply.context_queries)?,
+            context_queries: context_query_nodes_from_values(&reply.context_queries)?,
             dependency_keys: reply
                 .dependency_keys
                 .iter()
@@ -907,7 +907,7 @@ impl Prolog {
             return Ok(Vec::new());
         }
         reject_relation_diagnostics(&reply)?;
-        let queries = decode_context_graph_values(&reply.context_queries)?;
+        let queries = context_query_nodes_from_values(&reply.context_queries)?;
         reply
             .solutions
             .iter()
@@ -994,7 +994,7 @@ impl Prolog {
             return Ok(Vec::new());
         }
         reject_relation_diagnostics(&reply)?;
-        let queries = decode_context_graph_values(&reply.context_queries)?;
+        let queries = context_query_nodes_from_values(&reply.context_queries)?;
         let target_query_id = queries
             .iter()
             .rev()
@@ -2371,20 +2371,30 @@ fn document_binding_value(binding: &DocumentBinding) -> RelationValue {
     )
 }
 
+pub(crate) fn context_query_node_value(node: &ContextQueryNode) -> RelationValue {
+    relation_compound(
+        "query",
+        vec![node.id.clone(), context_query_value(&node.query)],
+    )
+}
+
 fn context_graph_value(graph: &[ContextQueryNode]) -> Result<RelationValue, String> {
     graph
         .iter()
-        .map(|node| {
-            Ok(relation_compound(
-                "query",
-                vec![node.id.clone(), context_query_value(&node.query)],
-            ))
-        })
+        .map(|node| Ok(context_query_node_value(node)))
         .collect::<Result<Vec<_>, String>>()
         .map(relation_list)
 }
 
-fn decode_context_graph_values(values: &[RelationValue]) -> Result<Vec<ContextQueryNode>, String> {
+pub(crate) fn context_observation_from_value(
+    value: &RelationValue,
+) -> Result<ContextObservation, String> {
+    decode_context_observation(&parsed_relation_value(value))
+}
+
+pub(crate) fn context_query_nodes_from_values(
+    values: &[RelationValue],
+) -> Result<Vec<ContextQueryNode>, String> {
     values
         .iter()
         .map(|value| decode_context_node(&parsed_relation_value(value)))

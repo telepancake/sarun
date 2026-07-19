@@ -9,14 +9,15 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock, RwLock};
 
 use crate::prolog::{
-    ContextEntry, ContextQueryNode, ContextSnapshot, RelationBinding, RelationLimits,
-    RelationReply, RelationValue,
+    ContextEntry, ContextObservation, ContextQueryNode, ContextSnapshot, RelationBinding,
+    RelationLimits, RelationReply, RelationValue,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Request {
     pub given: Vec<RelationBinding>,
     pub wanted: Vec<String>,
+    pub observations: Vec<ContextObservation>,
     pub limits: RelationLimits,
 }
 
@@ -81,9 +82,9 @@ pub(crate) fn snapshot(node: &ContextQueryNode) -> Result<Option<ContextSnapshot
         .ok_or_else(|| format!("no registered relation adapter for {handle}"))?;
     let revision = adapter.revision();
     let reply = adapter.transform(&request)?;
-    if !reply.context_queries.is_empty() || !reply.dependency_keys.is_empty() {
+    if !reply.dependency_keys.is_empty() {
         return Err(format!(
-            "registered relation {handle} suspended on context before continuation support"
+            "registered relation {handle} returned forged dependency keys"
         ));
     }
     let reply = crate::prolog::relation_reply_value(&reply)?;
@@ -111,7 +112,7 @@ fn decode_request(value: &RelationValue) -> Result<Request, String> {
     let RelationValue::Compound(name, fields) = value else {
         return Err("registered relation request is not a compound".into());
     };
-    if name != "relation_request" || fields.len() != 3 {
+    if name != "relation_request" || fields.len() != 4 {
         return Err("registered relation request has an invalid shape".into());
     }
     let RelationValue::List(given) = &fields[0] else {
@@ -131,7 +132,14 @@ fn decode_request(value: &RelationValue) -> Result<Request, String> {
             _ => Err("registered relation wanted value is not an atom".to_string()),
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let RelationValue::Compound(limits_name, limits) = &fields[2] else {
+    let RelationValue::List(observations) = &fields[2] else {
+        return Err("registered relation observations value is not a list".into());
+    };
+    let observations = observations
+        .iter()
+        .map(crate::prolog::context_observation_from_value)
+        .collect::<Result<Vec<_>, _>>()?;
+    let RelationValue::Compound(limits_name, limits) = &fields[3] else {
         return Err("registered relation limits value is not a compound".into());
     };
     if limits_name != "limits" || limits.len() != 3 {
@@ -145,6 +153,7 @@ fn decode_request(value: &RelationValue) -> Result<Request, String> {
     Ok(Request {
         given,
         wanted,
+        observations,
         limits,
     })
 }
@@ -206,6 +215,30 @@ mod tests {
 
         fn transform(&self, request: &Request) -> Result<RelationReply, String> {
             assert_eq!(request.wanted, ["status"]);
+            if request.observations.is_empty() {
+                let query = ContextQueryNode {
+                    id: RelationValue::Atom("fixture_empty".into()),
+                    query: crate::prolog::ContextQuery {
+                        cardinality: crate::prolog::ContextCardinality::Empty,
+                        domain: RelationValue::Atom("fixture_context".into()),
+                        selector: RelationValue::Compound(
+                            "name".into(),
+                            vec![RelationValue::String("missing".into())],
+                        ),
+                    },
+                };
+                return Ok(RelationReply {
+                    solutions: vec![],
+                    context_queries: vec![crate::prolog::context_query_node_value(&query)],
+                    dependency_keys: vec![],
+                    diagnostics: vec![],
+                });
+            }
+            assert_eq!(request.observations.len(), 1);
+            assert_eq!(
+                request.observations[0].outcome,
+                Some(crate::prolog::ContextResult::Empty(true))
+            );
             Ok(RelationReply {
                 solutions: vec![crate::prolog::RelationSolution {
                     bindings: vec![RelationBinding {
@@ -241,37 +274,27 @@ mod tests {
             observations: vec![],
             limits,
         };
-        let pending = prolog.transform(&request).unwrap();
-        let graph = pending
-            .context_queries
-            .iter()
-            .map(|value| {
-                let RelationValue::Compound(_, fields) = value else {
-                    panic!("query node must be compound")
-                };
-                let RelationValue::Compound(_, ask) = &fields[1] else {
-                    panic!("ask must be compound")
-                };
-                ContextQueryNode {
-                    id: fields[0].clone(),
-                    query: crate::prolog::ContextQuery {
-                        cardinality: crate::prolog::ContextCardinality::One,
-                        domain: ask[1].clone(),
-                        selector: ask[2].clone(),
-                    },
-                }
-            })
-            .collect::<Vec<_>>();
-        let observations =
-            crate::parser::execute_context_graph(prolog, &graph, &crate::parser::EmptyContext)
-                .unwrap()
+        let mut resolved = None;
+        for _ in 0..8 {
+            let reply = prolog.transform(&request).unwrap();
+            if reply.context_queries.is_empty() {
+                resolved = Some(reply);
+                break;
+            }
+            let graph = crate::prolog::context_query_nodes_from_values(&reply.context_queries)
                 .unwrap();
-        request.observations = observations
-            .iter()
-            .map(crate::prolog::context_observation_value)
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-        let resolved = prolog.transform(&request).unwrap();
+            let observations =
+                crate::parser::execute_context_graph(prolog, &graph, &crate::parser::EmptyContext)
+                    .unwrap()
+                    .unwrap();
+            for observation in observations {
+                let value = crate::prolog::context_observation_value(&observation).unwrap();
+                if !request.observations.contains(&value) {
+                    request.observations.push(value);
+                }
+            }
+        }
+        let resolved = resolved.expect("registered relation continuation must settle");
         assert_eq!(resolved.solutions.len(), 1);
         assert_eq!(resolved.solutions[0].preference, 17);
         assert_eq!(
@@ -281,6 +304,6 @@ mod tests {
                 value: RelationValue::Atom("complete".into()),
             }]
         );
-        assert_eq!(resolved.dependency_keys.len(), 1);
+        assert_eq!(resolved.dependency_keys.len(), 2);
     }
 }

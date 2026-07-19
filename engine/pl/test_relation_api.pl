@@ -30,6 +30,7 @@ test_name(raw_text_mode_matrix_rejects_unimplemented_constructs_explicitly).
 test_name(opaque_handle_resolves_install_once_grammar).
 test_name(supplied_grammar_resolves_install_once_handle).
 test_name(registered_relation_uses_explicit_revisioned_query).
+test_name(registered_relation_replays_with_explicit_context_observations).
 test_name(solution_limit_is_enforced_and_reported).
 test_name(envelope_fails_closed).
 
@@ -921,7 +922,7 @@ run_test(registered_relation_uses_explicit_revisioned_query) :-
     Given = [binding(source, text_source("bind -m e", exact, brush_text))],
     Wanted = [status, completions],
     Id = registered_relation_call(brush_clap),
-    Request = relation_request(Given, Wanted, Limits),
+    Request = relation_request(Given, Wanted, [], Limits),
     Query = ask(one, registered_relation(brush_clap), where(Request)),
     transform(
         request(registered_relation(brush_clap), given(Given), want(Wanted),
@@ -946,6 +947,76 @@ run_test(registered_relation_uses_explicit_revisioned_query) :-
         reply([solution([binding(status, incomplete(edit)),
                          binding(completions, [Completion])], 30)],
               [], [dependency(Id, Query, some(one(Entry)))], [])).
+
+run_test(registered_relation_replays_with_explicit_context_observations) :-
+    limits(Limits),
+    Handle = brush_clap,
+    Key = registered_relation(Handle),
+    Given = [binding(source, text_source("edit ./t", exact, brush_text))],
+    Wanted = [status, completions],
+    HostId = registered_relation_call(Handle),
+    Request0 = relation_request(Given, Wanted, [], Limits),
+    HostQuery0 = ask(one, registered_relation(Handle), where(Request0)),
+    PathId = path_candidates,
+    PathQuery = ask(all, filesystem_path, prefix("./t")),
+    PendingReply = reply([], [query(PathId, PathQuery)], [], []),
+    HostEntry0 = entry(registered_relation(Handle),
+                       parser_result(Handle, 1), ["result"],
+                       result(PendingReply), [Request0]),
+    HostObservation0 = observed(
+        HostId, HostQuery0, source(brush_clap, revision(1)),
+        some(one(HostEntry0))),
+    ScopedPathId = branch(Key, PathId),
+    transform(
+        request(registered_relation(Handle), given(Given), want(Wanted),
+                observations([HostObservation0]), Limits),
+        reply([], [query(ScopedPathId, PathQuery)],
+              [dependency(HostId, HostQuery0, some(one(HostEntry0)))], [])),
+    PathEntry = entry(filesystem_path, file_1, ["./test1.sh"],
+                      filesystem_path("/tmp/test1.sh"), [file]),
+    ScopedPathObservation = observed(
+        ScopedPathId, PathQuery, source(filesystem, revision(9)),
+        some(all([PathEntry]))),
+    AdapterPathObservation = observed(
+        PathId, PathQuery, source(filesystem, revision(9)),
+        some(all([PathEntry]))),
+    Request1 = relation_request(Given, Wanted, [AdapterPathObservation],
+                                Limits),
+    HostQuery1 = ask(one, registered_relation(Handle), where(Request1)),
+    transform(
+        request(registered_relation(Handle), given(Given), want(Wanted),
+                observations([HostObservation0, ScopedPathObservation]),
+                Limits),
+        reply([], [query(HostId, HostQuery1)],
+              [dependency(ScopedPathId, PathQuery,
+                          some(all([PathEntry])))], [])),
+    Completion = completion(span(5, 8), "./test1.sh",
+                            [alternative(context(filesystem_path, file_1),
+                                         builtin_argument, brush_clap, 30)],
+                            30, 1),
+    CompleteReply = reply(
+        [solution([binding(status, incomplete(edit)),
+                   binding(completions, [Completion])], 30)],
+        [], [], []),
+    HostEntry1 = entry(registered_relation(Handle),
+                       parser_result(Handle, 1), ["result"],
+                       result(CompleteReply), [Request1]),
+    HostObservation1 = observed(
+        HostId, HostQuery1, source(brush_clap, revision(1)),
+        some(one(HostEntry1))),
+    transform(
+        request(registered_relation(Handle), given(Given), want(Wanted),
+                observations([HostObservation0, ScopedPathObservation,
+                              HostObservation1]), Limits),
+        reply([solution([binding(status, incomplete(edit)),
+                         binding(completions, [Completion])], 30)],
+              [], Dependencies, [])),
+    list_contains(
+        dependency(ScopedPathId, PathQuery, some(all([PathEntry]))),
+        Dependencies),
+    list_contains(
+        dependency(HostId, HostQuery1, some(one(HostEntry1))),
+        Dependencies).
 
 run_test(envelope_fails_closed) :-
     foreign_grammar(Grammar),
