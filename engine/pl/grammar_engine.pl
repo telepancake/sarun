@@ -94,20 +94,25 @@ transform_relation(given_grammar(Name), Given, Wanted, Observations, Limits,
     transform_relation(Grammar, Given, Wanted, Observations, Limits, Reply).
 
 transform_relation(ast_state_grammar(Rules), Given, Wanted, Observations,
-                   _Limits,
+                   Limits,
                    reply(Solutions, ReadyQueries,
-                         DependencyKeys, [])) :-
+                         DependencyKeys, Diagnostics)) :-
     given_value(ast, Given, Ast),
     given_value(source, Given, Source),
     initial_local_state(Given, Initial),
     derive_ast_state_steps(Rules, Ast, Source, Steps),
     run_state_steps(Steps, Initial, Final, Resolutions0, Queries, Delta,
-                    LocalCompletionPairs),
+                    LocalCompletionPairs, Applications),
     valid_query_graph(Queries),
-    stage_context(Queries, Observations, ReadyQueries, DependencyKeys),
+    stage_context(Queries, Observations, StateReadyQueries,
+                  StateDependencyKeys),
     context_state_completion_pairs(Queries, Observations,
                                    ContextCompletionPairs),
-    append(LocalCompletionPairs, ContextCompletionPairs, CompletionPairs),
+    run_state_applications(Applications, Given, Observations, Limits,
+                           ApplicationCompletionPairs, ApplicationQueries,
+                           ApplicationDependencies, ApplicationDiagnostics),
+    append(LocalCompletionPairs, ContextCompletionPairs, StateCompletionPairs),
+    append(StateCompletionPairs, ApplicationCompletionPairs, CompletionPairs),
     project_completions(CompletionPairs, StateCompletions),
     ( resolve_state_resolutions(Resolutions0, Observations, Resolutions)
     -> Available = [binding(steps, Steps),
@@ -118,7 +123,12 @@ transform_relation(ast_state_grammar(Rules), Given, Wanted, Observations,
        requested_bindings(Wanted, Available, Bindings),
        Solutions = [solution(Bindings, 0)]
     ;  Solutions = []
-    ).
+    ),
+    append(StateReadyQueries, ApplicationQueries, ReadyQueries0),
+    sort(ReadyQueries0, ReadyQueries),
+    append(StateDependencyKeys, ApplicationDependencies, DependencyKeys0),
+    sort(DependencyKeys0, DependencyKeys),
+    Diagnostics = ApplicationDiagnostics.
 transform_relation(enrichment_grammar(Base, Shared, Extension, Outputs),
                    Given, Wanted, Observations, Limits, Reply) :-
     proper_atom_names(Shared),
@@ -272,6 +282,58 @@ initial_local_state(Given, Initial) :-
     given_value(initial_state, Given, Initial), !.
 initial_local_state(_, Initial) :-
     empty_local_state(Initial).
+
+% State applications are ordinary nested relation requests captured by the
+% AST/state walk at the exact point where they occur.  The generic engine knows
+% neither the node name nor the supplied grammar's language.  Failure to match
+% one annotation grammar contributes no projection; diagnostics from an
+% executable but unsupported nested grammar remain visible.
+run_state_applications([], _, _, _, [], [], [], []).
+run_state_applications([Application|Applications], Given, Observations, Limits,
+                       CompletionPairs, Queries, Dependencies, Diagnostics) :-
+    state_application_reply(Application, Given, Observations, Limits, Reply),
+    reply_completion_pairs(Reply, FirstPairs),
+    Reply = reply(_, FirstQueries, FirstDependencies, FirstDiagnostics),
+    run_state_applications(Applications, Given, Observations, Limits,
+                           RestPairs, RestQueries, RestDependencies,
+                           RestDiagnostics),
+    append(FirstPairs, RestPairs, CompletionPairs),
+    append(FirstQueries, RestQueries, Queries0),
+    sort(Queries0, Queries),
+    append(FirstDependencies, RestDependencies, Dependencies0),
+    sort(Dependencies0, Dependencies),
+    append(FirstDiagnostics, RestDiagnostics, Diagnostics).
+
+state_application_reply(
+    application(Id, Grammar, SymbolicSource, State), Given, Observations, Limits,
+    Reply) :-
+    symbolic_text_source(SymbolicSource, State, state_application(Id), Source),
+    bindings_except(source, Given, ApplicationGiven0),
+    ApplicationGiven = [binding(source, Source)|ApplicationGiven0],
+    Key = state_application(Id),
+    scoped_observations(Key, Observations, ApplicationObservations),
+    ( transform_relation(Grammar, ApplicationGiven, [completions],
+                         ApplicationObservations, Limits, InnerReply)
+    -> scope_reply(Key, 0, InnerReply, Reply)
+    ;  Reply = reply([], [], [], [])
+    ),
+    !.
+state_application_reply(_, _, _, _, reply([], [], [], [])).
+
+reply_completion_pairs(reply(Solutions, _, _, _), Pairs) :-
+    findall(Pair,
+            ( candidate_member(solution(Bindings, _), Solutions),
+              given_value(completions, Bindings, Completions),
+              completion_pairs(Completions, CompletionPairs),
+              candidate_member(Pair, CompletionPairs)
+            ),
+            Pairs).
+
+bindings_except(_, [], []).
+bindings_except(Name, [binding(Name, _)|Bindings], Rest) :- !,
+    bindings_except(Name, Bindings, Rest).
+bindings_except(Name, [Binding|Bindings], [Binding|Rest]) :-
+    bindings_except(Name, Bindings, Rest).
 
 union_completion_reply(
     reply(Solutions0, Queries, Dependencies, Diagnostics), AdditionalName,

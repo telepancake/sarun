@@ -5,7 +5,9 @@
            state_step_constraints/2,
            valid_local_state/1,
            resolve_state_resolutions/3,
-           run_state_steps/7
+           run_state_steps/7,
+           run_state_steps/8,
+           symbolic_text_source/4
           ]).
 
 /** <module> Pure scoped state transitions for relational grammars
@@ -34,9 +36,15 @@ valid_local_state(local_state(Scopes, Delta)) :-
 
 run_state_steps(Steps, Initial, Final, Resolutions, Queries, Delta,
                 CompletionPairs) :-
+    run_state_steps(Steps, Initial, Final, Resolutions, Queries, Delta,
+                    CompletionPairs, _Applications).
+
+run_state_steps(Steps, Initial, Final, Resolutions, Queries, Delta,
+                CompletionPairs, Applications) :-
     proper_list(Steps),
     valid_local_state(Initial),
-    run_steps(Steps, Initial, Final, Resolutions, Queries, CompletionPairs),
+    run_steps(Steps, Initial, Final, Resolutions, Queries, CompletionPairs,
+              Applications),
     Final = local_state(_, Delta),
     valid_local_state(Final).
 
@@ -173,6 +181,34 @@ resolve_text_segment(reference(Domain, Name), State, Seen, Resolved) :-
 resolve_text_segment(text(Segments), State, Seen, Resolved) :-
     resolve_text_expression(text(Segments), State, Seen, Resolved).
 
+%! symbolic_text_source(+Expression, +State, +Origin, -Source) is semidet.
+%
+%  Lower a symbolic text value at one exact local-state checkpoint to an
+%  ordinary UTF-8 text source.  A single source hole may have a virtual byte
+%  position in the lowered text which differs from its physical edit span in
+%  the containing document.  The text grammar owns parsing both forms.
+
+symbolic_text_source(Expression, State, Origin,
+                     text_source(Text, exact, Origin)) :-
+    resolve_text_expression(Expression, State, [], Segments),
+    text_segments_string(Segments, Text),
+    !.
+symbolic_text_source(Expression, State, Origin,
+                     text_source(Text,
+                                 assist(EditId, span(VirtualStart, VirtualEnd),
+                                        replace_span(PhysicalStart,
+                                                     PhysicalEnd)),
+                                 Origin)) :-
+    resolve_text_expression(Expression, State, [], Segments),
+    single_text_hole(Segments,
+                     hole(EditId, span(PhysicalStart, PhysicalEnd), Surface, _),
+                     Prefix, Suffix),
+    string_concat(Prefix, Surface, PrefixSurface),
+    string_concat(PrefixSurface, Suffix, Text),
+    string_utf8_bytes(Prefix, VirtualStart),
+    string_utf8_bytes(Surface, SurfaceBytes),
+    VirtualEnd is VirtualStart + SurfaceBytes.
+
 single_text_hole(Segments, Hole, Prefix, Suffix) :-
     append(PrefixSegments, [Hole|SuffixSegments], Segments),
     Hole = hole(_, _, _, _),
@@ -200,51 +236,55 @@ hole_insertion(Text, Prefix, Suffix, Surface, Insert) :-
 value_member(Value, [Value|_]).
 value_member(Value, [_|Values]) :- value_member(Value, Values).
 
-run_steps([], State, State, [], [], []).
+run_steps([], State, State, [], [], [], []).
 run_steps([Step|Steps], State0, State, Resolutions, Queries,
-          CompletionPairs) :-
+          CompletionPairs, Applications) :-
     state_step(Step, State0, State1, StepResolutions, StepQueries,
-               StepCompletionPairs),
+               StepCompletionPairs, StepApplications),
     run_steps(Steps, State1, State, RestResolutions, RestQueries,
-              RestCompletionPairs),
+              RestCompletionPairs, RestApplications),
     append(StepResolutions, RestResolutions, Resolutions),
     append(StepQueries, RestQueries, Queries),
-    append(StepCompletionPairs, RestCompletionPairs, CompletionPairs).
+    append(StepCompletionPairs, RestCompletionPairs, CompletionPairs),
+    append(StepApplications, RestApplications, Applications).
 
 state_step(enter(ScopeId), local_state(Scopes, Delta),
-           local_state([scope(ScopeId, [])|Scopes], Delta), [], [], []) :-
+           local_state([scope(ScopeId, [])|Scopes], Delta), [], [], [], []) :-
     ground(ScopeId).
 state_step(leave(ScopeId),
            local_state([scope(ScopeId, Bindings), Parent|Scopes], Delta0),
-           local_state([MergedParent|Scopes], Delta), [], [], []) :-
+           local_state([MergedParent|Scopes], Delta), [], [], [], []) :-
     escaping_bindings(Bindings, Escaping),
     merge_bindings(Escaping, Parent, MergedParent),
     merge_delta(Escaping, Delta0, Delta).
 state_step(define(Domain, Name, Value, Lifetime, Policy),
            local_state([scope(ScopeId, Bindings0)|Scopes], Delta0),
-           local_state([scope(ScopeId, Bindings)|Scopes], Delta), [], [], []) :-
+           local_state([scope(ScopeId, Bindings)|Scopes], Delta), [], [], [], []) :-
     valid_binding(local_binding(Domain, Name, Value, Lifetime)),
     valid_policy(Policy),
     define_binding(Policy, local_binding(Domain, Name, Value, Lifetime),
                    Bindings0, Bindings),
     definition_delta(Lifetime, Domain, Name, Value, Delta0, Delta).
-state_step(constraint(Constraint), State, State, [], [], []) :-
+state_step(constraint(Constraint), State, State, [], [], [], []) :-
     ground(Constraint).
+state_step(apply(Id, Grammar, SymbolicSource), State, State, [], [], [],
+           [application(Id, Grammar, SymbolicSource, State)]) :-
+    ground(Id), ground(Grammar), ground(SymbolicSource).
 state_step(use(Id, Domain, Name), State, State,
-           [resolved(Id, local(Binding))], [], []) :-
+           [resolved(Id, local(Binding))], [], [], []) :-
     ground(Id), ground(Domain), ground(Name),
     Name \= text_hole(_, _, _),
     lookup_binding(State, Domain, Name, Binding),
     !.
 state_step(use(Id, Domain, Name), State, State,
            [resolved(Id, external(ref(Id)))],
-           [query(Id, ask(one, Domain, name(Name)))], []) :-
+           [query(Id, ask(one, Domain, name(Name)))], [], []) :-
     ground(Id), ground(Domain), ground(Name),
     Name \= text_hole(_, _, _).
 state_step(use(Id, Domain, TextHole), State, State,
            [resolved(Id, incomplete(TextHole))],
            [query(CompletionId, ask(all, Domain, prefix(QueryPrefix)))],
-           CompletionPairs) :-
+           CompletionPairs, []) :-
     ground(Id), ground(Domain),
     TextHole = text_hole(Prefix, Hole, Suffix),
     Hole = hole(_, _, Surface, _),
@@ -256,7 +296,7 @@ state_step(use(Id, Domain, TextHole), State, State,
                                        Pair),
             CompletionPairs).
 state_step(require(Id, Cardinality, Domain, Selector), State, State, [],
-           [query(Id, ask(Cardinality, Domain, Selector))], []) :-
+           [query(Id, ask(Cardinality, Domain, Selector))], [], []) :-
     ground(Id),
     valid_cardinality(Cardinality),
     ground(Domain), ground(Selector).
@@ -408,6 +448,21 @@ delta_key_member(Domain, Name, [_|Delta]) :-
 
 proper_list([]).
 proper_list([_|Values]) :- proper_list(Values).
+
+string_utf8_bytes(Text, Bytes) :-
+    string_codes(Text, Codes),
+    utf8_codes_bytes(Codes, 0, Bytes).
+
+utf8_codes_bytes([], Bytes, Bytes).
+utf8_codes_bytes([Code|Codes], Bytes0, Bytes) :-
+    utf8_codepoint_bytes(Code, Width),
+    Bytes1 is Bytes0 + Width,
+    utf8_codes_bytes(Codes, Bytes1, Bytes).
+
+utf8_codepoint_bytes(Code, 1) :- Code =< 0x7f, !.
+utf8_codepoint_bytes(Code, 2) :- Code =< 0x7ff, !.
+utf8_codepoint_bytes(Code, 3) :- Code =< 0xffff, !.
+utf8_codepoint_bytes(Code, 4) :- Code =< 0x10ffff.
 
 append([], Tail, Tail).
 append([Value|Values], Tail, [Value|Result]) :- append(Values, Tail, Result).

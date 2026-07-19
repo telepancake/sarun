@@ -20,6 +20,7 @@ test_name(recursive_raw_text_grammar_reports_utf8_byte_evidence).
 test_name(raw_terminal_tear_is_an_ordinary_symbolic_parse_value).
 test_name(every_tested_parse_prefix_exposes_an_ordinary_completion).
 test_name(context_backed_text_is_one_parse_relation).
+test_name(virtual_context_tear_maps_to_physical_source_span).
 test_name(raw_text_extras_are_grammar_owned_trivia).
 test_name(raw_text_mode_matrix_rejects_unimplemented_constructs_explicitly).
 test_name(opaque_handle_resolves_install_once_grammar).
@@ -675,6 +676,56 @@ run_test(context_backed_text_is_one_parse_relation) :-
                                            foreign_text))]),
                 want([ast]), observations([Missing]), Limits),
         reply([], [], [dependency(ExactId, ExactQuery, none)], [])).
+
+run_test(virtual_context_tear_maps_to_physical_source_span) :-
+    PathCodepoint = terminal(
+        text(codepoint(except(" \t\r\n"))),
+        presentation([meta(syntax, path), meta(tear, symbolic)])),
+    Grammar = grammar(
+        source(text(utf8)), path,
+        [rule(path,
+              context(path_value,
+                      repeat(1, unbounded, PathCodepoint),
+                      ask(one, filesystem_path, name(value(surface))),
+                      presentation([meta(syntax, path)])))],
+        []),
+    limits(Limits),
+    Ask = ask(one, filesystem_path, name(value(surface))),
+    Id = text_context(path_value, span(7, 10), Ask),
+    Query = ask(all, filesystem_path, prefix("./t")),
+    transform(
+        request(Grammar,
+                given([binding(source,
+                               text_source(
+                                   "./t",
+                                   assist(edit, span(3, 3),
+                                          replace_span(10, 10)),
+                                   virtual_text))]),
+                want([status, completions]), observations([]), Limits),
+        reply([solution([binding(status, incomplete(edit(edit))),
+                         binding(completions, [])], 0)],
+              [query(Id, Query)], [], [])),
+    Entry = entry(filesystem_path, file_1, ["./test1.sh"],
+                  filesystem_path("/tmp/test1.sh"), [file]),
+    Observation = observed(Id, Query, source(filesystem, revision_1),
+                           some(all([Entry]))),
+    transform(
+        request(Grammar,
+                given([binding(source,
+                               text_source(
+                                   "./t",
+                                   assist(edit, span(3, 3),
+                                          replace_span(10, 10)),
+                                   virtual_text))]),
+                want([completions]), observations([Observation]), Limits),
+        reply([solution(
+                   [binding(completions,
+                            [completion(
+                                 span(7, 10), "./test1.sh",
+                                 [alternative(context(filesystem_path, file_1),
+                                              path, filesystem, 0)],
+                                 0, 1)])], 0)],
+              [], [dependency(Id, Query, some(all([Entry])))], [])).
 
 run_test(raw_text_extras_are_grammar_owned_trivia) :-
     Space = terminal(text(codepoint(chars(" \t\n"))),

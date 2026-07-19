@@ -54,6 +54,8 @@ valid_capture_selector(field_symbolic_text(Name, Rules)) :-
 valid_capture_selector(fields_symbolic_text(Name, Rules)) :-
     atom(Name),
     valid_text_projection_rules(Rules).
+valid_capture_selector(node_symbolic_text(Rules)) :-
+    valid_text_projection_rules(Rules).
 
 valid_text_projection_rules(Rules) :-
     proper_list(Rules),
@@ -144,6 +146,8 @@ capture_value(fields_symbolic_text(Name, Rules), _, Value, Source, Texts) :-
               project_symbolic_text(FieldValue, Source, Rules, Text)
             ),
             Texts).
+capture_value(node_symbolic_text(Rules), _, Value, Source, Text) :-
+    project_symbolic_text(Value, Source, Rules, Text).
 
 project_symbolic_text(Value, Source, Rules, text(Segments)) :-
     project_text_segments(Value, Source, Rules, RawSegments),

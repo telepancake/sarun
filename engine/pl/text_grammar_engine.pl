@@ -92,13 +92,37 @@ text_source_context(
     parse_context(
         source_context(Origin,
                        tear(EditId, cursor(CharacterStart, ByteStart),
-                            cursor(CharacterEnd, ByteEnd), Surface)),
+                            cursor(CharacterEnd, ByteEnd), Surface,
+                            source_span(ByteStart, ByteEnd))),
         []),
     incomplete(edit(EditId))) :-
     string(Text),
     atom(EditId),
     ground(Origin),
     integer(ByteStart), integer(ByteEnd), 0 =< ByteStart, ByteStart =< ByteEnd,
+    byte_character_cursor(Text, ByteStart, CharacterStart),
+    byte_character_cursor(Text, ByteEnd, CharacterEnd),
+    CharacterLength is CharacterEnd - CharacterStart,
+    sub_string(Text, CharacterStart, CharacterLength, _, Surface),
+    string_length(Text, CharacterCount).
+text_source_context(
+    text_source(Text,
+                assist(EditId, span(ByteStart, ByteEnd),
+                       replace_span(ReplaceStart, ReplaceEnd)), Origin), Text,
+    CharacterCount,
+    parse_context(
+        source_context(Origin,
+                       tear(EditId, cursor(CharacterStart, ByteStart),
+                            cursor(CharacterEnd, ByteEnd), Surface,
+                            replace_span(ReplaceStart, ReplaceEnd))),
+        []),
+    incomplete(edit(EditId))) :-
+    string(Text),
+    atom(EditId),
+    ground(Origin),
+    integer(ByteStart), integer(ByteEnd), 0 =< ByteStart, ByteStart =< ByteEnd,
+    integer(ReplaceStart), integer(ReplaceEnd),
+    0 =< ReplaceStart, ReplaceStart =< ReplaceEnd,
     byte_character_cursor(Text, ByteStart, CharacterStart),
     byte_character_cursor(Text, ByteEnd, CharacterEnd),
     CharacterLength is CharacterEnd - CharacterStart,
@@ -124,13 +148,13 @@ source_origin(parse_context(source_context(Origin, _), _), Origin).
 
 initial_text_cursor(parse_context(source_context(_, no_tear), _),
                     cursor(0, 0, absent)).
-initial_text_cursor(parse_context(source_context(_, tear(_, _, _, _)), _),
+initial_text_cursor(parse_context(source_context(_, tear(_, _, _, _, _)), _),
                     cursor(0, 0, unused)).
 
 complete_text_cursor(parse_context(source_context(_, no_tear), _),
                      CharacterCount, ByteEnd,
                      cursor(CharacterCount, ByteEnd, absent)).
-complete_text_cursor(parse_context(source_context(_, tear(_, _, _, _)), _),
+complete_text_cursor(parse_context(source_context(_, tear(_, _, _, _, _)), _),
                      CharacterCount,
                      ByteEnd, cursor(CharacterCount, ByteEnd, used)).
 
@@ -138,10 +162,15 @@ source_tear_at(
     parse_context(
         source_context(_,
                        tear(EditId, cursor(CharacterStart, ByteStart),
-                            cursor(CharacterEnd, ByteEnd), Surface)),
+                            cursor(CharacterEnd, ByteEnd), Surface,
+                            SourceSpan)),
         _),
     cursor(CharacterStart, ByteStart, unused), EditId,
-    cursor(CharacterEnd, ByteEnd, used), Surface).
+    cursor(CharacterEnd, ByteEnd, used), Surface, Span) :-
+    tear_replacement_span(SourceSpan, Span).
+
+tear_replacement_span(source_span(Start, End), span(Start, End)).
+tear_replacement_span(replace_span(Start, End), span(Start, End)).
 
 context_with_extras(parse_context(Source, Existing), Added,
                     parse_context(Source, Combined)) :-
@@ -305,13 +334,12 @@ match_expression(ref(Name), Rules, Text, Origin, Maximum, Start, End,
 match_expression(seq(Expressions), Rules, _Text, Context, Maximum, Start, End,
                  generated(sequence, Rendered), [Item], Depth0, Depth) :-
     Depth0 < Maximum,
-    source_tear_at(Context, Start, EditId, End, TearSurface),
+    source_tear_at(Context, Start, EditId, End, TearSurface, Span),
     render_completion_expressions(Expressions, Rules, Maximum, Depth0,
                                   Rendered, Depth),
     Rendered \= "",
     string_length(TearSurface, TearLength),
     sub_string(Rendered, 0, TearLength, _, TearSurface),
-    cursor_span(Start, End, Span),
     Item = evidence(generated(sequence), Span, [], TearSurface,
                     grammar, continuation, 0,
                     tear(EditId, literal(Rendered))).
@@ -379,11 +407,10 @@ match_expression(
 match_expression(literal(Surface0, Semantic, presentation(Metadata)), _, _Text,
                  Context, _, Start, End, literal(Semantic), [Item], Depth,
                  Depth) :-
-    source_tear_at(Context, Start, EditId, End, TearSurface),
+    source_tear_at(Context, Start, EditId, End, TearSurface, Span),
     text_string(Surface0, Surface),
     string_length(TearSurface, TearLength),
     sub_string(Surface, 0, TearLength, _, TearSurface),
-    cursor_span(Start, End, Span),
     presentation(Metadata, Syntax, Description, Preference),
     Item = evidence(Semantic, Span, [], TearSurface, Syntax, Description,
                     Preference, tear(EditId, literal(Surface))).
@@ -407,9 +434,8 @@ match_expression(
     _, Start, End,
     hole(EditId, Span, TearSurface, terminal(text(codepoint(Set)))), [Item],
     Depth, Depth) :-
-    source_tear_at(Context, Start, EditId, End, TearSurface),
+    source_tear_at(Context, Start, EditId, End, TearSurface, Span),
     metadata_value(tear, Metadata, none, symbolic),
-    cursor_span(Start, End, Span),
     presentation(Metadata, Syntax, Description, Preference),
     Item = evidence(hole(EditId, terminal(text(codepoint(Set)))), Span, [],
                     TearSurface, Syntax, Description, Preference,
@@ -498,12 +524,28 @@ render_completion_repetition(Count, Expression, Rules, Maximum, Depth0,
 context_match_source(
     parse_context(
         source_context(_, tear(EditId, _, cursor(TearCharacterEnd,
-                                                  TearByteEnd), _)), _),
+                                                  TearByteEnd), _,
+                               source_span(_, _))), _),
     Text, cursor(CharacterStart, ByteStart, unused),
     cursor(_, _, used), span(ByteStart, TearByteEnd), Surface, tear(EditId)) :-
     CharacterLength is TearCharacterEnd - CharacterStart,
     CharacterLength >= 0,
     sub_string(Text, CharacterStart, CharacterLength, _, Surface),
+    !.
+context_match_source(
+    parse_context(
+        source_context(_, tear(EditId, cursor(_, TearByteStart),
+                               cursor(TearCharacterEnd, _), _,
+                               replace_span(ReplaceStart, ReplaceEnd))), _),
+    Text, cursor(CharacterStart, ByteStart, unused),
+    cursor(_, _, used), span(PhysicalStart, ReplaceEnd), Surface, tear(EditId)) :-
+    CharacterLength is TearCharacterEnd - CharacterStart,
+    CharacterLength >= 0,
+    sub_string(Text, CharacterStart, CharacterLength, _, Surface),
+    PrefixBytes is TearByteStart - ByteStart,
+    PrefixBytes >= 0,
+    PhysicalStart is ReplaceStart - PrefixBytes,
+    PhysicalStart >= 0,
     !.
 context_match_source(_, Text, cursor(CharacterStart, ByteStart, _),
                      cursor(CharacterEnd, ByteEnd, _), span(ByteStart, ByteEnd),

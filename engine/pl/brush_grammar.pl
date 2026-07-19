@@ -19,25 +19,7 @@ brush_relation_grammar(Grammar) :-
     StateGrammar0 = enrichment_grammar(
         Syntax, [ast], ast_state_grammar(StateRules),
         [steps, final_state, resolutions, delta, state_completions]),
-    StateGrammar = completion_union_grammar(StateGrammar0,
-                                            state_completions),
-    BuiltinCompletions = projection_grammar(
-        given_grammar(builtin_grammar),
-        [projection(completions, reference(completions))]),
-    EmptyCompletions = projection_grammar(
-        binding_grammar([]),
-        [projection(completions, constant([]))]),
-    SemanticGrammar = projection_grammar(
-        choice_grammar([
-            alternative(builtin_grammar, 0, BuiltinCompletions),
-            alternative(empty_completion_set, 0, EmptyCompletions)
-        ]),
-        [projection(semantic_completions, reference(completions))]),
-    EnrichedGrammar = enrichment_grammar(
-        StateGrammar, [steps, final_state], SemanticGrammar,
-        [semantic_completions]),
-    Grammar = completion_union_grammar(EnrichedGrammar,
-                                       semantic_completions).
+    Grammar = completion_union_grammar(StateGrammar0, state_completions).
 
 brush_state_rules([
     state_rule(node(assignment),
@@ -50,13 +32,18 @@ brush_state_rules([
                [capture(name, field_text_or_hole(name))],
                before([use(node_identity, shell_variable, slot(name))]),
                after([])),
-    state_rule(node(command_words), [], before([]), after([]))
+    state_rule(node(command_words),
+               [capture(source, node_symbolic_text(TextRules))],
+               before([]),
+               after([apply(node_identity, given_grammar(builtin_grammar),
+                            slot(source))]))
 ]) :-
     brush_text_projection_rules(TextRules).
 
 brush_text_projection_rules([
     text_rule(node(unquoted_text), children_else_source),
     text_rule(node(double_quoted_part), children_else_source),
+    text_rule(node(required_horizontal_space), source),
     text_rule(node(simple_parameter),
               reference(shell_variable, field_text(name)))
 ]).

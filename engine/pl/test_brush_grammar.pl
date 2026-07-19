@@ -15,6 +15,12 @@ test_name(parameter_observation_resolves_and_records_dependency).
 test_name(missing_unique_parameter_observation_fails_semantic_solution).
 test_name(assignment_tear_survives_as_later_local_value).
 test_name(local_variable_name_completion_comes_from_ordinary_use_step).
+test_name(supplied_grammar_constrains_earlier_local_value_hole).
+test_name(supplied_grammar_uses_state_at_command_position).
+test_name(supplied_grammar_applies_at_each_command_position).
+test_name(unknown_command_keeps_the_shell_solution).
+test_name(direct_and_propagated_tears_use_the_same_grammar).
+test_name(propagated_tear_retains_physical_utf8_byte_span).
 
 run_brush_grammar_tests :-
     findall(Name, test_name(Name), Names),
@@ -35,14 +41,10 @@ run_test(grammar_is_valid_executable_data) :-
     brush_relation_grammar(
         completion_union_grammar(
             enrichment_grammar(
-                completion_union_grammar(
-                    enrichment_grammar(
-                        Syntax, [ast], ast_state_grammar(StateRules),
-                        [steps, final_state, resolutions, delta,
-                         state_completions]),
-                    state_completions),
-                [steps, final_state], _, [semantic_completions]),
-            semantic_completions)),
+                Syntax, [ast], ast_state_grammar(StateRules),
+                [steps, final_state, resolutions, delta,
+                 state_completions]),
+            state_completions)),
     grammar_ir:valid_grammar(Syntax),
     ast_state_relation:valid_ast_state_rules(StateRules).
 
@@ -260,6 +262,108 @@ run_test(local_variable_name_completion_comes_from_ordinary_use_step) :-
                           binding(completions, Completions),
                           binding(delta, _)], _), Solutions),
     has_completion("A", local(shell_variable, "A"), Completions).
+
+run_test(supplied_grammar_constrains_earlier_local_value_hole) :-
+    tool_analysis("A=\"\"; tool $A", span(3, 3), Solutions),
+    solution_completion_texts_at(Solutions, span(3, 3), Texts),
+    Texts = ["alpha", "beta"].
+
+run_test(supplied_grammar_uses_state_at_command_position) :-
+    tool_analysis("A=\"\"; tool $A; A=omega", span(3, 3), Solutions),
+    solution_completion_texts_at(Solutions, span(3, 3), Texts),
+    Texts = ["alpha", "beta"].
+
+run_test(supplied_grammar_applies_at_each_command_position) :-
+    tool_analysis("noop; A=\"\"; noop | tool $A && noop", span(9, 9),
+                  Solutions),
+    solution_completion_texts_at(Solutions, span(9, 9), Texts),
+    Texts = ["alpha", "beta"].
+
+run_test(unknown_command_keeps_the_shell_solution) :-
+    brush_relation_grammar(Grammar),
+    tool_grammar(ToolGrammar),
+    transform(
+        request(Grammar,
+                given([binding(source,
+                               text_source("unknown argument", exact,
+                                           brush_test)),
+                       binding(initial_state,
+                               local_state([scope(root, [])], [])),
+                       binding(builtin_grammar, ToolGrammar)]),
+                want([status, completions]), observations([]),
+                limits(32, 4096, 1048576)),
+        reply([solution([binding(status, complete),
+                         binding(completions, [])], 0)], [], [], [])).
+
+run_test(direct_and_propagated_tears_use_the_same_grammar) :-
+    tool_analysis("tool ", span(5, 5), DirectSolutions),
+    solution_completion_texts_at(DirectSolutions, span(5, 5), DirectTexts),
+    tool_analysis("A=\"\"; tool $A", span(3, 3), PropagatedSolutions),
+    solution_completion_texts_at(PropagatedSolutions, span(3, 3),
+                                 PropagatedTexts),
+    DirectTexts = PropagatedTexts,
+    DirectTexts = ["alpha", "beta"].
+
+run_test(propagated_tear_retains_physical_utf8_byte_span) :-
+    tool_analysis("é; A=\"\"; tool $A", span(7, 7), Solutions),
+    solution_completion_texts_at(Solutions, span(7, 7), Texts),
+    Texts = ["alpha", "beta"],
+    \+ solution_has_completion_at(Solutions, span(5, 5)).
+
+tool_analysis(Source, Span, Solutions) :-
+    brush_relation_grammar(Grammar),
+    tool_grammar(ToolGrammar),
+    transform(
+        request(Grammar,
+                given([binding(source,
+                               text_source(Source, assist(edit, Span),
+                                           brush_test)),
+                       binding(initial_state,
+                               local_state([scope(root, [])], [])),
+                       binding(builtin_grammar, ToolGrammar)]),
+                want([status, completions, delta]), observations([]),
+                limits(64, 8192, 1048576)),
+        reply(Solutions, _, _, [])).
+
+tool_grammar(
+    grammar(
+        source(text(utf8)), tool_invocation,
+        [rule(tool_invocation,
+              seq([literal("tool", tool_command,
+                           presentation([meta(syntax, command)])),
+                   ref(required_space),
+                   choice([literal("alpha", alpha_value,
+                                   presentation([meta(syntax, tool_value),
+                                                 meta(description,
+                                                      alpha_value)])),
+                           literal("beta", beta_value,
+                                   presentation([meta(syntax, tool_value),
+                                                 meta(description,
+                                                      beta_value)]))])])),
+         rule(required_space,
+              repeat(1, unbounded,
+                     terminal(text(codepoint(chars(" \t"))),
+                              presentation([meta(syntax, trivia)]))))],
+        [])).
+
+solution_completion_texts_at(Solutions, Span, Texts) :-
+    findall(Text,
+            ( list_member(solution(Bindings, _), Solutions),
+              list_member(binding(completions, Completions), Bindings),
+              list_member(completion(Span, Text, Alternatives, _, _),
+                          Completions),
+              has_syntax(tool_value, Alternatives)
+            ),
+            Texts0),
+    sort(Texts0, Texts).
+
+has_syntax(Syntax, [alternative(_, Syntax, _, _)|_]).
+has_syntax(Syntax, [_|Alternatives]) :- has_syntax(Syntax, Alternatives).
+
+solution_has_completion_at(Solutions, Span) :-
+    list_member(solution(Bindings, _), Solutions),
+    list_member(binding(completions, Completions), Bindings),
+    list_member(completion(Span, _, _, _, _), Completions).
 
 has_assignment_hole_solution(
     Hole,
