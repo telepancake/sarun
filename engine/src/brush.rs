@@ -3214,6 +3214,93 @@ mod builtin_boundary_tests {
     }
 
     #[test]
+    fn typed_builtin_probe_observes_edit_path_at_the_tear() {
+        use brush_core::builtins::{CommandParseStatus, CommandProbeInput};
+
+        let builtins = super::box_builtins::<brush_core::extensions::DefaultShellExtensions>();
+        let probe = builtins["edit"]
+            .probe_func
+            .expect("typed edit builtin parser probe");
+
+        let missing = probe(CommandProbeInput {
+            before: vec!["edit".into()],
+            surface: String::new(),
+            after: Vec::new(),
+        });
+        assert_eq!(missing.status, CommandParseStatus::Incomplete);
+        assert_eq!(missing.expected.len(), 1);
+        assert_eq!(missing.expected[0].id, "path");
+        assert_eq!(missing.expected[0].value_hint, clap::ValueHint::AnyPath);
+
+        let consumed = probe(CommandProbeInput {
+            before: vec!["edit".into()],
+            surface: "./test1.sh".into(),
+            after: Vec::new(),
+        });
+        assert_eq!(consumed.status, CommandParseStatus::Complete);
+        assert_eq!(consumed.tear_arguments.len(), 1);
+        assert_eq!(consumed.tear_arguments[0].id, "path");
+
+        let excess = probe(CommandProbeInput {
+            before: vec!["edit".into()],
+            surface: "./test1.sh".into(),
+            after: vec!["unexpected".into()],
+        });
+        assert!(matches!(excess.status, CommandParseStatus::Rejected(_)));
+    }
+
+    #[test]
+    fn typed_builtin_probe_derives_bind_option_and_value_evidence() {
+        use brush_core::builtins::{CommandParseStatus, CommandProbeInput};
+
+        let builtins = super::box_builtins::<brush_core::extensions::DefaultShellExtensions>();
+        let probe = builtins["bind"]
+            .probe_func
+            .expect("typed bind builtin parser probe");
+
+        let gap = probe(CommandProbeInput {
+            before: vec!["bind".into()],
+            surface: String::new(),
+            after: Vec::new(),
+        });
+        assert_eq!(gap.status, CommandParseStatus::Complete);
+        let keymap_option = gap
+            .literal_continuations
+            .iter()
+            .find(|continuation| continuation.literal == "-m")
+            .expect("real parser rejected its -m continuation");
+        assert_eq!(keymap_option.argument.id, "keymap");
+        assert_eq!(keymap_option.expected.len(), 1);
+        assert_eq!(keymap_option.expected[0].id, "keymap");
+        assert_eq!(
+            keymap_option.expected[0].possible_values,
+            [
+                "emacs-standard",
+                "emacs-meta",
+                "emacs-ctlx",
+                "vi-command",
+                "vi-insert",
+            ]
+        );
+
+        let partial_value = probe(CommandProbeInput {
+            before: vec!["bind".into(), "-m".into()],
+            surface: "emacs-".into(),
+            after: Vec::new(),
+        });
+        assert_eq!(partial_value.status, CommandParseStatus::Incomplete);
+        assert_eq!(partial_value.expected[0].id, "keymap");
+
+        let concrete_value = probe(CommandProbeInput {
+            before: vec!["bind".into(), "-m".into()],
+            surface: "emacs-standard".into(),
+            after: Vec::new(),
+        });
+        assert_eq!(concrete_value.status, CommandParseStatus::Complete);
+        assert_eq!(concrete_value.tear_arguments[0].id, "keymap");
+    }
+
+    #[test]
     fn self_shadowed_bash_version_is_a_successful_compatibility_probe() {
         assert_eq!(
             super::brush_sh(&["bash".to_string(), "--version".to_string()]),

@@ -26,3 +26,4 @@
 0260-Require-complete-pathname-glob-matches.patch
 0270-Keep-embedded-recipe-exec-inside-its-shell.patch
 0280-Reset-state-across-interposed-shell-execs.patch
+0290-Expose-typed-builtin-parser-observations-at-edit-tears.patch

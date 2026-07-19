@@ -1,0 +1,334 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Sun, 19 Jul 2026 15:24:56 +0000
+Subject: [PATCH] Expose typed builtin parser observations at edit tears
+
+---
+diff --git a/src/builtins.rs b/src/builtins.rs
+index 8d79004..bc990b6 100644
+--- a/src/builtins.rs
++++ b/src/builtins.rs
+@@ -33,6 +33,64 @@ pub type CommandContentFunc =
+ /// is used to parse a builtin's arguments.
+ pub type CommandDefinitionFunc = fn() -> clap::Command;
+
++/// Input to a declarative builtin's parser probe.
++///
++/// `before` includes argv[0]. `surface` is the physical token containing the
++/// edit tear (and is empty for a tear between tokens); `after` is retained so
++/// an interactive parse can prove that a completion is compatible with the
++/// concrete suffix instead of parsing only a prefix.
++#[derive(Clone, Debug, Default, PartialEq, Eq)]
++pub struct CommandProbeInput {
++    pub before: Vec<String>,
++    pub surface: String,
++    pub after: Vec<String>,
++}
++
++/// Argument identity observed from the command's real clap parser.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct CommandArgumentEvidence {
++    pub id: String,
++    pub display: String,
++    pub help: Option<String>,
++    pub value_hint: clap::ValueHint,
++    pub possible_values: Vec<String>,
++}
++
++/// Whether the exact typed parser accepts the current input.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum CommandParseStatus {
++    Complete,
++    Incomplete,
++    Rejected(clap::error::ErrorKind),
++}
++
++/// A literal option whose insertion at the tear remains viable according to
++/// the builtin's real parser. If the option requires a value, `expected`
++/// records the argument requested by that same parse attempt.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct CommandLiteralContinuation {
++    pub literal: String,
++    pub argument: CommandArgumentEvidence,
++    pub expected: Vec<CommandArgumentEvidence>,
++}
++
++/// Evidence from probing a declarative builtin at an edit tear.
++///
++/// This is deliberately parser evidence, not a second command schema. The
++/// engine may relate the argument identity/value hint to context providers,
++/// then submit each resulting concrete candidate to this same probe again.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct CommandParseObservation {
++    pub status: CommandParseStatus,
++    pub tear_arguments: Vec<CommandArgumentEvidence>,
++    pub expected: Vec<CommandArgumentEvidence>,
++    pub literal_continuations: Vec<CommandLiteralContinuation>,
++}
++
++/// Type of a parser observation function backed by a builtin's `Command`
++/// implementation (including any `Command::new` override).
++pub type CommandProbeFunc = fn(CommandProbeInput) -> CommandParseObservation;
++
+ /// Trait implemented by built-in shell commands.
+ pub trait Command: clap::Parser {
+     /// The error type returned by the command.
+@@ -164,6 +222,9 @@ pub struct Registration<SE: extensions::ShellExtensions> {
+     /// builtin is implemented through [`Command`].
+     pub definition_func: Option<CommandDefinitionFunc>,
+
++    /// Tear-aware observation through the same typed parser used at runtime.
++    pub probe_func: Option<CommandProbeFunc>,
++
+     /// Has this registration been disabled?
+     pub disabled: bool,
+
+@@ -402,6 +463,7 @@ pub fn simple_builtin<B: SimpleCommand + Send + Sync, SE: extensions::ShellExten
+         execute_func: exec_simple_builtin::<B, SE>,
+         content_func: B::get_content,
+         definition_func: None,
++        probe_func: None,
+         disabled: false,
+         special_builtin: false,
+         external_command: false,
+@@ -416,6 +478,7 @@ pub fn builtin<B: Command + Send + Sync, SE: extensions::ShellExtensions>() -> R
+         execute_func: exec_builtin::<B, SE>,
+         content_func: get_builtin_content::<B>,
+         definition_func: Some(command_definition::<B>),
++        probe_func: Some(command_probe::<B>),
+         disabled: false,
+         special_builtin: false,
+         external_command: false,
+@@ -432,6 +495,9 @@ pub fn decl_builtin<B: DeclarationCommand + Send + Sync, SE: extensions::ShellEx
+         execute_func: exec_declaration_builtin::<B, SE>,
+         content_func: get_builtin_content::<B>,
+         definition_func: Some(command_definition::<B>),
++        // Runtime declaration parsing splits options from declaration words
++        // before invoking `B::new`; a generic argv probe would be dishonest.
++        probe_func: None,
+         disabled: false,
+         special_builtin: false,
+         external_command: false,
+@@ -454,6 +520,7 @@ pub fn raw_arg_builtin<
+         execute_func: exec_raw_arg_builtin::<B, SE>,
+         content_func: get_builtin_content::<B>,
+         definition_func: Some(command_definition::<B>),
++        probe_func: None,
+         disabled: false,
+         special_builtin: false,
+         external_command: false,
+@@ -465,6 +532,214 @@ fn command_definition<T: Command>() -> clap::Command {
+     T::command()
+ }
+
++fn context_strings(value: &clap::error::ContextValue) -> Vec<String> {
++    match value {
++        clap::error::ContextValue::String(value) => vec![value.clone()],
++        clap::error::ContextValue::Strings(values) => values.clone(),
++        clap::error::ContextValue::StyledStr(value) => vec![value.to_string()],
++        clap::error::ContextValue::StyledStrs(values) => {
++            values.iter().map(ToString::to_string).collect()
++        }
++        _ => Vec::new(),
++    }
++}
++
++fn argument_evidence(argument: &clap::Arg) -> CommandArgumentEvidence {
++    CommandArgumentEvidence {
++        id: argument.get_id().to_string(),
++        display: argument.to_string(),
++        help: argument.get_help().map(ToString::to_string),
++        value_hint: argument.get_value_hint(),
++        possible_values: argument
++            .get_value_parser()
++            .possible_values()
++            .into_iter()
++            .flatten()
++            .filter(|value| !value.is_hide_set())
++            .map(|value| value.get_name().to_owned())
++            .collect(),
++    }
++}
++
++fn expected_arguments(
++    command: &clap::Command,
++    error: &clap::Error,
++) -> Vec<CommandArgumentEvidence> {
++    let displays = error
++        .get(clap::error::ContextKind::InvalidArg)
++        .map(context_strings)
++        .unwrap_or_default();
++    let mut expected = command
++        .get_arguments()
++        .filter(|argument| {
++            displays
++                .iter()
++                .any(|display| display == &argument.to_string())
++        })
++        .map(argument_evidence)
++        .collect::<Vec<_>>();
++
++    // clap reports the finite candidates on the error itself. Preserve them
++    // even if the command's value parser synthesizes them dynamically.
++    let valid_values = error
++        .get(clap::error::ContextKind::ValidValue)
++        .map(context_strings)
++        .unwrap_or_default();
++    if !valid_values.is_empty() {
++        for argument in &mut expected {
++            argument.possible_values.clone_from(&valid_values);
++        }
++    }
++    expected
++}
++
++fn incomplete_error(error: &clap::Error, surface: &str) -> bool {
++    use clap::error::{ContextKind, ErrorKind};
++
++    match error.kind() {
++        ErrorKind::MissingRequiredArgument
++        | ErrorKind::MissingSubcommand
++        | ErrorKind::TooFewValues
++        | ErrorKind::NoEquals => true,
++        ErrorKind::WrongNumberOfValues => {
++            let number = |kind| match error.get(kind) {
++                Some(clap::error::ContextValue::Number(value)) => Some(*value),
++                _ => None,
++            };
++            match (
++                number(ContextKind::ActualNumValues),
++                number(ContextKind::ExpectedNumValues),
++            ) {
++                (Some(actual), Some(expected)) => actual < expected,
++                _ => false,
++            }
++        }
++        ErrorKind::InvalidValue => {
++            let invalid = error
++                .get(ContextKind::InvalidValue)
++                .map(context_strings)
++                .unwrap_or_default();
++            let valid = error
++                .get(ContextKind::ValidValue)
++                .map(context_strings)
++                .unwrap_or_default();
++            invalid.iter().any(|value| value.is_empty())
++                || invalid.iter().any(|value| {
++                    value == surface && valid.iter().any(|candidate| candidate.starts_with(surface))
++                })
++        }
++        _ => false,
++    }
++}
++
++fn argv_with_surface(input: &CommandProbeInput, surface: Option<&str>) -> Vec<String> {
++    let mut argv = Vec::with_capacity(input.before.len() + input.after.len() + 1);
++    argv.extend(input.before.iter().cloned());
++    if let Some(surface) = surface.filter(|surface| !surface.is_empty()) {
++        argv.push(surface.to_owned());
++    }
++    argv.extend(input.after.iter().cloned());
++    argv
++}
++
++fn typed_parse_status<T: Command>(
++    input: &CommandProbeInput,
++    surface: Option<&str>,
++    command: &clap::Command,
++) -> (CommandParseStatus, Vec<CommandArgumentEvidence>) {
++    match T::new(argv_with_surface(input, surface)) {
++        Ok(_) => (CommandParseStatus::Complete, Vec::new()),
++        Err(error) if incomplete_error(&error, surface.unwrap_or_default()) => (
++            CommandParseStatus::Incomplete,
++            expected_arguments(command, &error),
++        ),
++        Err(error) => (CommandParseStatus::Rejected(error.kind()), Vec::new()),
++    }
++}
++
++fn command_probe<T: Command>(input: CommandProbeInput) -> CommandParseObservation {
++    let mut command = T::command();
++    command.build();
++    let current_surface = (!input.surface.is_empty()).then_some(input.surface.as_str());
++    let current_argv = argv_with_surface(&input, current_surface);
++    let (status, expected) = typed_parse_status::<T>(&input, current_surface, &command);
++
++    let tear_index = input.before.len();
++    let tear_arguments = if current_surface.is_some() && status == CommandParseStatus::Complete {
++        let match_command = T::command();
++        match match_command.try_get_matches_from(current_argv) {
++            Ok(matches) => command
++                .get_arguments()
++                .filter(|argument| {
++                    matches
++                        .indices_of(argument.get_id().as_str())
++                        .is_some_and(|mut indices| indices.any(|index| index == tear_index))
++                })
++                .map(argument_evidence)
++                .collect(),
++            Err(_) => Vec::new(),
++        }
++    } else {
++        Vec::new()
++    };
++
++    // If the parser is waiting for a value at this tear, option tokens are not
++    // alternatives. Otherwise ask the real typed parser about every visible
++    // option spelling, retaining only viable insertions.
++    let literal_continuations = if status == CommandParseStatus::Incomplete && !expected.is_empty()
++    {
++        Vec::new()
++    } else {
++        let mut continuations = Vec::new();
++        for argument in command
++            .get_arguments()
++            .filter(|argument| !argument.is_hide_set() && !argument.is_positional())
++        {
++            let evidence = argument_evidence(argument);
++            let mut spellings = argument
++                .get_short_and_visible_aliases()
++                .into_iter()
++                .flatten()
++                .map(|short| format!("-{short}"))
++                .collect::<Vec<_>>();
++            spellings.extend(
++                argument
++                    .get_long_and_visible_aliases()
++                    .into_iter()
++                    .flatten()
++                    .map(|long| format!("--{long}")),
++            );
++            for literal in spellings {
++                if !literal.starts_with(&input.surface) || literal == input.surface {
++                    continue;
++                }
++                let (candidate_status, candidate_expected) =
++                    typed_parse_status::<T>(&input, Some(&literal), &command);
++                if matches!(
++                    candidate_status,
++                    CommandParseStatus::Complete | CommandParseStatus::Incomplete
++                ) {
++                    continuations.push(CommandLiteralContinuation {
++                        literal,
++                        argument: evidence.clone(),
++                        expected: candidate_expected,
++                    });
++                }
++            }
++        }
++        continuations.sort_by(|left, right| left.literal.cmp(&right.literal));
++        continuations.dedup_by(|left, right| left.literal == right.literal);
++        continuations
++    };
++
++    CommandParseObservation {
++        status,
++        tear_arguments,
++        expected,
++        literal_continuations,
++    }
++}
++
+ fn get_builtin_content<T: Command + Send + Sync>(
+     name: &str,
+     content_type: ContentType,
