@@ -51,6 +51,9 @@ WORKLOAD = r'''
 set -eu
 printf CHANGED > lower.txt
 chmod 741 lower.txt
+: > owner.txt
+chown 1234:2345 owner.txt
+[ "$(stat -c %u:%g owner.txt)" = 1234:2345 ]
 mkdir -p nested
 printf NESTED > nested/data
 ln lower.txt hardlink
@@ -135,6 +138,9 @@ def sqlar_observation(sqlar, module, work):
         sparse = database.execute(
             "SELECT sz FROM sqlar WHERE name=?", (rel("sparse"),)
         ).fetchone()
+        owner = database.execute(
+            "SELECT uid,gid FROM ownership WHERE name=?", (rel("owner.txt"),)
+        ).fetchone()
     return {
         "lower": module.sqlar_content(sqlar, rel("lower.txt")),
         "lower_mode": stat.S_IMODE(rows.get(rel("lower.txt"), 0)),
@@ -145,6 +151,7 @@ def sqlar_observation(sqlar, module, work):
         "parallel_count": module.sqlar_content(sqlar, rel("parallel-count")),
         "victim_tombstone": stat.S_ISCHR(rows.get(rel("victim.txt"), 0)),
         "sparse_size": sparse[0] if sparse else None,
+        "owner": tuple(owner) if owner else None,
         "source_absent": rel("source") not in rows,
         "lower_open_tombstone": stat.S_ISCHR(rows.get(rel("lower-open.txt"), 0)),
     }
@@ -215,6 +222,7 @@ def run_backend(backend):
             and (work / "lower-open.txt").read_bytes() == b"LOWER-OPEN"
             and (work / "victim.txt").read_bytes() == b"VICTIM"
             and not (work / "executed.txt").exists()
+            and not (work / "owner.txt").exists()
         )
         brush_command = [
             str(ENGINE_BIN), "run", "--net", "off", *backend_selector(backend),
@@ -811,6 +819,8 @@ def main():
         value = observations[backend]
         check(value["lower"] == b"CHANGED", f"{backend}: lower file copied up")
         check(value["lower_mode"] == 0o741, f"{backend}: mode captured")
+        check(value["owner"] == (1234, 2345),
+              f"{backend}: canonical uid/gid captured")
         check(value["hardlink"] == b"CHANGED", f"{backend}: hardlink content")
         check(value["moved"] == b"NESTED", f"{backend}: nested rename")
         check(value["destination"] == b"SOURCE", f"{backend}: rename-over fd lifetime")

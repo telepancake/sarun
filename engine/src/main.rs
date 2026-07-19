@@ -91,9 +91,9 @@ static TERMINATING: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn on_term(_sig: i32) {
     // Wake the blocking accept loop using only signal-safe operations.  FUSE
-    // teardown must happen on the ordinary main path: an unprivileged mount
-    // requires the fusermount helper, which cannot be spawned in a signal
-    // handler.  The old direct umount2(2)+_exit leaked every such mount.
+    // teardown must happen on the ordinary main path: the broker must release
+    // its private mount namespace and join the raw-FUSE workers. The old direct
+    // umount2(2)+_exit leaked every such mount.
     TERMINATING.store(true, Ordering::Relaxed);
     let listener = LISTENER_FOR_SIGNAL.load(Ordering::Relaxed);
     if listener >= 0 {

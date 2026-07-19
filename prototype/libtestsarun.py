@@ -23,7 +23,10 @@ import hashlib
 
 import json
 
-import magic   # python-magic; used by the file-type / struct helpers
+try:
+    import magic   # python-magic; used by the file-type / struct helpers
+except ImportError:
+    magic = None
 
 import os
 
@@ -5289,4 +5292,3 @@ def run_on_untrusted(argv, files, timeout=10, out_cap=256 * 1024, on_spawn=None)
             return (True, out_t, "")
     except Exception as e:
         return (False, "", f"sandbox error: {e}")
-

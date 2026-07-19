@@ -602,6 +602,11 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
     // UDS) per call — no in-box socket node, no host UDS, attribution implicit.
     if api_on { inner_args.push("--api"); }
     inner_args.push("--");
+    // A top-level FUSE runner is already root in the broker's complete
+    // subordinate-ID namespace. Do not ask bwrap to select a uid in that case:
+    // its rootless uid machinery would replace the complete map with a one-ID
+    // namespace.
+    let canonical_id_map = crate::fuse_broker::runner_has_canonical_id_map();
     let mut bwrap = Command::new("bwrap");
     bwrap.args(["--bind", &root_src, "/",
                 "--proc", "/proc", "--dev", "/dev",
@@ -714,10 +719,11 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
     // Unix owner representable; run the default box as its uid/gid zero and
     // retain capabilities only inside that private user namespace.  An OCI
     // image's explicit numeric User above remains authoritative.
-    if box_uid.is_none() {
+    if box_uid.is_none() && !canonical_id_map {
         bwrap.args(["--uid", "0", "--gid", "0"]);
         box_uid = Some(0);
     }
+    if box_uid.is_none() { box_uid = Some(0); }
     if box_uid == Some(0) {
         bwrap.args(["--cap-add", "ALL"]);
     }

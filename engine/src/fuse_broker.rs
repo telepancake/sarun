@@ -8,7 +8,8 @@
 //! worker thread exists; bubblewrap consequently sees the private root and
 //! ordinary ownership syscalls without an outside-in mount operation.
 
-use std::fs::File;
+use std::ffi::CString;
+use std::fs::{File, OpenOptions};
 use std::io::{self, IoSlice, IoSliceMut, Read, Write};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
@@ -26,7 +27,6 @@ use virtiofsd::filesystem::FileSystem;
 const CHILD_COMMAND: &str = "fuse-mount-broker";
 const CONTROL_FD_ENV: &str = "SARUN_FUSE_BROKER_CONTROL_FD";
 const MOUNTPOINT_ENV: &str = "SARUN_FUSE_BROKER_MOUNTPOINT";
-const FUSERMOUNT_COMM_FD: &str = "_FUSE_COMMFD";
 const RUNNER_ENTERED_ENV: &str = "SARUN_FUSE_NAMESPACE_ENTERED";
 const REQUEST_NAMESPACES: u8 = b'N';
 const REQUEST_SHUTDOWN: u8 = b'Q';
@@ -230,6 +230,16 @@ pub fn enter_runner_namespace() -> io::Result<()> {
         .map_err(io::Error::from)?;
     nix::sched::setns(mount.as_fd(), nix::sched::CloneFlags::CLONE_NEWNS)
         .map_err(io::Error::from)?;
+    // Establish the machine identity while this process is still
+    // single-threaded. Asking rootless bubblewrap to select uid 0 later would
+    // replace the complete subordinate map with a one-identity namespace.
+    // newgidmap requires setgroups=deny, so the inherited supplementary groups
+    // cannot be rewritten; their unmapped IDs confer no authority here.
+    if unsafe { libc::setresgid(0, 0, 0) } != 0
+        || unsafe { libc::setresuid(0, 0, 0) } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
     // A rootless Tap setup can deliberately self-exec after parser startup.
     // Namespace membership survives exec; this marker prevents that second
     // image from trying to setns from a child user namespace back to its
@@ -271,6 +281,11 @@ pub fn is_child_command(argv: &[String]) -> bool {
     argv.first().map(String::as_str) == Some(CHILD_COMMAND)
 }
 
+/// True after this runner joined the broker's canonical-ID user namespace.
+pub fn runner_has_canonical_id_map() -> bool {
+    std::env::var_os(RUNNER_ENTERED_ENV).is_some()
+}
+
 pub fn child_main() -> i32 {
     // The broker shares the engine's inherited process group, but its lifetime
     // is the control socket, not terminal signal delivery.  Let the engine's
@@ -306,7 +321,7 @@ fn child_run(control: &mut UnixStream) -> io::Result<()> {
     let mountpoint = std::env::var_os(MOUNTPOINT_ENV)
         .map(PathBuf::from)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing broker mountpoint"))?;
-    let device = mount_with_helper(&mountpoint)?;
+    let device = mount_direct(&mountpoint)?;
     if !mountinfo_contains(&mountpoint)? {
         return Err(io::Error::other(
             "FUSE mount was not created in broker namespace",
@@ -456,79 +471,32 @@ fn run_id_mapper(program: &str, pid: u32, arguments: Vec<String>) -> io::Result<
     }
 }
 
-fn fusermount_binary() -> String {
-    if let Some(path) = std::env::var_os("FUSERMOUNT_PATH") {
-        return path.to_string_lossy().into_owned();
-    }
-    if Command::new("fusermount3").arg("-h").output().is_ok() {
-        "fusermount3".into()
-    } else {
-        "fusermount".into()
-    }
-}
-
 /// Create the superblock in the broker's complete canonical-ID namespace.
 /// FUSE translates protocol uid/gid values through this creating namespace;
 /// the parent therefore establishes its subordinate map before this call and
 /// receives only the connection descriptor afterward.
-fn mount_with_helper(mountpoint: &Path) -> io::Result<File> {
-    let (child_socket, receive_socket) = UnixStream::pair()?;
-    let fd = child_socket.as_raw_fd();
-    let mut command = Command::new(fusermount_binary());
-    command
-        .arg("-o")
-        .arg("fsname=sarun-rs")
-        .arg("--")
-        .arg(mountpoint)
-        .env(FUSERMOUNT_COMM_FD, fd.to_string())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    // SAFETY: this closure performs only fcntl on one inherited descriptor.
-    unsafe {
-        command.pre_exec(move || {
-            let flags = libc::fcntl(fd, libc::F_GETFD);
-            if flags < 0 || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    let child = command.spawn()?;
-    drop(child_socket);
-    let device = match receive_fds(&receive_socket, 1) {
-        Ok((_, mut fds)) if fds.len() == 1 => fds.pop().unwrap(),
-        Ok((_, fds)) => {
-            drop(fds);
-            drop(receive_socket);
-            let output = child.wait_with_output()?;
-            let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-            return Err(io::Error::other(if detail.is_empty() {
-                "fusermount did not return a /dev/fuse descriptor".to_owned()
-            } else {
-                detail
-            }));
-        }
-        Err(receive_error) => {
-            drop(receive_socket);
-            let output = child.wait_with_output()?;
-            let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-            return Err(if detail.is_empty() {
-                receive_error
-            } else {
-                io::Error::other(detail)
-            });
-        }
+fn mount_direct(mountpoint: &Path) -> io::Result<File> {
+    let device = OpenOptions::new().read(true).write(true).open("/dev/fuse")?;
+    let target = CString::new(mountpoint.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput,
+                                    "FUSE mountpoint contains NUL"))?;
+    let uid = unsafe { libc::getuid() };
+    let gid = unsafe { libc::getgid() };
+    let options = CString::new(format!(
+        "fd={},rootmode=40000,user_id={uid},group_id={gid},allow_other",
+        device.as_raw_fd(),
+    )).unwrap();
+    let result = unsafe {
+        libc::mount(
+            c"sarun-rs".as_ptr(),
+            target.as_ptr(),
+            c"fuse".as_ptr(),
+            libc::MS_NOSUID | libc::MS_NODEV,
+            options.as_ptr().cast(),
+        )
     };
-    drop(receive_socket);
-    let output = child.wait_with_output()?;
-    if !output.status.success() {
-        return Err(io::Error::other(
-            String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-        ));
-    }
-    let flags = unsafe { libc::fcntl(device.as_raw_fd(), libc::F_GETFD) };
-    if flags >= 0 {
-        unsafe { libc::fcntl(device.as_raw_fd(), libc::F_SETFD, flags | libc::FD_CLOEXEC) };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
     }
     Ok(device)
 }

@@ -176,8 +176,10 @@ as executable mappings and mmap that genuinely need a host fd.
         broker with the ordinary 65,536-ID subordinate uid and gid ranges plus
         a separate extent for the caller's identity, using `newuidmap` and
         `newgidmap`. Only then does the broker create its private mount
-        namespace and invoke `fusermount3`, returning the connection descriptor
-        to the engine. Protocol and database IDs consequently stay canonical;
+        namespace and directly mount the already-open `/dev/fuse` descriptor,
+        returning that descriptor to the engine. A setuid mount helper is both
+        unnecessary and unable to operate after this rootless namespace
+        transition. Protocol and database IDs consequently stay canonical;
         no host-ID normalization exists. Startup fails with the missing
         `uidmap` or `/etc/subuid`/`/etc/subgid` prerequisite instead of exposing
         a filesystem with false ownership semantics. Ordinary machine boxes
@@ -1090,17 +1092,21 @@ as executable mappings and mmap that genuinely need a host fd.
           and `/proc/self/uid_map` contained only the developer's one identity:
           the kernel rejected the unmapped owner before dispatching FUSE. The
           repaired broker uses the subordinate-ID topology described above and
-          mounts only after its map exists. The static aarch64 production build
-          and all 48 Kati library tests pass. A root-owned live namespace gate
-          additionally runs the new binary as namespace root, changes an
-          overlay file to uid 1234/gid 2345, reads those exact IDs back, finds
-          the canonical pair in `ownership`, passes SQLite `quick_check`, and
-          proves no lower file escaped. The unprivileged live/OpenWrt replay is
-          now gated on installing `uidmap` and provisioning this host's absent
-          `/etc/subuid` and `/etc/subgid` ranges; startup reports that prerequisite
-          directly. After provisioning, the next gate is the exact ownership
-          fixture and resumed clean `world -j10`, followed by artifact,
-          provenance, trace, and lower-layer-isolation validation.
+          mounts only after its map exists. Captured `chown` now mutates only
+          the canonical ownership side table: the old redundant attempt to
+          `lchown` a private blob on the host superblock failed correctly for
+          namespace root and contradicted the projected-metadata design. The
+          unprivileged production binary now enters the real box as uid/gid 0,
+          exposes the complete 65,536-ID maps, changes an overlay file to uid
+          1234/gid 2345, reads those exact IDs back, records that pair in
+          `ownership`, passes SQLite `quick_check`, and proves no lower file
+          escaped. The portable backend-equivalence suite now makes that exact
+          chown/readback/database/no-escape sequence a regression and passes on
+          native aarch64 FUSE, aarch64 QEMU, and cross-architecture x86_64 QEMU,
+          including nested and lifecycle gates. The static aarch64 production
+          build and all 48 Kati library tests pass. The next gate is the resumed
+          clean `world -j10`, followed by artifact, provenance, trace, and
+          lower-layer-isolation validation.
           Earlier nonfatal empty-operand arithmetic and generated-config `sed`
           diagnostics stay recorded for attribution rather than normalization.
     - [x] Complete the native-aarch64 FUSE Brush gate from a clean output tree.

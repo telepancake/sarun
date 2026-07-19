@@ -2513,14 +2513,12 @@ impl SarunFs {
             {
                 self.copy_up(&b, &rel, pid).map_err(|_| Errno::EIO)?;
             }
-            if let Layer::UpperFile { rowid, .. } = self.layer(&b, &rel) {
-                self.ensure_upper_blob(box_id, rowid, &rel);
-                let path = CString::new(blob_path(box_id, rowid).as_os_str().as_encoded_bytes())
-                    .map_err(|_| Errno::EINVAL)?;
-                if unsafe { libc::lchown(path.as_ptr(), uid, gid) } != 0 {
-                    return Err(Errno::from(std::io::Error::last_os_error()));
-                }
-            } else if matches!(self.layer(&b, &rel), Layer::Absent) {
+            // Captured ownership is protocol metadata, not backing-store
+            // ownership. The blob lives on a host superblock where namespace
+            // root has no authority to chown it, and no guest accesses that
+            // blob except through this projection. Persist the canonical IDs
+            // in the ownership side table below.
+            if matches!(self.layer(&b, &rel), Layer::Absent) {
                 return Err(Errno::ENOENT);
             }
             self.inner

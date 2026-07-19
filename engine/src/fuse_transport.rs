@@ -222,7 +222,7 @@ fn clone_device(source: &File) -> io::Result<File> {
         .open("/dev/fuse")?;
     let mut source_fd = source.as_raw_fd() as u32;
     // SAFETY: `clone` is a fresh /dev/fuse fd and source_fd names the mounted
-    // connection returned by fusermount.
+    // connection returned by the private mount broker.
     unsafe { fuse_dev_ioc_clone(clone.as_raw_fd(), &mut source_fd)? };
     Ok(clone)
 }
