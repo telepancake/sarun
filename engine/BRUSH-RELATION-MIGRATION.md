@@ -296,6 +296,12 @@ Implementation order:
    [ ] Capture `command_words` as separate spanned symbolic command/argument
        fields, make quote/escape cooking grammar-owned, and replace the
        temporary flat source binding with that `argv_source`.
+       [x] The generic AST adapter can now project repeated named fields as
+           `symbolic_word(Span, Fragments)`. Every literal, reference, tear,
+           or opaque fragment retains its source identity, physical UTF-8 byte
+           span, and grammar-declared attributes such as quote mode. References
+           also carry their exact use identity. The remaining work is to make
+           Brush declare the projection and replace the flat adapter input.
 3. [ ] Cut those two builtins to execute the typed invocation returned by that
        same exact parser, then delete their generated `CommandSyntax` copies.
 4. [ ] Adapt one simple uutils parser/executor split (`cat`), then one embedded

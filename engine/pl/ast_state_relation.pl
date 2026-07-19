@@ -51,9 +51,14 @@ valid_capture_selector(field_text_or_hole(Name)) :- atom(Name).
 valid_capture_selector(field_symbolic_text(Name, Rules)) :-
     atom(Name),
     valid_text_projection_rules(Rules).
-valid_capture_selector(fields_symbolic_text(Name, Rules)) :-
+valid_capture_selector(field_symbolic_word(Name, Rules, Attributes)) :-
     atom(Name),
-    valid_text_projection_rules(Rules).
+    valid_fragment_projection_rules(Rules),
+    ground(Attributes), proper_list(Attributes).
+valid_capture_selector(fields_symbolic_words(Name, Rules, Attributes)) :-
+    atom(Name),
+    valid_fragment_projection_rules(Rules),
+    ground(Attributes), proper_list(Attributes).
 valid_capture_selector(node_symbolic_text(Rules)) :-
     valid_text_projection_rules(Rules).
 
@@ -73,6 +78,34 @@ valid_text_projection_strategy(children).
 valid_text_projection_strategy(children_else_source).
 valid_text_projection_strategy(reference(Domain, field_text(Name))) :-
     ground(Domain), atom(Name).
+
+valid_fragment_projection_rules(Rules) :-
+    proper_list(Rules),
+    valid_fragment_projection_rules(Rules, []).
+
+valid_fragment_projection_rules([], _).
+valid_fragment_projection_rules(
+    [fragment_rule(node(Name), Strategy)|Rules], Seen) :-
+    atom(Name),
+    \+ member_eq(Name, Seen),
+    valid_fragment_projection_strategy(Strategy),
+    valid_fragment_projection_rules(Rules, [Name|Seen]).
+
+valid_fragment_projection_strategy(emit(source, Kind, Attributes)) :-
+    ground(Kind), ground(Attributes), proper_list(Attributes).
+valid_fragment_projection_strategy(
+    emit(field_text(Name), Kind, Attributes)) :-
+    atom(Name), ground(Kind), ground(Attributes), proper_list(Attributes).
+valid_fragment_projection_strategy(descend(Attributes)) :-
+    ground(Attributes), proper_list(Attributes).
+valid_fragment_projection_strategy(
+    descend_else_emit(source, Kind, Attributes)) :-
+    ground(Kind), ground(Attributes), proper_list(Attributes).
+valid_fragment_projection_strategy(
+    emit_reference(Domain, field_text(Name), Attributes)) :-
+    ground(Domain), atom(Name), ground(Attributes), proper_list(Attributes).
+valid_fragment_projection_strategy(emit_opaque(source, Form, Attributes)) :-
+    ground(Form), ground(Attributes), proper_list(Attributes).
 
 derive_ast_state_steps(Rules, Ast, Source, Steps) :-
     valid_ast_state_rules(Rules),
@@ -140,12 +173,19 @@ capture_value(field_text_or_hole(Name), _, Value, Source, Text) :-
 capture_value(field_symbolic_text(Name, Rules), _, Value, Source, Text) :-
     node_field(Name, Value, _, FieldValue),
     project_symbolic_text(FieldValue, Source, Rules, Text).
-capture_value(fields_symbolic_text(Name, Rules), _, Value, Source, Texts) :-
-    findall(Text,
-            ( node_field_value(Name, Value, FieldValue),
-              project_symbolic_text(FieldValue, Source, Rules, Text)
+capture_value(field_symbolic_word(Name, Rules, Attributes), _, Value, Source,
+              symbolic_word(Span, Fragments)) :-
+    node_field(Name, Value, Span, FieldValue),
+    project_symbolic_fragments(FieldValue, Source, Rules, Attributes,
+                               Fragments).
+capture_value(fields_symbolic_words(Name, Rules, Attributes), _, Value,
+              Source, Words) :-
+    findall(symbolic_word(Span, Fragments),
+            ( node_field_span_value(Name, Value, Span, FieldValue),
+              project_symbolic_fragments(FieldValue, Source, Rules,
+                                         Attributes, Fragments)
             ),
-            Texts).
+            Words).
 capture_value(node_symbolic_text(Rules), _, Value, Source, Text) :-
     project_symbolic_text(Value, Source, Rules, Text).
 
@@ -199,6 +239,96 @@ normalize_text_segments([Text, Next|Segments], Normalized) :-
 normalize_text_segments([Segment|Segments], [Segment|Normalized]) :-
     normalize_text_segments(Segments, Normalized).
 
+project_symbolic_fragments(Value, Source, Rules, Attributes, Fragments) :-
+    source_identity(Source, SourceId),
+    project_fragments(Value, Source, SourceId, Rules, Attributes, Fragments).
+
+project_fragments(hole(EditId, Span, Surface, Codec), _, SourceId, _,
+                  Attributes,
+                  [fragment(tear, origin(SourceId, Span, Attributes),
+                            edit_tear(EditId, Surface, Codec))]) :- !.
+project_fragments(node(Name, Span, Value), Source, SourceId, Rules,
+                  Attributes, Fragments) :- !,
+    fragment_projection_strategy(Name, Rules, Strategy),
+    project_node_fragments(Strategy, Name, Span, Value, Source, SourceId,
+                           Rules, Attributes, Fragments).
+project_fragments(Value, Source, SourceId, Rules, Attributes, Fragments) :-
+    compound(Value), !,
+    Value =.. [_|Arguments],
+    project_fragment_arguments(Arguments, Source, SourceId, Rules,
+                               Attributes, Fragments).
+project_fragments(_, _, _, _, _, []).
+
+fragment_projection_strategy(Name,
+    [fragment_rule(node(Name), Strategy)|_], Strategy) :- !.
+fragment_projection_strategy(Name, [_|Rules], Strategy) :-
+    fragment_projection_strategy(Name, Rules, Strategy).
+fragment_projection_strategy(_, [], descend([])).
+
+project_node_fragments(emit(source, Kind, Added), _, Span, _, Source,
+                       SourceId, _, Attributes,
+                       [fragment(Kind, origin(SourceId, Span, Merged),
+                                 utf8(Text))]) :-
+    overlay_attributes(Attributes, Added, Merged),
+    source_span_text(Source, Span, Text).
+project_node_fragments(emit(field_text(Field), Kind, Added), _, Span, Value,
+                       Source, SourceId, _, Attributes,
+                       [fragment(Kind, origin(SourceId, Span, Merged),
+                                 utf8(Text))]) :-
+    node_field(Field, Value, FieldSpan, _),
+    overlay_attributes(Attributes, Added, Merged),
+    source_span_text(Source, FieldSpan, Text).
+project_node_fragments(descend(Added), _, _, Value, Source, SourceId, Rules,
+                       Attributes, Fragments) :-
+    overlay_attributes(Attributes, Added, Merged),
+    project_fragments(Value, Source, SourceId, Rules, Merged, Fragments).
+project_node_fragments(descend_else_emit(source, Kind, Added), _, Span, Value,
+                       Source, SourceId, Rules, Attributes, Fragments) :-
+    overlay_attributes(Attributes, Added, Merged),
+    project_fragments(Value, Source, SourceId, Rules, Merged, Children),
+    ( Children = []
+    -> source_span_text(Source, Span, Text),
+       Fragments = [fragment(Kind, origin(SourceId, Span, Merged),
+                             utf8(Text))]
+    ;  Fragments = Children
+    ).
+project_node_fragments(
+    emit_reference(Domain, field_text(Field), Added), Name, Span, Value,
+    Source, SourceId, _, Attributes,
+    [fragment(reference, origin(SourceId, Span, Merged),
+              state_ref(node_ref(Name, Span), Domain, Text))]) :-
+    node_field(Field, Value, FieldSpan, _),
+    overlay_attributes(Attributes, Added, Merged),
+    source_span_text(Source, FieldSpan, Text).
+project_node_fragments(emit_opaque(source, Form, Added), _, Span, _, Source,
+                       SourceId, _, Attributes,
+                       [fragment(opaque, origin(SourceId, Span, Merged),
+                                 opaque(Form, Text))]) :-
+    overlay_attributes(Attributes, Added, Merged),
+    source_span_text(Source, Span, Text).
+
+project_fragment_arguments([], _, _, _, _, []).
+project_fragment_arguments([Value|Values], Source, SourceId, Rules,
+                           Attributes, Fragments) :-
+    project_fragments(Value, Source, SourceId, Rules, Attributes, First),
+    project_fragment_arguments(Values, Source, SourceId, Rules, Attributes,
+                               Rest),
+    append(First, Rest, Fragments).
+
+overlay_attributes(Attributes, [], Attributes).
+overlay_attributes(Attributes, [Attribute|Added], Merged) :-
+    Attribute =.. [Key|_],
+    remove_attribute(Key, Attributes, Rest),
+    overlay_attributes(Rest, Added, Tail),
+    Merged = [Attribute|Tail].
+
+remove_attribute(_, [], []).
+remove_attribute(Key, [Attribute|Attributes], Rest) :-
+    compound(Attribute), Attribute =.. [Key|_], !,
+    remove_attribute(Key, Attributes, Rest).
+remove_attribute(Key, [Attribute|Attributes], [Attribute|Rest]) :-
+    remove_attribute(Key, Attributes, Rest).
+
 % Fields are searched within the current named node, but never through a child
 % named node.  A field wrapping a child node is still visible at its owner.
 node_field(Name, field(Name, Span, Value), Span, Value) :- !.
@@ -213,17 +343,17 @@ node_field_arguments(Name, [Value|_], Span, FieldValue) :-
 node_field_arguments(Name, [_|Values], Span, FieldValue) :-
     node_field_arguments(Name, Values, Span, FieldValue).
 
-node_field_value(Name, field(Name, _, Value), Value) :- !.
-node_field_value(_, node(_, _, _), _) :- !, fail.
-node_field_value(Name, Value, FieldValue) :-
+node_field_span_value(Name, field(Name, Span, Value), Span, Value).
+node_field_span_value(_, node(_, _, _), _, _) :- !, fail.
+node_field_span_value(Name, Value, Span, FieldValue) :-
     compound(Value),
     Value =.. [_|Arguments],
-    node_field_value_arguments(Name, Arguments, FieldValue).
+    node_field_span_value_arguments(Name, Arguments, Span, FieldValue).
 
-node_field_value_arguments(Name, [Value|_], FieldValue) :-
-    node_field_value(Name, Value, FieldValue).
-node_field_value_arguments(Name, [_|Values], FieldValue) :-
-    node_field_value_arguments(Name, Values, FieldValue).
+node_field_span_value_arguments(Name, [Value|_], Span, FieldValue) :-
+    node_field_span_value(Name, Value, Span, FieldValue).
+node_field_span_value_arguments(Name, [_|Values], Span, FieldValue) :-
+    node_field_span_value_arguments(Name, Values, Span, FieldValue).
 
 instantiate_templates([], _, _, []).
 instantiate_templates([Template|Templates], Captures, NodeIdentity,
@@ -288,6 +418,9 @@ tree_edit_hole_arguments([_|Values], Hole) :-
 
 source_text(text_source(Text, _, _), Text) :- string(Text).
 source_text(Text, Text) :- string(Text).
+
+source_identity(text_source(_, _, Origin), Origin) :- ground(Origin), !.
+source_identity(_, source).
 
 byte_character_offset(Text, TargetByte, Character) :-
     byte_character_offset(Text, TargetByte, 1, 0, 0, Character).

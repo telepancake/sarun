@@ -6,6 +6,7 @@
 test_name(fields_emit_ordered_state_steps_from_utf8_source).
 test_name(before_and_after_emissions_wrap_child_nodes).
 test_name(symbolic_text_projection_is_declarative_ast_glue).
+test_name(symbolic_words_keep_fragment_origins_and_utf8_spans).
 
 run_ast_state_relation_tests :-
     findall(Name, test_name(Name), Names),
@@ -92,3 +93,68 @@ run_test(symbolic_text_projection_is_declarative_ast_glue) :-
         [define(variable, "A",
                 text(["x", reference(variable, "B"), Hole, "y"]),
                 escaping, replace)]).
+
+run_test(symbolic_words_keep_fragment_origins_and_utf8_spans) :-
+    Hole = hole(edit, span(12, 12), "", any),
+    Ast = node(command_words, span(0, 13),
+               sequence([
+                   field(command, span(0, 4),
+                         node(word, span(0, 4),
+                              node(raw_text, span(0, 4), ignored))),
+                   field(argument, span(5, 7),
+                         node(word, span(5, 7),
+                              node(raw_text, span(5, 7), ignored))),
+                   field(argument, span(7, 9),
+                         node(word, span(7, 9),
+                              node(parameter, span(7, 9),
+                                   field(name, span(8, 9), ignored)))),
+                   field(argument, span(10, 13),
+                         node(word, span(10, 13),
+                              node(quoted, span(10, 13),
+                                   sequence([
+                                       node(raw_text, span(11, 12), ignored),
+                                       Hole
+                                   ]))))
+               ])),
+    FragmentRules = [
+        fragment_rule(node(raw_text), emit(source, literal, [])),
+        fragment_rule(node(quoted), descend([quote(double)])),
+        fragment_rule(node(parameter),
+                      emit_reference(variable, field_text(name), []))],
+    Rules = [state_rule(
+                 node(command_words),
+                 [capture(command,
+                          field_symbolic_word(
+                              command, FragmentRules, [quote(unquoted)])),
+                  capture(arguments,
+                          fields_symbolic_words(
+                              argument, FragmentRules, [quote(unquoted)]))],
+                 before([]),
+                 after([argv(slot(command), slot(arguments))]))],
+    derive_ast_state_steps(
+        Rules, Ast,
+        text_source("tool α$B \"x\"", assist(edit, span(12, 12)), fixture),
+        [argv(symbolic_word(
+                  span(0, 4),
+                  [fragment(literal,
+                            origin(fixture, span(0, 4), [quote(unquoted)]),
+                            utf8("tool"))]),
+              [symbolic_word(
+                   span(5, 7),
+                   [fragment(literal,
+                             origin(fixture, span(5, 7), [quote(unquoted)]),
+                             utf8("α"))]),
+               symbolic_word(
+                   span(7, 9),
+                   [fragment(reference,
+                             origin(fixture, span(7, 9), [quote(unquoted)]),
+                             state_ref(node_ref(parameter, span(7, 9)),
+                                       variable, "B"))]),
+               symbolic_word(
+                   span(10, 13),
+                   [fragment(literal,
+                             origin(fixture, span(11, 12), [quote(double)]),
+                             utf8("x")),
+                    fragment(tear,
+                             origin(fixture, span(12, 12), [quote(double)]),
+                             edit_tear(edit, "", any))])])]).
