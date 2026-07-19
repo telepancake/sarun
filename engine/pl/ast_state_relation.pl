@@ -176,14 +176,14 @@ capture_value(field_symbolic_text(Name, Rules), _, Value, Source, Text) :-
 capture_value(field_symbolic_word(Name, Rules, Attributes), _, Value, Source,
               symbolic_word(Span, Fragments)) :-
     node_field(Name, Value, Span, FieldValue),
-    project_symbolic_fragments(FieldValue, Source, Rules, Attributes,
-                               Fragments).
+    project_symbolic_word(Span, FieldValue, Source, Rules, Attributes,
+                          Fragments).
 capture_value(fields_symbolic_words(Name, Rules, Attributes), _, Value,
               Source, Words) :-
     findall(symbolic_word(Span, Fragments),
             ( node_field_span_value(Name, Value, Span, FieldValue),
-              project_symbolic_fragments(FieldValue, Source, Rules,
-                                         Attributes, Fragments)
+              project_symbolic_word(Span, FieldValue, Source, Rules,
+                                    Attributes, Fragments)
             ),
             Words).
 capture_value(node_symbolic_text(Rules), _, Value, Source, Text) :-
@@ -241,7 +241,80 @@ normalize_text_segments([Segment|Segments], [Segment|Normalized]) :-
 
 project_symbolic_fragments(Value, Source, Rules, Attributes, Fragments) :-
     source_identity(Source, SourceId),
-    project_fragments(Value, Source, SourceId, Rules, Attributes, Fragments).
+    project_fragments(Value, Source, SourceId, Rules, Attributes, RawFragments),
+    normalize_symbolic_fragments(RawFragments, Fragments).
+
+project_symbolic_word(Span, Value, Source, Rules, Attributes, Fragments) :-
+    project_symbolic_fragments(Value, Source, Rules, Attributes, Projected),
+    ( contains_tear_fragment(Projected)
+    -> Fragments = Projected
+    ;  source_edit_tear(Source, Span, Tear),
+       insert_source_tear(Projected, Span, Tear, Fragments)
+    -> true
+    ;  Fragments = Projected
+    ).
+
+contains_tear_fragment([fragment(tear, _, _)|_]) :- !.
+contains_tear_fragment([_|Fragments]) :-
+    contains_tear_fragment(Fragments).
+
+source_edit_tear(
+    text_source(Text, assist(EditId, span(Start, End)), Origin),
+    span(WordStart, WordEnd),
+    fragment(tear, origin(Origin, span(Start, End), source_edit),
+             edit_tear(EditId, Surface, source_edit))) :-
+    WordStart =< Start, Start =< End, End =< WordEnd,
+    source_span_text(Text, span(Start, End), Surface).
+source_edit_tear(
+    text_source(Text,
+                assist(EditId, span(_, _), replace_span(Start, End)),
+                Origin),
+    span(WordStart, WordEnd),
+    fragment(tear, origin(Origin, span(Start, End), source_edit),
+             edit_tear(EditId, Surface, source_edit))) :-
+    WordStart =< Start, Start =< End, End =< WordEnd,
+    source_span_text(Text, span(Start, End), Surface).
+
+insert_source_tear([], span(Start, End), Tear, [Tear]) :-
+    Tear = fragment(tear, origin(_, span(Start, End), _), _).
+insert_source_tear(
+    [fragment(literal, origin(Source, span(Start, End), Attributes),
+              utf8(Text))|Fragments],
+    _,
+    Tear,
+    Result) :-
+    Tear = fragment(tear, origin(_, span(TearStart, TearEnd), _), _),
+    Start =< TearStart, TearStart =< TearEnd, TearEnd =< End,
+    !,
+    source_literal_piece(Source, Attributes, Text, span(Start, End),
+                         span(Start, TearStart), Prefix),
+    source_literal_piece(Source, Attributes, Text, span(Start, End),
+                         span(TearEnd, End), Suffix),
+    optional_fragment(Prefix, Prefixes),
+    optional_fragment(Suffix, Suffixes),
+    append(Prefixes, [Tear|Suffixes], First),
+    append(First, Fragments, Result).
+insert_source_tear([Fragment|Fragments], WordSpan, Tear,
+                   [Fragment|Result]) :-
+    insert_source_tear(Fragments, WordSpan, Tear, Result).
+
+source_literal_piece(Source, Attributes, Text, span(WholeStart, WholeEnd),
+                     span(Start, End),
+                     fragment(literal,
+                              origin(Source, span(Start, End), Attributes),
+                              utf8(Piece))) :-
+    WholeStart =< Start, Start =< End, End =< WholeEnd,
+    PrefixBytes is Start - WholeStart,
+    PieceBytes is End - Start,
+    EndBytes is PrefixBytes + PieceBytes,
+    byte_character_offset(Text, PrefixBytes, CharacterStart),
+    byte_character_offset(Text, EndBytes, CharacterEnd),
+    CharacterLength is CharacterEnd - CharacterStart,
+    sub_string(Text, CharacterStart, CharacterLength, _, Piece).
+
+optional_fragment(fragment(literal, origin(_, span(Start, Start), _),
+                           utf8("")), []) :- !.
+optional_fragment(Fragment, [Fragment]).
 
 project_fragments(hole(EditId, Span, Surface, Codec), _, SourceId, _,
                   Attributes,
@@ -314,6 +387,21 @@ project_fragment_arguments([Value|Values], Source, SourceId, Rules,
     project_fragment_arguments(Values, Source, SourceId, Rules, Attributes,
                                Rest),
     append(First, Rest, Fragments).
+
+normalize_symbolic_fragments([], []).
+normalize_symbolic_fragments([
+    fragment(literal, origin(Source, span(Start, Middle), Attributes),
+             utf8(First)),
+    fragment(literal, origin(Source, span(Middle, End), Attributes),
+             utf8(Second))|Fragments], Normalized) :-
+    string(First), string(Second), !,
+    string_concat(First, Second, Combined),
+    normalize_symbolic_fragments([
+        fragment(literal, origin(Source, span(Start, End), Attributes),
+                 utf8(Combined))|Fragments], Normalized).
+normalize_symbolic_fragments([Fragment|Fragments],
+                             [Fragment|Normalized]) :-
+    normalize_symbolic_fragments(Fragments, Normalized).
 
 overlay_attributes(Attributes, [], Attributes).
 overlay_attributes(Attributes, [Attribute|Added], Merged) :-

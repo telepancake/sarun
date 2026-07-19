@@ -921,7 +921,7 @@ run_test(registered_relation_uses_explicit_revisioned_query) :-
     limits(Limits),
     Given = [binding(source, text_source("bind -m e", exact, brush_text))],
     Wanted = [status, completions],
-    Id = registered_relation_call(brush_clap),
+    Id = registered_relation_call(brush_clap, Request),
     Request = relation_request(Given, Wanted, [], Limits),
     Query = ask(one, registered_relation(brush_clap), where(Request)),
     transform(
@@ -954,8 +954,8 @@ run_test(registered_relation_replays_with_explicit_context_observations) :-
     Key = registered_relation(Handle),
     Given = [binding(source, text_source("edit ./t", exact, brush_text))],
     Wanted = [status, completions],
-    HostId = registered_relation_call(Handle),
     Request0 = relation_request(Given, Wanted, [], Limits),
+    HostId0 = registered_relation_call(Handle, Request0),
     HostQuery0 = ask(one, registered_relation(Handle), where(Request0)),
     PathId = path_candidates,
     PathQuery = ask(all, filesystem_path, prefix("./t")),
@@ -964,14 +964,14 @@ run_test(registered_relation_replays_with_explicit_context_observations) :-
                        parser_result(Handle, 1), ["result"],
                        result(PendingReply), [Request0]),
     HostObservation0 = observed(
-        HostId, HostQuery0, source(brush_clap, revision(1)),
+        HostId0, HostQuery0, source(brush_clap, revision(1)),
         some(one(HostEntry0))),
     ScopedPathId = branch(Key, PathId),
     transform(
         request(registered_relation(Handle), given(Given), want(Wanted),
                 observations([HostObservation0]), Limits),
         reply([], [query(ScopedPathId, PathQuery)],
-              [dependency(HostId, HostQuery0, some(one(HostEntry0)))], [])),
+              [dependency(HostId0, HostQuery0, some(one(HostEntry0)))], [])),
     PathEntry = entry(filesystem_path, file_1, ["./test1.sh"],
                       filesystem_path("/tmp/test1.sh"), [file]),
     ScopedPathObservation = observed(
@@ -981,12 +981,13 @@ run_test(registered_relation_replays_with_explicit_context_observations) :-
         PathId, PathQuery, some(all([PathEntry]))),
     Request1 = relation_request(Given, Wanted, [AdapterPathObservation],
                                 Limits),
+    HostId1 = registered_relation_call(Handle, Request1),
     HostQuery1 = ask(one, registered_relation(Handle), where(Request1)),
     transform(
         request(registered_relation(Handle), given(Given), want(Wanted),
                 observations([HostObservation0, ScopedPathObservation]),
                 Limits),
-        reply([], [query(HostId, HostQuery1)],
+        reply([], [query(HostId1, HostQuery1)],
               [dependency(ScopedPathId, PathQuery,
                           some(all([PathEntry])))], [])),
     Completion = completion(span(5, 8), "./test1.sh",
@@ -1001,7 +1002,7 @@ run_test(registered_relation_replays_with_explicit_context_observations) :-
                        parser_result(Handle, 1), ["result"],
                        result(CompleteReply), [Request1]),
     HostObservation1 = observed(
-        HostId, HostQuery1, source(brush_clap, revision(1)),
+        HostId1, HostQuery1, source(brush_clap, revision(1)),
         some(one(HostEntry1))),
     transform(
         request(registered_relation(Handle), given(Given), want(Wanted),
@@ -1014,7 +1015,7 @@ run_test(registered_relation_replays_with_explicit_context_observations) :-
         dependency(ScopedPathId, PathQuery, some(all([PathEntry]))),
         Dependencies),
     list_contains(
-        dependency(HostId, HostQuery1, some(one(HostEntry1))),
+        dependency(HostId1, HostQuery1, some(one(HostEntry1))),
         Dependencies).
 
 run_test(envelope_fails_closed) :-

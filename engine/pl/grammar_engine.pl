@@ -110,7 +110,7 @@ transform_relation(registered_relation(Handle), Given, Wanted, Observations,
     scoped_observations(Key, Observations, AdapterObservations),
     observation_dependency_keys(AdapterObservations, AdapterInputs),
     Request = relation_request(Given, Wanted, AdapterInputs, Limits),
-    Id = registered_relation_call(Handle),
+    Id = registered_relation_call(Handle, Request),
     Query = ask(one, registered_relation(Handle), where(Request)),
     Graph = [query(Id, Query)],
     project_observations(Graph, Observations, HostObservations),
@@ -404,15 +404,16 @@ state_application_reply(
     Limits,
     Reply) :-
     Key = state_application(Id),
+    resolve_application_grammar(Grammar, Given, ApplicationGrammar),
     application_binding_names(ApplicationTemplates, ApplicationNames),
     proper_atom_names(ApplicationNames),
     all_unique_terms(ApplicationNames),
-    materialize_application_bindings(ApplicationTemplates, State, Key,
+    materialize_application_bindings(ApplicationTemplates, State,
+                                     Observations, Key,
                                      ApplicationBindings),
-    bindings_without_names(Given, ApplicationNames, InheritedGiven),
-    merge_bindings(InheritedGiven, ApplicationBindings, ApplicationGiven),
+    ApplicationGiven = ApplicationBindings,
     scoped_observations(Key, Observations, ApplicationObservations),
-    ( transform_relation(Grammar, ApplicationGiven, [completions],
+    ( transform_relation(ApplicationGrammar, ApplicationGiven, [completions],
                          ApplicationObservations, Limits, InnerReply)
     -> scope_reply(Key, 0, InnerReply, Reply)
     ;  Reply = reply([], [], [], [])
@@ -420,31 +421,42 @@ state_application_reply(
     !.
 state_application_reply(_, _, _, _, reply([], [], [], [])).
 
+resolve_application_grammar(given_grammar(Name), Given, Grammar) :-
+    atom(Name),
+    given_value(Name, Given, Reference),
+    resolve_grammar(Reference, Grammar).
+resolve_application_grammar(Reference, _, Grammar) :-
+    Reference \= given_grammar(_),
+    resolve_grammar(Reference, Grammar).
+
 application_binding_names([], []).
 application_binding_names([binding(Name, _)|Bindings], [Name|Names]) :-
     application_binding_names(Bindings, Names).
 
-materialize_application_bindings([], _, _, []).
+materialize_application_bindings([], _, _, _, []).
 materialize_application_bindings(
-    [binding(Name, state_text_source(Expression))|Bindings], State, Origin,
+    [binding(Name, state_text_source(Expression))|Bindings], State,
+    Observations, Origin,
     [binding(Name, Source)|Materialized]) :-
     atom(Name),
     symbolic_text_source(Expression, State, Origin, Source),
-    materialize_application_bindings(Bindings, State, Origin, Materialized).
+    materialize_application_bindings(Bindings, State, Observations, Origin,
+                                     Materialized).
 
 materialize_application_bindings(
-    [binding(Name, Value)|Bindings], State, Origin,
+    [binding(Name, state_resolved(Value))|Bindings], State, Observations,
+    Origin, [binding(Name, Resolved)|Materialized]) :-
+    atom(Name),
+    resolve_state_value(Value, State, Observations, Resolved),
+    materialize_application_bindings(Bindings, State, Observations, Origin,
+                                     Materialized).
+
+materialize_application_bindings(
+    [binding(Name, Value)|Bindings], State, Observations, Origin,
     [binding(Name, Value)|Materialized]) :-
     atom(Name), ground(Value),
-    materialize_application_bindings(Bindings, State, Origin, Materialized).
-
-bindings_without_names([], _, []).
-bindings_without_names([binding(Name, _)|Bindings], Names, Rest) :-
-    member_term(Name, Names),
-    !,
-    bindings_without_names(Bindings, Names, Rest).
-bindings_without_names([Binding|Bindings], Names, [Binding|Rest]) :-
-    bindings_without_names(Bindings, Names, Rest).
+    materialize_application_bindings(Bindings, State, Observations, Origin,
+                                     Materialized).
 
 reply_completion_pairs(reply(Solutions, _, _, _), Pairs) :-
     findall(Pair,

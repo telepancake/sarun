@@ -439,6 +439,7 @@ pub struct Prolog {
 
 impl Prolog {
     pub fn new() -> Result<Self, String> {
+        crate::brush::probe_relation::register()?;
         match ACTIVE.compare_exchange(INACTIVE, RUNNING, Ordering::AcqRel, Ordering::Acquire) {
             Ok(_) => {}
             Err(RUNNING) => return Err("a Prolog runtime is already active".into()),
@@ -3316,15 +3317,21 @@ mod tests {
 
     #[test]
     fn production_brush_document_api_returns_combined_analysis() {
-        let analysis = analyze_brush_document(&BrushDocumentRequest {
-            source: "x=123; echo $x".into(),
-            assist: None,
-            initial_bindings: vec![],
-            observations: vec![],
-        })
+        let analysis = crate::parser::analyze_brush_document_resolved(
+            &BrushDocumentRequest {
+                source: "x=123; echo $x".into(),
+                assist: None,
+                initial_bindings: vec![],
+                observations: vec![],
+            },
+            &crate::parser::FilesystemContext::new(std::path::Path::new(".")),
+        )
         .unwrap();
         assert!(analysis.context_queries.is_empty());
-        assert!(analysis.dependency_keys.is_empty());
+        assert!(analysis.dependency_keys.iter().any(|dependency| {
+            dependency.query.domain
+                == rv_compound("registered_relation", vec![rv_atom("brush_typed_builtins")])
+        }));
         assert_eq!(analysis.candidates.len(), 1);
         let candidate = &analysis.candidates[0];
         assert_eq!(candidate.status, ParseStatus::Complete);
@@ -3342,12 +3349,15 @@ mod tests {
             }]
         );
 
-        let assist = analyze_brush_document(&BrushDocumentRequest {
-            source: "echo hi)".into(),
-            assist: Some(Span { start: 0, end: 0 }),
-            initial_bindings: vec![],
-            observations: vec![],
-        })
+        let assist = crate::parser::analyze_brush_document_resolved(
+            &BrushDocumentRequest {
+                source: "echo hi)".into(),
+                assist: Some(Span { start: 0, end: 0 }),
+                initial_bindings: vec![],
+                observations: vec![],
+            },
+            &crate::parser::FilesystemContext::new(std::path::Path::new(".")),
+        )
         .unwrap();
         assert_eq!(assist.candidates.len(), 1);
         assert_eq!(
@@ -3376,12 +3386,15 @@ mod tests {
 
     #[test]
     fn production_brush_document_keeps_assignment_tear_in_local_value() {
-        let analysis = analyze_brush_document(&BrushDocumentRequest {
-            source: "A=\"\"; echo $A".into(),
-            assist: Some(Span { start: 3, end: 3 }),
-            initial_bindings: vec![],
-            observations: vec![],
-        })
+        let analysis = crate::parser::analyze_brush_document_resolved(
+            &BrushDocumentRequest {
+                source: "A=\"\"; echo $A".into(),
+                assist: Some(Span { start: 3, end: 3 }),
+                initial_bindings: vec![],
+                observations: vec![],
+            },
+            &crate::parser::FilesystemContext::new(std::path::Path::new(".")),
+        )
         .unwrap();
         assert!(analysis.context_queries.is_empty());
         assert!(analysis.candidates.iter().all(|candidate| {
@@ -3523,12 +3536,15 @@ mod tests {
 
     #[test]
     fn production_brush_document_propagates_later_find_type_constraint() {
-        let analysis = analyze_brush_document(&BrushDocumentRequest {
-            source: "A=\"\"; find . -type $A".into(),
-            assist: Some(Span { start: 3, end: 3 }),
-            initial_bindings: vec![],
-            observations: vec![],
-        })
+        let analysis = crate::parser::analyze_brush_document_resolved(
+            &BrushDocumentRequest {
+                source: "A=\"\"; find . -type $A".into(),
+                assist: Some(Span { start: 3, end: 3 }),
+                initial_bindings: vec![],
+                observations: vec![],
+            },
+            &crate::parser::FilesystemContext::new(std::path::Path::new(".")),
+        )
         .unwrap();
         assert!(analysis.context_queries.is_empty());
         let candidate = analysis
@@ -3630,15 +3646,18 @@ mod tests {
     #[test]
     fn production_brush_document_uses_builtin_argument_definition() {
         let source = "bind -m ";
-        let analysis = analyze_brush_document(&BrushDocumentRequest {
-            source: source.into(),
-            assist: Some(Span {
-                start: source.len(),
-                end: source.len(),
-            }),
-            initial_bindings: vec![],
-            observations: vec![],
-        })
+        let analysis = crate::parser::analyze_brush_document_resolved(
+            &BrushDocumentRequest {
+                source: source.into(),
+                assist: Some(Span {
+                    start: source.len(),
+                    end: source.len(),
+                }),
+                initial_bindings: vec![],
+                observations: vec![],
+            },
+            &crate::parser::FilesystemContext::new(std::path::Path::new(".")),
+        )
         .unwrap();
         let completions = analysis
             .candidates
@@ -3672,6 +3691,52 @@ mod tests {
         assert!(!completions.contains("emacs"));
         assert!(!completions.contains("vi"));
         assert!(!completions.contains("vi-move"));
+    }
+
+    #[test]
+    fn production_builtin_completion_preserves_prefix_and_quote_context() {
+        let analyze = |source: &str, cursor: usize| {
+            crate::parser::analyze_brush_document_resolved(
+                &BrushDocumentRequest {
+                    source: source.into(),
+                    assist: Some(Span {
+                        start: cursor,
+                        end: cursor,
+                    }),
+                    initial_bindings: vec![],
+                    observations: vec![],
+                },
+                &crate::parser::FilesystemContext::new(std::path::Path::new(".")),
+            )
+            .unwrap()
+        };
+        for (source, cursor) in [("bind -m em", 10), ("bind -m \"em\"", 11)] {
+            let analysis = analyze(source, cursor);
+            let completions = analysis
+                .candidates
+                .iter()
+                .flat_map(|candidate| &candidate.completions)
+                .filter(|completion| {
+                    completion.replace
+                        == (Span {
+                            start: cursor,
+                            end: cursor,
+                        })
+                        && completion
+                            .alternatives
+                            .iter()
+                            .any(|alternative| alternative.syntax == "builtin_argument")
+                })
+                .map(|completion| completion.insert.as_str())
+                .collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(
+                completions,
+                ["acs-ctlx", "acs-meta", "acs-standard"]
+                    .into_iter()
+                    .collect(),
+                "source {source:?}"
+            );
+        }
     }
 
     #[test]

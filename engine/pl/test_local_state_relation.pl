@@ -10,6 +10,8 @@ test_name(external_resolution_consumes_unique_observation).
 test_name(failed_unique_observation_fails_resolution).
 test_name(later_constraint_binds_hole_through_local_reference).
 test_name(symbolic_constraints_fail_closed).
+test_name(recursive_state_resolution_preserves_local_and_external_origins).
+test_name(recursive_state_resolution_fails_closed_on_cycles).
 
 run_local_state_relation_tests :-
     findall(Name, test_name(Name), Names),
@@ -146,3 +148,53 @@ run_test(symbolic_constraints_fail_closed) :-
            [text_constraint(text([hole(edit, span(2, 1), "", any)]),
                             one_of([]), presentation(invalid))],
            State, _).
+
+run_test(recursive_state_resolution_preserves_local_and_external_origins) :-
+    Hole = hole(edit, span(3, 3), "", any),
+    State = local_state(
+                [scope(root,
+                       [local_binding(shell_variable, "A", text([Hole]),
+                                      escaping)])],
+                []),
+    ExternalValue = shell_text("vi-command"),
+    Observations = [
+        observed(use_b, ask(one, shell_variable, name("B")),
+                 source(shell_environment, revision_7),
+                 some(one(entry(shell_variable, variable_b, ["B"],
+                                ExternalValue, [exported]))))
+    ],
+    Value = symbolic_argv([
+                symbolic_word(
+                    span(10, 12),
+                    [fragment(reference, use_origin,
+                              state_ref(use_a, shell_variable, "A"))]),
+                symbolic_word(
+                    span(13, 15),
+                    [fragment(reference, use_origin,
+                              state_ref(use_b, shell_variable, "B"))])]),
+    resolve_state_value(Value, State, Observations,
+        symbolic_argv([
+            symbolic_word(
+                span(10, 12),
+                [fragment(reference, use_origin,
+                          resolved_reference(
+                              use_a, local(shell_variable, "A"),
+                              text([Hole])))]),
+            symbolic_word(
+                span(13, 15),
+                [fragment(reference, use_origin,
+                          resolved_reference(
+                              use_b,
+                              external(source(shell_environment, revision_7),
+                                       shell_variable, variable_b),
+                              ExternalValue))])])).
+
+run_test(recursive_state_resolution_fails_closed_on_cycles) :-
+    State = local_state(
+                [scope(root,
+                       [local_binding(shell_variable, "A",
+                                      state_ref(use_a, shell_variable, "A"),
+                                      escaping)])],
+                []),
+    \+ resolve_state_value(state_ref(use_a, shell_variable, "A"), State, [],
+                           _).

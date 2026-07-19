@@ -33,13 +33,22 @@ brush_state_rules([
                before([use(node_identity, shell_variable, slot(name))]),
                after([])),
     state_rule(node(command_words),
-               [capture(source, node_symbolic_text(TextRules))],
+               [capture(command,
+                        field_symbolic_word(
+                            command, FragmentRules, [quote(unquoted)])),
+                capture(arguments,
+                        fields_symbolic_words(
+                            argument, FragmentRules, [quote(unquoted)]))],
                before([]),
                after([apply(node_identity, given_grammar(builtin_grammar),
-                            [binding(source,
-                                     state_text_source(slot(source)))])]))
+                            [binding(
+                                 argv,
+                                 state_resolved(
+                                     symbolic_argv(
+                                         [slot(command)|slot(arguments)])))])]))
 ]) :-
-    brush_text_projection_rules(TextRules).
+    brush_text_projection_rules(TextRules),
+    brush_fragment_projection_rules(FragmentRules).
 
 brush_text_projection_rules([
     text_rule(node(unquoted_text), children_else_source),
@@ -47,6 +56,28 @@ brush_text_projection_rules([
     text_rule(node(required_horizontal_space), source),
     text_rule(node(simple_parameter),
               reference(shell_variable, field_text(name)))
+]).
+
+brush_fragment_projection_rules([
+    fragment_rule(node(unquoted_text), emit(source, literal, [])),
+    fragment_rule(node(double_quoted), descend([quote(double)])),
+    fragment_rule(node(double_quoted_part),
+                  descend_else_emit(source, literal, [])),
+    fragment_rule(node(single_quoted),
+                  emit(field_text(content), literal, [quote(single)])),
+    fragment_rule(node(escape),
+                  emit(field_text(content), literal, [escaped(true)])),
+    fragment_rule(node(simple_parameter),
+                  emit_reference(shell_variable, field_text(name), [])),
+    fragment_rule(node(special_parameter),
+                  emit_opaque(source, special_parameter, [])),
+    fragment_rule(node(braced_parameter),
+                  emit_opaque(source, braced_parameter, [])),
+    fragment_rule(node(command_substitution),
+                  emit_opaque(source, command_substitution, [])),
+    fragment_rule(node(arithmetic_expansion),
+                  emit_opaque(source, arithmetic_expansion, [])),
+    fragment_rule(node(double_literal_dollar), emit(source, literal, []))
 ]).
 
 brush_syntax_grammar(
@@ -150,15 +181,23 @@ brush_syntax_grammar(
          rule(escape,
               seq([literal("\\", escape,
                            presentation([meta(syntax, escape)])),
-                   terminal(text(codepoint(any)),
-                            presentation([meta(syntax, escaped),
-                                          meta(description, escaped_codepoint)]))])),
+                   field(
+                       content,
+                       terminal(
+                           text(codepoint(any)),
+                           presentation([meta(syntax, escaped),
+                                         meta(description, escaped_codepoint),
+                                         meta(tear, symbolic)])))])),
          rule(single_quoted,
               seq([literal("'", quote_open,
                            presentation([meta(syntax, delimiter)])),
-                   repeat(0, unbounded,
-                          terminal(text(codepoint(except("'"))),
-                                   presentation([meta(syntax, string)]))),
+                   field(
+                       content,
+                       repeat(0, unbounded,
+                              terminal(
+                                  text(codepoint(except("'"))),
+                                  presentation([meta(syntax, string),
+                                                meta(tear, symbolic)])))),
                    literal("'", quote_close,
                            presentation([meta(syntax, delimiter)]))])),
          rule(double_quoted,

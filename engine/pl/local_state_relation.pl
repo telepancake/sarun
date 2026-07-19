@@ -7,6 +7,7 @@
            resolve_state_resolutions/3,
            run_state_steps/7,
            run_state_steps/8,
+           resolve_state_value/4,
            symbolic_text_source/4
           ]).
 
@@ -180,6 +181,61 @@ resolve_text_segment(reference(Domain, Name), State, Seen, Resolved) :-
     resolve_text_expression(Value, State, [Domain-Name|Seen], Resolved).
 resolve_text_segment(text(Segments), State, Seen, Resolved) :-
     resolve_text_expression(text(Segments), State, Seen, Resolved).
+
+%! resolve_state_value(+Value, +State, +Observations, -Resolved) is semidet.
+%
+%  Resolve `state_ref/3` terms recursively inside arbitrary grammar data at
+%  one exact local-state checkpoint. The result retains the use identity and
+%  whether its value came from a local definition or external context.
+
+resolve_state_value(Value, State, Observations, Resolved) :-
+    valid_local_state(State),
+    proper_list(Observations),
+    resolve_state_value_(Value, State, Observations, [], Resolved).
+
+resolve_state_value_(state_ref(Id, Domain, Name), State, Observations, Seen,
+                     resolved_reference(Id, local(Domain, Name), Resolved)) :-
+    ground(Id), ground(Domain), ground(Name),
+    \+ binding_key_member(Domain, Name, Seen),
+    lookup_binding(State, Domain, Name,
+                   local_binding(Domain, Name, Value, _)),
+    !,
+    resolve_state_value_(Value, State, Observations,
+                         [Domain-Name|Seen], Resolved).
+resolve_state_value_(state_ref(Id, Domain, Name), State, Observations, Seen,
+                     resolved_reference(
+                         Id, external(Source, Domain, Identity), Resolved)) :-
+    ground(Id), ground(Domain), ground(Name),
+    \+ binding_key_member(Domain, Name, Seen),
+    resolution_entry_observation(Id, Domain, Name, Observations, Source,
+                                 Identity, Value),
+    resolve_state_value_(Value, State, Observations,
+                         [Domain-Name|Seen], Resolved).
+resolve_state_value_(Value, _, _, _, Value) :- atomic(Value), !.
+resolve_state_value_(Value, State, Observations, Seen, Resolved) :-
+    compound(Value),
+    Value \= state_ref(_, _, _),
+    Value =.. [Functor|Arguments],
+    resolve_state_arguments(Arguments, State, Observations, Seen,
+                            ResolvedArguments),
+    Resolved =.. [Functor|ResolvedArguments].
+
+resolve_state_arguments([], _, _, _, []).
+resolve_state_arguments([Value|Values], State, Observations, Seen,
+                        [Resolved|ResolvedValues]) :-
+    resolve_state_value_(Value, State, Observations, Seen, Resolved),
+    resolve_state_arguments(Values, State, Observations, Seen,
+                            ResolvedValues).
+
+resolution_entry_observation(
+    Id, Domain, Name,
+    [observed(Id, ask(one, Domain, name(Name)), Source,
+              some(one(entry(Domain, Identity, _, Value, _))))|_],
+    Source, Identity, Value) :- !.
+resolution_entry_observation(Id, Domain, Name, [_|Observations], Source,
+                             Identity, Value) :-
+    resolution_entry_observation(Id, Domain, Name, Observations, Source,
+                                 Identity, Value).
 
 %! symbolic_text_source(+Expression, +State, +Origin, -Source) is semidet.
 %

@@ -1,12 +1,8 @@
 //! Brush's typed builtin parsers as one opaque host relation client.
 //!
-//! This adapter is intentionally conservative. It proves the existing
-//! `Command::new` parser can supply ordinary relation evidence without first
-//! copying its grammar into `CommandSyntax`. The current input projection only
-//! accepts already-cooked, whitespace-separated words with a tear at a word
-//! boundary. Quoting, expansion provenance, and contextual value providers
-//! require the richer argv/continuation protocol recorded in
-//! `BRUSH-RELATION-MIGRATION.md`; those shapes fail closed here.
+//! This adapter consumes grammar-owned, spanned symbolic argv. It cooks only
+//! explicitly resolved fragments and rejects opaque or unresolved input, so a
+//! parser observation cannot silently discard shell provenance.
 
 use brush_core::builtins::{
     CommandArgumentEvidence, CommandParseObservation, CommandParseStatus, CommandProbeInput,
@@ -22,7 +18,12 @@ const PREFERENCE: i64 = 40;
 pub(crate) struct BuiltinProbeAdapter;
 
 pub(crate) fn register() -> Result<(), String> {
-    crate::relation_adapter::register(HANDLE, std::sync::Arc::new(BuiltinProbeAdapter))
+    static REGISTERED: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
+    REGISTERED
+        .get_or_init(|| {
+            crate::relation_adapter::register(HANDLE, std::sync::Arc::new(BuiltinProbeAdapter))
+        })
+        .clone()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -32,48 +33,53 @@ struct ByteSpan {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct Word {
+struct CookedWord {
     text: String,
-    span: ByteSpan,
+    tears: Vec<CookedTear>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum SourceMode {
-    Exact,
-    Assist {
-        edit_id: String,
-        virtual_span: ByteSpan,
-        physical_span: Option<ByteSpan>,
-    },
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct Source {
-    text: String,
-    mode: SourceMode,
+struct CookedTear {
+    edit_id: String,
+    replace: ByteSpan,
+    offset: usize,
+    surface_len: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ProbeAtTear {
     input: CommandProbeInput,
     replace: ByteSpan,
-    needs_separator: bool,
     edit_id: String,
+    tear_surface_len: usize,
+}
+
+#[derive(Debug)]
+enum ArgvDecodeError {
+    Unsupported,
+    Invalid(String),
+}
+
+impl From<String> for ArgvDecodeError {
+    fn from(error: String) -> Self {
+        Self::Invalid(error)
+    }
 }
 
 impl Adapter for BuiltinProbeAdapter {
     fn revision(&self) -> RelationValue {
         RelationValue::Compound(
             "brush_typed_builtin_revision".into(),
-            vec![RelationValue::Integer(1)],
+            vec![RelationValue::Integer(2)],
         )
     }
 
     fn transform(&self, request: &Request) -> Result<RelationReply, String> {
-        let source = request_source(request)?;
-        let words = simple_words(&source.text).ok_or_else(|| {
-            "typed builtin probe needs rich shell-word input for this source".to_string()
-        })?;
+        let words = match request_argv(request) {
+            Ok(words) => words,
+            Err(ArgvDecodeError::Unsupported) => return Ok(no_solution()),
+            Err(ArgvDecodeError::Invalid(error)) => return Err(error),
+        };
         let Some(command_name) = words.first().map(|word| word.text.clone()) else {
             return Ok(no_solution());
         };
@@ -81,8 +87,17 @@ impl Adapter for BuiltinProbeAdapter {
             return Ok(no_solution());
         };
 
-        match source.mode {
-            SourceMode::Exact => {
+        let tears = words
+            .iter()
+            .enumerate()
+            .flat_map(|(word_index, word)| {
+                word.tears
+                    .iter()
+                    .map(move |tear| (word_index, tear.clone()))
+            })
+            .collect::<Vec<_>>();
+        match tears.as_slice() {
+            [] => {
                 let observation = probe(CommandProbeInput {
                     before: words.into_iter().map(|word| word.text).collect(),
                     prefix: String::new(),
@@ -91,70 +106,78 @@ impl Adapter for BuiltinProbeAdapter {
                 });
                 exact_reply(request, observation)
             }
-            SourceMode::Assist {
-                edit_id,
-                virtual_span,
-                physical_span,
-            } => {
-                let Some(at_tear) =
-                    probe_at_tear(&source.text, &words, &edit_id, virtual_span, physical_span)
-                else {
-                    return Ok(diagnostic("rich_argv_required"));
-                };
+            [(word_index, tear)] => {
+                let at_tear = probe_from_symbolic_tear(&words, *word_index, tear)?;
                 let observation = probe(at_tear.input.clone());
                 assist_reply(request, &command_name, at_tear, observation)
             }
+            _ => Ok(no_solution()),
         }
     }
 }
 
-fn request_source(request: &Request) -> Result<Source, String> {
-    let value = request
+fn request_argv(request: &Request) -> Result<Vec<CookedWord>, ArgvDecodeError> {
+    let mut bindings = request
         .given
         .iter()
-        .find(|binding| binding.name == "source")
-        .map(|binding| &binding.value)
-        .ok_or_else(|| "typed builtin relation omitted source".to_string())?;
-    let RelationValue::Compound(name, fields) = value else {
-        return Err("typed builtin source is not a compound".into());
-    };
-    if name != "text_source" || fields.len() != 3 {
-        return Err("typed builtin source has an invalid shape".into());
+        .filter(|binding| binding.name == "argv");
+    let value = &bindings
+        .next()
+        .ok_or_else(|| ArgvDecodeError::Invalid("typed builtin relation omitted argv".into()))?
+        .value;
+    if bindings.next().is_some() {
+        return Err(ArgvDecodeError::Invalid(
+            "typed builtin relation supplied argv more than once".into(),
+        ));
     }
-    let RelationValue::String(text) = &fields[0] else {
-        return Err("typed builtin source is not text".into());
-    };
-    let mode = decode_mode(&fields[1])?;
-    Ok(Source {
-        text: text.clone(),
-        mode,
-    })
+    decode_symbolic_argv(value)
 }
 
-fn decode_mode(value: &RelationValue) -> Result<SourceMode, String> {
-    if value == &RelationValue::Atom("exact".into()) {
-        return Ok(SourceMode::Exact);
-    }
+fn decode_symbolic_argv(value: &RelationValue) -> Result<Vec<CookedWord>, ArgvDecodeError> {
     let RelationValue::Compound(name, fields) = value else {
-        return Err("typed builtin source mode is invalid".into());
+        return Err(ArgvDecodeError::Invalid(
+            "typed builtin argv is not a compound".into(),
+        ));
     };
-    if name != "assist" || !(fields.len() == 2 || fields.len() == 3) {
-        return Err("typed builtin assist mode is invalid".into());
+    if name != "symbolic_argv" || fields.len() != 1 {
+        return Err(ArgvDecodeError::Invalid(
+            "typed builtin argv has an invalid shape".into(),
+        ));
     }
-    let edit_id = match &fields[0] {
-        RelationValue::Atom(value) => value.clone(),
-        _ => return Err("typed builtin edit identity is not an atom".into()),
+    let RelationValue::List(words) = &fields[0] else {
+        return Err(ArgvDecodeError::Invalid(
+            "typed builtin argv words are not a list".into(),
+        ));
     };
-    let virtual_span = decode_span(&fields[1], "span")?;
-    let physical_span = fields
-        .get(2)
-        .map(|value| decode_span(value, "replace_span"))
-        .transpose()?;
-    Ok(SourceMode::Assist {
-        edit_id,
-        virtual_span,
-        physical_span,
-    })
+    words
+        .iter()
+        .map(decode_symbolic_word)
+        .collect::<Result<Vec<_>, _>>()
+        .map(|words| words.into_iter().flatten().collect())
+}
+
+fn decode_symbolic_word(value: &RelationValue) -> Result<Vec<CookedWord>, ArgvDecodeError> {
+    let RelationValue::Compound(name, fields) = value else {
+        return Err(ArgvDecodeError::Invalid(
+            "typed builtin symbolic word is not a compound".into(),
+        ));
+    };
+    if name != "symbolic_word" || fields.len() != 2 {
+        return Err(ArgvDecodeError::Invalid(
+            "typed builtin symbolic word has an invalid shape".into(),
+        ));
+    }
+    decode_span(&fields[0], "span")?;
+    let RelationValue::List(fragments) = &fields[1] else {
+        return Err(ArgvDecodeError::Invalid(
+            "typed builtin symbolic word fragments are not a list".into(),
+        ));
+    };
+    let mut words = vec![empty_cooked_word()];
+    for fragment in fragments {
+        append_expansion(&mut words, decode_fragment(fragment)?);
+    }
+    Ok(words)
 }
 
 fn decode_span(value: &RelationValue, expected: &str) -> Result<ByteSpan, String> {
@@ -177,140 +200,230 @@ fn decode_span(value: &RelationValue, expected: &str) -> Result<ByteSpan, String
     Ok(ByteSpan { start, end })
 }
 
-fn simple_words(text: &str) -> Option<Vec<Word>> {
-    if text
-        .chars()
-        .any(|character| matches!(character, '\n' | '\\' | '\'' | '"' | '$' | '`'))
-    {
-        return None;
+fn decode_fragment(value: &RelationValue) -> Result<Vec<CookedWord>, ArgvDecodeError> {
+    let RelationValue::Compound(name, fields) = value else {
+        return Err(ArgvDecodeError::Invalid(
+            "typed builtin fragment is not a compound".into(),
+        ));
+    };
+    if name != "fragment" || fields.len() != 3 {
+        return Err(ArgvDecodeError::Invalid(
+            "typed builtin fragment has an invalid shape".into(),
+        ));
     }
-    let mut words = Vec::new();
-    let mut start = None;
-    for (offset, character) in text.char_indices() {
-        if matches!(character, ' ' | '\t' | '\r') {
-            if let Some(begin) = start.take() {
-                words.push(Word {
-                    text: text[begin..offset].into(),
-                    span: ByteSpan {
-                        start: begin,
-                        end: offset,
-                    },
-                });
-            }
-        } else if start.is_none() {
-            start = Some(offset);
-        }
+    let RelationValue::Atom(kind) = &fields[0] else {
+        return Err(ArgvDecodeError::Invalid(
+            "typed builtin fragment kind is not an atom".into(),
+        ));
+    };
+    let physical_span = decode_origin_span(&fields[1])?;
+    match kind.as_str() {
+        "literal" => decode_utf8(&fields[2])
+            .map(cooked_text)
+            .map_err(ArgvDecodeError::Invalid),
+        "tear" => decode_edit_tear(&fields[2], physical_span)
+            .map(cooked_tear)
+            .map_err(ArgvDecodeError::Invalid),
+        "reference" => decode_resolved_reference(&fields[2]),
+        "opaque" => Err(ArgvDecodeError::Unsupported),
+        _ => Err(ArgvDecodeError::Unsupported),
     }
-    if let Some(begin) = start {
-        words.push(Word {
-            text: text[begin..].into(),
-            span: ByteSpan {
-                start: begin,
-                end: text.len(),
-            },
-        });
-    }
-    Some(words)
 }
 
-fn probe_at_tear(
-    text: &str,
-    words: &[Word],
-    edit_id: &str,
-    virtual_span: ByteSpan,
-    physical_span: Option<ByteSpan>,
-) -> Option<ProbeAtTear> {
-    if virtual_span.start != virtual_span.end
-        || virtual_span.end > text.len()
-        || !text.is_char_boundary(virtual_span.end)
-    {
-        return None;
+fn decode_origin_span(value: &RelationValue) -> Result<ByteSpan, String> {
+    let RelationValue::Compound(name, fields) = value else {
+        return Err("typed builtin fragment origin is not a compound".into());
+    };
+    if name != "origin" || fields.len() != 3 {
+        return Err("typed builtin fragment origin has an invalid shape".into());
     }
-    let cursor = virtual_span.end;
-    let command = words.first()?;
-    if cursor < command.span.end {
-        return None;
-    }
+    decode_span(&fields[1], "span")
+}
 
-    // An exact command word followed by a tear is command-argument position,
-    // even when the user has not typed the separating space yet.
-    if cursor == command.span.end && words.len() == 1 {
-        return Some(ProbeAtTear {
-            input: CommandProbeInput {
-                before: vec![command.text.clone()],
-                prefix: String::new(),
-                suffix: String::new(),
-                after: Vec::new(),
-            },
-            replace: physical_span.unwrap_or(ByteSpan {
-                start: cursor,
-                end: cursor,
-            }),
-            needs_separator: !ends_with_separator(&text[..cursor]),
-            edit_id: edit_id.into(),
-        });
+fn decode_utf8(value: &RelationValue) -> Result<String, String> {
+    let RelationValue::Compound(name, fields) = value else {
+        return Err("typed builtin literal is not a compound".into());
+    };
+    if name != "utf8" || fields.len() != 1 {
+        return Err("typed builtin literal has an invalid shape".into());
     }
+    let RelationValue::String(text) = &fields[0] else {
+        return Err("typed builtin literal UTF-8 value is not text".into());
+    };
+    Ok(text.clone())
+}
 
-    if let Some((index, word)) = words
-        .iter()
-        .enumerate()
-        .find(|(_, word)| word.span.start <= cursor && cursor <= word.span.end)
-    {
-        if index == 0 {
-            return None;
-        }
-        return Some(ProbeAtTear {
-            input: CommandProbeInput {
-                before: words[..index]
-                    .iter()
-                    .map(|word| word.text.clone())
-                    .collect(),
-                prefix: text[word.span.start..cursor].into(),
-                suffix: text[cursor..word.span.end].into(),
-                after: words[index + 1..]
-                    .iter()
-                    .map(|word| word.text.clone())
-                    .collect(),
-            },
-            replace: physical_span.unwrap_or(ByteSpan {
-                start: word.span.start,
-                end: cursor,
-            }),
-            needs_separator: false,
-            edit_id: edit_id.into(),
-        });
+fn decode_edit_tear(
+    value: &RelationValue,
+    replace: ByteSpan,
+) -> Result<(String, CookedTear), String> {
+    let RelationValue::Compound(name, fields) = value else {
+        return Err("typed builtin edit tear is not a compound".into());
+    };
+    if name != "edit_tear" || fields.len() != 3 {
+        return Err("typed builtin edit tear has an invalid shape".into());
     }
-
-    let before = words
-        .iter()
-        .take_while(|word| word.span.end <= cursor)
-        .map(|word| word.text.clone())
-        .collect::<Vec<_>>();
-    let after = words
-        .iter()
-        .skip_while(|word| word.span.start < cursor)
-        .map(|word| word.text.clone())
-        .collect::<Vec<_>>();
-    Some(ProbeAtTear {
-        input: CommandProbeInput {
-            before,
-            prefix: String::new(),
-            suffix: String::new(),
-            after,
+    let RelationValue::Atom(edit_id) = &fields[0] else {
+        return Err("typed builtin edit identity is not an atom".into());
+    };
+    let RelationValue::String(surface) = &fields[1] else {
+        return Err("typed builtin edit surface is not text".into());
+    };
+    Ok((
+        surface.clone(),
+        CookedTear {
+            edit_id: edit_id.clone(),
+            replace,
+            offset: surface.len(),
+            surface_len: surface.len(),
         },
-        replace: physical_span.unwrap_or(ByteSpan {
-            start: cursor,
-            end: cursor,
-        }),
-        needs_separator: cursor > 0 && !ends_with_separator(&text[..cursor]),
-        edit_id: edit_id.into(),
-    })
+    ))
 }
 
-fn ends_with_separator(text: &str) -> bool {
-    text.chars()
-        .next_back()
-        .is_some_and(|character| matches!(character, ' ' | '\t' | '\r'))
+fn decode_resolved_reference(value: &RelationValue) -> Result<Vec<CookedWord>, ArgvDecodeError> {
+    let RelationValue::Compound(name, fields) = value else {
+        return Err(ArgvDecodeError::Invalid(
+            "typed builtin reference is not a compound".into(),
+        ));
+    };
+    if name == "state_ref" {
+        return Err(ArgvDecodeError::Unsupported);
+    }
+    if name != "resolved_reference" || fields.len() != 3 {
+        return Err(ArgvDecodeError::Invalid(
+            "typed builtin reference has an invalid shape".into(),
+        ));
+    }
+    decode_resolved_value(&fields[2])
+}
+
+fn decode_resolved_value(value: &RelationValue) -> Result<Vec<CookedWord>, ArgvDecodeError> {
+    let RelationValue::Compound(name, fields) = value else {
+        return Err(ArgvDecodeError::Invalid(
+            "typed builtin resolved value is not a compound".into(),
+        ));
+    };
+    match (name.as_str(), fields.as_slice()) {
+        ("symbolic_word", _) => decode_symbolic_word(value),
+        ("symbolic_argv", _) => decode_symbolic_argv(value),
+        ("shell_text", [RelationValue::String(text)]) => Ok(cooked_text(text.clone())),
+        ("text", [RelationValue::List(segments)]) => {
+            let mut words = vec![empty_cooked_word()];
+            for segment in segments {
+                let decoded = match segment {
+                    RelationValue::String(text) => cooked_text(text.clone()),
+                    RelationValue::Compound(name, fields)
+                        if name == "hole" && fields.len() == 4 =>
+                    {
+                        let edit_id = match &fields[0] {
+                            RelationValue::Atom(edit_id) => edit_id.clone(),
+                            _ => {
+                                return Err(ArgvDecodeError::Invalid(
+                                    "typed builtin hole identity is not an atom".into(),
+                                ));
+                            }
+                        };
+                        let replace = decode_span(&fields[1], "span")?;
+                        let surface = match &fields[2] {
+                            RelationValue::String(surface) => surface.clone(),
+                            _ => {
+                                return Err(ArgvDecodeError::Invalid(
+                                    "typed builtin hole surface is not text".into(),
+                                ));
+                            }
+                        };
+                        cooked_tear((
+                            surface.clone(),
+                            CookedTear {
+                                edit_id,
+                                replace,
+                                offset: surface.len(),
+                                surface_len: surface.len(),
+                            },
+                        ))
+                    }
+                    _ => return Err(ArgvDecodeError::Unsupported),
+                };
+                append_expansion(&mut words, decoded);
+            }
+            Ok(words)
+        }
+        ("state_ref", _) => Err(ArgvDecodeError::Unsupported),
+        _ => Err(ArgvDecodeError::Unsupported),
+    }
+}
+
+fn empty_cooked_word() -> CookedWord {
+    CookedWord {
+        text: String::new(),
+        tears: Vec::new(),
+    }
+}
+
+fn cooked_text(text: String) -> Vec<CookedWord> {
+    vec![CookedWord {
+        text,
+        tears: Vec::new(),
+    }]
+}
+
+fn cooked_tear((text, tear): (String, CookedTear)) -> Vec<CookedWord> {
+    vec![CookedWord {
+        text,
+        tears: vec![tear],
+    }]
+}
+
+fn append_expansion(words: &mut Vec<CookedWord>, mut expansion: Vec<CookedWord>) {
+    if expansion.is_empty() {
+        return;
+    }
+    if words.is_empty() {
+        *words = expansion;
+        return;
+    }
+    let first = expansion.remove(0);
+    append_word(words.last_mut().expect("nonempty words"), first);
+    words.extend(expansion);
+}
+
+fn append_word(target: &mut CookedWord, mut suffix: CookedWord) {
+    let offset = target.text.len();
+    for tear in &mut suffix.tears {
+        tear.offset += offset;
+    }
+    target.text.push_str(&suffix.text);
+    target.tears.extend(suffix.tears);
+}
+
+fn probe_from_symbolic_tear(
+    words: &[CookedWord],
+    word_index: usize,
+    tear: &CookedTear,
+) -> Result<ProbeAtTear, String> {
+    let word = words
+        .get(word_index)
+        .ok_or_else(|| "typed builtin tear word is missing".to_string())?;
+    if tear.offset > word.text.len() || !word.text.is_char_boundary(tear.offset) {
+        return Err("typed builtin tear has an invalid cooked offset".into());
+    }
+    Ok(ProbeAtTear {
+        input: CommandProbeInput {
+            before: words[..word_index]
+                .iter()
+                .map(|word| word.text.clone())
+                .collect(),
+            prefix: word.text[..tear.offset].into(),
+            suffix: word.text[tear.offset..].into(),
+            after: words[word_index + 1..]
+                .iter()
+                .map(|word| word.text.clone())
+                .collect(),
+        },
+        replace: tear.replace,
+        edit_id: tear.edit_id.clone(),
+        tear_surface_len: tear.surface_len,
+    })
 }
 
 fn exact_reply(
@@ -399,17 +512,9 @@ fn assist_reply(
     let completions = candidates
         .into_iter()
         .enumerate()
-        .map(|(rank, (candidate, alternatives))| {
-            completion_value(
-                at_tear.replace,
-                if at_tear.needs_separator {
-                    format!(" {candidate}")
-                } else {
-                    candidate
-                },
-                alternatives,
-                rank + 1,
-            )
+        .filter_map(|(rank, (candidate, alternatives))| {
+            completion_insertion(&candidate, &at_tear)
+                .map(|insert| completion_value(at_tear.replace, insert, alternatives, rank + 1))
         })
         .collect();
     let mut reply = solution_reply(
@@ -422,6 +527,19 @@ fn assist_reply(
     )?;
     reply.context_queries = context_queries;
     Ok(reply)
+}
+
+fn completion_insertion(candidate: &str, at_tear: &ProbeAtTear) -> Option<String> {
+    let prefix_len = at_tear.input.prefix.len();
+    let surface_len = at_tear.tear_surface_len;
+    let outside_prefix_len = prefix_len.checked_sub(surface_len)?;
+    if outside_prefix_len > candidate.len()
+        || !candidate.is_char_boundary(outside_prefix_len)
+        || !candidate.starts_with(&at_tear.input.prefix)
+    {
+        return None;
+    }
+    Some(candidate[outside_prefix_len..].into())
 }
 
 fn completion_value(
@@ -589,39 +707,102 @@ mod tests {
     use super::*;
     use crate::prolog::RelationLimits;
 
-    fn request(source: &str, mode: RelationValue, wanted: &[&str]) -> Request {
+    fn span(start: usize, end: usize) -> RelationValue {
+        span_value(ByteSpan { start, end })
+    }
+
+    fn origin(start: usize, end: usize) -> RelationValue {
+        RelationValue::Compound(
+            "origin".into(),
+            vec![
+                RelationValue::Atom("test".into()),
+                span(start, end),
+                RelationValue::List(vec![]),
+            ],
+        )
+    }
+
+    fn fragment(kind: &str, start: usize, end: usize, payload: RelationValue) -> RelationValue {
+        RelationValue::Compound(
+            "fragment".into(),
+            vec![
+                RelationValue::Atom(kind.into()),
+                origin(start, end),
+                payload,
+            ],
+        )
+    }
+
+    fn literal(start: usize, end: usize, text: &str) -> RelationValue {
+        fragment(
+            "literal",
+            start,
+            end,
+            RelationValue::Compound("utf8".into(), vec![RelationValue::String(text.into())]),
+        )
+    }
+
+    fn tear(start: usize, end: usize, surface: &str) -> RelationValue {
+        fragment(
+            "tear",
+            start,
+            end,
+            RelationValue::Compound(
+                "edit_tear".into(),
+                vec![
+                    RelationValue::Atom("edit".into()),
+                    RelationValue::String(surface.into()),
+                    RelationValue::Atom("any".into()),
+                ],
+            ),
+        )
+    }
+
+    fn reference(start: usize, end: usize, id: &str, resolved: RelationValue) -> RelationValue {
+        fragment(
+            "reference",
+            start,
+            end,
+            RelationValue::Compound(
+                "resolved_reference".into(),
+                vec![
+                    RelationValue::Atom(id.into()),
+                    RelationValue::Atom("test_resolution".into()),
+                    resolved,
+                ],
+            ),
+        )
+    }
+
+    fn word(start: usize, end: usize, fragments: Vec<RelationValue>) -> RelationValue {
+        RelationValue::Compound(
+            "symbolic_word".into(),
+            vec![span(start, end), RelationValue::List(fragments)],
+        )
+    }
+
+    fn argv(words: Vec<RelationValue>) -> RelationValue {
+        RelationValue::Compound("symbolic_argv".into(), vec![RelationValue::List(words)])
+    }
+
+    fn literal_word(start: usize, text: &str) -> RelationValue {
+        word(
+            start,
+            start + text.len(),
+            vec![literal(start, start + text.len(), text)],
+        )
+    }
+
+    fn request(argv: RelationValue, wanted: &[&str]) -> Request {
         Request {
             given: vec![RelationBinding {
-                name: "source".into(),
-                value: RelationValue::Compound(
-                    "text_source".into(),
-                    vec![
-                        RelationValue::String(source.into()),
-                        mode,
-                        RelationValue::Atom("test".into()),
-                    ],
-                ),
+                name: "argv".into(),
+                value: argv,
             }],
             wanted: wanted.iter().map(|value| (*value).into()).collect(),
             observations: vec![],
             limits: RelationLimits::default(),
         }
-    }
-
-    fn assist(cursor: usize) -> RelationValue {
-        RelationValue::Compound(
-            "assist".into(),
-            vec![
-                RelationValue::Atom("edit".into()),
-                RelationValue::Compound(
-                    "span".into(),
-                    vec![
-                        RelationValue::Integer(cursor as i64),
-                        RelationValue::Integer(cursor as i64),
-                    ],
-                ),
-            ],
-        )
     }
 
     fn completion_texts(reply: &RelationReply) -> Vec<String> {
@@ -650,13 +831,13 @@ mod tests {
 
     #[test]
     fn bind_finite_values_come_from_runtime_parser_probe() {
-        let source = "bind -m ";
+        let argv_input = argv(vec![
+            literal_word(0, "bind"),
+            literal_word(5, "-m"),
+            word(8, 8, vec![tear(8, 8, "")]),
+        ]);
         let reply = BuiltinProbeAdapter
-            .transform(&request(
-                source,
-                assist(source.len()),
-                &["status", "completions"],
-            ))
+            .transform(&request(argv_input, &["status", "completions"]))
             .unwrap();
         assert_eq!(
             completion_texts(&reply),
@@ -672,20 +853,27 @@ mod tests {
 
     #[test]
     fn bind_finite_value_completion_preserves_and_proves_same_word_suffix() {
-        let source = "bind -m em-standard";
-        let cursor = "bind -m em".len();
+        let argv_input = argv(vec![
+            literal_word(0, "bind"),
+            literal_word(5, "-m"),
+            word(8, 19, vec![tear(8, 10, "em"), literal(10, 19, "-standard")]),
+        ]);
         let reply = BuiltinProbeAdapter
-            .transform(&request(source, assist(cursor), &["status", "completions"]))
+            .transform(&request(argv_input, &["status", "completions"]))
             .unwrap();
         assert_eq!(completion_texts(&reply), ["emacs"]);
 
-        let incompatible = "bind -m em-not-a-keymap";
+        let incompatible = argv(vec![
+            literal_word(0, "bind"),
+            literal_word(5, "-m"),
+            word(
+                8,
+                23,
+                vec![tear(8, 10, "em"), literal(10, 23, "-not-a-keymap")],
+            ),
+        ]);
         let reply = BuiltinProbeAdapter
-            .transform(&request(
-                incompatible,
-                assist(cursor),
-                &["status", "completions"],
-            ))
+            .transform(&request(incompatible, &["status", "completions"]))
             .unwrap();
         assert!(reply.solutions.is_empty());
         assert_eq!(
@@ -698,13 +886,30 @@ mod tests {
     }
 
     #[test]
-    fn exact_bind_uses_the_same_typed_parser() {
+    fn source_cursor_tear_inserts_only_the_missing_literal_suffix() {
+        let argv_input = argv(vec![
+            literal_word(0, "bind"),
+            literal_word(5, "-m"),
+            word(8, 10, vec![literal(8, 10, "em"), tear(10, 10, "")]),
+        ]);
         let reply = BuiltinProbeAdapter
-            .transform(&request(
-                "bind -m emacs-standard",
-                RelationValue::Atom("exact".into()),
-                &["status"],
-            ))
+            .transform(&request(argv_input, &["status", "completions"]))
+            .unwrap();
+        assert_eq!(
+            completion_texts(&reply),
+            ["acs-ctlx", "acs-meta", "acs-standard"]
+        );
+    }
+
+    #[test]
+    fn exact_bind_uses_the_same_typed_parser() {
+        let argv = argv(vec![
+            literal_word(0, "bind"),
+            literal_word(5, "-m"),
+            literal_word(8, "emacs-standard"),
+        ]);
+        let reply = BuiltinProbeAdapter
+            .transform(&request(argv, &["status"]))
             .unwrap();
         assert_eq!(
             reply.solutions[0].bindings[0].value,
@@ -714,8 +919,11 @@ mod tests {
 
     #[test]
     fn edit_path_replays_from_explicit_context_observation() {
-        let source = "edit ";
-        let mut request = request(source, assist(source.len()), &["status", "completions"]);
+        let argv = argv(vec![
+            literal_word(0, "edit"),
+            word(5, 5, vec![tear(5, 5, "")]),
+        ]);
+        let mut request = request(argv, &["status", "completions"]);
         let pending = BuiltinProbeAdapter.transform(&request).unwrap();
         assert_eq!(
             pending.solutions[0]
@@ -761,22 +969,18 @@ mod tests {
         let _ = register();
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(temp.path().join("test1.sh"), b"").unwrap();
-        let source = "edit ./t";
+        let argv = argv(vec![
+            literal_word(0, "edit"),
+            word(5, 8, vec![tear(5, 8, "./t")]),
+        ]);
         let mut request = crate::prolog::RelationRequest {
             grammar: RelationValue::Compound(
                 "registered_relation".into(),
                 vec![RelationValue::Atom(HANDLE.into())],
             ),
             given: vec![RelationBinding {
-                name: "source".into(),
-                value: RelationValue::Compound(
-                    "text_source".into(),
-                    vec![
-                        RelationValue::String(source.into()),
-                        assist(source.len()),
-                        RelationValue::Atom("test".into()),
-                    ],
-                ),
+                name: "argv".into(),
+                value: argv,
             }],
             wanted: vec!["status".into(), "completions".into()],
             observations: vec![],
@@ -813,12 +1017,112 @@ mod tests {
     }
 
     #[test]
-    fn shell_quoting_fails_closed_until_rich_words_cross_boundary() {
+    fn resolved_symbolic_argv_and_shell_text_are_cooked_recursively() {
+        let expanded = argv(vec![
+            literal_word(5, "-m"),
+            word(
+                8,
+                23,
+                vec![reference(
+                    8,
+                    23,
+                    "value",
+                    RelationValue::Compound(
+                        "shell_text".into(),
+                        vec![RelationValue::String("emacs-standard".into())],
+                    ),
+                )],
+            ),
+        ]);
+        let argv = argv(vec![
+            literal_word(0, "bind"),
+            word(5, 23, vec![reference(5, 23, "args", expanded)]),
+        ]);
+        let reply = BuiltinProbeAdapter
+            .transform(&request(argv, &["status"]))
+            .unwrap();
+        assert_eq!(
+            reply.solutions[0].bindings[0].value,
+            RelationValue::Atom("complete".into())
+        );
+    }
+
+    #[test]
+    fn resolved_text_hole_preserves_tear_provenance() {
+        let resolved = RelationValue::Compound(
+            "text".into(),
+            vec![RelationValue::List(vec![
+                RelationValue::Compound(
+                    "hole".into(),
+                    vec![
+                        RelationValue::Atom("edit".into()),
+                        span(8, 10),
+                        RelationValue::String("em".into()),
+                        RelationValue::Atom("any".into()),
+                    ],
+                ),
+                RelationValue::String("-standard".into()),
+            ])],
+        );
+        let argv = argv(vec![
+            literal_word(0, "bind"),
+            literal_word(5, "-m"),
+            word(8, 19, vec![reference(8, 19, "variable_a", resolved)]),
+        ]);
+        let reply = BuiltinProbeAdapter
+            .transform(&request(argv, &["status", "completions"]))
+            .unwrap();
+        assert_eq!(completion_texts(&reply), ["emacs"]);
+        let RelationValue::List(completions) = &reply.solutions[0]
+            .bindings
+            .iter()
+            .find(|binding| binding.name == "completions")
+            .unwrap()
+            .value
+        else {
+            panic!("completion binding must be a list")
+        };
+        let RelationValue::Compound(_, fields) = &completions[0] else {
+            panic!("completion must be a compound")
+        };
+        assert_eq!(fields[0], span(8, 10));
+    }
+
+    #[test]
+    fn opaque_and_unresolved_fragments_are_failed_relation_branches() {
+        let opaque = fragment(
+            "opaque",
+            0,
+            4,
+            RelationValue::Compound(
+                "opaque".into(),
+                vec![
+                    RelationValue::Atom("shell_word".into()),
+                    RelationValue::String("bind".into()),
+                ],
+            ),
+        );
+        let reply = BuiltinProbeAdapter
+            .transform(&request(argv(vec![word(0, 4, vec![opaque])]), &["status"]));
+        assert!(reply.unwrap().solutions.is_empty());
+
+        let unresolved = fragment(
+            "reference",
+            5,
+            7,
+            RelationValue::Compound(
+                "state_ref".into(),
+                vec![
+                    RelationValue::Atom("use_a".into()),
+                    RelationValue::Atom("shell_variable".into()),
+                    RelationValue::String("A".into()),
+                ],
+            ),
+        );
         let reply = BuiltinProbeAdapter.transform(&request(
-            "bind -m 'emacs-standard'",
-            RelationValue::Atom("exact".into()),
+            argv(vec![literal_word(0, "bind"), word(5, 7, vec![unresolved])]),
             &["status"],
         ));
-        assert!(reply.is_err());
+        assert!(reply.unwrap().solutions.is_empty());
     }
 }

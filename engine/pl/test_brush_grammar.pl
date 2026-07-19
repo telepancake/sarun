@@ -16,10 +16,11 @@ test_name(missing_unique_parameter_observation_fails_semantic_solution).
 test_name(assignment_tear_survives_as_later_local_value).
 test_name(local_variable_name_completion_comes_from_ordinary_use_step).
 test_name(provider_variable_completion_survives_sibling_parse_observations).
-test_name(supplied_grammar_completes_required_suffix_at_command_tear).
-test_name(supplied_grammar_constrains_earlier_local_value_hole).
-test_name(supplied_grammar_uses_state_at_command_position).
-test_name(supplied_grammar_applies_at_each_command_position).
+test_name(command_projection_is_cooked_rich_symbolic_argv).
+test_name(generic_text_application_completes_required_suffix_at_tear).
+test_name(generic_text_application_constrains_earlier_local_value_hole).
+test_name(generic_text_application_uses_state_at_command_position).
+test_name(generic_text_application_runs_at_each_command_position).
 test_name(unknown_command_keeps_the_shell_solution).
 test_name(direct_and_propagated_tears_use_the_same_grammar).
 test_name(propagated_tear_retains_physical_utf8_byte_span).
@@ -294,22 +295,54 @@ run_test(provider_variable_completion_survives_sibling_parse_observations) :-
     solution_has_completion(
         Solutions, "SISTENT", context(shell_variable, persistent_variable)).
 
-run_test(supplied_grammar_completes_required_suffix_at_command_tear) :-
+run_test(command_projection_is_cooked_rich_symbolic_argv) :-
+    brush_relation_grammar(Grammar),
+    transform(
+        request(Grammar,
+                given([binding(source,
+                               text_source("bind -m 'emacs-standard'", exact,
+                                           brush_test))]),
+                want([steps]), observations([]),
+                limits(32, 4096, 1048576)),
+        reply(Solutions, [], [], [])),
+    list_member(solution([binding(steps, Steps)], 0), Solutions),
+    ExpectedWords = [
+        symbolic_word(
+            span(0, 4),
+            [fragment(literal,
+                      origin(brush_test, span(0, 4), [quote(unquoted)]),
+                      utf8("bind"))]),
+        symbolic_word(
+            span(5, 7),
+            [fragment(literal,
+                      origin(brush_test, span(5, 7), [quote(unquoted)]),
+                      utf8("-m"))]),
+        symbolic_word(
+            span(8, 24),
+            [fragment(literal,
+                      origin(brush_test, span(8, 24), [quote(single)]),
+                      utf8("emacs-standard"))])
+    ],
+    Steps = [apply(_, given_grammar(builtin_grammar),
+                   [binding(argv,
+                            state_resolved(symbolic_argv(ExpectedWords)))])].
+
+run_test(generic_text_application_completes_required_suffix_at_tear) :-
     tool_analysis("tool", span(4, 4), Solutions),
     solution_has_completion(Solutions, " alpha", generated(sequence)),
     solution_has_completion(Solutions, " beta", generated(sequence)).
 
-run_test(supplied_grammar_constrains_earlier_local_value_hole) :-
+run_test(generic_text_application_constrains_earlier_local_value_hole) :-
     tool_analysis("A=\"\"; tool $A", span(3, 3), Solutions),
     solution_completion_texts_at(Solutions, span(3, 3), Texts),
     Texts = ["alpha", "beta"].
 
-run_test(supplied_grammar_uses_state_at_command_position) :-
+run_test(generic_text_application_uses_state_at_command_position) :-
     tool_analysis("A=\"\"; tool $A; A=omega", span(3, 3), Solutions),
     solution_completion_texts_at(Solutions, span(3, 3), Texts),
     Texts = ["alpha", "beta"].
 
-run_test(supplied_grammar_applies_at_each_command_position) :-
+run_test(generic_text_application_runs_at_each_command_position) :-
     tool_analysis("noop; A=\"\"; noop | tool $A && noop", span(9, 9),
                   Solutions),
     solution_completion_texts_at(Solutions, span(9, 9), Texts),
@@ -347,7 +380,7 @@ run_test(propagated_tear_retains_physical_utf8_byte_span) :-
     \+ solution_has_completion_at(Solutions, span(5, 5)).
 
 tool_analysis(Source, Span, Solutions) :-
-    brush_relation_grammar(Grammar),
+    text_application_fixture_grammar(Grammar),
     tool_grammar(ToolGrammar),
     transform(
         request(Grammar,
@@ -360,6 +393,35 @@ tool_analysis(Source, Span, Solutions) :-
                 want([status, completions, delta]), observations([]),
                 limits(64, 8192, 1048576)),
         reply(Solutions, _, _, [])).
+
+text_application_fixture_grammar(Grammar) :-
+    brush_syntax_grammar(Syntax),
+    brush_grammar:brush_text_projection_rules(TextRules),
+    StateRules = [
+        state_rule(node(assignment),
+                   [capture(name, field_text(name)),
+                    capture(value,
+                            field_symbolic_text(value, TextRules))],
+                   before([]),
+                   after([define(shell_variable, slot(name), slot(value),
+                                 escaping, replace)])),
+        state_rule(node(simple_parameter),
+                   [capture(name, field_text_or_hole(name))],
+                   before([use(node_identity, shell_variable, slot(name))]),
+                   after([])),
+        state_rule(node(command_words),
+                   [capture(source, node_symbolic_text(TextRules))],
+                   before([]),
+                   after([apply(node_identity,
+                                given_grammar(builtin_grammar),
+                                [binding(
+                                     source,
+                                     state_text_source(slot(source)))])]))
+    ],
+    StateGrammar = enrichment_grammar(
+        Syntax, [ast], ast_state_grammar(StateRules),
+        [steps, final_state, resolutions, delta, state_completions]),
+    Grammar = completion_union_grammar(StateGrammar, state_completions).
 
 tool_grammar(
     grammar(

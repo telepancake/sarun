@@ -279,31 +279,39 @@ Implementation order:
        is the provenance-free `(query id, query, outcome)` dependency value;
        provider identity/revision remains in the outer trace and cannot alter
        parsing when the typed result is unchanged.
-   [ ] Compose that handle at Brush command nodes after rich shell words cross
-       the boundary. The current proof accepts only already-cooked simple
-       words and deliberately rejects quoting and expansions rather than
-       flattening their provenance. Same-word concrete suffixes are preserved:
+   [x] Compose that handle at Brush command nodes after rich shell words cross
+       the boundary. The production builtin grammar is now the registered
+       typed-parser relation itself; the duplicated `CommandSyntax` catalog is
+       gone. Same-word concrete suffixes are preserved:
        `bind -m em|-standard` offers only the prefix `emacs`, after the real
        typed parser accepts the rejoined `emacs-standard`; incompatible
-       suffixes produce no completion.
+       suffixes produce no completion. Valid but unsupported symbolic branches
+       fail as relation alternatives without aborting sibling parse candidates.
    [x] Remove the engine's hard-coded nested-grammar `text_source` call shape.
        An AST/state application now supplies a unique list of named relation
        bindings, with `state_text_source(Expression)` as one generic
-       materializer. Application bindings explicitly replace inherited names;
-       the engine still knows neither Brush nor a command/parser kind. This is
+       materializer. The grammar reference is resolved from the outer request,
+       then the nested relation receives only its explicitly declared inputs;
+       no outer representation leaks into it. The engine still knows neither
+       Brush nor a command/parser kind. This is
        the API needed for the next `argv_source` materializer rather than an
        additional parsing mode.
-   [ ] Capture `command_words` as separate spanned symbolic command/argument
+   [x] Capture `command_words` as separate spanned symbolic command/argument
        fields, make quote/escape cooking grammar-owned, and replace the
-       temporary flat source binding with that `argv_source`.
-       [x] The generic AST adapter can now project repeated named fields as
-           `symbolic_word(Span, Fragments)`. Every literal, reference, tear,
-           or opaque fragment retains its source identity, physical UTF-8 byte
-           span, and grammar-declared attributes such as quote mode. References
-           also carry their exact use identity. The remaining work is to make
-           Brush declare the projection and replace the flat adapter input.
-3. [ ] Cut those two builtins to execute the typed invocation returned by that
-       same exact parser, then delete their generated `CommandSyntax` copies.
+       temporary flat source binding with `symbolic_argv`. Every literal,
+       reference, tear, or opaque fragment retains source identity, physical
+       UTF-8 byte span, and grammar-declared quote attributes. References carry
+       their exact use identity and are recursively materialized from local
+       state or explicit external observations. Source assists split successful
+       literal parses at the real cursor, retaining concrete suffixes and UTF-8
+       spans. Native tests cover gap, prefix, quote, propagated local tear,
+       opaque failure, and registered context replay.
+   [ ] Project assignment values into the same rich fragments and remove the
+       adapter's temporary `text([...])` local-value bridge. Then instrument
+       shared Brush expansion for splitting/globbing/substitution rather than
+       reproducing those semantics in the adapter.
+3. [ ] Cut the first builtins to execute the typed invocation returned by that
+       same exact parser probe.
 4. [ ] Adapt one simple uutils parser/executor split (`cat`), then one embedded
        operand grammar (`cut` or `chmod`) through the same boundary.
 5. [x] Add generic recording/suspending context to a parser that needs it. A
@@ -313,12 +321,38 @@ Implementation order:
        visible diagnostic rather than hidden provider access.
    [ ] Add Kati's `MakeInvocation` and its evaluated-target snapshot provider
        through the same protocol.
-6. [ ] Introduce `FindPlan`/`FindExpr`, move parse-time I/O into explicit
-       context/compile phases, and replace the temporary `-type` schema slice.
+6. [ ] Generalize the registered parser evidence ABI before adapting non-Clap
+       parsers. It currently leaks `clap::ValueHint`,
+       `clap::error::ErrorKind`, `clap_argument`, and the `brush_clap` provider
+       name across the otherwise neutral boundary. Replace those with parser-
+       neutral argument identity, display/help, optional value-domain identity,
+       finite values, status/diagnostics, and a `builtin_parser` dependency.
+       The existing Clap probe becomes one producer of that neutral evidence;
+       Find must not manufacture fake Clap metadata.
+   [ ] Add Find-owned rich argv/probe types and make execution and assist enter
+       the same internal parser. The current derived `FindBuiltin` Clap parser
+       accepts an opaque trailing `Vec<String>`; it is not Find's grammar. The
+       real seam is `findutils::find::parse_args` followed by
+       `matchers::build_top_level_matcher_with_input`.
+   [ ] Refactor the first real Find slice through a small argument cursor and
+       recording/suspending parse environment: starting-path/expression
+       classification, `-type`/`-xtype`, and their unique comma-list operand.
+       Concrete input keeps the current execution behavior. A tear records
+       compatible literals/value expectations and each candidate is replayed
+       through that same parser with its concrete suffix. This must restore
+       `find . -type |` and `A="|"; find . -type $A` without a metadata table in
+       sarun, Prolog, or the generic adapter.
+   [ ] Move Find's parse-time effects behind explicit environment operations:
+       output file creation, `-files0-from`, stat/time references, NSS
+       user/group resolution, and clock access. Assist emits typed
+       `ask(empty|one|all, Domain, Selector)` dependencies and suspends; it
+       never substitutes empty/default answers. Then introduce a neutral
+       `FindPlan`/`FindExpr` compile boundary and remove vendor patch 0180's
+       temporary file-type syntax catalog rather than expanding it.
 
-The generated `CommandSyntax` grammar remains a temporary viability client for
-coverage not yet adapted. It is not the target universal command grammar and
-must shrink as real parser adapters cross their exact-runtime gates.
+Commands whose execution parser does not yet expose a probe deliberately have
+no argument projection. The next adapters must expose their existing parser or
+instrument its normal parse path; no parallel command catalog is retained.
 
 ### 0. Preserve and measure the reference
 

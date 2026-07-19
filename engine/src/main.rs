@@ -26,7 +26,6 @@ pub use net::NetMode;
 
 mod brush;
 mod brush_relation;
-mod command_syntax;
 mod builtin_exec;
 mod capture;
 mod containers_conf;
@@ -546,10 +545,6 @@ fn main() {
         }
     }
     prolog::ensure_linked();
-    if let Err(error) = brush::probe_relation::register() {
-        eprintln!("sarun-engine: cannot register Brush parser relation: {error}");
-        std::process::exit(1);
-    }
 
     // Symlinked-as-`oaita` dispatch — same trick brush_sh / ninja / make use
     // below: when this engine binary is invoked under the name `oaita` (a

@@ -7,6 +7,7 @@ test_name(fields_emit_ordered_state_steps_from_utf8_source).
 test_name(before_and_after_emissions_wrap_child_nodes).
 test_name(symbolic_text_projection_is_declarative_ast_glue).
 test_name(symbolic_words_keep_fragment_origins_and_utf8_spans).
+test_name(source_assist_tear_splits_successful_literal_with_suffix).
 
 run_ast_state_relation_tests :-
     findall(Name, test_name(Name), Names),
@@ -158,3 +159,34 @@ run_test(symbolic_words_keep_fragment_origins_and_utf8_spans) :-
                     fragment(tear,
                              origin(fixture, span(12, 12), [quote(double)]),
                              edit_tear(edit, "", any))])])]).
+
+run_test(source_assist_tear_splits_successful_literal_with_suffix) :-
+    Ast = node(command_words, span(0, 5),
+               field(argument, span(0, 5),
+                     node(raw_text, span(0, 5), ignored))),
+    Rules = [state_rule(
+                 node(command_words),
+                 [capture(words,
+                          fields_symbolic_words(
+                              argument,
+                              [fragment_rule(
+                                   node(raw_text),
+                                   emit(source, literal, []))],
+                              [quote(unquoted)]))],
+                 before([]), after([words(slot(words))]))],
+    derive_ast_state_steps(
+        Rules,
+        Ast,
+        text_source("emλx", assist(edit, span(2, 2)), fixture),
+        [words([
+             symbolic_word(
+                 span(0, 5),
+                 [fragment(literal,
+                           origin(fixture, span(0, 2), [quote(unquoted)]),
+                           utf8("em")),
+                  fragment(tear,
+                           origin(fixture, span(2, 2), source_edit),
+                           edit_tear(edit, "", source_edit)),
+                  fragment(literal,
+                           origin(fixture, span(2, 5), [quote(unquoted)]),
+                           utf8("λx"))])])]).

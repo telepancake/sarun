@@ -1214,168 +1214,20 @@ pub(crate) fn builtin_command_probe(
         .copied()
 }
 
-/// Collect command-owned parser definitions into an immutable neutral schema.
-/// Clap-backed builtins and independently parsed commands enter the same list;
-/// the grammar adapter below has no command-name cases.
-fn builtin_command_syntax() -> &'static [crate::command_syntax::CommandSyntax] {
-    use crate::command_syntax::{
-        CommandOptionSyntax, CommandPositionalSyntax, CommandSyntax, CommandValueSyntax,
-        ContextCardinalitySyntax, ContextSelectorSyntax, FiniteDomainSyntax, FiniteValueSyntax,
-        LexicalSyntax,
-    };
-
-    fn path_domain(hint: clap::ValueHint) -> Option<&'static str> {
-        match hint {
-            clap::ValueHint::AnyPath => Some("filesystem_path"),
-            clap::ValueHint::FilePath => Some("filesystem_file"),
-            clap::ValueHint::DirPath => Some("filesystem_directory"),
-            clap::ValueHint::ExecutablePath => Some("filesystem_executable"),
-            _ => None,
-        }
-    }
-
-    static SYNTAX: std::sync::OnceLock<Vec<CommandSyntax>> = std::sync::OnceLock::new();
-    SYNTAX.get_or_init(|| {
-        let mut registrations = box_builtins::<brush_core::extensions::DefaultShellExtensions>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        registrations.sort_by(|left, right| left.0.cmp(&right.0));
-
-        let mut commands = registrations
-            .into_iter()
-            .filter_map(|(command_name, registration)| {
-                let definition = registration.definition_func?;
-                let mut command = definition();
-                command.build();
-                let command_description = command
-                    .get_about()
-                    .map_or_else(|| format!("{command_name} builtin"), ToString::to_string);
-                let mut options = Vec::new();
-                let mut positionals = Vec::new();
-                for argument in command.get_arguments().filter(|argument| {
-                    !argument.is_hide_set() && argument.get_action().takes_values()
-                }) {
-                    let description = argument.get_help().map_or_else(
-                        || format!("value for {}", argument.get_id()),
-                        ToString::to_string,
-                    );
-                    let values = argument
-                        .get_value_parser()
-                        .possible_values()
-                        .into_iter()
-                        .flatten()
-                        .filter(|value| !value.is_hide_set())
-                        .map(|value| FiniteValueSyntax {
-                            surface: value.get_name().to_string(),
-                            description: value
-                                .get_help()
-                                .or_else(|| argument.get_help())
-                                .map_or_else(
-                                    || format!("value for {}", argument.get_id()),
-                                    ToString::to_string,
-                                ),
-                        })
-                        .collect::<Vec<_>>();
-
-                    if argument.is_positional() {
-                        let value = if !values.is_empty() {
-                            Some(CommandValueSyntax::Finite(FiniteDomainSyntax {
-                                values,
-                                separator: None,
-                                unique: false,
-                                syntax: "builtin_argument".into(),
-                            }))
-                        } else {
-                            path_domain(argument.get_value_hint()).map(|domain| {
-                                CommandValueSyntax::Context {
-                                    domain: domain.into(),
-                                    syntax: "path".into(),
-                                    lexical: LexicalSyntax::NonEmptyCodepointsExcept(
-                                        " \t\r\n\\'\"$|&;()<>".into(),
-                                    ),
-                                    cardinality: ContextCardinalitySyntax::One,
-                                    selector: ContextSelectorSyntax::NameFromSurface,
-                                }
-                            })
-                        };
-                        let Some(value) = value else {
-                            continue;
-                        };
-                        let range = argument.get_num_args().unwrap_or_default();
-                        let minimum = if argument.is_required_set() {
-                            range.min_values()
-                        } else {
-                            0
-                        };
-                        positionals.push((
-                            argument.get_index().unwrap_or(usize::MAX),
-                            CommandPositionalSyntax {
-                                id: argument.get_id().to_string(),
-                                description,
-                                value,
-                                minimum,
-                                maximum: (range.max_values() != usize::MAX)
-                                    .then_some(range.max_values()),
-                            },
-                        ));
-                        continue;
-                    }
-
-                    if values.is_empty() {
-                        continue;
-                    }
-                    let mut spellings = Vec::new();
-                    if let Some(short) = argument.get_short() {
-                        spellings.push(format!("-{short}"));
-                    }
-                    if let Some(long) = argument.get_long() {
-                        spellings.push(format!("--{long}"));
-                    }
-                    if !spellings.is_empty() {
-                        options.push(CommandOptionSyntax {
-                            id: argument.get_id().to_string(),
-                            spellings,
-                            description,
-                            value: CommandValueSyntax::Finite(FiniteDomainSyntax {
-                                values,
-                                separator: None,
-                                unique: false,
-                                syntax: "builtin_argument".into(),
-                            }),
-                        });
-                    }
-                }
-                positionals.sort_by_key(|(index, _)| *index);
-                if options.is_empty() && positionals.is_empty() {
-                    return None;
-                }
-                Some(CommandSyntax {
-                    name: command_name,
-                    description: command_description,
-                    options,
-                    positionals: positionals
-                        .into_iter()
-                        .map(|(_, positional)| positional)
-                        .collect(),
-                    allow_opaque_words: false,
-                })
-            })
-            .collect::<Vec<_>>();
-        commands.push(crate::find_builtin::command_syntax());
-        commands.sort_by(|left, right| left.name.cmp(&right.name));
-        commands
-    })
-}
-
-/// Lower every registered command schema through one generic grammar adapter.
+/// The command grammar is the required host relation backed by the same typed
+/// parsers used at execution time. Shell syntax supplies resolved symbolic
+/// argv; the adapter supplies ordinary relation projections.
 pub(crate) fn builtin_command_grammar() -> Result<&'static crate::prolog::RelationValue, String> {
-    static GRAMMAR: std::sync::OnceLock<
-        Result<crate::prolog::RelationValue, crate::command_syntax::CommandSyntaxError>,
-    > = std::sync::OnceLock::new();
-    GRAMMAR
-        .get_or_init(|| crate::command_syntax::grammar(builtin_command_syntax()))
-        .as_ref()
-        .map_err(ToString::to_string)
+    static GRAMMAR: std::sync::OnceLock<crate::prolog::RelationValue> =
+        std::sync::OnceLock::new();
+    Ok(GRAMMAR.get_or_init(|| {
+        crate::prolog::RelationValue::Compound(
+            "registered_relation".into(),
+            vec![crate::prolog::RelationValue::Atom(
+                probe_relation::HANDLE.into(),
+            )],
+        )
+    }))
 }
 /// Build a box brush shell. `sh_mode=true` → POSIX; `false` → BASH mode.
 /// `shell_name`/`positional`/`cwd` are $0/$1../$PWD; `None` → brush-core defaults.
@@ -3404,68 +3256,6 @@ mod builtin_boundary_tests {
         )
         .await;
         assert_eq!(out, "700 600\nparent=0022");
-    }
-
-    #[test]
-    fn builtin_parser_projects_only_ordinary_grammar_values() {
-        fn has_compound(value: &crate::prolog::RelationValue, wanted: &str) -> bool {
-            match value {
-                crate::prolog::RelationValue::Compound(name, arguments) => {
-                    name == wanted
-                        || arguments
-                            .iter()
-                            .any(|argument| has_compound(argument, wanted))
-                }
-                crate::prolog::RelationValue::List(values) => {
-                    values.iter().any(|value| has_compound(value, wanted))
-                }
-                _ => false,
-            }
-        }
-
-        let value = super::builtin_command_grammar().unwrap();
-        let grammar = format!("{value:#?}");
-        assert!(grammar.contains("builtin_invocation"));
-        assert!(grammar.contains("emacs-standard"));
-        assert!(grammar.contains("filesystem_path"));
-        assert!(grammar.contains("command_edit_path_context"));
-        assert!(grammar.contains("find_file_type"));
-        assert!(has_compound(value, "grammar"));
-        assert!(has_compound(value, "context"));
-        assert!(!has_compound(value, "following"));
-        assert!(!has_compound(value, "positional"));
-    }
-
-    #[test]
-    fn find_command_schema_is_the_findutils_catalog_projection() {
-        let find = super::builtin_command_syntax()
-            .iter()
-            .find(|command| command.name == "find")
-            .expect("find command schema");
-        assert!(find.allow_opaque_words);
-        assert_eq!(
-            find.options
-                .iter()
-                .flat_map(|option| &option.spellings)
-                .map(String::as_str)
-                .collect::<Vec<_>>(),
-            ["-type", "-xtype"]
-        );
-        for option in &find.options {
-            let crate::command_syntax::CommandValueSyntax::Finite(domain) = &option.value else {
-                panic!("find file-type option is not finite");
-            };
-            assert_eq!(
-                domain
-                    .values
-                    .iter()
-                    .map(|value| value.surface.as_str())
-                    .collect::<Vec<_>>(),
-                ["b", "c", "d", "f", "l", "p", "s"]
-            );
-            assert_eq!(domain.separator, Some(','));
-            assert!(domain.unique);
-        }
     }
 
     #[test]
