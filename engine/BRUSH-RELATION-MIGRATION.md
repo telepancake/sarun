@@ -219,6 +219,59 @@ binaries without executing them is not a gate. The production backward-
 completion test, editor insertion test, and real editor PTY are green at this
 checkpoint.
 
+### Existing-parser adaptation checkpoint (active, 2026-07-19)
+
+Do not grow the neutral `CommandSyntax` bootstrap into a second implementation
+of Clap, find, Kati, coreutils, or any embedded operand language. The preferred
+integration boundary is a registered parser relation behind an opaque grammar
+handle:
+
+```
+rich source/argv + optional tear + observations
+    <-> command-owned parser adapter
+    <-> typed invocation AST + parse evidence + context queries
+```
+
+The same adapter has two projections, not two parsers. Exact execution parsing
+returns the typed invocation consumed by the existing executor. Assist parsing
+also records the successful parser path, expected terminals/value domains,
+source spans, and suspended context requirements at the tear. The generic
+relation engine composes those results with shell state, nested grammars, and
+external observations; it never switches on command names or parser kinds.
+
+A fake environment must be recording and suspending, not a no-op that returns
+empty/default values. When parsing needs external information, it emits the
+ordinary `ask(empty|one|all, Domain, Selector)` query and suspends that
+candidate. After the relation resolves the observation, the parser adapter is
+replayed deterministically. Locally defined values continue to resolve inside
+the relation without external queries.
+
+The input adapter must preserve cooked bytes, physical source spans, symbolic
+values, and a typed zero-width tear. Existing parsers may keep their functional
+core, but conversions to plain `String`, `OsString`, or `&str` must not erase
+the provenance needed for evidence and completion. Parsing must be separated
+from execution where an existing entry point currently performs I/O while
+recognizing arguments.
+
+Implementation order:
+
+1. [ ] Add the generic registered-parser request/result boundary and bounds;
+       prove that the engine treats it as an ordinary grammar relation.
+2. [ ] Instrument the shared Brush/Clap command boundary once. Prove exact and
+       assist projections with `edit` and `bind`; do not add command-name cases.
+3. [ ] Cut those two builtins to execute the typed invocation returned by that
+       same exact parser, then delete their generated `CommandSyntax` copies.
+4. [ ] Adapt one simple uutils parser/executor split (`cat`), then one embedded
+       operand grammar (`cut` or `chmod`) through the same boundary.
+5. [ ] Add recording/suspending context to a parser that needs it, followed by
+       Kati's `MakeInvocation` and its evaluated-target snapshot provider.
+6. [ ] Introduce `FindPlan`/`FindExpr`, move parse-time I/O into explicit
+       context/compile phases, and replace the temporary `-type` schema slice.
+
+The generated `CommandSyntax` grammar remains a temporary viability client for
+coverage not yet adapted. It is not the target universal command grammar and
+must shrink as real parser adapters cross their exact-runtime gates.
+
 ### 0. Preserve and measure the reference
 
 - [x] Inventory every `Shell::parse_string`, `run_string`, `run_program`,
@@ -314,7 +367,7 @@ checkpoint.
       adapter preserves terminal holes and normalizes adjacent text. Brush
       assignments now store `text([...])` values, so a tear inside `A="|"`
       survives local resolution at a later `$A` use.
-- [ ] Compose an ordinary supplied command grammar at each parsed Brush command
+- [x] Compose an ordinary supplied command grammar at each parsed Brush command
       position, including propagation through locally resolved shell values.
       The removed `signature`/`following`/`positional` mini-language is not an
       acceptable implementation. The target fixture remains
