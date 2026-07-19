@@ -1,0 +1,715 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Sun, 19 Jul 2026 18:37:31 +0000
+Subject: [PATCH] find: defer output creation until execution preparation
+
+Keep -fprint, -fprintf, -fprint0, and -fls destinations unresolved while the real argument parser builds its matcher tree. Prepare the tree only after complete successful parsing and help/version handling, resolving relative outputs through the injected logical cwd. This keeps parser replay effect-free and makes the preparation seam recursive through every logical matcher.
+
+---
+diff --git a/src/find/matchers/logical_matchers.rs b/src/find/matchers/logical_matchers.rs
+index a892e12..59fc603 100644
+--- a/src/find/matchers/logical_matchers.rs
++++ b/src/find/matchers/logical_matchers.rs
+@@ -12,7 +12,7 @@
+ use std::error::Error;
+ use std::path::Path;
+ 
+-use super::{Matcher, MatcherIO, WalkEntry};
++use super::{FindOperations, Matcher, MatcherIO, WalkEntry};
+ 
+ /// This matcher contains a collection of other matchers. A file only matches
+ /// if it matches ALL the contained sub-matchers. For sub-matchers that have
+@@ -29,6 +29,13 @@ impl AndMatcher {
+ }
+ 
+ impl Matcher for AndMatcher {
++    fn prepare(&mut self, operations: &dyn FindOperations) -> Result<(), Box<dyn Error>> {
++        for matcher in &mut self.submatchers {
++            matcher.prepare(operations)?;
++        }
++        Ok(())
++    }
++
+     /// Returns true if all sub-matchers return true. Short-circuiting does take
+     /// place. If the nth sub-matcher returns false, then we immediately return
+     /// and don't make any further calls.
+@@ -105,6 +112,13 @@ impl OrMatcher {
+ }
+ 
+ impl Matcher for OrMatcher {
++    fn prepare(&mut self, operations: &dyn FindOperations) -> Result<(), Box<dyn Error>> {
++        for matcher in &mut self.submatchers {
++            matcher.prepare(operations)?;
++        }
++        Ok(())
++    }
++
+     /// Returns true if any sub-matcher returns true. Short-circuiting does take
+     /// place. If the nth sub-matcher returns true, then we immediately return
+     /// and don't make any further calls.
+@@ -203,6 +217,13 @@ impl ListMatcher {
+ }
+ 
+ impl Matcher for ListMatcher {
++    fn prepare(&mut self, operations: &dyn FindOperations) -> Result<(), Box<dyn Error>> {
++        for matcher in &mut self.submatchers {
++            matcher.prepare(operations)?;
++        }
++        Ok(())
++    }
++
+     /// Calls matches on all submatcher objects, with no short-circuiting.
+     /// Returns the result of the call to the final submatcher
+     fn matches(&self, dir_entry: &WalkEntry, matcher_io: &mut MatcherIO) -> bool {
+@@ -338,6 +359,10 @@ impl NotMatcher {
+ }
+ 
+ impl Matcher for NotMatcher {
++    fn prepare(&mut self, operations: &dyn FindOperations) -> Result<(), Box<dyn Error>> {
++        self.submatcher.prepare(operations)
++    }
++
+     fn matches(&self, dir_entry: &WalkEntry, matcher_io: &mut MatcherIO) -> bool {
+         !self.submatcher.matches(dir_entry, matcher_io)
+     }
+diff --git a/src/find/matchers/ls.rs b/src/find/matchers/ls.rs
+index 796e8eb..697d749 100644
+--- a/src/find/matchers/ls.rs
++++ b/src/find/matchers/ls.rs
+@@ -9,7 +9,8 @@ use std::{
+     io::Write,
+ };
+ 
+-use super::{Matcher, MatcherIO, WalkEntry};
++use super::output::OutputTarget;
++use super::{FindOperations, Matcher, MatcherIO, WalkEntry};
+ 
+ #[cfg(unix)]
+ fn format_permissions(mode: uucore::libc::mode_t) -> String {
+@@ -110,12 +111,16 @@ fn format_permissions(file_attributes: u32) -> String {
+ }
+ 
+ pub struct Ls {
+-    output_file: Option<File>,
++    output: OutputTarget,
+ }
+ 
+ impl Ls {
+     pub fn new(output_file: Option<File>) -> Self {
+-        Self { output_file }
++        Self::new_output(OutputTarget::from_file(output_file))
++    }
++
++    pub(super) fn new_output(output: OutputTarget) -> Self {
++        Self { output }
+     }
+ 
+     #[cfg(unix)]
+@@ -269,7 +274,7 @@ impl Ls {
+ 
+ impl Matcher for Ls {
+     fn matches(&self, file_info: &WalkEntry, matcher_io: &mut MatcherIO) -> bool {
+-        if let Some(file) = &self.output_file {
++        if let Some(file) = self.output.file() {
+             self.print(file_info, matcher_io, file, true);
+         } else {
+             self.print(
+@@ -285,6 +290,13 @@ impl Matcher for Ls {
+     fn has_side_effects(&self) -> bool {
+         true
+     }
++
++    fn prepare(
++        &mut self,
++        operations: &dyn FindOperations,
++    ) -> Result<(), Box<dyn std::error::Error>> {
++        self.output.prepare(operations)
++    }
+ }
+ 
+ #[cfg(test)]
+diff --git a/src/find/matchers/mod.rs b/src/find/matchers/mod.rs
+index 2cc7722..e306810 100644
+--- a/src/find/matchers/mod.rs
++++ b/src/find/matchers/mod.rs
+@@ -16,6 +16,7 @@ mod lname;
+ mod logical_matchers;
+ mod ls;
+ mod name;
++mod output;
+ mod path;
+ mod perm;
+ mod printer;
+@@ -41,6 +42,7 @@ use self::logical_matchers::{
+     AndMatcherBuilder, FalseMatcher, ListMatcherBuilder, NotMatcher, TrueMatcher,
+ };
+ use self::name::NameMatcher;
++use self::output::OutputTarget;
+ use self::path::PathMatcher;
+ use self::perm::PermMatcher;
+ use self::printer::{PrintDelimiter, Printer};
+@@ -71,7 +73,7 @@ use std::{
+     time::SystemTime,
+ };
+ 
+-use super::{Config, Dependencies};
++use super::{Config, Dependencies, FindOperations};
+ 
+ pub use entry::{FileType, WalkEntry, WalkError};
+ pub use regex::RegexType;
+@@ -266,6 +268,13 @@ pub trait Matcher: 'static {
+         false
+     }
+ 
++    /// Commit resources required by this matcher after the complete command
++    /// line has parsed. Syntax probing constructs and drops the same matcher
++    /// tree without calling this method.
++    fn prepare(&mut self, _operations: &dyn FindOperations) -> Result<(), Box<dyn Error>> {
++        Ok(())
++    }
++
+     /// Notification that find is leaving a given directory.
+     fn finished_dir(&self, _finished_directory: &Path, _matcher_io: &mut MatcherIO) {}
+ 
+@@ -288,6 +297,10 @@ impl Matcher for Box<dyn Matcher> {
+         (**self).has_side_effects()
+     }
+ 
++    fn prepare(&mut self, operations: &dyn FindOperations) -> Result<(), Box<dyn Error>> {
++        (**self).prepare(operations)
++    }
++
+     fn finished_dir(&self, finished_directory: &Path, matcher_io: &mut MatcherIO) {
+         (**self).finished_dir(finished_directory, matcher_io);
+     }
+@@ -502,13 +515,6 @@ fn parse_str_to_newer_args(input: &str) -> Option<(String, String)> {
+     }
+ }
+ 
+-/// Creates a file if it doesn't exist.
+-/// If it does exist, it will be overwritten.
+-fn get_or_create_file(path: &str) -> Result<File, Box<dyn Error>> {
+-    let file = File::create(path)?;
+-    Ok(file)
+-}
+-
+ /// The main "translate command-line args into a matcher" function. Will call
+ /// itself recursively if it encounters an opening bracket. A successful return
+ /// consists of a tuple containing the new index into the args array to use (if
+@@ -586,8 +592,13 @@ fn build_matcher_tree(
+                 }
+                 i += 1;
+ 
+-                let file = get_or_create_file(args[i])?;
+-                Some(Printer::new(PrintDelimiter::Newline, Some(file)).into_box())
++                Some(
++                    Printer::new_output(
++                        PrintDelimiter::Newline,
++                        OutputTarget::pending(args[i]),
++                    )
++                    .into_box(),
++                )
+             }
+             "-fprintf" => {
+                 if i + 2 >= args.len() {
+@@ -598,9 +609,9 @@ fn build_matcher_tree(
+                 // Args + 1: output file path
+                 // Args + 2: format string
+                 i += 1;
+-                let file = get_or_create_file(args[i])?;
++                let output = OutputTarget::pending(args[i]);
+                 i += 1;
+-                Some(Printf::new(args[i], Some(file))?.into_box())
++                Some(Printf::new_output(args[i], output)?.into_box())
+             }
+             "-fprint0" => {
+                 if i >= args.len() - 1 {
+@@ -608,8 +619,13 @@ fn build_matcher_tree(
+                 }
+                 i += 1;
+ 
+-                let file = get_or_create_file(args[i])?;
+-                Some(Printer::new(PrintDelimiter::Null, Some(file)).into_box())
++                Some(
++                    Printer::new_output(
++                        PrintDelimiter::Null,
++                        OutputTarget::pending(args[i]),
++                    )
++                    .into_box(),
++                )
+             }
+             "-ls" => Some(Ls::new(None).into_box()),
+             "-fls" => {
+@@ -618,8 +634,7 @@ fn build_matcher_tree(
+                 }
+                 i += 1;
+ 
+-                let file = get_or_create_file(args[i])?;
+-                Some(Ls::new(Some(file)).into_box())
++                Some(Ls::new_output(OutputTarget::pending(args[i])).into_box())
+             }
+             "-true" => Some(TrueMatcher.into_box()),
+             "-false" => Some(FalseMatcher.into_box()),
+@@ -2013,29 +2028,4 @@ mod tests {
+         assert!(config.version_requested);
+     }
+ 
+-    #[test]
+-    fn get_or_create_file_test() {
+-        use std::fs;
+-
+-        // remove file if hard link file exist.
+-        // But you can't delete a file that doesn't exist,
+-        // so ignore the error returned here.
+-        let _ = fs::remove_file("test_data/get_or_create_file_test");
+-
+-        // test create file
+-        let file = get_or_create_file("test_data/get_or_create_file_test");
+-        assert!(file.is_ok());
+-
+-        let file = get_or_create_file("test_data/get_or_create_file_test");
+-        assert!(file.is_ok());
+-
+-        // test error when file no permission
+-        #[cfg(unix)]
+-        {
+-            let result = get_or_create_file("/etc/shadow");
+-            assert!(result.is_err());
+-        }
+-
+-        let _ = fs::remove_file("test_data/get_or_create_file_test");
+-    }
+ }
+diff --git a/src/find/matchers/output.rs b/src/find/matchers/output.rs
+new file mode 100644
+index 0000000..cdcc451
+--- /dev/null
++++ b/src/find/matchers/output.rs
+@@ -0,0 +1,42 @@
++use std::error::Error;
++use std::fs::File;
++use std::path::{Path, PathBuf};
++
++use crate::find::FindOperations;
++
++/// An action output selected by the parser but opened only during preparation.
++pub(super) enum OutputTarget {
++    Standard,
++    Open(File),
++    Pending(PathBuf),
++}
++
++impl OutputTarget {
++    pub(super) fn from_file(file: Option<File>) -> Self {
++        file.map_or(Self::Standard, Self::Open)
++    }
++
++    pub(super) fn pending(path: impl AsRef<Path>) -> Self {
++        Self::Pending(path.as_ref().to_path_buf())
++    }
++
++    pub(super) fn prepare(
++        &mut self,
++        operations: &dyn FindOperations,
++    ) -> Result<(), Box<dyn Error>> {
++        if let Self::Pending(path) = self {
++            *self = Self::Open(operations.create_output(path)?);
++        }
++        Ok(())
++    }
++
++    pub(super) fn file(&self) -> Option<&File> {
++        match self {
++            Self::Standard => None,
++            Self::Open(file) => Some(file),
++            Self::Pending(path) => {
++                panic!("output target '{}' was not prepared", path.display())
++            }
++        }
++    }
++}
+diff --git a/src/find/matchers/printer.rs b/src/find/matchers/printer.rs
+index 4627958..65cafcb 100644
+--- a/src/find/matchers/printer.rs
++++ b/src/find/matchers/printer.rs
+@@ -7,7 +7,8 @@
+ use std::fs::File;
+ use std::io::Write;
+ 
+-use super::{Matcher, MatcherIO, WalkEntry};
++use super::output::OutputTarget;
++use super::{FindOperations, Matcher, MatcherIO, WalkEntry};
+ 
+ pub enum PrintDelimiter {
+     Newline,
+@@ -26,14 +27,18 @@ impl std::fmt::Display for PrintDelimiter {
+ /// This matcher just prints the name of the file to stdout.
+ pub struct Printer {
+     delimiter: PrintDelimiter,
+-    output_file: Option<File>,
++    output: OutputTarget,
+ }
+ 
+ impl Printer {
+     pub fn new(delimiter: PrintDelimiter, output_file: Option<File>) -> Self {
++        Self::new_output(delimiter, OutputTarget::from_file(output_file))
++    }
++
++    pub(super) fn new_output(delimiter: PrintDelimiter, output: OutputTarget) -> Self {
+         Self {
+             delimiter,
+-            output_file,
++            output,
+         }
+     }
+ 
+@@ -70,7 +75,7 @@ impl Printer {
+ 
+ impl Matcher for Printer {
+     fn matches(&self, file_info: &WalkEntry, matcher_io: &mut MatcherIO) -> bool {
+-        if let Some(file) = &self.output_file {
++        if let Some(file) = self.output.file() {
+             self.print(file_info, matcher_io, file, true);
+         } else {
+             self.print(
+@@ -86,6 +91,13 @@ impl Matcher for Printer {
+     fn has_side_effects(&self) -> bool {
+         true
+     }
++
++    fn prepare(
++        &mut self,
++        operations: &dyn FindOperations,
++    ) -> Result<(), Box<dyn std::error::Error>> {
++        self.output.prepare(operations)
++    }
+ }
+ 
+ #[cfg(test)]
+diff --git a/src/find/matchers/printf.rs b/src/find/matchers/printf.rs
+index fe57443..b6a2673 100644
+--- a/src/find/matchers/printf.rs
++++ b/src/find/matchers/printf.rs
+@@ -12,7 +12,8 @@ use std::{borrow::Cow, io::Write};
+ 
+ use chrono::{format::StrftimeItems, DateTime, FixedOffset, Local, Utc};
+ 
+-use super::{logical_offset, FileType, Matcher, MatcherIO, WalkEntry, WalkError};
++use super::output::OutputTarget;
++use super::{logical_offset, FileType, FindOperations, Matcher, MatcherIO, WalkEntry, WalkError};
+ 
+ #[cfg(unix)]
+ use std::os::unix::prelude::MetadataExt;
+@@ -595,14 +596,18 @@ fn format_directive<'entry>(
+ /// find's printf syntax.
+ pub struct Printf {
+     format: FormatString,
+-    output_file: Option<File>,
++    output: OutputTarget,
+ }
+ 
+ impl Printf {
+     pub fn new(format: &str, output_file: Option<File>) -> Result<Self, Box<dyn Error>> {
++        Self::new_output(format, OutputTarget::from_file(output_file))
++    }
++
++    pub(super) fn new_output(format: &str, output: OutputTarget) -> Result<Self, Box<dyn Error>> {
+         Ok(Self {
+             format: FormatString::parse(format)?,
+-            output_file,
++            output,
+         })
+     }
+ 
+@@ -657,7 +662,7 @@ impl Matcher for Printf {
+         // sarun: the box shell's LOGICAL TZ (None ⇒ process local zone).
+         let tz = matcher_io.tz();
+         let tz = tz.as_deref();
+-        if let Some(file) = &self.output_file {
++        if let Some(file) = self.output.file() {
+             self.print(
+                 file_info,
+                 file,
+@@ -681,6 +686,10 @@ impl Matcher for Printf {
+     fn has_side_effects(&self) -> bool {
+         true
+     }
++
++    fn prepare(&mut self, operations: &dyn FindOperations) -> Result<(), Box<dyn Error>> {
++        self.output.prepare(operations)
++    }
+ }
+ 
+ #[cfg(test)]
+diff --git a/src/find/mod.rs b/src/find/mod.rs
+index 15d5fce..e84fd54 100644
+--- a/src/find/mod.rs
++++ b/src/find/mod.rs
+@@ -19,6 +19,29 @@ use std::rc::Rc;
+ use std::time::SystemTime;
+ use walkdir::WalkDir;
+ 
++/// Operations committed after the complete command line has parsed.
++///
++/// Keeping these out of matcher construction makes the parser safe to replay
++/// for syntax assistance: a speculative parse must never create or truncate a
++/// user's output file.
++pub trait FindOperations {
++    fn create_output(&self, path: &std::path::Path) -> io::Result<std::fs::File>;
++}
++
++struct DependencyFindOperations<'a> {
++    dependencies: &'a dyn Dependencies,
++}
++
++impl FindOperations for DependencyFindOperations<'_> {
++    fn create_output(&self, path: &std::path::Path) -> io::Result<std::fs::File> {
++        let resolved = match self.dependencies.cwd() {
++            Some(cwd) if path.is_relative() => cwd.join(path),
++            _ => path.to_path_buf(),
++        };
++        std::fs::File::create(resolved)
++    }
++}
++
+ pub struct Config {
+     same_file_system: bool,
+     depth_first: bool,
+@@ -471,7 +494,7 @@ fn process_dir(
+ }
+ 
+ fn do_find(args: &[&str], deps: &dyn Dependencies) -> Result<i32, Box<dyn Error>> {
+-    let paths_and_matcher = parse_args(args, &mut *deps.get_input().borrow_mut())?;
++    let mut paths_and_matcher = parse_args(args, &mut *deps.get_input().borrow_mut())?;
+     // Emit any non-fatal parse-time diagnostics (e.g. a zero-length name in
+     // -files0-from) through the injected error sink, before walking.
+     for warning in &paths_and_matcher.config.parse_warnings {
+@@ -486,6 +509,13 @@ fn do_find(args: &[&str], deps: &dyn Dependencies) -> Result<i32, Box<dyn Error>
+         return Ok(0);
+     }
+ 
++    // Parsing above is deliberately free of output-file effects. Only after
++    // the complete command line has succeeded (and help/version have returned)
++    // do we commit resources needed by action matchers.
++    paths_and_matcher.matcher.prepare(&DependencyFindOperations {
++        dependencies: deps,
++    })?;
++
+     let mut ret = 0;
+     let mut quit = false;
+     for path in paths_and_matcher.paths {
+@@ -664,6 +694,7 @@ mod tests {
+         pub error_output: RefCell<Cursor<Vec<u8>>>,
+         input: RefCell<Cursor<Vec<u8>>>,
+         now: SystemTime,
++        cwd: Option<PathBuf>,
+         /// Preset responses for confirm(), consumed front-to-back.
+         confirm_responses: RefCell<std::collections::VecDeque<bool>>,
+     }
+@@ -675,6 +706,7 @@ mod tests {
+                 error_output: RefCell::new(Cursor::new(Vec::<u8>::new())),
+                 input: RefCell::new(Cursor::new(Vec::<u8>::new())),
+                 now: SystemTime::now(),
++                cwd: None,
+                 confirm_responses: RefCell::new(std::collections::VecDeque::new()),
+             }
+         }
+@@ -697,6 +729,10 @@ mod tests {
+             self.now = new_time;
+         }
+ 
++        pub fn set_cwd(&mut self, cwd: impl Into<PathBuf>) {
++            self.cwd = Some(cwd.into());
++        }
++
+         pub fn new_matcher_io(&'a self) -> MatcherIO<'a> {
+             MatcherIO::new(self)
+         }
+@@ -740,6 +776,10 @@ mod tests {
+                 .pop_front()
+                 .unwrap_or(false)
+         }
++
++        fn cwd(&self) -> Option<&std::path::Path> {
++            self.cwd.as_deref()
++        }
+     }
+ 
+     fn create_file_link() {
+@@ -830,6 +870,176 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn parsing_and_probing_output_actions_do_not_create_files() {
++        let temp_dir = Builder::new().prefix("find-output-parse").tempdir().unwrap();
++        let fprint = temp_dir.path().join("fprint");
++        let fprintf = temp_dir.path().join("fprintf");
++        let fprint0 = temp_dir.path().join("fprint0");
++        let fls = temp_dir.path().join("fls");
++        let fprint_text = fprint.to_string_lossy();
++        let fprintf_text = fprintf.to_string_lossy();
++        let fprint0_text = fprint0.to_string_lossy();
++        let fls_text = fls.to_string_lossy();
++
++        parse_args(
++            &[
++                ".",
++                "-fprint",
++                fprint_text.as_ref(),
++                "-fprintf",
++                fprintf_text.as_ref(),
++                "%p",
++                "-fprint0",
++                fprint0_text.as_ref(),
++                "-fls",
++                fls_text.as_ref(),
++            ],
++            &mut std::io::empty(),
++        )
++        .expect("the output actions should parse");
++        for output in [&fprint, &fprintf, &fprint0, &fls] {
++            assert!(!output.exists(), "parsing must not create {output:?}");
++        }
++
++        let probe_output = temp_dir.path().join("probe-output");
++        let probe_output_text = probe_output.to_string_lossy();
++        let result = probe::probe(&[
++            probe::ProbeArgument::Exact("."),
++            probe::ProbeArgument::Exact("-fprint"),
++            probe::ProbeArgument::Exact(probe_output_text.as_ref()),
++        ]);
++        assert_eq!(result.status, probe::ProbeStatus::Unsupported);
++        assert!(!probe_output.exists(), "probing must not create the output");
++    }
++
++    #[test]
++    fn parse_failure_after_output_action_does_not_truncate() {
++        let temp_dir = Builder::new().prefix("find-output-failure").tempdir().unwrap();
++        let output = temp_dir.path().join("kept");
++        fs::write(&output, b"keep me").unwrap();
++        let output_text = output.to_string_lossy();
++
++        let deps = FakeDependencies::new();
++        let rc = find_main(
++            &["find", ".", "-fprint", output_text.as_ref(), "-and"],
++            &deps,
++        );
++
++        assert_eq!(rc, 1);
++        assert_eq!(fs::read(&output).unwrap(), b"keep me");
++    }
++
++    #[test]
++    fn help_after_output_action_does_not_truncate() {
++        let temp_dir = Builder::new().prefix("find-output-help").tempdir().unwrap();
++        let output = temp_dir.path().join("kept");
++        fs::write(&output, b"keep me").unwrap();
++        let output_text = output.to_string_lossy();
++
++        let deps = FakeDependencies::new();
++        let rc = find_main(
++            &["find", ".", "-fprint", output_text.as_ref(), "-help"],
++            &deps,
++        );
++
++        assert_eq!(rc, 0);
++        assert_eq!(fs::read(&output).unwrap(), b"keep me");
++    }
++
++    #[test]
++    fn execution_prepares_and_writes_output_action() {
++        let temp_dir = Builder::new().prefix("find-output-execute").tempdir().unwrap();
++        let root = temp_dir.path().join("root");
++        fs::create_dir(&root).unwrap();
++        let output = temp_dir.path().join("result");
++        let root_text = root.to_string_lossy();
++        let output_text = output.to_string_lossy();
++
++        let deps = FakeDependencies::new();
++        let rc = find_main(
++            &[
++                "find",
++                root_text.as_ref(),
++                "-maxdepth",
++                "0",
++                "-fprint",
++                output_text.as_ref(),
++            ],
++            &deps,
++        );
++
++        assert_eq!(rc, 0);
++        assert_eq!(
++            fs::read_to_string(output).unwrap(),
++            format!("{}\n", root.display())
++        );
++    }
++
++    #[test]
++    fn relative_output_action_uses_logical_cwd() {
++        let temp_dir = Builder::new().prefix("find-output-cwd").tempdir().unwrap();
++        let output_name = "logical-output";
++        let process_output = std::env::current_dir().unwrap().join(output_name);
++        assert!(!process_output.exists());
++
++        let mut deps = FakeDependencies::new();
++        deps.set_cwd(temp_dir.path());
++        let rc = find_main(
++            &[
++                "find",
++                ".",
++                "-maxdepth",
++                "0",
++                "-fprint",
++                output_name,
++            ],
++            &deps,
++        );
++
++        assert_eq!(rc, 0);
++        assert_eq!(
++            fs::read_to_string(temp_dir.path().join(output_name)).unwrap(),
++            ".\n"
++        );
++        assert!(!process_output.exists());
++    }
++
++    #[test]
++    fn output_preparation_recurses_through_logical_combinators() {
++        let temp_dir = Builder::new().prefix("find-output-nested").tempdir().unwrap();
++        let root = temp_dir.path().join("root");
++        fs::create_dir(&root).unwrap();
++        let output = temp_dir.path().join("nested-output");
++        let root_text = root.to_string_lossy();
++        let output_text = output.to_string_lossy();
++
++        let deps = FakeDependencies::new();
++        let rc = find_main(
++            &[
++                "find",
++                root_text.as_ref(),
++                "(",
++                "-true",
++                "-and",
++                "!",
++                "(",
++                "-false",
++                "-or",
++                "-false",
++                ",",
++                "-fprint",
++                output_text.as_ref(),
++                ")",
++                ")",
++            ],
++            &deps,
++        );
++
++        assert_eq!(rc, 0);
++        assert!(output.exists());
++    }
++
+     #[test]
+     fn files0_from_dash_reads_injected_input_not_process_stdin() {
+         // `-files0-from -` must read the injected logical stdin, not the host
