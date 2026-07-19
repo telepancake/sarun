@@ -620,6 +620,7 @@ def _write_validated_callgate(document: dict, output: Path) -> None:
 
 def _load_scratch_regions(
     path: Path, expected_vmlinux_sha256: str, expected_build_id: str,
+    expected_arch: str,
 ) -> tuple[Path, dict[str, dict[str, int]]]:
     """Load symbol-derived scratch GVAs and bind them to the exact kernel."""
 
@@ -636,8 +637,10 @@ def _load_scratch_regions(
         raise AuditError(
             f"scratch regions schema must be {SCRATCH_REGIONS_SCHEMA!r}"
         )
-    if document.get("arch") != "aarch64":
-        raise AuditError("scratch regions document must describe aarch64")
+    if document.get("arch") != expected_arch:
+        raise AuditError(
+            f"scratch regions document must describe {expected_arch}"
+        )
     kernel = document.get("vmlinux")
     if not isinstance(kernel, dict):
         raise AuditError("scratch regions vmlinux must be an object")
@@ -668,9 +671,27 @@ def _load_scratch_regions(
             raise AuditError(f"scratch region {name} must be an object")
         gva = _manifest_integer(raw.get("gva"), f"scratch.regions.{name}.gva")
         size = _manifest_integer(raw.get("size"), f"scratch.regions.{name}.size")
-        if gva >= UINT64_LIMIT or size <= 0 or gva + size > UINT64_LIMIT:
-            raise AuditError(f"scratch region {name} has invalid 64-bit bounds")
-        regions[name] = {"gva": gva, "size": size}
+        address_bits = 64 if expected_arch == "aarch64" else 32
+        address_limit = 1 << address_bits
+        if gva >= address_limit or size <= 0 or gva + size > address_limit:
+            raise AuditError(
+                f"scratch region {name} has invalid {address_bits}-bit bounds"
+            )
+        region = {"gva": gva, "size": size}
+        if expected_arch == "mmips":
+            gpa = _manifest_integer(
+                raw.get("gpa"), f"scratch.regions.{name}.gpa"
+            )
+            if not 0x80000000 <= gva or gva + size > 0xa0000000:
+                raise AuditError(
+                    f"scratch region {name} must remain wholly in MMIPS KSEG0"
+                )
+            if gpa != gva - 0x80000000:
+                raise AuditError(
+                    f"scratch region {name} GPA does not match its KSEG0 mapping"
+                )
+            region["gpa"] = gpa
+        regions[name] = region
     return scratch_path, regions
 
 
@@ -679,19 +700,19 @@ def create_callgate_manifest(args):
 
     package_path = Path(args.package).resolve()
     package, binary = load_probe_package(package_path)
-    if package["arch"] != "aarch64":
-        raise AuditError(
-            "callgate-manifest currently requires an aarch64 probe package"
-        )
+    arch = package["arch"]
+    address_bits = 64 if arch == "aarch64" else 32
     if (
         not isinstance(args.init_task, int) or isinstance(args.init_task, bool)
-        or args.init_task <= 0 or args.init_task >= 1 << 64
+        or args.init_task <= 0 or args.init_task >= 1 << address_bits
     ):
-        raise AuditError("init_task must be a nonzero 64-bit address")
+        raise AuditError(
+            f"init_task must be a nonzero {address_bits}-bit address"
+        )
     vmlinux = Path(args.vmlinux).resolve()
     if not vmlinux.is_file():
         raise AuditError(f"vmlinux does not name a regular file: {vmlinux}")
-    build_id = gnu_build_id(vmlinux)
+    build_id = gnu_build_id(vmlinux, arch)
     vmlinux_sha256 = _sha256_file(vmlinux)
     package_kernel = package["kernel"]
     if package_kernel["sha256"] != vmlinux_sha256:
@@ -726,21 +747,32 @@ def create_callgate_manifest(args):
                 "--scratch-regions cannot be mixed with explicit GVA/size inputs: "
                 + ", ".join(ambiguous)
             )
+        supplied_gpas = [
+            f"--{name}-gpa" for name, values in region_arguments.items()
+            if values["gpa"] is not None
+        ]
+        if arch == "mmips" and supplied_gpas:
+            raise AuditError(
+                "MMIPS --scratch-regions already contains exact KSEG0 mappings; "
+                "do not supply " + ", ".join(supplied_gpas)
+            )
         missing_gpas = [
             f"--{name}-gpa" for name, values in region_arguments.items()
             if values["gpa"] is None
         ]
-        if missing_gpas:
+        if arch == "aarch64" and missing_gpas:
             raise AuditError(
                 "--scratch-regions requires all three physical mappings: "
                 + ", ".join(missing_gpas)
             )
         scratch_path, discovered = _load_scratch_regions(
-            Path(scratch_argument), vmlinux_sha256, build_id,
+            Path(scratch_argument), vmlinux_sha256, build_id, arch,
         )
         for name in ("code", "data", "stack"):
             region_arguments[name]["gva"] = discovered[name]["gva"]
             region_arguments[name]["size"] = discovered[name]["size"]
+            if arch == "mmips":
+                region_arguments[name]["gpa"] = discovered[name]["gpa"]
     else:
         missing = [
             f"--{name}-{field}"
@@ -791,7 +823,7 @@ def create_callgate_manifest(args):
     )
     document = {
         "format": "viros-callgate-v1",
-        "architecture": "aarch64",
+        "architecture": arch,
         "allow_transient_guest_modification": True,
         "kernel": {
             "vmlinux": _relative_file(vmlinux, output.parent),
@@ -834,11 +866,16 @@ def create_callgate_manifest(args):
             "completion_magic_hex": struct.pack("<I", PROBE_RESPONSE_MAGIC).hex(),
         },
         "invocation": {
-            "cpu": args.cpu, "pstate": hex(args.pstate),
+            "cpu": args.cpu,
             "stack_region": "stack", "stack_pointer": hex(stack_pointer),
             "timeout_seconds": args.timeout_seconds,
         },
     }
+    pstate = getattr(args, "pstate", None)
+    if arch == "aarch64":
+        document["invocation"]["pstate"] = hex(0x3c5 if pstate is None else pstate)
+    elif pstate is not None:
+        raise AuditError("--pstate is only valid for an aarch64 probe package")
     _write_validated_callgate(document, output)
     return document
 
@@ -1314,7 +1351,8 @@ def main(argv=None):
         "--scratch-regions", type=Path,
         help=(
             "scratch.json from scratch_tool.py; supplies all region GVAs and sizes "
-            "while the three runtime GPAs remain required"
+            "and, for MMIPS KSEG0, exact GPAs; AArch64 still requires three "
+            "runtime GPA arguments"
         ),
     )
     for region in ("code", "data", "stack"):
@@ -1336,7 +1374,7 @@ def main(argv=None):
         help="kernel virtual address of init_task from the exact vmlinux",
     )
     callgate.add_argument(
-        "--pstate", type=lambda value: int(value, 0), default=0x3c5,
+        "--pstate", type=lambda value: int(value, 0), default=None,
         help="AArch64 EL1h PSTATE used during the probe call (default: 0x3c5)",
     )
     callgate.add_argument("--timeout-seconds", type=float, default=1.0)
@@ -1349,8 +1387,6 @@ def main(argv=None):
         elif args.command == "package":
             result = package_object(args)
         else:
-            if args.init_task <= 0 or args.init_task >= 1 << 64:
-                raise AuditError("init_task must be a nonzero 64-bit address")
             result = create_callgate_manifest(args)
     except (AuditError, OSError, subprocess.CalledProcessError) as exc:
         parser.exit(1, f"probe_tool: {exc}\n")

@@ -16,6 +16,8 @@ ROOT = Path(__file__).resolve().parents[1]
 PAGE_SIZE = 4096
 CODE_GVA = 0xFFFF800080100000
 BSS_GVA = 0xFFFF800082000000
+MIPS_CODE_GVA = 0x80100000
+MIPS_BSS_GVA = 0x82000000
 BUILD_ID = bytes.fromhex("0123456789abcdef")
 
 
@@ -113,6 +115,92 @@ def _elf_with_scratch(
     return bytes(image)
 
 
+def _mips_elf_with_scratch(
+    *, code_gva: int = MIPS_CODE_GVA, bss_gva: int = MIPS_BSS_GVA,
+    byte_order: str = "<", code_flags: int = 0x6, bss_flags: int = 0x3,
+) -> bytes:
+    encoding = 1 if byte_order == "<" else 2
+    note = struct.pack(byte_order + "III", 4, len(BUILD_ID), 3)
+    note += b"GNU\0" + BUILD_ID
+    note += b"\0" * (-len(note) & 3)
+    symbol_values = {
+        "__viros_scratch_code_start": (code_gva, 2),
+        "__viros_scratch_code_end": (code_gva + PAGE_SIZE, 2),
+        "__viros_scratch_data_start": (bss_gva, 3),
+        "__viros_scratch_data_end": (bss_gva + PAGE_SIZE, 3),
+        "__viros_scratch_stack_start": (bss_gva + PAGE_SIZE, 3),
+        "__viros_scratch_stack_end": (bss_gva + 2 * PAGE_SIZE, 3),
+    }
+    strings = bytearray(b"\0")
+    symbol_name_offsets = {}
+    for name in symbol_values:
+        symbol_name_offsets[name] = len(strings)
+        strings.extend(name.encode("ascii") + b"\0")
+    symtab = bytearray(b"\0" * 16)
+    for name, (value, section_index) in symbol_values.items():
+        symtab.extend(struct.pack(
+            byte_order + "IIIBBH", symbol_name_offsets[name], value, 0,
+            0x11, 0, section_index,
+        ))
+
+    section_names = (
+        b"\0.note.gnu.build-id\0.text\0.bss\0.symtab\0.strtab\0.shstrtab\0"
+    )
+    image = bytearray(b"\0" * 64)
+    note_offset = len(image)
+    image.extend(note)
+    _aligned(image)
+    text_offset = len(image)
+    image.extend(struct.pack(byte_order + "I", 0x0015940D) * (PAGE_SIZE // 4))
+    _aligned(image)
+    symtab_offset = len(image)
+    image.extend(symtab)
+    strtab_offset = len(image)
+    image.extend(strings)
+    shstrtab_offset = len(image)
+    image.extend(section_names)
+    _aligned(image)
+    section_offset = len(image)
+
+    def name_offset(name: bytes) -> int:
+        return section_names.index(name)
+
+    sections = [b"\0" * 40]
+    sections.append(struct.pack(
+        byte_order + "IIIIIIIIII", name_offset(b".note"), 7, 0x2, 0,
+        note_offset, len(note), 0, 0, 4, 0,
+    ))
+    sections.append(struct.pack(
+        byte_order + "IIIIIIIIII", name_offset(b".text"), 1, code_flags,
+        code_gva, text_offset, PAGE_SIZE, 0, 0, PAGE_SIZE, 0,
+    ))
+    sections.append(struct.pack(
+        byte_order + "IIIIIIIIII", name_offset(b".bss"), 8, bss_flags,
+        bss_gva, 0, PAGE_SIZE * 2, 0, 0, PAGE_SIZE, 0,
+    ))
+    sections.append(struct.pack(
+        byte_order + "IIIIIIIIII", name_offset(b".symtab"), 2, 0, 0,
+        symtab_offset, len(symtab), 5, 1, 4, 16,
+    ))
+    sections.append(struct.pack(
+        byte_order + "IIIIIIIIII", name_offset(b".strtab"), 3, 0, 0,
+        strtab_offset, len(strings), 0, 0, 1, 0,
+    ))
+    sections.append(struct.pack(
+        byte_order + "IIIIIIIIII", name_offset(b".shstrtab"), 3, 0, 0,
+        shstrtab_offset, len(section_names), 0, 0, 1, 0,
+    ))
+    image.extend(b"".join(sections))
+
+    header = b"\x7fELF" + bytes((1, encoding, 1, 0)) + b"\0" * 8
+    header += struct.pack(
+        byte_order + "HHIIIIIHHHHHH", 2, 8, 1, 0, 0, section_offset, 0,
+        52, 0, 0, 40, len(sections), 6,
+    )
+    image[:52] = header
+    return bytes(image)
+
+
 class ScratchToolTests(unittest.TestCase):
     def test_discovers_exact_boundaries_and_kernel_identity(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -135,6 +223,58 @@ class ScratchToolTests(unittest.TestCase):
             )
             for region in result["regions"].values():
                 self.assertNotIn("gpa", region)
+
+    def test_discovers_mmips_kseg0_regions_and_derives_physical_addresses(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            vmlinux = Path(temporary) / "vmlinux"
+            vmlinux.write_bytes(_mips_elf_with_scratch())
+
+            result = scratch_tool.discover_regions(vmlinux, 2 * PAGE_SIZE)
+
+            self.assertEqual(result["arch"], "mmips")
+            self.assertEqual(result["page_size"], PAGE_SIZE)
+            self.assertEqual(
+                result["regions"]["code"]["gva"],
+                MIPS_CODE_GVA + 2 * PAGE_SIZE,
+            )
+            self.assertEqual(
+                result["regions"]["code"]["gpa"],
+                MIPS_CODE_GVA + 2 * PAGE_SIZE - 0x80000000,
+            )
+            self.assertEqual(
+                result["regions"]["stack"]["gpa"],
+                MIPS_BSS_GVA + PAGE_SIZE + 2 * PAGE_SIZE - 0x80000000,
+            )
+            self.assertEqual(result["vmlinux"]["build_id"], BUILD_ID.hex())
+
+    def test_mmips_requires_elf32_little_endian_and_kseg0(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            elf64 = directory / "elf64"
+            elf64_image = bytearray(_elf_with_scratch())
+            struct.pack_into("<H", elf64_image, 18, 8)
+            elf64.write_bytes(elf64_image)
+            with self.assertRaisesRegex(
+                scratch_tool.ScratchError, "ELF32 little-endian",
+            ):
+                scratch_tool.discover_regions(elf64)
+
+            big_endian = directory / "big-endian"
+            big_endian.write_bytes(_mips_elf_with_scratch(byte_order=">"))
+            with self.assertRaisesRegex(
+                scratch_tool.ScratchError, "ELF32 little-endian",
+            ):
+                scratch_tool.discover_regions(big_endian)
+
+            outside = directory / "outside-kseg0"
+            outside.write_bytes(_mips_elf_with_scratch(code_gva=0x7FF00000))
+            with self.assertRaisesRegex(scratch_tool.ScratchError, "KSEG0"):
+                scratch_tool.discover_regions(outside)
+
+            relocated_outside = directory / "relocated-outside-kseg0"
+            relocated_outside.write_bytes(_mips_elf_with_scratch())
+            with self.assertRaisesRegex(scratch_tool.ScratchError, "KSEG0"):
+                scratch_tool.discover_regions(relocated_outside, 0x20000000)
 
     def test_cli_applies_page_aligned_runtime_offset_and_writes_json(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -200,6 +340,11 @@ class ScratchToolTests(unittest.TestCase):
         self.assertNotIn("obj-m", kbuild)
         self.assertIn(".rept VIROS_SCRATCH_PAGE_SIZE / 4", source)
         self.assertIn("brk #0x5653", source)
+        self.assertIn("#elif defined(CONFIG_MIPS)", source)
+        self.assertIn(".set nomips16", source)
+        self.assertIn(".set nomicromips", source)
+        self.assertIn(".set mips32", source)
+        self.assertIn(".word 0x0015940d", source)
         self.assertNotIn(".init", source)
         self.assertNotIn(" bl ", source)
         self.assertNotIn("svc ", source)

@@ -52,6 +52,36 @@ def aarch64_elf_with_build_id(build_id: bytes) -> bytes:
     return bytes(image)
 
 
+def mmips_elf_with_build_id(build_id: bytes) -> bytes:
+    note = struct.pack("<III", 4, len(build_id), 3) + b"GNU\0" + build_id
+    note += b"\0" * (-len(note) & 3)
+    names = b"\0.note.gnu.build-id\0.shstrtab\0"
+    image = bytearray(b"\0" * 52)
+    note_offset = len(image)
+    image.extend(note)
+    names_offset = len(image)
+    image.extend(names)
+    section_offset = (len(image) + 3) & ~3
+    image.extend(b"\0" * (section_offset - len(image)))
+    sections = [b"\0" * 40]
+    sections.append(struct.pack(
+        "<IIIIIIIIII", names.index(b".note"), 7, 2, 0,
+        note_offset, len(note), 0, 0, 4, 0,
+    ))
+    sections.append(struct.pack(
+        "<IIIIIIIIII", names.index(b".shstrtab"), 3, 0, 0,
+        names_offset, len(names), 0, 0, 1, 0,
+    ))
+    image.extend(b"".join(sections))
+    header = b"\x7fELF" + bytes((1, 1, 1, 0)) + b"\0" * 8
+    header += struct.pack(
+        "<HHIIIIIHHHHHH", 2, 8, 1, 0, 0, section_offset, 0x70001001,
+        52, 0, 0, 40, 3, 2,
+    )
+    image[:52] = header
+    return bytes(image)
+
+
 def write_package(
     directory: Path, load_address: int, kernel_sha256: str, kernel_build_id: str
 ) -> tuple[Path, Path]:
@@ -122,14 +152,80 @@ def manifest_args(directory: Path) -> SimpleNamespace:
     )
 
 
+def mmips_manifest_args(directory: Path) -> SimpleNamespace:
+    load_address = 0x80100000
+    build_id = "0123456789abcdef"
+    vmlinux = directory / "vmlinux-mmips"
+    vmlinux.write_bytes(mmips_elf_with_build_id(bytes.fromhex(build_id)))
+    package_path, binary = write_package(
+        directory, load_address, hashlib.sha256(vmlinux.read_bytes()).hexdigest(),
+        build_id,
+    )
+    binary.write_bytes(bytes.fromhex("000000000d941500"))
+    package = json.loads(package_path.read_text(encoding="utf-8"))
+    package.update({
+        "arch": "mmips",
+        "abi_minor": 2,
+        "abi_layout": {
+            "version": 1,
+            "request_v1_bytes": 64,
+            "response_v1_header_bytes": 64,
+            "task_v1_bytes": 192,
+            "target_byte_order": "little",
+        },
+        "capabilities": ["snapshot-v1"],
+        "call_abi": {
+            "name": "o32-soft-float",
+            "argument_registers": ["r4", "r5", "r6"],
+            "result_register": "r2",
+            "link_register": "r31",
+            "stack_alignment": 8,
+            "completion_trap": "break-0x5650",
+        },
+        "elf_abi": {
+            "class": 32,
+            "byte_order": "little",
+            "machine": "EM_MIPS",
+            "isa": "mips32r2",
+            "abi": "o32",
+            "float": "soft",
+            "pic": False,
+            "mips16": False,
+            "micromips": False,
+        },
+        "image_end": load_address + binary.stat().st_size,
+        "image_size": binary.stat().st_size,
+        "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
+    })
+    package_path.write_text(json.dumps(package), encoding="utf-8")
+    return SimpleNamespace(
+        package=package_path,
+        vmlinux=vmlinux,
+        output=directory / "callgate-mmips.json",
+        code_gva=load_address,
+        code_gpa=0x10100000,
+        code_size=4096,
+        data_gva=0x82000000,
+        data_gpa=0x12000000,
+        data_size=4096,
+        stack_gva=0x82001000,
+        stack_gpa=0x12001000,
+        stack_size=4096,
+        cpu=0,
+        init_task=0x80304000,
+        pstate=None,
+        timeout_seconds=1.0,
+    )
+
+
 def write_scratch_regions(
     args: SimpleNamespace, *, sha256: str | None = None,
-    build_id: str = "0123456789abcdef",
+    build_id: str = "0123456789abcdef", arch: str = "aarch64",
 ) -> Path:
     path = Path(args.output).parent / "scratch.json"
     document = {
         "schema": "viros-scratch-regions-v1",
-        "arch": "aarch64",
+        "arch": arch,
         "page_size": 4096,
         "runtime_offset": 0,
         "vmlinux": {
@@ -143,6 +239,11 @@ def write_scratch_regions(
             "stack": {"gva": args.stack_gva, "size": args.stack_size},
         },
     }
+    if arch == "mmips":
+        for name in ("code", "data", "stack"):
+            document["regions"][name]["gpa"] = (
+                document["regions"][name]["gva"] - 0x80000000
+            )
     path.write_text(json.dumps(document), encoding="utf-8")
     return path
 
@@ -155,6 +256,59 @@ def select_scratch_mode(args: SimpleNamespace, scratch: Path) -> None:
 
 
 class ProbeManifestTests(unittest.TestCase):
+    def test_mmips_snapshot_package_creates_derived_status_manifest(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            args = mmips_manifest_args(Path(temporary))
+
+            document = PROBE_TOOL.create_callgate_manifest(args)
+            validated = load_and_validate_manifest(args.output)
+
+            self.assertEqual(document["architecture"], "mmips")
+            self.assertNotIn("pstate", document["invocation"])
+            self.assertEqual(validated.architecture.name, "mmips")
+            self.assertIsNone(validated.pstate)
+            self.assertEqual(validated.probe_capabilities, ("snapshot-v1",))
+            self.assertEqual(validated.entry_address, args.code_gva)
+            request = struct.unpack("<IHHHHIQQIIQQQ", validated.request_bytes)
+            self.assertEqual(request[6], args.init_task)
+
+    def test_mmips_manifest_rejects_explicit_pstate_and_wide_init_task(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            args = mmips_manifest_args(Path(temporary))
+            args.pstate = 0x3c5
+            with self.assertRaisesRegex(PROBE_TOOL.AuditError, "only valid.*aarch64"):
+                PROBE_TOOL.create_callgate_manifest(args)
+            self.assertFalse(args.output.exists())
+
+    def test_mmips_scratch_document_supplies_exact_kseg0_mappings(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            args = mmips_manifest_args(Path(temporary))
+            expected_code_gpa = args.code_gva - 0x80000000
+            scratch = write_scratch_regions(args, arch="mmips")
+            select_scratch_mode(args, scratch)
+            for name in ("code", "data", "stack"):
+                setattr(args, f"{name}_gpa", None)
+
+            document = PROBE_TOOL.create_callgate_manifest(args)
+            self.assertEqual(
+                int(document["regions"][0]["physical_address"], 0),
+                expected_code_gpa,
+            )
+
+            args.output.unlink()
+            scratch_document = json.loads(scratch.read_text(encoding="utf-8"))
+            scratch_document["regions"]["code"]["gpa"] += 0x1000
+            scratch.write_text(json.dumps(scratch_document), encoding="utf-8")
+            with self.assertRaisesRegex(PROBE_TOOL.AuditError, "KSEG0 mapping"):
+                PROBE_TOOL.create_callgate_manifest(args)
+            self.assertFalse(args.output.exists())
+
+            args.pstate = None
+            args.init_task = 1 << 32
+            with self.assertRaisesRegex(PROBE_TOOL.AuditError, "nonzero 32-bit"):
+                PROBE_TOOL.create_callgate_manifest(args)
+            self.assertFalse(args.output.exists())
+
     def test_translation_abi_1_1_package_remains_loadable(self):
         with tempfile.TemporaryDirectory() as temporary:
             args = manifest_args(Path(temporary))

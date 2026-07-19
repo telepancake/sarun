@@ -219,7 +219,10 @@ def load_and_validate_manifest(path: str | Path) -> ValidatedManifest:
     try:
         architecture = architecture_by_name(root.get("architecture"))
     except LookupError:
-        raise ManifestError("only the aarch64 call gate is supported")
+        supported = ", ".join(sorted(("aarch64", "mmips")))
+        raise ManifestError(
+            f"architecture must name a supported call gate: {supported}"
+        )
     if root.get("allow_transient_guest_modification") is not True:
         raise ManifestError("allow_transient_guest_modification must be true")
 

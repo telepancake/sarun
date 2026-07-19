@@ -202,9 +202,10 @@ Stages:
   run <target> [-- ...] Prepare and run one target; extra args go to QEMU
   gdb <target> [remote] Launch debug workflow, or attach to explicit remote
   debug <target>        Boot matching debug kernel, stop after init, open GDB
+  inferiors mmips       Boot the matching MMIPS kernel to /init and expose its
+                        live task snapshot through the GDB RSP facade
   inferiors openwrt-arm64 MANIFEST BOOTABLE_KERNEL
-                        Boot an exact local OpenWrt AArch64 build and expose
-                        its live task snapshot through the GDB RSP facade
+                        Do the same for an exact local OpenWrt AArch64 build
 
 Information:
   list                  Print accepted run targets and their current status
@@ -667,6 +668,81 @@ setup_mipsbe_cross() { setup_downloaded_cross "$MIPSBE_TOOLCHAIN_NAME" "$MIPSBE_
 setup_ppc_cross() { setup_downloaded_cross "$PPC_TOOLCHAIN_NAME" "$PPC_TOOLCHAIN_SHA256" powerpc powerpc-linux PPC_CROSS_PREFIX 10.2.0 PowerPC; }
 setup_mmips_cross() { setup_downloaded_cross "$MMIPS_TOOLCHAIN_NAME" "$MMIPS_TOOLCHAIN_SHA256" mmips mipsel-buildroot-linux-musl MMIPS_CROSS_PREFIX 9.3.0 MMIPS; }
 
+kernel_scratch_source_hash() {
+    (CDPATH= cd -- "$SCRIPT_DIR/probe/scratch/kernel" &&
+        sha256sum Kbuild viros_scratch.S | sha256sum | awk '{print $1}')
+}
+
+install_kernel_scratch_source() {
+    local src=$1 destination="$1/kernel/viros"
+    local makefile="$1/kernel/Makefile"
+    local marker='# viros built-in debugger workspace'
+    mkdir -p -- "$destination"
+    cp -f -- "$SCRIPT_DIR/probe/scratch/kernel/Kbuild" "$destination/Kbuild"
+    cp -f -- "$SCRIPT_DIR/probe/scratch/kernel/viros_scratch.S" \
+        "$destination/viros_scratch.S"
+    if ! grep -qxF "$marker" "$makefile"; then
+        {
+            printf '\n%s\n' "$marker"
+            printf 'obj-$(CONFIG_ARM64) += viros/\n'
+            printf 'obj-$(CONFIG_MIPS) += viros/\n'
+        } >> "$makefile"
+    fi
+}
+
+verify_kernel_scratch_symbols() {
+    local out=$1 prefix=$2 symbol symbols
+    symbols=$("${prefix}nm" -g --defined-only "$out/vmlinux") ||
+        die "cannot read reserved-workspace symbols from vmlinux"
+    for symbol in \
+        __viros_scratch_code_start __viros_scratch_code_end \
+        __viros_scratch_data_start __viros_scratch_data_end \
+        __viros_scratch_stack_start __viros_scratch_stack_end; do
+        grep -Eq "[[:space:]]${symbol}$" <<< "$symbols" ||
+            die "kernel build did not retain reserved-workspace symbol: $symbol"
+    done
+}
+
+build_mmips_inferiors_artifacts() {
+    local out=$1 prefix=$2 destination="$ARTIFACTS/mmips/inferiors"
+    local python code_gva init_task
+    python=$(managed_python)
+    [[ -x "$python" ]] || die "managed Python is missing; run download"
+    rm -rf -- "$destination"
+    mkdir -p -- "$destination"
+
+    env PYTHONPATH="$SCRIPT_DIR" PYTHONNOUSERSITE=1 "$python" \
+        "$SCRIPT_DIR/probe/scratch/scratch_tool.py" "$out/vmlinux" \
+        --output "$destination/scratch.json" \
+        > "$destination/scratch-build.log"
+    code_gva=$(env PYTHONNOUSERSITE=1 "$python" -c \
+        'import json,sys; print(hex(json.load(open(sys.argv[1]))["regions"]["code"]["gva"]))' \
+        "$destination/scratch.json")
+    init_task=$("${prefix}nm" -n "$out/vmlinux" | awk '
+        $3 == "init_task" { count++; value = $1 }
+        END { if (count != 1) exit 1; print "0x" value }
+    ') || die "matching MMIPS vmlinux does not define exactly one init_task"
+
+    env PYTHONPATH="$SCRIPT_DIR" PYTHONNOUSERSITE=1 "$python" \
+        "$SCRIPT_DIR/probe/probe_tool.py" build \
+        --linux-dir "$out" --output-dir "$destination/probe-build" \
+        --arch mmips --cross-compile "$prefix" --vmlinux "$out/vmlinux" \
+        > "$destination/probe-build.log"
+    env PYTHONPATH="$SCRIPT_DIR" PYTHONNOUSERSITE=1 "$python" \
+        "$SCRIPT_DIR/probe/probe_tool.py" package \
+        "$destination/probe-build/probe.json" \
+        --output-dir "$destination/probe-package" --load-address "$code_gva" \
+        --cross-ld "${prefix}ld" --objcopy "${prefix}objcopy" \
+        > "$destination/probe-package.log"
+    env PYTHONPATH="$SCRIPT_DIR" PYTHONNOUSERSITE=1 "$python" \
+        "$SCRIPT_DIR/probe/probe_tool.py" callgate-manifest \
+        "$destination/probe-package/package.json" --vmlinux "$out/vmlinux" \
+        --scratch-regions "$destination/scratch.json" --cpu 0 \
+        --init-task "$init_task" --output "$destination/callgate.json" \
+        > "$destination/callgate-build.log"
+    say "Built matching MMIPS task snapshot artifacts: $destination"
+}
+
 find_kernel_config() {
     local candidate
     for candidate in "$@"; do
@@ -704,6 +780,39 @@ assert_casefold_portable_tree() {
         die "retained Kbuild output has names that collide on a case-insensitive filesystem: $collision"
 }
 
+prune_casefold_colliding_intermediates() {
+    local tree=$1 listing="$1/.viros-casefold-pruned" relative
+    local candidates="$1/.viros-casefold-candidates-$$"
+    (CDPATH= cd -- "$tree" && LC_ALL=C find . -mindepth 1 -printf '%P\n' |
+        LC_ALL=C awk '
+            {
+                folded = tolower($0)
+                count[folded]++
+                paths[folded] = paths[folded] $0 "\n"
+            }
+            END {
+                for (folded in count)
+                    if (count[folded] > 1)
+                        printf "%s", paths[folded]
+            }
+        ' | LC_ALL=C sort -u) > "$candidates"
+    : > "$listing"
+    while IFS= read -r relative; do
+        [[ -n "$relative" ]] || continue
+        if [[ -d "$tree/$relative" && ! -L "$tree/$relative" ]]; then
+            rm -f -- "$candidates"
+            die "retained Kbuild has a case-colliding directory: $relative"
+        fi
+        [[ -f "$tree/$relative" || -L "$tree/$relative" ]] || {
+            rm -f -- "$candidates"
+            die "retained Kbuild collision is not a removable intermediate: $relative"
+        }
+        printf '%s\n' "$relative" >> "$listing"
+        rm -f -- "$tree/$relative"
+    done < "$candidates"
+    rm -f -- "$candidates"
+}
+
 materialize_kernel_gdb_helpers() {
     local out=$1 temporary="$1/.viros-gdb-copy-$$"
     [[ -s "$out/vmlinux-gdb.py" && -d "$out/scripts/gdb" ]] ||
@@ -732,6 +841,12 @@ retain_case_kbuild_workspace() {
         die "case-sensitive Kbuild output is incomplete"
     materialize_kernel_gdb_helpers "$out"
     ln -sfn -- "$out" "$out/.viros-original-output"
+    # Linux contains a few differently-cased built-in object names.  Their
+    # generated intermediates cannot coexist on a case-insensitive checkout,
+    # but vmlinux has already consumed them and Kbuild can recreate them in a
+    # later case-sensitive workspace.  Record and remove only the colliding
+    # files before the portable copy.
+    prune_casefold_colliding_intermediates "$out"
     assert_casefold_portable_tree "$out"
     assert_casefold_portable_tree "$ARTIFACTS/$target"
     linux_hash=$(sha256sum "$DOWNLOADS/linux-${LINUX_VERSION}.tar.xz" | awk '{print $1}')
@@ -747,6 +862,9 @@ retain_case_kbuild_workspace() {
         printf 'linux_update_sha256 %s\n' "$update_hash"
         printf 'config_sha256 %s\n' "$config_hash"
         printf 'vmlinux_sha256 %s\n' "$vmlinux_hash"
+        if [[ "$target" == mmips ]]; then
+            printf 'scratch_source_sha256 %s\n' "$(kernel_scratch_source_hash)"
+        fi
     } > "$out/.viros-case-kbuild"
     mkdir -p "$destination/kernel-$target" "$destination/artifacts/$target"
     cp -a -- "$out/." "$destination/kernel-$target/"
@@ -813,6 +931,12 @@ rehydrate_case_kbuild_worker() {
     verify_file "$expected" "$DOWNLOADS/linux-${LINUX_VERSION}.tar.xz"
     prepare_mikrotik_kernel_source
     src=$(mikrotik_kernel_source)
+    if [[ "$target" == mmips ]]; then
+        expected=$(case_kbuild_identity_value "$identity" scratch_source_sha256)
+        [[ "$expected" == "$(kernel_scratch_source_hash)" ]] ||
+            die "retained MMIPS workspace source does not match this checkout"
+        install_kernel_scratch_source "$src"
+    fi
     expected=$(case_kbuild_identity_value "$identity" linux_update_sha256)
     verify_file "$expected" "$SOURCES/mikrotik-gpl/2025-03-19/linux-${LINUX_VERSION}.patch"
     out="$BUILD/kernel-$target"
@@ -974,6 +1098,9 @@ build_debug_kernel() {
             ;;
     esac
     mkdir -p "$out" "$ARTIFACTS/$target"
+    if [[ "$target" == mmips ]]; then
+        install_kernel_scratch_source "$src"
+    fi
     cp -f -- "$config" "$out/.config"
     "$src/scripts/config" --file "$out/.config" \
         --enable GDB_SCRIPTS --enable DEBUG_INFO \
@@ -993,6 +1120,10 @@ build_debug_kernel() {
     targets=(vmlinux scripts_gdb)
     [[ -n "$image" ]] && targets+=("$image")
     make "${make_args[@]}" -j "$JOBS" "${targets[@]}"
+    if [[ "$target" == mmips ]]; then
+        verify_kernel_scratch_symbols "$out" "$prefix"
+        build_mmips_inferiors_artifacts "$out" "$prefix"
+    fi
     cp -f -- "$out/vmlinux" "$ARTIFACTS/$target/vmlinux.debug"
     [[ -s "$out/vmlinux-gdb.py" ]] || die "kernel build did not create vmlinux-gdb.py"
     case "$target" in
@@ -1637,17 +1768,41 @@ cleanup_inferiors_on_exit() {
 }
 
 inferiors_stage() {
-    local target=${1:-} manifest=${2:-} boot_kernel=${3:-}
-    local qemu gdb python vmlinux session_dir console_log qemu_log facade_log bootstrap_log manifest_log status deadline
+    local target=${1:-} manifest=${2:-} boot_kernel=${3:-} initrd= init_entry=
+    local qemu gdb python vmlinux session_dir console_log qemu_log facade_log bootstrap_log manifest_log status deadline console_chardev
     local -a qemu_args bootstrap_args gdb_args
 
-    [[ "$target" == openwrt-arm64 ]] ||
-        die "inferiors currently requires: openwrt-arm64 MANIFEST BOOTABLE_KERNEL"
-    (($# == 3)) || die "usage: ./viros.sh inferiors openwrt-arm64 MANIFEST BOOTABLE_KERNEL"
+    case "$target" in
+        openwrt-arm64)
+            (($# == 3)) || die "usage: ./viros.sh inferiors openwrt-arm64 MANIFEST BOOTABLE_KERNEL"
+            ;;
+        mmips)
+            (($# == 1)) || die "usage: ./viros.sh inferiors mmips"
+            prepare_one mmips
+            manifest="$ARTIFACTS/mmips/inferiors/callgate.json"
+            boot_kernel="$ARTIFACTS/mmips/kernel.debug.qemu.elf"
+            initrd="$ARTIFACTS/mmips/initramfs.cpio"
+            [[ -s "$ARTIFACTS/mmips/init.entry" ]] ||
+                die "MMIPS init entry is missing; re-extract mmips"
+            init_entry=$(head -n 1 "$ARTIFACTS/mmips/init.entry")
+            [[ "$init_entry" =~ ^0x[0-9a-fA-F]+$ ]] ||
+                die "invalid MMIPS init entry: $init_entry"
+            ;;
+        *)
+            die "inferiors requires mmips, or openwrt-arm64 MANIFEST BOOTABLE_KERNEL"
+            ;;
+    esac
     [[ -f "$manifest" ]] || die "call-gate manifest is not a regular file: $manifest"
-    [[ -s "$boot_kernel" ]] || die "bootable OpenWrt AArch64 kernel is missing or empty: $boot_kernel"
+    [[ -s "$boot_kernel" ]] || die "bootable kernel is missing or empty: $boot_kernel"
 
-    qemu=$(qemu_binary qemu-system-aarch64)
+    if [[ "$target" == mmips ]]; then
+        qemu="$TOOLS/qemu/bin/qemu-system-mipsel"
+        [[ -x "$qemu" ]] ||
+            die "MMIPS requires viros's MT7621-compatible patched QEMU; run build"
+        [[ -s "$initrd" ]] || die "MMIPS initramfs is missing; re-extract mmips"
+    else
+        qemu=$(qemu_binary qemu-system-aarch64)
+    fi
     gdb="$TOOLS/gdb/bin/gdb"
     [[ -x "$gdb" ]] || die "Python-enabled GDB is missing; run download and build"
     python=$(managed_python)
@@ -1655,7 +1810,7 @@ inferiors_stage() {
     need setsid
     need timeout
 
-    session_dir="$ARTIFACTS/openwrt-arm64/inferiors-$$"
+    session_dir="$ARTIFACTS/$target/inferiors-$$"
     mkdir -p "$session_dir" "$BUILD"
     console_log="$session_dir/console.log"
     qemu_log="$session_dir/qemu.log"
@@ -1691,13 +1846,23 @@ inferiors_stage() {
     ((${#INFERIORS_CONSOLE_SOCKET} <= 100)) || die "console socket path is too long; use a shorter VIROS_WORKDIR"
     rm -f -- "$INFERIORS_QEMU_SOCKET" "$INFERIORS_GDB_SOCKET" "$INFERIORS_CONSOLE_SOCKET"
 
-    qemu_args=( -M virt -cpu cortex-a57 -smp 2 -m 512M
-        -display none -monitor none -nic none -nodefaults
-        -no-reboot -no-shutdown -S -kernel "$boot_kernel"
-        -append 'console=ttyAMA0,115200 earlycon=pl011,0x09000000 loglevel=8 ignore_loglevel nokaslr'
-        -chardev "socket,id=viros-console,path=$INFERIORS_CONSOLE_SOCKET,server=on,wait=off,logfile=$console_log,logappend=on"
-        -serial chardev:viros-console
-        -gdb "unix:path=$INFERIORS_QEMU_SOCKET,server=on,wait=off" )
+    if [[ "$target" == mmips ]]; then
+        console_chardev=mikrotik-mmips-uart
+        qemu_args=( -M malta -cpu 34Kf -smp 1 -m 256M
+            -display none -monitor none -serial none -parallel none -nic none
+            -no-reboot -no-shutdown -nodefaults -S -kernel "$boot_kernel" -initrd "$initrd"
+            -append 'board=750g-mt mem=256M HZ=100000000 console=ttyS0,115200 loglevel=8 ignore_loglevel init=/init panic=-1'
+            -chardev "socket,id=$console_chardev,path=$INFERIORS_CONSOLE_SOCKET,server=on,wait=off,logfile=$console_log,logappend=on"
+            -gdb "unix:path=$INFERIORS_QEMU_SOCKET,server=on,wait=off" )
+    else
+        qemu_args=( -M virt -cpu cortex-a57 -smp 2 -m 512M
+            -display none -monitor none -nic none -nodefaults
+            -no-reboot -no-shutdown -S -kernel "$boot_kernel"
+            -append 'console=ttyAMA0,115200 earlycon=pl011,0x09000000 loglevel=8 ignore_loglevel nokaslr'
+            -chardev "socket,id=viros-console,path=$INFERIORS_CONSOLE_SOCKET,server=on,wait=off,logfile=$console_log,logappend=on"
+            -serial chardev:viros-console
+            -gdb "unix:path=$INFERIORS_QEMU_SOCKET,server=on,wait=off" )
+    fi
 
     setsid "$qemu" "${qemu_args[@]}" 2> "$qemu_log" &
     INFERIORS_QEMU_PID=$!
@@ -1715,24 +1880,37 @@ inferiors_stage() {
         sleep 0.1
     done
 
-    # GDB owns QEMU only long enough to reach an EL1 return-to-userspace
-    # boundary.  `disconnect` closes RSP without sending QEMU a detach/resume
-    # packet, leaving the VM stopped for the facade's sole downstream session.
-    bootstrap_args=( -nx -q -batch -iex 'set auto-load safe-path /' "$vmlinux"
-        -ex 'set pagination off' -ex 'set confirm off' -ex 'set remotetimeout 10'
-        -ex "target remote $INFERIORS_QEMU_SOCKET"
-        -ex 'thbreak ret_to_user' -ex continue
-        -ex 'python assert int(gdb.parse_and_eval("$pc")) == int(gdb.parse_and_eval("&ret_to_user")), "unexpected bootstrap stop"'
-        -ex 'printf "viros-bootstrap: stopped at ret_to_user\\n"'
-        -ex 'delete breakpoints' -ex disconnect )
+    # GDB owns QEMU only long enough to reach the architecture's /init
+    # userspace boundary.  `disconnect` closes RSP without sending QEMU a
+    # detach/resume packet, leaving the VM stopped for the facade's sole
+    # downstream session.
+    if [[ "$target" == mmips ]]; then
+        bootstrap_args=( -nx -q -batch -iex 'set auto-load safe-path /' "$vmlinux"
+            -ex 'set pagination off' -ex 'set confirm off' -ex 'set remotetimeout 10'
+            -ex 'set suppress-cli-notifications on' -ex 'set architecture mips'
+            -ex "target remote $INFERIORS_QEMU_SOCKET"
+            -ex 'thbreak start_thread' -ex continue -ex 'delete breakpoints'
+            -ex "thbreak *$init_entry" -ex continue
+            -ex "python assert int(gdb.parse_and_eval('\$pc')) == $init_entry, 'unexpected MMIPS init stop'"
+            -ex 'printf "viros-bootstrap: stopped at MMIPS init entry\\n"'
+            -ex 'delete breakpoints' -ex disconnect )
+    else
+        bootstrap_args=( -nx -q -batch -iex 'set auto-load safe-path /' "$vmlinux"
+            -ex 'set pagination off' -ex 'set confirm off' -ex 'set remotetimeout 10'
+            -ex "target remote $INFERIORS_QEMU_SOCKET"
+            -ex 'thbreak ret_to_user' -ex continue
+            -ex 'python assert int(gdb.parse_and_eval("$pc")) == int(gdb.parse_and_eval("&ret_to_user")), "unexpected bootstrap stop"'
+            -ex 'printf "viros-bootstrap: stopped at ret_to_user\\n"'
+            -ex 'delete breakpoints' -ex disconnect )
+    fi
     set +e
     timeout --foreground --kill-after=2 "${DEBUG_BOOT_TIMEOUT}s" \
         "$gdb" "${bootstrap_args[@]}" > "$bootstrap_log" 2>&1
     status=$?
     set -e
-    if ((status != 0)) || ! grep -q '^viros-bootstrap: stopped at ret_to_user$' "$bootstrap_log"; then
+    if ((status != 0)) || ! grep -q '^viros-bootstrap: stopped at ' "$bootstrap_log"; then
         [[ -s "$bootstrap_log" ]] && tail -n 40 "$bootstrap_log" >&2
-        die "GDB bootstrap did not stop at ret_to_user"
+        die "GDB bootstrap did not stop at the expected /init boundary"
     fi
     kill -0 "$INFERIORS_QEMU_PID" 2>/dev/null || die "QEMU exited after the bootstrap stop"
 
@@ -1768,6 +1946,12 @@ inferiors_stage() {
         -ex 'set pagination off' -ex 'set confirm off' -ex 'set python print-stack full' -ex 'set remotetimeout 10'
         -ex "source $SCRIPT_DIR/gdb_console.py"
         -ex "target remote $INFERIORS_GDB_SOCKET" -ex 'info inferiors' )
+    if [[ "$target" == mmips ]]; then
+        gdb_args=( -nx -q -iex 'set auto-load safe-path /' "$vmlinux"
+            -ex 'set pagination off' -ex 'set confirm off' -ex 'set python print-stack full' -ex 'set remotetimeout 10'
+            -ex 'set architecture mips' -ex "source $SCRIPT_DIR/gdb_console.py"
+            -ex "target remote $INFERIORS_GDB_SOCKET" -ex 'info inferiors' )
+    fi
     set +e
     VIROS_CONSOLE_SOCKET="$INFERIORS_CONSOLE_SOCKET" VIROS_CONSOLE_LOG="$console_log" \
         "$gdb" "${gdb_args[@]}"

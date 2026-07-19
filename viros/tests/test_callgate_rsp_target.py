@@ -364,10 +364,9 @@ class MipsFixedRspTests(unittest.TestCase):
     def tearDown(self):
         self.temporary.cleanup()
 
-    def test_descriptor_is_explicitly_not_manifest_registered(self):
-        self.assertNotIn(MIPS32EL_MMIPS.name, ARCHITECTURES)
-        with self.assertRaises(LookupError):
-            architecture_by_name(MIPS32EL_MMIPS.name)
+    def test_descriptor_is_manifest_registered_for_mmips(self):
+        self.assertIs(ARCHITECTURES["mmips"], MIPS32EL_MMIPS)
+        self.assertIs(architecture_by_name("mmips"), MIPS32EL_MMIPS)
         self.assertEqual(len(MIPS32EL_MMIPS.core_registers), 38)
         self.assertTrue(all(
             register.bits == 32

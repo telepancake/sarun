@@ -7,9 +7,13 @@ import struct
 import tempfile
 import threading
 import unittest
+import xml.etree.ElementTree as ET
 
+from callgate.architectures import AARCH64, MIPS32EL_MMIPS
+from callgate.manifest import load_and_validate_manifest
 from inferiors.live_facade import (
     CurrentCpuProbeOracle,
+    _make_runner,
     build_live_facade,
     load_target_descriptions,
 )
@@ -19,11 +23,11 @@ from inferiors.partial_registers import (
     PartialRegisterError,
 )
 from inferiors.probe_oracle import ProbeOracle
-from inferiors.qemu_rsp import QemuRspClient
+from inferiors.qemu_rsp import QemuRspClient, RspRemoteError
 from inferiors.rsp_proxy import RspFacade
 from inferiors.rsp_transport import RspStream
 from inferiors.rsp_server import qemu_cpu_stop_resolver
-from probe.abi import ProbeSavedRegisters
+from probe.abi import ARCH_MIPS, MIPS32EL_SNAPSHOT_ABI, ProbeSavedRegisters
 from test_rsp_support import memory_duplex_pair
 
 
@@ -31,6 +35,7 @@ HEADER = "IHHHHHBBiIIIQQIIQ"
 TASK = "HHIQQQQQQQQIIIIIHH16s10Q"
 REQUEST = "IHHHHIQQIIQQQ"
 ROOT = 0xFFFF800081234000
+MIPS_ROOT = 0x81234000
 
 
 def _sha256(path: Path) -> str:
@@ -57,6 +62,21 @@ def _response() -> bytes:
         0x56505253, 1, 0, 64, 192, 1, 1, 64, 0, 0, 2,
         64 + len(records), 0, ROOT, 12, 0, 0,
     ) + records
+
+
+def _mips_response() -> bytes:
+    record = struct.pack(
+        "<" + TASK,
+        192, 1, 1 | 2 | 4, MIPS_ROOT, MIPS_ROOT, MIPS_ROOT,
+        0x82345000, 0x83456000, 0x1020304050607080, 0, 0,
+        1, 1, 0, 0, 0, 32, 0, b"init\0".ljust(16, b"\0"),
+        *([0] * 10),
+    )
+    return struct.pack(
+        "<" + HEADER,
+        0x56505253, 1, 0, 64, 192, ARCH_MIPS, 1, 32, 0, 0, 1,
+        64 + len(record), 0, MIPS_ROOT, 12, 0, 0,
+    ) + record
 
 
 def _manifest(directory: Path) -> Path:
@@ -93,6 +113,60 @@ def _manifest(directory: Path) -> Path:
                     "completion_magic_hex": "53525056"},
         "invocation": {"cpu": 0, "pstate": "0x3c5", "stack_region": "stack",
                        "stack_pointer": "0xffff800082002000", "timeout_seconds": 1},
+    }
+    path = directory / "callgate.json"
+    path.write_text(json.dumps(document), encoding="utf-8")
+    return path
+
+
+def _mmips_manifest(directory: Path) -> Path:
+    kernel = directory / "vmlinux"
+    probe = directory / "probe.bin"
+    kernel.write_bytes(b"exact MMIPS live-facade test kernel")
+    probe.write_bytes(bytes.fromhex("000000000d941500"))
+    request = struct.pack(
+        "<" + REQUEST,
+        0x56505251, 1, 0, 64, 1, 0, MIPS_ROOT, 0, 1, 0, 0, 0, 0,
+    )
+    document = {
+        "format": "viros-callgate-v1",
+        "architecture": "mmips",
+        "allow_transient_guest_modification": True,
+        "kernel": {
+            "vmlinux": kernel.name,
+            "sha256": _sha256(kernel),
+            "build_id": "89abcdef01234567",
+        },
+        "regions": [
+            {"name": "code", "role": "code", "virtual_address": "0x80100000",
+             "physical_address": "0x00100000", "size": 4096},
+            {"name": "data", "role": "data", "virtual_address": "0x82000000",
+             "physical_address": "0x02000000", "size": 4096},
+            {"name": "stack", "role": "stack", "virtual_address": "0x82001000",
+             "physical_address": "0x02001000", "size": 4096},
+        ],
+        "probe": {
+            "binary": probe.name,
+            "sha256": _sha256(probe),
+            "code_region": "code",
+            "entry_offset": 0,
+            "completion_offset": 4,
+            "capabilities": ["snapshot-v1"],
+        },
+        "mailbox": {
+            "data_region": "data",
+            "request_offset": 0,
+            "request_hex": request.hex(),
+            "result_offset": 64,
+            "result_size": 64 + 192,
+            "completion_magic_hex": "53525056",
+        },
+        "invocation": {
+            "cpu": 0,
+            "stack_region": "stack",
+            "stack_pointer": "0x82002000",
+            "timeout_seconds": 1,
+        },
     }
     path = directory / "callgate.json"
     path.write_text(json.dumps(document), encoding="utf-8")
@@ -160,6 +234,13 @@ class FrozenRunner:
         return _response()
 
 
+class FrozenMipsRunner:
+    def __call__(self, cursor):
+        if cursor != 0:
+            raise AssertionError(cursor)
+        return _mips_response()
+
+
 class MappingRunner:
     def __call__(self, cursor):
         if cursor != 0:
@@ -206,6 +287,17 @@ class FakeSavedRegisterReader:
             pstate=0,
             flags=7,
         )
+
+
+class FakeLegacyMmipsClient(FakeClient):
+    def __init__(self, register_bytes=73 * 4):
+        super().__init__()
+        self.xml = {}
+        self.register_block = bytes(number & 0xff for number in range(register_bytes))
+
+    def read_xfer(self, object_name, annex):
+        self.assert_equal((object_name, annex), ("features", "target.xml"))
+        raise RspRemoteError(b"")
 
 
 def _full_core_xml(extra: bytes = b"") -> bytes:
@@ -338,6 +430,7 @@ class LiveFacadeTests(unittest.TestCase):
                 runner_factory=lambda target, sealed: FrozenRunner(),
             )
             try:
+                self.assertIs(live.target.architecture, AARCH64)
                 # The current vCPU task is the initial GDB inferior even though
                 # PID 1 sorts first and is sleeping.
                 self.assertEqual(live.facade.handle(b"qC"), b"QCp2a.2a")
@@ -359,6 +452,74 @@ class LiveFacadeTests(unittest.TestCase):
             finally:
                 live.close()
             self.assertTrue(client.closed)
+
+    def test_mmips_default_runner_uses_little_endian_32_bit_snapshot_abi(self):
+        with tempfile.TemporaryDirectory(dir=".") as directory_text:
+            manifest = load_and_validate_manifest(
+                _mmips_manifest(Path(directory_text))
+            )
+
+            runner = _make_runner(object(), manifest)
+
+            self.assertIs(
+                runner.request.snapshot_abi, MIPS32EL_SNAPSHOT_ABI
+            )
+
+    def test_xml_less_mmips_exposes_only_the_exact_fixed_g_packet_layout(self):
+        with tempfile.TemporaryDirectory(dir=".") as directory_text:
+            directory = Path(directory_text)
+            manifest = _mmips_manifest(directory)
+            client = FakeLegacyMmipsClient()
+
+            live = build_live_facade(
+                qemu_socket=str(directory / "qemu.sock"),
+                gdb_socket=str(directory / "gdb.sock"),
+                manifest_path=manifest,
+                client_factory=lambda path, timeout: client,
+                runner_factory=lambda target, sealed: FrozenMipsRunner(),
+            )
+            try:
+                self.assertIs(live.target.architecture, MIPS32EL_MMIPS)
+                self.assertEqual(live.facade.handle(b"qC"), b"QCp1.1")
+                self.assertEqual(
+                    live.facade.handle(b"g"),
+                    client.register_block.hex().encode("ascii"),
+                )
+                root = ET.fromstring(live.descriptions[b"target.xml"])
+                self.assertEqual(root.findtext("architecture"), "mips")
+                registers = {
+                    int(element.attrib["regnum"]): element.attrib["name"]
+                    for element in root.iter("reg")
+                }
+                self.assertEqual(len(registers), 73)
+                self.assertEqual(registers[0], "r0")
+                self.assertEqual(registers[32], "status")
+                self.assertEqual(registers[37], "pc")
+                self.assertEqual(registers[38], "f0")
+                self.assertEqual(registers[71], "fir")
+                self.assertEqual(registers[72], "restart")
+                self.assertEqual(set(live.descriptions), {b"target.xml"})
+            finally:
+                live.close()
+            # Construction checked both stopped CPUs; the forwarded current
+            # task register read then selected CPU 0 once more.
+            self.assertEqual(client.register_reads, ["1", "2", "1"])
+
+    def test_xml_less_mmips_rejects_a_nonstandard_g_packet_size(self):
+        with tempfile.TemporaryDirectory(dir=".") as directory_text:
+            directory = Path(directory_text)
+            client = FakeLegacyMmipsClient(register_bytes=72 * 4)
+
+            with self.assertRaisesRegex(RspRemoteError, "292 bytes"):
+                build_live_facade(
+                    qemu_socket=str(directory / "qemu.sock"),
+                    gdb_socket=str(directory / "gdb.sock"),
+                    manifest_path=_mmips_manifest(directory),
+                    client_factory=lambda path, timeout: client,
+                    runner_factory=lambda target, sealed: FrozenMipsRunner(),
+                )
+            self.assertTrue(client.closed)
+            self.assertEqual(client.register_reads, ["1"])
 
     def test_advertised_mapping_capability_reads_selected_program(self):
         with tempfile.TemporaryDirectory(dir=".") as directory_text:

@@ -272,8 +272,8 @@ multiprocess GDB remote facade backed by a small probe compiled through the
 exact guest kernel's configured Kbuild tree. Unlike `viros-user-*`, that
 facade presents the probe's frozen Linux task snapshot as actual GDB
 inferiors. The code path is connected end to end for a locally built AArch64
-OpenWrt kernel; it is not a claim that the downloaded release kernel was
-probed live.
+OpenWrt kernel and for the matching published MMIPS kernel built by viros; it
+is not a claim that the downloaded OpenWrt release kernel was probed live.
 
 Two independent pieces have been exercised so far:
 
@@ -372,6 +372,21 @@ launcher is:
   /path/to/the-matching-openwrt-initramfs-kernel.bin
 ```
 
+For MMIPS, `kernel-debug` installs the built-in KSEG0 workspace and produces
+the exact-Kbuild snapshot package and portable manifest automatically:
+
+```sh
+./viros.sh kernel-debug mmips
+./viros.sh inferiors mmips
+```
+
+The retained inputs are below `artifacts/mmips/inferiors/`. The launcher uses
+the same Malta/34Kf/MT7621 shape as `debug mmips`, proves that the kernel has
+started `/init`, then opens GDB on the snapshot facade with `info inferiors`
+already displayed. MMIPS currently provides task enumeration and current-CPU
+registers; its package deliberately does not advertise process-memory or
+sleeping-task register operations.
+
 There is deliberately no default to the downloaded official OpenWrt image.
 The command validates the manifest-bound probe and `vmlinux` before starting
 anything, boots the supplied kernel stopped, uses the exact `vmlinux` in a
@@ -400,9 +415,9 @@ sealed ABI 1.2 package also advertises `saved-regs-aarch64-v1`, a sleeping
 native AArch64 task instead gets its validated saved EL0 x0-x30, SP, PC, and
 PSTATE frame; GDB receives literal `x` digits for unavailable FP/system
 registers rather than invented values. Saved compat32 frames, register and
-process-memory writes, automatic userspace ELF symbol loading, ARMv7, and MIPS
-remain unimplemented. The facade's direct RSP call gate has a restoring
-wall-clock timeout, but it is not an emulated instruction budget and ordinary
+process-memory writes, automatic userspace ELF symbol loading, ARMv7, and the
+other MIPS variants remain unimplemented. The facade's direct RSP call gate
+has a restoring wall-clock timeout, but it is not an emulated instruction budget and ordinary
 QEMU virtual time can advance during the transaction.
 
 The launcher and facade have lifecycle/unit coverage, but this repository has

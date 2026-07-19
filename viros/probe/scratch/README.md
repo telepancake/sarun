@@ -1,13 +1,13 @@
-# Reserved AArch64 kernel scratch pages
+# Reserved kernel debugger workspace
 
 This optional helper gives the reversible call gate three explicit pages in a
-locally built, exact OpenWrt kernel.  It has no initialization function,
+locally built, exact AArch64 or MMIPS kernel.  It has no initialization function,
 thread, syscall, module entry point, exported runtime API, or normal execution
 path.  It only contributes storage and six stable symbols to `vmlinux`.
 
 The code page is executable because the debugger temporarily places its
 audited probe there.  In the linked kernel every aligned instruction slot is
-normally an AArch64 `BRK #0x5653`, so an accidental branch stops instead of
+normally an AArch64 `BRK #0x5653` or classic MIPS `break` instruction, so an accidental branch stops instead of
 executing zeroes or falling through.  The data and stack pages are distinct,
 page-aligned BSS ranges and are non-executable under the kernel's normal
 section permissions.
@@ -65,3 +65,11 @@ The bridge rechecks that the scratch document, probe package, and supplied
 `vmlinux` have exactly the same SHA-256 and GNU build ID.  The original fully
 explicit GVA/GPA/size mode remains available, but the two modes cannot be
 mixed.
+
+For `./viros.sh kernel-debug mmips`, installation, discovery, exact Kbuild
+module compilation, absolute linking, and manifest creation are automatic.
+The portable results are retained below `artifacts/mmips/inferiors/`; run
+`./viros.sh inferiors mmips` to boot to `/init` and open the task facade in
+GDB. MMIPS scratch addresses are required to remain in KSEG0, so their guest
+physical addresses are derived exactly by subtracting `0x80000000` rather
+than supplied as guesses.

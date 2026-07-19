@@ -315,13 +315,11 @@ _MMIPS_REGISTER_NAMES = tuple(
     + ["status", "lo", "hi", "badvaddr", "cause", "pc"]
 )
 
-# Unregistered description of the legacy MMIPS QEMU stub's fixed MIPS32
-# register numbering and o32 helper-call policy.  CP1 is deliberately absent:
-# a soft-float helper cannot clobber it, and no-FPU targets reject those
-# optional p packets.  This constant remains absent from ARCHITECTURES until
-# matching manifest and packaged-helper prerequisites exist.
+# Description of the legacy MMIPS QEMU stub's fixed MIPS32 register numbering
+# and o32 helper-call policy.  CP1 is deliberately absent: a soft-float helper
+# cannot clobber it, and no-FPU targets reject those optional p packets.
 MIPS32EL_MMIPS = ArchitectureDescriptor(
-    name="mips32el-mmips-experimental",
+    name="mmips",
     display_name="MIPS32 little-endian MMIPS",
     address_bits=32,
     page_size=4096,
@@ -350,13 +348,14 @@ MIPS32EL_MMIPS = ArchitectureDescriptor(
     original_state_precondition=_mips32_original_state,
     control_state_deriver=_mips32_gate_status,
     entry_address_registers=("r25",),
-    known_capabilities=frozenset(),
+    known_capabilities=frozenset({"snapshot-v1"}),
     dependent_capabilities=frozenset(),
 )
 
 
 ARCHITECTURES: Mapping[str, ArchitectureDescriptor] = MappingProxyType({
     AARCH64.name: AARCH64,
+    MIPS32EL_MMIPS.name: MIPS32EL_MMIPS,
 })
 
 

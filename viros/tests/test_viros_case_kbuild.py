@@ -284,6 +284,33 @@ class CaseKbuildTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0, result.stdout)
             self.assertIn("collide on a case-insensitive filesystem", result.stdout)
 
+    def test_retention_prunes_and_records_only_casefold_colliding_files(self):
+        with tempfile.TemporaryDirectory(prefix="case-prune-", dir=PROJECT) as raw:
+            work = Path(raw)
+            tree = work / "tree/net/netfilter"
+            tree.mkdir(parents=True)
+            (tree / ".xt_tcpmss.mod.cmd").write_bytes(b"lower")
+            (tree / ".xt_TCPMSS.mod.cmd").write_bytes(b"upper")
+            (tree / "unrelated.o").write_bytes(b"keep")
+            if len(tuple(tree.iterdir())) != 3:
+                self.skipTest("fixture needs a case-sensitive directory")
+
+            result = self.run_shell(
+                work,
+                r"""
+                prune_casefold_colliding_intermediates "$WORKDIR/tree"
+                assert_casefold_portable_tree "$WORKDIR/tree"
+                test -s "$WORKDIR/tree/.viros-casefold-pruned"
+                test -s "$WORKDIR/tree/net/netfilter/unrelated.o"
+                test ! -e "$WORKDIR/tree/net/netfilter/.xt_tcpmss.mod.cmd"
+                test ! -e "$WORKDIR/tree/net/netfilter/.xt_TCPMSS.mod.cmd"
+                """,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout)
+            listing = (work / "tree/.viros-casefold-pruned").read_text()
+            self.assertIn(".xt_tcpmss.mod.cmd", listing)
+            self.assertIn(".xt_TCPMSS.mod.cmd", listing)
+
     def test_rehydrated_worker_reconnects_source_and_runs_foreground_command(self):
         with tempfile.TemporaryDirectory(prefix="case-rehydrate-", dir=PROJECT) as raw:
             work = Path(raw)

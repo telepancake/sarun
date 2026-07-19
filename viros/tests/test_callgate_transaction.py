@@ -515,12 +515,14 @@ class MipsTransactionPolicyTests(unittest.TestCase):
         self.assertEqual(target.writes, [])
         self.assertEqual(target.register_writes, [])
 
-    def test_descriptor_remains_unregistered_until_packaging_exists(self):
+    def test_descriptor_is_registered_for_snapshot_packages(self):
         self.assertEqual(MIPS32EL_MMIPS.stack_alignment, 8)
         self.assertEqual(MIPS32EL_MMIPS.argument_registers, ("r4", "r5", "r6"))
         self.assertEqual(MIPS32EL_MMIPS.entry_address_registers, ("r25",))
         self.assertFalse(MIPS32EL_MMIPS.manifest_control_state)
-        self.assertNotIn(MIPS32EL_MMIPS.name, ARCHITECTURES)
+        self.assertEqual(MIPS32EL_MMIPS.known_capabilities, {"snapshot-v1"})
+        self.assertIs(ARCHITECTURES["mmips"], MIPS32EL_MMIPS)
+        self.assertIs(architecture_by_name("mmips"), MIPS32EL_MMIPS)
 
 
 class ManifestTests(unittest.TestCase):
@@ -538,6 +540,51 @@ class ManifestTests(unittest.TestCase):
             document["invocation"]["argument_address"] = "0xffff800082000000"
             path.write_text(json.dumps(document), encoding="utf-8")
             with self.assertRaisesRegex(ManifestError, "must equal data_region"):
+                load_and_validate_manifest(path)
+
+    def test_mmips_snapshot_manifest_uses_32_bit_regions_and_derived_status(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            path, document = make_manifest(directory)
+            document["architecture"] = "mmips"
+            document["probe"]["capabilities"] = ["snapshot-v1"]
+            for region, virtual in zip(
+                document["regions"], (0x80100000, 0x82000000, 0x82001000)
+            ):
+                region["virtual_address"] = hex(virtual)
+            document["invocation"].pop("pstate")
+            document["invocation"]["stack_pointer"] = "0x82002000"
+            document["invocation"]["argument_address"] = "0x82000020"
+            path.write_text(json.dumps(document), encoding="utf-8")
+
+            manifest = load_and_validate_manifest(path)
+
+            self.assertIs(manifest.architecture, MIPS32EL_MMIPS)
+            self.assertIsNone(manifest.pstate)
+            self.assertEqual(manifest.probe_capabilities, ("snapshot-v1",))
+            self.assertEqual(manifest.entry_address, 0x80100000)
+
+    def test_mmips_manifest_rejects_pstate_and_non_32_bit_regions(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            path, document = make_manifest(directory)
+            document["architecture"] = "mmips"
+            document["probe"]["capabilities"] = ["snapshot-v1"]
+            for region, virtual in zip(
+                document["regions"], (0x80100000, 0x82000000, 0x82001000)
+            ):
+                region["virtual_address"] = hex(virtual)
+            document["invocation"]["stack_pointer"] = "0x82002000"
+            document["invocation"]["argument_address"] = "0x82000020"
+            with self.subTest(field="pstate"):
+                path.write_text(json.dumps(document), encoding="utf-8")
+                with self.assertRaisesRegex(ManifestError, "pstate must be omitted"):
+                    load_and_validate_manifest(path)
+
+            document["invocation"].pop("pstate")
+            document["regions"][0]["virtual_address"] = "0x100000000"
+            path.write_text(json.dumps(document), encoding="utf-8")
+            with self.assertRaisesRegex(ManifestError, "does not fit in 32 bits"):
                 load_and_validate_manifest(path)
 
     def test_probe_hash_mismatch_is_rejected(self):

@@ -208,6 +208,29 @@ class InferiorsWorkflowTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("usage: ./viros.sh inferiors", result.stdout)
 
+        result = subprocess.run(
+            [str(PROJECT / "viros.sh"), "inferiors", "mmips", "unexpected"],
+            cwd=PROJECT,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("usage: ./viros.sh inferiors mmips", result.stdout)
+
+    def test_mmips_workflow_uses_matching_kernel_init_and_console_shape(self):
+        script = (PROJECT / "viros.sh").read_text(encoding="utf-8")
+        body = script.split("inferiors_stage() {", 1)[1].split(
+            "\ndebug_qemu_failed()", 1
+        )[0]
+        self.assertIn('manifest="$ARTIFACTS/mmips/inferiors/callgate.json"', body)
+        self.assertIn('-M malta -cpu 34Kf -smp 1 -m 256M', body)
+        self.assertIn('-ex \'thbreak start_thread\' -ex continue', body)
+        self.assertIn('-ex "thbreak *$init_entry" -ex continue', body)
+        self.assertIn('console_chardev=mikrotik-mmips-uart', body)
+        self.assertIn("-ex 'set architecture mips'", body)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Discover viros reserved scratch regions in an exact AArch64 vmlinux."""
+"""Discover viros reserved scratch regions in an exact supported vmlinux."""
 
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ from probe.probe_tool import (  # noqa: E402
     AuditError,
     ElfObject,
     EM_AARCH64,
+    EM_MIPS,
     _sha256_file,
     _write_json_atomic,
     gnu_build_id,
@@ -29,6 +30,9 @@ SHF_ALLOC = 0x2
 SHF_EXECINSTR = 0x4
 SUPPORTED_PAGE_SIZES = (4096, 16384, 65536)
 UINT64_LIMIT = 1 << 64
+UINT32_LIMIT = 1 << 32
+MIPS_KSEG0_START = 0x80000000
+MIPS_KSEG0_END = 0xA0000000
 SYMBOLS = {
     "code": ("__viros_scratch_code_start", "__viros_scratch_code_end"),
     "data": ("__viros_scratch_data_start", "__viros_scratch_data_end"),
@@ -77,9 +81,20 @@ def discover_regions(vmlinux: Path, runtime_offset: int = 0) -> dict:
     if runtime_offset < 0 or runtime_offset >= UINT64_LIMIT:
         raise ScratchError("runtime offset must be an unsigned 64-bit integer")
     elf = ElfObject(vmlinux)
-    if elf.machine != EM_AARCH64:
+    if elf.machine == EM_AARCH64:
+        arch = "aarch64"
+        address_limit = UINT64_LIMIT
+    elif elf.machine == EM_MIPS:
+        if elf.elf_class != 32 or elf.endian != "<":
+            raise ScratchError(
+                f"{vmlinux}: mmips scratch requires ELF32 little-endian"
+            )
+        arch = "mmips"
+        address_limit = UINT32_LIMIT
+    else:
         raise ScratchError(
-            f"{vmlinux}: expected AArch64 machine {EM_AARCH64}, got {elf.machine}"
+            f"{vmlinux}: expected AArch64 ({EM_AARCH64}) or MIPS "
+            f"({EM_MIPS}) machine, got {elf.machine}"
         )
 
     raw_regions = {}
@@ -94,7 +109,7 @@ def discover_regions(vmlinux: Path, runtime_offset: int = 0) -> dict:
     sizes = {region[2] for region in raw_regions.values()}
     if len(sizes) != 1 or next(iter(sizes)) not in SUPPORTED_PAGE_SIZES:
         raise ScratchError(
-            "scratch regions must each occupy one supported AArch64 page"
+            f"scratch regions must each occupy one supported {arch} page"
         )
     page_size = next(iter(sizes))
     if runtime_offset % page_size:
@@ -106,16 +121,31 @@ def discover_regions(vmlinux: Path, runtime_offset: int = 0) -> dict:
         if start["value"] % page_size:
             raise ScratchError(f"{name} scratch region is not page aligned")
         runtime_gva = start["value"] + runtime_offset
-        if runtime_gva >= UINT64_LIMIT or runtime_gva + size > UINT64_LIMIT:
-            raise ScratchError(f"{name} runtime GVA exceeds 64-bit address space")
+        if runtime_gva >= address_limit or runtime_gva + size > address_limit:
+            raise ScratchError(
+                f"{name} runtime GVA exceeds {address_limit.bit_length() - 1}-bit "
+                "address space"
+            )
+        if arch == "mmips" and not (
+            MIPS_KSEG0_START <= start["value"]
+            and end["value"] <= MIPS_KSEG0_END
+            and MIPS_KSEG0_START <= runtime_gva
+            and runtime_gva + size <= MIPS_KSEG0_END
+        ):
+            raise ScratchError(
+                f"{name} scratch region must remain wholly in MIPS KSEG0"
+            )
         ranges.append((start["value"], end["value"], name))
-        regions[name] = {
+        region = {
             "gva": runtime_gva,
             "link_gva": start["value"],
             "size": size,
             "start_symbol": start_name,
             "end_symbol": end_name,
         }
+        if arch == "mmips":
+            region["gpa"] = runtime_gva - MIPS_KSEG0_START
+        regions[name] = region
 
     ranges.sort()
     for previous, current in zip(ranges, ranges[1:]):
@@ -136,13 +166,13 @@ def discover_regions(vmlinux: Path, runtime_offset: int = 0) -> dict:
 
     return {
         "schema": SCRATCH_SCHEMA,
-        "arch": "aarch64",
+        "arch": arch,
         "page_size": page_size,
         "runtime_offset": runtime_offset,
         "vmlinux": {
             "path": str(vmlinux),
             "sha256": _sha256_file(vmlinux),
-            "build_id": gnu_build_id(vmlinux),
+            "build_id": gnu_build_id(vmlinux, arch),
         },
         "regions": regions,
     }

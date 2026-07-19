@@ -10,6 +10,7 @@ from probe.abi import (
     TASK_ON_CPU,
     ProbeSavedRegisters,
     ProbeTask,
+    SnapshotAbi,
     decode_paginated,
 )
 
@@ -56,16 +57,20 @@ class ProbeOracle:
         executable_resolver: ExecutableResolver | None = None,
         memory_reader: MemoryReader | None = None,
         register_reader: RegisterReader | None = None,
+        snapshot_abi: SnapshotAbi | None = None,
     ) -> None:
         self.fetch_page = fetch_page
         self.executable_resolver = executable_resolver or (lambda task: "")
         self.memory_reader = memory_reader
         self.register_reader = register_reader
+        self.snapshot_abi = snapshot_abi
         self._generation = 0
         self._pgd_kernel_va: dict[TaskId, int] = {}
 
     def snapshot(self) -> Snapshot:
-        probe = decode_paginated(self.fetch_page)
+        probe = decode_paginated(
+            self.fetch_page, expected_abi=self.snapshot_abi
+        )
         if self.memory_reader is not None:
             self.memory_reader.bind_snapshot(probe)
         if self.register_reader is not None:

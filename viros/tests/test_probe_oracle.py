@@ -96,6 +96,29 @@ class ProbeDecoderTests(unittest.TestCase):
                 self.assertEqual(task.start_cookie, 0x1020304050607080)
                 self.assertEqual(task.task_flags, 0x8877665544332211)
 
+    def test_oracle_accepts_an_explicit_mips_snapshot_abi(self):
+        page = mips_response(
+            MIPS32EL_SNAPSHOT_ABI,
+            [mips_task_bytes(MIPS32EL_SNAPSHOT_ABI.byte_order)],
+        )
+        oracle = ProbeOracle(
+            lambda cursor: page,
+            snapshot_abi=MIPS32EL_SNAPSHOT_ABI,
+        )
+
+        snapshot = oracle.snapshot()
+
+        self.assertEqual(snapshot.tasks[0].identity, TaskId(1, 1))
+        self.assertEqual(snapshot.tasks[0].auxv, b"\0" * 8)
+
+    def test_oracle_default_remains_aarch64_only(self):
+        page = mips_response(
+            MIPS32EL_SNAPSHOT_ABI,
+            [mips_task_bytes(MIPS32EL_SNAPSHOT_ABI.byte_order)],
+        )
+        with self.assertRaisesRegex(ProbeDecodeError, "unsupported probe architecture"):
+            ProbeOracle(lambda cursor: page).snapshot()
+
     def test_mips32_rejects_non_zero_extended_pointer_slots(self):
         record = mips_task_bytes(">", task=(1 << 32) | MIPS_ROOT)
         with self.assertRaisesRegex(ProbeDecodeError, r"task\[0\]\.task.*32-bit"):
