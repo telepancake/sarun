@@ -170,6 +170,19 @@ fn standalone_brush_completes_find_type_through_execution_parser() {
 }
 
 #[test]
+fn standalone_brush_completes_find_files0_source_without_reading_it() {
+    let dir = std::env::temp_dir().join(format!(
+        "sarun-brush-relation-find-files0-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create files0 completion fixture directory");
+    std::fs::write(dir.join("roots0"), b"target\0").expect("write files0 completion fixture");
+    run_brush_completion(&dir, b"find -files0-from ./r\t", &[b"oots0"]);
+    std::fs::remove_dir_all(&dir).expect("remove files0 completion fixture directory");
+}
+
+#[test]
 fn standalone_brush_completes_builtin_flag_through_relation() {
     run_brush_completion(
         &std::env::current_dir().unwrap(),

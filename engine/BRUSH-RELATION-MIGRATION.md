@@ -396,6 +396,15 @@ Implementation order:
            existing files untouched, and relative destinations resolve through
            the injected logical cwd. Filesystem reads, NSS, and clock queries
            remain to be separated, so the parent item remains open.
+       [x] Represent `-files0-from` as an unresolved Find-owned starting-point
+           query. Argument parsing has no reader or execution context; assist
+           enters the actual option arm without reading, while execution
+           resolves logical stdin or a logical-cwd/absolute source exactly once
+           before output preparation. Pure decoding preserves ordered duplicate,
+           empty, and non-UTF-8 Unix paths. Empty records produce indexed
+           diagnostics and failure status without discarding valid neighbors.
+           Its source operand uses ordinary `filesystem_file` completion, with
+           `-` retained as parser evidence. Stat/time and NSS reads remain.
 
 Commands whose execution parser does not yet expose a probe deliberately have
 no argument projection. The next adapters must expose their existing parser or

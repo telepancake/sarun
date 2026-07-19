@@ -1,0 +1,1005 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Sun, 19 Jul 2026 19:31:43 +0000
+Subject: [PATCH] find: defer files0 sources through explicit context
+
+Keep -files0-from as an unresolved Find-owned query during argument parsing. Resolve logical stdin or logical-cwd/absolute files only during execution preparation, before output resources are committed. Pure NUL-record decoding preserves order, duplicates, empty input, and Unix path bytes; indexed empty records set failure status without dropping valid neighbors. The actual parser arm also supplies source-operand evidence for ordinary contextual completion without reading the source.
+
+---
+diff --git a/src/find/matchers/mod.rs b/src/find/matchers/mod.rs
+index e306810..bb1da79 100644
+--- a/src/find/matchers/mod.rs
++++ b/src/find/matchers/mod.rs
+@@ -66,8 +66,7 @@ use fs::FileSystemMatcher;
+ use ls::Ls;
+ use std::{
+     error::Error,
+-    fs::{File, Metadata},
+-    io::Read,
++    fs::Metadata,
+     path::Path,
+     str::FromStr,
+     time::SystemTime,
+@@ -342,37 +341,22 @@ pub fn build_top_level_matcher(
+     args: &[&str],
+     config: &mut Config,
+ ) -> Result<Box<dyn Matcher>, Box<dyn Error>> {
+-    // Default entry: `-files0-from -` bulk reads come from the process's real
+-    // stdin. The in-process builtin uses `build_top_level_matcher_with_input`
+-    // to supply the shell's logical stdin instead.
+-    build_top_level_matcher_with_input(args, config, &mut std::io::stdin().lock())
+-}
+-
+-/// As [`build_top_level_matcher`], but with an explicit source for the
+-/// `-files0-from -` bulk stdin read (see `crate::find::Dependencies::get_input`).
+-pub fn build_top_level_matcher_with_input(
+-    args: &[&str],
+-    config: &mut Config,
+-    input: &mut dyn Read,
+-) -> Result<Box<dyn Matcher>, Box<dyn Error>> {
+-    build_top_level_matcher_with_input_observed(
++    build_top_level_matcher_observed(
+         args,
+         config,
+-        input,
+         &mut super::IgnoreParseObservations,
+         0,
+     )
+ }
+ 
+-pub(super) fn build_top_level_matcher_with_input_observed(
++pub(super) fn build_top_level_matcher_observed(
+     args: &[&str],
+     config: &mut Config,
+-    input: &mut dyn Read,
+     observer: &mut dyn super::ParseObserver,
+     argument_offset: usize,
+ ) -> Result<Box<dyn Matcher>, Box<dyn Error>> {
+     let (_, top_level_matcher) =
+-        build_matcher_tree(args, config, 0, false, input, observer, argument_offset)?;
++        build_matcher_tree(args, config, 0, false, observer, argument_offset)?;
+ 
+     // if the matcher doesn't have any side-effects, then we default to printing
+     if !top_level_matcher.has_side_effects() {
+@@ -524,7 +508,6 @@ fn build_matcher_tree(
+     config: &mut Config,
+     arg_index: usize,
+     mut expecting_bracket: bool,
+-    input: &mut dyn Read,
+     observer: &mut dyn super::ParseObserver,
+     argument_offset: usize,
+ ) -> Result<(usize, Box<dyn Matcher>), Box<dyn Error>> {
+@@ -540,7 +523,12 @@ fn build_matcher_tree(
+     let mut invert_next_matcher = false;
+     while i < args.len() {
+         let file_type_predicate = crate::find::syntax::file_type_predicate(args[i]);
+-        if !observer.expression(argument_offset + i, args[i], file_type_predicate) {
++        // `-files0-from` has its own observer hooks in its actual parser arm.
++        // Every other unsupported expression is still stopped before entering
++        // an arm which may perform parse-time work.
++        if args[i] != "-files0-from"
++            && !observer.expression(argument_offset + i, args[i], file_type_predicate)
++        {
+             return Err(Box::new(super::ParseObservationRejected));
+         }
+         let possible_submatcher = match args[i] {
+@@ -970,7 +958,6 @@ fn build_matcher_tree(
+                     config,
+                     i + 1,
+                     true,
+-                    input,
+                     observer,
+                     argument_offset,
+                 )?;
+@@ -1058,9 +1045,14 @@ fn build_matcher_tree(
+             }
+             "-files0-from" => {
+                 if i >= args.len() - 1 {
++                    observer.missing_files0_source(argument_offset + i + 1);
+                     return Err(From::from(format!("missing argument to {}", args[i])));
+                 }
+-                let _ = config.files0_argument.insert(args[i + 1].to_string());
++                observer.files0_source(argument_offset + i + 1, args[i + 1]);
++                let _ = config.files0_query.insert(super::Files0Query::from_argument(
++                    argument_offset + i + 1,
++                    args[i + 1],
++                ));
+                 i += 1;
+                 Some(TrueMatcher.into_box())
+             }
+@@ -1121,61 +1113,9 @@ fn build_matcher_tree(
+              did not see one.",
+         ));
+     }
+-    if config.files0_argument.is_some() {
+-        parse_files0_args(config, input)?;
+-    }
+     Ok((i, top_level_matcher.build()))
+ }
+ 
+-// https://www.gnu.org/software/findutils/manual/html_node/find_html/Starting-points.html
+-// This allows users to take the entry point for find from stdin (eg. pipe) or from a text file.
+-// eg. dummy | find -files0-from -
+-// eg. find -files0-from rust.txt -name "cargo"
+-fn parse_files0_args(config: &mut Config, input: &mut dyn Read) -> Result<(), Box<dyn Error>> {
+-    let mode = config.files0_argument.as_ref().unwrap();
+-    let mut buffer = Vec::new();
+-    let new_paths = config.new_paths.insert(Vec::new());
+-
+-    if mode == "-" {
+-        // The caller-supplied logical stdin — NOT `std::io::stdin()`, which in
+-        // an in-process embedder would read (and consume) the host process's
+-        // real fd 0.
+-        input.read_to_end(&mut buffer)?;
+-    } else {
+-        let mut file =
+-            File::open(mode).map_err(|e| format!("cannot open '{}' for reading: {}", mode, e))?;
+-        file.read_to_end(&mut buffer)?;
+-    }
+-
+-    let mut buffer_split: Vec<&[u8]> = buffer.split(|&b| b == 0).collect();
+-    // if the pipe/file ends with ASCII NULL
+-    if buffer_split.last().is_some_and(|s| s.is_empty()) {
+-        buffer_split.remove(buffer_split.len() - 1);
+-    }
+-
+-    let mut string_segments: Vec<String> = buffer_split
+-        .iter()
+-        .filter_map(|s| std::str::from_utf8(s).ok())
+-        .map(std::string::ToString::to_string)
+-        .collect();
+-    // empty starting point checker
+-    let had_zero_length = string_segments.iter().any(std::string::String::is_empty);
+-    if had_zero_length {
+-        // remove the empty ones so as to avoid file not found error
+-        string_segments.retain(|s| !s.is_empty());
+-    }
+-
+-    new_paths.extend(string_segments);
+-    // `new_paths` borrowed `config.new_paths`; that borrow ends above, so we can
+-    // now record the diagnostic on `config` for `do_find` to emit via deps.
+-    if had_zero_length {
+-        config
+-            .parse_warnings
+-            .push("find: invalid zero-length file name".to_string());
+-    }
+-    Ok(())
+-}
+-
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+diff --git a/src/find/mod.rs b/src/find/mod.rs
+index e84fd54..cfb2b9a 100644
+--- a/src/find/mod.rs
++++ b/src/find/mod.rs
+@@ -11,10 +11,13 @@ pub mod syntax;
+ use matchers::{Follow, WalkEntry};
+ use std::cell::RefCell;
+ use std::error::Error;
++use std::ffi::OsString;
+ #[cfg(unix)]
+ use std::io::IsTerminal;
+ use std::io::{self, stderr, stdout, BufRead, BufReader, Read, Write};
+-use std::path::PathBuf;
++#[cfg(unix)]
++use std::os::unix::ffi::OsStringExt;
++use std::path::{Path, PathBuf};
+ use std::rc::Rc;
+ use std::time::SystemTime;
+ use walkdir::WalkDir;
+@@ -28,6 +31,62 @@ pub trait FindOperations {
+     fn create_output(&self, path: &std::path::Path) -> io::Result<std::fs::File>;
+ }
+ 
++/// An external value required to turn a parsed find invocation into an
++/// executable plan. Parsing only constructs this value; it never reads it.
++#[derive(Clone, Debug, Eq, PartialEq)]
++pub struct Files0Query {
++    pub argument: usize,
++    pub source: Files0Source,
++}
++
++impl Files0Query {
++    pub(crate) fn from_argument(argument: usize, surface: &str) -> Self {
++        let source = if surface == "-" {
++            Files0Source::LogicalStdin
++        } else {
++            let path = PathBuf::from(surface);
++            if path.is_absolute() {
++                Files0Source::AbsolutePath(path)
++            } else {
++                Files0Source::LogicalCwdPath(path)
++            }
++        };
++        Self { argument, source }
++    }
++
++    fn display_source(&self) -> String {
++        match &self.source {
++            Files0Source::LogicalStdin => "(standard input)".to_string(),
++            Files0Source::LogicalCwdPath(path) | Files0Source::AbsolutePath(path) => {
++                path.to_string_lossy().into_owned()
++            }
++        }
++    }
++}
++
++/// The logical namespace in which a `-files0-from` source is interpreted.
++#[derive(Clone, Debug, Eq, PartialEq)]
++pub enum Files0Source {
++    LogicalStdin,
++    LogicalCwdPath(PathBuf),
++    AbsolutePath(PathBuf),
++}
++
++/// Immutable result of resolving one [`Files0Query`]. The query is repeated in
++/// the observation so pure replay can reject an observation for another input.
++#[derive(Clone, Debug, Eq, PartialEq)]
++pub struct Files0Observation {
++    pub query: Files0Query,
++    pub bytes: Vec<u8>,
++}
++
++/// Read-only execution context used to resolve parsed Find dependencies.
++/// This is deliberately separate from [`FindOperations`], whose methods commit
++/// mutations such as creating output files.
++pub trait FindContext {
++    fn observe_files0(&self, query: &Files0Query) -> Result<Files0Observation, Box<dyn Error>>;
++}
++
+ struct DependencyFindOperations<'a> {
+     dependencies: &'a dyn Dependencies,
+ }
+@@ -42,6 +101,50 @@ impl FindOperations for DependencyFindOperations<'_> {
+     }
+ }
+ 
++struct DependencyFindContext<'a> {
++    dependencies: &'a dyn Dependencies,
++}
++
++impl FindContext for DependencyFindContext<'_> {
++    fn observe_files0(&self, query: &Files0Query) -> Result<Files0Observation, Box<dyn Error>> {
++        let mut bytes = Vec::new();
++        match &query.source {
++            Files0Source::LogicalStdin => {
++                self.dependencies
++                    .get_input()
++                    .borrow_mut()
++                    .read_to_end(&mut bytes)?;
++            }
++            Files0Source::LogicalCwdPath(path) => {
++                let path = self
++                    .dependencies
++                    .cwd()
++                    .map_or_else(|| path.clone(), |cwd| cwd.join(path));
++                let mut file = std::fs::File::open(&path).map_err(|error| {
++                    format!(
++                        "cannot open '{}' for reading: {error}",
++                        query.display_source()
++                    )
++                })?;
++                file.read_to_end(&mut bytes)?;
++            }
++            Files0Source::AbsolutePath(path) => {
++                let mut file = std::fs::File::open(path).map_err(|error| {
++                    format!(
++                        "cannot open '{}' for reading: {error}",
++                        query.display_source()
++                    )
++                })?;
++                file.read_to_end(&mut bytes)?;
++            }
++        }
++        Ok(Files0Observation {
++            query: query.clone(),
++            bytes,
++        })
++    }
++}
++
+ pub struct Config {
+     same_file_system: bool,
+     depth_first: bool,
+@@ -53,13 +156,7 @@ pub struct Config {
+     today_start: bool,
+     no_leaf_dirs: bool,
+     follow: Follow,
+-    new_paths: Option<Vec<String>>,
+-    files0_argument: Option<String>,
+-    /// Non-fatal diagnostics produced while parsing arguments (e.g. a
+-    /// zero-length name in `-files0-from`). Collected here rather than written
+-    /// straight to `stderr` so the parse path stays free of an injected sink;
+-    /// `do_find` drains them to `deps.get_error_output()` before walking.
+-    parse_warnings: Vec<String>,
++    files0_query: Option<Files0Query>,
+ }
+ 
+ impl Default for Config {
+@@ -78,9 +175,7 @@ impl Default for Config {
+             // a compatibility item for GNU findutils.
+             no_leaf_dirs: false,
+             follow: Follow::Never,
+-            new_paths: None, // This option exclusively for -files0-from argument.
+-            files0_argument: None, //This option also is used for file0-from
+-            parse_warnings: Vec::new(),
++            files0_query: None,
+         }
+     }
+ }
+@@ -246,10 +341,28 @@ impl Dependencies for StandardDependencies {
+ /// The result of parsing the command-line arguments into useful forms.
+ struct ParsedInfo {
+     matcher: Box<dyn self::matchers::Matcher>,
+-    paths: Vec<String>,
++    starting_points: StartingPoints,
+     config: Config,
+ }
+ 
++#[derive(Clone, Debug, Eq, PartialEq)]
++enum StartingPoints {
++    /// No source was written: Find supplies its ordinary `.` default.
++    Default,
++    /// Starting points explicitly present in argv.
++    Explicit(Vec<PathBuf>),
++    /// The ordered starting points are an unresolved external observation.
++    Files0(Files0Query),
++}
++
++struct PreparedInfo {
++    matcher: Box<dyn self::matchers::Matcher>,
++    paths: Vec<PathBuf>,
++    config: Config,
++    initial_exit_code: i32,
++    diagnostics: Vec<String>,
++}
++
+ trait ParseObserver {
+     fn top_level_option(&mut self, _argument: usize, _surface: &str) -> bool {
+         true
+@@ -290,6 +403,10 @@ trait ParseObserver {
+         _predicate: &syntax::FileTypePredicate,
+     ) {
+     }
++
++    fn files0_source(&mut self, _argument: usize, _surface: &str) {}
++
++    fn missing_files0_source(&mut self, _argument: usize) {}
+ }
+ 
+ struct IgnoreParseObservations;
+@@ -307,18 +424,14 @@ impl std::fmt::Display for ParseObservationRejected {
+ 
+ impl Error for ParseObservationRejected {}
+ 
+-/// Function to generate a `ParsedInfo` from the strings supplied on the command-line.
+-///
+-/// `input` is the source for any `-files0-from -` bulk stdin read; the caller
+-/// supplies the logical stdin (real `stdin` for the standalone binary, the
+-/// shell's logical stdin for the in-process builtin).
+-fn parse_args(args: &[&str], input: &mut dyn Read) -> Result<ParsedInfo, Box<dyn Error>> {
+-    parse_args_observed(args, input, &mut IgnoreParseObservations)
++/// Parse argv without access to a `-files0-from` source. Other legacy matcher
++/// construction effects are migrated behind context boundaries separately.
++fn parse_args(args: &[&str]) -> Result<ParsedInfo, Box<dyn Error>> {
++    parse_args_observed(args, &mut IgnoreParseObservations)
+ }
+ 
+ fn parse_args_observed(
+     args: &[&str],
+-    input: &mut dyn Read,
+     observer: &mut dyn ParseObserver,
+ ) -> Result<ParsedInfo, Box<dyn Error>> {
+     let mut paths = vec![];
+@@ -365,38 +478,96 @@ fn parse_args_observed(
+         && args[i] != "("
+     {
+         observer.starting_path(i, args[i]);
+-        paths.push(args[i].to_string());
++        paths.push(PathBuf::from(args[i]));
+         i += 1;
+     }
+-    if i == paths_start {
+-        paths.push(".".to_string());
+-    }
+-    let matcher = matchers::build_top_level_matcher_with_input_observed(
++    let matcher = matchers::build_top_level_matcher_observed(
+         &args[i..],
+         &mut config,
+-        input,
+         observer,
+         i,
+     )?;
+-    if let Some(new_paths) = &config.new_paths {
+-        if paths.len() == 1 && paths[0] == "." {
+-            paths.clone_from(new_paths);
+-        } else {
++    let starting_points = match config.files0_query.take() {
++        Some(query) if paths.is_empty() => StartingPoints::Files0(query),
++        Some(_) => {
+             return Err(From::from(format!(
+                 "extra operand '{}'\nfile operands cannot be combined with -files0-from",
+-                paths[0]
++                paths[0].display()
+             )));
+         }
+-    }
++        None if paths_start == i && paths.is_empty() => StartingPoints::Default,
++        None => StartingPoints::Explicit(paths),
++    };
+     Ok(ParsedInfo {
+         matcher,
+-        paths,
++        starting_points,
+         config,
+     })
+ }
+ 
++impl ParsedInfo {
++    fn resolve(self, context: &dyn FindContext) -> Result<PreparedInfo, Box<dyn Error>> {
++        let (paths, diagnostics, initial_exit_code) = match &self.starting_points {
++            StartingPoints::Default => (vec![PathBuf::from(".")], Vec::new(), 0),
++            StartingPoints::Explicit(paths) => (paths.clone(), Vec::new(), 0),
++            StartingPoints::Files0(query) => {
++                let observation = context.observe_files0(query)?;
++                decode_files0_observation(query, &observation)?
++            }
++        };
++        Ok(PreparedInfo {
++            matcher: self.matcher,
++            paths,
++            config: self.config,
++            initial_exit_code,
++            diagnostics,
++        })
++    }
++}
++
++fn decode_files0_observation(
++    query: &Files0Query,
++    observation: &Files0Observation,
++) -> Result<(Vec<PathBuf>, Vec<String>, i32), Box<dyn Error>> {
++    if &observation.query != query {
++        return Err(From::from(
++            "-files0-from observation does not match its query",
++        ));
++    }
++    let mut records = observation.bytes.split(|byte| *byte == 0).collect::<Vec<_>>();
++    if records.last().is_some_and(|record| record.is_empty()) {
++        records.pop();
++    }
++
++    let mut paths = Vec::new();
++    let mut diagnostics = Vec::new();
++    for (index, record) in records.into_iter().enumerate() {
++        if record.is_empty() {
++            diagnostics.push(format!(
++                "find: '{}':{}: invalid zero-length file name",
++                query.display_source(),
++                index + 1
++            ));
++            continue;
++        }
++        #[cfg(unix)]
++        let path = PathBuf::from(OsString::from_vec(record.to_vec()));
++        #[cfg(not(unix))]
++        let path = PathBuf::from(String::from_utf8(record.to_vec()).map_err(|_| {
++            format!(
++                "{}:{}: file name is not valid UTF-8 on this platform",
++                query.display_source(),
++                index + 1
++            )
++        })?);
++        paths.push(path);
++    }
++    let exit_code = i32::from(!diagnostics.is_empty());
++    Ok((paths, diagnostics, exit_code))
++}
++
+ fn process_dir(
+-    dir: &str,
++    dir: &Path,
+     config: &Config,
+     deps: &dyn Dependencies,
+     matcher: &dyn matchers::Matcher,
+@@ -407,7 +578,7 @@ fn process_dir(
+     // process cwd — no `unshare`/`chdir`), and remap each entry's DISPLAY path
+     // back to the start-relative form the user expects. An absolute start path,
+     // or the standalone binary (cwd == None), is walked as-is.
+-    let start = std::path::Path::new(dir);
++    let start = dir;
+     let (walk_root, remap): (PathBuf, Option<PathBuf>) = match deps.cwd() {
+         Some(cwd) if start.is_relative() => (cwd.join(start), Some(start.to_path_buf())),
+         _ => (start.to_path_buf(), None),
+@@ -494,36 +665,34 @@ fn process_dir(
+ }
+ 
+ fn do_find(args: &[&str], deps: &dyn Dependencies) -> Result<i32, Box<dyn Error>> {
+-    let mut paths_and_matcher = parse_args(args, &mut *deps.get_input().borrow_mut())?;
+-    // Emit any non-fatal parse-time diagnostics (e.g. a zero-length name in
+-    // -files0-from) through the injected error sink, before walking.
+-    for warning in &paths_and_matcher.config.parse_warnings {
+-        writeln!(&mut *deps.get_error_output().borrow_mut(), "{warning}").unwrap();
+-    }
+-    if paths_and_matcher.config.help_requested {
++    let parsed = parse_args(args)?;
++    if parsed.config.help_requested {
+         print_help(deps)?;
+         return Ok(0);
+     }
+-    if paths_and_matcher.config.version_requested {
++    if parsed.config.version_requested {
+         print_version(deps)?;
+         return Ok(0);
+     }
+ 
+-    // Parsing above is deliberately free of output-file effects. Only after
+-    // the complete command line has succeeded (and help/version have returned)
+-    // do we commit resources needed by action matchers.
+-    paths_and_matcher.matcher.prepare(&DependencyFindOperations {
++    // Resolve all read-only dependencies before committing output resources.
++    // A missing `-files0-from` source must not truncate an -fprint destination.
++    let mut prepared = parsed.resolve(&DependencyFindContext { dependencies: deps })?;
++    for diagnostic in &prepared.diagnostics {
++        writeln!(&mut *deps.get_error_output().borrow_mut(), "{diagnostic}").unwrap();
++    }
++    prepared.matcher.prepare(&DependencyFindOperations {
+         dependencies: deps,
+     })?;
+ 
+-    let mut ret = 0;
++    let mut ret = prepared.initial_exit_code;
+     let mut quit = false;
+-    for path in paths_and_matcher.paths {
++    for path in prepared.paths {
+         let dir_ret = process_dir(
+             &path,
+-            &paths_and_matcher.config,
++            &prepared.config,
+             deps,
+-            &*paths_and_matcher.matcher,
++            &*prepared.matcher,
+             &mut quit,
+         );
+         if dir_ret != 0 {
+@@ -659,6 +828,7 @@ pub fn find_main(args: &[&str], deps: &dyn Dependencies) -> i32 {
+ #[cfg(test)]
+ mod tests {
+ 
++    use std::cell::Cell;
+     use std::fs;
+     use std::io::{Cursor, ErrorKind, Read};
+     use std::time::Duration;
+@@ -693,6 +863,7 @@ mod tests {
+         pub output: RefCell<Cursor<Vec<u8>>>,
+         pub error_output: RefCell<Cursor<Vec<u8>>>,
+         input: RefCell<Cursor<Vec<u8>>>,
++        input_accesses: Cell<usize>,
+         now: SystemTime,
+         cwd: Option<PathBuf>,
+         /// Preset responses for confirm(), consumed front-to-back.
+@@ -705,6 +876,7 @@ mod tests {
+                 output: RefCell::new(Cursor::new(Vec::<u8>::new())),
+                 error_output: RefCell::new(Cursor::new(Vec::<u8>::new())),
+                 input: RefCell::new(Cursor::new(Vec::<u8>::new())),
++                input_accesses: Cell::new(0),
+                 now: SystemTime::now(),
+                 cwd: None,
+                 confirm_responses: RefCell::new(std::collections::VecDeque::new()),
+@@ -716,6 +888,10 @@ mod tests {
+             *self.input.borrow_mut() = Cursor::new(data.to_vec());
+         }
+ 
++        pub fn input_accesses(&self) -> usize {
++            self.input_accesses.get()
++        }
++
+         /// Captured diagnostics, for tests asserting error routing.
+         pub fn get_error_output_as_string(&self) -> String {
+             let mut cursor = self.error_output.borrow_mut();
+@@ -761,6 +937,7 @@ mod tests {
+         }
+ 
+         fn get_input(&self) -> &RefCell<dyn Read> {
++            self.input_accesses.set(self.input_accesses.get() + 1);
+             &self.input
+         }
+ 
+@@ -803,14 +980,17 @@ mod tests {
+     #[test]
+     fn parse_args_handles_single_dash() {
+         // Apparently "-" should be treated as a directory name.
+-        let parsed_info = super::parse_args(&["-"], &mut std::io::empty()).expect("parsing should succeed");
+-        assert_eq!(parsed_info.paths, ["-"]);
++        let parsed_info = super::parse_args(&["-"]).expect("parsing should succeed");
++        assert_eq!(
++            parsed_info.starting_points,
++            StartingPoints::Explicit(vec![PathBuf::from("-")])
++        );
+     }
+ 
+     #[test]
+     fn parse_args_bad_flag() {
+         //
+-        let result = super::parse_args(&["-asdadsafsfsadcs"], &mut std::io::empty());
++        let result = super::parse_args(&["-asdadsafsfsadcs"]);
+         if let Err(e) = result {
+             assert_eq!(e.to_string(), "Unrecognized flag: '-asdadsafsfsadcs'");
+         } else {
+@@ -820,41 +1000,109 @@ mod tests {
+ 
+     #[test]
+     fn parse_optimize_flag() {
+-        let parsed_info =
+-            super::parse_args(&["-O0", ".", "-print"], &mut std::io::empty()).expect("parsing should succeed");
+-        assert_eq!(parsed_info.paths, ["."]);
++        let parsed_info = super::parse_args(&["-O0", ".", "-print"])
++            .expect("parsing should succeed");
++        assert_eq!(
++            parsed_info.starting_points,
++            StartingPoints::Explicit(vec![PathBuf::from(".")])
++        );
+     }
+ 
+     #[test]
+     fn parse_h_flag() {
+-        let parsed_info = super::parse_args(&["-H"], &mut std::io::empty()).expect("parsing should succeed");
++        let parsed_info = super::parse_args(&["-H"]).expect("parsing should succeed");
+         assert_eq!(parsed_info.config.follow, Follow::Roots);
+     }
+ 
+     #[test]
+     fn parse_l_flag() {
+-        let parsed_info = super::parse_args(&["-L"], &mut std::io::empty()).expect("parsing should succeed");
++        let parsed_info = super::parse_args(&["-L"]).expect("parsing should succeed");
+         assert_eq!(parsed_info.config.follow, Follow::Always);
+     }
+ 
+     #[test]
+     fn parse_p_flag() {
+-        let parsed_info = super::parse_args(&["-P"], &mut std::io::empty()).expect("parsing should succeed");
++        let parsed_info = super::parse_args(&["-P"]).expect("parsing should succeed");
+         assert_eq!(parsed_info.config.follow, Follow::Never);
+     }
+ 
+     #[test]
+     fn parse_flag_then_double_dash() {
+-        super::parse_args(&["-P", "--"], &mut std::io::empty()).expect("parsing should succeed");
++        super::parse_args(&["-P", "--"]).expect("parsing should succeed");
+     }
+ 
+     #[test]
+     fn parse_double_dash_then_flag() {
+-        super::parse_args(&["--", "-P"], &mut std::io::empty())
++        super::parse_args(&["--", "-P"])
+             .err()
+             .expect("parsing should fail");
+     }
+ 
++    #[test]
++    fn files0_parse_produces_an_unresolved_query() {
++        let parsed = parse_args(&["-files0-from", "roots0"]).expect("parsing should succeed");
++        assert_eq!(
++            parsed.starting_points,
++            StartingPoints::Files0(Files0Query {
++                argument: 1,
++                source: Files0Source::LogicalCwdPath(PathBuf::from("roots0")),
++            })
++        );
++    }
++
++    #[test]
++    fn explicit_dot_conflicts_with_files0_without_reading_stdin() {
++        let deps = FakeDependencies::new();
++        deps.set_input(b"ignored\0");
++        let rc = find_main(&["find", ".", "-files0-from", "-"], &deps);
++        assert_eq!(rc, 1);
++        assert_eq!(deps.input_accesses(), 0);
++        assert!(deps
++            .get_error_output_as_string()
++            .contains("file operands cannot be combined with -files0-from"));
++    }
++
++    #[test]
++    fn files0_decode_preserves_order_duplicates_and_empty_input() {
++        let query = Files0Query::from_argument(1, "-");
++        let observation = Files0Observation {
++            query: query.clone(),
++            bytes: b"b\0a\0b".to_vec(),
++        };
++        let (paths, diagnostics, status) =
++            decode_files0_observation(&query, &observation).unwrap();
++        assert_eq!(paths, [PathBuf::from("b"), PathBuf::from("a"), PathBuf::from("b")]);
++        assert!(diagnostics.is_empty());
++        assert_eq!(status, 0);
++
++        let empty = Files0Observation {
++            query: query.clone(),
++            bytes: Vec::new(),
++        };
++        let (paths, diagnostics, status) = decode_files0_observation(&query, &empty).unwrap();
++        assert!(paths.is_empty());
++        assert!(diagnostics.is_empty());
++        assert_eq!(status, 0);
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn files0_decode_preserves_non_utf8_paths() {
++        use std::os::unix::ffi::OsStrExt;
++
++        let query = Files0Query::from_argument(1, "-");
++        let observation = Files0Observation {
++            query: query.clone(),
++            bytes: vec![b'f', 0xff, 0],
++        };
++        let (paths, diagnostics, status) =
++            decode_files0_observation(&query, &observation).unwrap();
++        assert_eq!(paths.len(), 1);
++        assert_eq!(paths[0].as_os_str().as_bytes(), &[b'f', 0xff]);
++        assert!(diagnostics.is_empty());
++        assert_eq!(status, 0);
++    }
++
+     #[test]
+     fn diagnostics_route_to_error_output_not_stdout() {
+         // A failing start path must produce an exit code and a message on the
+@@ -895,7 +1143,6 @@ mod tests {
+                 "-fls",
+                 fls_text.as_ref(),
+             ],
+-            &mut std::io::empty(),
+         )
+         .expect("the output actions should parse");
+         for output in [&fprint, &fprintf, &fprint0, &fls] {
+@@ -1044,14 +1291,106 @@ mod tests {
+     fn files0_from_dash_reads_injected_input_not_process_stdin() {
+         // `-files0-from -` must read the injected logical stdin, not the host
+         // process's fd 0. Feed a NUL-separated start path through get_input.
++        let temp_dir = Builder::new().prefix("find-files0-stdin").tempdir().unwrap();
++        fs::write(temp_dir.path().join("target"), b"").unwrap();
++        let mut deps = FakeDependencies::new();
++        deps.set_cwd(temp_dir.path());
++        deps.set_input(b"target\0");
++        let rc = find_main(
++            &["find", "-files0-from", "-", "-maxdepth", "0"],
++            &deps,
++        );
++        assert_eq!(rc, 0);
++        assert_eq!(deps.get_output_as_string(), "target\n");
++        assert_eq!(deps.input_accesses(), 1);
++    }
++
++    #[test]
++    fn files0_help_does_not_consume_logical_stdin() {
++        let deps = FakeDependencies::new();
++        deps.set_input(b"must remain unread\0");
++        let rc = find_main(&["find", "-files0-from", "-", "-help"], &deps);
++        assert_eq!(rc, 0);
++        assert_eq!(deps.input_accesses(), 0);
++    }
++
++    #[test]
++    fn files0_syntax_failure_does_not_consume_logical_stdin() {
++        let deps = FakeDependencies::new();
++        deps.set_input(b"must remain unread\0");
++        let rc = find_main(
++            &["find", "-files0-from", "-", "-definitely-invalid"],
++            &deps,
++        );
++        assert_eq!(rc, 1);
++        assert_eq!(deps.input_accesses(), 0);
++    }
++
++    #[test]
++    fn files0_relative_source_uses_logical_cwd() {
++        let temp_dir = Builder::new().prefix("find-files0-cwd").tempdir().unwrap();
++        fs::write(temp_dir.path().join("target"), b"").unwrap();
++        fs::write(temp_dir.path().join("roots0"), b"target\0").unwrap();
++        let mut deps = FakeDependencies::new();
++        deps.set_cwd(temp_dir.path());
++        let rc = find_main(
++            &["find", "-files0-from", "roots0", "-maxdepth", "0"],
++            &deps,
++        );
++        assert_eq!(rc, 0);
++        assert_eq!(deps.get_output_as_string(), "target\n");
++        assert_eq!(deps.input_accesses(), 0);
++    }
++
++    #[test]
++    fn files0_empty_source_does_not_restore_default_dot() {
+         let deps = FakeDependencies::new();
+-        deps.set_input(format!("{}\0", fix_up_slashes("./test_data/simple/abbbc")).as_bytes());
++        deps.set_input(b"");
+         let rc = find_main(&["find", "-files0-from", "-"], &deps);
+         assert_eq!(rc, 0);
+-        assert_eq!(
+-            deps.get_output_as_string(),
+-            fix_up_slashes("./test_data/simple/abbbc\n")
++        assert_eq!(deps.get_output_as_string(), "");
++        assert_eq!(deps.input_accesses(), 1);
++    }
++
++    #[test]
++    fn files0_zero_length_records_warn_and_set_failure_status() {
++        let temp_dir = Builder::new().prefix("find-files0-zero").tempdir().unwrap();
++        fs::write(temp_dir.path().join("target"), b"").unwrap();
++        let mut deps = FakeDependencies::new();
++        deps.set_cwd(temp_dir.path());
++        deps.set_input(b"target\0\0target\0");
++        let rc = find_main(
++            &["find", "-files0-from", "-", "-maxdepth", "0"],
++            &deps,
++        );
++        assert_eq!(rc, 1);
++        assert_eq!(deps.get_output_as_string(), "target\ntarget\n");
++        assert!(deps
++            .get_error_output_as_string()
++            .contains("(standard input)':2: invalid zero-length file name"));
++        assert_eq!(deps.input_accesses(), 1);
++    }
++
++    #[test]
++    fn files0_read_failure_does_not_truncate_prepared_output() {
++        let temp_dir = Builder::new().prefix("find-files0-failure").tempdir().unwrap();
++        let output = temp_dir.path().join("kept");
++        fs::write(&output, b"keep me").unwrap();
++        let output_text = output.to_string_lossy();
++        let mut deps = FakeDependencies::new();
++        deps.set_cwd(temp_dir.path());
++        let rc = find_main(
++            &[
++                "find",
++                "-files0-from",
++                "missing-roots0",
++                "-fprint",
++                output_text.as_ref(),
++            ],
++            &deps,
+         );
++        assert_eq!(rc, 1);
++        assert_eq!(fs::read(&output).unwrap(), b"keep me");
+     }
+ 
+     #[test]
+diff --git a/src/find/probe.rs b/src/find/probe.rs
+index d78b40e..20cfb21 100644
+--- a/src/find/probe.rs
++++ b/src/find/probe.rs
+@@ -28,6 +28,7 @@ pub enum ProbeStatus {
+ #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+ pub enum ArgumentIdentity {
+     StartingPath,
++    Files0Source,
+     FileTypePredicate(FileTypePredicateIdentity),
+     FileTypeValue {
+         predicate: FileTypePredicateIdentity,
+@@ -44,6 +45,7 @@ pub struct ArgumentMatch {
+ #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+ pub enum Expectation {
+     StartingPath,
++    Files0Source,
+     FileTypePredicate,
+     FileTypeValue(FileTypePredicateIdentity),
+ }
+@@ -149,12 +151,26 @@ impl ParseObserver for Recorder {
+         self.expectations
+             .push((argument, Expectation::FileTypeValue(predicate.identity)));
+     }
++
++    fn files0_source(&mut self, argument: usize, _surface: &str) {
++        self.expectations
++            .push((argument, Expectation::Files0Source));
++        self.matches.push(ArgumentMatch {
++            argument,
++            identity: ArgumentIdentity::Files0Source,
++        });
++    }
++
++    fn missing_files0_source(&mut self, argument: usize) {
++        self.expectations
++            .push((argument, Expectation::Files0Source));
++    }
+ }
+ 
+ fn replay(arguments: &[String]) -> (bool, Recorder) {
+     let refs = arguments.iter().map(String::as_str).collect::<Vec<_>>();
+     let mut recorder = Recorder::default();
+-    let accepted = parse_args_observed(&refs, &mut std::io::empty(), &mut recorder).is_ok();
++    let accepted = parse_args_observed(&refs, &mut recorder).is_ok();
+     (accepted, recorder)
+ }
+ 
+@@ -291,6 +307,45 @@ fn assist(arguments: &[ProbeArgument<'_>], tear: usize) -> ProbeOutput {
+         output.matches = path_recorder.matches;
+     }
+ 
++    // A `-files0-from` source is syntactically a path or the literal `-`.
++    // Replay a representative surface through the actual option arm; source
++    // contents remain an unresolved execution dependency and are never read.
++    let source_surface = if prefix.is_empty() && suffix.is_empty() {
++        ".".to_owned()
++    } else {
++        format!("{prefix}{suffix}")
++    };
++    let (_, source_recorder) = replay(&replace_tear(arguments, tear, &source_surface));
++    unsupported_outside_tear |= source_recorder
++        .unsupported
++        .is_some_and(|argument| argument != tear);
++    if source_recorder.unsupported.is_none()
++        && source_recorder.expects(tear, Expectation::Files0Source)
++    {
++        proved_role = true;
++        output.expectations.push(Expectation::Files0Source);
++        if output.matches.is_empty() {
++            output.matches.clone_from(&source_recorder.matches);
++        }
++        if let Some(insertion) = compatible_insertion(prefix, suffix, "-") {
++            let completed = format!("{prefix}{insertion}{suffix}");
++            let (accepted, recorder) = replay(&replace_tear(arguments, tear, &completed));
++            if accepted
++                && recorder.unsupported.is_none()
++                && recorder.has(tear, ArgumentIdentity::Files0Source)
++                && seen_insertions.insert(insertion.to_owned())
++            {
++                output.completions.push(Completion {
++                    insertion: insertion.to_owned(),
++                    display: "-",
++                    help: "read NUL-separated starting points from standard input",
++                    identity: ArgumentIdentity::Files0Source,
++                    matches: recorder.matches,
++                });
++            }
++        }
++    }
++
+     // Replay each execution-owned predicate spelling. The actual expression
+     // dispatch decides whether the tear is a predicate position.
+     for predicate in FILE_TYPE_PREDICATES {
+@@ -376,9 +431,10 @@ fn assist(arguments: &[ProbeArgument<'_>], tear: usize) -> ProbeOutput {
+         .expectations
+         .sort_by_key(|expectation| match expectation {
+             Expectation::StartingPath => (0, 0),
+-            Expectation::FileTypePredicate => (1, 0),
+-            Expectation::FileTypeValue(FileTypePredicateIdentity::Type) => (2, 0),
+-            Expectation::FileTypeValue(FileTypePredicateIdentity::Xtype) => (2, 1),
++            Expectation::Files0Source => (1, 0),
++            Expectation::FileTypePredicate => (2, 0),
++            Expectation::FileTypeValue(FileTypePredicateIdentity::Type) => (3, 0),
++            Expectation::FileTypeValue(FileTypePredicateIdentity::Xtype) => (3, 1),
+         });
+     output.expectations.dedup();
+     output
+@@ -494,6 +550,30 @@ mod tests {
+         assert!(value.completions.is_empty());
+     }
+ 
++    #[test]
++    fn files0_source_is_observed_by_its_execution_parser_arm() {
++        let exact_source = probe(&[
++            exact("-files0-from"),
++            exact("roots0"),
++            exact("-type"),
++            exact("f"),
++        ]);
++        assert_eq!(exact_source.status, ProbeStatus::Complete);
++        assert!(exact_source.matches.iter().any(|matched| {
++            matched.argument == 1 && matched.identity == ArgumentIdentity::Files0Source
++        }));
++
++        let source_tear = probe(&[exact("-files0-from"), tear("./r", "")]);
++        assert_eq!(source_tear.status, ProbeStatus::Incomplete);
++        assert_eq!(source_tear.expectations, [Expectation::Files0Source]);
++
++        let stdin_tear = probe(&[exact("-files0-from"), tear("", "")]);
++        assert!(stdin_tear.completions.iter().any(|completion| {
++            completion.insertion == "-"
++                && completion.identity == ArgumentIdentity::Files0Source
++        }));
++    }
++
+     #[test]
+     fn unsupported_expression_is_stopped_before_its_arm() {
+         for arguments in [

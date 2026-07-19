@@ -509,8 +509,16 @@ fn assist_reply(
             }
         }
     }
-    let mut arguments = observation.expected;
-    arguments.extend(observation.tear_arguments);
+    let mut arguments = Vec::new();
+    for argument in observation
+        .expected
+        .into_iter()
+        .chain(observation.tear_arguments)
+    {
+        if !arguments.contains(&argument) {
+            arguments.push(argument);
+        }
+    }
     for argument in arguments {
         for value in &argument.finite_values {
             if value.starts_with(&at_tear.input.prefix) {
@@ -1167,6 +1175,32 @@ mod tests {
         let resolved = BuiltinProbeAdapter.transform(&request).unwrap();
         assert!(resolved.context_queries.is_empty());
         assert_eq!(completion_texts(&resolved), ["./test1.sh"]);
+    }
+
+    #[test]
+    fn find_files0_source_uses_ordinary_file_context_without_reading_it() {
+        let argv = argv(vec![
+            literal_word(0, "find"),
+            literal_word(5, "-files0-from"),
+            word(18, 21, vec![tear(18, 21, "./r")]),
+        ]);
+        let pending = BuiltinProbeAdapter
+            .transform(&request(argv, &["status", "completions"]))
+            .unwrap();
+        let graph =
+            crate::prolog::context_query_nodes_from_values(&pending.context_queries).unwrap();
+        assert_eq!(graph.len(), 1);
+        assert_eq!(
+            graph[0].query.domain,
+            RelationValue::Atom("filesystem_file".into())
+        );
+        assert_eq!(
+            graph[0].query.selector,
+            RelationValue::Compound(
+                "prefix".into(),
+                vec![RelationValue::String("./r".into())],
+            )
+        );
     }
 
     #[test]

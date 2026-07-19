@@ -199,6 +199,7 @@ fn expectation_evidence(
     use findutils::find::probe::{ArgumentIdentity, Expectation};
     match expectation {
         Expectation::StartingPath => parser_argument_evidence(ArgumentIdentity::StartingPath),
+        Expectation::Files0Source => parser_argument_evidence(ArgumentIdentity::Files0Source),
         Expectation::FileTypePredicate => brush_core::builtins::ParserArgumentEvidence {
             id: "file_type_predicate".into(),
             display: "-type or -xtype".into(),
@@ -236,6 +237,12 @@ fn parser_argument_evidence(
             "PATH",
             "starting path",
             Some("filesystem_path".into()),
+        ),
+        ArgumentIdentity::Files0Source => (
+            "files0_source",
+            "FILE",
+            "NUL-separated starting-point source, or - for standard input",
+            Some("filesystem_file".into()),
         ),
         ArgumentIdentity::FileTypePredicate(_) => (
             "file_type_predicate",
@@ -359,5 +366,33 @@ mod parser_tests {
             after: Vec::new(),
         });
         assert_eq!(exact.status, BuiltinParseStatus::Complete);
+    }
+
+    #[test]
+    fn registered_parser_maps_files0_source_without_resolving_it() {
+        let assist = parser(BuiltinParserInput {
+            tear: true,
+            before: vec!["find".into(), "-files0-from".into()],
+            prefix: "./r".into(),
+            suffix: String::new(),
+            after: Vec::new(),
+        });
+        assert_eq!(assist.status, BuiltinParseStatus::Incomplete);
+        assert!(assist.expected.iter().any(|argument| {
+            argument.id == "files0_source"
+                && argument.value_domain.as_deref() == Some("filesystem_file")
+        }));
+
+        let stdin = parser(BuiltinParserInput {
+            tear: true,
+            before: vec!["find".into(), "-files0-from".into()],
+            prefix: String::new(),
+            suffix: String::new(),
+            after: Vec::new(),
+        });
+        assert!(stdin
+            .literal_continuations
+            .iter()
+            .any(|continuation| continuation.literal == "-"));
     }
 }
