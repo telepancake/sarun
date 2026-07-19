@@ -180,6 +180,13 @@ context_with_extras(parse_context(Source, Existing), Added,
 
 context_without_extras(parse_context(Source, _), parse_context(Source, [])).
 
+% Negative lookahead constrains the concrete representation at its current
+% cursor.  It must not consume an edit tear and thereby reject another parse
+% merely because the looked-ahead expression could be completed there.
+context_without_source_tear(
+    parse_context(source_context(Origin, _), Extras),
+    parse_context(source_context(Origin, no_tear), Extras)).
+
 context_extras(parse_context(_, Extras), Extras).
 
 complete_text_candidate(Root, Rules, Text, CharacterCount, Context, Status,
@@ -235,7 +242,7 @@ text_candidate_context_queries(Candidates, Queries) :-
 text_context_evidence_query(
     evidence(context(Name), Span, _, Surface, _, _, _,
              context_source(Mode, AskTemplate)),
-    query(text_context(Name, Span, AskTemplate), Ask)) :-
+    query(text_context(Name, Span, AskTemplate, Ask), Ask)) :-
     context_surface_query(Mode, AskTemplate, Surface, Ask).
 
 context_surface_query(exact, AskTemplate, Surface, Ask) :-
@@ -291,11 +298,11 @@ text_context_completion_pair(
         evidence(context(Name), Span, _, Surface, Syntax, _, Preference,
                  context_source(tear(EditId), AskTemplate)),
         Evidence),
-    candidate_member(query(text_context(Name, Span, AskTemplate), Query),
+    candidate_member(query(text_context(Name, Span, AskTemplate, Query), Query),
                      Queries),
     Query = ask(all, Domain, _),
     candidate_member(
-        observed(text_context(Name, Span, AskTemplate), Query, Source,
+        observed(text_context(Name, Span, AskTemplate, Query), Query, Source,
                  some(all(Entries))),
         Observations),
     Source = source(Provider, _),
@@ -333,18 +340,6 @@ match_expression(ref(Name), Rules, Text, Origin, Maximum, Start, End,
     match_expression(Expression, Rules, Text, Origin, Maximum, Start, End,
                      Value, Evidence, NextDepth, Depth),
     cursor_span(Start, End, Span).
-match_expression(seq(Expressions), Rules, _Text, Context, Maximum, Start, End,
-                 generated(sequence, Rendered), [Item], Depth0, Depth) :-
-    Depth0 < Maximum,
-    source_tear_at(Context, Start, EditId, End, TearSurface, Span),
-    render_completion_expressions(Expressions, Rules, Maximum, Depth0,
-                                  Rendered, Depth),
-    Rendered \= "",
-    string_length(TearSurface, TearLength),
-    sub_string(Rendered, 0, TearLength, _, TearSurface),
-    Item = evidence(generated(sequence), Span, [], TearSurface,
-                    grammar, continuation, 0,
-                    tear(EditId, literal(Rendered))).
 match_expression(seq(Expressions), Rules, Text, Origin, Maximum, Start, End,
                  sequence(Values), Evidence, Depth0, Depth) :-
     match_expressions(Expressions, Rules, Text, Origin, Maximum, Start, End,
@@ -360,9 +355,10 @@ match_expression(optional(Expression), Rules, Text, Origin, Maximum, Start,
                      Value, Evidence, Depth0, Depth).
 match_expression(optional(_), _, _, _, _, Cursor, Cursor, none, [], Depth,
                  Depth).
-match_expression(not(Expression), Rules, Text, Origin, Maximum, Cursor, Cursor,
+match_expression(not(Expression), Rules, Text, Context, Maximum, Cursor, Cursor,
                  absent, [], Depth, Depth) :-
-    \+ match_expression(Expression, Rules, Text, Origin, Maximum, Cursor, _,
+    context_without_source_tear(Context, LookaheadContext),
+    \+ match_expression(Expression, Rules, Text, LookaheadContext, Maximum, Cursor, _,
                         _, _, Depth, _).
 match_expression(extras(ExtraExpressions, Expression), Rules, Text, Context,
                  Maximum, Start, End,
@@ -555,6 +551,19 @@ context_match_source(_, Text, cursor(CharacterStart, ByteStart, _),
     CharacterLength is CharacterEnd - CharacterStart,
     sub_string(Text, CharacterStart, CharacterLength, _, Surface).
 
+match_expressions(Expressions, Rules, _Text, Context, Maximum, Start, End,
+                  [generated(sequence, Rendered)], [Item], Depth0, Depth) :-
+    Expressions = [_|_],
+    Depth0 < Maximum,
+    source_tear_at(Context, Start, EditId, End, TearSurface, Span),
+    render_completion_expressions(Expressions, Rules, Maximum, Depth0,
+                                  Rendered, Depth),
+    Rendered \= "",
+    string_length(TearSurface, TearLength),
+    sub_string(Rendered, 0, TearLength, _, TearSurface),
+    Item = evidence(generated(sequence), Span, [], TearSurface,
+                    grammar, continuation, 0,
+                    tear(EditId, literal(Rendered))).
 match_expressions([], _, _, _, _, Cursor, Cursor, [], [], Depth, Depth).
 match_expressions([Expression], Rules, Text, Context, Maximum, Start, End,
                   [Value], Evidence, Depth0, Depth) :-

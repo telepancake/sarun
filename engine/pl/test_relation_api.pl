@@ -19,7 +19,9 @@ test_name(grammar_terminal_codecs_are_declarative_and_bidirectional).
 test_name(recursive_raw_text_grammar_reports_utf8_byte_evidence).
 test_name(raw_terminal_tear_is_an_ordinary_symbolic_parse_value).
 test_name(every_tested_parse_prefix_exposes_an_ordinary_completion).
+test_name(lookahead_does_not_consume_tear_or_hide_valid_sequence_suffix).
 test_name(context_backed_text_is_one_parse_relation).
+test_name(sibling_exact_and_tear_context_queries_have_distinct_identities).
 test_name(virtual_context_tear_maps_to_physical_source_span).
 test_name(raw_text_extras_are_grammar_owned_trivia).
 test_name(raw_text_mode_matrix_rejects_unimplemented_constructs_explicitly).
@@ -617,6 +619,31 @@ run_test(every_tested_parse_prefix_exposes_an_ordinary_completion) :-
     parse_prefix_completion(Grammar, Limits, "bind -m ", 8,
                             "emacs-standard").
 
+run_test(lookahead_does_not_consume_tear_or_hide_valid_sequence_suffix) :-
+    Grammar = grammar(
+        source(text(utf8)), root,
+        [rule(root, choice([ref(assignment), ref(command)])),
+         rule(assignment,
+              seq([literal("bind", assignment_name, presentation([])),
+                   literal("=", assignment_operator,
+                           presentation([meta(syntax, operator)]))])),
+         rule(command,
+              seq([not(ref(assignment)),
+                   literal("bind", command_name, presentation([])),
+                   literal(" alpha", command_argument,
+                           presentation([meta(syntax, argument)]))]))],
+        []),
+    limits(Limits),
+    transform(
+        request(Grammar,
+                given([binding(source,
+                               text_source("bind", assist(edit, span(4, 4)),
+                                           foreign_text))]),
+                want([status, completions]), observations([]), Limits),
+        reply(Solutions, [], [], [])),
+    solution_has_completion(Solutions, "="),
+    solution_has_completion(Solutions, " alpha").
+
 run_test(context_backed_text_is_one_parse_relation) :-
     PathCodepoint = terminal(
         text(codepoint(except(" \t\r\n"))),
@@ -632,8 +659,8 @@ run_test(context_backed_text_is_one_parse_relation) :-
         []),
     limits(Limits),
     Ask = ask(one, filesystem_path, name(value(surface))),
-    Id = text_context(path_value, span(0, 3), Ask),
     Query = ask(all, filesystem_path, prefix("./t")),
+    Id = text_context(path_value, span(0, 3), Ask, Query),
     transform(
         request(Grammar,
                 given([binding(source,
@@ -665,8 +692,8 @@ run_test(context_backed_text_is_one_parse_relation) :-
                                               path, filesystem, 0)],
                                  0, 1)])], 0)],
               [], [dependency(Id, Query, some(all([Entry])))], [])),
-    ExactId = text_context(path_value, span(0, 10), Ask),
     ExactQuery = ask(one, filesystem_path, name("missing.sh")),
+    ExactId = text_context(path_value, span(0, 10), Ask, ExactQuery),
     Missing = observed(ExactId, ExactQuery, source(filesystem, revision_2),
                        none),
     transform(
@@ -676,6 +703,46 @@ run_test(context_backed_text_is_one_parse_relation) :-
                                            foreign_text))]),
                 want([ast]), observations([Missing]), Limits),
         reply([], [], [dependency(ExactId, ExactQuery, none)], [])).
+
+run_test(sibling_exact_and_tear_context_queries_have_distinct_identities) :-
+    PathCodepoint = terminal(
+        text(codepoint(except(" \t\r\n"))),
+        presentation([meta(syntax, path), meta(tear, symbolic)])),
+    AskTemplate = ask(one, filesystem_path, name(value(surface))),
+    Grammar = grammar(
+        source(text(utf8)), path_with_suffix,
+        [rule(path_with_suffix,
+              seq([context(path_value,
+                           repeat(1, unbounded, PathCodepoint),
+                           AskTemplate,
+                           presentation([meta(syntax, path)])),
+                   optional(literal("!", suffix,
+                                    presentation([meta(syntax, operator)])))]))],
+        []),
+    limits(Limits),
+    Source = text_source("./t", assist(edit, span(3, 3)), foreign_text),
+    ExactQuery = ask(one, filesystem_path, name("./t")),
+    PrefixQuery = ask(all, filesystem_path, prefix("./t")),
+    transform(
+        request(Grammar, given([binding(source, Source)]),
+                want([status, completions]), observations([]), Limits),
+        reply(_, Queries, [], [])),
+    list_contains(query(ExactId, ExactQuery), Queries),
+    list_contains(query(PrefixId, PrefixQuery), Queries),
+    ExactId \== PrefixId,
+    Entry = entry(filesystem_path, file_1, ["./test1.sh"],
+                  filesystem_path("/tmp/test1.sh"), [file]),
+    ExactObservation = observed(ExactId, ExactQuery,
+                                source(filesystem, revision_1), none),
+    PrefixObservation = observed(PrefixId, PrefixQuery,
+                                 source(filesystem, revision_1),
+                                 some(all([Entry]))),
+    transform(
+        request(Grammar, given([binding(source, Source)]),
+                want([status, completions]),
+                observations([ExactObservation, PrefixObservation]), Limits),
+        reply(Solutions, [], _, [])),
+    solution_has_completion(Solutions, "./test1.sh").
 
 run_test(virtual_context_tear_maps_to_physical_source_span) :-
     PathCodepoint = terminal(
@@ -691,8 +758,8 @@ run_test(virtual_context_tear_maps_to_physical_source_span) :-
         []),
     limits(Limits),
     Ask = ask(one, filesystem_path, name(value(surface))),
-    Id = text_context(path_value, span(7, 10), Ask),
     Query = ask(all, filesystem_path, prefix("./t")),
+    Id = text_context(path_value, span(7, 10), Ask, Query),
     transform(
         request(Grammar,
                 given([binding(source,

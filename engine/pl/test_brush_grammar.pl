@@ -16,6 +16,7 @@ test_name(missing_unique_parameter_observation_fails_semantic_solution).
 test_name(assignment_tear_survives_as_later_local_value).
 test_name(local_variable_name_completion_comes_from_ordinary_use_step).
 test_name(provider_variable_completion_survives_sibling_parse_observations).
+test_name(supplied_grammar_completes_required_suffix_at_command_tear).
 test_name(supplied_grammar_constrains_earlier_local_value_hole).
 test_name(supplied_grammar_uses_state_at_command_position).
 test_name(supplied_grammar_applies_at_each_command_position).
@@ -292,6 +293,11 @@ run_test(provider_variable_completion_survives_sibling_parse_observations) :-
               reply(Solutions, [], _, [])),
     solution_has_completion(
         Solutions, "SISTENT", context(shell_variable, persistent_variable)).
+
+run_test(supplied_grammar_completes_required_suffix_at_command_tear) :-
+    tool_analysis("tool", span(4, 4), Solutions),
+    solution_has_completion(Solutions, " alpha", generated(sequence)),
+    solution_has_completion(Solutions, " beta", generated(sequence)).
 
 run_test(supplied_grammar_constrains_earlier_local_value_hole) :-
     tool_analysis("A=\"\"; tool $A", span(3, 3), Solutions),
