@@ -546,6 +546,10 @@ fn main() {
         }
     }
     prolog::ensure_linked();
+    if let Err(error) = brush::probe_relation::register() {
+        eprintln!("sarun-engine: cannot register Brush parser relation: {error}");
+        std::process::exit(1);
+    }
 
     // Symlinked-as-`oaita` dispatch — same trick brush_sh / ninja / make use
     // below: when this engine binary is invoked under the name `oaita` (a

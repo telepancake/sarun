@@ -21,6 +21,10 @@ const PREFERENCE: i64 = 40;
 
 pub(crate) struct BuiltinProbeAdapter;
 
+pub(crate) fn register() -> Result<(), String> {
+    crate::relation_adapter::register(HANDLE, std::sync::Arc::new(BuiltinProbeAdapter))
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ByteSpan {
     start: usize,
@@ -327,82 +331,185 @@ fn assist_reply(
     if matches!(observation.status, CommandParseStatus::Rejected(_)) {
         return Ok(diagnostic("parser_rejected"));
     }
-    let mut candidates = Vec::<(String, CommandArgumentEvidence)>::new();
+    let mut candidates = Vec::<(String, Vec<RelationValue>)>::new();
+    let mut context_queries = Vec::new();
     for continuation in observation.literal_continuations {
-        candidates.push((continuation.literal, continuation.argument));
+        let literal = continuation.literal;
+        candidates.push((
+            literal.clone(),
+            vec![clap_alternative(
+                command_name,
+                &continuation.argument,
+                &literal,
+            )],
+        ));
     }
-    for argument in observation.expected {
-        if argument.possible_values.is_empty() && argument.value_hint != clap::ValueHint::Unknown {
-            return Ok(diagnostic("context_continuation_required"));
-        }
+    let mut arguments = observation.expected;
+    arguments.extend(observation.tear_arguments);
+    for argument in arguments {
         for value in &argument.possible_values {
-            if value.starts_with(&at_tear.input.surface) {
-                candidates.push((value.clone(), argument.clone()));
+            if value.starts_with(&at_tear.input.surface) && value != &at_tear.input.surface {
+                candidates.push((
+                    value.clone(),
+                    vec![clap_alternative(command_name, &argument, value)],
+                ));
+            }
+        }
+        let Some(domain) = value_hint_domain(argument.value_hint) else {
+            continue;
+        };
+        let query = argument_context_query(command_name, &argument, &at_tear, domain);
+        let Some(observation) = request
+            .observations
+            .iter()
+            .find(|observation| observation.id == query.id && observation.query == query.query)
+        else {
+            context_queries.push(crate::prolog::context_query_node_value(&query));
+            continue;
+        };
+        let Some(crate::prolog::ContextResult::All(entries)) = &observation.outcome else {
+            continue;
+        };
+        for entry in entries {
+            for name in &entry.names {
+                if name.starts_with(&at_tear.input.surface) && name != &at_tear.input.surface {
+                    candidates.push((
+                        name.clone(),
+                        vec![context_alternative(domain, &entry.identity)],
+                    ));
+                }
             }
         }
     }
     candidates.sort_by(|left, right| left.0.cmp(&right.0));
-    candidates.dedup_by(|left, right| left.0 == right.0);
+    let mut grouped = Vec::<(String, Vec<RelationValue>)>::new();
+    for (insert, alternatives) in candidates {
+        if let Some((_, existing)) = grouped.last_mut().filter(|(value, _)| value == &insert) {
+            existing.extend(alternatives);
+        } else {
+            grouped.push((insert, alternatives));
+        }
+    }
+    let mut candidates = grouped;
     candidates.truncate(request.limits.max_evidence);
     let completions = candidates
         .into_iter()
         .enumerate()
-        .map(|(rank, (candidate, argument))| {
+        .map(|(rank, (candidate, alternatives))| {
             completion_value(
-                command_name,
-                &argument,
                 at_tear.replace,
                 if at_tear.needs_separator {
                     format!(" {candidate}")
                 } else {
                     candidate
                 },
+                alternatives,
                 rank + 1,
             )
         })
         .collect();
-    solution_reply(
+    let mut reply = solution_reply(
         request,
         RelationValue::Compound(
             "incomplete".into(),
             vec![RelationValue::Atom(at_tear.edit_id)],
         ),
         completions,
-    )
+    )?;
+    reply.context_queries = context_queries;
+    Ok(reply)
 }
 
 fn completion_value(
-    command_name: &str,
-    argument: &CommandArgumentEvidence,
     replace: ByteSpan,
     insert: String,
+    alternatives: Vec<RelationValue>,
     rank: usize,
 ) -> RelationValue {
     RelationValue::Compound(
         "completion".into(),
         vec![
             span_value(replace),
-            RelationValue::String(insert.clone()),
-            RelationValue::List(vec![RelationValue::Compound(
-                "alternative".into(),
-                vec![
-                    RelationValue::Compound(
-                        "clap_argument".into(),
-                        vec![
-                            RelationValue::String(command_name.into()),
-                            RelationValue::String(argument.id.clone()),
-                            RelationValue::String(insert),
-                        ],
-                    ),
-                    RelationValue::Atom("builtin_argument".into()),
-                    RelationValue::Atom(PROVIDER.into()),
-                    RelationValue::Integer(PREFERENCE),
-                ],
-            )]),
+            RelationValue::String(insert),
+            RelationValue::List(alternatives),
             RelationValue::Integer(PREFERENCE),
             RelationValue::Integer(i64::try_from(rank).unwrap_or(i64::MAX)),
         ],
     )
+}
+
+fn clap_alternative(
+    command_name: &str,
+    argument: &CommandArgumentEvidence,
+    value: &str,
+) -> RelationValue {
+    RelationValue::Compound(
+        "alternative".into(),
+        vec![
+            RelationValue::Compound(
+                "clap_argument".into(),
+                vec![
+                    RelationValue::String(command_name.into()),
+                    RelationValue::String(argument.id.clone()),
+                    RelationValue::String(value.into()),
+                ],
+            ),
+            RelationValue::Atom("builtin_argument".into()),
+            RelationValue::Atom(PROVIDER.into()),
+            RelationValue::Integer(PREFERENCE),
+        ],
+    )
+}
+
+fn context_alternative(domain: &str, identity: &RelationValue) -> RelationValue {
+    RelationValue::Compound(
+        "alternative".into(),
+        vec![
+            RelationValue::Compound(
+                "context".into(),
+                vec![RelationValue::Atom(domain.into()), identity.clone()],
+            ),
+            RelationValue::Atom("builtin_argument".into()),
+            RelationValue::Atom(PROVIDER.into()),
+            RelationValue::Integer(PREFERENCE),
+        ],
+    )
+}
+
+fn value_hint_domain(hint: clap::ValueHint) -> Option<&'static str> {
+    match hint {
+        clap::ValueHint::AnyPath => Some("filesystem_path"),
+        clap::ValueHint::FilePath => Some("filesystem_file"),
+        clap::ValueHint::DirPath => Some("filesystem_directory"),
+        clap::ValueHint::ExecutablePath => Some("filesystem_executable"),
+        _ => None,
+    }
+}
+
+fn argument_context_query(
+    command_name: &str,
+    argument: &CommandArgumentEvidence,
+    at_tear: &ProbeAtTear,
+    domain: &str,
+) -> crate::prolog::ContextQueryNode {
+    crate::prolog::ContextQueryNode {
+        id: RelationValue::Compound(
+            "builtin_argument_context".into(),
+            vec![
+                RelationValue::String(command_name.into()),
+                RelationValue::String(argument.id.clone()),
+                span_value(at_tear.replace),
+            ],
+        ),
+        query: crate::prolog::ContextQuery {
+            cardinality: crate::prolog::ContextCardinality::All,
+            domain: RelationValue::Atom(domain.into()),
+            selector: RelationValue::Compound(
+                "prefix".into(),
+                vec![RelationValue::String(at_tear.input.surface.clone())],
+            ),
+        },
+    }
 }
 
 fn solution_reply(
@@ -575,23 +682,105 @@ mod tests {
     }
 
     #[test]
-    fn edit_path_requires_explicit_context_continuation() {
+    fn edit_path_replays_from_explicit_context_observation() {
         let source = "edit ";
-        let reply = BuiltinProbeAdapter
-            .transform(&request(
-                source,
-                assist(source.len()),
-                &["status", "completions"],
-            ))
-            .unwrap();
-        assert!(reply.solutions.is_empty());
+        let mut request = request(source, assist(source.len()), &["status", "completions"]);
+        let pending = BuiltinProbeAdapter.transform(&request).unwrap();
         assert_eq!(
-            reply.diagnostics,
-            [RelationValue::Compound(
-                "diagnostic".into(),
-                vec![RelationValue::Atom("context_continuation_required".into())],
-            )]
+            pending.solutions[0]
+                .bindings
+                .iter()
+                .find(|binding| binding.name == "completions")
+                .unwrap()
+                .value,
+            RelationValue::List(vec![])
         );
+        let graph =
+            crate::prolog::context_query_nodes_from_values(&pending.context_queries).unwrap();
+        assert_eq!(graph.len(), 1);
+        assert_eq!(
+            graph[0].query.domain,
+            RelationValue::Atom("filesystem_path".into())
+        );
+        request
+            .observations
+            .push(crate::prolog::ContextObservation {
+                id: graph[0].id.clone(),
+                query: graph[0].query.clone(),
+                provider: RelationValue::Atom("fixture_filesystem".into()),
+                revision: RelationValue::Integer(7),
+                outcome: Some(crate::prolog::ContextResult::All(vec![
+                    crate::prolog::ContextEntry {
+                        domain: RelationValue::Atom("filesystem_path".into()),
+                        identity: RelationValue::String("/tmp/test1.sh".into()),
+                        names: vec!["./test1.sh".into()],
+                        value: RelationValue::Compound(
+                            "filesystem_path".into(),
+                            vec![RelationValue::String("/tmp/test1.sh".into())],
+                        ),
+                        attributes: vec![RelationValue::Atom("file".into())],
+                    },
+                ])),
+            });
+        let resolved = BuiltinProbeAdapter.transform(&request).unwrap();
+        assert!(resolved.context_queries.is_empty());
+        assert_eq!(completion_texts(&resolved), ["./test1.sh"]);
+    }
+
+    #[test]
+    fn edit_path_round_trips_through_registered_relation_and_provider() {
+        let _ = register();
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("test1.sh"), b"").unwrap();
+        let source = "edit ./t";
+        let mut request = crate::prolog::RelationRequest {
+            grammar: RelationValue::Compound(
+                "registered_relation".into(),
+                vec![RelationValue::Atom(HANDLE.into())],
+            ),
+            given: vec![RelationBinding {
+                name: "source".into(),
+                value: RelationValue::Compound(
+                    "text_source".into(),
+                    vec![
+                        RelationValue::String(source.into()),
+                        assist(source.len()),
+                        RelationValue::Atom("test".into()),
+                    ],
+                ),
+            }],
+            wanted: vec!["status".into(), "completions".into()],
+            observations: vec![],
+            limits: RelationLimits::default(),
+        };
+        let prolog = crate::prolog::global().unwrap();
+        let context = crate::parser::FilesystemContext::new(temp.path());
+        let mut query_rounds = 0;
+        let mut resolved = None;
+        for _ in 0..8 {
+            let reply = prolog.transform(&request).unwrap();
+            assert!(reply.diagnostics.is_empty(), "{reply:#?}");
+            if reply.context_queries.is_empty() {
+                resolved = Some(reply);
+                break;
+            }
+            query_rounds += 1;
+            let graph =
+                crate::prolog::context_query_nodes_from_values(&reply.context_queries).unwrap();
+            let observations = crate::parser::execute_context_graph(prolog, &graph, &context)
+                .unwrap()
+                .unwrap();
+            for observation in observations {
+                let value = crate::prolog::context_observation_value(&observation).unwrap();
+                if !request.observations.contains(&value) {
+                    request.observations.push(value);
+                }
+            }
+        }
+        let resolved = resolved.expect("registered Brush relation must settle");
+        assert_eq!(query_rounds, 3);
+        assert_eq!(completion_texts(&resolved), ["./test1.sh"]);
+        assert_eq!(resolved.dependency_keys.len(), 2);
     }
 
     #[test]

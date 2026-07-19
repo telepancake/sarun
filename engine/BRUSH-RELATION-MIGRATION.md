@@ -268,16 +268,29 @@ Implementation order:
        `CommandProbeInput` must grow from plain argv strings into the rich
        word/provenance representation described above; this checkpoint does
        not authorize flattening quoted, expanded, or symbolic shell words.
-   [ ] Route that probe through the opaque registered relation handle and
-       ordinary completion evidence at Brush command nodes. Keep contextual
-       value hints suspended as explicit queries rather than consulting an
-       environment inside the adapter.
+   [x] Route probe results through the opaque registered relation handle and
+       ordinary completion evidence. The handle is required process glue, not
+       an opt-in mode. `bind -m |` finite values and `edit ./t|` filesystem
+       values come from the same typed parser probe; the latter visibly emits
+       an ordinary scoped `ask(all, filesystem_path, prefix("./t"))`, replays
+       only after its observation arrives, and records both parser-revision and
+       filesystem dependencies in the final reply. A native aarch64 test covers
+       the complete-but-still-completable matched-argument case.
+   [ ] Compose that handle at Brush command nodes after rich shell words cross
+       the boundary. The current proof accepts only already-cooked simple
+       words and deliberately rejects quoting, expansions, and mid-word
+       suffixes rather than flattening their provenance.
 3. [ ] Cut those two builtins to execute the typed invocation returned by that
        same exact parser, then delete their generated `CommandSyntax` copies.
 4. [ ] Adapt one simple uutils parser/executor split (`cat`), then one embedded
        operand grammar (`cut` or `chmod`) through the same boundary.
-5. [ ] Add recording/suspending context to a parser that needs it, followed by
-       Kati's `MakeInvocation` and its evaluated-target snapshot provider.
+5. [x] Add generic recording/suspending context to a parser that needs it. A
+       registered adapter's scoped query graph is ordinary relation output;
+       observations are explicit typed replay input, repeated suspension is
+       bounded by the consumer's stabilization loop, and stalled replay is a
+       visible diagnostic rather than hidden provider access.
+   [ ] Add Kati's `MakeInvocation` and its evaluated-target snapshot provider
+       through the same protocol.
 6. [ ] Introduce `FindPlan`/`FindExpr`, move parse-time I/O into explicit
        context/compile phases, and replace the temporary `-type` schema slice.
 
