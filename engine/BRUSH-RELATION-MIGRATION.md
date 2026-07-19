@@ -187,11 +187,8 @@ Do not implement these as Brush-specific engine branches:
 
 ### Restart audit (2026-07-19)
 
-The editor and Reedline completion paths prove the boundary is executable, but
-the defining composition gate is currently red. The builtin grammar is applied
-once to the whole document instead of at every `command_words` node, and
-`find` still exposes opaque raw argv rather than an ordinary supplied grammar.
-The next implementation order is fixed:
+The editor and Reedline completion paths prove the boundary is executable. The
+composition recovery run completed the following fixed implementation order:
 
 1. Add grammar-neutral AST-node relation application with the local-state
    snapshot visible at that node.
@@ -203,14 +200,24 @@ The next implementation order is fixed:
    UTF-8 spans before using a sarun builtin.
 4. Make `find` expose the same declarative argument grammar used by execution;
    do not add `find` knowledge to Rust adapters or the generic engine.
-5. Add an immutable Brush semantic snapshot, composite provider, and one
-   resolved/dependency-keyed analysis service shared by editor and Reedline.
+5. Add an immutable Brush semantic snapshot and one resolved/dependency-keyed
+   analysis service shared by editor and Reedline; route the first
+   shell-variable and filesystem domains. The general composite-provider
+   registry remains later provider-convergence work.
+
+The result is now an executable checkpoint rather than a plan: supplied command
+grammars run at every parsed command node with the local state visible there;
+symbolic local values preserve physical edit spans; `find` owns the native
+`-type`/`-xtype` catalog; and the editor/Reedline clients resolve immutable
+Brush-variable and filesystem snapshots through one analysis loop. The
+generated command grammar is installed once and passed to nested applications
+by opaque handle.
 
 The mandatory baseline includes the focused Prolog suites, the static Rust
 relation/editor tests, and every native aarch64 PTY binary. Building test
-binaries without executing them is not a gate. At this audit the production
-backward-completion test, editor unit test, and editor PTY are all intentionally
-recorded red until steps 1--4 land.
+binaries without executing them is not a gate. The production backward-
+completion test, editor insertion test, and real editor PTY are green at this
+checkpoint.
 
 ### 0. Preserve and measure the reference
 

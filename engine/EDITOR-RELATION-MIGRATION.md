@@ -20,15 +20,18 @@ same query protocol. The editor never switches on provider-specific domains.
 - `src/editor.rs` owns the reusable UI/builtin `EditorPane`, standalone
   terminal host, saving, debounced relation highlights, and relation completion
   popup. Bash no longer uses tree-sitter in the editor.
-- `edit` is a foreground Brush builtin, but it currently discards the borrowed
-  shell context before opening the editor. Editor requests therefore contain
-  no persistent Brush bindings and do not execute returned context queries.
-- Standalone Reedline completion is relation-owned but resolves only the
-  filesystem/cwd provider. Its highlighter still uses Brush's token heuristic,
-  its validator still calls the execution parser, and its hinter is history.
-- Builtin grammar is currently applied once to the whole source, not at each
-  parsed command node. The simple `bind` and `edit` viability cases pass, while
-  the defining multi-command backward `find -type` case is red.
+- `edit` captures an owned immutable snapshot of the borrowed Brush shell
+  before entering the terminal loop. Editor and Reedline analysis resolve
+  persistent shell-variable and filesystem queries through the same staged
+  observation loop without retaining a `ShellRef` or shell mutex.
+- Standalone Reedline completion is relation-owned. Its highlighter still uses
+  Brush's token heuristic, its validator still calls the execution parser, and
+  its hinter is history; those are the next active authority cutovers.
+- Supplied command grammars are applied at every parsed command node. A neutral
+  validated command-syntax schema lowers Clap-owned definitions and find-owned
+  `-type`/`-xtype` metadata to ordinary grammar IR. Unique comma lists use the
+  generic `separated(..., unique(value), ...)` relation rather than generated
+  completion code or an exponential grammar expansion.
 - Hints, diagnostics, indentation, domain-routed provider composition, and
   dependency-keyed analysis caching remain unimplemented.
 
@@ -103,11 +106,11 @@ replacement spans, cursor tears, and diagnostics.
       cut. Never run both and pick a winner.
 - [x] Convert byte spans to `edtui` coordinates and completion edits back to
       bytes without splitting UTF-8.
-- [ ] Render relation-derived completions in an edtui popup and apply their
-      exact replacement spans for composed command grammars. The popup and
-      insertion path work, but the defining backward `find -type` case is red
-      because command grammars are not yet applied at command nodes and `find`
-      still exposes opaque raw argv.
+- [x] Render relation-derived completions in an edtui popup and apply their
+      exact replacement spans for composed command grammars. The defining
+      backward `find -type` case passes in the production API, editor unit, and
+      real aarch64 PTY. The PTY selects the displayed completion identity from
+      a reconstructed terminal screen rather than relying on menu position.
 - [x] Feed finite builtin-argument grammar data from the builtin's actual Clap
       definition into the same analysis request. `bind -m |` completes and
       inserts canonical keymap values without editor, engine, or builtin-name
@@ -148,8 +151,9 @@ replacement spans, cursor tears, and diagnostics.
       Brush, box Brush, nested shells, and recipe shells share the same path.
 - [x] Resolve relative operands from `context.shell.working_dir()`, never the
       engine process cwd.
-- [ ] Snapshot Brush semantic context directly from the borrowed shell before
-      analysis. The shell is paused while its foreground editor runs.
+- [x] Snapshot Brush semantic context directly from the borrowed shell before
+      analysis. The shell is paused while its foreground editor runs, while
+      analysis owns deterministic revisioned facts rather than the borrow.
 - [x] Save through the builtin's direct logical filesystem and return a
       meaningful shell status. Redirection does not steal the TUI terminal;
       non-interactive, background, and pipeline uses fail before terminal setup.
@@ -189,12 +193,12 @@ an editor heuristic, a forward-only shell completion pass, or a `find` branch
 in Rust: it is a completion projection from the same relation that parses the
 document and relates the assignment, expansion, command signature, and tear.
 
-This exact case is the current mandatory red gate. The production API and
-`EditorPane` tests miss the finite `find -type` values, and the native aarch64
-PTY currently selects a generic arithmetic completion and saves the wrong
-text. Completion at each command node, the ordinary `find` argument grammar,
-and identity-based PTY selection must make all three green before this
-acceptance claim can be restored.
+This exact case is green in the production API, `EditorPane`, and native
+aarch64 PTY. The accepted values come from findutils' execution-owned catalog
+(`b,c,d,f,l,p,s` on Linux), are related through the ordinary supplied grammar,
+and propagate backward to the assignment tear. There is no editor or find
+completion branch. This remains a permanent regression gate while broader find
+grammar coverage is imported.
 
 The second native acceptance case is the ordinary forward local-name use:
 
