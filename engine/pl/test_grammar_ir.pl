@@ -5,6 +5,7 @@
 test_name(tree_sitter_shaped_grammar_is_data).
 test_name(wireshark_shaped_grammar_is_data).
 test_name(undeclared_rules_and_primitives_fail_closed).
+test_name(separated_list_bounds_and_uniqueness_are_closed_data).
 
 run_grammar_ir_tests :-
     findall(Name, test_name(Name), Names),
@@ -101,3 +102,22 @@ run_test(undeclared_rules_and_primitives_fail_closed) :-
                    [rule(root,
                          terminal(primitive(hidden_callback, []),
                                   presentation([])))], [])).
+
+run_test(separated_list_bounds_and_uniqueness_are_closed_data) :-
+    Separator = literal(",", comma, presentation([])),
+    Item = literal("x", x, presentation([])),
+    valid_grammar(
+        grammar(source(text(utf8)), root,
+                [rule(root, separated(1, 4, Separator, unique, Item))], [])),
+    valid_grammar(
+        grammar(source(text(utf8)), root,
+                [rule(root,
+                      separated(0, unbounded, Separator, allow_duplicates,
+                                Item))], [])),
+    \+ valid_grammar(
+           grammar(source(text(utf8)), root,
+                   [rule(root, separated(2, 1, Separator, unique, Item))], [])),
+    \+ valid_grammar(
+           grammar(source(text(utf8)), root,
+                   [rule(root, separated(1, 4, Separator, distinct, Item))],
+                   [])).

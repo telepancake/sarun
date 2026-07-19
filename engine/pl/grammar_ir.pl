@@ -80,6 +80,15 @@ valid_expression(repeat(Minimum, Maximum, Expression), Names, Primitives) :-
     Minimum >= 0,
     valid_maximum(Maximum, Minimum),
     valid_expression(Expression, Names, Primitives).
+valid_expression(
+    separated(Minimum, Maximum, Separator, Uniqueness, Item),
+    Names, Primitives) :-
+    integer(Minimum),
+    Minimum >= 0,
+    valid_maximum(Maximum, Minimum),
+    valid_uniqueness(Uniqueness),
+    valid_expression(Separator, Names, Primitives),
+    valid_expression(Item, Names, Primitives).
 valid_expression(field(Name, Expression), Names, Primitives) :-
     atom(Name),
     valid_expression(Expression, Names, Primitives).
@@ -136,6 +145,9 @@ valid_maximum(unbounded, _).
 valid_maximum(Maximum, Minimum) :-
     integer(Maximum),
     Maximum >= Minimum.
+
+valid_uniqueness(unique).
+valid_uniqueness(allow_duplicates).
 
 valid_associativity(none).
 valid_associativity(left).

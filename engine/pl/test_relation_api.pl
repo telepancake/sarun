@@ -20,12 +20,14 @@ test_name(recursive_raw_text_grammar_reports_utf8_byte_evidence).
 test_name(raw_terminal_tear_is_an_ordinary_symbolic_parse_value).
 test_name(every_tested_parse_prefix_exposes_an_ordinary_completion).
 test_name(lookahead_does_not_consume_tear_or_hide_valid_sequence_suffix).
+test_name(separated_list_parsing_rendering_and_completion_are_one_relation).
 test_name(context_backed_text_is_one_parse_relation).
 test_name(sibling_exact_and_tear_context_queries_have_distinct_identities).
 test_name(virtual_context_tear_maps_to_physical_source_span).
 test_name(raw_text_extras_are_grammar_owned_trivia).
 test_name(raw_text_mode_matrix_rejects_unimplemented_constructs_explicitly).
 test_name(opaque_handle_resolves_install_once_grammar).
+test_name(supplied_grammar_resolves_install_once_handle).
 test_name(solution_limit_is_enforced_and_reported).
 test_name(envelope_fails_closed).
 
@@ -644,6 +646,25 @@ run_test(lookahead_does_not_consume_tear_or_hide_valid_sequence_suffix) :-
     solution_has_completion(Solutions, "="),
     solution_has_completion(Solutions, " alpha").
 
+run_test(separated_list_parsing_rendering_and_completion_are_one_relation) :-
+    separated_list_grammar(unique, Grammar),
+    limits(Limits),
+    raw_text_parses(Grammar, Limits, "f,d"),
+    \+ raw_text_parses(Grammar, Limits, "f,f"),
+    \+ raw_text_parses(Grammar, Limits, "f,"),
+    raw_text_completion_texts(Grammar, Limits, "", 0, InitialTexts),
+    list_contains("f", InitialTexts),
+    list_contains("d", InitialTexts),
+    raw_text_completion_texts(Grammar, Limits, "f,", 2, NextTexts),
+    list_contains("d", NextTexts),
+    \+ list_contains("f", NextTexts),
+    raw_text_completion_texts(Grammar, Limits, "f", 1,
+                              ContinuationTexts),
+    list_contains(",d", ContinuationTexts),
+    \+ list_contains(",f", ContinuationTexts),
+    separated_list_grammar(allow_duplicates, DuplicateGrammar),
+    raw_text_parses(DuplicateGrammar, Limits, "f,f").
+
 run_test(context_backed_text_is_one_parse_relation) :-
     PathCodepoint = terminal(
         text(codepoint(except(" \t\r\n"))),
@@ -857,6 +878,19 @@ run_test(opaque_handle_resolves_install_once_grammar) :-
                 observations([]), Limits),
         reply([], [], [], [diagnostic(invalid_request)])).
 
+run_test(supplied_grammar_resolves_install_once_handle) :-
+    separated_list_grammar(unique, Grammar),
+    install_grammar(supplied_raw_text_test, Grammar),
+    limits(Limits),
+    transform(
+        request(given_grammar(supplied),
+                given([binding(supplied,
+                               grammar_handle(supplied_raw_text_test)),
+                       binding(source,
+                               text_source("f,d", exact, foreign_text))]),
+                want([status]), observations([]), Limits),
+        reply([solution([binding(status, complete)], 0)], [], [], [])).
+
 run_test(envelope_fails_closed) :-
     foreign_grammar(Grammar),
     transform(request(Grammar, given([]), want([]), observations([]),
@@ -873,6 +907,42 @@ parse_prefix_completion(Grammar, Limits, Prefix, Cursor, Expected) :-
                 want([status, completions]), observations([]), Limits),
         reply(Solutions, [], [], [])),
     solution_has_completion(Solutions, Expected).
+
+separated_list_grammar(Uniqueness,
+    grammar(
+        source(text(utf8)), root,
+        [rule(root,
+              separated(
+                  1, 3, literal(",", comma, presentation([])), Uniqueness,
+                  choice([literal("f", file, presentation([])),
+                          literal("d", directory, presentation([]))])))],
+        [])).
+
+raw_text_parses(Grammar, Limits, Text) :-
+    transform(
+        request(Grammar,
+                given([binding(source,
+                               text_source(Text, exact, foreign_text))]),
+                want([status]), observations([]), Limits),
+        reply([solution([binding(status, complete)], 0)|_], [], [], [])).
+
+raw_text_completion_texts(Grammar, Limits, Text, Cursor, Texts) :-
+    transform(
+        request(Grammar,
+                given([binding(source,
+                               text_source(Text,
+                                           assist(edit,
+                                                  span(Cursor, Cursor)),
+                                           foreign_text))]),
+                want([completions]), observations([]), Limits),
+        reply(Solutions, [], [], [])),
+    findall(CompletionText,
+            ( list_contains(solution(Bindings, _), Solutions),
+              list_contains(binding(completions, Completions), Bindings),
+              list_contains(completion(_, CompletionText, _, _, _),
+                            Completions)
+            ),
+            Texts).
 
 solution_has_completion([solution(Bindings, _)|_], Expected) :-
     list_contains(binding(completions, Completions), Bindings),

@@ -68,6 +68,10 @@ executable_text_expression(lexical(Expression)) :-
     executable_text_expression(Expression).
 executable_text_expression(repeat(_, _, Expression)) :-
     executable_text_expression(Expression).
+executable_text_expression(
+    separated(_, _, Separator, _, Item)) :-
+    executable_text_expression(Separator),
+    executable_text_expression(Item).
 executable_text_expression(field(_, Expression)) :-
     executable_text_expression(Expression).
 executable_text_expression(literal(_, _, presentation(_))).
@@ -385,6 +389,14 @@ match_expression(repeat(Minimum, MaximumCount, Expression), Rules, Text,
     match_repetition(Expression, Rules, Text, Origin, Maximum, Minimum,
                      MaximumCount, 0, Start, End, Values, Evidence, Depth0,
                      Depth).
+match_expression(
+    separated(Minimum, MaximumCount, Separator, Uniqueness, Item), Rules,
+    Text, Context, Maximum, Start, End, separated(Values), Evidence,
+    Depth0, Depth) :-
+    match_separated(Item, Separator, Uniqueness, Rules, Text, Context,
+                    Maximum, Minimum, MaximumCount, 0, [], Start, End,
+                    ReversedValues, Evidence, Depth0, Depth),
+    reverse_values(ReversedValues, Values).
 match_expression(field(Name, Expression), Rules, Text, Origin, Maximum, Start,
                  End, field(Name, Span, Value), Evidence, Depth0, Depth) :-
     match_expression(Expression, Rules, Text, Origin, Maximum, Start, End,
@@ -485,6 +497,11 @@ render_completion_expression(repeat(Minimum, _, Expression), Rules, Maximum,
                              Depth0, Text, Depth) :-
     render_completion_repetition(Minimum, Expression, Rules, Maximum, Depth0,
                                  Text, Depth).
+render_completion_expression(
+    separated(Minimum, _, Separator, Uniqueness, Item), Rules, Maximum,
+    Depth0, Text, Depth) :-
+    render_completion_separated(Minimum, Separator, Uniqueness, Item, Rules,
+                                Maximum, [], Depth0, Text, Depth).
 render_completion_expression(field(_, Expression), Rules, Maximum, Depth0,
                              Text, Depth) :-
     render_completion_expression(Expression, Rules, Maximum, Depth0,
@@ -518,6 +535,46 @@ render_completion_repetition(Count, Expression, Rules, Maximum, Depth0,
     render_completion_repetition(Next, Expression, Rules, Maximum, Depth1,
                                  Rest, Depth),
     string_concat(First, Rest, Text).
+
+render_completion_separated(0, _, _, _, _, _, _, Depth, "", Depth) :- !.
+render_completion_separated(Count, Separator, Uniqueness, Item, Rules,
+                            Maximum, Seen, Depth0, Text, Depth) :-
+    Count > 0,
+    render_completion_item(Item, Rules, Maximum, Depth0, Seen, Uniqueness,
+                           ItemText, ItemValue, Depth1),
+    Next is Count - 1,
+    render_completion_separated_tail(Next, Separator, Uniqueness, Item,
+                                     Rules, Maximum, [ItemValue|Seen], Depth1,
+                                     Rest, Depth),
+    string_concat(ItemText, Rest, Text).
+
+render_completion_separated_tail(0, _, _, _, _, _, _, Depth, "", Depth) :- !.
+render_completion_separated_tail(Count, Separator, Uniqueness, Item, Rules,
+                                 Maximum, Seen, Depth0, Text, Depth) :-
+    Count > 0,
+    render_completion_expression(Separator, Rules, Maximum, Depth0,
+                                 SeparatorText, Depth1),
+    render_completion_item(Item, Rules, Maximum, Depth1, Seen, Uniqueness,
+                           ItemText, ItemValue, Depth2),
+    Next is Count - 1,
+    render_completion_separated_tail(Next, Separator, Uniqueness, Item,
+                                     Rules, Maximum, [ItemValue|Seen], Depth2,
+                                     Rest, Depth),
+    string_concat(SeparatorText, ItemText, First),
+    string_concat(First, Rest, Text).
+
+render_completion_item(Item, Rules, Maximum, Depth0, Seen, Uniqueness,
+                       Text, Value, Depth) :-
+    render_completion_expression(Item, Rules, Maximum, Depth0, Text, Depth),
+    string_length(Text, CharacterLength),
+    string_utf8_bytes(Text, ByteLength),
+    RenderContext = parse_context(source_context(completion_render, no_tear),
+                                  []),
+    match_expression(Item, Rules, Text, RenderContext, Maximum,
+                     cursor(0, 0, absent),
+                     cursor(CharacterLength, ByteLength, absent),
+                     Value, _, 0, _),
+    separated_value_allowed(Uniqueness, Value, Seen).
 
 context_match_source(
     parse_context(
@@ -636,6 +693,70 @@ repetition_gap(Context, Rules, Text, Maximum, Start, End, Trivia, Evidence,
 
 gap_has_following_value([], _).
 gap_has_following_value([_|_], [_|_]).
+
+match_separated(_, _, _, _, _, _, _, Minimum, _, Count, Seen,
+                Cursor, Cursor, Seen, [], Depth, Depth) :-
+    Count >= Minimum.
+match_separated(Item, Separator, Uniqueness, Rules, Text, Context, Maximum,
+                Minimum, MaximumCount, Count, Seen, Start, End, Values,
+                Evidence, Depth0, Depth) :-
+    repetition_room(MaximumCount, Count),
+    match_separated_next(Count, Item, Separator, Rules, Text, Context, Maximum,
+                         Start, Middle, Value, FirstEvidence, Depth0, Depth1),
+    Middle \= Start,
+    separated_value_allowed(Uniqueness, Value, Seen),
+    NextCount is Count + 1,
+    match_separated(Item, Separator, Uniqueness, Rules, Text, Context,
+                    Maximum, Minimum, MaximumCount, NextCount, [Value|Seen],
+                    Middle, End, Values, RestEvidence, Depth1, Depth),
+    append(FirstEvidence, RestEvidence, Evidence).
+match_separated(Item, Separator, Uniqueness, Rules, _Text, Context, Maximum,
+                Minimum, MaximumCount, Count, Seen, Start, End,
+                [generated(separated, Rendered)|Seen], [Evidence], Depth0,
+                Depth) :-
+    Count > 0,
+    Count >= Minimum,
+    repetition_room(MaximumCount, Count),
+    source_tear_at(Context, Start, EditId, End, TearSurface, Span),
+    render_completion_expression(Separator, Rules, Maximum, Depth0,
+                                 SeparatorText, Depth1),
+    render_completion_item(Item, Rules, Maximum, Depth1, Seen, Uniqueness,
+                           ItemText, _, Depth),
+    string_concat(SeparatorText, ItemText, Rendered),
+    Rendered \= "",
+    string_length(TearSurface, TearLength),
+    sub_string(Rendered, 0, TearLength, _, TearSurface),
+    Evidence = evidence(generated(separated), Span, [], TearSurface,
+                        grammar, continuation, 0,
+                        tear(EditId, literal(Rendered))).
+
+match_separated_next(0, Item, _, Rules, Text, Context, Maximum, Start, End,
+                     Value, Evidence, Depth0, Depth) :-
+    match_expression(Item, Rules, Text, Context, Maximum, Start, End, Value,
+                     Evidence, Depth0, Depth).
+match_separated_next(Count, Item, Separator, Rules, Text, Context, Maximum,
+                     Start, End, Value, Evidence, Depth0, Depth) :-
+    Count > 0,
+    match_expression(Separator, Rules, Text, Context, Maximum, Start,
+                     SeparatorEnd0, _, SeparatorEvidence, Depth0, Depth1),
+    match_active_trivia(Context, Rules, Text, Maximum, SeparatorEnd0,
+                        SeparatorEnd, _, TriviaEvidence, Depth1, Depth2),
+    match_expression(Item, Rules, Text, Context, Maximum, SeparatorEnd, End,
+                     Value, ItemEvidence, Depth2, Depth),
+    append(SeparatorEvidence, TriviaEvidence, BeforeItem),
+    append(BeforeItem, ItemEvidence, Evidence).
+
+separated_value_allowed(allow_duplicates, _, _).
+separated_value_allowed(unique, Value, Seen) :-
+    \+ variant_member(Value, Seen).
+
+variant_member(Value, [Seen|_]) :- Value =@= Seen.
+variant_member(Value, [_|Seen]) :- variant_member(Value, Seen).
+
+reverse_values(Values, Reversed) :- reverse_values(Values, [], Reversed).
+reverse_values([], Reversed, Reversed).
+reverse_values([Value|Values], Accumulator, Reversed) :-
+    reverse_values(Values, [Value|Accumulator], Reversed).
 
 repetition_room(unbounded, _).
 repetition_room(Maximum, Count) :- integer(Maximum), Count < Maximum.

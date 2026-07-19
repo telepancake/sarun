@@ -16,6 +16,7 @@
 :- use_module(grammar_codec).
 :- use_module(local_state_relation).
 :- use_module(text_grammar_engine).
+:- use_module(grammar_store).
 
 /** <module> Grammar-independent relational sequence execution
 
@@ -91,7 +92,8 @@ transform_relation(symbolic_text_grammar, Given, Wanted, _Observations,
 transform_relation(given_grammar(Name), Given, Wanted, Observations, Limits,
                    Reply) :-
     atom(Name),
-    given_value(Name, Given, Grammar),
+    given_value(Name, Given, GrammarReference),
+    resolve_grammar(GrammarReference, Grammar),
     transform_relation(Grammar, Given, Wanted, Observations, Limits, Reply).
 
 transform_relation(ast_state_grammar(Rules), Given, Wanted, Observations,
