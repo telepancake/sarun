@@ -46,7 +46,7 @@ run_test(catalog_is_closed_bounded_and_valid) :-
     length(Responses, 5),
     length(Modes, 7),
     length(Events, 10),
-    length(Frames, 19),
+    length(Frames, 21),
     expect(wire_limit(frame_bytes, 16777216)),
     expect(wire_response(action, 6, [field(value, action_success)])).
 
@@ -136,6 +136,8 @@ run_test(stream_frames_cover_modes_directions_and_fd_handoffs) :-
                     [fd(pidfd, required, always)], stay)),
     once(wire_frame(box, connection, 14, engine_to_runner, [],
                     [fd(connected_socket, required, always)], stay)),
+    once(wire_frame(box, guest_process, 7, runner_to_engine,
+                    [field(event, guest_process_event)], [], stay)),
     once(wire_frame(pty, resize, 8, client_to_engine,
                     [field(rows, u16), field(columns, u16)], [], stay)),
     once(wire_frame(service_accept, paired, 1, engine_to_service, [], [],
@@ -145,7 +147,9 @@ run_test(stream_frames_cover_modes_directions_and_fd_handoffs) :-
                      field(request, appliance_run_request)], [], stay)),
     once(wire_frame(appliance, nested_result, 6, host_to_guest,
                     [field(stream, u64), field(code, exit_code)], [], stay)),
-    once(wire_frame(appliance, ready, 8, guest_to_host, [], [], stay)).
+    once(wire_frame(appliance, ready, 8, guest_to_host, [], [], stay)),
+    once(wire_frame(appliance, process, 9, guest_to_host,
+                    [field(event, guest_process_event)], [], stay)).
 
 run_test(all_transport_facts_project_through_central_relation) :-
     expect(all_requests_project),
