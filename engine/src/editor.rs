@@ -21,10 +21,11 @@
 
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
-use std::sync::{OnceLock, mpsc};
+use std::sync::{Arc, OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
-use crate::prolog::{BrushDocumentRequest, Completion, Span, analyze_brush_document};
+use crate::parser::{BrushSemanticSnapshot, analyze_brush_document_resolved};
+use crate::prolog::{BrushDocumentRequest, Completion, Span};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use edtui::{
     EditorEventHandler, EditorMode, EditorState, EditorTheme, EditorView, Highlight, Index2,
@@ -222,17 +223,24 @@ fn relation_highlights(code: &str, highlights: &[crate::prolog::Highlight]) -> F
 fn brush_analysis(
     code: &str,
     assist: Option<Span>,
+    context: &BrushSemanticSnapshot,
 ) -> Result<crate::prolog::BrushDocumentAnalysis, String> {
-    analyze_brush_document(&BrushDocumentRequest {
+    analyze_brush_document_resolved(
+        &BrushDocumentRequest {
         source: code.to_string(),
         assist,
         initial_bindings: vec![],
         observations: vec![],
-    })
+        },
+        context,
+    )
 }
 
-fn brush_file_highlights(code: &str) -> Result<FileHighlights, String> {
-    let analysis = brush_analysis(code, None)?;
+fn brush_file_highlights(
+    code: &str,
+    context: &BrushSemanticSnapshot,
+) -> Result<FileHighlights, String> {
+    let analysis = brush_analysis(code, None, context)?;
     Ok(brush_analysis_highlights(code, &analysis))
 }
 
@@ -367,6 +375,10 @@ pub struct EditorPane {
     pub state: EditorState,
     handler: EditorEventHandler,
     provider: AnalysisProvider,
+    /// Immutable facts captured from the foreground Brush shell.  The editor
+    /// never retains the borrowed shell or a ShellRef while its terminal loop
+    /// is active.
+    brush_context: Arc<BrushSemanticSnapshot>,
     fh: Option<FileHighlights>,
     completions: Option<CompletionMenu>,
     analysis_tx: mpsc::Sender<HighlightAnalysisResult>,
@@ -406,13 +418,32 @@ impl EditorPane {
     /// Open caller-supplied bytes for `target`. `read_only` marks a source
     /// the UI knows cannot be written back.
     pub fn from_bytes(target: Target, bytes: Vec<u8>, read_only: bool) -> anyhow::Result<Self> {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+        Self::from_bytes_with_brush_context(
+            target,
+            bytes,
+            read_only,
+            BrushSemanticSnapshot::empty(cwd),
+        )
+    }
+
+    /// Open bytes with facts captured from the persistent foreground Brush
+    /// shell.  The snapshot is owned and immutable, so background relation
+    /// work cannot race shell execution or deadlock its mutex.
+    pub fn from_bytes_with_brush_context(
+        target: Target,
+        bytes: Vec<u8>,
+        read_only: bool,
+        brush_context: BrushSemanticSnapshot,
+    ) -> anyhow::Result<Self> {
         let label = target.label();
         let text = text_for_edit(&label, bytes)?;
         let provider = provider_for_path(&label);
+        let brush_context = Arc::new(brush_context);
         let (fh, analysis_error) = match provider {
             AnalysisProvider::Plain => (None, None),
             AnalysisProvider::Syntastica(lang) => (Some(compute(&text, lang)), None),
-            AnalysisProvider::Brush => match brush_file_highlights(&text) {
+            AnalysisProvider::Brush => match brush_file_highlights(&text, &brush_context) {
                 Ok(highlights) => (Some(highlights), None),
                 Err(error) => (Some(FileHighlights { per_line: vec![] }), Some(error)),
             },
@@ -429,6 +460,7 @@ impl EditorPane {
             state,
             handler: EditorEventHandler::default(),
             provider,
+            brush_context,
             fh,
             completions: None,
             analysis_tx,
@@ -464,6 +496,14 @@ impl EditorPane {
     /// Standalone editor open: unlike the UI's explicit existing-file prompt,
     /// a shell `edit new.sh` may create a new regular file on first save.
     pub fn open_host_or_new(path: PathBuf) -> anyhow::Result<Self> {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+        Self::open_host_or_new_with_brush_context(path, BrushSemanticSnapshot::empty(cwd))
+    }
+
+    pub fn open_host_or_new_with_brush_context(
+        path: PathBuf,
+        brush_context: BrushSemanticSnapshot,
+    ) -> anyhow::Result<Self> {
         match std::fs::symlink_metadata(&path) {
             Ok(metadata) => {
                 if metadata.file_type().is_symlink() {
@@ -474,10 +514,20 @@ impl EditorPane {
                 }
                 let bytes = std::fs::read(&path)
                     .map_err(|error| anyhow::anyhow!("editor: {}: {error}", path.display()))?;
-                Self::from_bytes(Target::Host(path), bytes, metadata.permissions().readonly())
+                Self::from_bytes_with_brush_context(
+                    Target::Host(path),
+                    bytes,
+                    metadata.permissions().readonly(),
+                    brush_context,
+                )
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                Self::from_bytes(Target::Host(path), vec![], false)
+                Self::from_bytes_with_brush_context(
+                    Target::Host(path),
+                    vec![],
+                    false,
+                    brush_context,
+                )
             }
             Err(error) => Err(anyhow::anyhow!("editor: {}: {error}", path.display())),
         }
@@ -529,11 +579,12 @@ impl EditorPane {
         let revision = self.revision;
         let buffer_hash = self.buf_hash;
         let tx = self.analysis_tx.clone();
+        let context = self.brush_context.clone();
         self.analysis_pending = Some(revision);
         let spawn = std::thread::Builder::new()
             .name("sarun-editor-analysis".into())
             .spawn(move || {
-                let result = brush_file_highlights(&text);
+                let result = brush_file_highlights(&text, &context);
                 let _ = tx.send(HighlightAnalysisResult {
                     revision,
                     buffer_hash,
@@ -595,6 +646,7 @@ impl EditorPane {
                 start: cursor,
                 end: cursor,
             }),
+            &self.brush_context,
         ) {
             Ok(analysis) => analysis,
             Err(error) => {
@@ -628,12 +680,16 @@ impl EditorPane {
             self.completions = None;
             self.status = "brush relation: no completion at cursor".into();
         } else {
-            self.status = format!(
-                "{} relation completion(s) · Tab/↓ next · Enter accept · Esc close",
-                items.len()
-            );
+            self.status = Self::completion_status(&items[0]);
             self.completions = Some(CompletionMenu { items, selected: 0 });
         }
+    }
+
+    fn completion_status(completion: &Completion) -> String {
+        format!(
+            "completion: {} · Tab/↓ next · Enter accept · Esc close",
+            completion.display
+        )
     }
 
     fn handle_completion_key(&mut self, code: KeyCode, mods: KeyModifiers) -> bool {
@@ -647,10 +703,12 @@ impl EditorPane {
         match code {
             KeyCode::Tab | KeyCode::Down => {
                 menu.selected = (menu.selected + 1) % menu.items.len();
+                self.status = Self::completion_status(&menu.items[menu.selected]);
                 true
             }
             KeyCode::BackTab | KeyCode::Up => {
                 menu.selected = menu.selected.checked_sub(1).unwrap_or(menu.items.len() - 1);
+                self.status = Self::completion_status(&menu.items[menu.selected]);
                 true
             }
             KeyCode::Enter => {
@@ -882,9 +940,13 @@ impl EditorPane {
             .wrap(false)
             .line_numbers(LineNumbers::Absolute);
         f.render_widget(view, editor_area);
+        let status = if self.completions.is_some() {
+            format!("{} · {}", self.status, self.title())
+        } else {
+            format!("{} · {}", self.title(), self.status)
+        };
         f.render_widget(
-            Paragraph::new(format!("{} · {}", self.title(), self.status))
-                .style(Style::default().fg(Color::DarkGray)),
+            Paragraph::new(status).style(Style::default().fg(Color::DarkGray)),
             status_area,
         );
         self.render_completion_menu(f, editor_area);
@@ -989,14 +1051,14 @@ fn save_standalone_host(pane: &mut EditorPane) -> anyhow::Result<()> {
 /// Unix event source and raw-mode implementation use `/dev/tty`; the Ratatui
 /// backend is explicitly attached there as well, so shell redirections remain
 /// ordinary command I/O and cannot capture or corrupt the TUI.
-pub fn run_standalone(path: PathBuf) -> anyhow::Result<()> {
+pub fn run_standalone(path: PathBuf, brush_context: BrushSemanticSnapshot) -> anyhow::Result<()> {
     use crossterm::event::{self, Event, KeyCode, KeyEventKind};
     use crossterm::{cursor, execute, terminal};
     use ratatui::Terminal;
     use ratatui::backend::CrosstermBackend;
     use std::io::IsTerminal;
 
-    let mut pane = EditorPane::open_host_or_new(path)?;
+    let mut pane = EditorPane::open_host_or_new_with_brush_context(path, brush_context)?;
     let mut tty = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -1201,7 +1263,7 @@ mod tests {
             pane.handle_key(KeyCode::Tab, KeyModifiers::empty()),
             KeyResult::Consumed
         );
-        for expected in ["D", "b", "c", "d", "f", "l", "p", "s"] {
+        for expected in ["b", "c", "d", "f", "l", "p", "s"] {
             assert!(
                 pane.completion_items()
                     .iter()
@@ -1209,6 +1271,12 @@ mod tests {
                 "missing relation completion {expected:?}"
             );
         }
+        assert!(
+            pane.completion_items()
+                .iter()
+                .all(|completion| completion.insert != "D"),
+            "unsupported Solaris door type leaked into native completions"
+        );
         let backend = TestBackend::new(90, 24);
         let mut term = Terminal::new(backend).unwrap();
         term.draw(|frame| pane.render(frame, frame.area(), true))
@@ -1258,6 +1326,58 @@ mod tests {
             KeyResult::Consumed
         );
         assert_eq!(text_of(&pane.state), "#!/bin/bash\nA=\"\"\nfind . -type $A");
+    }
+
+    #[test]
+    fn standalone_editor_completes_a_variable_captured_from_its_brush_shell() {
+        let mut shell: brush_core::Shell = brush_core::Shell::default();
+        shell
+            .set_working_dir(std::env::temp_dir())
+            .expect("set test shell cwd");
+        shell
+            .set_env_global(
+                "PERSISTENT_VALUE",
+                brush_core::ShellVariable::new("from-shell"),
+            )
+            .expect("set persistent shell variable");
+        let context = BrushSemanticSnapshot::capture(&shell);
+        drop(shell);
+
+        let source = "echo $PERS";
+        let mut pane = EditorPane::from_bytes_with_brush_context(
+            Target::Host(PathBuf::from("captured.sh")),
+            source.as_bytes().to_vec(),
+            false,
+            context,
+        )
+        .unwrap();
+        pane.state.mode = EditorMode::Insert;
+        pane.state.cursor = Index2::new(0, source.chars().count());
+        assert_eq!(
+            pane.handle_key(KeyCode::Tab, KeyModifiers::empty()),
+            KeyResult::Consumed
+        );
+        let selected = pane
+            .completion_items()
+            .iter()
+            .position(|completion| {
+                let replace = completion.replace.clone();
+                replace.start <= replace.end
+                    && replace.end <= source.len()
+                    && format!(
+                        "{}{}{}",
+                        &source[..replace.start],
+                        completion.insert,
+                        &source[replace.end..]
+                    ) == "echo $PERSISTENT_VALUE"
+            })
+            .expect("captured Brush variable completion");
+        pane.completions.as_mut().unwrap().selected = selected;
+        assert_eq!(
+            pane.handle_key(KeyCode::Enter, KeyModifiers::empty()),
+            KeyResult::Consumed
+        );
+        assert_eq!(text_of(&pane.state), "echo $PERSISTENT_VALUE");
     }
 
     #[test]

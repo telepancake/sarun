@@ -26,6 +26,47 @@ use findutils::find::Dependencies;
 
 use crate::builtin_exec;
 
+/// Adapt find-owned immutable syntax metadata to the engine-neutral command
+/// schema. No Prolog representation crosses this boundary, and accepted file
+/// type spellings are read exclusively from findutils' execution catalog.
+/// This phase projects only `-type`/`-xtype`; opaque words preserve the rest of
+/// find's still-unimported grammar without claiming to validate it.
+pub(crate) fn command_syntax() -> crate::command_syntax::CommandSyntax {
+    use crate::command_syntax::{
+        CommandOptionSyntax, CommandSyntax, CommandValueSyntax, FiniteDomainSyntax,
+        FiniteValueSyntax,
+    };
+
+    let options = findutils::find::syntax::FILE_TYPE_PREDICATES
+        .iter()
+        .map(|predicate| CommandOptionSyntax {
+            id: predicate.surface.trim_start_matches('-').to_string(),
+            spellings: vec![predicate.surface.to_string()],
+            description: predicate.description.to_string(),
+            value: CommandValueSyntax::Finite(FiniteDomainSyntax {
+                values: predicate
+                    .values
+                    .iter()
+                    .map(|value| FiniteValueSyntax {
+                        surface: value.surface.to_string(),
+                        description: value.description.to_string(),
+                    })
+                    .collect(),
+                separator: Some(predicate.separator),
+                unique: predicate.values_must_be_unique,
+                syntax: "find_file_type".into(),
+            }),
+        })
+        .collect();
+    CommandSyntax {
+        name: "find".into(),
+        description: "walk directory trees and evaluate expressions".into(),
+        options,
+        positionals: vec![],
+        allow_opaque_words: true,
+    }
+}
+
 /// `find`'s injected dependencies: logical I/O, logical cwd, and the
 /// `-exec` submitter that routes commands through brush.
 struct BrushFindDeps {

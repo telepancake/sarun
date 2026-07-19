@@ -1058,8 +1058,13 @@ impl brush_core::builtins::Command for EditBuiltin {
         } else {
             context.shell.working_dir().join(operand)
         };
+        // The interactive executor holds the shell mutex for the duration of
+        // this builtin. Capture owned facts now; retaining a ShellRef in the
+        // foreground editor would deadlock and retaining this borrow would
+        // let analysis race mutable shell state.
+        let brush_context = crate::parser::BrushSemanticSnapshot::capture(context.shell);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::editor::run_standalone(path)
+            crate::editor::run_standalone(path, brush_context)
         }));
         match result {
             Ok(Ok(())) => Ok(brush_core::results::ExecutionResult::new(0)),
@@ -1183,63 +1188,16 @@ fn box_builtins<SE: brush_core::extensions::ShellExtensions>(
     m
 }
 
-/// Translate declarative builtin parsers into an ordinary immutable text
-/// grammar. The result contains only the generic grammar IR vocabulary; the
-/// engine has no command, flag, positional-argument, or Clap cases.
-pub(crate) fn builtin_command_grammar() -> &'static crate::prolog::RelationValue {
-    use crate::prolog::RelationValue as V;
+/// Collect command-owned parser definitions into an immutable neutral schema.
+/// Clap-backed builtins and independently parsed commands enter the same list;
+/// the grammar adapter below has no command-name cases.
+fn builtin_command_syntax() -> &'static [crate::command_syntax::CommandSyntax] {
+    use crate::command_syntax::{
+        CommandOptionSyntax, CommandPositionalSyntax, CommandSyntax, CommandValueSyntax,
+        ContextCardinalitySyntax, ContextSelectorSyntax, FiniteDomainSyntax, FiniteValueSyntax,
+        LexicalSyntax,
+    };
 
-    fn compound(name: &str, arguments: Vec<V>) -> V {
-        V::Compound(name.into(), arguments)
-    }
-    fn list(values: Vec<V>) -> V {
-        V::List(values)
-    }
-    fn choice(mut expressions: Vec<V>) -> V {
-        if expressions.len() == 1 {
-            expressions.pop().unwrap()
-        } else {
-            compound("choice", vec![list(expressions)])
-        }
-    }
-    fn literal(surface: String, semantic: V, syntax: &str, description: String) -> V {
-        compound(
-            "literal",
-            vec![
-                V::String(surface),
-                semantic,
-                compound(
-                    "presentation",
-                    vec![list(vec![
-                        compound(
-                            "meta",
-                            vec![V::Atom("syntax".into()), V::Atom(syntax.into())],
-                        ),
-                        compound(
-                            "meta",
-                            vec![V::Atom("description".into()), V::String(description)],
-                        ),
-                        compound("meta", vec![V::Atom("preference".into()), V::Integer(30)]),
-                    ])],
-                ),
-            ],
-        )
-    }
-    fn presentation(syntax: &str, description: String) -> V {
-        compound(
-            "presentation",
-            vec![list(vec![
-                compound(
-                    "meta",
-                    vec![V::Atom("syntax".into()), V::Atom(syntax.into())],
-                ),
-                compound(
-                    "meta",
-                    vec![V::Atom("description".into()), V::String(description)],
-                ),
-            ])],
-        )
-    }
     fn path_domain(hint: clap::ValueHint) -> Option<&'static str> {
         match hint {
             clap::ValueHint::AnyPath => Some("filesystem_path"),
@@ -1249,287 +1207,150 @@ pub(crate) fn builtin_command_grammar() -> &'static crate::prolog::RelationValue
             _ => None,
         }
     }
-    fn contextual_path(name: String, domain: &str, description: String) -> V {
-        let path_codepoint = compound(
-            "terminal",
-            vec![
-                compound(
-                    "text",
-                    vec![compound(
-                        "codepoint",
-                        vec![compound(
-                            "except",
-                            vec![V::String(" \t\r\n\\'\"$|&;()<>".into())],
-                        )],
-                    )],
-                ),
-                compound(
-                    "presentation",
-                    vec![list(vec![
-                        compound(
-                            "meta",
-                            vec![V::Atom("syntax".into()), V::Atom("path".into())],
-                        ),
-                        compound(
-                            "meta",
-                            vec![V::Atom("tear".into()), V::Atom("symbolic".into())],
-                        ),
-                    ])],
-                ),
-            ],
-        );
-        compound(
-            "context",
-            vec![
-                V::Atom(name),
-                compound(
-                    "repeat",
-                    vec![V::Integer(1), V::Atom("unbounded".into()), path_codepoint],
-                ),
-                compound(
-                    "ask",
-                    vec![
-                        V::Atom("one".into()),
-                        V::Atom(domain.into()),
-                        compound(
-                            "name",
-                            vec![compound("value", vec![V::Atom("surface".into())])],
-                        ),
-                    ],
-                ),
-                presentation("path", description),
-            ],
-        )
-    }
 
-    static GRAMMAR: std::sync::OnceLock<V> = std::sync::OnceLock::new();
-    GRAMMAR.get_or_init(|| {
+    static SYNTAX: std::sync::OnceLock<Vec<CommandSyntax>> = std::sync::OnceLock::new();
+    SYNTAX.get_or_init(|| {
         let mut registrations = box_builtins::<brush_core::extensions::DefaultShellExtensions>()
             .into_iter()
             .collect::<Vec<_>>();
         registrations.sort_by(|left, right| left.0.cmp(&right.0));
 
-        let command_expressions = registrations
+        let mut commands = registrations
             .into_iter()
             .filter_map(|(command_name, registration)| {
                 let definition = registration.definition_func?;
                 let mut command = definition();
                 command.build();
-                let mut argument_expressions = Vec::new();
-                let mut positional_expressions = Vec::new();
+                let command_description = command
+                    .get_about()
+                    .map_or_else(|| format!("{command_name} builtin"), ToString::to_string);
+                let mut options = Vec::new();
+                let mut positionals = Vec::new();
                 for argument in command.get_arguments().filter(|argument| {
                     !argument.is_hide_set() && argument.get_action().takes_values()
                 }) {
+                    let description = argument.get_help().map_or_else(
+                        || format!("value for {}", argument.get_id()),
+                        ToString::to_string,
+                    );
                     let values = argument
                         .get_value_parser()
                         .possible_values()
                         .into_iter()
                         .flatten()
                         .filter(|value| !value.is_hide_set())
-                        .map(|value| {
-                            let text = value.get_name().to_string();
-                            let description = value
+                        .map(|value| FiniteValueSyntax {
+                            surface: value.get_name().to_string(),
+                            description: value
                                 .get_help()
                                 .or_else(|| argument.get_help())
                                 .map_or_else(
                                     || format!("value for {}", argument.get_id()),
                                     ToString::to_string,
-                                );
-                            literal(
-                                text.clone(),
-                                V::Compound(
-                                    "builtin_argument".into(),
-                                    vec![
-                                        V::String(command_name.clone()),
-                                        V::String(argument.get_id().to_string()),
-                                        V::String(text),
-                                    ],
                                 ),
-                                "builtin_argument",
-                                description,
-                            )
                         })
                         .collect::<Vec<_>>();
 
-                    let mut flags = Vec::new();
-                    if let Some(short) = argument.get_short() {
-                        flags.push(format!("-{short}"));
-                    }
-                    if let Some(long) = argument.get_long() {
-                        flags.push(format!("--{long}"));
-                    }
-                    for flag in flags.into_iter().filter(|_| !values.is_empty()) {
-                        let flag_literal = literal(
-                            flag.clone(),
-                            compound(
-                                "builtin_flag",
-                                vec![
-                                    V::String(command_name.clone()),
-                                    V::String(argument.get_id().to_string()),
-                                    V::String(flag),
-                                ],
-                            ),
-                            "builtin_flag",
-                            argument
-                                .get_help()
-                                .map_or_else(|| "builtin option".into(), ToString::to_string),
-                        );
-                        argument_expressions.push(compound(
-                            "seq",
-                            vec![list(vec![
-                                compound("ref", vec![V::Atom("required_space".into())]),
-                                compound(
-                                    "seq",
-                                    vec![list(vec![
-                                        flag_literal,
-                                        compound("ref", vec![V::Atom("required_space".into())]),
-                                        choice(values.clone()),
-                                    ])],
-                                ),
-                            ])],
+                    if argument.is_positional() {
+                        let value = if !values.is_empty() {
+                            Some(CommandValueSyntax::Finite(FiniteDomainSyntax {
+                                values,
+                                separator: None,
+                                unique: false,
+                                syntax: "builtin_argument".into(),
+                            }))
+                        } else {
+                            path_domain(argument.get_value_hint()).map(|domain| {
+                                CommandValueSyntax::Context {
+                                    domain: domain.into(),
+                                    syntax: "path".into(),
+                                    lexical: LexicalSyntax::NonEmptyCodepointsExcept(
+                                        " \t\r\n\\'\"$|&;()<>".into(),
+                                    ),
+                                    cardinality: ContextCardinalitySyntax::One,
+                                    selector: ContextSelectorSyntax::NameFromSurface,
+                                }
+                            })
+                        };
+                        let Some(value) = value else {
+                            continue;
+                        };
+                        let range = argument.get_num_args().unwrap_or_default();
+                        let minimum = if argument.is_required_set() {
+                            range.min_values()
+                        } else {
+                            0
+                        };
+                        positionals.push((
+                            argument.get_index().unwrap_or(usize::MAX),
+                            CommandPositionalSyntax {
+                                id: argument.get_id().to_string(),
+                                description,
+                                value,
+                                minimum,
+                                maximum: (range.max_values() != usize::MAX)
+                                    .then_some(range.max_values()),
+                            },
                         ));
+                        continue;
                     }
 
-                    if argument.is_positional() {
-                        if let Some(domain) = path_domain(argument.get_value_hint()) {
-                            let description = argument
-                                .get_help()
-                                .map_or_else(|| format!("value for {}", argument.get_id()),
-                                             ToString::to_string);
-                            let value = contextual_path(
-                                format!("builtin_{command_name}_{}", argument.get_id()),
-                                domain,
-                                description,
-                            );
-                            let tail = compound(
-                                "seq",
-                                vec![list(vec![
-                                    compound("ref", vec![V::Atom("required_space".into())]),
-                                    value,
-                                ])],
-                            );
-                            let range = argument.get_num_args().unwrap_or_default();
-                            let minimum = if argument.is_required_set() {
-                                range.min_values()
-                            } else {
-                                0
-                            };
-                            let maximum = range.max_values();
-                            let expression = if minimum == 1 && maximum == 1 {
-                                tail
-                            } else if minimum == 0 && maximum == 1 {
-                                compound("optional", vec![tail])
-                            } else {
-                                compound(
-                                    "repeat",
-                                    vec![
-                                        V::Integer(minimum as i64),
-                                        if maximum == usize::MAX {
-                                            V::Atom("unbounded".into())
-                                        } else {
-                                            V::Integer(maximum as i64)
-                                        },
-                                        tail,
-                                    ],
-                                )
-                            };
-                            positional_expressions.push((
-                                argument.get_index().unwrap_or(usize::MAX),
-                                expression,
-                            ));
-                        }
+                    if values.is_empty() {
+                        continue;
+                    }
+                    let mut spellings = Vec::new();
+                    if let Some(short) = argument.get_short() {
+                        spellings.push(format!("-{short}"));
+                    }
+                    if let Some(long) = argument.get_long() {
+                        spellings.push(format!("--{long}"));
+                    }
+                    if !spellings.is_empty() {
+                        options.push(CommandOptionSyntax {
+                            id: argument.get_id().to_string(),
+                            spellings,
+                            description,
+                            value: CommandValueSyntax::Finite(FiniteDomainSyntax {
+                                values,
+                                separator: None,
+                                unique: false,
+                                syntax: "builtin_argument".into(),
+                            }),
+                        });
                     }
                 }
-                positional_expressions.sort_by_key(|(index, _)| *index);
-                if argument_expressions.is_empty() && positional_expressions.is_empty() {
+                positionals.sort_by_key(|(index, _)| *index);
+                if options.is_empty() && positionals.is_empty() {
                     return None;
                 }
-                let mut invocation = vec![literal(
-                    command_name.clone(),
-                    compound("builtin_command", vec![V::String(command_name.clone())]),
-                    "command",
-                    format!("{command_name} builtin"),
-                )];
-                if !argument_expressions.is_empty() {
-                    invocation.push(compound(
-                        "repeat",
-                        vec![
-                            V::Integer(0),
-                            V::Atom("unbounded".into()),
-                            choice(argument_expressions),
-                        ],
-                    ));
-                }
-                invocation.extend(
-                    positional_expressions
+                Some(CommandSyntax {
+                    name: command_name,
+                    description: command_description,
+                    options,
+                    positionals: positionals
                         .into_iter()
-                        .map(|(_, expression)| expression),
-                );
-                Some(compound("seq", vec![list(invocation)]))
+                        .map(|(_, positional)| positional)
+                        .collect(),
+                    allow_opaque_words: false,
+                })
             })
             .collect::<Vec<_>>();
-        assert!(command_expressions.len() >= 2);
-        compound(
-            "grammar",
-            vec![
-                compound(
-                    "source",
-                    vec![compound("text", vec![V::Atom("utf8".into())])],
-                ),
-                V::Atom("builtin_invocation".into()),
-                list(vec![
-                    compound(
-                        "rule",
-                        vec![
-                            V::Atom("builtin_invocation".into()),
-                            choice(command_expressions),
-                        ],
-                    ),
-                    compound(
-                        "rule",
-                        vec![
-                            V::Atom("required_space".into()),
-                            compound(
-                                "repeat",
-                                vec![
-                                    V::Integer(1),
-                                    V::Atom("unbounded".into()),
-                                    compound(
-                                        "terminal",
-                                        vec![
-                                            compound(
-                                                "text",
-                                                vec![compound(
-                                                    "codepoint",
-                                                    vec![compound(
-                                                        "chars",
-                                                        vec![V::String(" \t\r".into())],
-                                                    )],
-                                                )],
-                                            ),
-                                            compound(
-                                                "presentation",
-                                                vec![list(vec![compound(
-                                                    "meta",
-                                                    vec![
-                                                        V::Atom("syntax".into()),
-                                                        V::Atom("trivia".into()),
-                                                    ],
-                                                )])],
-                                            ),
-                                        ],
-                                    ),
-                                ],
-                            ),
-                        ],
-                    ),
-                ]),
-                list(vec![]),
-            ],
-        )
+        commands.push(crate::find_builtin::command_syntax());
+        commands.sort_by(|left, right| left.name.cmp(&right.name));
+        commands
     })
 }
 
+/// Lower every registered command schema through one generic grammar adapter.
+pub(crate) fn builtin_command_grammar() -> Result<&'static crate::prolog::RelationValue, String> {
+    static GRAMMAR: std::sync::OnceLock<
+        Result<crate::prolog::RelationValue, crate::command_syntax::CommandSyntaxError>,
+    > = std::sync::OnceLock::new();
+    GRAMMAR
+        .get_or_init(|| crate::command_syntax::grammar(builtin_command_syntax()))
+        .as_ref()
+        .map_err(ToString::to_string)
+}
 /// Build a box brush shell. `sh_mode=true` → POSIX; `false` → BASH mode.
 /// `shell_name`/`positional`/`cwd` are $0/$1../$PWD; `None` → brush-core defaults.
 async fn build_box_shell(
@@ -2693,7 +2514,7 @@ impl BrushRelationCompletionProvider {
         cursor: usize,
         context: &dyn crate::parser::ContextProvider,
     ) -> Vec<brush_interactive::SemanticCompletion> {
-        let mut request = crate::prolog::BrushDocumentRequest {
+        let request = crate::prolog::BrushDocumentRequest {
             source: source.to_string(),
             assist: Some(crate::prolog::Span {
                 start: cursor,
@@ -2702,31 +2523,9 @@ impl BrushRelationCompletionProvider {
             initial_bindings: vec![],
             observations: vec![],
         };
-        let Ok(mut analysis) = crate::prolog::analyze_brush_document(&request) else {
+        let Ok(analysis) = crate::parser::analyze_brush_document_resolved(&request, context) else {
             return Vec::new();
         };
-        for _ in 0..4 {
-            if analysis.context_queries.is_empty() {
-                break;
-            }
-            let Ok(prolog) = crate::prolog::global() else {
-                return Vec::new();
-            };
-            let Ok(Some(observations)) =
-                crate::parser::execute_context_graph(prolog, &analysis.context_queries, context)
-            else {
-                return Vec::new();
-            };
-            request.observations = observations;
-            let Ok(next) = crate::prolog::analyze_brush_document(&request) else {
-                return Vec::new();
-            };
-            let stable = next.context_queries == analysis.context_queries;
-            analysis = next;
-            if stable {
-                break;
-            }
-        }
         analysis
             .candidates
             .into_iter()
@@ -2747,13 +2546,11 @@ impl BrushRelationCompletionProvider {
 
 impl brush_interactive::SemanticCompletionProvider for BrushRelationCompletionProvider {
     fn complete(&self, source: &str, cursor: usize) -> Vec<brush_interactive::SemanticCompletion> {
-        let cwd = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(self.shell.lock())
-                .working_dir()
-                .to_path_buf()
+        let snapshot = tokio::task::block_in_place(|| {
+            let shell = tokio::runtime::Handle::current().block_on(self.shell.lock());
+            crate::parser::BrushSemanticSnapshot::capture(&*shell)
         });
-        Self::complete_with_context(source, cursor, &crate::parser::FilesystemContext::new(cwd))
+        Self::complete_with_context(source, cursor, &snapshot)
     }
 }
 
@@ -3459,7 +3256,8 @@ mod builtin_boundary_tests {
         let out = run_capture(
             "umask 022; \
              (umask 077; mkdir private; /usr/bin/touch private/external; \
-              stat -c '%a %a' private private/external); \
+              printf '%s %s\n' \"$(stat -c %a private)\" \
+                                 \"$(stat -c %a private/external)\"); \
              printf 'parent=%s' \"$(umask)\"",
             &dir,
         )
@@ -3469,15 +3267,64 @@ mod builtin_boundary_tests {
 
     #[test]
     fn builtin_parser_projects_only_ordinary_grammar_values() {
-        let grammar = format!("{:#?}", super::builtin_command_grammar());
-        assert!(grammar.contains("grammar"));
+        fn has_compound(value: &crate::prolog::RelationValue, wanted: &str) -> bool {
+            match value {
+                crate::prolog::RelationValue::Compound(name, arguments) => {
+                    name == wanted
+                        || arguments
+                            .iter()
+                            .any(|argument| has_compound(argument, wanted))
+                }
+                crate::prolog::RelationValue::List(values) => {
+                    values.iter().any(|value| has_compound(value, wanted))
+                }
+                _ => false,
+            }
+        }
+
+        let value = super::builtin_command_grammar().unwrap();
+        let grammar = format!("{value:#?}");
         assert!(grammar.contains("builtin_invocation"));
         assert!(grammar.contains("emacs-standard"));
         assert!(grammar.contains("filesystem_path"));
-        assert!(grammar.contains("builtin_edit_path"));
-        assert!(grammar.contains("context"));
-        assert!(!grammar.contains("following"));
-        assert!(!grammar.contains("positional"));
+        assert!(grammar.contains("command_edit_path_context"));
+        assert!(grammar.contains("find_file_type"));
+        assert!(has_compound(value, "grammar"));
+        assert!(has_compound(value, "context"));
+        assert!(!has_compound(value, "following"));
+        assert!(!has_compound(value, "positional"));
+    }
+
+    #[test]
+    fn find_command_schema_is_the_findutils_catalog_projection() {
+        let find = super::builtin_command_syntax()
+            .iter()
+            .find(|command| command.name == "find")
+            .expect("find command schema");
+        assert!(find.allow_opaque_words);
+        assert_eq!(
+            find.options
+                .iter()
+                .flat_map(|option| &option.spellings)
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["-type", "-xtype"]
+        );
+        for option in &find.options {
+            let crate::command_syntax::CommandValueSyntax::Finite(domain) = &option.value else {
+                panic!("find file-type option is not finite");
+            };
+            assert_eq!(
+                domain
+                    .values
+                    .iter()
+                    .map(|value| value.surface.as_str())
+                    .collect::<Vec<_>>(),
+                ["b", "c", "d", "f", "l", "p", "s"]
+            );
+            assert_eq!(domain.separator, Some(','));
+            assert!(domain.unique);
+        }
     }
 
     #[test]

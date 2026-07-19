@@ -26,6 +26,7 @@ pub use net::NetMode;
 
 mod brush;
 mod brush_relation;
+mod command_syntax;
 mod builtin_exec;
 mod capture;
 mod containers_conf;

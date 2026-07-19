@@ -1,4 +1,4 @@
-#![cfg(all(target_os = "linux", target_arch = "aarch64"))]
+#![cfg(target_os = "linux")]
 
 use std::fs::File;
 use std::io::{ErrorKind, Read, Write};

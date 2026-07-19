@@ -256,6 +256,203 @@ impl ContextProvider for EmptyContext {
     }
 }
 
+/// An immutable projection of the persistent state owned by one Brush shell.
+///
+/// Foreground consumers capture this while they have a borrowed `Shell`, then
+/// release the borrow before invoking Prolog or entering a terminal UI.  The
+/// snapshot deliberately contains facts, not matching policy: cardinality and
+/// selectors are still evaluated by the context relation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BrushSemanticSnapshot {
+    logical_cwd: std::path::PathBuf,
+    variables: Vec<crate::prolog::ContextEntry>,
+    variable_revision: crate::prolog::RelationValue,
+}
+
+impl BrushSemanticSnapshot {
+    /// A context with no persistent shell variables.  This is the normal
+    /// context for document hosts that are not running inside Brush.
+    pub fn empty(logical_cwd: impl Into<std::path::PathBuf>) -> Self {
+        let logical_cwd = logical_cwd.into();
+        let variables = Vec::new();
+        let variable_revision = brush_variable_revision(&logical_cwd, &variables);
+        Self {
+            logical_cwd,
+            variables,
+            variable_revision,
+        }
+    }
+
+    /// Capture the visible variable environment and logical cwd atomically
+    /// from a borrowed shell. Shadowed variables are already removed by
+    /// `ShellEnvironment::iter`; sorting makes identity, revisions, and query
+    /// outcomes independent of HashMap iteration order.
+    pub fn capture<SE: brush_core::extensions::ShellExtensions>(
+        shell: &brush_core::Shell<SE>,
+    ) -> Self {
+        use crate::prolog::{ContextEntry, RelationValue};
+        use brush_core::variables::ShellValue;
+
+        let logical_cwd = shell.working_dir().to_path_buf();
+        let mut variables = shell
+            .env()
+            .iter()
+            .map(|(name, variable)| {
+                let value = match variable.value() {
+                    ShellValue::Unset(_) => RelationValue::Atom("unset".into()),
+                    ShellValue::String(value) => shell_text_value(value.clone()),
+                    ShellValue::AssociativeArray(values) => RelationValue::Compound(
+                        "shell_associative_array".into(),
+                        vec![RelationValue::List(
+                            values
+                                .iter()
+                                .map(|(key, value)| {
+                                    RelationValue::Compound(
+                                        "entry".into(),
+                                        vec![
+                                            RelationValue::String(key.clone()),
+                                            RelationValue::String(value.clone()),
+                                        ],
+                                    )
+                                })
+                                .collect(),
+                        )],
+                    ),
+                    ShellValue::IndexedArray(values) => RelationValue::Compound(
+                        "shell_indexed_array".into(),
+                        vec![RelationValue::List(
+                            values
+                                .iter()
+                                .map(|(index, value)| {
+                                    RelationValue::Compound(
+                                        "entry".into(),
+                                        vec![
+                                            RelationValue::Integer(
+                                                (*index).min(i64::MAX as u64) as i64
+                                            ),
+                                            RelationValue::String(value.clone()),
+                                        ],
+                                    )
+                                })
+                                .collect(),
+                        )],
+                    ),
+                    ShellValue::Dynamic { .. } => {
+                        shell_text_value(variable.value().to_cow_str(shell).into_owned())
+                    }
+                };
+                let mut attributes = Vec::new();
+                if variable.is_exported() {
+                    attributes.push(RelationValue::Atom("exported".into()));
+                }
+                if variable.is_readonly() {
+                    attributes.push(RelationValue::Atom("readonly".into()));
+                }
+                if variable.is_treated_as_integer() {
+                    attributes.push(RelationValue::Atom("integer".into()));
+                }
+                if variable.is_treated_as_nameref() {
+                    attributes.push(RelationValue::Atom("nameref".into()));
+                }
+                ContextEntry {
+                    domain: RelationValue::Atom("shell_variable".into()),
+                    identity: RelationValue::Compound(
+                        "shell_variable".into(),
+                        vec![RelationValue::String(name.clone())],
+                    ),
+                    names: vec![name.clone()],
+                    value,
+                    attributes,
+                }
+            })
+            .collect::<Vec<_>>();
+        variables.sort_by(|left, right| left.names.cmp(&right.names));
+        let variable_revision = brush_variable_revision(&logical_cwd, &variables);
+        Self {
+            logical_cwd,
+            variables,
+            variable_revision,
+        }
+    }
+}
+
+fn shell_text_value(value: String) -> crate::prolog::RelationValue {
+    crate::prolog::RelationValue::Compound(
+        "shell_text".into(),
+        vec![crate::prolog::RelationValue::String(value)],
+    )
+}
+
+fn brush_variable_revision(
+    logical_cwd: &std::path::Path,
+    entries: &[crate::prolog::ContextEntry],
+) -> crate::prolog::RelationValue {
+    use sha2::Digest as _;
+    let mut digest = sha2::Sha256::new();
+    digest.update(b"sarun-brush-variables-v1\0");
+    digest.update(logical_cwd.as_os_str().as_encoded_bytes());
+    for entry in entries {
+        digest.update(b"\0entry\0");
+        hash_relation_value(&mut digest, &entry.domain);
+        hash_relation_value(&mut digest, &entry.identity);
+        for name in &entry.names {
+            digest.update((name.len() as u64).to_le_bytes());
+            digest.update(name.as_bytes());
+        }
+        hash_relation_value(&mut digest, &entry.value);
+        for attribute in &entry.attributes {
+            hash_relation_value(&mut digest, attribute);
+        }
+    }
+    let digest = digest.finalize();
+    let mut text = String::with_capacity(digest.len() * 2);
+    use std::fmt::Write as _;
+    for byte in digest {
+        let _ = write!(text, "{byte:02x}");
+    }
+    crate::prolog::RelationValue::Compound(
+        "brush_variables_revision".into(),
+        vec![crate::prolog::RelationValue::String(text)],
+    )
+}
+
+fn hash_relation_value(digest: &mut sha2::Sha256, value: &crate::prolog::RelationValue) {
+    use crate::prolog::RelationValue;
+    use sha2::Digest as _;
+    match value {
+        RelationValue::Atom(value) => {
+            digest.update(b"a");
+            digest.update((value.len() as u64).to_le_bytes());
+            digest.update(value.as_bytes());
+        }
+        RelationValue::String(value) => {
+            digest.update(b"s");
+            digest.update((value.len() as u64).to_le_bytes());
+            digest.update(value.as_bytes());
+        }
+        RelationValue::Integer(value) => {
+            digest.update(b"i");
+            digest.update(value.to_le_bytes());
+        }
+        RelationValue::Compound(name, arguments) => {
+            digest.update(b"c");
+            digest.update((name.len() as u64).to_le_bytes());
+            digest.update(name.as_bytes());
+            digest.update((arguments.len() as u64).to_le_bytes());
+            for argument in arguments {
+                hash_relation_value(digest, argument);
+            }
+        }
+        RelationValue::List(values) => {
+            digest.update(b"l");
+            digest.update((values.len() as u64).to_le_bytes());
+            for value in values {
+                hash_relation_value(digest, value);
+            }
+        }
+    }
+}
+
 /// Parse process argv through the same relation while preserving each argument
 /// as one source unit, including embedded whitespace and empty strings.
 pub fn parse_argv(parts: &[String], context: &dyn ContextProvider) -> ParseResult {
@@ -431,6 +628,61 @@ pub(crate) fn execute_context_graph(
     Ok(Some(observations))
 }
 
+/// Resolve one Brush document analysis, including every explicit external
+/// query emitted by the ordinary relation.  Consumers use this single result
+/// for status, highlights, completions, and state deltas; they must not run a
+/// neighboring context algorithm for an individual projection.
+pub fn analyze_brush_document_resolved(
+    request: &crate::prolog::BrushDocumentRequest,
+    context: &dyn ContextProvider,
+) -> Result<crate::prolog::BrushDocumentAnalysis, String> {
+    const MAX_CONTEXT_ROUNDS: usize = 8;
+    let mut request = request.clone();
+    for _ in 0..MAX_CONTEXT_ROUNDS {
+        let analysis = crate::prolog::analyze_brush_document(&request)?;
+        if analysis.context_queries.is_empty() {
+            return Ok(analysis);
+        }
+        let prolog = crate::prolog::global()?;
+        let Some(observations) = execute_context_graph(prolog, &analysis.context_queries, context)?
+        else {
+            return Err("Brush context query graph has no ready query".into());
+        };
+        if !merge_context_observations(&mut request.observations, observations) {
+            return Ok(analysis);
+        }
+    }
+    Err(format!(
+        "Brush context query graph did not stabilize after {MAX_CONTEXT_ROUNDS} rounds"
+    ))
+}
+
+/// Add newly-ready observations without discarding observations from earlier
+/// dependency stages. A relation can reveal another query only after an
+/// earlier one succeeds; the accumulated set is therefore keyed by the
+/// relation's scoped query identity, not by provider revision or vector slot.
+fn merge_context_observations(
+    accumulated: &mut Vec<crate::prolog::ContextObservation>,
+    additions: Vec<crate::prolog::ContextObservation>,
+) -> bool {
+    let mut changed = false;
+    for addition in additions {
+        if let Some(index) = accumulated
+            .iter()
+            .position(|existing| existing.id == addition.id && existing.query == addition.query)
+        {
+            if accumulated[index] != addition {
+                accumulated[index] = addition;
+                changed = true;
+            }
+        } else {
+            accumulated.push(addition);
+            changed = true;
+        }
+    }
+    changed
+}
+
 /// Query-scoped filesystem snapshots rooted in a caller's logical working
 /// directory. Path interpretation and matching remain in the Prolog context
 /// relation; this provider only enumerates the smallest directory snapshot
@@ -597,6 +849,34 @@ impl ContextProvider for FilesystemContext {
             revision,
             entries,
         })
+    }
+}
+
+impl ContextProvider for BrushSemanticSnapshot {
+    fn snapshot(
+        &self,
+        request: &crate::prolog::ContextQueryNode,
+    ) -> Result<crate::prolog::ContextSnapshot, String> {
+        use crate::prolog::{ContextSnapshot, RelationValue};
+        if request.query.domain == RelationValue::Atom("shell_variable".into()) {
+            return Ok(ContextSnapshot {
+                provider: RelationValue::Compound(
+                    "brush_shell_variables".into(),
+                    vec![RelationValue::String(
+                        self.logical_cwd.to_string_lossy().into_owned(),
+                    )],
+                ),
+                revision: self.variable_revision.clone(),
+                entries: self.variables.clone(),
+            });
+        }
+        if FilesystemContext::filesystem_domain(&request.query.domain).is_some() {
+            return FilesystemContext::new(&self.logical_cwd).snapshot(request);
+        }
+        Err(format!(
+            "no Brush context provider for domain {:?}",
+            request.query.domain
+        ))
     }
 }
 
@@ -972,6 +1252,19 @@ fn floor_char_boundary(input: &str, mut cursor: usize) -> usize {
 mod tests {
     use super::*;
 
+    fn shell_snapshot(variables: &[(&str, &str)]) -> BrushSemanticSnapshot {
+        let mut shell: brush_core::Shell = brush_core::Shell::default();
+        shell
+            .set_working_dir(std::env::temp_dir())
+            .expect("set test shell cwd");
+        for &(name, value) in variables {
+            shell
+                .set_env_global(name, brush_core::ShellVariable::new(value))
+                .expect("set test shell variable");
+        }
+        BrushSemanticSnapshot::capture(&shell)
+    }
+
     struct FixtureContext;
 
     impl ContextProvider for FixtureContext {
@@ -1021,6 +1314,76 @@ mod tests {
                 entries: vec![entry],
             })
         }
+    }
+
+    #[test]
+    fn brush_snapshot_is_ordered_and_revision_is_content_deterministic() {
+        let left = shell_snapshot(&[("BETA", "2"), ("ALPHA", "1")]);
+        let right = shell_snapshot(&[("ALPHA", "1"), ("BETA", "2")]);
+        assert_eq!(left, right);
+
+        let request = crate::prolog::ContextQueryNode {
+            id: crate::prolog::RelationValue::Atom("variables".into()),
+            query: crate::prolog::ContextQuery {
+                cardinality: crate::prolog::ContextCardinality::All,
+                domain: crate::prolog::RelationValue::Atom("shell_variable".into()),
+                selector: crate::prolog::RelationValue::Compound(
+                    "prefix".into(),
+                    vec![crate::prolog::RelationValue::String(String::new())],
+                ),
+            },
+        };
+        let snapshot = left.snapshot(&request).unwrap();
+        let names = snapshot
+            .entries
+            .iter()
+            .map(|entry| entry.names[0].as_str())
+            .collect::<Vec<_>>();
+        assert!(names.windows(2).all(|pair| pair[0] <= pair[1]));
+        assert!(names.contains(&"ALPHA"));
+        assert!(names.contains(&"BETA"));
+    }
+
+    #[test]
+    fn resolved_brush_analysis_completes_and_tracks_persistent_variables() {
+        let before = shell_snapshot(&[("PERSISTENT", "value"), ("UNRELATED", "before")]);
+
+        let source = "echo $PERS";
+        let completed_source = "echo $PERSISTENT";
+        let request = crate::prolog::BrushDocumentRequest {
+            source: source.into(),
+            assist: Some(crate::prolog::Span {
+                start: source.len(),
+                end: source.len(),
+            }),
+            initial_bindings: vec![],
+            observations: vec![],
+        };
+        let first = analyze_brush_document_resolved(&request, &before).unwrap();
+        assert!(first.candidates.iter().any(|candidate| {
+            candidate.completions.iter().any(|completion| {
+                let replace = completion.replace.clone();
+                replace.start <= replace.end
+                    && replace.end <= source.len()
+                    && format!(
+                        "{}{}{}",
+                        &source[..replace.start],
+                        completion.insert,
+                        &source[replace.end..]
+                    ) == completed_source
+            })
+        }));
+
+        let value_changed = shell_snapshot(&[("PERSISTENT", "new value")]);
+        let exact_request = crate::prolog::BrushDocumentRequest {
+            source: "echo $PERSISTENT".into(),
+            assist: None,
+            initial_bindings: vec![],
+            observations: vec![],
+        };
+        let exact_before = analyze_brush_document_resolved(&exact_request, &before).unwrap();
+        let exact_after = analyze_brush_document_resolved(&exact_request, &value_changed).unwrap();
+        assert_ne!(exact_before.dependency_keys, exact_after.dependency_keys);
     }
 
     fn invocation(input: &str) -> Invocation {

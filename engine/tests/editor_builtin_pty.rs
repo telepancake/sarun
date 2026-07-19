@@ -1,11 +1,14 @@
-#![cfg(all(target_os = "linux", target_arch = "aarch64"))]
+#![cfg(target_os = "linux")]
 
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+static EDITOR_PTY_CASE: Mutex<()> = Mutex::new(());
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack
@@ -29,9 +32,15 @@ fn run_editor_case(
     label: &str,
     initial_text: &[u8],
     before_tab: &[u8],
-    selection_downs: u8,
+    completion_identity: &str,
     expected: &[u8],
 ) {
+    // Each case starts a complete Brush, embedded SWI runtime, and terminal UI.
+    // Running several at once can starve an otherwise healthy PTY past its
+    // interaction deadline; parallel startup is not part of this UI contract.
+    let _case = EDITOR_PTY_CASE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     let path = std::env::temp_dir().join(format!(
         "sarun_editor_builtin_pty_{}_{}.sh",
         std::process::id(),
@@ -99,13 +108,15 @@ fn run_editor_case(
     let started = Instant::now();
     let deadline = started + Duration::from_secs(15);
     let mut output = Vec::new();
+    let mut terminal = tui_term::vt100::Parser::new(30, 100, 0);
     let mut dsr_replies = 0usize;
     let mut command_sent = false;
     let mut editor_entered = None;
     let mut phase = 0u8;
-    let mut downs = 0u8;
     let mut last_down = started;
+    let mut identity_seen = None;
     let mut exit_sent = false;
+    let completion_marker = format!("completion: {completion_identity} ·");
 
     while Instant::now() < deadline && child.try_wait().unwrap().is_none() {
         let mut poll_fd = libc::pollfd {
@@ -119,7 +130,10 @@ fn run_editor_case(
         loop {
             match master.read(&mut buffer) {
                 Ok(0) => break,
-                Ok(count) => output.extend_from_slice(&buffer[..count]),
+                Ok(count) => {
+                    output.extend_from_slice(&buffer[..count]);
+                    terminal.process(&buffer[..count]);
+                }
                 Err(error) if error.kind() == ErrorKind::WouldBlock => break,
                 Err(error) if error.raw_os_error() == Some(libc::EIO) => break,
                 Err(error) => panic!("read PTY: {error}"),
@@ -157,19 +171,23 @@ fn run_editor_case(
                 phase = 3;
             } else if phase == 3 && elapsed > Duration::from_millis(1000) {
                 send(&mut master, b"\t");
+                last_down = now;
                 phase = 4;
-            } else if phase == 4 && contains(&output, b"relation completions") {
-                if downs < selection_downs
-                    && now.duration_since(last_down) > Duration::from_millis(160)
-                {
-                    send(&mut master, b"\x1b[B");
-                    downs += 1;
-                    last_down = now;
-                } else if downs == selection_downs
-                    && now.duration_since(last_down) > Duration::from_millis(250)
-                {
-                    send(&mut master, b"\r");
-                    phase = 5;
+            } else if phase == 4
+                && terminal.screen().contents().contains("relation completions")
+            {
+                if terminal.screen().contents().contains(&completion_marker) {
+                    let seen = identity_seen.get_or_insert(now);
+                    if now.duration_since(*seen) > Duration::from_millis(120) {
+                        send(&mut master, b"\r");
+                        phase = 5;
+                    }
+                } else {
+                    identity_seen = None;
+                    if now.duration_since(last_down) > Duration::from_millis(250) {
+                        send(&mut master, b"\x1b[B");
+                        last_down = now;
+                    }
                 }
             } else if phase == 5 && elapsed > Duration::from_millis(2200) {
                 send(&mut master, b"\x1b");
@@ -226,7 +244,7 @@ fn standalone_brush_edit_builtin_propagates_argument_value_and_restores_terminal
         "argument_value",
         b"A=\"\"; find . -type $A",
         b"0llli",
-        5,
+        "f",
         b"A=\"f\"; find . -type $A",
     );
 }
@@ -237,7 +255,7 @@ fn standalone_brush_edit_builtin_completes_visible_local_after_dollar() {
         "local_name",
         b"#!/bin/bash\rA=\"\"\rfind . -type $",
         b"",
-        0,
+        "A",
         b"#!/bin/bash\nA=\"\"\nfind . -type $A",
     );
 }
@@ -248,7 +266,7 @@ fn standalone_brush_edit_builtin_completes_builtin_argument_definition() {
         "builtin_argument",
         b"bind -m ",
         b"",
-        0,
+        "emacs-ctlx",
         b"bind -m emacs-ctlx",
     );
 }

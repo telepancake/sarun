@@ -13,6 +13,10 @@ const RUNNING: u8 = 1;
 const POISONED: u8 = 2;
 const LOAD_INFERENCES: i64 = 5_000_000;
 pub(crate) const MAX_DOCUMENT_INPUT_BYTES: usize = 16 * 1024;
+// Per-operation request envelopes remain small because installed grammars cross
+// this boundary by handle. Startup grammar installation has its own capacity.
+const MAX_RELATION_REQUEST_BYTES: usize = 64 * 1024;
+const MAX_GRAMMAR_INSTALL_BYTES: usize = 1024 * 1024;
 const MAX_ITEMS: usize = 256;
 const MAX_OUTPUT_BYTES: usize = 256 * 1024;
 const MAX_RELATION_NODES: usize = 65_536;
@@ -605,7 +609,7 @@ impl Prolog {
                 },
                 RelationBinding {
                     name: "builtin_grammar".into(),
-                    value: crate::brush::builtin_command_grammar().clone(),
+                    value: builtin_command_grammar_handle(),
                 },
             ],
             wanted: vec![
@@ -1188,7 +1192,70 @@ impl Runtime {
             cleanup_attempted: false,
         };
         runtime.load_grammar()?;
+        runtime.install_grammar(
+            "sarun_builtin_commands",
+            crate::brush::builtin_command_grammar()?,
+        )?;
         Ok(runtime)
+    }
+
+    fn install_grammar(&mut self, handle: &str, grammar: &RelationValue) -> Result<(), String> {
+        // SAFETY: startup owns the only SWI engine. The grammar is built from
+        // typed Rust data and crosses the FLI structurally, never as source.
+        unsafe {
+            let terms = PL_new_term_refs(2);
+            if terms == 0 {
+                return Err("FLI term allocation failed while installing grammar".into());
+            }
+            let mut budget = RelationTermBudget::new(MAX_GRAMMAR_INSTALL_BYTES);
+            if put_relation_value(terms, &RelationValue::Atom(handle.into()), 0, &mut budget) == 0
+                || put_relation_value(terms + 1, grammar, 0, &mut budget) == 0
+            {
+                PL_clear_exception();
+                PL_reset_term_refs(terms);
+                return Err("failed to construct installed grammar terms".into());
+            }
+            let predicate = PL_predicate(
+                c"install_grammar".as_ptr(),
+                2,
+                c"grammar_store".as_ptr(),
+            );
+            if predicate.is_null() {
+                PL_reset_term_refs(terms);
+                return Err("FLI grammar installer predicate allocation failed".into());
+            }
+            let query = PL_open_query(
+                ptr::null_mut(),
+                PL_Q_NODEBUG | PL_Q_CATCH_EXCEPTION,
+                predicate,
+                terms,
+            );
+            if query == 0 {
+                PL_reset_term_refs(terms);
+                return Err("FLI grammar installer query allocation failed".into());
+            }
+            let succeeded = PL_next_solution(query) != 0;
+            let exception = !succeeded && PL_exception(query) != 0;
+            let closed = if succeeded {
+                PL_cut_query(query)
+            } else {
+                PL_close_query(query)
+            };
+            if exception || closed != 1 {
+                PL_clear_exception();
+            }
+            PL_reset_term_refs(terms);
+            if closed != 1 {
+                return Err("FLI grammar installer query cleanup failed".into());
+            }
+            if exception {
+                Err("Prolog exception while installing command grammar".into())
+            } else if !succeeded {
+                Err("Prolog rejected command grammar installation".into())
+            } else {
+                Ok(())
+            }
+        }
     }
 
     fn load_grammar(&mut self) -> Result<(), String> {
@@ -1279,7 +1346,7 @@ impl Runtime {
             if terms == 0 {
                 return Err("FLI term allocation failed for relation transform".into());
             }
-            let mut put_budget = RelationTermBudget::new(MAX_DOCUMENT_INPUT_BYTES);
+            let mut put_budget = RelationTermBudget::new(MAX_RELATION_REQUEST_BYTES);
             if put_relation_value(terms, request, 0, &mut put_budget) == 0
                 || PL_put_variable(terms + 1) == 0
             {
@@ -1681,6 +1748,13 @@ fn brush_grammar_handle() -> RelationValue {
     relation_compound(
         "grammar_handle",
         vec![RelationValue::Atom("sarun_brush".into())],
+    )
+}
+
+fn builtin_command_grammar_handle() -> RelationValue {
+    relation_compound(
+        "grammar_handle",
+        vec![RelationValue::Atom("sarun_builtin_commands".into())],
     )
 }
 
@@ -2673,6 +2747,28 @@ pub(crate) fn ensure_linked() {
 mod tests {
     use super::*;
 
+    fn find_file_type_completions(source: &str, assist: Span) -> std::collections::BTreeSet<String> {
+        analyze_brush_document(&BrushDocumentRequest {
+            source: source.into(),
+            assist: Some(assist),
+            initial_bindings: vec![],
+            observations: vec![],
+        })
+        .unwrap()
+        .candidates
+        .iter()
+        .flat_map(|candidate| &candidate.completions)
+        .filter(|completion| {
+            completion.replace == assist
+                && completion
+                    .alternatives
+                    .iter()
+                    .any(|alternative| alternative.syntax == "find_file_type")
+        })
+        .map(|completion| completion.insert.clone())
+        .collect()
+    }
+
     fn contains_relation_value(value: &RelationValue, wanted: &RelationValue) -> bool {
         value == wanted
             || match value {
@@ -3285,6 +3381,104 @@ mod tests {
     }
 
     #[test]
+    fn production_brush_document_derives_find_type_values_from_ordinary_parse() {
+        let source = "find . -type ";
+        let completions = find_file_type_completions(
+            source,
+            Span {
+                start: source.len(),
+                end: source.len(),
+            },
+        );
+        assert_eq!(
+            completions,
+            ["b", "c", "d", "f", "l", "p", "s"]
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        );
+    }
+
+    #[test]
+    fn ordinary_find_list_tears_respect_prefix_remaining_values_and_xtype() {
+        let after_separator = "find . -type f,";
+        assert_eq!(
+            find_file_type_completions(
+                after_separator,
+                Span {
+                    start: after_separator.len(),
+                    end: after_separator.len(),
+                },
+            ),
+            ["b", "c", "d", "l", "p", "s"]
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        );
+
+        let partial = "find . -type f";
+        assert_eq!(
+            find_file_type_completions(
+                partial,
+                Span {
+                    start: partial.len() - 1,
+                    end: partial.len(),
+                },
+            ),
+            ["f"].into_iter().map(str::to_string).collect()
+        );
+
+        let xtype = "find . -xtype ";
+        assert_eq!(
+            find_file_type_completions(
+                xtype,
+                Span {
+                    start: xtype.len(),
+                    end: xtype.len(),
+                },
+            ),
+            ["b", "c", "d", "f", "l", "p", "s"]
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        );
+    }
+
+    #[test]
+    fn ordinary_find_type_relation_rejects_invalid_duplicate_and_trailing_values() {
+        let parse = |source: &str| {
+            global()
+                .unwrap()
+                .transform(&RelationRequest {
+                    grammar: builtin_command_grammar_handle(),
+                    given: vec![RelationBinding {
+                        name: "source".into(),
+                        value: rv_compound(
+                            "text_source",
+                            vec![rv_string(source), rv_atom("exact"), rv_atom("rust_test")],
+                        ),
+                    }],
+                    wanted: vec!["status".into()],
+                    observations: vec![],
+                    limits: RelationLimits::default(),
+                })
+                .unwrap()
+        };
+        assert!(!parse("find . -type f,d").solutions.is_empty());
+        assert!(!parse("find . -typewriter").solutions.is_empty());
+        for invalid in [
+            "find . -type x",
+            "find . -type f,f",
+            "find . -type f,",
+        ] {
+            assert!(
+                parse(invalid).solutions.is_empty(),
+                "ordinary grammar accepted {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
     fn production_brush_document_propagates_later_find_type_constraint() {
         let analysis = analyze_brush_document(&BrushDocumentRequest {
             source: "A=\"\"; find . -type $A".into(),
@@ -3331,16 +3525,24 @@ mod tests {
                 })
             })
             .expect("ordinary parse lost the assignment tear");
-        for expected in ["D", "b", "c", "d", "f", "l", "p", "s"] {
-            assert!(candidate
-                .completions
-                .iter()
-                .any(|completion| completion.insert == expected));
-        }
-        assert!(candidate
+        let completions = candidate
             .completions
             .iter()
-            .all(|completion| completion.replace == Span { start: 3, end: 3 }));
+            .filter(|completion| {
+                completion.replace == Span { start: 3, end: 3 }
+                    && completion
+                        .alternatives
+                        .iter()
+                        .any(|alternative| alternative.syntax == "find_file_type")
+            })
+            .map(|completion| completion.insert.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            completions,
+            ["b", "c", "d", "f", "l", "p", "s"]
+                .into_iter()
+                .collect()
+        );
     }
 
     #[test]
