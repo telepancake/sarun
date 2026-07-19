@@ -255,10 +255,23 @@ recognizing arguments.
 
 Implementation order:
 
-1. [ ] Add the generic registered-parser request/result boundary and bounds;
-       prove that the engine treats it as an ordinary grammar relation.
-2. [ ] Instrument the shared Brush/Clap command boundary once. Prove exact and
-       assist projections with `edit` and `bind`; do not add command-name cases.
+1. [x] Add the generic registered-parser request/result boundary and bounds;
+       prove that the engine treats it as an ordinary grammar relation. The
+       first context-free host adapter crosses the explicit query/observation
+       protocol and records its implementation revision as a dependency on
+       native aarch64. Context suspension by the adapter remains item 5.
+2. [x] Instrument the shared Brush/Clap command boundary once. The token-level
+       probe calls the real `T::new`, retains the concrete suffix, records
+       consumed/expected Clap argument identities, and tests option candidates
+       by submitting them to that parser. Generic `edit` and `bind` fixtures
+       are green with no command-name cases. Before production cutover its
+       `CommandProbeInput` must grow from plain argv strings into the rich
+       word/provenance representation described above; this checkpoint does
+       not authorize flattening quoted, expanded, or symbolic shell words.
+   [ ] Route that probe through the opaque registered relation handle and
+       ordinary completion evidence at Brush command nodes. Keep contextual
+       value hints suspended as explicit queries rather than consulting an
+       environment inside the adapter.
 3. [ ] Cut those two builtins to execute the typed invocation returned by that
        same exact parser, then delete their generated `CommandSyntax` copies.
 4. [ ] Adapt one simple uutils parser/executor split (`cat`), then one embedded
