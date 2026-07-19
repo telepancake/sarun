@@ -1195,18 +1195,18 @@ fn box_builtins<SE: brush_core::extensions::ShellExtensions>(
 /// builtin registration.  The caller supplies argv[0]; this boundary contains
 /// no builtin-name dispatch and returns `None` for registrations whose runtime
 /// parser cannot yet be probed honestly.
-pub(crate) fn builtin_command_probe(
+pub(crate) fn builtin_parser(
     command_name: &str,
-) -> Option<brush_core::builtins::CommandProbeFunc> {
+) -> Option<brush_core::builtins::BuiltinParserFunc> {
     static PROBES: std::sync::OnceLock<
-        std::collections::BTreeMap<String, brush_core::builtins::CommandProbeFunc>,
+        std::collections::BTreeMap<String, brush_core::builtins::BuiltinParserFunc>,
     > = std::sync::OnceLock::new();
     PROBES
         .get_or_init(|| {
             box_builtins::<brush_core::extensions::DefaultShellExtensions>()
                 .into_iter()
                 .filter_map(|(name, registration)| {
-                    registration.probe_func.map(|probe| (name, probe))
+                    registration.parser_func.map(|parser| (name, parser))
                 })
                 .collect()
         })
@@ -3092,60 +3092,67 @@ mod builtin_boundary_tests {
     }
 
     #[test]
-    fn typed_builtin_probe_observes_edit_path_at_the_tear() {
-        use brush_core::builtins::{CommandParseStatus, CommandProbeInput};
+    fn builtin_parser_observes_edit_path_at_the_tear() {
+        use brush_core::builtins::{BuiltinParseStatus, BuiltinParserInput};
 
         let builtins = super::box_builtins::<brush_core::extensions::DefaultShellExtensions>();
-        let probe = builtins["edit"]
-            .probe_func
+        let parser = builtins["edit"]
+            .parser_func
             .expect("typed edit builtin parser probe");
 
-        let missing = probe(CommandProbeInput {
+        let missing = parser(BuiltinParserInput {
             before: vec!["edit".into()],
             prefix: String::new(),
             suffix: String::new(),
             after: Vec::new(),
         });
-        assert_eq!(missing.status, CommandParseStatus::Incomplete);
+        assert_eq!(missing.status, BuiltinParseStatus::Incomplete);
         assert_eq!(missing.expected.len(), 1);
         assert_eq!(missing.expected[0].id, "path");
-        assert_eq!(missing.expected[0].value_hint, clap::ValueHint::AnyPath);
+        assert_eq!(
+            missing.expected[0].value_domain.as_deref(),
+            Some("filesystem_path")
+        );
 
-        let consumed = probe(CommandProbeInput {
+        let consumed = parser(BuiltinParserInput {
             before: vec!["edit".into()],
             prefix: "./test1.sh".into(),
             suffix: String::new(),
             after: Vec::new(),
         });
-        assert_eq!(consumed.status, CommandParseStatus::Complete);
+        assert_eq!(consumed.status, BuiltinParseStatus::Complete);
         assert_eq!(consumed.tear_arguments.len(), 1);
         assert_eq!(consumed.tear_arguments[0].id, "path");
 
-        let excess = probe(CommandProbeInput {
+        let excess = parser(BuiltinParserInput {
             before: vec!["edit".into()],
             prefix: "./test1.sh".into(),
             suffix: String::new(),
             after: vec!["unexpected".into()],
         });
-        assert!(matches!(excess.status, CommandParseStatus::Rejected(_)));
+        assert!(matches!(excess.status, BuiltinParseStatus::Rejected(_)));
+        let BuiltinParseStatus::Rejected(diagnostic) = excess.status else {
+            unreachable!()
+        };
+        assert_eq!(diagnostic.code, "unknown_argument");
     }
 
     #[test]
-    fn typed_builtin_probe_derives_bind_option_and_value_evidence() {
-        use brush_core::builtins::{CommandParseStatus, CommandProbeInput};
+    fn builtin_parser_derives_bind_option_and_value_evidence() {
+        use brush_core::builtins::{BuiltinParseStatus, BuiltinParserInput};
 
         let builtins = super::box_builtins::<brush_core::extensions::DefaultShellExtensions>();
-        let probe = builtins["bind"]
-            .probe_func
+        let parser = builtins["bind"]
+            .parser_func
             .expect("typed bind builtin parser probe");
 
-        let gap = probe(CommandProbeInput {
+        let gap = parser(BuiltinParserInput {
             before: vec!["bind".into()],
             prefix: String::new(),
             suffix: String::new(),
             after: Vec::new(),
         });
-        assert_eq!(gap.status, CommandParseStatus::Complete);
+        assert_eq!(gap.status, BuiltinParseStatus::Complete);
         let keymap_option = gap
             .literal_continuations
             .iter()
@@ -3155,7 +3162,7 @@ mod builtin_boundary_tests {
         assert_eq!(keymap_option.expected.len(), 1);
         assert_eq!(keymap_option.expected[0].id, "keymap");
         assert_eq!(
-            keymap_option.expected[0].possible_values,
+            keymap_option.expected[0].finite_values,
             [
                 "emacs-standard",
                 "emacs-meta",
@@ -3165,26 +3172,26 @@ mod builtin_boundary_tests {
             ]
         );
 
-        let partial_value = probe(CommandProbeInput {
+        let partial_value = parser(BuiltinParserInput {
             before: vec!["bind".into(), "-m".into()],
             prefix: "emacs-".into(),
             suffix: String::new(),
             after: Vec::new(),
         });
-        assert_eq!(partial_value.status, CommandParseStatus::Incomplete);
+        assert_eq!(partial_value.status, BuiltinParseStatus::Incomplete);
         assert_eq!(partial_value.expected[0].id, "keymap");
 
-        let concrete_suffix = probe(CommandProbeInput {
+        let concrete_suffix = parser(BuiltinParserInput {
             before: vec!["bind".into(), "-m".into()],
             prefix: "em".into(),
             suffix: "-standard".into(),
             after: Vec::new(),
         });
-        assert_eq!(concrete_suffix.status, CommandParseStatus::Incomplete);
+        assert_eq!(concrete_suffix.status, BuiltinParseStatus::Incomplete);
         assert_eq!(concrete_suffix.expected[0].id, "keymap");
-        assert_eq!(concrete_suffix.expected[0].possible_values, ["emacs"]);
+        assert_eq!(concrete_suffix.expected[0].finite_values, ["emacs"]);
 
-        let incompatible_suffix = probe(CommandProbeInput {
+        let incompatible_suffix = parser(BuiltinParserInput {
             before: vec!["bind".into(), "-m".into()],
             prefix: "em".into(),
             suffix: "-not-a-keymap".into(),
@@ -3192,17 +3199,17 @@ mod builtin_boundary_tests {
         });
         assert!(matches!(
             incompatible_suffix.status,
-            CommandParseStatus::Rejected(_)
+            BuiltinParseStatus::Rejected(_)
         ));
         assert!(incompatible_suffix.expected.is_empty());
 
-        let concrete_value = probe(CommandProbeInput {
+        let concrete_value = parser(BuiltinParserInput {
             before: vec!["bind".into(), "-m".into()],
             prefix: "emacs-standard".into(),
             suffix: String::new(),
             after: Vec::new(),
         });
-        assert_eq!(concrete_value.status, CommandParseStatus::Complete);
+        assert_eq!(concrete_value.status, BuiltinParseStatus::Complete);
         assert_eq!(concrete_value.tear_arguments[0].id, "keymap");
     }
 

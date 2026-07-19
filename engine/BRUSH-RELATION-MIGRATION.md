@@ -321,14 +321,16 @@ Implementation order:
        visible diagnostic rather than hidden provider access.
    [ ] Add Kati's `MakeInvocation` and its evaluated-target snapshot provider
        through the same protocol.
-6. [ ] Generalize the registered parser evidence ABI before adapting non-Clap
-       parsers. It currently leaks `clap::ValueHint`,
-       `clap::error::ErrorKind`, `clap_argument`, and the `brush_clap` provider
-       name across the otherwise neutral boundary. Replace those with parser-
-       neutral argument identity, display/help, optional value-domain identity,
-       finite values, status/diagnostics, and a `builtin_parser` dependency.
-       The existing Clap probe becomes one producer of that neutral evidence;
-       Find must not manufacture fake Clap metadata.
+6. [x] Generalize the registered parser evidence ABI before adapting non-Clap
+       parsers. Registration now exposes parser-neutral argument identity,
+       display/help, optional open value-domain identity, finite values, and
+       neutral status/diagnostics. `clap::Command`, `clap::ValueHint`, and
+       `clap::error::ErrorKind` remain inside Brush's Clap producer; relation
+       evidence uses `parser_argument` with the `builtin_parser` provider.
+       `Unsupported` explicitly means that the registered parser has no honest
+       projection for this input, maps to relation no-solution, and never
+       invokes another parser or fallback. Find must produce this evidence
+       directly rather than manufacture fake Clap metadata.
    [ ] Add Find-owned rich argv/probe types and make execution and assist enter
        the same internal parser. The current derived `FindBuiltin` Clap parser
        accepts an opaque trailing `Vec<String>`; it is not Find's grammar. The

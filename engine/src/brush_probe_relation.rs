@@ -5,14 +5,14 @@
 //! parser observation cannot silently discard shell provenance.
 
 use brush_core::builtins::{
-    CommandArgumentEvidence, CommandParseObservation, CommandParseStatus, CommandProbeInput,
+    BuiltinParseStatus, BuiltinParserInput, BuiltinParserObservation, ParserArgumentEvidence,
 };
 
 use crate::prolog::{RelationBinding, RelationReply, RelationSolution, RelationValue};
 use crate::relation_adapter::{Adapter, Request};
 
 pub(crate) const HANDLE: &str = "brush_typed_builtins";
-const PROVIDER: &str = "brush_clap";
+const PROVIDER: &str = "builtin_parser";
 const PREFERENCE: i64 = 40;
 
 pub(crate) struct BuiltinProbeAdapter;
@@ -48,7 +48,7 @@ struct CookedTear {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ProbeAtTear {
-    input: CommandProbeInput,
+    input: BuiltinParserInput,
     replace: ByteSpan,
     edit_id: String,
     tear_surface_len: usize,
@@ -69,8 +69,8 @@ impl From<String> for ArgvDecodeError {
 impl Adapter for BuiltinProbeAdapter {
     fn revision(&self) -> RelationValue {
         RelationValue::Compound(
-            "brush_typed_builtin_revision".into(),
-            vec![RelationValue::Integer(2)],
+            "builtin_parser_revision".into(),
+            vec![RelationValue::Integer(3)],
         )
     }
 
@@ -83,7 +83,7 @@ impl Adapter for BuiltinProbeAdapter {
         let Some(command_name) = words.first().map(|word| word.text.clone()) else {
             return Ok(no_solution());
         };
-        let Some(probe) = super::builtin_command_probe(&command_name) else {
+        let Some(probe) = super::builtin_parser(&command_name) else {
             return Ok(no_solution());
         };
 
@@ -98,7 +98,7 @@ impl Adapter for BuiltinProbeAdapter {
             .collect::<Vec<_>>();
         match tears.as_slice() {
             [] => {
-                let observation = probe(CommandProbeInput {
+                let observation = probe(BuiltinParserInput {
                     before: words.into_iter().map(|word| word.text).collect(),
                     prefix: String::new(),
                     suffix: String::new(),
@@ -408,7 +408,7 @@ fn probe_from_symbolic_tear(
         return Err("typed builtin tear has an invalid cooked offset".into());
     }
     Ok(ProbeAtTear {
-        input: CommandProbeInput {
+        input: BuiltinParserInput {
             before: words[..word_index]
                 .iter()
                 .map(|word| word.text.clone())
@@ -428,14 +428,14 @@ fn probe_from_symbolic_tear(
 
 fn exact_reply(
     request: &Request,
-    observation: CommandParseObservation,
+    observation: BuiltinParserObservation,
 ) -> Result<RelationReply, String> {
     match observation.status {
-        CommandParseStatus::Complete => {
+        BuiltinParseStatus::Complete => {
             solution_reply(request, RelationValue::Atom("complete".into()), Vec::new())
         }
-        CommandParseStatus::Incomplete => Ok(no_solution()),
-        CommandParseStatus::Rejected(_) => Ok(diagnostic("parser_rejected")),
+        BuiltinParseStatus::Incomplete | BuiltinParseStatus::Unsupported => Ok(no_solution()),
+        BuiltinParseStatus::Rejected(_) => Ok(diagnostic("parser_rejected")),
     }
 }
 
@@ -443,10 +443,12 @@ fn assist_reply(
     request: &Request,
     command_name: &str,
     at_tear: ProbeAtTear,
-    observation: CommandParseObservation,
+    observation: BuiltinParserObservation,
 ) -> Result<RelationReply, String> {
-    if matches!(observation.status, CommandParseStatus::Rejected(_)) {
-        return Ok(diagnostic("parser_rejected"));
+    match observation.status {
+        BuiltinParseStatus::Rejected(_) => return Ok(diagnostic("parser_rejected")),
+        BuiltinParseStatus::Unsupported => return Ok(no_solution()),
+        BuiltinParseStatus::Complete | BuiltinParseStatus::Incomplete => {}
     }
     let mut candidates = Vec::<(String, Vec<RelationValue>)>::new();
     let mut context_queries = Vec::new();
@@ -454,7 +456,7 @@ fn assist_reply(
         let literal = continuation.literal;
         candidates.push((
             literal.clone(),
-            vec![clap_alternative(
+            vec![parser_alternative(
                 command_name,
                 &continuation.argument,
                 &literal,
@@ -464,15 +466,15 @@ fn assist_reply(
     let mut arguments = observation.expected;
     arguments.extend(observation.tear_arguments);
     for argument in arguments {
-        for value in &argument.possible_values {
+        for value in &argument.finite_values {
             if value.starts_with(&at_tear.input.prefix) && value != &at_tear.input.prefix {
                 candidates.push((
                     value.clone(),
-                    vec![clap_alternative(command_name, &argument, value)],
+                    vec![parser_alternative(command_name, &argument, value)],
                 ));
             }
         }
-        let Some(domain) = value_hint_domain(argument.value_hint) else {
+        let Some(domain) = argument.value_domain.as_deref() else {
             continue;
         };
         let query = argument_context_query(command_name, &argument, &at_tear, domain);
@@ -560,16 +562,16 @@ fn completion_value(
     )
 }
 
-fn clap_alternative(
+fn parser_alternative(
     command_name: &str,
-    argument: &CommandArgumentEvidence,
+    argument: &ParserArgumentEvidence,
     value: &str,
 ) -> RelationValue {
     RelationValue::Compound(
         "alternative".into(),
         vec![
             RelationValue::Compound(
-                "clap_argument".into(),
+                "parser_argument".into(),
                 vec![
                     RelationValue::String(command_name.into()),
                     RelationValue::String(argument.id.clone()),
@@ -598,19 +600,9 @@ fn context_alternative(domain: &str, identity: &RelationValue) -> RelationValue 
     )
 }
 
-fn value_hint_domain(hint: clap::ValueHint) -> Option<&'static str> {
-    match hint {
-        clap::ValueHint::AnyPath => Some("filesystem_path"),
-        clap::ValueHint::FilePath => Some("filesystem_file"),
-        clap::ValueHint::DirPath => Some("filesystem_directory"),
-        clap::ValueHint::ExecutablePath => Some("filesystem_executable"),
-        _ => None,
-    }
-}
-
 fn argument_context_query(
     command_name: &str,
-    argument: &CommandArgumentEvidence,
+    argument: &ParserArgumentEvidence,
     at_tear: &ProbeAtTear,
     domain: &str,
 ) -> crate::prolog::ContextQueryNode {
@@ -829,6 +821,26 @@ mod tests {
             .collect()
     }
 
+    fn first_completion_alternative(reply: &RelationReply) -> &RelationValue {
+        let RelationValue::List(completions) = &reply.solutions[0]
+            .bindings
+            .iter()
+            .find(|binding| binding.name == "completions")
+            .unwrap()
+            .value
+        else {
+            panic!("completion binding must be a list")
+        };
+        let RelationValue::Compound(name, fields) = &completions[0] else {
+            panic!("completion must have the expected shape")
+        };
+        assert_eq!(name, "completion");
+        let RelationValue::List(alternatives) = &fields[2] else {
+            panic!("completion alternatives must be a list")
+        };
+        &alternatives[0]
+    }
+
     #[test]
     fn bind_finite_values_come_from_runtime_parser_probe() {
         let argv_input = argv(vec![
@@ -849,6 +861,39 @@ mod tests {
                 "vi-insert",
             ]
         );
+        assert_eq!(
+            first_completion_alternative(&reply),
+            &RelationValue::Compound(
+                "alternative".into(),
+                vec![
+                    RelationValue::Compound(
+                        "parser_argument".into(),
+                        vec![
+                            RelationValue::String("bind".into()),
+                            RelationValue::String("keymap".into()),
+                            RelationValue::String("emacs-ctlx".into()),
+                        ],
+                    ),
+                    RelationValue::Atom("builtin_argument".into()),
+                    RelationValue::Atom("builtin_parser".into()),
+                    RelationValue::Integer(PREFERENCE),
+                ],
+            )
+        );
+    }
+
+    #[test]
+    fn unsupported_parser_projection_is_relation_no_solution() {
+        let observation = BuiltinParserObservation {
+            status: BuiltinParseStatus::Unsupported,
+            tear_arguments: Vec::new(),
+            expected: Vec::new(),
+            literal_continuations: Vec::new(),
+        };
+        let request = request(argv(vec![literal_word(0, "test")]), &["status"]);
+        let reply = exact_reply(&request, observation).unwrap();
+        assert!(reply.solutions.is_empty());
+        assert!(reply.diagnostics.is_empty());
     }
 
     #[test]

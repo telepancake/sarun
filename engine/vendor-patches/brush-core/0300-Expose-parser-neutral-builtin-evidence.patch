@@ -1,0 +1,352 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Sun, 19 Jul 2026 17:31:33 +0000
+Subject: [PATCH] Expose parser-neutral builtin evidence
+
+---
+diff --git a/src/builtins.rs b/src/builtins.rs
+index a018e8e..6a0a000 100644
+--- a/src/builtins.rs
++++ b/src/builtins.rs
+@@ -29,11 +29,7 @@ pub type CommandExecuteFunc<SE: extensions::ShellExtensions> =
+ pub type CommandContentFunc =
+     fn(&str, ContentType, &ContentOptions) -> Result<String, error::Error>;
+ 
+-/// Type of a function exposing the same declarative command definition that
+-/// is used to parse a builtin's arguments.
+-pub type CommandDefinitionFunc = fn() -> clap::Command;
+-
+-/// Input to a declarative builtin's parser probe.
++/// Input to a builtin's parser probe.
+ ///
+ /// `before` includes argv[0]. `prefix` and `suffix` are the cooked portions of
+ /// the same argv word on either side of the edit tear (both are empty for a
+@@ -41,57 +37,76 @@ pub type CommandDefinitionFunc = fn() -> clap::Command;
+ /// submission rejoins a proposed prefix with `suffix`, so completion evidence
+ /// is compatible with the concrete remainder of the word.
+ #[derive(Clone, Debug, Default, PartialEq, Eq)]
+-pub struct CommandProbeInput {
++pub struct BuiltinParserInput {
+     pub before: Vec<String>,
+     pub prefix: String,
+     pub suffix: String,
+     pub after: Vec<String>,
+ }
+ 
+-/// Argument identity observed from the command's real clap parser.
++/// Parser-neutral evidence about an argument accepted by a builtin.
+ #[derive(Clone, Debug, PartialEq, Eq)]
+-pub struct CommandArgumentEvidence {
++pub struct ParserArgumentEvidence {
+     pub id: String,
+     pub display: String,
+     pub help: Option<String>,
+-    pub value_hint: clap::ValueHint,
+-    pub possible_values: Vec<String>,
++    /// Optional identity of the external value domain used by this argument.
++    ///
++    /// The identity is intentionally open rather than an enum owned by a
++    /// particular parser implementation. Embedders can relate it to a context
++    /// provider without knowing whether the evidence came from clap or some
++    /// other parser.
++    pub value_domain: Option<String>,
++    /// Finite values exposed by the builtin's parser, if any.
++    pub finite_values: Vec<String>,
++}
++
++/// Parser-neutral diagnostic attached to a rejected invocation.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct ParserDiagnostic {
++    pub code: String,
++    pub message: String,
+ }
+ 
+ /// Whether the exact typed parser accepts the current input.
+-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+-pub enum CommandParseStatus {
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub enum BuiltinParseStatus {
+     Complete,
+     Incomplete,
+-    Rejected(clap::error::ErrorKind),
++    Rejected(ParserDiagnostic),
++    /// This parser does not expose an honest projection for this input.
++    /// Consumers must return no solution; this is not acceptance, rejection,
++    /// or permission to invoke a different parser.
++    Unsupported,
+ }
+ 
+ /// A literal option whose insertion at the tear remains viable according to
+ /// the builtin's real parser. If the option requires a value, `expected`
+ /// records the argument requested by that same parse attempt.
+ #[derive(Clone, Debug, PartialEq, Eq)]
+-pub struct CommandLiteralContinuation {
++pub struct ParserLiteralContinuation {
+     pub literal: String,
+-    pub argument: CommandArgumentEvidence,
+-    pub expected: Vec<CommandArgumentEvidence>,
++    pub argument: ParserArgumentEvidence,
++    pub expected: Vec<ParserArgumentEvidence>,
+ }
+ 
+ /// Evidence from probing a declarative builtin at an edit tear.
+ ///
+ /// This is deliberately parser evidence, not a second command schema. The
+-/// engine may relate the argument identity/value hint to context providers,
++/// engine may relate the argument identity/value domain to context providers,
+ /// then submit each resulting concrete candidate to this same probe again.
+ #[derive(Clone, Debug, PartialEq, Eq)]
+-pub struct CommandParseObservation {
+-    pub status: CommandParseStatus,
+-    pub tear_arguments: Vec<CommandArgumentEvidence>,
+-    pub expected: Vec<CommandArgumentEvidence>,
+-    pub literal_continuations: Vec<CommandLiteralContinuation>,
++pub struct BuiltinParserObservation {
++    pub status: BuiltinParseStatus,
++    pub tear_arguments: Vec<ParserArgumentEvidence>,
++    pub expected: Vec<ParserArgumentEvidence>,
++    pub literal_continuations: Vec<ParserLiteralContinuation>,
+ }
+ 
+-/// Type of a parser observation function backed by a builtin's `Command`
+-/// implementation (including any `Command::new` override).
+-pub type CommandProbeFunc = fn(CommandProbeInput) -> CommandParseObservation;
++/// Type of a parser observation function backed by the parser used by the
++/// builtin at runtime. Clap is one internal producer; it is not part of this
++/// registered-parser ABI.
++pub type BuiltinParserFunc = fn(BuiltinParserInput) -> BuiltinParserObservation;
+ 
+ /// Trait implemented by built-in shell commands.
+ pub trait Command: clap::Parser {
+@@ -220,12 +235,8 @@ pub struct Registration<SE: extensions::ShellExtensions> {
+     /// Function to retrieve the builtin's content/help text.
+     pub content_func: CommandContentFunc,
+ 
+-    /// Declarative argument definition used by the builtin parser, when the
+-    /// builtin is implemented through [`Command`].
+-    pub definition_func: Option<CommandDefinitionFunc>,
+-
+     /// Tear-aware observation through the same typed parser used at runtime.
+-    pub probe_func: Option<CommandProbeFunc>,
++    pub parser_func: Option<BuiltinParserFunc>,
+ 
+     /// Has this registration been disabled?
+     pub disabled: bool,
+@@ -464,8 +475,7 @@ pub fn simple_builtin<B: SimpleCommand + Send + Sync, SE: extensions::ShellExten
+     Registration {
+         execute_func: exec_simple_builtin::<B, SE>,
+         content_func: B::get_content,
+-        definition_func: None,
+-        probe_func: None,
++        parser_func: None,
+         disabled: false,
+         special_builtin: false,
+         external_command: false,
+@@ -479,8 +489,7 @@ pub fn builtin<B: Command + Send + Sync, SE: extensions::ShellExtensions>() -> R
+     Registration {
+         execute_func: exec_builtin::<B, SE>,
+         content_func: get_builtin_content::<B>,
+-        definition_func: Some(command_definition::<B>),
+-        probe_func: Some(command_probe::<B>),
++        parser_func: Some(command_probe::<B>),
+         disabled: false,
+         special_builtin: false,
+         external_command: false,
+@@ -496,10 +505,9 @@ pub fn decl_builtin<B: DeclarationCommand + Send + Sync, SE: extensions::ShellEx
+     Registration {
+         execute_func: exec_declaration_builtin::<B, SE>,
+         content_func: get_builtin_content::<B>,
+-        definition_func: Some(command_definition::<B>),
+         // Runtime declaration parsing splits options from declaration words
+         // before invoking `B::new`; a generic argv probe would be dishonest.
+-        probe_func: None,
++        parser_func: None,
+         disabled: false,
+         special_builtin: false,
+         external_command: false,
+@@ -521,8 +529,7 @@ pub fn raw_arg_builtin<
+     Registration {
+         execute_func: exec_raw_arg_builtin::<B, SE>,
+         content_func: get_builtin_content::<B>,
+-        definition_func: Some(command_definition::<B>),
+-        probe_func: None,
++        parser_func: None,
+         disabled: false,
+         special_builtin: false,
+         external_command: false,
+@@ -530,10 +537,6 @@ pub fn raw_arg_builtin<
+     }
+ }
+ 
+-fn command_definition<T: Command>() -> clap::Command {
+-    T::command()
+-}
+-
+ fn context_strings(value: &clap::error::ContextValue) -> Vec<String> {
+     match value {
+         clap::error::ContextValue::String(value) => vec![value.clone()],
+@@ -546,13 +549,23 @@ fn context_strings(value: &clap::error::ContextValue) -> Vec<String> {
+     }
+ }
+ 
+-fn argument_evidence(argument: &clap::Arg) -> CommandArgumentEvidence {
+-    CommandArgumentEvidence {
++fn value_domain(value_hint: clap::ValueHint) -> Option<String> {
++    match value_hint {
++        clap::ValueHint::AnyPath => Some("filesystem_path".into()),
++        clap::ValueHint::FilePath => Some("filesystem_file".into()),
++        clap::ValueHint::DirPath => Some("filesystem_directory".into()),
++        clap::ValueHint::ExecutablePath => Some("filesystem_executable".into()),
++        _ => None,
++    }
++}
++
++fn argument_evidence(argument: &clap::Arg) -> ParserArgumentEvidence {
++    ParserArgumentEvidence {
+         id: argument.get_id().to_string(),
+         display: argument.to_string(),
+         help: argument.get_help().map(ToString::to_string),
+-        value_hint: argument.get_value_hint(),
+-        possible_values: argument
++        value_domain: value_domain(argument.get_value_hint()),
++        finite_values: argument
+             .get_value_parser()
+             .possible_values()
+             .into_iter()
+@@ -566,7 +579,7 @@ fn argument_evidence(argument: &clap::Arg) -> CommandArgumentEvidence {
+ fn expected_arguments(
+     command: &clap::Command,
+     error: &clap::Error,
+-) -> Vec<CommandArgumentEvidence> {
++) -> Vec<ParserArgumentEvidence> {
+     let displays = error
+         .get(clap::error::ContextKind::InvalidArg)
+         .map(context_strings)
+@@ -589,7 +602,7 @@ fn expected_arguments(
+         .unwrap_or_default();
+     if !valid_values.is_empty() {
+         for argument in &mut expected {
+-            argument.possible_values.clone_from(&valid_values);
++            argument.finite_values.clone_from(&valid_values);
+         }
+     }
+     expected
+@@ -643,7 +656,7 @@ fn incomplete_error(error: &clap::Error, prefix: &str, suffix: &str) -> bool {
+     }
+ }
+ 
+-fn argv_with_prefix(input: &CommandProbeInput, prefix: Option<&str>) -> Vec<String> {
++fn argv_with_prefix(input: &BuiltinParserInput, prefix: Option<&str>) -> Vec<String> {
+     let mut argv = Vec::with_capacity(input.before.len() + input.after.len() + 1);
+     argv.extend(input.before.iter().cloned());
+     if let Some(prefix) = prefix.filter(|prefix| !prefix.is_empty() || !input.suffix.is_empty()) {
+@@ -654,25 +667,45 @@ fn argv_with_prefix(input: &CommandProbeInput, prefix: Option<&str>) -> Vec<Stri
+ }
+ 
+ fn typed_parse_status<T: Command>(
+-    input: &CommandProbeInput,
++    input: &BuiltinParserInput,
+     prefix: Option<&str>,
+     command: &clap::Command,
+-) -> (CommandParseStatus, Vec<CommandArgumentEvidence>) {
++) -> (BuiltinParseStatus, Vec<ParserArgumentEvidence>) {
+     match T::new(argv_with_prefix(input, prefix)) {
+-        Ok(_) => (CommandParseStatus::Complete, Vec::new()),
++        Ok(_) => (BuiltinParseStatus::Complete, Vec::new()),
+         Err(error)
+             if incomplete_error(&error, prefix.unwrap_or_default(), input.suffix.as_str()) =>
+         {
+             (
+-                CommandParseStatus::Incomplete,
++                BuiltinParseStatus::Incomplete,
+                 expected_arguments(command, &error),
+             )
+         }
+-        Err(error) => (CommandParseStatus::Rejected(error.kind()), Vec::new()),
++        Err(error) => (
++            BuiltinParseStatus::Rejected(parser_diagnostic(&error)),
++            Vec::new(),
++        ),
++    }
++}
++
++fn parser_diagnostic(error: &clap::Error) -> ParserDiagnostic {
++    use clap::error::ErrorKind;
++
++    let code = match error.kind() {
++        ErrorKind::InvalidValue | ErrorKind::ValueValidation => "invalid_value",
++        ErrorKind::UnknownArgument | ErrorKind::InvalidSubcommand => "unknown_argument",
++        ErrorKind::TooManyValues => "too_many_values",
++        ErrorKind::ArgumentConflict => "argument_conflict",
++        ErrorKind::MissingRequiredArgument | ErrorKind::MissingSubcommand => "missing_argument",
++        _ => "invalid_invocation",
++    };
++    ParserDiagnostic {
++        code: code.into(),
++        message: error.to_string(),
+     }
+ }
+ 
+-fn command_probe<T: Command>(input: CommandProbeInput) -> CommandParseObservation {
++fn command_probe<T: Command>(input: BuiltinParserInput) -> BuiltinParserObservation {
+     let mut command = T::command();
+     command.build();
+     let current_prefix =
+@@ -681,15 +714,15 @@ fn command_probe<T: Command>(input: CommandProbeInput) -> CommandParseObservatio
+     let (status, mut expected) = typed_parse_status::<T>(&input, current_prefix, &command);
+ 
+     for argument in &mut expected {
+-        argument.possible_values = argument
+-            .possible_values
++        argument.finite_values = argument
++            .finite_values
+             .iter()
+             .filter_map(|value| candidate_prefix(value, &input.prefix, &input.suffix))
+             .filter(|candidate| *candidate != input.prefix)
+             .filter(|candidate| {
+                 matches!(
+                     typed_parse_status::<T>(&input, Some(candidate), &command).0,
+-                    CommandParseStatus::Complete | CommandParseStatus::Incomplete
++                    BuiltinParseStatus::Complete | BuiltinParseStatus::Incomplete
+                 )
+             })
+             .map(ToOwned::to_owned)
+@@ -697,7 +730,7 @@ fn command_probe<T: Command>(input: CommandProbeInput) -> CommandParseObservatio
+     }
+ 
+     let tear_index = input.before.len();
+-    let tear_arguments = if current_prefix.is_some() && status == CommandParseStatus::Complete {
++    let tear_arguments = if current_prefix.is_some() && status == BuiltinParseStatus::Complete {
+         let match_command = T::command();
+         match match_command.try_get_matches_from(current_argv) {
+             Ok(matches) => command
+@@ -718,7 +751,7 @@ fn command_probe<T: Command>(input: CommandProbeInput) -> CommandParseObservatio
+     // If the parser is waiting for a value at this tear, option tokens are not
+     // alternatives. Otherwise ask the real typed parser about every visible
+     // option spelling, retaining only viable insertions.
+-    let literal_continuations = if status == CommandParseStatus::Incomplete && !expected.is_empty()
++    let literal_continuations = if status == BuiltinParseStatus::Incomplete && !expected.is_empty()
+     {
+         Vec::new()
+     } else {
+@@ -753,9 +786,9 @@ fn command_probe<T: Command>(input: CommandProbeInput) -> CommandParseObservatio
+                     typed_parse_status::<T>(&input, Some(candidate), &command);
+                 if matches!(
+                     candidate_status,
+-                    CommandParseStatus::Complete | CommandParseStatus::Incomplete
++                    BuiltinParseStatus::Complete | BuiltinParseStatus::Incomplete
+                 ) {
+-                    continuations.push(CommandLiteralContinuation {
++                    continuations.push(ParserLiteralContinuation {
+                         literal: candidate.to_owned(),
+                         argument: evidence.clone(),
+                         expected: candidate_expected,
+@@ -768,7 +801,7 @@ fn command_probe<T: Command>(input: CommandProbeInput) -> CommandParseObservatio
+         continuations
+     };
+ 
+-    CommandParseObservation {
++    BuiltinParserObservation {
+         status,
+         tear_arguments,
+         expected,
