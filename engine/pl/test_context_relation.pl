@@ -9,6 +9,7 @@ test_name(selectors_are_typed_and_composable).
 test_name(tear_matches_are_exact_unique_parse_witnesses).
 test_name(observations_have_stable_dependency_keys).
 test_name(dependent_queries_become_ready_in_order).
+test_name(sibling_candidate_observations_are_projected_without_dependency_leakage).
 test_name(invalid_graphs_fail_closed).
 
 run_context_relation_tests :-
@@ -100,6 +101,28 @@ run_test(dependent_queries_become_ready_in_order) :-
                    within(box(box_id(2)), prefix("src/"))))],
         [dependency(box_query, ask(one, box, name("work")),
                     some(one(entry(box, 2, ["work"], box_id(2), []))))]).
+
+run_test(sibling_candidate_observations_are_projected_without_dependency_leakage) :-
+    OwnQuery = ask(one, box, name("work")),
+    SiblingQuery = ask(all, box, prefix("wo")),
+    OwnEntry = entry(box, 2, ["work"], box_id(2), [running]),
+    SiblingEntries =
+        [entry(box, 2, ["work"], box_id(2), [running]),
+         entry(box, 9, ["worker"], box_id(9), [stopped])],
+    OwnObservation = observed(candidate_query, OwnQuery,
+                              source(boxes, 7), some(one(OwnEntry))),
+    SiblingObservation = observed(sibling_query, SiblingQuery,
+                                  source(boxes, 7),
+                                  some(all(SiblingEntries))),
+    Graph = [query(candidate_query, OwnQuery)],
+    project_observations(Graph, [OwnObservation, SiblingObservation],
+                         Projected),
+    expect_equal(Projected, [OwnObservation]),
+    stage_context(Graph, Projected, Ready, Dependencies),
+    expect_equal(Ready, []),
+    expect_equal(Dependencies,
+                 [dependency(candidate_query, OwnQuery,
+                             some(one(OwnEntry)))]).
 
 run_test(invalid_graphs_fail_closed) :-
     \+ valid_query_graph([query(a, ask(one, box, name("x"))),

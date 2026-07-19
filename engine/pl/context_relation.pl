@@ -4,6 +4,7 @@
             observe_query/4,
             dependency_key/2,
             valid_query_graph/1,
+            project_observations/3,
             stage_context/4,
             ready_queries/3,
             resolve_query_refs/3,
@@ -242,6 +243,34 @@ ready_queries(Graph, Observations, Ready) :-
     ;  Ready = []
     ).
 
+%! project_observations(+Graph, +Observations, -Projected) is semidet.
+%
+% A composed relation may receive the union of observations emitted by
+% several sibling candidates.  Project that envelope onto this candidate's
+% concrete query graph before interpreting it.  Observation shape and outcome
+% validity remain strict for the whole envelope; duplicate observations remain
+% invalid within the projected graph.
+
+project_observations(Graph, Observations, Projected) :-
+    valid_query_graph(Graph),
+    project_graph_observations(Observations, Graph, Projected),
+    valid_observations(Projected, Graph).
+
+project_graph_observations([], _, []).
+project_graph_observations([Observation|Observations], Graph, Projected) :-
+    valid_observation_shape(Observation),
+    ( observation_in_graph(Observation, Graph)
+    -> Projected = [Observation|Rest]
+    ;  Projected = Rest
+    ),
+    project_graph_observations(Observations, Graph, Rest).
+
+observation_in_graph(observed(Id, Query, _, _), Graph) :-
+    query_node(Graph, GraphId, GraphQuery),
+    Id == GraphId,
+    Query == GraphQuery,
+    !.
+
 %! stage_context(+Graph, +Observations, -Ready, -DependencyKeys) is semidet.
 %
 % Validate a staged query/observation exchange, return queries whose typed
@@ -271,14 +300,19 @@ resolve_query_refs(Query, Observations, Resolved) :-
 
 valid_observations([], _).
 valid_observations([Observation|Observations], Graph) :-
-    Observation = observed(Id, Query, source(Provider, Revision), Outcome),
-    ground(Observation),
+    valid_observation_shape(Observation),
+    Observation = observed(Id, Query, _, _),
     query_node(Graph, Id, Query),
-    ground(Provider),
-    ground(Revision),
-    valid_outcome(Query, Outcome),
     \+ observation_for(Observations, Id, _),
     valid_observations(Observations, Graph).
+
+valid_observation_shape(Observation) :-
+    Observation = observed(_, Query, source(Provider, Revision), Outcome),
+    ground(Observation),
+    ground(Provider),
+    ground(Revision),
+    valid_ask(Query),
+    valid_outcome(Query, Outcome).
 
 valid_outcome(_, none).
 valid_outcome(ask(empty, _, _), some(empty(Boolean))) :-

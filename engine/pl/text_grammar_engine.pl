@@ -34,11 +34,13 @@ transform_executable_text_grammar(
     Candidates0 = [_|_],
     text_candidate_context_queries(Candidates0, Queries),
     valid_query_graph(Queries),
-    stage_context(Queries, Observations, ReadyQueries, DependencyKeys),
-    text_candidate_completions(Candidates0, Queries, Observations,
+    project_observations(Queries, Observations, CandidateObservations),
+    stage_context(Queries, CandidateObservations, ReadyQueries,
+                  DependencyKeys),
+    text_candidate_completions(Candidates0, Queries, CandidateObservations,
                                Completions),
     text_candidate_solutions(Candidates0, Wanted, Completions, Queries,
-                             Observations, Solutions0),
+                             CandidateObservations, Solutions0),
     limit_solutions(Solutions0, MaxSolutions, Solutions, Diagnostics).
 
 executable_text_grammar(grammar(source(text(utf8)), _, Rules, [])) :-

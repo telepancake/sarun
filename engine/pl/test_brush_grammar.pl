@@ -15,6 +15,7 @@ test_name(parameter_observation_resolves_and_records_dependency).
 test_name(missing_unique_parameter_observation_fails_semantic_solution).
 test_name(assignment_tear_survives_as_later_local_value).
 test_name(local_variable_name_completion_comes_from_ordinary_use_step).
+test_name(provider_variable_completion_survives_sibling_parse_observations).
 test_name(supplied_grammar_constrains_earlier_local_value_hole).
 test_name(supplied_grammar_uses_state_at_command_position).
 test_name(supplied_grammar_applies_at_each_command_position).
@@ -263,6 +264,35 @@ run_test(local_variable_name_completion_comes_from_ordinary_use_step) :-
                           binding(delta, _)], _), Solutions),
     has_completion("A", local(shell_variable, "A"), Completions).
 
+run_test(provider_variable_completion_survives_sibling_parse_observations) :-
+    brush_relation_grammar(Grammar),
+    Given = [binding(source,
+                     text_source("echo $PER", assist(edit, span(9, 9)),
+                                 brush_test)),
+             binding(initial_state,
+                     local_state([scope(root, [])], []))],
+    Limits = limits(32, 4096, 1048576),
+    transform(request(Grammar, given(Given), want([status, completions]),
+                      observations([]), Limits),
+              reply(_, Queries, [], [])),
+    list_member(query(ExactId, ExactQuery), Queries),
+    ExactQuery = ask(one, shell_variable, name("PER")),
+    list_member(query(CompletionId, CompletionQuery), Queries),
+    CompletionQuery = ask(all, shell_variable, prefix("PER")),
+    Entry = entry(shell_variable, persistent_variable, ["PERSISTENT"],
+                  shell_text("value"), [exported]),
+    ExactObservation = observed(ExactId, ExactQuery,
+                                source(brush_variables, revision_1), none),
+    CompletionObservation = observed(CompletionId, CompletionQuery,
+                                     source(brush_variables, revision_1),
+                                     some(all([Entry]))),
+    transform(request(Grammar, given(Given), want([status, completions]),
+                      observations([ExactObservation,
+                                    CompletionObservation]), Limits),
+              reply(Solutions, [], _, [])),
+    solution_has_completion(
+        Solutions, "SISTENT", context(shell_variable, persistent_variable)).
+
 run_test(supplied_grammar_constrains_earlier_local_value_hole) :-
     tool_analysis("A=\"\"; tool $A", span(3, 3), Solutions),
     solution_completion_texts_at(Solutions, span(3, 3), Texts),
@@ -364,6 +394,11 @@ solution_has_completion_at(Solutions, Span) :-
     list_member(solution(Bindings, _), Solutions),
     list_member(binding(completions, Completions), Bindings),
     list_member(completion(Span, _, _, _, _), Completions).
+
+solution_has_completion(Solutions, Text, Semantic) :-
+    list_member(solution(Bindings, _), Solutions),
+    list_member(binding(completions, Completions), Bindings),
+    has_completion(Text, Semantic, Completions).
 
 has_assignment_hole_solution(
     Hole,
