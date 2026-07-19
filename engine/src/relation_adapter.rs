@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock, RwLock};
 
 use crate::prolog::{
-    ContextEntry, ContextObservation, ContextQueryNode, ContextSnapshot, RelationBinding,
+    ContextDependencyKey, ContextEntry, ContextQueryNode, ContextSnapshot, RelationBinding,
     RelationLimits, RelationReply, RelationValue,
 };
 
@@ -17,7 +17,10 @@ use crate::prolog::{
 pub struct Request {
     pub given: Vec<RelationBinding>,
     pub wanted: Vec<String>,
-    pub observations: Vec<ContextObservation>,
+    /// Provenance-free query results supplied by the relation for pure replay.
+    /// Provider identity and revision stay in the outer dependency trace and
+    /// cannot influence parser behavior when the typed outcome is unchanged.
+    pub observations: Vec<ContextDependencyKey>,
     pub limits: RelationLimits,
 }
 
@@ -137,7 +140,7 @@ fn decode_request(value: &RelationValue) -> Result<Request, String> {
     };
     let observations = observations
         .iter()
-        .map(crate::prolog::context_observation_from_value)
+        .map(crate::prolog::context_dependency_key_from_value)
         .collect::<Result<Vec<_>, _>>()?;
     let RelationValue::Compound(limits_name, limits) = &fields[3] else {
         return Err("registered relation limits value is not a compound".into());

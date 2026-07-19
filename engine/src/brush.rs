@@ -3250,7 +3250,8 @@ mod builtin_boundary_tests {
 
         let missing = probe(CommandProbeInput {
             before: vec!["edit".into()],
-            surface: String::new(),
+            prefix: String::new(),
+            suffix: String::new(),
             after: Vec::new(),
         });
         assert_eq!(missing.status, CommandParseStatus::Incomplete);
@@ -3260,7 +3261,8 @@ mod builtin_boundary_tests {
 
         let consumed = probe(CommandProbeInput {
             before: vec!["edit".into()],
-            surface: "./test1.sh".into(),
+            prefix: "./test1.sh".into(),
+            suffix: String::new(),
             after: Vec::new(),
         });
         assert_eq!(consumed.status, CommandParseStatus::Complete);
@@ -3269,7 +3271,8 @@ mod builtin_boundary_tests {
 
         let excess = probe(CommandProbeInput {
             before: vec!["edit".into()],
-            surface: "./test1.sh".into(),
+            prefix: "./test1.sh".into(),
+            suffix: String::new(),
             after: vec!["unexpected".into()],
         });
         assert!(matches!(excess.status, CommandParseStatus::Rejected(_)));
@@ -3286,7 +3289,8 @@ mod builtin_boundary_tests {
 
         let gap = probe(CommandProbeInput {
             before: vec!["bind".into()],
-            surface: String::new(),
+            prefix: String::new(),
+            suffix: String::new(),
             after: Vec::new(),
         });
         assert_eq!(gap.status, CommandParseStatus::Complete);
@@ -3311,15 +3315,39 @@ mod builtin_boundary_tests {
 
         let partial_value = probe(CommandProbeInput {
             before: vec!["bind".into(), "-m".into()],
-            surface: "emacs-".into(),
+            prefix: "emacs-".into(),
+            suffix: String::new(),
             after: Vec::new(),
         });
         assert_eq!(partial_value.status, CommandParseStatus::Incomplete);
         assert_eq!(partial_value.expected[0].id, "keymap");
 
+        let concrete_suffix = probe(CommandProbeInput {
+            before: vec!["bind".into(), "-m".into()],
+            prefix: "em".into(),
+            suffix: "-standard".into(),
+            after: Vec::new(),
+        });
+        assert_eq!(concrete_suffix.status, CommandParseStatus::Incomplete);
+        assert_eq!(concrete_suffix.expected[0].id, "keymap");
+        assert_eq!(concrete_suffix.expected[0].possible_values, ["emacs"]);
+
+        let incompatible_suffix = probe(CommandProbeInput {
+            before: vec!["bind".into(), "-m".into()],
+            prefix: "em".into(),
+            suffix: "-not-a-keymap".into(),
+            after: Vec::new(),
+        });
+        assert!(matches!(
+            incompatible_suffix.status,
+            CommandParseStatus::Rejected(_)
+        ));
+        assert!(incompatible_suffix.expected.is_empty());
+
         let concrete_value = probe(CommandProbeInput {
             before: vec!["bind".into(), "-m".into()],
-            surface: "emacs-standard".into(),
+            prefix: "emacs-standard".into(),
+            suffix: String::new(),
             after: Vec::new(),
         });
         assert_eq!(concrete_value.status, CommandParseStatus::Complete);

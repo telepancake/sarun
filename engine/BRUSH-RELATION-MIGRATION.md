@@ -275,11 +275,17 @@ Implementation order:
        an ordinary scoped `ask(all, filesystem_path, prefix("./t"))`, replays
        only after its observation arrives, and records both parser-revision and
        filesystem dependencies in the final reply. A native aarch64 test covers
-       the complete-but-still-completable matched-argument case.
+       the complete-but-still-completable matched-argument case. Replay input
+       is the provenance-free `(query id, query, outcome)` dependency value;
+       provider identity/revision remains in the outer trace and cannot alter
+       parsing when the typed result is unchanged.
    [ ] Compose that handle at Brush command nodes after rich shell words cross
        the boundary. The current proof accepts only already-cooked simple
-       words and deliberately rejects quoting, expansions, and mid-word
-       suffixes rather than flattening their provenance.
+       words and deliberately rejects quoting and expansions rather than
+       flattening their provenance. Same-word concrete suffixes are preserved:
+       `bind -m em|-standard` offers only the prefix `emacs`, after the real
+       typed parser accepts the rejoined `emacs-standard`; incompatible
+       suffixes produce no completion.
 3. [ ] Cut those two builtins to execute the typed invocation returned by that
        same exact parser, then delete their generated `CommandSyntax` copies.
 4. [ ] Adapt one simple uutils parser/executor split (`cat`), then one embedded

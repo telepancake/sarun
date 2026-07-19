@@ -5,23 +5,25 @@ Subject: [PATCH] Expose typed builtin parser observations at edit tears
 
 ---
 diff --git a/src/builtins.rs b/src/builtins.rs
-index 8d79004..bc990b6 100644
+index 8d79004..a018e8e 100644
 --- a/src/builtins.rs
 +++ b/src/builtins.rs
-@@ -33,6 +33,64 @@ pub type CommandContentFunc =
+@@ -33,6 +33,66 @@ pub type CommandContentFunc =
  /// is used to parse a builtin's arguments.
  pub type CommandDefinitionFunc = fn() -> clap::Command;
 
 +/// Input to a declarative builtin's parser probe.
 +///
-+/// `before` includes argv[0]. `surface` is the physical token containing the
-+/// edit tear (and is empty for a tear between tokens); `after` is retained so
-+/// an interactive parse can prove that a completion is compatible with the
-+/// concrete suffix instead of parsing only a prefix.
++/// `before` includes argv[0]. `prefix` and `suffix` are the cooked portions of
++/// the same argv word on either side of the edit tear (both are empty for a
++/// tear between words). `after` contains only later argv words. Every parse
++/// submission rejoins a proposed prefix with `suffix`, so completion evidence
++/// is compatible with the concrete remainder of the word.
 +#[derive(Clone, Debug, Default, PartialEq, Eq)]
 +pub struct CommandProbeInput {
 +    pub before: Vec<String>,
-+    pub surface: String,
++    pub prefix: String,
++    pub suffix: String,
 +    pub after: Vec<String>,
 +}
 +
@@ -73,7 +75,7 @@ index 8d79004..bc990b6 100644
  /// Trait implemented by built-in shell commands.
  pub trait Command: clap::Parser {
      /// The error type returned by the command.
-@@ -164,6 +222,9 @@ pub struct Registration<SE: extensions::ShellExtensions> {
+@@ -164,6 +224,9 @@ pub struct Registration<SE: extensions::ShellExtensions> {
      /// builtin is implemented through [`Command`].
      pub definition_func: Option<CommandDefinitionFunc>,
 
@@ -83,7 +85,7 @@ index 8d79004..bc990b6 100644
      /// Has this registration been disabled?
      pub disabled: bool,
 
-@@ -402,6 +463,7 @@ pub fn simple_builtin<B: SimpleCommand + Send + Sync, SE: extensions::ShellExten
+@@ -402,6 +465,7 @@ pub fn simple_builtin<B: SimpleCommand + Send + Sync, SE: extensions::ShellExten
          execute_func: exec_simple_builtin::<B, SE>,
          content_func: B::get_content,
          definition_func: None,
@@ -91,7 +93,7 @@ index 8d79004..bc990b6 100644
          disabled: false,
          special_builtin: false,
          external_command: false,
-@@ -416,6 +478,7 @@ pub fn builtin<B: Command + Send + Sync, SE: extensions::ShellExtensions>() -> R
+@@ -416,6 +480,7 @@ pub fn builtin<B: Command + Send + Sync, SE: extensions::ShellExtensions>() -> R
          execute_func: exec_builtin::<B, SE>,
          content_func: get_builtin_content::<B>,
          definition_func: Some(command_definition::<B>),
@@ -99,7 +101,7 @@ index 8d79004..bc990b6 100644
          disabled: false,
          special_builtin: false,
          external_command: false,
-@@ -432,6 +495,9 @@ pub fn decl_builtin<B: DeclarationCommand + Send + Sync, SE: extensions::ShellEx
+@@ -432,6 +497,9 @@ pub fn decl_builtin<B: DeclarationCommand + Send + Sync, SE: extensions::ShellEx
          execute_func: exec_declaration_builtin::<B, SE>,
          content_func: get_builtin_content::<B>,
          definition_func: Some(command_definition::<B>),
@@ -109,7 +111,7 @@ index 8d79004..bc990b6 100644
          disabled: false,
          special_builtin: false,
          external_command: false,
-@@ -454,6 +520,7 @@ pub fn raw_arg_builtin<
+@@ -454,6 +522,7 @@ pub fn raw_arg_builtin<
          execute_func: exec_raw_arg_builtin::<B, SE>,
          content_func: get_builtin_content::<B>,
          definition_func: Some(command_definition::<B>),
@@ -117,7 +119,7 @@ index 8d79004..bc990b6 100644
          disabled: false,
          special_builtin: false,
          external_command: false,
-@@ -465,6 +532,214 @@ fn command_definition<T: Command>() -> clap::Command {
+@@ -465,6 +534,248 @@ fn command_definition<T: Command>() -> clap::Command {
      T::command()
  }
 
@@ -182,7 +184,12 @@ index 8d79004..bc990b6 100644
 +    expected
 +}
 +
-+fn incomplete_error(error: &clap::Error, surface: &str) -> bool {
++fn candidate_prefix<'a>(value: &'a str, prefix: &str, suffix: &str) -> Option<&'a str> {
++    let candidate = value.strip_suffix(suffix)?;
++    candidate.starts_with(prefix).then_some(candidate)
++}
++
++fn incomplete_error(error: &clap::Error, prefix: &str, suffix: &str) -> bool {
 +    use clap::error::{ContextKind, ErrorKind};
 +
 +    match error.kind() {
@@ -212,20 +219,24 @@ index 8d79004..bc990b6 100644
 +                .get(ContextKind::ValidValue)
 +                .map(context_strings)
 +                .unwrap_or_default();
++            let surface = format!("{prefix}{suffix}");
 +            invalid.iter().any(|value| value.is_empty())
 +                || invalid.iter().any(|value| {
-+                    value == surface && valid.iter().any(|candidate| candidate.starts_with(surface))
++                    value == &surface
++                        && valid
++                            .iter()
++                            .any(|candidate| candidate_prefix(candidate, prefix, suffix).is_some())
 +                })
 +        }
 +        _ => false,
 +    }
 +}
 +
-+fn argv_with_surface(input: &CommandProbeInput, surface: Option<&str>) -> Vec<String> {
++fn argv_with_prefix(input: &CommandProbeInput, prefix: Option<&str>) -> Vec<String> {
 +    let mut argv = Vec::with_capacity(input.before.len() + input.after.len() + 1);
 +    argv.extend(input.before.iter().cloned());
-+    if let Some(surface) = surface.filter(|surface| !surface.is_empty()) {
-+        argv.push(surface.to_owned());
++    if let Some(prefix) = prefix.filter(|prefix| !prefix.is_empty() || !input.suffix.is_empty()) {
++        argv.push(format!("{prefix}{}", input.suffix));
 +    }
 +    argv.extend(input.after.iter().cloned());
 +    argv
@@ -233,15 +244,19 @@ index 8d79004..bc990b6 100644
 +
 +fn typed_parse_status<T: Command>(
 +    input: &CommandProbeInput,
-+    surface: Option<&str>,
++    prefix: Option<&str>,
 +    command: &clap::Command,
 +) -> (CommandParseStatus, Vec<CommandArgumentEvidence>) {
-+    match T::new(argv_with_surface(input, surface)) {
++    match T::new(argv_with_prefix(input, prefix)) {
 +        Ok(_) => (CommandParseStatus::Complete, Vec::new()),
-+        Err(error) if incomplete_error(&error, surface.unwrap_or_default()) => (
-+            CommandParseStatus::Incomplete,
-+            expected_arguments(command, &error),
-+        ),
++        Err(error)
++            if incomplete_error(&error, prefix.unwrap_or_default(), input.suffix.as_str()) =>
++        {
++            (
++                CommandParseStatus::Incomplete,
++                expected_arguments(command, &error),
++            )
++        }
 +        Err(error) => (CommandParseStatus::Rejected(error.kind()), Vec::new()),
 +    }
 +}
@@ -249,12 +264,29 @@ index 8d79004..bc990b6 100644
 +fn command_probe<T: Command>(input: CommandProbeInput) -> CommandParseObservation {
 +    let mut command = T::command();
 +    command.build();
-+    let current_surface = (!input.surface.is_empty()).then_some(input.surface.as_str());
-+    let current_argv = argv_with_surface(&input, current_surface);
-+    let (status, expected) = typed_parse_status::<T>(&input, current_surface, &command);
++    let current_prefix =
++        (!input.prefix.is_empty() || !input.suffix.is_empty()).then_some(input.prefix.as_str());
++    let current_argv = argv_with_prefix(&input, current_prefix);
++    let (status, mut expected) = typed_parse_status::<T>(&input, current_prefix, &command);
++
++    for argument in &mut expected {
++        argument.possible_values = argument
++            .possible_values
++            .iter()
++            .filter_map(|value| candidate_prefix(value, &input.prefix, &input.suffix))
++            .filter(|candidate| *candidate != input.prefix)
++            .filter(|candidate| {
++                matches!(
++                    typed_parse_status::<T>(&input, Some(candidate), &command).0,
++                    CommandParseStatus::Complete | CommandParseStatus::Incomplete
++                )
++            })
++            .map(ToOwned::to_owned)
++            .collect();
++    }
 +
 +    let tear_index = input.before.len();
-+    let tear_arguments = if current_surface.is_some() && status == CommandParseStatus::Complete {
++    let tear_arguments = if current_prefix.is_some() && status == CommandParseStatus::Complete {
 +        let match_command = T::command();
 +        match match_command.try_get_matches_from(current_argv) {
 +            Ok(matches) => command
@@ -299,17 +331,21 @@ index 8d79004..bc990b6 100644
 +                    .map(|long| format!("--{long}")),
 +            );
 +            for literal in spellings {
-+                if !literal.starts_with(&input.surface) || literal == input.surface {
++                let Some(candidate) = candidate_prefix(&literal, &input.prefix, &input.suffix)
++                else {
++                    continue;
++                };
++                if candidate == input.prefix {
 +                    continue;
 +                }
 +                let (candidate_status, candidate_expected) =
-+                    typed_parse_status::<T>(&input, Some(&literal), &command);
++                    typed_parse_status::<T>(&input, Some(candidate), &command);
 +                if matches!(
 +                    candidate_status,
 +                    CommandParseStatus::Complete | CommandParseStatus::Incomplete
 +                ) {
 +                    continuations.push(CommandLiteralContinuation {
-+                        literal,
++                        literal: candidate.to_owned(),
 +                        argument: evidence.clone(),
 +                        expected: candidate_expected,
 +                    });

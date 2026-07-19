@@ -4,8 +4,8 @@
 //! `Command::new` parser can supply ordinary relation evidence without first
 //! copying its grammar into `CommandSyntax`. The current input projection only
 //! accepts already-cooked, whitespace-separated words with a tear at a word
-//! boundary. Quoting, expansion provenance, mid-word suffixes, and contextual
-//! value providers require the richer argv/continuation protocol recorded in
+//! boundary. Quoting, expansion provenance, and contextual value providers
+//! require the richer argv/continuation protocol recorded in
 //! `BRUSH-RELATION-MIGRATION.md`; those shapes fail closed here.
 
 use brush_core::builtins::{
@@ -85,7 +85,8 @@ impl Adapter for BuiltinProbeAdapter {
             SourceMode::Exact => {
                 let observation = probe(CommandProbeInput {
                     before: words.into_iter().map(|word| word.text).collect(),
-                    surface: String::new(),
+                    prefix: String::new(),
+                    suffix: String::new(),
                     after: Vec::new(),
                 });
                 exact_reply(request, observation)
@@ -237,7 +238,8 @@ fn probe_at_tear(
         return Some(ProbeAtTear {
             input: CommandProbeInput {
                 before: vec![command.text.clone()],
-                surface: String::new(),
+                prefix: String::new(),
+                suffix: String::new(),
                 after: Vec::new(),
             },
             replace: physical_span.unwrap_or(ByteSpan {
@@ -254,10 +256,7 @@ fn probe_at_tear(
         .enumerate()
         .find(|(_, word)| word.span.start <= cursor && cursor <= word.span.end)
     {
-        // The current token may have a parsed prefix, but a concrete suffix
-        // needs the future rich token representation rather than being folded
-        // into `after` as a different argv element.
-        if cursor != word.span.end || index == 0 {
+        if index == 0 {
             return None;
         }
         return Some(ProbeAtTear {
@@ -266,13 +265,17 @@ fn probe_at_tear(
                     .iter()
                     .map(|word| word.text.clone())
                     .collect(),
-                surface: word.text.clone(),
+                prefix: text[word.span.start..cursor].into(),
+                suffix: text[cursor..word.span.end].into(),
                 after: words[index + 1..]
                     .iter()
                     .map(|word| word.text.clone())
                     .collect(),
             },
-            replace: physical_span.unwrap_or(word.span),
+            replace: physical_span.unwrap_or(ByteSpan {
+                start: word.span.start,
+                end: cursor,
+            }),
             needs_separator: false,
             edit_id: edit_id.into(),
         });
@@ -291,7 +294,8 @@ fn probe_at_tear(
     Some(ProbeAtTear {
         input: CommandProbeInput {
             before,
-            surface: String::new(),
+            prefix: String::new(),
+            suffix: String::new(),
             after,
         },
         replace: physical_span.unwrap_or(ByteSpan {
@@ -348,7 +352,7 @@ fn assist_reply(
     arguments.extend(observation.tear_arguments);
     for argument in arguments {
         for value in &argument.possible_values {
-            if value.starts_with(&at_tear.input.surface) && value != &at_tear.input.surface {
+            if value.starts_with(&at_tear.input.prefix) && value != &at_tear.input.prefix {
                 candidates.push((
                     value.clone(),
                     vec![clap_alternative(command_name, &argument, value)],
@@ -372,7 +376,7 @@ fn assist_reply(
         };
         for entry in entries {
             for name in &entry.names {
-                if name.starts_with(&at_tear.input.surface) && name != &at_tear.input.surface {
+                if name.starts_with(&at_tear.input.prefix) && name != &at_tear.input.prefix {
                     candidates.push((
                         name.clone(),
                         vec![context_alternative(domain, &entry.identity)],
@@ -506,7 +510,7 @@ fn argument_context_query(
             domain: RelationValue::Atom(domain.into()),
             selector: RelationValue::Compound(
                 "prefix".into(),
-                vec![RelationValue::String(at_tear.input.surface.clone())],
+                vec![RelationValue::String(at_tear.input.prefix.clone())],
             ),
         },
     }
@@ -667,6 +671,33 @@ mod tests {
     }
 
     #[test]
+    fn bind_finite_value_completion_preserves_and_proves_same_word_suffix() {
+        let source = "bind -m em-standard";
+        let cursor = "bind -m em".len();
+        let reply = BuiltinProbeAdapter
+            .transform(&request(source, assist(cursor), &["status", "completions"]))
+            .unwrap();
+        assert_eq!(completion_texts(&reply), ["emacs"]);
+
+        let incompatible = "bind -m em-not-a-keymap";
+        let reply = BuiltinProbeAdapter
+            .transform(&request(
+                incompatible,
+                assist(cursor),
+                &["status", "completions"],
+            ))
+            .unwrap();
+        assert!(reply.solutions.is_empty());
+        assert_eq!(
+            reply.diagnostics,
+            [RelationValue::Compound(
+                "diagnostic".into(),
+                vec![RelationValue::Atom("parser_rejected".into())],
+            )]
+        );
+    }
+
+    #[test]
     fn exact_bind_uses_the_same_typed_parser() {
         let reply = BuiltinProbeAdapter
             .transform(&request(
@@ -704,11 +735,9 @@ mod tests {
         );
         request
             .observations
-            .push(crate::prolog::ContextObservation {
+            .push(crate::prolog::ContextDependencyKey {
                 id: graph[0].id.clone(),
                 query: graph[0].query.clone(),
-                provider: RelationValue::Atom("fixture_filesystem".into()),
-                revision: RelationValue::Integer(7),
                 outcome: Some(crate::prolog::ContextResult::All(vec![
                     crate::prolog::ContextEntry {
                         domain: RelationValue::Atom("filesystem_path".into()),

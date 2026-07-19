@@ -977,9 +977,8 @@ run_test(registered_relation_replays_with_explicit_context_observations) :-
     ScopedPathObservation = observed(
         ScopedPathId, PathQuery, source(filesystem, revision(9)),
         some(all([PathEntry]))),
-    AdapterPathObservation = observed(
-        PathId, PathQuery, source(filesystem, revision(9)),
-        some(all([PathEntry]))),
+    AdapterPathObservation = dependency(
+        PathId, PathQuery, some(all([PathEntry]))),
     Request1 = relation_request(Given, Wanted, [AdapterPathObservation],
                                 Limits),
     HostQuery1 = ask(one, registered_relation(Handle), where(Request1)),

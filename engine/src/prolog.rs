@@ -2386,10 +2386,10 @@ fn context_graph_value(graph: &[ContextQueryNode]) -> Result<RelationValue, Stri
         .map(relation_list)
 }
 
-pub(crate) fn context_observation_from_value(
+pub(crate) fn context_dependency_key_from_value(
     value: &RelationValue,
-) -> Result<ContextObservation, String> {
-    decode_context_observation(&parsed_relation_value(value))
+) -> Result<ContextDependencyKey, String> {
+    decode_context_dependency_key(&parsed_relation_value(value))
 }
 
 pub(crate) fn context_query_nodes_from_values(
