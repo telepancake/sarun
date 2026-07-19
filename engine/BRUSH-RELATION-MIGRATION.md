@@ -286,6 +286,16 @@ Implementation order:
        `bind -m em|-standard` offers only the prefix `emacs`, after the real
        typed parser accepts the rejoined `emacs-standard`; incompatible
        suffixes produce no completion.
+   [x] Remove the engine's hard-coded nested-grammar `text_source` call shape.
+       An AST/state application now supplies a unique list of named relation
+       bindings, with `state_text_source(Expression)` as one generic
+       materializer. Application bindings explicitly replace inherited names;
+       the engine still knows neither Brush nor a command/parser kind. This is
+       the API needed for the next `argv_source` materializer rather than an
+       additional parsing mode.
+   [ ] Capture `command_words` as separate spanned symbolic command/argument
+       fields, make quote/escape cooking grammar-owned, and replace the
+       temporary flat source binding with that `argv_source`.
 3. [ ] Cut those two builtins to execute the typed invocation returned by that
        same exact parser, then delete their generated `CommandSyntax` copies.
 4. [ ] Adapt one simple uutils parser/executor split (`cat`), then one embedded

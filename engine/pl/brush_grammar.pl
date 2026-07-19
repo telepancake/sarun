@@ -36,7 +36,8 @@ brush_state_rules([
                [capture(source, node_symbolic_text(TextRules))],
                before([]),
                after([apply(node_identity, given_grammar(builtin_grammar),
-                            slot(source))]))
+                            [binding(source,
+                                     state_text_source(slot(source)))])]))
 ]) :-
     brush_text_projection_rules(TextRules).
 

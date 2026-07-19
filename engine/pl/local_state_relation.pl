@@ -267,9 +267,9 @@ state_step(define(Domain, Name, Value, Lifetime, Policy),
     definition_delta(Lifetime, Domain, Name, Value, Delta0, Delta).
 state_step(constraint(Constraint), State, State, [], [], [], []) :-
     ground(Constraint).
-state_step(apply(Id, Grammar, SymbolicSource), State, State, [], [], [],
-           [application(Id, Grammar, SymbolicSource, State)]) :-
-    ground(Id), ground(Grammar), ground(SymbolicSource).
+state_step(apply(Id, Grammar, Given), State, State, [], [], [],
+           [application(Id, Grammar, Given, State)]) :-
+    ground(Id), ground(Grammar), ground(Given).
 state_step(use(Id, Domain, Name), State, State,
            [resolved(Id, local(Binding))], [], [], []) :-
     ground(Id), ground(Domain), ground(Name),

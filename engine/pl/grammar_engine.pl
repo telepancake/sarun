@@ -400,12 +400,17 @@ run_state_applications([Application|Applications], Given, Observations, Limits,
     append(FirstDiagnostics, RestDiagnostics, Diagnostics).
 
 state_application_reply(
-    application(Id, Grammar, SymbolicSource, State), Given, Observations, Limits,
+    application(Id, Grammar, ApplicationTemplates, State), Given, Observations,
+    Limits,
     Reply) :-
-    symbolic_text_source(SymbolicSource, State, state_application(Id), Source),
-    bindings_except(source, Given, ApplicationGiven0),
-    ApplicationGiven = [binding(source, Source)|ApplicationGiven0],
     Key = state_application(Id),
+    application_binding_names(ApplicationTemplates, ApplicationNames),
+    proper_atom_names(ApplicationNames),
+    all_unique_terms(ApplicationNames),
+    materialize_application_bindings(ApplicationTemplates, State, Key,
+                                     ApplicationBindings),
+    bindings_without_names(Given, ApplicationNames, InheritedGiven),
+    merge_bindings(InheritedGiven, ApplicationBindings, ApplicationGiven),
     scoped_observations(Key, Observations, ApplicationObservations),
     ( transform_relation(Grammar, ApplicationGiven, [completions],
                          ApplicationObservations, Limits, InnerReply)
@@ -415,6 +420,32 @@ state_application_reply(
     !.
 state_application_reply(_, _, _, _, reply([], [], [], [])).
 
+application_binding_names([], []).
+application_binding_names([binding(Name, _)|Bindings], [Name|Names]) :-
+    application_binding_names(Bindings, Names).
+
+materialize_application_bindings([], _, _, []).
+materialize_application_bindings(
+    [binding(Name, state_text_source(Expression))|Bindings], State, Origin,
+    [binding(Name, Source)|Materialized]) :-
+    atom(Name),
+    symbolic_text_source(Expression, State, Origin, Source),
+    materialize_application_bindings(Bindings, State, Origin, Materialized).
+
+materialize_application_bindings(
+    [binding(Name, Value)|Bindings], State, Origin,
+    [binding(Name, Value)|Materialized]) :-
+    atom(Name), ground(Value),
+    materialize_application_bindings(Bindings, State, Origin, Materialized).
+
+bindings_without_names([], _, []).
+bindings_without_names([binding(Name, _)|Bindings], Names, Rest) :-
+    member_term(Name, Names),
+    !,
+    bindings_without_names(Bindings, Names, Rest).
+bindings_without_names([Binding|Bindings], Names, [Binding|Rest]) :-
+    bindings_without_names(Bindings, Names, Rest).
+
 reply_completion_pairs(reply(Solutions, _, _, _), Pairs) :-
     findall(Pair,
             ( candidate_member(solution(Bindings, _), Solutions),
@@ -423,12 +454,6 @@ reply_completion_pairs(reply(Solutions, _, _, _), Pairs) :-
               candidate_member(Pair, CompletionPairs)
             ),
             Pairs).
-
-bindings_except(_, [], []).
-bindings_except(Name, [binding(Name, _)|Bindings], Rest) :- !,
-    bindings_except(Name, Bindings, Rest).
-bindings_except(Name, [Binding|Bindings], [Binding|Rest]) :-
-    bindings_except(Name, Bindings, Rest).
 
 union_completion_reply(
     reply(Solutions0, Queries, Dependencies, Diagnostics), AdditionalName,
