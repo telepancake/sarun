@@ -71,7 +71,7 @@ impl Adapter for BuiltinProbeAdapter {
     fn revision(&self) -> RelationValue {
         RelationValue::Compound(
             "builtin_parser_revision".into(),
-            vec![RelationValue::Integer(3)],
+            vec![RelationValue::Integer(4)],
         )
     }
 
@@ -111,7 +111,7 @@ impl Adapter for BuiltinProbeAdapter {
             [(word_index, tear)] => {
                 let at_tear = probe_from_symbolic_tear(&words, *word_index, tear)?;
                 let observation = probe(at_tear.input.clone());
-                assist_reply(request, &command_name, at_tear, observation)
+                assist_reply(request, &command_name, probe, at_tear, observation)
             }
             _ => Ok(no_solution()),
         }
@@ -462,6 +462,7 @@ fn exact_reply(
 fn assist_reply(
     request: &Request,
     command_name: &str,
+    probe: brush_core::builtins::BuiltinParserFunc,
     at_tear: ProbeAtTear,
     observation: BuiltinParserObservation,
 ) -> Result<RelationReply, String> {
@@ -512,7 +513,7 @@ fn assist_reply(
     arguments.extend(observation.tear_arguments);
     for argument in arguments {
         for value in &argument.finite_values {
-            if value.starts_with(&at_tear.input.prefix) && value != &at_tear.input.prefix {
+            if value.starts_with(&at_tear.input.prefix) {
                 candidates.push((
                     value.clone(),
                     vec![parser_alternative(command_name, &argument, value)],
@@ -536,10 +537,18 @@ fn assist_reply(
         };
         for entry in entries {
             for name in &entry.names {
-                if name.starts_with(&at_tear.input.prefix) && name != &at_tear.input.prefix {
+                if !name.starts_with(&at_tear.input.prefix) {
+                    continue;
+                }
+                if let Some(matched_argument) =
+                    replay_context_candidate(probe, &at_tear, &argument, name)
+                {
                     candidates.push((
                         name.clone(),
-                        vec![context_alternative(domain, &entry.identity)],
+                        vec![
+                            parser_alternative(command_name, &matched_argument, name),
+                            context_alternative(domain, &entry.identity),
+                        ],
                     ));
                 }
             }
@@ -575,6 +584,44 @@ fn assist_reply(
     )?;
     reply.context_queries = context_queries;
     Ok(reply)
+}
+
+/// Submit a contextual name to the same parser producer which requested its
+/// domain. A viable command is not sufficient: the producer must report that
+/// the concrete tear word was consumed as the same semantic argument. This is
+/// what prevents a path named like an option or operator from being emitted
+/// merely because it forms some other valid syntax.
+///
+/// `candidate` is the complete cooked prefix through the tear, matching the
+/// contract used by `completion_insertion`. The concrete word seen by the
+/// producer is therefore `candidate + suffix`; `before` and `after` remain
+/// unchanged.
+fn replay_context_candidate(
+    probe: brush_core::builtins::BuiltinParserFunc,
+    at_tear: &ProbeAtTear,
+    requested_argument: &ParserArgumentEvidence,
+    candidate: &str,
+) -> Option<ParserArgumentEvidence> {
+    let mut input = at_tear.input.clone();
+    input.prefix = candidate.into();
+    let replay = probe(input);
+    if !matches!(
+        replay.status,
+        BuiltinParseStatus::Complete | BuiltinParseStatus::Incomplete
+    ) {
+        return None;
+    }
+    replay
+        .tear_arguments
+        .into_iter()
+        .find(|matched| same_argument_role(matched, requested_argument))
+}
+
+fn same_argument_role(
+    matched: &ParserArgumentEvidence,
+    requested: &ParserArgumentEvidence,
+) -> bool {
+    matched.id == requested.id && matched.value_domain == requested.value_domain
 }
 
 fn completion_insertion(candidate: &str, at_tear: &ProbeAtTear) -> Option<String> {
@@ -875,6 +922,65 @@ mod tests {
         &alternatives[0]
     }
 
+    fn parser_argument(id: &str, domain: Option<&str>) -> ParserArgumentEvidence {
+        ParserArgumentEvidence {
+            id: id.into(),
+            display: id.into(),
+            help: None,
+            value_domain: domain.map(str::to_owned),
+            finite_values: Vec::new(),
+        }
+    }
+
+    fn syntax_sensitive_parser(input: BuiltinParserInput) -> BuiltinParserObservation {
+        if input.before != ["fixture", "head"] || input.suffix != ".txt" || input.after != ["tail"]
+        {
+            return BuiltinParserObservation {
+                status: BuiltinParseStatus::Unsupported,
+                tear_arguments: Vec::new(),
+                expected: Vec::new(),
+                literal_continuations: Vec::new(),
+            };
+        }
+        let argument = if input.prefix == "--mode" {
+            parser_argument("mode_option", None)
+        } else {
+            parser_argument("path", Some("filesystem_path"))
+        };
+        BuiltinParserObservation {
+            status: BuiltinParseStatus::Complete,
+            tear_arguments: vec![argument],
+            expected: Vec::new(),
+            literal_continuations: Vec::new(),
+        }
+    }
+
+    fn observed_context_request(
+        at_tear: &ProbeAtTear,
+        argument: &ParserArgumentEvidence,
+        names: &[&str],
+    ) -> Request {
+        let domain = argument.value_domain.as_deref().unwrap();
+        let query = argument_context_query("fixture", argument, at_tear, domain);
+        let mut request = request(argv(vec![literal_word(0, "fixture")]), &["completions"]);
+        request
+            .observations
+            .push(crate::prolog::ContextDependencyKey {
+                id: query.id,
+                query: query.query,
+                outcome: Some(crate::prolog::ContextResult::All(vec![
+                    crate::prolog::ContextEntry {
+                        domain: RelationValue::Atom(domain.into()),
+                        identity: RelationValue::Atom("entry".into()),
+                        names: names.iter().map(|name| (*name).into()).collect(),
+                        value: RelationValue::Atom("value".into()),
+                        attributes: Vec::new(),
+                    },
+                ])),
+            });
+        request
+    }
+
     #[test]
     fn bind_finite_values_come_from_runtime_parser_probe() {
         let argv_input = argv(vec![
@@ -1046,11 +1152,125 @@ mod tests {
                         ),
                         attributes: vec![RelationValue::Atom("file".into())],
                     },
+                    crate::prolog::ContextEntry {
+                        domain: RelationValue::Atom("filesystem_path".into()),
+                        identity: RelationValue::String("special-help-syntax".into()),
+                        names: vec!["--help".into()],
+                        value: RelationValue::Compound(
+                            "filesystem_path".into(),
+                            vec![RelationValue::String("--help".into())],
+                        ),
+                        attributes: vec![RelationValue::Atom("file".into())],
+                    },
                 ])),
             });
         let resolved = BuiltinProbeAdapter.transform(&request).unwrap();
         assert!(resolved.context_queries.is_empty());
         assert_eq!(completion_texts(&resolved), ["./test1.sh"]);
+    }
+
+    #[test]
+    fn context_candidates_must_replay_as_the_requested_parser_argument() {
+        let at_tear = ProbeAtTear {
+            input: BuiltinParserInput {
+                tear: true,
+                before: vec!["fixture".into(), "head".into()],
+                prefix: String::new(),
+                suffix: ".txt".into(),
+                after: vec!["tail".into()],
+            },
+            replace: ByteSpan { start: 8, end: 8 },
+            edit_id: "edit".into(),
+            tear_surface_len: 0,
+            command_gap: false,
+        };
+        let initial = syntax_sensitive_parser(at_tear.input.clone());
+        let requested = initial.tear_arguments[0].clone();
+        let request = observed_context_request(&at_tear, &requested, &["ordinary", "--mode"]);
+        let reply = assist_reply(
+            &request,
+            "fixture",
+            syntax_sensitive_parser,
+            at_tear,
+            initial,
+        )
+        .unwrap();
+
+        // Both candidates make the producer accept the invocation, but
+        // `--mode` is consumed as option syntax rather than the requested path.
+        assert_eq!(completion_texts(&reply), ["ordinary"]);
+        let RelationValue::List(completions) = &reply.solutions[0].bindings[0].value else {
+            panic!("completion binding must be a list")
+        };
+        let RelationValue::Compound(_, fields) = &completions[0] else {
+            panic!("completion must be a compound")
+        };
+        let RelationValue::List(alternatives) = &fields[2] else {
+            panic!("completion alternatives must be a list")
+        };
+        assert_eq!(
+            alternatives,
+            &[
+                parser_alternative("fixture", &requested, "ordinary"),
+                context_alternative("filesystem_path", &RelationValue::Atom("entry".into())),
+            ]
+        );
+    }
+
+    #[test]
+    fn selected_context_value_is_preserved_when_the_tear_replaces_its_surface() {
+        let at_tear = ProbeAtTear {
+            input: BuiltinParserInput {
+                tear: true,
+                before: vec!["fixture".into(), "head".into()],
+                prefix: "ordinary".into(),
+                suffix: ".txt".into(),
+                after: vec!["tail".into()],
+            },
+            replace: ByteSpan { start: 8, end: 16 },
+            edit_id: "edit".into(),
+            tear_surface_len: "ordinary".len(),
+            command_gap: false,
+        };
+        let initial = syntax_sensitive_parser(at_tear.input.clone());
+        let requested = initial.tear_arguments[0].clone();
+        let request = observed_context_request(&at_tear, &requested, &["ordinary"]);
+        let reply = assist_reply(
+            &request,
+            "fixture",
+            syntax_sensitive_parser,
+            at_tear,
+            initial,
+        )
+        .unwrap();
+
+        assert_eq!(completion_texts(&reply), ["ordinary"]);
+
+        let cursor_tear = ProbeAtTear {
+            input: BuiltinParserInput {
+                tear: true,
+                before: vec!["fixture".into(), "head".into()],
+                prefix: "ordinary".into(),
+                suffix: ".txt".into(),
+                after: vec!["tail".into()],
+            },
+            replace: ByteSpan { start: 16, end: 16 },
+            edit_id: "edit".into(),
+            tear_surface_len: 0,
+            command_gap: false,
+        };
+        let initial = syntax_sensitive_parser(cursor_tear.input.clone());
+        let requested = initial.tear_arguments[0].clone();
+        let request = observed_context_request(&cursor_tear, &requested, &["ordinary"]);
+        let reply = assist_reply(
+            &request,
+            "fixture",
+            syntax_sensitive_parser,
+            cursor_tear,
+            initial,
+        )
+        .unwrap();
+        assert!(completion_texts(&reply).is_empty());
     }
 
     #[test]

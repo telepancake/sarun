@@ -377,6 +377,12 @@ Implementation order:
        this slice because every filename is syntactically admissible; generic
        context-candidate replay remains required before domains whose returned
        strings can alter parser structure are exposed.
+   [x] Replay every context-provider name through the same registered parser
+       before emitting it. Acceptance alone is insufficient: the replay must
+       consume the tear as the same semantic argument identity and domain, so
+       a path named like an option cannot change syntax and masquerade as a
+       value. Completion evidence retains both parser-match and context-entry
+       identities, and concrete suffix/later argv constraints are preserved.
    [ ] Move Find's parse-time effects behind explicit environment operations:
        output file creation, `-files0-from`, stat/time references, NSS
        user/group resolution, and clock access. Assist emits typed
