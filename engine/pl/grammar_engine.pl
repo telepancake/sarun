@@ -96,6 +96,25 @@ transform_relation(given_grammar(Name), Given, Wanted, Observations, Limits,
     resolve_grammar(GrammarReference, Grammar),
     transform_relation(Grammar, Given, Wanted, Observations, Limits, Reply).
 
+% A host-registered relation is invoked through the ordinary explicit context
+% protocol.  The engine knows only its opaque handle and the standard relation
+% envelope; it has no parser kind, command name, or client-specific callback.
+% The host returns one immutable, revisioned `result(Reply)` entry.  This first
+% executable slice deliberately accepts context-free replies only.  Adapters
+% which themselves suspend on context will extend this same data protocol with
+% continuation queries rather than performing hidden provider access.
+transform_relation(registered_relation(Handle), Given, Wanted, Observations,
+                   Limits, Reply) :-
+    atom(Handle),
+    Request = relation_request(Given, Wanted, Limits),
+    Id = registered_relation_call(Handle),
+    Query = ask(one, registered_relation(Handle), where(Request)),
+    Graph = [query(Id, Query)],
+    project_observations(Graph, Observations, AdapterObservations),
+    stage_context(Graph, AdapterObservations, Ready, Dependencies),
+    registered_relation_reply(Handle, Id, Query, AdapterObservations, Ready,
+                              Dependencies, Wanted, Reply).
+
 transform_relation(ast_state_grammar(Rules), Given, Wanted, Observations,
                    Limits,
                    reply(Solutions, ReadyQueries,
@@ -278,6 +297,35 @@ transform_relation(
     project_highlights(Evidence, Highlights),
     Available = [binding(highlights, Highlights)],
     requested_bindings(Wanted, Available, Bindings).
+
+registered_relation_reply(_, _, _, [], Ready, Dependencies, _,
+                          reply([], Ready, Dependencies, [])) :- !.
+registered_relation_reply(
+    _, Id, Query,
+    [observed(Id, Query, _,
+              some(one(entry(_, _, _, result(AdapterReply), _))))],
+    [], Dependencies, Wanted,
+    reply(Solutions, [], Dependencies, Diagnostics)) :-
+    AdapterReply = reply(Solutions, [], [], Diagnostics),
+    valid_registered_solutions(Solutions, Wanted),
+    proper_ground_list(Diagnostics),
+    !.
+registered_relation_reply(Handle, _, _, [_], [], Dependencies, _,
+                          reply([], [], Dependencies,
+                                [diagnostic(registered_relation_unavailable(
+                                    Handle))])).
+
+valid_registered_solutions([], _).
+valid_registered_solutions([solution(Bindings, Preference)|Solutions], Wanted) :-
+    integer(Preference),
+    ground(Bindings),
+    requested_bindings(Wanted, Bindings, Bindings),
+    valid_registered_solutions(Solutions, Wanted).
+
+proper_ground_list([]).
+proper_ground_list([Value|Values]) :-
+    ground(Value),
+    proper_ground_list(Values).
 
 symbolic_constraints(Given, Constraints) :-
     given_value(constraints, Given, Constraints), !.

@@ -614,7 +614,10 @@ pub(crate) fn execute_context_graph(
                     resolved.id
                 ));
             };
-            let snapshot = context.snapshot(&resolved)?;
+            let snapshot = match crate::relation_adapter::snapshot(&resolved)? {
+                Some(snapshot) => snapshot,
+                None => context.snapshot(&resolved)?,
+            };
             let outcome = prolog.context_query(&resolved.query, &snapshot)?;
             observations.push(crate::prolog::ContextObservation {
                 id: original.id.clone(),

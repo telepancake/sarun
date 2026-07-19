@@ -29,6 +29,7 @@ test_name(raw_text_extras_are_grammar_owned_trivia).
 test_name(raw_text_mode_matrix_rejects_unimplemented_constructs_explicitly).
 test_name(opaque_handle_resolves_install_once_grammar).
 test_name(supplied_grammar_resolves_install_once_handle).
+test_name(registered_relation_uses_explicit_revisioned_query).
 test_name(solution_limit_is_enforced_and_reported).
 test_name(envelope_fails_closed).
 
@@ -914,6 +915,37 @@ run_test(supplied_grammar_resolves_install_once_handle) :-
                                text_source("f,d", exact, foreign_text))]),
                 want([status]), observations([]), Limits),
         reply([solution([binding(status, complete)], 0)], [], [], [])).
+
+run_test(registered_relation_uses_explicit_revisioned_query) :-
+    limits(Limits),
+    Given = [binding(source, text_source("bind -m e", exact, brush_text))],
+    Wanted = [status, completions],
+    Id = registered_relation_call(brush_clap),
+    Request = relation_request(Given, Wanted, Limits),
+    Query = ask(one, registered_relation(brush_clap), where(Request)),
+    transform(
+        request(registered_relation(brush_clap), given(Given), want(Wanted),
+                observations([]), Limits),
+        reply([], [query(Id, Query)], [], [])),
+    Completion = completion(span(8, 9), "emacs-standard",
+                            [alternative(keymap(emacs_standard),
+                                         builtin_argument, brush_clap, 30)],
+                            30, 1),
+    AdapterReply = reply(
+        [solution([binding(status, incomplete(edit)),
+                   binding(completions, [Completion])], 30)],
+        [], [], []),
+    Entry = entry(registered_relation(brush_clap),
+                  parser_result(brush_clap, 1), ["result"],
+                  result(AdapterReply), [Request]),
+    Observation = observed(
+        Id, Query, source(brush_clap, revision(1)), some(one(Entry))),
+    transform(
+        request(registered_relation(brush_clap), given(Given), want(Wanted),
+                observations([Observation]), Limits),
+        reply([solution([binding(status, incomplete(edit)),
+                         binding(completions, [Completion])], 30)],
+              [], [dependency(Id, Query, some(one(Entry)))], [])).
 
 run_test(envelope_fails_closed) :-
     foreign_grammar(Grammar),

@@ -1970,6 +1970,37 @@ fn encode_relation_binding(binding: &RelationBinding) -> Result<RelationValue, S
     ))
 }
 
+pub(crate) fn relation_reply_value(reply: &RelationReply) -> Result<RelationValue, String> {
+    let solutions = reply
+        .solutions
+        .iter()
+        .map(|solution| {
+            Ok(relation_compound(
+                "solution",
+                vec![
+                    relation_list(
+                        solution
+                            .bindings
+                            .iter()
+                            .map(encode_relation_binding)
+                            .collect::<Result<Vec<_>, _>>()?,
+                    ),
+                    RelationValue::Integer(solution.preference),
+                ],
+            ))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(relation_compound(
+        "reply",
+        vec![
+            relation_list(solutions),
+            relation_list(reply.context_queries.clone()),
+            relation_list(reply.dependency_keys.clone()),
+            relation_list(reply.diagnostics.clone()),
+        ],
+    ))
+}
+
 fn bounded_relation_integer(value: usize, field: &str) -> Result<RelationValue, String> {
     i64::try_from(value)
         .map(RelationValue::Integer)
@@ -2303,7 +2334,9 @@ fn context_result_value(result: &ContextResult) -> RelationValue {
     }
 }
 
-fn context_observation_value(observation: &ContextObservation) -> Result<RelationValue, String> {
+pub(crate) fn context_observation_value(
+    observation: &ContextObservation,
+) -> Result<RelationValue, String> {
     let outcome = observation.outcome.as_ref().map_or_else(
         || RelationValue::Atom("none".into()),
         |result| relation_compound("some", vec![context_result_value(result)]),

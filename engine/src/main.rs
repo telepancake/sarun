@@ -66,6 +66,7 @@ mod paths;
 mod prolog;
 mod pty;
 mod reader;
+mod relation_adapter;
 mod review;
 mod rules;
 mod runner;
