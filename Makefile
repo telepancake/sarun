@@ -37,7 +37,8 @@ deps: ## Install system packages (FUSE, bubblewrap; iproute2 + tshark for net te
 # ---- Build ----------------------------------------------------------------
 #
 # The only build: a fully-static musl binary via cargo-zigbuild + ziglang (no
-# apt toolchain). The cargo default target is musl (engine/.cargo/config.toml).
+# apt toolchain). The `engine` target below selects the host-architecture musl
+# target explicitly; Cargo configuration must remain architecture-neutral.
 
 .PHONY: vendor
 vendor: ## Assemble engine/vendor/ from pinned upstreams + vendor-patches/ series

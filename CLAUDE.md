@@ -51,15 +51,15 @@ NOT touch it when working on sarun.
 ## Build the engine
 
 The only build is a fully-static musl binary, via `cargo-zigbuild` + `ziglang`
-from `uv` (no `apt` toolchain). `engine/.cargo/config.toml` sets the musl target
-as the default, but plain `cargo build`/`cargo test` do NOT work — there is no
-`musl-gcc` on this system, so the C deps (rusqlite's bundled SQLite) won't
-compile. Use `cargo zigbuild` (which supplies the compiler/linker) or `make
-engine`.
+from `uv` (no `apt` toolchain). `make engine` selects the host-architecture musl
+target explicitly. Plain `cargo build`/`cargo test` do NOT work: Cargo's native
+GNU target is intentionally unsupported, and there is no `musl-gcc` on this
+system for selecting musl by hand. Use `cargo zigbuild` (which supplies the
+compiler/linker) or `make engine`.
 
 ```
 make engine
-file engine/target/x86_64-unknown-linux-musl/release/sarun   # "statically linked"
+file engine/target/$(uname -m)-unknown-linux-musl/release/sarun  # "statically linked"
 ```
 
 `prototype/test_musl_rs.py` checks the static-linkage guarantee.
