@@ -511,9 +511,20 @@ fn subordinate_range(path: &str, id: u32) -> io::Result<u32> {
 
 fn mapping_arguments(identity: u32, subordinate: u32) -> Vec<String> {
     let mut result = Vec::new();
-    let canonical_before = identity.min(CANONICAL_ID_COUNT);
-    if canonical_before != 0 {
-        result.extend(["0".into(), subordinate.to_string(), canonical_before.to_string()]);
+    if identity >= CANONICAL_ID_COUNT {
+        // Preserve the caller outside the guest's canonical range, then map
+        // that range exactly once.  The former code emitted the full range
+        // both before and after the identity extent, which newuidmap rejects
+        // as overlapping.
+        result.extend([identity.to_string(), identity.to_string(), "1".into()]);
+        result.extend([
+            "0".into(), subordinate.to_string(), CANONICAL_ID_COUNT.to_string(),
+        ]);
+        return result;
+    }
+
+    if identity != 0 {
+        result.extend(["0".into(), subordinate.to_string(), identity.to_string()]);
     }
     result.extend([identity.to_string(), identity.to_string(), "1".into()]);
     if identity < CANONICAL_ID_COUNT - 1 {
@@ -522,10 +533,6 @@ fn mapping_arguments(identity: u32, subordinate: u32) -> Vec<String> {
             start.to_string(),
             (subordinate + start).to_string(),
             (CANONICAL_ID_COUNT - start).to_string(),
-        ]);
-    } else if identity >= CANONICAL_ID_COUNT {
-        result.extend([
-            "0".into(), subordinate.to_string(), CANONICAL_ID_COUNT.to_string(),
         ]);
     }
     result
