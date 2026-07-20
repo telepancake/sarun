@@ -380,7 +380,7 @@ fn create_private_namespace(control: &mut UnixStream) -> io::Result<()> {
     control.write_all(&[REQUEST_ID_MAP])?;
     let mut reply = [0u8; 1];
     control.read_exact(&mut reply)?;
-    let id_map = IdMapKind::from_reply(reply)
+    let id_map = IdMapKind::from_reply(reply[0])
         .ok_or_else(|| io::Error::other("parent rejected broker ID map"))?;
     unsafe { std::env::set_var(ID_MAP_KIND_ENV, id_map.env_value()) };
     if unsafe { libc::unshare(libc::CLONE_NEWNS) } != 0 {

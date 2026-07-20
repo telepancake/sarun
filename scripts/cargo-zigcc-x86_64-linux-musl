@@ -6,8 +6,25 @@ if command -v uv >/dev/null 2>&1; then
     PATH="${uv_tool_dir}/cargo-zigbuild/bin:${HOME}/.local/bin:${PATH}"
   fi
 fi
-if ! command -v zig >/dev/null 2>&1; then
-  echo "sarun cargo build: missing zig; run 'uv tool install --with ziglang cargo-zigbuild' or 'make engine' first" >&2
+cc=
+if command -v python-zig >/dev/null 2>&1; then
+  cc="python-zig cc"
+elif command -v zig >/dev/null 2>&1; then
+  cc="zig cc"
+else
+  echo "sarun cargo build: missing python-zig/zig; run 'uv tool install --with ziglang cargo-zigbuild' or 'make engine' first" >&2
   exit 127
 fi
-exec zig cc -target x86_64-linux-musl "$@"
+set -- -target x86_64-linux-musl "$@"
+# cc-rs passes Clang-style --target=<rust-triple>; Zig's driver wants
+# -target x86_64-linux-musl, supplied above. Drop the duplicate Rust triple.
+out=
+for arg do
+  case "$arg" in
+    --target=x86_64-unknown-linux-musl) ;;
+    *) out="${out}${out:+
+}${arg}" ;;
+  esac
+done
+# shellcheck disable=SC2086
+printf '%s\0' $out | xargs -0 $cc
