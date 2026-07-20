@@ -1,12 +1,19 @@
 # Static musl is the ONLY build. The dynamic glibc path is gone — sarun
 # ships a single static executable. Plain `cargo build` from engine/ uses
-# an explicit host-architecture musl target selected by `make engine`; the
-# linker setup is handled by cargo-zigbuild (plain `cargo build` is rejected
-# by build.rs rather than silently producing a dynamic host binary).
+# the same x86_64 musl target as `make engine`; the Makefile still performs
+# release assembly around this Cargo build (vendor, SWI-Prolog, generated wire,
+# SUD wrappers, licenses, and the repo-root symlink).
 
 [build]
+target = "x86_64-unknown-linux-musl"
 # Keep frame pointers so the `stuck` diagnostic's in-box self-unwind (a
 # frame-pointer walk seeded from the signal ucontext — the only way to get a
 # real stack out of a spinning thread under the sud loader, where external gdb
 # sees `?? ()`) can walk the interrupted stack. Costs one register; worth it.
 rustflags = ["-Cforce-frame-pointers=yes"]
+
+[target.x86_64-unknown-linux-musl]
+linker = "scripts/cargo-zigcc-x86_64-linux-musl"
+
+[env]
+CC_x86_64_unknown_linux_musl = { value = "../scripts/cargo-zigcc-x86_64-linux-musl", relative = true }

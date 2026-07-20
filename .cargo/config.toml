@@ -1,0 +1,14 @@
+# Plain `cargo build` should target the same static-musl engine that `make engine`
+# builds. `make engine` still performs the full release assembly (vendor,
+# generated wire checks, SWI-Prolog build, SUD wrappers, licenses, root symlink),
+# but Cargo's default compilation target must not silently be glibc.
+
+[build]
+target = "x86_64-unknown-linux-musl"
+rustflags = ["-Cforce-frame-pointers=yes"]
+
+[target.x86_64-unknown-linux-musl]
+linker = "scripts/cargo-zigcc-x86_64-linux-musl"
+
+[env]
+CC_x86_64_unknown_linux_musl = { value = "../scripts/cargo-zigcc-x86_64-linux-musl", relative = true }

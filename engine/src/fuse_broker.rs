@@ -28,6 +28,9 @@ const CHILD_COMMAND: &str = "fuse-mount-broker";
 const CONTROL_FD_ENV: &str = "SARUN_FUSE_BROKER_CONTROL_FD";
 const MOUNTPOINT_ENV: &str = "SARUN_FUSE_BROKER_MOUNTPOINT";
 const RUNNER_ENTERED_ENV: &str = "SARUN_FUSE_NAMESPACE_ENTERED";
+const ID_MAP_KIND_ENV: &str = "SARUN_FUSE_ID_MAP";
+const CANONICAL_ID_MAP: &str = "canonical";
+const CALLER_ID_MAP: &str = "caller";
 const REQUEST_NAMESPACES: u8 = b'N';
 const REQUEST_SHUTDOWN: u8 = b'Q';
 const REQUEST_ID_MAP: u8 = b'M';
@@ -145,12 +148,15 @@ impl FuseBroker {
             let _ = child.wait();
             return Err(io::Error::other(format!("FUSE mount broker: {detail}")));
         }
-        if let Err(error) = configure_id_maps(child.id()) {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(io::Error::other(format!("FUSE mount broker: {error}")));
-        }
-        if let Err(error) = parent.write_all(&[REPLY_ID_MAP]) {
+        let id_map = match configure_id_maps(child.id()) {
+            Ok(id_map) => id_map,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(io::Error::other(format!("FUSE mount broker: {error}")));
+            }
+        };
+        if let Err(error) = parent.write_all(&[id_map.reply()]) {
             let _ = child.kill();
             let _ = child.wait();
             return Err(error);
@@ -218,9 +224,13 @@ pub fn enter_runner_namespace() -> io::Result<()> {
     let mut broker = UnixStream::connect(crate::paths::fuse_broker_socket())?;
     broker.write_all(&[REQUEST_NAMESPACES])?;
     let (reply, fds) = receive_fds(&broker, 2)?;
-    if reply != [REPLY_READY] || fds.len() != 2 {
+    if reply.first() != Some(&REPLY_READY) || fds.len() != 2 {
         return Err(io::Error::other("invalid FUSE namespace handoff"));
     }
+    let id_map = reply.get(1).copied()
+        .and_then(IdMapKind::from_reply)
+        .unwrap_or(IdMapKind::Canonical);
+    unsafe { std::env::set_var(ID_MAP_KIND_ENV, id_map.env_value()) };
     let user = &fds[0];
     let mount = &fds[1];
     // Joining the owning user namespace first grants the capability needed to
@@ -230,15 +240,18 @@ pub fn enter_runner_namespace() -> io::Result<()> {
         .map_err(io::Error::from)?;
     nix::sched::setns(mount.as_fd(), nix::sched::CloneFlags::CLONE_NEWNS)
         .map_err(io::Error::from)?;
-    // Establish the machine identity while this process is still
-    // single-threaded. Asking rootless bubblewrap to select uid 0 later would
-    // replace the complete subordinate map with a one-identity namespace.
-    // newgidmap requires setgroups=deny, so the inherited supplementary groups
-    // cannot be rewritten; their unmapped IDs confer no authority here.
-    if unsafe { libc::setresgid(0, 0, 0) } != 0
-        || unsafe { libc::setresuid(0, 0, 0) } != 0
-    {
-        return Err(io::Error::last_os_error());
+    if broker_uses_canonical_id_map() {
+        // Establish the machine identity while this process is still
+        // single-threaded. Asking rootless bubblewrap to select uid 0 later
+        // would replace the complete subordinate map with a one-identity
+        // namespace. newgidmap requires setgroups=deny, so the inherited
+        // supplementary groups cannot be rewritten; their unmapped IDs confer
+        // no authority here.
+        if unsafe { libc::setresgid(0, 0, 0) } != 0
+            || unsafe { libc::setresuid(0, 0, 0) } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
     }
     // A rootless Tap setup can deliberately self-exec after parser startup.
     // Namespace membership survives exec; this marker prevents that second
@@ -281,9 +294,13 @@ pub fn is_child_command(argv: &[String]) -> bool {
     argv.first().map(String::as_str) == Some(CHILD_COMMAND)
 }
 
-/// True after this runner joined the broker's canonical-ID user namespace.
+/// True after this runner joined the broker's complete canonical-ID namespace.
 pub fn runner_has_canonical_id_map() -> bool {
-    std::env::var_os(RUNNER_ENTERED_ENV).is_some()
+    std::env::var(ID_MAP_KIND_ENV).is_ok_and(|value| value == CANONICAL_ID_MAP)
+}
+
+fn broker_uses_canonical_id_map() -> bool {
+    std::env::var(ID_MAP_KIND_ENV).is_ok_and(|value| value == CANONICAL_ID_MAP)
 }
 
 pub fn child_main() -> i32 {
@@ -363,9 +380,9 @@ fn create_private_namespace(control: &mut UnixStream) -> io::Result<()> {
     control.write_all(&[REQUEST_ID_MAP])?;
     let mut reply = [0u8; 1];
     control.read_exact(&mut reply)?;
-    if reply != [REPLY_ID_MAP] {
-        return Err(io::Error::other("parent rejected broker ID map"));
-    }
+    let id_map = IdMapKind::from_reply(reply)
+        .ok_or_else(|| io::Error::other("parent rejected broker ID map"))?;
+    unsafe { std::env::set_var(ID_MAP_KIND_ENV, id_map.env_value()) };
     if unsafe { libc::unshare(libc::CLONE_NEWNS) } != 0 {
         return Err(io::Error::last_os_error());
     }
@@ -388,6 +405,44 @@ fn create_private_namespace(control: &mut UnixStream) -> io::Result<()> {
 
 const CANONICAL_ID_COUNT: u32 = 65_536;
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum IdMapKind {
+    Canonical,
+    Caller,
+}
+
+impl IdMapKind {
+    fn reply(self) -> u8 {
+        match self {
+            Self::Canonical => REPLY_ID_MAP,
+            Self::Caller => b'i',
+        }
+    }
+
+    fn from_reply(reply: u8) -> Option<Self> {
+        match reply {
+            REPLY_ID_MAP => Some(Self::Canonical),
+            b'i' => Some(Self::Caller),
+            _ => None,
+        }
+    }
+
+    fn env_value(self) -> &'static str {
+        match self {
+            Self::Canonical => CANONICAL_ID_MAP,
+            Self::Caller => CALLER_ID_MAP,
+        }
+    }
+
+    fn from_env_value(value: &str) -> Option<Self> {
+        match value {
+            CANONICAL_ID_MAP => Some(Self::Canonical),
+            CALLER_ID_MAP => Some(Self::Caller),
+            _ => None,
+        }
+    }
+}
+
 fn startup_reply_error(reply: &[u8], descriptors: usize, expected: &str) -> String {
     if reply.first() == Some(&REPLY_ERROR) {
         String::from_utf8_lossy(&reply[1..]).trim().to_owned()
@@ -396,7 +451,7 @@ fn startup_reply_error(reply: &[u8], descriptors: usize, expected: &str) -> Stri
     }
 }
 
-fn configure_id_maps(pid: u32) -> io::Result<()> {
+fn configure_id_maps(pid: u32) -> io::Result<IdMapKind> {
     let uid = unsafe { libc::getuid() };
     let gid = unsafe { libc::getgid() };
     if unsafe { libc::geteuid() } == 0 {
@@ -404,12 +459,34 @@ fn configure_id_maps(pid: u32) -> io::Result<()> {
                        format!("0 0 {CANONICAL_ID_COUNT}\n"))?;
         std::fs::write(format!("/proc/{pid}/gid_map"),
                        format!("0 0 {CANONICAL_ID_COUNT}\n"))?;
-        return Ok(());
+        return Ok(IdMapKind::Canonical);
     }
-    let uid_range = subordinate_range("/etc/subuid", uid)?;
-    let gid_range = subordinate_range("/etc/subgid", gid)?;
+    let (uid_range, gid_range) = match (
+        subordinate_range("/etc/subuid", uid),
+        subordinate_range("/etc/subgid", gid),
+    ) {
+        (Ok(uid_range), Ok(gid_range)) => (uid_range, gid_range),
+        (uid_result, gid_result) => {
+            let detail = uid_result.err()
+                .or_else(|| gid_result.err())
+                .map(|error| error.to_string())
+                .unwrap_or_else(|| "subordinate ID lookup failed".into());
+            write_caller_id_map(pid, uid, gid)?;
+            eprintln!(
+                "sarun-engine: FUSE broker: using caller-only user namespace; \
+                 canonical ownership disabled ({detail})"
+            );
+            return Ok(IdMapKind::Caller);
+        }
+    };
     run_id_mapper("newuidmap", pid, mapping_arguments(uid, uid_range))?;
-    run_id_mapper("newgidmap", pid, mapping_arguments(gid, gid_range))
+    run_id_mapper("newgidmap", pid, mapping_arguments(gid, gid_range))?;
+    Ok(IdMapKind::Canonical)
+}
+
+fn write_caller_id_map(pid: u32, uid: u32, gid: u32) -> io::Result<()> {
+    std::fs::write(format!("/proc/{pid}/uid_map"), format!("0 {uid} 1\n"))?;
+    std::fs::write(format!("/proc/{pid}/gid_map"), format!("0 {gid} 1\n"))
 }
 
 fn subordinate_range(path: &str, id: u32) -> io::Result<u32> {
@@ -571,9 +648,14 @@ fn broker_loop(control: &mut UnixStream, listener: &UnixListener) -> io::Result<
             }
             let user = File::open("/proc/self/ns/user")?;
             let mount = File::open("/proc/self/ns/mnt")?;
+            let id_map = std::env::var(ID_MAP_KIND_ENV)
+                .ok()
+                .as_deref()
+                .and_then(IdMapKind::from_env_value)
+                .unwrap_or(IdMapKind::Canonical);
             send_fds(
                 &client,
-                &[REPLY_READY],
+                &[REPLY_READY, id_map.reply()],
                 &[user.as_raw_fd(), mount.as_raw_fd()],
             )?;
         }
@@ -669,6 +751,40 @@ mod tests {
             "70000", "70000", "1",
             "0", "100000", "65536",
         ]);
+    }
+
+    #[test]
+    fn id_map_kind_round_trips_over_broker_protocol_and_env() {
+        assert_eq!(
+            IdMapKind::from_reply(REPLY_ID_MAP),
+            Some(IdMapKind::Canonical)
+        );
+        assert_eq!(IdMapKind::from_reply(b'i'), Some(IdMapKind::Caller));
+        assert_eq!(IdMapKind::Canonical.reply(), REPLY_ID_MAP);
+        assert_eq!(IdMapKind::Caller.reply(), b'i');
+        assert_eq!(
+            IdMapKind::from_env_value(CANONICAL_ID_MAP),
+            Some(IdMapKind::Canonical)
+        );
+        assert_eq!(
+            IdMapKind::from_env_value(CALLER_ID_MAP),
+            Some(IdMapKind::Caller)
+        );
+    }
+
+    #[test]
+    fn runner_reports_canonical_map_only_when_broker_selected_it() {
+        let old = std::env::var_os(ID_MAP_KIND_ENV);
+        unsafe { std::env::set_var(ID_MAP_KIND_ENV, CANONICAL_ID_MAP) };
+        assert!(runner_has_canonical_id_map());
+        unsafe { std::env::set_var(ID_MAP_KIND_ENV, CALLER_ID_MAP) };
+        assert!(!runner_has_canonical_id_map());
+        unsafe {
+            match old {
+                Some(value) => std::env::set_var(ID_MAP_KIND_ENV, value),
+                None => std::env::remove_var(ID_MAP_KIND_ENV),
+            }
+        }
     }
 
     #[test]

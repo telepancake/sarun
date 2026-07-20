@@ -1,0 +1,13 @@
+#!/usr/bin/env sh
+set -eu
+if command -v uv >/dev/null 2>&1; then
+  uv_tool_dir=$(uv tool dir 2>/dev/null || true)
+  if [ -n "${uv_tool_dir}" ]; then
+    PATH="${uv_tool_dir}/cargo-zigbuild/bin:${HOME}/.local/bin:${PATH}"
+  fi
+fi
+if ! command -v zig >/dev/null 2>&1; then
+  echo "sarun cargo build: missing zig; run 'uv tool install --with ziglang cargo-zigbuild' or 'make engine' first" >&2
+  exit 127
+fi
+exec zig cc -target x86_64-linux-musl "$@"

@@ -3,7 +3,8 @@
 // replacements for each other behind the same socket path.
 
 use std::env;
-use std::path::PathBuf;
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
 
 fn app_dir() -> String {
     match env::var("SLOPBOX_NS") {
@@ -15,8 +16,7 @@ fn app_dir() -> String {
 fn home(var: &str, fallback: &str) -> PathBuf {
     match env::var(var) {
         Ok(v) if !v.is_empty() => PathBuf::from(v),
-        _ => PathBuf::from(env::var("HOME").unwrap_or_else(|_| "/root".into()))
-            .join(fallback),
+        _ => PathBuf::from(env::var("HOME").unwrap_or_else(|_| "/root".into())).join(fallback),
     }
 }
 
@@ -157,9 +157,198 @@ pub fn appliance_host_resolv_conf_path() -> PathBuf {
 }
 
 pub fn ensure_dirs() -> std::io::Result<()> {
-    for d in [data_home(), config_home(), runtime_home(), state_home(),
-              live_home(), mnt_point(), oaita_state_home()] {
-        std::fs::create_dir_all(&d)?;
+    let mnt = mnt_point();
+    detach_stale_mounts(&mnt)?;
+    for d in [
+        data_home(),
+        config_home(),
+        runtime_home(),
+        state_home(),
+        live_home(),
+        mnt,
+        oaita_state_home(),
+    ] {
+        ensure_dir(&d)?;
     }
     Ok(())
+}
+
+fn detach_stale_mounts(path: &Path) -> std::io::Result<()> {
+    let mountinfo = match std::fs::read_to_string("/proc/self/mountinfo") {
+        Ok(mountinfo) => mountinfo,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let Some(target) = mountinfo_path(path) else {
+        return Ok(());
+    };
+    for line in mountinfo.lines() {
+        if !is_sarun_fuse_mount(line, &target) {
+            continue;
+        }
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("{}: mountpoint contains NUL", path.display()),
+            )
+        })?;
+        if unsafe { libc::umount2(c_path.as_ptr(), libc::MNT_DETACH) } != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return Err(std::io::Error::new(
+                    error.kind(),
+                    format!("{}: detach stale sarun-rs mount: {error}", path.display()),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn is_sarun_fuse_mount(line: &str, target: &str) -> bool {
+    let Some((mount, filesystem)) = line.split_once(" - ") else {
+        return false;
+    };
+    let mut mount_fields = mount.split_whitespace();
+    let Some(mount_point) = mount_fields.nth(4) else {
+        return false;
+    };
+    if mount_point != target {
+        return false;
+    }
+    let mut filesystem_fields = filesystem.split_whitespace();
+    let fs_type = filesystem_fields.next().unwrap_or("");
+    let source = filesystem_fields.next().unwrap_or("");
+    fs_type.starts_with("fuse") && source == "sarun-rs"
+}
+
+fn mountinfo_path(path: &Path) -> Option<String> {
+    let mut encoded = String::new();
+    for &byte in path.as_os_str().as_bytes() {
+        match byte {
+            b' ' => encoded.push_str("\\040"),
+            b'\t' => encoded.push_str("\\011"),
+            b'\n' => encoded.push_str("\\012"),
+            b'\\' => encoded.push_str("\\134"),
+            0 => return None,
+            value => encoded.push(value as char),
+        }
+    }
+    Some(encoded)
+}
+
+fn ensure_dir(path: &Path) -> std::io::Result<()> {
+    match std::fs::create_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && path.is_dir() => Ok(()),
+        Err(error) => Err(std::io::Error::new(
+            error.kind(),
+            format!("{}: {error}", path.display()),
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct EnvGuard {
+        vars: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl EnvGuard {
+        fn set(vars: &[(&'static str, &Path)]) -> Self {
+            let names = [
+                "HOME",
+                "XDG_DATA_HOME",
+                "XDG_CONFIG_HOME",
+                "XDG_RUNTIME_DIR",
+                "XDG_STATE_HOME",
+                "SLOPBOX_NS",
+            ];
+            let guard = Self {
+                vars: names
+                    .iter()
+                    .map(|name| (*name, std::env::var_os(name)))
+                    .collect(),
+            };
+            unsafe {
+                for name in names {
+                    std::env::remove_var(name);
+                }
+                for (name, value) in vars {
+                    std::env::set_var(name, value);
+                }
+                std::env::set_var("SLOPBOX_NS", "PATHSTEST");
+            }
+            guard
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                for (name, value) in self.vars.drain(..) {
+                    match value {
+                        Some(value) => std::env::set_var(name, value),
+                        None => std::env::remove_var(name),
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sarun_mountinfo_detection_matches_only_the_runtime_mountpoint() {
+        let line = "123 45 0:99 / /run/user/1000/slopbox/mnt rw,nosuid,nodev - fuse sarun-rs rw,user_id=1000,group_id=1000";
+
+        assert!(is_sarun_fuse_mount(line, "/run/user/1000/slopbox/mnt"));
+        assert!(!is_sarun_fuse_mount(
+            line,
+            "/var/home/me/.local/share/slopbox/mnt"
+        ));
+        assert!(!is_sarun_fuse_mount(
+            "123 45 0:99 / /run/user/1000/slopbox/mnt rw - fuse other rw",
+            "/run/user/1000/slopbox/mnt"
+        ));
+    }
+
+    #[test]
+    fn mountinfo_path_escapes_kernel_mountinfo_fields() {
+        assert_eq!(
+            mountinfo_path(Path::new("/run/user/1000/slop box/mnt")).unwrap(),
+            "/run/user/1000/slop\\040box/mnt"
+        );
+    }
+
+    #[test]
+    fn ensure_dirs_is_idempotent_for_existing_instance_dirs() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let config = temp.path().join("config");
+        let runtime = temp.path().join("runtime");
+        let state = temp.path().join("state");
+        let _guard = EnvGuard::set(&[
+            ("XDG_DATA_HOME", &data),
+            ("XDG_CONFIG_HOME", &config),
+            ("XDG_RUNTIME_DIR", &runtime),
+            ("XDG_STATE_HOME", &state),
+        ]);
+
+        ensure_dirs().unwrap();
+        ensure_dirs().unwrap();
+    }
+
+    #[test]
+    fn ensure_dirs_reports_the_conflicting_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = temp.path().join("runtime");
+        std::fs::create_dir_all(&runtime).unwrap();
+        let conflict = runtime.join("slopbox.PATHSTEST");
+        std::fs::write(&conflict, b"not a directory").unwrap();
+        let _guard = EnvGuard::set(&[("XDG_RUNTIME_DIR", &runtime)]);
+
+        let error = ensure_dirs().unwrap_err().to_string();
+        assert!(error.contains(conflict.to_str().unwrap()), "{error}");
+    }
 }
