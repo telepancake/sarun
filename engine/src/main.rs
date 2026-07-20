@@ -196,27 +196,6 @@ fn serve() -> i32 {
         eprintln!("sarun-engine: cannot create instance dirs: {e}");
         return 1;
     }
-    // Bind the control socket NOW, under the instance lock and before the FUSE
-    // mount / the rest of init. This is the fix for the startup race: the socket
-    // file must only appear once it is a live listening socket, so a client that
-    // connects during startup queues in the backlog (served when the accept loop
-    // runs) instead of racing a stale socket left by a dead daemon. Held until
-    // control::serve consumes it below.
-    let listener = match control::bind_listener(&sock) {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!(
-                "sarun-engine: cannot bind control socket {}: {e}",
-                sock.display()
-            );
-            return 1;
-        }
-    };
-    LISTENER_FOR_SIGNAL.store(listener.as_raw_fd(), Ordering::Release);
-    unsafe {
-        libc::signal(libc::SIGTERM, on_term as *const () as libc::sighandler_t);
-        libc::signal(libc::SIGINT, on_term as *const () as libc::sighandler_t);
-    }
     // Retain the multi-box overlay only in the mount-owner broker's private
     // user+mount namespace. The engine keeps the raw FUSE connection and
     // workers; the short superblock-creation attachment is gone before those
@@ -234,6 +213,26 @@ fn serve() -> i32 {
             return 1;
         }
     };
+    // Publish the public control socket only after the private FUSE broker has
+    // completed its namespace handoff and mounted the overlay.  Top-level FUSE
+    // runners must join that broker namespace before they can even initialize
+    // the ordinary command parser, so an earlier ui.sock is a false readiness
+    // signal and races fuse-broker.sock creation.
+    let listener = match control::bind_listener(&sock) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!(
+                "sarun-engine: cannot bind control socket {}: {e}",
+                sock.display()
+            );
+            return 1;
+        }
+    };
+    LISTENER_FOR_SIGNAL.store(listener.as_raw_fd(), Ordering::Release);
+    unsafe {
+        libc::signal(libc::SIGTERM, on_term as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGINT, on_term as *const () as libc::sighandler_t);
+    }
     let state: control::State = Default::default();
     state.lock().unwrap().overlay = Some(ov.clone());
     control::install_state_handle(state.clone());
