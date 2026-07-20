@@ -7,6 +7,11 @@ __pycache__/
 # on box-mode kati behavior (see kati corpus runner work).
 /.corpus-staging/
 
+# Repository-local bootstrap tools. scripts/with-tools.sh installs uv and
+# rustup here when the host does not already provide them, without touching
+# shell startup files or requiring a global rustup default.
+/.tools/
+
 # Guard against stray cargo prototypes left at the repo root by subagents
 # (the real manifest is engine/Cargo.toml). Keeps the worktree clean.
 /Cargo.toml

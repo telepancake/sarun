@@ -9,6 +9,7 @@
 
 SHELL := bash
 .DEFAULT_GOAL := help
+TOOLS_RUN := $(CURDIR)/scripts/with-tools.sh
 
 # ---- Discovery ------------------------------------------------------------
 
@@ -44,6 +45,10 @@ deps: ## Install system packages (FUSE, bubblewrap; iproute2 + tshark for net te
 vendor: ## Assemble engine/vendor/ from pinned upstreams + vendor-patches/ series
 	python3 scripts/vendor.py
 
+.PHONY: tools
+tools: ## Bootstrap repository-local uv/rustup fallbacks and cargo-zigbuild
+	$(TOOLS_RUN) uv tool install --with ziglang cargo-zigbuild
+
 # The addin set the sarun runner requires of the sud wrappers.
 HOST_ARCH := $(shell uname -m)
 ENGINE_TARGET ?= $(HOST_ARCH)-unknown-linux-musl
@@ -51,12 +56,10 @@ SWIPL_TARGET := $(subst -unknown,,$(ENGINE_TARGET))
 ENGINE_RELEASE := engine/target/$(ENGINE_TARGET)/release
 
 .PHONY: engine
-engine: vendor wire-codegen ## Build the engine (fully-static musl binary; cargo-zigbuild + zig)
-	@command -v uv >/dev/null || { echo "engine needs uv (https://docs.astral.sh/uv/)"; exit 1; }
-	uv tool install --with ziglang cargo-zigbuild
-	rustup target add $(ENGINE_TARGET)
-	cd engine && PATH="$$(uv tool dir)/cargo-zigbuild/bin:$$HOME/.local/bin:$$PATH" \
-	  cargo zigbuild --release --target $(ENGINE_TARGET)
+engine: vendor wire-codegen tools ## Build the engine (fully-static musl binary; cargo-zigbuild + zig)
+	$(TOOLS_RUN) rustup target add $(ENGINE_TARGET)
+	$(TOOLS_RUN) bash -c 'cd engine && \
+	  cargo zigbuild --release --target $(ENGINE_TARGET)'
 	@ln -sfn $(ENGINE_RELEASE)/sarun sarun
 	@# SUD is a first-class run backend: both wrappers must sit next to the
 	@# engine binary (runner::sud_wrapper_paths resolves the sibling).
@@ -65,9 +68,9 @@ engine: vendor wire-codegen ## Build the engine (fully-static musl binary; cargo
 	@# tv/Makefile uses zig's bundled musl+UAPI headers, so no host -m32
 	@# toolchain is required; fail visibly instead of leaving stale/missing
 	@# wrapper siblings in the release directory.
-	$(MAKE) -C tv sud64 sud32
+	$(TOOLS_RUN) $(MAKE) -C tv sud64 sud32
 	cp tv/sud64 tv/sud32 $(ENGINE_RELEASE)/
-	python3 scripts/release_licenses.py --target $(ENGINE_TARGET) \
+	$(TOOLS_RUN) python3 scripts/release_licenses.py --target $(ENGINE_TARGET) \
 	  --output $(ENGINE_RELEASE)/LICENSES
 	@# The mirror drivers are compiled INTO sarun (multi-call dispatch on
 	@# argv[0] / subcommand — mirrors.rs self-execs); the symlinks are a
@@ -77,28 +80,26 @@ engine: vendor wire-codegen ## Build the engine (fully-static musl binary; cargo
 	@echo "→ ./sarun → $(ENGINE_RELEASE)/sarun"
 
 .PHONY: appliances
-appliances: ## Build both tightly paired QEMU + Linux + target-/init appliances
-	scripts/build-appliances.sh all
+appliances: tools ## Build both tightly paired QEMU + Linux + target-/init appliances
+	$(TOOLS_RUN) scripts/build-appliances.sh all
 
 .PHONY: release-licenses
 release-licenses: vendor ## Regenerate notices beside the current static release
-	python3 scripts/release_licenses.py --target $(ENGINE_TARGET) \
+	$(TOOLS_RUN) python3 scripts/release_licenses.py --target $(ENGINE_TARGET) \
 	  --output $(ENGINE_RELEASE)/LICENSES
 
 .PHONY: swipl
-swipl: ## Build pinned static SWI-Prolog + zlib artifacts (cached outside the repo)
-	@command -v uv >/dev/null || { echo "swipl needs uv (https://docs.astral.sh/uv/)"; exit 1; }
-	uv tool install --with ziglang cargo-zigbuild
-	PATH="$$(uv tool dir)/cargo-zigbuild/bin:$$HOME/.local/bin:$$PATH" \
-	  uv run --with cmake --with ninja python3 scripts/swipl.py --target $(SWIPL_TARGET)
+swipl: tools ## Build pinned static SWI-Prolog + zlib artifacts (cached outside the repo)
+	$(TOOLS_RUN) uv run --with cmake --with ninja \
+	  python3 scripts/swipl.py --target $(SWIPL_TARGET)
 
 .PHONY: wire-codegen
 wire-codegen: swipl ## Project concrete Rust transport codecs from the Prolog relation
-	python3 scripts/wire_codegen.py
+	$(TOOLS_RUN) python3 scripts/wire_codegen.py
 
 .PHONY: check-wire-codegen
 check-wire-codegen: swipl ## Fail if the checked-in Rust transport projection is stale
-	python3 scripts/wire_codegen.py --check
+	$(TOOLS_RUN) python3 scripts/wire_codegen.py --check
 
 .PHONY: test-action-grammar
 test-action-grammar: swipl ## Run the core-only action grammar tests with pinned host SWI-Prolog
@@ -132,7 +133,7 @@ test-action-grammar: swipl ## Run the core-only action grammar tests with pinned
 
 .PHONY: test
 test: ## Run the test suite (pytest-xdist; build the engine first; excludes test_oci.py + the box corpus)
-	cd prototype && uv run --with pytest --with pytest-xdist --with pytest-timeout \
+	cd prototype && $(TOOLS_RUN) uv run --with pytest --with pytest-xdist --with pytest-timeout \
 	  --with "wcmatch>=8.4" --with "python-magic>=0.4" --with "pyte>=0.8" \
 	  pytest -q -p no:cacheprovider -n auto --dist=loadscope \
 	  --timeout=180 --timeout-method=signal --ignore=test_oci.py \
@@ -144,41 +145,41 @@ test-oci: ## Run the hermetic OCI tests (synthetic archive; real engine; needs `
 
 .PHONY: test-kati-box
 test-kati-box: ## The FULL kati conformance corpus through real -b boxes vs GNU make (needs `make engine`; ~10 min)
-	cd prototype && uv run --with "pyfuse3>=3.2" --with "trio>=0.22" \
+	cd prototype && $(TOOLS_RUN) uv run --with "pyfuse3>=3.2" --with "trio>=0.22" \
 	  --with "wcmatch>=8.4" --with "python-magic>=0.4" \
 	  python test_kati_corpus_box_rs.py
 
 .PHONY: test-integ
 test-integ: ## Real-project builds (GNU hello autoconf + cmake) through -b boxes (needs `make engine`; also in `make test`)
-	cd prototype && uv run --with "pyfuse3>=3.2" --with "trio>=0.22" \
+	cd prototype && $(TOOLS_RUN) uv run --with "pyfuse3>=3.2" --with "trio>=0.22" \
 	  --with "wcmatch>=8.4" --with "python-magic>=0.4" \
 	  python test_integration_builds_rs.py
 
 .PHONY: test-contract
 test-contract: ## Syscall-level (strace) contract test for the native builtins (needs `make engine` + strace)
-	uv run --with pytest python engine/test_builtin_contract.py
+	$(TOOLS_RUN) uv run --with pytest python engine/test_builtin_contract.py
 
 .PHONY: test-sud
 test-sud: ## sud vs FUSE equivalence + sud exec capabilities (needs `make engine`; builds sud64/sud32)
-	cd prototype && uv run --with "wcmatch>=8.4" --with "python-magic>=0.4" \
+	cd prototype && $(TOOLS_RUN) uv run --with "wcmatch>=8.4" --with "python-magic>=0.4" \
 	  python test_sud_equiv_rs.py
-	cd prototype && uv run --with "wcmatch>=8.4" --with "python-magic>=0.4" \
+	cd prototype && $(TOOLS_RUN) uv run --with "wcmatch>=8.4" --with "python-magic>=0.4" \
 	  python test_sud_concurrent_rs.py
 
 .PHONY: test-backends
 test-backends: ## Portable live SarunFs equivalence (FUSE, host QEMU, and native SUD where supported)
-	cd prototype && uv run --with "wcmatch>=8.4" --with "python-magic>=0.4" \
+	cd prototype && $(TOOLS_RUN) uv run --with "wcmatch>=8.4" --with "python-magic>=0.4" \
 	  python test_backend_equiv_rs.py
-	cd prototype && uv run python test_appliance_compat32.py
+	cd prototype && $(TOOLS_RUN) uv run python test_appliance_compat32.py
 
 .PHONY: bench-backends
 bench-backends: ## Compare live backend filesystem workloads (set SARUN_BENCH_ROUNDS=N)
-	cd prototype && uv run --with "wcmatch>=8.4" --with "python-magic>=0.4" \
+	cd prototype && $(TOOLS_RUN) uv run --with "wcmatch>=8.4" --with "python-magic>=0.4" \
 	  python benchmark_backends.py
 
 .PHONY: test-backend-workloads
 test-backend-workloads: ## Strict real-tool matrix across every locally runnable backend
-	cd prototype && uv run --with "wcmatch>=8.4" --with "python-magic>=0.4" \
+	cd prototype && $(TOOLS_RUN) uv run --with "wcmatch>=8.4" --with "python-magic>=0.4" \
 	  python test_backend_workloads.py
 
 .PHONY: validate-backends
