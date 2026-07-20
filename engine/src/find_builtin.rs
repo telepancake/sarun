@@ -224,6 +224,16 @@ fn expectation_evidence(
                 finite_values: Vec::new(),
             }
         }
+        Expectation::ReferencePredicate => brush_core::builtins::ParserArgumentEvidence {
+            id: "reference_predicate".into(),
+            display: "REFERENCE TEST".into(),
+            help: Some("select a reference-entry predicate".into()),
+            value_domain: None,
+            finite_values: Vec::new(),
+        },
+        Expectation::ReferenceOperand(predicate) => {
+            parser_argument_evidence(ArgumentIdentity::ReferenceOperand(predicate))
+        }
     }
 }
 
@@ -257,6 +267,26 @@ fn parser_argument_evidence(
             findutils::find::syntax::FileTypePredicateIdentity::Xtype => {
                 ("xtype_value", "TYPE", "referent file type", None)
             }
+        },
+        ArgumentIdentity::ReferencePredicate(_) => (
+            "reference_predicate",
+            "REFERENCE TEST",
+            "reference-entry predicate",
+            None,
+        ),
+        ArgumentIdentity::ReferenceOperand(predicate) => match predicate {
+            findutils::find::syntax::ReferencePredicateIdentity::Newer { .. } => (
+                "newer_reference",
+                "REFERENCE",
+                "entry supplying the comparison timestamp",
+                Some("filesystem_path".into()),
+            ),
+            findutils::find::syntax::ReferencePredicateIdentity::SameFile => (
+                "samefile_reference",
+                "REFERENCE",
+                "entry whose filesystem identity should match",
+                Some("filesystem_path".into()),
+            ),
         },
     };
     brush_core::builtins::ParserArgumentEvidence {
@@ -394,5 +424,23 @@ mod parser_tests {
             .literal_continuations
             .iter()
             .any(|continuation| continuation.literal == "-"));
+    }
+
+    #[test]
+    fn registered_parser_maps_reference_entry_without_resolving_it() {
+        for predicate in ["-newer", "-newerma", "-samefile"] {
+            let assist = parser(BuiltinParserInput {
+                tear: true,
+                before: vec!["find".into(), ".".into(), predicate.into()],
+                prefix: "./r".into(),
+                suffix: String::new(),
+                after: Vec::new(),
+            });
+            assert_eq!(assist.status, BuiltinParseStatus::Incomplete, "{predicate}");
+            assert!(assist.expected.iter().any(|argument| {
+                argument.display == "REFERENCE"
+                    && argument.value_domain.as_deref() == Some("filesystem_path")
+            }));
+        }
     }
 }

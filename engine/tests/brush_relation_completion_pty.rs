@@ -183,6 +183,25 @@ fn standalone_brush_completes_find_files0_source_without_reading_it() {
 }
 
 #[test]
+fn standalone_brush_completes_find_reference_from_actual_parser_arm() {
+    let dir = std::env::temp_dir().join(format!(
+        "sarun-brush-relation-find-reference-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("reference-dir"))
+        .expect("create reference completion fixture directory");
+    std::fs::write(dir.join("reference-file"), b"")
+        .expect("write reference completion fixture");
+    run_brush_completion(
+        &dir,
+        b"find . -newer ./r\t",
+        &[b"eference-file", b"eference-dir/"],
+    );
+    std::fs::remove_dir_all(&dir).expect("remove reference completion fixture directory");
+}
+
+#[test]
 fn standalone_brush_completes_builtin_flag_through_relation() {
     run_brush_completion(
         &std::env::current_dir().unwrap(),

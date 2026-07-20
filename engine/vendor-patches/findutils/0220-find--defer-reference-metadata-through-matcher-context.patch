@@ -1,0 +1,1732 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Sun, 19 Jul 2026 20:04:46 +0000
+Subject: [PATCH] find: defer reference metadata through matcher context
+
+Parse -newer, file-backed -newerXY, and -samefile into typed reference queries without touching the filesystem. Resolve every matcher-tree branch through the read-only FindContext before consuming files0 inputs or preparing output actions. This also fixes logical-cwd and symlink-following behavior, implements candidate X versus reference Y exactly, and exposes reference evidence from the execution parser for contextual completion.
+
+---
+diff --git a/src/find/matchers/logical_matchers.rs b/src/find/matchers/logical_matchers.rs
+index 59fc603..21a66fc 100644
+--- a/src/find/matchers/logical_matchers.rs
++++ b/src/find/matchers/logical_matchers.rs
+@@ -12,7 +12,7 @@
+ use std::error::Error;
+ use std::path::Path;
+ 
+-use super::{FindOperations, Matcher, MatcherIO, WalkEntry};
++use super::{FindContext, FindOperations, Matcher, MatcherIO, WalkEntry};
+ 
+ /// This matcher contains a collection of other matchers. A file only matches
+ /// if it matches ALL the contained sub-matchers. For sub-matchers that have
+@@ -29,6 +29,13 @@ impl AndMatcher {
+ }
+ 
+ impl Matcher for AndMatcher {
++    fn resolve_context(&mut self, context: &dyn FindContext) -> Result<(), Box<dyn Error>> {
++        for matcher in &mut self.submatchers {
++            matcher.resolve_context(context)?;
++        }
++        Ok(())
++    }
++
+     fn prepare(&mut self, operations: &dyn FindOperations) -> Result<(), Box<dyn Error>> {
+         for matcher in &mut self.submatchers {
+             matcher.prepare(operations)?;
+@@ -112,6 +119,13 @@ impl OrMatcher {
+ }
+ 
+ impl Matcher for OrMatcher {
++    fn resolve_context(&mut self, context: &dyn FindContext) -> Result<(), Box<dyn Error>> {
++        for matcher in &mut self.submatchers {
++            matcher.resolve_context(context)?;
++        }
++        Ok(())
++    }
++
+     fn prepare(&mut self, operations: &dyn FindOperations) -> Result<(), Box<dyn Error>> {
+         for matcher in &mut self.submatchers {
+             matcher.prepare(operations)?;
+@@ -217,6 +231,13 @@ impl ListMatcher {
+ }
+ 
+ impl Matcher for ListMatcher {
++    fn resolve_context(&mut self, context: &dyn FindContext) -> Result<(), Box<dyn Error>> {
++        for matcher in &mut self.submatchers {
++            matcher.resolve_context(context)?;
++        }
++        Ok(())
++    }
++
+     fn prepare(&mut self, operations: &dyn FindOperations) -> Result<(), Box<dyn Error>> {
+         for matcher in &mut self.submatchers {
+             matcher.prepare(operations)?;
+@@ -359,6 +380,10 @@ impl NotMatcher {
+ }
+ 
+ impl Matcher for NotMatcher {
++    fn resolve_context(&mut self, context: &dyn FindContext) -> Result<(), Box<dyn Error>> {
++        self.submatcher.resolve_context(context)
++    }
++
+     fn prepare(&mut self, operations: &dyn FindOperations) -> Result<(), Box<dyn Error>> {
+         self.submatcher.prepare(operations)
+     }
+diff --git a/src/find/matchers/mod.rs b/src/find/matchers/mod.rs
+index bb1da79..4b41d52 100644
+--- a/src/find/matchers/mod.rs
++++ b/src/find/matchers/mod.rs
+@@ -55,8 +55,7 @@ use self::size::SizeMatcher;
+ #[cfg(unix)]
+ use self::stat::{InodeMatcher, LinksMatcher};
+ use self::time::{
+-    FileAgeRangeMatcher, FileTimeMatcher, FileTimeType, NewerMatcher, NewerOptionMatcher,
+-    NewerOptionType, NewerTimeMatcher,
++    FileAgeRangeMatcher, FileTimeMatcher, FileTimeType, NewerMatcher, NewerTimeMatcher,
+ };
+ use self::type_matcher::{TypeMatcher, XtypeMatcher};
+ use self::user::{NoUserMatcher, UserMatcher};
+@@ -72,7 +71,9 @@ use std::{
+     time::SystemTime,
+ };
+ 
+-use super::{Config, Dependencies, FindOperations};
++use super::{
++    Config, Dependencies, FindContext, FindOperations, ReferenceProjection, ReferenceQuery,
++};
+ 
+ pub use entry::{FileType, WalkEntry, WalkError};
+ pub use regex::RegexType;
+@@ -267,6 +268,13 @@ pub trait Matcher: 'static {
+         false
+     }
+ 
++    /// Resolve immutable external dependencies retained by this matcher plan.
++    /// Logical combinators recurse through every branch before output resources
++    /// are committed, independently of run-time short-circuiting.
++    fn resolve_context(&mut self, _context: &dyn FindContext) -> Result<(), Box<dyn Error>> {
++        Ok(())
++    }
++
+     /// Commit resources required by this matcher after the complete command
+     /// line has parsed. Syntax probing constructs and drops the same matcher
+     /// tree without calling this method.
+@@ -296,6 +304,10 @@ impl Matcher for Box<dyn Matcher> {
+         (**self).has_side_effects()
+     }
+ 
++    fn resolve_context(&mut self, context: &dyn FindContext) -> Result<(), Box<dyn Error>> {
++        (**self).resolve_context(context)
++    }
++
+     fn prepare(&mut self, operations: &dyn FindOperations) -> Result<(), Box<dyn Error>> {
+         (**self).prepare(operations)
+     }
+@@ -462,43 +474,6 @@ fn parse_date_str_to_timestamps(date_str: &str) -> Option<i64> {
+     }
+ }
+ 
+-/// This function implements the function of matching substrings of
+-/// X and Y from the -newerXY string.
+-/// X and Y are constrained to a/B/c/m and t.
+-/// such as: "-neweraB" -> Some(a, B) "-neweraD" -> None
+-///
+-/// Additionally, there is support for the -anewer and -cnewer short arguments. as follows:
+-/// 1. -anewer is equivalent to -neweram
+-/// 2. -cnewer is equivalent to -newercm
+-///
+-/// If -newer is used it will be resolved to -newermm.
+-fn parse_str_to_newer_args(input: &str) -> Option<(String, String)> {
+-    if input.is_empty() {
+-        return None;
+-    }
+-
+-    if input == "-newer" {
+-        return Some(("m".to_string(), "m".to_string()));
+-    }
+-
+-    if input == "-anewer" {
+-        return Some(("a".to_string(), "m".to_string()));
+-    }
+-
+-    if input == "-cnewer" {
+-        return Some(("c".to_string(), "m".to_string()));
+-    }
+-
+-    let re = Regex::new(r"-newer([aBcm])([aBcmt])").unwrap();
+-    if let Some(captures) = re.captures(input) {
+-        let x = captures.get(1)?.as_str().to_string();
+-        let y = captures.get(2)?.as_str().to_string();
+-        Some((x, y))
+-    } else {
+-        None
+-    }
+-}
+-
+ /// The main "translate command-line args into a matcher" function. Will call
+ /// itself recursively if it encounters an opening bracket. A successful return
+ /// consists of a tuple containing the new index into the args array to use (if
+@@ -523,11 +498,18 @@ fn build_matcher_tree(
+     let mut invert_next_matcher = false;
+     while i < args.len() {
+         let file_type_predicate = crate::find::syntax::file_type_predicate(args[i]);
++        let reference_predicate = crate::find::syntax::reference_predicate(args[i]);
++        let newer_predicate = crate::find::syntax::newer_predicate(args[i]);
+         // `-files0-from` has its own observer hooks in its actual parser arm.
+         // Every other unsupported expression is still stopped before entering
+         // an arm which may perform parse-time work.
+         if args[i] != "-files0-from"
+-            && !observer.expression(argument_offset + i, args[i], file_type_predicate)
++            && !observer.expression(
++                argument_offset + i,
++                args[i],
++                file_type_predicate,
++                reference_predicate,
++            )
+         {
+             return Err(Box::new(super::ParseObservationRejected));
+         }
+@@ -565,6 +547,49 @@ fn build_matcher_tree(
+                     ),
+                 }
+             }
++            _ if newer_predicate.is_some() => {
++                let predicate = newer_predicate.expect("guarded by is_some");
++                #[cfg(target_os = "linux")]
++                if predicate.candidate == time::FileTimestamp::Birthed
++                    || predicate.reference == Some(time::FileTimestamp::Birthed)
++                {
++                    return Err(From::from(
++                        "find: This system does not provide a way to find the birth time of a file.",
++                    ));
++                }
++                if i >= args.len() - 1 {
++                    if let Some(reference) = reference_predicate {
++                        observer.reference_predicate(argument_offset + i, args[i], reference);
++                        observer.missing_reference_operand(argument_offset + i + 1, reference);
++                    }
++                    return Err(From::from(format!("missing argument to {}", args[i])));
++                }
++                if let Some(reference_time) = predicate.reference {
++                    let reference = reference_predicate.expect("file-backed newer predicate");
++                    observer.reference_predicate(argument_offset + i, args[i], reference);
++                    i += 1;
++                    observer.reference_operand(argument_offset + i, reference, args[i]);
++                    let query = ReferenceQuery::from_surface(
++                        args[i],
++                        config.follow,
++                        ReferenceProjection::Time(reference_time),
++                    );
++                    Some(
++                        NewerMatcher::pending(predicate.candidate, argument_offset + i, query)
++                            .into_box(),
++                    )
++                } else {
++                    let time = args[i + 1];
++                    let Some(comparable_time) = parse_date_str_to_timestamps(time) else {
++                        return Err(From::from(format!(
++                            "find: I cannot figure out how to interpret ‘{}’ as a date or time",
++                            args[i + 1]
++                        )));
++                    };
++                    i += 1;
++                    Some(NewerTimeMatcher::new(predicate.candidate, comparable_time).into_box())
++                }
++            }
+             "-print" => Some(Printer::new(PrintDelimiter::Newline, None).into_box()),
+             "-print0" => Some(Printer::new(PrintDelimiter::Null, None).into_box()),
+             "-printf" => {
+@@ -682,13 +707,6 @@ fn build_matcher_tree(
+                 config.depth_first = true;
+                 Some(DeleteMatcher::new().into_box())
+             }
+-            "-newer" => {
+-                if i >= args.len() - 1 {
+-                    return Err(From::from(format!("missing argument to {}", args[i])));
+-                }
+-                i += 1;
+-                Some(NewerMatcher::new(args[i], config.follow)?.into_box())
+-            }
+             "-mtime" | "-atime" | "-ctime" => {
+                 if i >= args.len() - 1 {
+                     return Err(From::from(format!("missing argument to {}", args[i])));
+@@ -832,14 +850,20 @@ fn build_matcher_tree(
+                 return Err(From::from("Link counts are not available on this platform"));
+             }
+             "-samefile" => {
++                let predicate = reference_predicate.expect("-samefile is a reference predicate");
++                observer.reference_predicate(argument_offset + i, args[i], predicate);
+                 if i >= args.len() - 1 {
++                    observer.missing_reference_operand(argument_offset + i + 1, predicate);
+                     return Err(From::from(format!("missing argument to {}", args[i])));
+                 }
+                 i += 1;
+-                let path = args[i];
+-                let matcher = SameFileMatcher::new(path, config.follow)
+-                    .map_err(|e| format!("{path}: {e}"))?;
+-                Some(matcher.into_box())
++                observer.reference_operand(argument_offset + i, predicate, args[i]);
++                let query = ReferenceQuery::from_surface(
++                    args[i],
++                    config.follow,
++                    ReferenceProjection::FileIdentity,
++                );
++                Some(SameFileMatcher::pending(argument_offset + i, query).into_box())
+             }
+             "-user" => {
+                 if i >= args.len() - 1 {
+@@ -1057,40 +1081,7 @@ fn build_matcher_tree(
+                 Some(TrueMatcher.into_box())
+             }
+ 
+-            _ => {
+-                match parse_str_to_newer_args(args[i]) {
+-                    Some((x_option, y_option)) => {
+-                        if i >= args.len() - 1 {
+-                            return Err(From::from(format!("missing argument to {}", args[i])));
+-                        }
+-                        #[cfg(target_os = "linux")]
+-                        if x_option == "B" {
+-                            return Err(From::from("find: This system does not provide a way to find the birth time of a file."));
+-                        }
+-                        if y_option == "t" {
+-                            let time = args[i + 1];
+-                            let newer_time_type = NewerOptionType::from_str(x_option.as_str());
+-                            // Convert args to unix timestamps. (expressed in numeric types)
+-                            let Some(comparable_time) = parse_date_str_to_timestamps(time) else {
+-                                return Err(From::from(format!(
+-                                    "find: I cannot figure out how to interpret ‘{}’ as a date or time",
+-                                    args[i + 1]
+-                                )));
+-                            };
+-                            i += 1;
+-                            Some(NewerTimeMatcher::new(newer_time_type, comparable_time).into_box())
+-                        } else {
+-                            let file_path = args[i + 1];
+-                            i += 1;
+-                            Some(
+-                                NewerOptionMatcher::new(&x_option, &y_option, file_path)?
+-                                    .into_box(),
+-                            )
+-                        }
+-                    }
+-                    None => return Err(From::from(format!("Unrecognized flag: '{}'", args[i]))),
+-                }
+-            }
++            _ => return Err(From::from(format!("Unrecognized flag: '{}'", args[i]))),
+         };
+         i += 1;
+         if config.help_requested || config.version_requested {
+@@ -1913,37 +1904,6 @@ mod tests {
+         assert_eq!(none_date_timestamps, Some(now_but_zero_hour_min_sec));
+     }
+ 
+-    #[test]
+-    fn parse_str_to_newer_args_test() {
+-        // test for error case
+-        let arg = parse_str_to_newer_args("");
+-        assert!(arg.is_none());
+-
+-        // test for short options
+-        // -newer equivalent to -newermm
+-        let arg = parse_str_to_newer_args("-newer").unwrap();
+-        assert_eq!(("m".to_string(), "m".to_string()), arg);
+-
+-        // -anewer equivalent to -neweram
+-        let arg = parse_str_to_newer_args("-anewer").unwrap();
+-        assert_eq!(("a".to_string(), "m".to_string()), arg);
+-
+-        // -cnewer equivalent to - newercm
+-        let arg = parse_str_to_newer_args("-cnewer").unwrap();
+-        assert_eq!(("c".to_string(), "m".to_string()), arg);
+-
+-        let x_options = ["a", "B", "c", "m"];
+-        let y_options = ["a", "B", "c", "m", "t"];
+-
+-        for &x in &x_options {
+-            for &y in &y_options {
+-                let eq: (String, String) = (String::from(x), String::from(y));
+-                let arg = parse_str_to_newer_args(&format!("-newer{x}{y}").to_string()).unwrap();
+-                assert_eq!(eq, arg);
+-            }
+-        }
+-    }
+-
+     #[test]
+     fn build_top_level_matcher_option_logical() {
+         let mut config = Config::default();
+diff --git a/src/find/matchers/samefile.rs b/src/find/matchers/samefile.rs
+index 4b7d554..2361e0f 100644
+--- a/src/find/matchers/samefile.rs
++++ b/src/find/matchers/samefile.rs
+@@ -3,45 +3,59 @@
+ // For the full copyright and license information, please view the LICENSE
+ // file that was distributed with this source code.
+ 
+-use super::{Follow, Matcher, MatcherIO, WalkEntry, WalkError};
++use super::{Matcher, MatcherIO, WalkEntry};
++use crate::find::{
++    FindContext, ReferenceFileIdentity, ReferenceFollow, ReferenceObservation, ReferenceQuery,
++    ReferenceValue,
++};
+ use std::error::Error;
+-use std::path::Path;
+-use uucore::fs::FileInformation;
+ 
+ pub struct SameFileMatcher {
+-    info: FileInformation,
++    argument: usize,
++    reference: ReferenceQuery,
++    identity: Option<ReferenceFileIdentity>,
+ }
+ 
+-/// Gets FileInformation, possibly following symlinks, but falling back on
+-/// broken links.
+-fn get_file_info(path: &Path, follow: bool) -> Result<FileInformation, WalkError> {
+-    if follow {
+-        let result = FileInformation::from_path(path, true).map_err(WalkError::from);
+-
+-        match result {
+-            Ok(info) => return Ok(info),
+-            Err(e) if !e.is_not_found() => return Err(e),
+-            _ => {}
++impl SameFileMatcher {
++    pub fn pending(argument: usize, reference: ReferenceQuery) -> Self {
++        Self {
++            argument,
++            reference,
++            identity: None,
+         }
+     }
+-
+-    Ok(FileInformation::from_path(path, false)?)
+ }
+ 
+-impl SameFileMatcher {
+-    pub fn new(path: impl AsRef<Path>, follow: Follow) -> Result<Self, Box<dyn Error>> {
+-        let info = get_file_info(path.as_ref(), follow != Follow::Never)?;
+-        Ok(Self { info })
++impl Matcher for SameFileMatcher {
++    fn resolve_context(&mut self, context: &dyn FindContext) -> Result<(), Box<dyn Error>> {
++        let ReferenceObservation { query, value } = context.observe_reference(&self.reference)?;
++        if query != self.reference {
++            return Err(From::from(format!(
++                "reference observation at argument {} does not match its query",
++                self.argument
++            )));
++        }
++        let ReferenceValue::FileIdentity(identity) = value else {
++            return Err(From::from(format!(
++                "reference observation at argument {} has the wrong projection",
++                self.argument
++            )));
++        };
++        self.identity = Some(identity);
++        Ok(())
+     }
+-}
+ 
+-impl Matcher for SameFileMatcher {
+     fn matches(&self, file_info: &WalkEntry, _matcher_io: &mut MatcherIO) -> bool {
+-        if let Ok(info) = get_file_info(file_info.path(), file_info.follow()) {
+-            info == self.info
++        let Some(reference) = &self.identity else {
++            return false;
++        };
++        let follow = if file_info.follow() {
++            ReferenceFollow::ReferentWithLinkFallback
+         } else {
+-            false
+-        }
++            ReferenceFollow::LinkItself
++        };
++        ReferenceFileIdentity::from_path(file_info.path(), follow)
++            .is_ok_and(|identity| identity == *reference)
+     }
+ }
+ 
+@@ -49,11 +63,26 @@ impl Matcher for SameFileMatcher {
+ mod tests {
+     use super::*;
+ 
++    use crate::find::matchers::Follow;
+     use crate::find::matchers::tests::{get_dir_entry_follow, get_dir_entry_for};
+     use crate::find::tests::FakeDependencies;
+     use std::fs::{self, File};
+     use tempfile::Builder;
+ 
++    fn resolved_matcher(path: &std::path::Path, follow: Follow) -> SameFileMatcher {
++        let reference = ReferenceQuery::from_surface(
++            &path.to_string_lossy(),
++            follow,
++            crate::find::ReferenceProjection::FileIdentity,
++        );
++        let identity = ReferenceFileIdentity::from_path(path, reference.follow).unwrap();
++        SameFileMatcher {
++            argument: 0,
++            reference,
++            identity: Some(identity),
++        }
++    }
++
+     #[test]
+     fn test_samefile() {
+         let root = Builder::new().prefix("example").tempdir().unwrap();
+@@ -68,7 +97,7 @@ mod tests {
+         let other_path = root_path.join("other");
+         File::create(&other_path).unwrap();
+ 
+-        let matcher = SameFileMatcher::new(&file_path, Follow::Never).unwrap();
++        let matcher = resolved_matcher(&file_path, Follow::Never);
+ 
+         let root_path = root_path.to_string_lossy();
+         let file_entry = get_dir_entry_for(&root_path, "file");
+@@ -82,26 +111,33 @@ mod tests {
+     }
+ 
+     #[test]
++    #[cfg(unix)]
+     fn test_follow() {
++        use std::os::unix::fs::symlink;
++
++        let root = Builder::new().prefix("samefile-follow").tempdir().unwrap();
++        File::create(root.path().join("target")).unwrap();
++        symlink("target", root.path().join("link")).unwrap();
++        let root_path = root.path().to_string_lossy();
+         let deps = FakeDependencies::new();
+-        let matcher = SameFileMatcher::new("test_data/links/link-f", Follow::Roots).unwrap();
++        let matcher = resolved_matcher(&root.path().join("link"), Follow::Roots);
+ 
+-        let entry = get_dir_entry_follow("test_data/links", "link-f", Follow::Never);
++        let entry = get_dir_entry_follow(&root_path, "link", Follow::Never);
+         assert!(!matcher.matches(&entry, &mut deps.new_matcher_io()));
+ 
+-        let entry = get_dir_entry_follow("test_data/links", "abbbc", Follow::Never);
++        let entry = get_dir_entry_follow(&root_path, "target", Follow::Never);
+         assert!(matcher.matches(&entry, &mut deps.new_matcher_io()));
+ 
+-        let entry = get_dir_entry_follow("test_data/links", "link-f", Follow::Roots);
++        let entry = get_dir_entry_follow(&root_path, "link", Follow::Roots);
+         assert!(!matcher.matches(&entry, &mut deps.new_matcher_io()));
+ 
+-        let entry = get_dir_entry_follow("test_data/links", "abbbc", Follow::Roots);
++        let entry = get_dir_entry_follow(&root_path, "target", Follow::Roots);
+         assert!(matcher.matches(&entry, &mut deps.new_matcher_io()));
+ 
+-        let entry = get_dir_entry_follow("test_data/links", "link-f", Follow::Always);
++        let entry = get_dir_entry_follow(&root_path, "link", Follow::Always);
+         assert!(matcher.matches(&entry, &mut deps.new_matcher_io()));
+ 
+-        let entry = get_dir_entry_follow("test_data/links", "abbbc", Follow::Always);
++        let entry = get_dir_entry_follow(&root_path, "target", Follow::Always);
+         assert!(matcher.matches(&entry, &mut deps.new_matcher_io()));
+     }
+ }
+diff --git a/src/find/matchers/time.rs b/src/find/matchers/time.rs
+index c1472a8..e294378 100644
+--- a/src/find/matchers/time.rs
++++ b/src/find/matchers/time.rs
+@@ -5,7 +5,7 @@
+ // https://opensource.org/licenses/MIT.
+ 
+ use std::error::Error;
+-use std::fs::{self, Metadata};
++use std::fs::Metadata;
+ use std::time::{Duration, SystemTime, UNIX_EPOCH};
+ 
+ use chrono::{DateTime, Local, Timelike};
+@@ -13,7 +13,10 @@ use chrono::{DateTime, Local, Timelike};
+ #[cfg(unix)]
+ use std::os::unix::fs::MetadataExt;
+ 
+-use super::{logical_offset, ComparableValue, Follow, Matcher, MatcherIO, WalkEntry};
++use super::{logical_offset, ComparableValue, Matcher, MatcherIO, WalkEntry};
++use crate::find::{
++    FindContext, ReferenceObservation, ReferenceQuery, ReferenceValue,
++};
+ 
+ const SECONDS_PER_DAY: i64 = 60 * 60 * 24;
+ 
+@@ -47,35 +50,62 @@ fn get_time(matcher_io: &mut MatcherIO, today_start: bool) -> SystemTime {
+     }
+ }
+ 
+-/// This matcher checks whether a file is newer than the file the matcher is initialized with.
++/// This matcher compares one candidate timestamp with an explicitly observed
++/// timestamp of a command-line reference entry.
+ pub struct NewerMatcher {
+-    given_modification_time: SystemTime,
++    candidate_time: FileTimestamp,
++    argument: usize,
++    reference: ReferenceQuery,
++    reference_time: Option<SystemTime>,
+ }
+ 
+ impl NewerMatcher {
+-    pub fn new(path_to_file: &str, follow: Follow) -> Result<Self, Box<dyn Error>> {
+-        let metadata = follow.root_metadata(path_to_file)?;
+-        Ok(Self {
+-            given_modification_time: metadata.modified()?,
+-        })
++    pub fn pending(
++        candidate_time: FileTimestamp,
++        argument: usize,
++        reference: ReferenceQuery,
++    ) -> Self {
++        Self {
++            candidate_time,
++            argument,
++            reference,
++            reference_time: None,
++        }
+     }
+ 
+     /// Implementation of matches that returns a result, allowing use to use try!
+     /// to deal with the errors.
+     fn matches_impl(&self, file_info: &WalkEntry) -> Result<bool, Box<dyn Error>> {
+-        let this_time = file_info.metadata()?.modified()?;
+-        // duration_since returns an Ok duration if this_time <= given_modification_time
+-        // and returns an Err (with a duration) otherwise. So if this_time >
+-        // given_modification_time (in which case we want to return true) then
+-        // duration_since will return an error.
+-        Ok(self
+-            .given_modification_time
+-            .duration_since(this_time)
+-            .is_err())
++        let reference_time = self.reference_time.ok_or_else(|| {
++            format!(
++                "reference operand at argument {} was not resolved",
++                self.argument
++            )
++        })?;
++        let candidate_time = self.candidate_time.get_file_time(file_info.metadata()?)?;
++        Ok(reference_time.duration_since(candidate_time).is_err())
+     }
+ }
+ 
+ impl Matcher for NewerMatcher {
++    fn resolve_context(&mut self, context: &dyn FindContext) -> Result<(), Box<dyn Error>> {
++        let ReferenceObservation { query, value } = context.observe_reference(&self.reference)?;
++        if query != self.reference {
++            return Err(From::from(format!(
++                "reference observation at argument {} does not match its query",
++                self.argument
++            )));
++        }
++        let ReferenceValue::Time(time) = value else {
++            return Err(From::from(format!(
++                "reference observation at argument {} has the wrong projection",
++                self.argument
++            )));
++        };
++        self.reference_time = Some(time);
++        Ok(())
++    }
++
+     fn matches(&self, file_info: &WalkEntry, matcher_io: &mut MatcherIO) -> bool {
+         match self.matches_impl(file_info) {
+             Err(e) => {
+@@ -99,26 +129,26 @@ impl Matcher for NewerMatcher {
+ /// c is meaning Changed time
+ /// m is meaning Modified time
+ /// It should be noted that not every file system supports birthed time.
+-#[derive(Clone, Copy, Debug)]
+-pub enum NewerOptionType {
++#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
++pub enum FileTimestamp {
+     Accessed,
+     Birthed,
+     Changed,
+     Modified,
+ }
+ 
+-impl NewerOptionType {
+-    #[allow(clippy::should_implement_trait)]
+-    pub fn from_str(option: &str) -> Self {
++impl FileTimestamp {
++    pub fn from_code(option: &str) -> Option<Self> {
+         match option {
+-            "a" => Self::Accessed,
+-            "B" => Self::Birthed,
+-            "c" => Self::Changed,
+-            _ => Self::Modified,
++            "a" => Some(Self::Accessed),
++            "B" => Some(Self::Birthed),
++            "c" => Some(Self::Changed),
++            "m" => Some(Self::Modified),
++            _ => None,
+         }
+     }
+ 
+-    fn get_file_time(self, metadata: &Metadata) -> std::io::Result<SystemTime> {
++    pub(crate) fn get_file_time(self, metadata: &Metadata) -> std::io::Result<SystemTime> {
+         match self {
+             Self::Accessed => metadata.accessed(),
+             Self::Birthed => metadata.created(),
+@@ -128,70 +158,15 @@ impl NewerOptionType {
+     }
+ }
+ 
+-/// This matcher checks whether the file is newer than the file time of any combination of
+-/// two comparison types from the target file's `NewerOptionType`.
+-pub struct NewerOptionMatcher {
+-    x_option: NewerOptionType,
+-    y_option: NewerOptionType,
+-    given_modification_time: SystemTime,
+-}
+-
+-impl NewerOptionMatcher {
+-    pub fn new(x_option: &str, y_option: &str, path_to_file: &str) -> Result<Self, Box<dyn Error>> {
+-        let metadata = fs::metadata(path_to_file)?;
+-        let x_option = NewerOptionType::from_str(x_option);
+-        let y_option = NewerOptionType::from_str(y_option);
+-        Ok(Self {
+-            x_option,
+-            y_option,
+-            given_modification_time: metadata.modified()?,
+-        })
+-    }
+-
+-    fn matches_impl(&self, file_info: &WalkEntry) -> Result<bool, Box<dyn Error>> {
+-        let x_option_time = self.x_option.get_file_time(file_info.metadata()?)?;
+-        let y_option_time = self.y_option.get_file_time(file_info.metadata()?)?;
+-
+-        Ok(self
+-            .given_modification_time
+-            .duration_since(x_option_time)
+-            .is_err()
+-            && self
+-                .given_modification_time
+-                .duration_since(y_option_time)
+-                .is_err())
+-    }
+-}
+-
+-impl Matcher for NewerOptionMatcher {
+-    fn matches(&self, file_info: &WalkEntry, matcher_io: &mut MatcherIO) -> bool {
+-        match self.matches_impl(file_info) {
+-            Err(e) => {
+-                writeln!(
+-                    &mut *matcher_io.deps.get_error_output().borrow_mut(),
+-                    "Error getting {:?} and {:?} time for {}: {}",
+-                    self.x_option,
+-                    self.y_option,
+-                    file_info.path().to_string_lossy(),
+-                    e
+-                )
+-                .unwrap();
+-                false
+-            }
+-            Ok(t) => t,
+-        }
+-    }
+-}
+-
+ /// This matcher checks whether files's accessed|creation|modification time is
+ /// newer than the given times.
+ pub struct NewerTimeMatcher {
+     time: i64,
+-    newer_time_type: NewerOptionType,
++    newer_time_type: FileTimestamp,
+ }
+ 
+ impl NewerTimeMatcher {
+-    pub fn new(newer_time_type: NewerOptionType, time: i64) -> Self {
++    pub fn new(newer_time_type: FileTimestamp, time: i64) -> Self {
+         Self {
+             time,
+             newer_time_type,
+@@ -423,6 +398,19 @@ mod tests {
+     use crate::find::matchers::tests::get_dir_entry_for;
+     use crate::find::tests::FakeDependencies;
+ 
++    fn resolved_newer(candidate_time: FileTimestamp, reference_time: SystemTime) -> NewerMatcher {
++        NewerMatcher {
++            candidate_time,
++            argument: 0,
++            reference: ReferenceQuery::from_surface(
++                "reference",
++                crate::find::matchers::Follow::Never,
++                crate::find::ReferenceProjection::Time(FileTimestamp::Modified),
++            ),
++            reference_time: Some(reference_time),
++        }
++    }
++
+     #[test]
+     fn newer_matcher() {
+         // this file should already exist
+@@ -436,13 +424,14 @@ mod tests {
+ 
+         let new_file = get_dir_entry_for(&temp_dir_path, new_file_name);
+ 
+-        let matcher_for_new = NewerMatcher::new(
+-            &temp_dir.path().join(new_file_name).to_string_lossy(),
+-            Follow::Never,
+-        )
+-        .unwrap();
+-        let matcher_for_old =
+-            NewerMatcher::new(&old_file.path().to_string_lossy(), Follow::Never).unwrap();
++        let matcher_for_new = resolved_newer(
++            FileTimestamp::Modified,
++            new_file.metadata().unwrap().modified().unwrap(),
++        );
++        let matcher_for_old = resolved_newer(
++            FileTimestamp::Modified,
++            old_file.metadata().unwrap().modified().unwrap(),
++        );
+         let deps = FakeDependencies::new();
+ 
+         assert!(
+@@ -728,37 +717,32 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn newer_option_matcher() {
++    fn newer_matcher_uses_only_the_selected_candidate_time() {
+         let options = [
+-            "a",
++            FileTimestamp::Accessed,
+             #[cfg(not(target_os = "linux"))]
+-            "B",
++            FileTimestamp::Birthed,
+             #[cfg(unix)]
+-            "c",
+-            "m",
++            FileTimestamp::Changed,
++            FileTimestamp::Modified,
+         ];
+ 
+-        for x_option in options {
+-            for y_option in options {
+-                let temp_dir = Builder::new().prefix("example").tempdir().unwrap();
+-                let temp_dir_path = temp_dir.path().to_string_lossy();
+-                let new_file_name = "newFile";
+-                // this has just been created, so should be newer
+-                File::create(temp_dir.path().join(new_file_name)).expect("create temp file");
+-                let new_file = get_dir_entry_for(&temp_dir_path, new_file_name);
+-                // this file should already exist
+-                let old_file = get_dir_entry_for("test_data", "simple");
+-                let deps = FakeDependencies::new();
+-                let matcher =
+-                    NewerOptionMatcher::new(x_option, y_option, &old_file.path().to_string_lossy());
+-
+-                assert!(
+-                    matcher
+-                        .unwrap()
+-                        .matches(&new_file, &mut deps.new_matcher_io()),
+-                    "new_file should be newer than old_dir"
+-                );
+-            }
++        for candidate_time in options {
++            let temp_dir = Builder::new().prefix("example").tempdir().unwrap();
++            let temp_dir_path = temp_dir.path().to_string_lossy();
++            let new_file_name = "newFile";
++            File::create(temp_dir.path().join(new_file_name)).expect("create temp file");
++            let new_file = get_dir_entry_for(&temp_dir_path, new_file_name);
++            let old_file = get_dir_entry_for("test_data", "simple");
++            let deps = FakeDependencies::new();
++            let matcher = resolved_newer(
++                candidate_time,
++                old_file.metadata().unwrap().modified().unwrap(),
++            );
++            assert!(
++                matcher.matches(&new_file, &mut deps.new_matcher_io()),
++                "new file's selected timestamp should be newer than old reference"
++            );
+         }
+     }
+ 
+@@ -774,7 +758,7 @@ mod tests {
+             .try_into()
+             .unwrap();
+ 
+-        let created_matcher = NewerTimeMatcher::new(NewerOptionType::Birthed, time);
++        let created_matcher = NewerTimeMatcher::new(FileTimestamp::Birthed, time);
+ 
+         thread::sleep(Duration::from_millis(100));
+         let temp_dir = Builder::new()
+@@ -793,7 +777,7 @@ mod tests {
+         );
+ 
+         // accessed time test
+-        let accessed_matcher = NewerTimeMatcher::new(NewerOptionType::Accessed, time);
++        let accessed_matcher = NewerTimeMatcher::new(FileTimestamp::Accessed, time);
+         let mut buffer = [0; 10];
+         {
+             let mut file = File::open(&foo_path).expect("open temp file");
+@@ -805,7 +789,7 @@ mod tests {
+         );
+ 
+         // modified time test
+-        let modified_matcher = NewerTimeMatcher::new(NewerOptionType::Modified, time);
++        let modified_matcher = NewerTimeMatcher::new(FileTimestamp::Modified, time);
+         let buffer = [0; 10];
+         let mut file = OpenOptions::new()
+             .read(true)
+@@ -821,7 +805,7 @@ mod tests {
+ 
+         #[cfg(unix)]
+         {
+-            let inode_changed_matcher = NewerTimeMatcher::new(NewerOptionType::Changed, time);
++            let inode_changed_matcher = NewerTimeMatcher::new(FileTimestamp::Changed, time);
+             // Steps to change inode:
+             // 1. Copy and rename the file
+             // 2. Delete the old file
+diff --git a/src/find/mod.rs b/src/find/mod.rs
+index cfb2b9a..9042448 100644
+--- a/src/find/mod.rs
++++ b/src/find/mod.rs
+@@ -20,6 +20,7 @@ use std::os::unix::ffi::OsStringExt;
+ use std::path::{Path, PathBuf};
+ use std::rc::Rc;
+ use std::time::SystemTime;
++use uucore::fs::FileInformation;
+ use walkdir::WalkDir;
+ 
+ /// Operations committed after the complete command line has parsed.
+@@ -31,6 +32,107 @@ pub trait FindOperations {
+     fn create_output(&self, path: &std::path::Path) -> io::Result<std::fs::File>;
+ }
+ 
++/// The logical namespace in which a matcher reference operand is interpreted.
++#[derive(Clone, Debug, Eq, PartialEq)]
++pub enum ReferenceSource {
++    LogicalCwdPath(PathBuf),
++    AbsolutePath(PathBuf),
++}
++
++/// How a command-line reference operand treats a final symbolic link.
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub enum ReferenceFollow {
++    LinkItself,
++    ReferentWithLinkFallback,
++}
++
++impl ReferenceFollow {
++    pub(crate) fn from_find_follow(follow: Follow) -> Self {
++        if follow == Follow::Never {
++            Self::LinkItself
++        } else {
++            Self::ReferentWithLinkFallback
++        }
++    }
++}
++
++/// The single value a matcher needs from its reference entry.
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub enum ReferenceProjection {
++    Time(matchers::time::FileTimestamp),
++    FileIdentity,
++}
++
++/// A pure unique-entry-or-fail dependency produced by the Find parser.
++#[derive(Clone, Debug, Eq, PartialEq)]
++pub struct ReferenceQuery {
++    pub source: ReferenceSource,
++    pub follow: ReferenceFollow,
++    pub projection: ReferenceProjection,
++}
++
++impl ReferenceQuery {
++    pub(crate) fn from_surface(
++        surface: &str,
++        follow: Follow,
++        projection: ReferenceProjection,
++    ) -> Self {
++        let path = PathBuf::from(surface);
++        let source = if path.is_absolute() {
++            ReferenceSource::AbsolutePath(path)
++        } else {
++            ReferenceSource::LogicalCwdPath(path)
++        };
++        Self {
++            source,
++            follow: ReferenceFollow::from_find_follow(follow),
++            projection,
++        }
++    }
++}
++
++/// Opaque, comparable identity of one filesystem entry.
++pub struct ReferenceFileIdentity(FileInformation);
++
++impl std::fmt::Debug for ReferenceFileIdentity {
++    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        formatter.write_str("ReferenceFileIdentity(..)")
++    }
++}
++
++impl PartialEq for ReferenceFileIdentity {
++    fn eq(&self, other: &Self) -> bool {
++        self.0 == other.0
++    }
++}
++
++impl Eq for ReferenceFileIdentity {}
++
++impl ReferenceFileIdentity {
++    pub(crate) fn from_path(path: &Path, follow: ReferenceFollow) -> io::Result<Self> {
++        if follow == ReferenceFollow::ReferentWithLinkFallback {
++            if let Ok(info) = FileInformation::from_path(path, true) {
++                return Ok(Self(info));
++            }
++        }
++        FileInformation::from_path(path, false).map(Self)
++    }
++}
++
++/// Terse immutable result of resolving one [`ReferenceQuery`].
++#[derive(Debug, Eq, PartialEq)]
++pub enum ReferenceValue {
++    Time(SystemTime),
++    FileIdentity(ReferenceFileIdentity),
++}
++
++/// The query is repeated so a pending matcher can reject unrelated evidence.
++#[derive(Debug, Eq, PartialEq)]
++pub struct ReferenceObservation {
++    pub query: ReferenceQuery,
++    pub value: ReferenceValue,
++}
++
+ /// An external value required to turn a parsed find invocation into an
+ /// executable plan. Parsing only constructs this value; it never reads it.
+ #[derive(Clone, Debug, Eq, PartialEq)]
+@@ -85,6 +187,10 @@ pub struct Files0Observation {
+ /// mutations such as creating output files.
+ pub trait FindContext {
+     fn observe_files0(&self, query: &Files0Query) -> Result<Files0Observation, Box<dyn Error>>;
++    fn observe_reference(
++        &self,
++        query: &ReferenceQuery,
++    ) -> Result<ReferenceObservation, Box<dyn Error>>;
+ }
+ 
+ struct DependencyFindOperations<'a> {
+@@ -143,6 +249,36 @@ impl FindContext for DependencyFindContext<'_> {
+             bytes,
+         })
+     }
++
++    fn observe_reference(
++        &self,
++        query: &ReferenceQuery,
++    ) -> Result<ReferenceObservation, Box<dyn Error>> {
++        let path = match &query.source {
++            ReferenceSource::LogicalCwdPath(path) => self
++                .dependencies
++                .cwd()
++                .map_or_else(|| path.clone(), |cwd| cwd.join(path)),
++            ReferenceSource::AbsolutePath(path) => path.clone(),
++        };
++        let value = match query.projection {
++            ReferenceProjection::Time(timestamp) => {
++                let metadata = if query.follow == ReferenceFollow::ReferentWithLinkFallback {
++                    std::fs::metadata(&path).or_else(|_| std::fs::symlink_metadata(&path))?
++                } else {
++                    std::fs::symlink_metadata(&path)?
++                };
++                ReferenceValue::Time(timestamp.get_file_time(&metadata)?)
++            }
++            ReferenceProjection::FileIdentity => ReferenceValue::FileIdentity(
++                ReferenceFileIdentity::from_path(&path, query.follow)?,
++            ),
++        };
++        Ok(ReferenceObservation {
++            query: query.clone(),
++            value,
++        })
++    }
+ }
+ 
+ pub struct Config {
+@@ -375,6 +511,7 @@ trait ParseObserver {
+         _argument: usize,
+         _surface: &str,
+         _file_type_predicate: Option<&syntax::FileTypePredicate>,
++        _reference_predicate: Option<syntax::ReferencePredicateIdentity>,
+     ) -> bool {
+         true
+     }
+@@ -407,6 +544,29 @@ trait ParseObserver {
+     fn files0_source(&mut self, _argument: usize, _surface: &str) {}
+ 
+     fn missing_files0_source(&mut self, _argument: usize) {}
++
++    fn reference_predicate(
++        &mut self,
++        _argument: usize,
++        _surface: &str,
++        _predicate: syntax::ReferencePredicateIdentity,
++    ) {
++    }
++
++    fn reference_operand(
++        &mut self,
++        _argument: usize,
++        _predicate: syntax::ReferencePredicateIdentity,
++        _surface: &str,
++    ) {
++    }
++
++    fn missing_reference_operand(
++        &mut self,
++        _argument: usize,
++        _predicate: syntax::ReferencePredicateIdentity,
++    ) {
++    }
+ }
+ 
+ struct IgnoreParseObservations;
+@@ -506,7 +666,11 @@ fn parse_args_observed(
+ }
+ 
+ impl ParsedInfo {
+-    fn resolve(self, context: &dyn FindContext) -> Result<PreparedInfo, Box<dyn Error>> {
++    fn resolve(mut self, context: &dyn FindContext) -> Result<PreparedInfo, Box<dyn Error>> {
++        // Reference metadata is immutable and replayable. Resolve the complete
++        // matcher tree before consuming a possibly linear -files0-from stream,
++        // and before FindOperations can create any output resource.
++        self.matcher.resolve_context(context)?;
+         let (paths, diagnostics, initial_exit_code) = match &self.starting_points {
+             StartingPoints::Default => (vec![PathBuf::from(".")], Vec::new(), 0),
+             StartingPoints::Explicit(paths) => (paths.clone(), Vec::new(), 0),
+@@ -1038,6 +1202,123 @@ mod tests {
+             .expect("parsing should fail");
+     }
+ 
++    struct RecordingReferenceContext {
++        queries: RefCell<Vec<ReferenceQuery>>,
++        mismatch: bool,
++    }
++
++    impl RecordingReferenceContext {
++        fn new() -> Self {
++            Self {
++                queries: RefCell::new(Vec::new()),
++                mismatch: false,
++            }
++        }
++    }
++
++    impl FindContext for RecordingReferenceContext {
++        fn observe_files0(
++            &self,
++            _query: &Files0Query,
++        ) -> Result<Files0Observation, Box<dyn Error>> {
++            panic!("reference tests must not resolve -files0-from")
++        }
++
++        fn observe_reference(
++            &self,
++            query: &ReferenceQuery,
++        ) -> Result<ReferenceObservation, Box<dyn Error>> {
++            self.queries.borrow_mut().push(query.clone());
++            let mut observed_query = query.clone();
++            if self.mismatch {
++                observed_query.source = ReferenceSource::AbsolutePath(PathBuf::from("/mismatch"));
++            }
++            Ok(ReferenceObservation {
++                query: observed_query,
++                value: ReferenceValue::Time(SystemTime::UNIX_EPOCH),
++            })
++        }
++    }
++
++    #[test]
++    fn reference_parse_and_probe_do_not_read_missing_paths() {
++        for predicate in ["-newer", "-anewer", "-cnewer", "-newerma", "-samefile"] {
++            parse_args(&[".", predicate, "/definitely/missing/reference"])
++                .unwrap_or_else(|error| panic!("{predicate} performed parse-time work: {error}"));
++            let output = probe::probe(&[
++                probe::ProbeArgument::Exact("."),
++                probe::ProbeArgument::Exact(predicate),
++                probe::ProbeArgument::Exact("/definitely/missing/reference"),
++            ]);
++            assert_eq!(output.status, probe::ProbeStatus::Complete, "{predicate}");
++        }
++    }
++
++    #[test]
++    fn help_and_syntax_failure_do_not_resolve_reference_paths() {
++        let deps = FakeDependencies::new();
++        assert_eq!(
++            find_main(
++                &["find", ".", "-newer", "/definitely/missing/reference", "-help"],
++                &deps,
++            ),
++            0
++        );
++
++        let deps = FakeDependencies::new();
++        assert_eq!(
++            find_main(
++                &[
++                    "find",
++                    ".",
++                    "-newer",
++                    "/definitely/missing/reference",
++                    "-and",
++                ],
++                &deps,
++            ),
++            1
++        );
++        assert!(!deps
++            .get_error_output_as_string()
++            .contains("No such file or directory"));
++    }
++
++    #[test]
++    fn reference_resolution_visits_every_nested_logical_branch() {
++        let parsed = parse_args(&[
++            ".", "(", "-newer", "a", "-o", "!", "(", "-newerma", "b", ",",
++            "-cnewer", "c", ")", ")",
++        ])
++        .unwrap();
++        let context = RecordingReferenceContext::new();
++        parsed.resolve(&context).unwrap();
++        assert_eq!(
++            context
++                .queries
++                .borrow()
++                .iter()
++                .map(|query| query.source.clone())
++                .collect::<Vec<_>>(),
++            [
++                ReferenceSource::LogicalCwdPath(PathBuf::from("a")),
++                ReferenceSource::LogicalCwdPath(PathBuf::from("b")),
++                ReferenceSource::LogicalCwdPath(PathBuf::from("c")),
++            ]
++        );
++    }
++
++    #[test]
++    fn reference_observation_must_match_its_query() {
++        let parsed = parse_args(&[".", "-newer", "reference"]).unwrap();
++        let context = RecordingReferenceContext {
++            queries: RefCell::new(Vec::new()),
++            mismatch: true,
++        };
++        let error = parsed.resolve(&context).err().expect("mismatch must fail");
++        assert!(error.to_string().contains("does not match its query"));
++    }
++
+     #[test]
+     fn files0_parse_produces_an_unresolved_query() {
+         let parsed = parse_args(&["-files0-from", "roots0"]).expect("parsing should succeed");
+@@ -1177,6 +1458,35 @@ mod tests {
+         assert_eq!(fs::read(&output).unwrap(), b"keep me");
+     }
+ 
++    #[test]
++    fn nested_reference_failure_does_not_truncate_output_action() {
++        let temp_dir = Builder::new().prefix("find-reference-output-failure").tempdir().unwrap();
++        let output = temp_dir.path().join("kept");
++        fs::write(&output, b"keep me").unwrap();
++        let output_text = output.to_string_lossy();
++
++        let deps = FakeDependencies::new();
++        let rc = find_main(
++            &[
++                "find",
++                ".",
++                "-fprint",
++                output_text.as_ref(),
++                ",",
++                "(",
++                "-false",
++                "-o",
++                "-newer",
++                "/definitely/missing/reference",
++                ")",
++            ],
++            &deps,
++        );
++
++        assert_eq!(rc, 1);
++        assert_eq!(fs::read(&output).unwrap(), b"keep me");
++    }
++
+     #[test]
+     fn help_after_output_action_does_not_truncate() {
+         let temp_dir = Builder::new().prefix("find-output-help").tempdir().unwrap();
+@@ -1658,6 +1968,115 @@ mod tests {
+         assert_eq!(deps.get_output_as_string(), "");
+     }
+ 
++    #[test]
++    fn reference_predicates_resolve_relative_to_logical_cwd() {
++        let root = Builder::new().prefix("find-reference-cwd").tempdir().unwrap();
++        fs::write(root.path().join("reference"), b"").unwrap();
++        std::thread::sleep(Duration::from_millis(50));
++        fs::write(root.path().join("candidate"), b"").unwrap();
++
++        for predicate in ["-newer", "-newerma"] {
++            let mut deps = FakeDependencies::new();
++            deps.set_cwd(root.path());
++            let rc = find_main(&["find", "candidate", predicate, "reference"], &deps);
++            assert_eq!(rc, 0, "{predicate}");
++            assert_eq!(deps.get_output_as_string(), "candidate\n", "{predicate}");
++        }
++
++        let mut deps = FakeDependencies::new();
++        deps.set_cwd(root.path());
++        let rc = find_main(&["find", "candidate", "-samefile", "candidate"], &deps);
++        assert_eq!(rc, 0);
++        assert_eq!(deps.get_output_as_string(), "candidate\n");
++    }
++
++    #[test]
++    fn newer_xy_query_requests_exact_reference_y_projection() {
++        let parsed = parse_args(&[".", "-newerma", "reference"]).unwrap();
++        let context = RecordingReferenceContext::new();
++        parsed.resolve(&context).unwrap();
++        assert_eq!(
++            context.queries.borrow()[0].projection,
++            ReferenceProjection::Time(matchers::time::FileTimestamp::Accessed)
++        );
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn reference_follow_modes_and_temporal_follow_match_gnu() {
++        let root = Builder::new().prefix("find-reference-follow").tempdir().unwrap();
++        fs::write(root.path().join("target"), b"").unwrap();
++        std::thread::sleep(Duration::from_millis(50));
++        fs::write(root.path().join("candidate"), b"").unwrap();
++        std::thread::sleep(Duration::from_millis(50));
++        symlink("target", root.path().join("reference-link")).unwrap();
++
++        let run = |args: &[&str]| {
++            let mut deps = FakeDependencies::new();
++            deps.set_cwd(root.path());
++            let rc = find_main(args, &deps);
++            assert_eq!(rc, 0, "{args:?}: {}", deps.get_error_output_as_string());
++            deps.get_output_as_string()
++        };
++
++        assert_eq!(
++            run(&["find", "-P", "candidate", "-newer", "reference-link"]),
++            ""
++        );
++        assert_eq!(
++            run(&["find", "-H", "candidate", "-newer", "reference-link"]),
++            "candidate\n"
++        );
++        assert_eq!(
++            run(&["find", "-L", "candidate", "-newerma", "reference-link"]),
++            "candidate\n"
++        );
++        assert_eq!(
++            run(&["find", "candidate", "-newer", "reference-link", "-follow"]),
++            ""
++        );
++        assert_eq!(
++            run(&["find", "candidate", "-follow", "-newer", "reference-link"]),
++            "candidate\n"
++        );
++
++        assert_eq!(
++            run(&["find", "-P", "target", "-samefile", "reference-link"]),
++            ""
++        );
++        assert_eq!(
++            run(&["find", "-H", "target", "-samefile", "reference-link"]),
++            "target\n"
++        );
++        assert_eq!(
++            run(&["find", "-L", "target", "-samefile", "reference-link"]),
++            "target\n"
++        );
++        assert_eq!(
++            run(&["find", "target", "-samefile", "reference-link", "-follow"]),
++            ""
++        );
++        assert_eq!(
++            run(&["find", "target", "-follow", "-samefile", "reference-link"]),
++            "target\n"
++        );
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn followed_broken_reference_falls_back_to_link_itself() {
++        let root = Builder::new().prefix("find-reference-broken").tempdir().unwrap();
++        symlink("missing-target", root.path().join("broken")).unwrap();
++        std::thread::sleep(Duration::from_millis(50));
++        fs::write(root.path().join("candidate"), b"").unwrap();
++
++        let mut deps = FakeDependencies::new();
++        deps.set_cwd(root.path());
++        let rc = find_main(&["find", "-H", "candidate", "-newer", "broken"], &deps);
++        assert_eq!(rc, 0, "{}", deps.get_error_output_as_string());
++        assert_eq!(deps.get_output_as_string(), "candidate\n");
++    }
++
+     #[test]
+     fn find_mtime() {
+         let meta = fs::metadata("./test_data/simple/subdir/ABBBC").unwrap();
+@@ -1909,12 +2328,13 @@ mod tests {
+ 
+                 assert_eq!(rc, 0);
+ 
+-                let arg = &format!("-follow -newer{x}{y}").to_string();
++                let arg = &format!("-newer{x}{y}").to_string();
+                 let deps = FakeDependencies::new();
+                 let rc = find_main(
+                     &[
+                         "find",
+                         "./test_data/simple/subdir",
++                        "-follow",
+                         arg,
+                         "./test_data/simple/subdir/ABBBC",
+                     ],
+@@ -1929,9 +2349,8 @@ mod tests {
+     #[test]
+     #[cfg(target_os = "linux")]
+     fn test_find_newer_xy_have_not_birthed_time_filesystem() {
+-        let y_options = ["a", "c", "m"];
+-        for &y in &y_options {
+-            let arg = &format!("-newerB{y}").to_string();
++        let args = ["-newerBa", "-newerBc", "-newerBm", "-neweraB", "-newercB", "-newermB"];
++        for arg in args {
+             let deps = FakeDependencies::new();
+             let rc = find_main(
+                 &[
+diff --git a/src/find/probe.rs b/src/find/probe.rs
+index 20cfb21..8a1a33e 100644
+--- a/src/find/probe.rs
++++ b/src/find/probe.rs
+@@ -1,12 +1,13 @@
+ //! Effect-free argument probing through find's execution parser.
+ //!
+-//! This deliberately covers only starting paths and `-type`/`-xtype`. Every
+-//! other expression is stopped before its parser arm can perform work and is
+-//! reported as [`ProbeStatus::Unsupported`].
++//! This deliberately covers only parser arms whose construction is effect-free:
++//! starting paths, `-files0-from`, `-type`/`-xtype`, and file-reference tests.
++//! Every other expression is stopped before its parser arm can perform work.
+ 
+ use super::matchers::FileType;
+ use super::syntax::{
+-    FileTypePredicate, FileTypePredicateIdentity, FileTypeValue, FILE_TYPE_PREDICATES,
++    FileTypePredicate, FileTypePredicateIdentity, FileTypeValue, ReferencePredicateIdentity,
++    FILE_TYPE_PREDICATES, REFERENCE_PREDICATE_SPELLINGS,
+ };
+ use super::{parse_args_observed, ParseObserver};
+ use std::collections::HashSet;
+@@ -34,6 +35,8 @@ pub enum ArgumentIdentity {
+         predicate: FileTypePredicateIdentity,
+         value: FileType,
+     },
++    ReferencePredicate(ReferencePredicateIdentity),
++    ReferenceOperand(ReferencePredicateIdentity),
+ }
+ 
+ #[derive(Clone, Debug, Eq, PartialEq)]
+@@ -48,6 +51,8 @@ pub enum Expectation {
+     Files0Source,
+     FileTypePredicate,
+     FileTypeValue(FileTypePredicateIdentity),
++    ReferencePredicate,
++    ReferenceOperand(ReferencePredicateIdentity),
+ }
+ 
+ #[derive(Clone, Debug, Eq, PartialEq)]
+@@ -106,8 +111,9 @@ impl ParseObserver for Recorder {
+         argument: usize,
+         _surface: &str,
+         file_type_predicate: Option<&FileTypePredicate>,
++        reference_predicate: Option<ReferencePredicateIdentity>,
+     ) -> bool {
+-        if file_type_predicate.is_some() {
++        if file_type_predicate.is_some() || reference_predicate.is_some() {
+             true
+         } else {
+             self.unsupported = Some(argument);
+@@ -165,6 +171,41 @@ impl ParseObserver for Recorder {
+         self.expectations
+             .push((argument, Expectation::Files0Source));
+     }
++
++    fn reference_predicate(
++        &mut self,
++        argument: usize,
++        _surface: &str,
++        predicate: ReferencePredicateIdentity,
++    ) {
++        self.matches.push(ArgumentMatch {
++            argument,
++            identity: ArgumentIdentity::ReferencePredicate(predicate),
++        });
++    }
++
++    fn reference_operand(
++        &mut self,
++        argument: usize,
++        predicate: ReferencePredicateIdentity,
++        _surface: &str,
++    ) {
++        self.expectations
++            .push((argument, Expectation::ReferenceOperand(predicate)));
++        self.matches.push(ArgumentMatch {
++            argument,
++            identity: ArgumentIdentity::ReferenceOperand(predicate),
++        });
++    }
++
++    fn missing_reference_operand(
++        &mut self,
++        argument: usize,
++        predicate: ReferencePredicateIdentity,
++    ) {
++        self.expectations
++            .push((argument, Expectation::ReferenceOperand(predicate)));
++    }
+ }
+ 
+ fn replay(arguments: &[String]) -> (bool, Recorder) {
+@@ -377,6 +418,70 @@ fn assist(arguments: &[ProbeArgument<'_>], tear: usize) -> ProbeOutput {
+         });
+     }
+ 
++    // Common file-reference predicate spellings are replayed through their
++    // actual arms. Mechanically encoded -newerXY forms remain accepted on
++    // exact input without requiring a second spelling catalog here.
++    for (surface, help) in REFERENCE_PREDICATE_SPELLINGS {
++        let Some(predicate) = super::syntax::reference_predicate(surface) else {
++            continue;
++        };
++        let (_, recorder) = replay(&replace_tear(arguments, tear, surface));
++        unsupported_outside_tear |= recorder
++            .unsupported
++            .is_some_and(|argument| argument != tear);
++        let identity = ArgumentIdentity::ReferencePredicate(predicate);
++        if recorder.unsupported.is_some() || !recorder.has(tear, identity) {
++            continue;
++        }
++        proved_role = true;
++        output.expectations.push(Expectation::ReferencePredicate);
++        if output.matches.is_empty() {
++            output.matches.clone_from(&recorder.matches);
++        }
++        let Some(insertion) = compatible_insertion(prefix, suffix, surface) else {
++            continue;
++        };
++        if !seen_insertions.insert(insertion.to_owned()) {
++            continue;
++        }
++        output.completions.push(Completion {
++            insertion: insertion.to_owned(),
++            display: surface,
++            help,
++            identity,
++            matches: recorder.matches,
++        });
++    }
++
++    // A reference operand can name any filesystem entry. Replay a harmless
++    // representative surface only to prove the grammar role; no metadata is
++    // resolved by the parser or probe.
++    let reference_surface = if prefix.is_empty() && suffix.is_empty() {
++        ".".to_owned()
++    } else {
++        format!("{prefix}{suffix}")
++    };
++    let (_, reference_recorder) = replay(&replace_tear(
++        arguments,
++        tear,
++        &reference_surface,
++    ));
++    unsupported_outside_tear |= reference_recorder
++        .unsupported
++        .is_some_and(|argument| argument != tear);
++    for (_, expectation) in &reference_recorder.expectations {
++        let Expectation::ReferenceOperand(predicate) = *expectation else {
++            continue;
++        };
++        proved_role = true;
++        output
++            .expectations
++            .push(Expectation::ReferenceOperand(predicate));
++        if output.matches.is_empty() {
++            output.matches.clone_from(&reference_recorder.matches);
++        }
++    }
++
+     // Replay finite operand values to let the real predicate branch establish
+     // the context. Candidate lists are then replayed through type_creator,
+     // which alone decides value validity and uniqueness.
+@@ -435,6 +540,8 @@ fn assist(arguments: &[ProbeArgument<'_>], tear: usize) -> ProbeOutput {
+             Expectation::FileTypePredicate => (2, 0),
+             Expectation::FileTypeValue(FileTypePredicateIdentity::Type) => (3, 0),
+             Expectation::FileTypeValue(FileTypePredicateIdentity::Xtype) => (3, 1),
++            Expectation::ReferencePredicate => (4, 0),
++            Expectation::ReferenceOperand(_) => (5, 0),
+         });
+     output.expectations.dedup();
+     output
+@@ -574,6 +681,41 @@ mod tests {
+         }));
+     }
+ 
++    #[test]
++    fn reference_predicates_and_operands_use_execution_parser_without_stat() {
++        for predicate in ["-newer", "-anewer", "-cnewer", "-newerma", "-samefile"] {
++            let parsed = probe(&[
++                exact("."),
++                exact(predicate),
++                exact("/definitely/missing/reference"),
++            ]);
++            assert_eq!(parsed.status, ProbeStatus::Complete, "{predicate}");
++            assert!(parsed.matches.iter().any(|matched| {
++                matched.argument == 2
++                    && matches!(matched.identity, ArgumentIdentity::ReferenceOperand(_))
++            }));
++
++            let operand = probe(&[exact("."), exact(predicate), tear("./r", "")]);
++            assert_eq!(operand.status, ProbeStatus::Incomplete, "{predicate}");
++            assert!(operand
++                .expectations
++                .iter()
++                .any(|expected| matches!(expected, Expectation::ReferenceOperand(_))));
++        }
++    }
++
++    #[test]
++    fn reference_predicate_completion_is_proved_by_actual_arm() {
++        let output = probe(&[exact("."), tear("-new", ""), exact("reference")]);
++        assert!(output.completions.iter().any(|completion| {
++            completion.display == "-newer"
++                && completion.matches.iter().any(|matched| {
++                    matched.argument == 1
++                        && matches!(matched.identity, ArgumentIdentity::ReferencePredicate(_))
++                })
++        }));
++    }
++
+     #[test]
+     fn unsupported_expression_is_stopped_before_its_arm() {
+         for arguments in [
+diff --git a/src/find/syntax.rs b/src/find/syntax.rs
+index 583a4df..b3fde35 100644
+--- a/src/find/syntax.rs
++++ b/src/find/syntax.rs
+@@ -5,6 +5,7 @@
+ //! the same values an importer sees; this is not a second help/completion table.
+ 
+ use super::matchers::FileType;
++use super::matchers::time::FileTimestamp;
+ 
+ /// Stable semantic identity of a file-type predicate.
+ #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+@@ -103,6 +104,74 @@ pub fn file_type_value(surface: &str) -> Option<&'static FileTypeValue> {
+         .find(|value| value.surface == surface)
+ }
+ 
++/// Semantic identity of a predicate whose operand names one filesystem entry.
++#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
++pub enum ReferencePredicateIdentity {
++    Newer {
++        candidate: FileTimestamp,
++        reference: FileTimestamp,
++    },
++    SameFile,
++}
++
++/// Parsed meaning of the mechanically encoded `-newerXY` family.
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub struct NewerPredicateIdentity {
++    pub candidate: FileTimestamp,
++    /// `None` is the `Y=t` textual-time form, which has no filesystem reference.
++    pub reference: Option<FileTimestamp>,
++}
++
++/// Parse `-newer`, its GNU short spellings, and the exact `-newerXY` encoding.
++pub fn newer_predicate(surface: &str) -> Option<NewerPredicateIdentity> {
++    let (candidate, reference) = match surface {
++        "-newer" => (FileTimestamp::Modified, FileTimestamp::Modified),
++        "-anewer" => (FileTimestamp::Accessed, FileTimestamp::Modified),
++        "-cnewer" => (FileTimestamp::Changed, FileTimestamp::Modified),
++        _ => {
++            let encoded = surface.strip_prefix("-newer")?;
++            if encoded.len() != 2 || !encoded.is_ascii() {
++                return None;
++            }
++            let candidate = FileTimestamp::from_code(&encoded[0..1])?;
++            let reference = if &encoded[1..2] == "t" {
++                None
++            } else {
++                Some(FileTimestamp::from_code(&encoded[1..2])?)
++            };
++            return Some(NewerPredicateIdentity {
++                candidate,
++                reference,
++            });
++        }
++    };
++    Some(NewerPredicateIdentity {
++        candidate,
++        reference: Some(reference),
++    })
++}
++
++/// Return only predicates whose operand is an external filesystem reference.
++pub fn reference_predicate(surface: &str) -> Option<ReferencePredicateIdentity> {
++    if surface == "-samefile" {
++        return Some(ReferencePredicateIdentity::SameFile);
++    }
++    let newer = newer_predicate(surface)?;
++    Some(ReferencePredicateIdentity::Newer {
++        candidate: newer.candidate,
++        reference: newer.reference?,
++    })
++}
++
++/// Common finite predicate spellings offered by syntax assistance. Exact
++/// `-newerXY` encodings are still accepted mechanically by `newer_predicate`.
++pub static REFERENCE_PREDICATE_SPELLINGS: &[(&str, &str)] = &[
++    ("-newer", "compare modification time with a reference entry"),
++    ("-anewer", "compare access time with a reference entry's modification time"),
++    ("-cnewer", "compare status-change time with a reference entry's modification time"),
++    ("-samefile", "match the same filesystem entry as a reference path"),
++];
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -130,4 +199,32 @@ mod tests {
+                 && predicate.values_must_be_unique
+         }));
+     }
++
++    #[test]
++    fn newer_encoding_is_exact_and_typed() {
++        assert_eq!(
++            newer_predicate("-newer"),
++            Some(NewerPredicateIdentity {
++                candidate: FileTimestamp::Modified,
++                reference: Some(FileTimestamp::Modified),
++            })
++        );
++        assert_eq!(
++            newer_predicate("-anewer"),
++            Some(NewerPredicateIdentity {
++                candidate: FileTimestamp::Accessed,
++                reference: Some(FileTimestamp::Modified),
++            })
++        );
++        assert_eq!(
++            newer_predicate("-newerct"),
++            Some(NewerPredicateIdentity {
++                candidate: FileTimestamp::Changed,
++                reference: None,
++            })
++        );
++        assert!(newer_predicate("-newermm-extra").is_none());
++        assert!(newer_predicate("-newertm").is_none());
++        assert!(newer_predicate("-newerzz").is_none());
++    }
+ }

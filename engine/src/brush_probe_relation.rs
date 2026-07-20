@@ -1204,6 +1204,35 @@ mod tests {
     }
 
     #[test]
+    fn find_reference_operand_uses_any_path_context_without_reading_it() {
+        for predicate in ["-newer", "-newerma", "-samefile"] {
+            let predicate_end = 7 + predicate.len();
+            let tear_start = predicate_end + 1;
+            let argv = argv(vec![
+                literal_word(0, "find"),
+                literal_word(5, "."),
+                literal_word(7, predicate),
+                word(
+                    tear_start,
+                    tear_start + 3,
+                    vec![tear(tear_start, tear_start + 3, "./r")],
+                ),
+            ]);
+            let pending = BuiltinProbeAdapter
+                .transform(&request(argv, &["status", "completions"]))
+                .unwrap();
+            let graph =
+                crate::prolog::context_query_nodes_from_values(&pending.context_queries).unwrap();
+            assert_eq!(graph.len(), 1, "{predicate}");
+            assert_eq!(
+                graph[0].query.domain,
+                RelationValue::Atom("filesystem_path".into()),
+                "{predicate}"
+            );
+        }
+    }
+
+    #[test]
     fn context_candidates_must_replay_as_the_requested_parser_argument() {
         let at_tear = ProbeAtTear {
             input: BuiltinParserInput {
