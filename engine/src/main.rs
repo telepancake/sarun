@@ -188,6 +188,10 @@ fn serve() -> i32 {
             return 1;
         }
     };
+    if let Err(e) = paths::recover_legacy_host_visible_fuse_mount() {
+        eprintln!("sarun-engine: cannot recover legacy FUSE mount: {e}");
+        return 1;
+    }
     if let Err(e) = paths::ensure_dirs() {
         eprintln!("sarun-engine: cannot create instance dirs: {e}");
         return 1;
