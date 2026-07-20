@@ -223,13 +223,8 @@ fn broker_executable() -> io::Result<PathBuf> {
 pub fn enter_runner_namespace() -> io::Result<()> {
     let mut broker = UnixStream::connect(crate::paths::fuse_broker_socket())?;
     broker.write_all(&[REQUEST_NAMESPACES])?;
-    let (reply, fds) = receive_fds(&broker, 2)?;
-    if reply.first() != Some(&REPLY_READY) || fds.len() != 2 {
-        return Err(io::Error::other("invalid FUSE namespace handoff"));
-    }
-    let id_map = reply.get(1).copied()
-        .and_then(IdMapKind::from_reply)
-        .unwrap_or(IdMapKind::Canonical);
+    let (reply, fds) = receive_exact_fds(&broker, 2, 2)?;
+    let id_map = decode_namespace_handoff(&reply, fds.len())?;
     unsafe { std::env::set_var(ID_MAP_KIND_ENV, id_map.env_value()) };
     let user = &fds[0];
     let mount = &fds[1];
@@ -652,7 +647,12 @@ fn broker_loop(control: &mut UnixStream, listener: &UnixListener) -> io::Result<
                 .ok()
                 .as_deref()
                 .and_then(IdMapKind::from_env_value)
-                .unwrap_or(IdMapKind::Canonical);
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "FUSE broker has no valid ID-map selection",
+                    )
+                })?;
             send_fds(
                 &client,
                 &[REPLY_READY, id_map.reply()],
@@ -701,7 +701,16 @@ fn send_fds(socket: &UnixStream, body: &[u8], fds: &[RawFd]) -> io::Result<()> {
 
 fn receive_fds(socket: &UnixStream, expected: usize) -> io::Result<(Vec<u8>, Vec<File>)> {
     let mut body = vec![0u8; 4096];
-    let mut iov = [IoSliceMut::new(&mut body)];
+    let (bytes, received) = receive_fd_chunk(socket, &mut body)?;
+    body.truncate(bytes);
+    if received.len() > expected {
+        return Err(io::Error::other("descriptor handoff contained extra fds"));
+    }
+    Ok((body, received))
+}
+
+fn receive_fd_chunk(socket: &UnixStream, body: &mut [u8]) -> io::Result<(usize, Vec<File>)> {
+    let mut iov = [IoSliceMut::new(body)];
     let mut ancillary = nix::cmsg_space!([RawFd; 2]);
     let message = recvmsg::<SockaddrStorage>(
         socket.as_raw_fd(),
@@ -715,6 +724,12 @@ fn receive_fds(socket: &UnixStream, expected: usize) -> io::Result<(Vec<u8>, Vec
             "descriptor handoff EOF",
         ));
     }
+    if message.flags.contains(MsgFlags::MSG_CTRUNC) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "descriptor handoff control data was truncated",
+        ));
+    }
     let bytes = message.bytes;
     let mut received = Vec::new();
     for control in message.cmsgs().map_err(io::Error::other)? {
@@ -725,11 +740,63 @@ fn receive_fds(socket: &UnixStream, expected: usize) -> io::Result<(Vec<u8>, Vec
             }
         }
     }
-    body.truncate(bytes);
-    if received.len() > expected {
-        return Err(io::Error::other("descriptor handoff contained extra fds"));
+    Ok((bytes, received))
+}
+
+/// Receive one fixed-size descriptor-bearing frame from a stream socket.
+///
+/// `SCM_RIGHTS` is attached to a byte position, but a Unix stream is still a
+/// stream: the body bytes can be returned by more than one `recvmsg`.  Keep
+/// receiving until the complete typed frame is present instead of interpreting
+/// a short first read as a different (or default) reply.
+fn receive_exact_fds(
+    socket: &UnixStream,
+    body_len: usize,
+    expected_fds: usize,
+) -> io::Result<(Vec<u8>, Vec<File>)> {
+    let mut body = vec![0u8; body_len];
+    let mut offset = 0;
+    let mut received = Vec::new();
+
+    while offset < body_len {
+        let (bytes, fds) = receive_fd_chunk(socket, &mut body[offset..])?;
+        received.extend(fds);
+        if received.len() > expected_fds {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "descriptor handoff contained extra fds",
+            ));
+        }
+        offset += bytes;
+    }
+
+    if received.len() != expected_fds {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "descriptor handoff contained {} fds, expected {expected_fds}",
+                received.len()
+            ),
+        ));
     }
     Ok((body, received))
+}
+
+fn decode_namespace_handoff(reply: &[u8], descriptors: usize) -> io::Result<IdMapKind> {
+    if reply.len() != 2 || reply[0] != REPLY_READY || descriptors != 2 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "invalid FUSE namespace handoff {reply:?} with {descriptors} descriptors"
+            ),
+        ));
+    }
+    IdMapKind::from_reply(reply[1]).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unknown FUSE namespace ID-map reply byte {:#04x}", reply[1]),
+        )
+    })
 }
 
 #[cfg(test)]
@@ -769,6 +836,41 @@ mod tests {
         assert_eq!(
             IdMapKind::from_env_value(CALLER_ID_MAP),
             Some(IdMapKind::Caller)
+        );
+    }
+
+    #[test]
+    fn namespace_handoff_requires_the_map_byte_and_exact_descriptor_count() {
+        assert!(decode_namespace_handoff(&[REPLY_READY], 2).is_err());
+        assert!(decode_namespace_handoff(&[REPLY_READY, REPLY_ID_MAP], 1).is_err());
+        assert!(decode_namespace_handoff(&[REPLY_READY, REPLY_ID_MAP], 3).is_err());
+    }
+
+    #[test]
+    fn namespace_handoff_rejects_unknown_map_kind_instead_of_defaulting() {
+        let error = decode_namespace_handoff(&[REPLY_READY, b'?'], 2).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("unknown FUSE namespace ID-map"));
+    }
+
+    #[test]
+    fn namespace_handoff_assembles_a_split_stream_frame() {
+        let (receiver, mut sender) = UnixStream::pair().unwrap();
+        let first = File::open("/dev/null").unwrap();
+        let second = File::open("/dev/null").unwrap();
+        send_fds(
+            &sender,
+            &[REPLY_READY],
+            &[first.as_raw_fd(), second.as_raw_fd()],
+        )
+        .unwrap();
+        let writer = std::thread::spawn(move || sender.write_all(&[IdMapKind::Caller.reply()]));
+
+        let (reply, fds) = receive_exact_fds(&receiver, 2, 2).unwrap();
+        writer.join().unwrap().unwrap();
+        assert_eq!(
+            decode_namespace_handoff(&reply, fds.len()).unwrap(),
+            IdMapKind::Caller
         );
     }
 
