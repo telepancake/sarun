@@ -269,7 +269,18 @@ fn timestamp(value: SystemTime) -> (u64, u32) {
         .unwrap_or((0, 0))
 }
 
-pub(crate) fn virtio_attr(attr: NodeAttr) -> virtiofsd::fuse::Attr {
+pub(crate) fn virtio_attr(
+    mut attr: NodeAttr,
+    protocol_has_single_identity: bool,
+) -> virtiofsd::fuse::Attr {
+    if protocol_has_single_identity {
+        // A caller-only broker maps its sole protocol uid/gid 0 to the invoking
+        // host user. Project visible owners to that representable identity for
+        // kernel permission checks; canonical owners remain in NodeAttr and
+        // mutation storage and therefore are not discarded.
+        attr.uid = 0;
+        attr.gid = 0;
+    }
     let (atime, atimensec) = timestamp(attr.atime);
     let (mtime, mtimensec) = timestamp(attr.mtime);
     let (ctime, ctimensec) = timestamp(attr.ctime);
@@ -382,7 +393,7 @@ mod tests {
     #[test]
     fn protocol_attributes_are_a_projection_of_one_canonical_value() {
         let canonical = attr(NodeKind::RegularFile);
-        let virtio = virtio_attr(canonical);
+        let virtio = virtio_attr(canonical, false);
         assert_eq!(virtio.ino, canonical.inode);
         assert_eq!(canonical.size, virtio.size);
         assert_eq!(canonical.blocks, virtio.blocks);
@@ -390,6 +401,16 @@ mod tests {
         assert_eq!(canonical.uid, virtio.uid.into_inner());
         assert_eq!(canonical.gid, virtio.gid.into_inner());
         assert_eq!(virtio.mode & libc::S_IFMT, libc::S_IFREG);
+    }
+
+    #[test]
+    fn single_identity_protocol_projects_owners_without_changing_canonical_state() {
+        let canonical = attr(NodeKind::Directory);
+        let projected = virtio_attr(canonical, true);
+        assert_eq!(projected.uid.into_inner(), 0);
+        assert_eq!(projected.gid.into_inner(), 0);
+        assert_eq!((canonical.uid, canonical.gid), (1000, 1001));
+        assert_eq!(projected.mode & 0o7777, u32::from(canonical.perm));
     }
 
     #[test]
@@ -416,7 +437,7 @@ mod tests {
             (NodeKind::Socket, libc::S_IFSOCK),
         ];
         for (kind, mode) in cases {
-            assert_eq!(virtio_attr(attr(kind)).mode & libc::S_IFMT, mode);
+            assert_eq!(virtio_attr(attr(kind), false).mode & libc::S_IFMT, mode);
         }
     }
 

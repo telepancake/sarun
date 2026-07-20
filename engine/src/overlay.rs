@@ -117,6 +117,10 @@ pub struct SarunFs {
     root: Key,
     kernel_passthrough: Arc<std::sync::atomic::AtomicBool>,
     host_request_pids: bool,
+    /// Raw FUSE connections created in a one-ID user namespace can represent
+    /// only namespace uid/gid 0. This is per transport clone: canonical state
+    /// and virtio-fs guests retain their full numeric owners.
+    protocol_has_single_identity: bool,
 }
 
 /// Transitional source-compatible name for control-plane callers.  Filesystem
@@ -578,6 +582,11 @@ mod file_group_tests {
 }
 
 impl SarunFs {
+    pub(crate) fn for_single_identity_protocol(mut self) -> Self {
+        self.protocol_has_single_identity = true;
+        self
+    }
+
     /// Drain queued (box_id, rel, op) events out of the overlay — the
     /// control loop calls this on a tick and broadcasts each one as a
     /// type=overlay event to subscribers. The mutation journal bounds itself
@@ -611,6 +620,7 @@ impl SarunFs {
             root: (0, String::new()),
             kernel_passthrough: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             host_request_pids: true,
+            protocol_has_single_identity: false,
         };
         // Reclaim unreferenced cache pool files once per engine start —
         // cheap (one readdir sweep), and NEVER on the FUSE path: eviction
@@ -646,6 +656,7 @@ impl SarunFs {
             root: (box_id, String::new()),
             kernel_passthrough: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             host_request_pids: false,
+            protocol_has_single_identity: false,
         })
     }
 
@@ -3132,7 +3143,7 @@ impl virtiofsd::filesystem::FileSystem for SarunFs {
         Ok(virtiofsd::filesystem::Entry {
             inode: attr.inode,
             generation: 0,
-            attr: crate::sarunfs::virtio_attr(attr),
+            attr: crate::sarunfs::virtio_attr(attr, self.protocol_has_single_identity),
             attr_timeout: TTL,
             entry_timeout: TTL,
         })
@@ -3149,7 +3160,10 @@ impl virtiofsd::filesystem::FileSystem for SarunFs {
         _handle: Option<u64>,
     ) -> std::io::Result<(virtiofsd::fuse::Attr, Duration)> {
         let attr = self.getattr_node(inode).map_err(virtio_error)?;
-        Ok((crate::sarunfs::virtio_attr(attr), TTL))
+        Ok((
+            crate::sarunfs::virtio_attr(attr, self.protocol_has_single_identity),
+            TTL,
+        ))
     }
 
     fn setattr(
@@ -3196,7 +3210,10 @@ impl virtiofsd::filesystem::FileSystem for SarunFs {
                 },
             )
             .map_err(virtio_error)?;
-        Ok((crate::sarunfs::virtio_attr(result), TTL))
+        Ok((
+            crate::sarunfs::virtio_attr(result, self.protocol_has_single_identity),
+            TTL,
+        ))
     }
 
     fn readlink(
@@ -3286,7 +3303,7 @@ impl virtiofsd::filesystem::FileSystem for SarunFs {
             virtiofsd::filesystem::Entry {
                 inode: attr.inode,
                 generation: 0,
-                attr: crate::sarunfs::virtio_attr(attr),
+                attr: crate::sarunfs::virtio_attr(attr, self.protocol_has_single_identity),
                 attr_timeout: TTL,
                 entry_timeout: TTL,
             },
@@ -3317,7 +3334,7 @@ impl virtiofsd::filesystem::FileSystem for SarunFs {
         Ok(virtiofsd::filesystem::Entry {
             inode: attr.inode,
             generation: 0,
-            attr: crate::sarunfs::virtio_attr(attr),
+            attr: crate::sarunfs::virtio_attr(attr, self.protocol_has_single_identity),
             attr_timeout: TTL,
             entry_timeout: TTL,
         })
@@ -3347,7 +3364,7 @@ impl virtiofsd::filesystem::FileSystem for SarunFs {
         Ok(virtiofsd::filesystem::Entry {
             inode: attr.inode,
             generation: 0,
-            attr: crate::sarunfs::virtio_attr(attr),
+            attr: crate::sarunfs::virtio_attr(attr, self.protocol_has_single_identity),
             attr_timeout: TTL,
             entry_timeout: TTL,
         })
@@ -3374,7 +3391,7 @@ impl virtiofsd::filesystem::FileSystem for SarunFs {
         Ok(virtiofsd::filesystem::Entry {
             inode: attr.inode,
             generation: 0,
-            attr: crate::sarunfs::virtio_attr(attr),
+            attr: crate::sarunfs::virtio_attr(attr, self.protocol_has_single_identity),
             attr_timeout: TTL,
             entry_timeout: TTL,
         })
@@ -3446,7 +3463,7 @@ impl virtiofsd::filesystem::FileSystem for SarunFs {
         Ok(virtiofsd::filesystem::Entry {
             inode: attr.inode,
             generation: 0,
-            attr: crate::sarunfs::virtio_attr(attr),
+            attr: crate::sarunfs::virtio_attr(attr, self.protocol_has_single_identity),
             attr_timeout: TTL,
             entry_timeout: TTL,
         })

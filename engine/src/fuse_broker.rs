@@ -48,11 +48,38 @@ pub struct BrokeredFuseSession {
 }
 
 impl BrokeredFuseSession {
+    #[cfg(test)]
     pub fn mount<F>(filesystem: F, mountpoint: &Path, workers: usize) -> io::Result<Self>
     where
         F: FileSystem + Send + Sync + 'static,
     {
-        let (broker, device) = FuseBroker::start(mountpoint)?;
+        let (broker, device, _) = FuseBroker::start(mountpoint)?;
+        Self::serve(broker, device, filesystem, workers)
+    }
+
+    pub fn mount_sarun(
+        filesystem: crate::sarunfs::SarunFs,
+        mountpoint: &Path,
+        workers: usize,
+    ) -> io::Result<Self> {
+        let (broker, device, id_map) = FuseBroker::start(mountpoint)?;
+        let filesystem = if id_map == IdMapKind::Caller {
+            filesystem.for_single_identity_protocol()
+        } else {
+            filesystem
+        };
+        Self::serve(broker, device, filesystem, workers)
+    }
+
+    fn serve<F>(
+        broker: FuseBroker,
+        device: File,
+        filesystem: F,
+        workers: usize,
+    ) -> io::Result<Self>
+    where
+        F: FileSystem + Send + Sync + 'static,
+    {
         let fuse =
             match crate::fuse_transport::FuseSession::serve_mounted(filesystem, device, workers) {
                 Ok(fuse) => fuse,
@@ -101,12 +128,12 @@ struct FuseBroker {
 }
 
 impl FuseBroker {
-    fn start(mountpoint: &Path) -> io::Result<(Self, File)> {
+    fn start(mountpoint: &Path) -> io::Result<(Self, File, IdMapKind)> {
         let mountpoint = mountpoint.canonicalize()?;
         Self::create_private_mount(&mountpoint)
     }
 
-    fn create_private_mount(mountpoint: &Path) -> io::Result<(Self, File)> {
+    fn create_private_mount(mountpoint: &Path) -> io::Result<(Self, File, IdMapKind)> {
         let (mut parent, child_socket) = UnixStream::pair()?;
         let fd = child_socket.as_raw_fd();
         let executable = broker_executable()?;
@@ -177,11 +204,15 @@ impl FuseBroker {
             return Err(io::Error::other(format!("FUSE mount broker: {detail}")));
         }
         let device = fds.pop().unwrap();
-        Ok((Self {
-            child,
-            control: parent,
-            socket_path,
-        }, device))
+        Ok((
+            Self {
+                child,
+                control: parent,
+                socket_path,
+            },
+            device,
+            id_map,
+        ))
     }
 
     fn shutdown(mut self) -> io::Result<()> {

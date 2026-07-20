@@ -205,7 +205,7 @@ fn serve() -> i32 {
     let n = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
-    let session = match fuse_broker::BrokeredFuseSession::mount(ov.clone(), &mnt, n) {
+    let session = match fuse_broker::BrokeredFuseSession::mount_sarun(ov.clone(), &mnt, n) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("sarun-engine: private overlay mount FAILED: {e}");
