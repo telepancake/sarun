@@ -1,0 +1,84 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Mon, 20 Jul 2026 18:00:00 +0300
+Subject: [PATCH] Resolve executables once in the shell namespace
+
+The shell deliberately keeps a logical working directory instead of changing
+the embedding process cwd.  External spawn applied that cwd, but executable
+probing and the exec interposer inspected relative paths against the process
+cwd.  A pathname could consequently fail interposition even though the later
+spawn would execute it, prompting callers to rewrite shell scripts by shebang.
+
+Resolve slash commands and relative PATH entries lexically against the shell
+working directory once.  Give that same path to both the interposer and the
+external spawn; retain the original command name separately as argv[0].
+---
+ src/commands.rs | 24 +++++++++++++++++-------
+ src/shell/fs.rs |  5 ++++-
+ 2 files changed, 21 insertions(+), 8 deletions(-)
+
+diff --git a/src/commands.rs b/src/commands.rs
+--- a/src/commands.rs
++++ b/src/commands.rs
+@@ -516,18 +516,26 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
+             // All else failed; if we were given path directories to search, try to look through
+             // them for a matching executable. Otherwise, use our default search logic.
+             let path = if let Some(path_dirs) = &self.path_dirs {
+-                pathsearch::search_for_executable(path_dirs.iter(), self.command_name.as_str())
+-                    .next()
++                let absolute_dirs = path_dirs
++                    .iter()
++                    .map(|dir| self.shell.absolute_path(dir));
++                pathsearch::search_for_executable(absolute_dirs, self.command_name.as_str()).next()
+             } else {
+                 self.shell
+                     .find_first_executable_in_path_using_cache(&self.command_name)
+             };
+ 
+             if let Some(path) = path {
+-                if let Some(result) = self.try_interpose_exec(&path).await {
++                // Resolve once in the shell's logical namespace.  Both the
++                // interposer and external spawn must inspect/execute this exact
++                // path; resolving one against the process cwd and the other
++                // against Shell::working_dir gives pathname commands two
++                // different meanings.
++                let resolved = self.shell.absolute_path(path);
++                if let Some(result) = self.try_interpose_exec(&resolved).await {
+                     return Ok(self.finish_interposed(result));
+                 }
+-                self.execute_via_external(&path)
++                self.execute_via_external(&resolved)
+             } else {
+                 // Bash updates $_ even when the command is not found, so mirror
+                 // that here before reporting the error.
+@@ -542,10 +551,11 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
+             }
+         } else {
+             let command_name = PathBuf::from(self.command_name.clone());
+-            if let Some(result) = self.try_interpose_exec(command_name.as_path()).await {
++            let resolved = self.shell.absolute_path(&command_name);
++            if let Some(result) = self.try_interpose_exec(&resolved).await {
+                 return Ok(self.finish_interposed(result));
+             }
+-            self.execute_via_external(command_name.as_path())
++            self.execute_via_external(&resolved)
+         }
+     }
+ 
+diff --git a/src/shell/fs.rs b/src/shell/fs.rs
+--- a/src/shell/fs.rs
++++ b/src/shell/fs.rs
+@@ -126,7 +126,10 @@ impl<SE: ShellExtensions> Shell<SE> {
+     ) -> Option<PathBuf> {
+         let path = self.env_str("PATH").unwrap_or_default();
+         for one_dir in crate::sys::fs::split_paths(path.as_ref()) {
+-            let candidate_path = one_dir.join(candidate_name.as_ref());
++            // Relative PATH entries are relative to the shell's logical cwd,
++            // not the embedding process cwd.  Return that same resolved path
++            // to command execution and any exec interposer.
++            let candidate_path = self.absolute_path(one_dir).join(candidate_name.as_ref());
+             if candidate_path.executable() {
+                 return Some(candidate_path);
+             }
+-- 
+2.39.5

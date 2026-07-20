@@ -1329,47 +1329,8 @@ pub(crate) fn script_from_argv(cmd: &[String]) -> String {
             }
         }
     }
-    // Executing an executable shell script by pathname (`./configure`,
-    // `./dir/script.sh`) must enter the script-file path of the shadowed shell,
-    // not brush-core's generic external-command path.  The latter can report the
-    // script itself as "command not found" before the kernel ever gets to the
-    // shebang interpreter on some backends/cwd shapes.  Rewriting to
-    // `bash ./script ...` / `sh ./script ...` preserves argv-splitting while
-    // still running the script through the embedded brush shim selected by
-    // shadow_sh.glob.
-    if let Some(shell) = executable_shell_script_interpreter(&cmd[0]) {
-        let mut words = Vec::with_capacity(cmd.len() + 1);
-        words.push(shell);
-        words.extend(cmd.iter().cloned());
-        return words
-            .iter()
-            .map(|w| shell_quote(w))
-            .collect::<Vec<_>>()
-            .join(" ");
-    }
     // Not a `sh -c` form: reconstruct with quoting so brush sees the same words.
     cmd.iter().map(|w| shell_quote(w)).collect::<Vec<_>>().join(" ")
-}
-
-fn executable_shell_script_interpreter(path: &str) -> Option<String> {
-    use std::os::unix::fs::PermissionsExt;
-
-    // Only pathname execution has shebang semantics.  Bare words should keep
-    // normal command lookup (`script.sh` found on PATH, builtins/functions, ...).
-    if !path.contains('/') {
-        return None;
-    }
-    let md = std::fs::metadata(path).ok()?;
-    if !md.is_file() || md.permissions().mode() & 0o111 == 0 {
-        return None;
-    }
-    let interp = shebang_interp(std::path::Path::new(path))?;
-    let base = interp.file_name().and_then(|s| s.to_str())?;
-    match base {
-        "bash" => Some("bash".to_string()),
-        "sh" | "dash" => Some("sh".to_string()),
-        _ => None,
-    }
 }
 
 /// POSIX single-quote escaping: wrap in `'…'`, escaping `'` as `'\''`.
@@ -3062,7 +3023,6 @@ pub fn n2_executor(cmdline: &str, output_cb: &mut dyn FnMut(&[u8])) -> n2::proce
 #[cfg(test)]
 mod builtin_boundary_tests {
     use std::io::Write;
-    use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -3082,27 +3042,14 @@ mod builtin_boundary_tests {
     }
 
     #[test]
-    fn pathname_bash_script_argv_enters_shadowed_shell_file_form() {
-        let dir = scratch_dir();
-        let script_dir = dir.join("dir");
-        std::fs::create_dir_all(&script_dir).unwrap();
-        let script = script_dir.join("script.sh");
-        std::fs::write(&script, "#!/bin/bash\necho \"$1 $2\"\n").unwrap();
-        let mut perm = std::fs::metadata(&script).unwrap().permissions();
-        perm.set_mode(0o755);
-        std::fs::set_permissions(&script, perm).unwrap();
-
+    fn pathname_script_argv_is_not_rewritten_by_shebang() {
         let argv = vec![
-            script.to_string_lossy().into_owned(),
+            "./dir/script.sh".to_string(),
             "blah".to_string(),
             "two words".to_string(),
         ];
         let rewritten = super::script_from_argv(&argv);
-
-        assert_eq!(
-            rewritten,
-            format!("bash {} blah 'two words'", script.to_string_lossy())
-        );
+        assert_eq!(rewritten, "./dir/script.sh blah 'two words'");
     }
 
     /// A fresh empty scratch dir under the system tempdir (never the process cwd).
@@ -3470,6 +3417,51 @@ mod builtin_boundary_tests {
         assert_ne!(std::env::current_dir().unwrap(), dir);
         let out = run_capture("cat rel.txt", &dir).await;
         assert_eq!(out, "logical-cwd-hit\n");
+    }
+
+    /// External command resolution has the same logical-cwd semantics as
+    /// builtin operands.  In particular, the exec interposer and the eventual
+    /// kernel exec must receive the same resolved pathname; callers must not
+    /// inspect and rewrite the script's shebang themselves.
+    #[tokio::test]
+    async fn pathname_script_execution_uses_logical_cwd() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = scratch_dir();
+        let script_dir = dir.join("dir");
+        std::fs::create_dir_all(&script_dir).unwrap();
+        let script = script_dir.join("script.sh");
+        std::fs::write(&script, "#!/bin/sh\nprintf '%s|%s' \"$1\" \"$2\"\n").unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).unwrap();
+
+        assert_ne!(std::env::current_dir().unwrap(), dir);
+        let argv = [
+            "./dir/script.sh".to_string(),
+            "one".to_string(),
+            "two words".to_string(),
+        ];
+        let out = run_capture(&super::script_from_argv(&argv), &dir).await;
+        assert_eq!(out, "one|two words");
+    }
+
+    #[tokio::test]
+    async fn relative_path_entry_uses_logical_cwd() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = scratch_dir();
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let command = bin.join("logical-command");
+        std::fs::write(&command, "#!/bin/sh\nprintf path-hit\n").unwrap();
+        let mut permissions = std::fs::metadata(&command).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&command, permissions).unwrap();
+
+        assert_ne!(std::env::current_dir().unwrap(), dir);
+        let out = run_capture("PATH=bin logical-command", &dir).await;
+        assert_eq!(out, "path-hit");
     }
 
     /// STREAM+ENV shape (`sort`): reads piped logical stdin and sorts it; also

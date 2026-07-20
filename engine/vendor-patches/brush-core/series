@@ -29,3 +29,4 @@
 0290-Expose-typed-builtin-parser-observations-at-edit-tears.patch
 0300-Expose-parser-neutral-builtin-evidence.patch
 0310-Represent-builtin-parser-tears-explicitly.patch
+0320-Resolve-executables-once-in-the-shell-namespace.patch
