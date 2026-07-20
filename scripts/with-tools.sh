@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-repo=$(cd "$(dirname "$0")/.." && pwd)
+# Resolve mount aliases and symlinks once so compiler paths written into CMake
+# caches do not oscillate between equivalent spellings of this checkout.
+repo=$(cd "$(dirname "$0")/.." && pwd -P)
 tools=$repo/.tools
 bin=$tools/bin
 uv_version=0.11.21

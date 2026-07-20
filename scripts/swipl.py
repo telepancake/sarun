@@ -273,6 +273,40 @@ def patch_swipl(source: Path) -> None:
 def configure(
     source: Path, build: Path, options: list[str], env: dict[str, str]
 ) -> None:
+    # The build identity deliberately records the compiler version rather than
+    # its checkout-specific absolute path. CMake, however, persists that path
+    # and treats moving the same compiler (for example from a global uv tool
+    # directory into repo-local .tools/) as an incompatible cache change.
+    # A validated published result returns before this point. For an
+    # incomplete build, discard CMake's configuration only when a configured
+    # compiler actually moved; otherwise preserve its resumable object tree.
+    cache = build / "CMakeCache.txt"
+    configured: dict[str, str] = {}
+    if cache.is_file():
+        for line in cache.read_text(errors="replace").splitlines():
+            if "=" not in line or line.startswith(("#", "//")):
+                continue
+            key_and_type, value = line.split("=", 1)
+            configured[key_and_type.split(":", 1)[0]] = value
+    requested = {
+        key: option.split("=", 1)[1]
+        for key in ("CMAKE_C_COMPILER", "CMAKE_CXX_COMPILER")
+        for option in options
+        if option.startswith(f"-D{key}=")
+    }
+    moved = [
+        key
+        for key, value in requested.items()
+        if configured.get(key) not in (None, value)
+    ]
+    if moved:
+        print(
+            f"CMake compiler path changed ({', '.join(moved)}); "
+            f"regenerating {build}",
+            flush=True,
+        )
+        cache.unlink(missing_ok=True)
+        shutil.rmtree(build / "CMakeFiles", ignore_errors=True)
     build.mkdir(parents=True, exist_ok=True)
     run(
         "cmake",
