@@ -88,3 +88,4 @@
 0880-Honor-global--SILENT-semantics.patch
 0890-Provide-GNU-default-ARFLAGS-variable.patch
 0900-Ignore-inline-comments-before-classifying-make-syntax.patch
+0910-Route-embedded-make-reads-through-scoped-filesystem-provider.patch

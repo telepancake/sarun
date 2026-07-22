@@ -9,6 +9,7 @@ test_name(actions_are_not_duplicated_as_transport_requests).
 test_name(register_schema_captures_conditional_fd_roles).
 test_name(unix_values_remain_bytes).
 test_name(events_are_compact_late_decode_invalidations).
+test_name(debug_client_is_a_declared_typed_resource).
 test_name(stream_frames_cover_modes_directions_and_fd_handoffs).
 test_name(all_transport_facts_project_through_central_relation).
 
@@ -45,8 +46,8 @@ run_test(catalog_is_closed_bounded_and_valid) :-
     length(Requests, 15),
     length(Responses, 5),
     length(Modes, 7),
-    length(Events, 10),
-    length(Frames, 21),
+    length(Events, 11),
+    length(Frames, 25),
     expect(wire_limit(frame_bytes, 16777216)),
     expect(wire_response(action, 6, [field(value, action_success)])).
 
@@ -101,6 +102,18 @@ run_test(register_schema_captures_conditional_fd_roles) :-
     expect(member_eq(field(name, registration_name), Fields)),
     expect(member_eq(field(backend, run_backend), Fields)),
     expect(member_eq(field(architecture, option(qemu_architecture)), Fields)),
+    expect(member_eq(field(debug_mode, debug_mode), Fields)),
+    expect(member_eq(field(selected_boot, option(selected_boot)), Fields)),
+    once(wire_type(selected_artifact, record([
+        field(box, box_selector),
+        field(path, path)
+    ]))),
+    once(wire_type(selected_boot, choice)),
+    once(wire_variant(selected_boot, image, 1,
+                      [field(image, selected_artifact)])),
+    once(wire_variant(selected_boot, kernel_initramfs, 2,
+                      [field(kernel, selected_artifact),
+                       field(initramfs, selected_artifact)])),
     expect(member_eq(field(net_mode, net_mode), Fields)),
     expect(\+ member_field(want_rerun, Fields)),
     expect_equal(Fds,
@@ -129,7 +142,18 @@ run_test(events_are_compact_late_decode_invalidations) :-
                     [field(box, box_id), field(phase, edge_phase)])),
     once(wire_event(overlay_changed, 4,
                     [field(box, box_id), field(count, u32),
-                     field(latest_path, option(path))])).
+                     field(latest_path, option(path))])),
+    once(wire_event(debug_console_ready, 11,
+                    [field(box, box_id), field(service, service_name)])).
+
+run_test(debug_client_is_a_declared_typed_resource) :-
+    once(wire_type(debug_client_start, record([
+        field(manifest, path),
+        field(image, option(debug_image_catalog)),
+        field(service, service_name)
+    ]))),
+    once(wire_request(service_declare, 267, reply(empty), Fields, [], broker_box)),
+    expect(member_eq(field(client_argv, list(os_string, command_items)), Fields)).
 
 run_test(stream_frames_cover_modes_directions_and_fd_handoffs) :-
     once(wire_frame(box, mute, 4, runner_to_engine, [],
@@ -149,7 +173,9 @@ run_test(stream_frames_cover_modes_directions_and_fd_handoffs) :-
                     [field(stream, u64), field(code, exit_code)], [], stay)),
     once(wire_frame(appliance, ready, 8, guest_to_host, [], [], stay)),
     once(wire_frame(appliance, process, 9, guest_to_host,
-                    [field(event, guest_process_event)], [], stay)).
+                    [field(event, guest_process_event)], [], stay)),
+    once(wire_frame(appliance, debug_prepared, 10, guest_to_host, [], [], stay)),
+    once(wire_frame(appliance, debug_start, 11, host_to_guest, [], [], stay)).
 
 run_test(all_transport_facts_project_through_central_relation) :-
     expect(all_requests_project),

@@ -20,7 +20,7 @@
 use serde_json::Value;
 
 use crate::oaita::exec::Executor;
-use crate::oaita::structural::{find_symbol, parse_symbols, Symbol};
+use crate::oaita::structural::{Symbol, find_symbol, parse_symbols};
 use crate::oaita::tools::RESULT_BUDGET;
 use crate::oaita::turns::Turn;
 
@@ -53,10 +53,16 @@ pub fn parse_locator(s: &str) -> Locator {
     for key in ["next", "previous", "first", "last"] {
         if s == key {
             let k: &'static str = match key {
-                "next" => "next", "previous" => "previous",
-                "first" => "first", "last" => "last", _ => "next",
+                "next" => "next",
+                "previous" => "previous",
+                "first" => "first",
+                "last" => "last",
+                _ => "next",
             };
-            return Locator { path: String::new(), window: Window::PageKey(k) };
+            return Locator {
+                path: String::new(),
+                window: Window::PageKey(k),
+            };
         }
     }
     if let Some(idx) = s.find(" lines ") {
@@ -64,7 +70,10 @@ pub fn parse_locator(s: &str) -> Locator {
         let range = &s[idx + 7..];
         if let Some((a, b)) = range.split_once("..") {
             if let (Ok(a), Ok(b)) = (a.trim().parse(), b.trim().parse()) {
-                return Locator { path, window: Window::Range(a, b) };
+                return Locator {
+                    path,
+                    window: Window::Range(a, b),
+                };
             }
         }
     }
@@ -73,14 +82,20 @@ pub fn parse_locator(s: &str) -> Locator {
         let range = &s[idx + 9..];
         if let Some((a, b)) = range.split_once("..") {
             if let (Ok(a), Ok(b)) = (a.trim().parse(), b.trim().parse()) {
-                return Locator { path, window: Window::Range(a, b) };
+                return Locator {
+                    path,
+                    window: Window::Range(a, b),
+                };
             }
         }
     }
     if let Some(idx) = s.find(" around ") {
         let path = s[..idx].to_string();
         if let Ok(n) = s[idx + 8..].trim().parse() {
-            return Locator { path, window: Window::Around(n) };
+            return Locator {
+                path,
+                window: Window::Around(n),
+            };
         }
     }
     // Structural locators come last because their separators (` symbols`,
@@ -92,7 +107,10 @@ pub fn parse_locator(s: &str) -> Locator {
         let path = s[..idx].to_string();
         let rest = s[idx + 8..].trim();
         if rest.is_empty() {
-            return Locator { path, window: Window::Symbols };
+            return Locator {
+                path,
+                window: Window::Symbols,
+            };
         }
     }
     if let Some(idx) = s.find(" symbol ") {
@@ -105,25 +123,36 @@ pub fn parse_locator(s: &str) -> Locator {
                     let name = rest[..open].trim().to_string();
                     if let Ok(n) = rest[open + 1..close].trim().parse::<usize>() {
                         if !name.is_empty() && n >= 1 {
-                            return Locator { path, window: Window::Symbol(name, n) };
+                            return Locator {
+                                path,
+                                window: Window::Symbol(name, n),
+                            };
                         }
                     }
                 }
             }
         }
         if !rest.is_empty() {
-            return Locator { path, window: Window::Symbol(rest.to_string(), 1) };
+            return Locator {
+                path,
+                window: Window::Symbol(rest.to_string(), 1),
+            };
         }
     }
-    Locator { path: s.to_string(), window: Window::Default }
+    Locator {
+        path: s.to_string(),
+        window: Window::Default,
+    }
 }
 
 /// Cursor footer for a PARTIAL page — the model needs to know more pages
 /// exist and which keys to use. Mid-stream only; the end-of-stuff banner
 /// below handles the last-page case.
 fn footer(target: &str, unit: &str, a: usize, b: usize, n: usize) -> String {
-    format!("\n--- inspect: {target:?} {unit} {a}..{b} of {n} — \
-             keys: first/previous/next/last\n")
+    format!(
+        "\n--- inspect: {target:?} {unit} {a}..{b} of {n} — \
+             keys: first/previous/next/last\n"
+    )
 }
 
 /// END-OF-STUFF banner: when the page IS the full listing (a..b covers
@@ -141,8 +170,7 @@ fn end_banner(target: &str, unit: &str, n: usize) -> String {
 /// `box_id` + `executor` together route file IO through the box overlay so
 /// the tool sees what a shell-inside-the-box would see (lower=host ⊕ upper=
 /// staged) — never the bare host fs.
-pub fn inspect(locator: &Locator, turns: &[Turn],
-               box_id: &str, executor: &dyn Executor) -> String {
+pub fn inspect(locator: &Locator, turns: &[Turn], box_id: &str, executor: &dyn Executor) -> String {
     let (target, window) = match &locator.window {
         Window::PageKey(k) => match resolve_page_key(k, turns) {
             Some((t, w)) => (t, w),
@@ -168,8 +196,13 @@ pub fn inspect(locator: &Locator, turns: &[Turn],
     }
 }
 
-fn inspect_structural(box_id: &str, executor: &dyn Executor,
-                      target: &str, window: &Window, turns: &[Turn]) -> String {
+fn inspect_structural(
+    box_id: &str,
+    executor: &dyn Executor,
+    target: &str,
+    window: &Window,
+    turns: &[Turn],
+) -> String {
     let bytes = match executor.read_file(box_id, target) {
         Ok(b) => b,
         Err(e) => return format!("inspect: {e}"),
@@ -178,22 +211,26 @@ fn inspect_structural(box_id: &str, executor: &dyn Executor,
         return format!(
             "inspect: {target}: no tree-sitter grammar for this extension \
              (currently: .rs, .py, .sh, .bash). Use `path lines A..B` for a \
-             line window instead.");
+             line window instead."
+        );
     };
     let body = match window {
         Window::Symbols => render_symbol_list(target, &symbols),
         Window::Symbol(name, n) => match find_symbol(&symbols, name, *n) {
             Some(sym) => render_symbol_focus(target, sym, &bytes),
             None => {
-                let matches: Vec<&Symbol> = symbols.iter()
-                    .filter(|s| s.name == *name).collect();
+                let matches: Vec<&Symbol> = symbols.iter().filter(|s| s.name == *name).collect();
                 if matches.is_empty() {
-                    format!("inspect: {target}: no symbol named {name:?} \
-                             (use `{target} symbols` to list)")
+                    format!(
+                        "inspect: {target}: no symbol named {name:?} \
+                             (use `{target} symbols` to list)"
+                    )
                 } else {
-                    format!("inspect: {target}: symbol {name:?} has only \
+                    format!(
+                        "inspect: {target}: symbol {name:?} has only \
                              {} occurrence(s); asked for #{n}",
-                            matches.len())
+                        matches.len()
+                    )
                 }
             }
         },
@@ -209,22 +246,33 @@ fn render_symbol_list(target: &str, symbols: &[Symbol]) -> String {
     // Tally same-name collisions so the listing tells the model when it
     // needs the `[N]` disambiguator. First pass: count names.
     let mut counts = std::collections::HashMap::<&str, usize>::new();
-    for s in symbols { *counts.entry(s.name.as_str()).or_insert(0) += 1; }
+    for s in symbols {
+        *counts.entry(s.name.as_str()).or_insert(0) += 1;
+    }
     let mut by_name_seen = std::collections::HashMap::<&str, usize>::new();
     let mut lines = Vec::with_capacity(symbols.len() + 1);
-    lines.push(format!("file {target}: {} named definitions", symbols.len()));
+    lines.push(format!(
+        "file {target}: {} named definitions",
+        symbols.len()
+    ));
     lines.push(String::new());
     for s in symbols {
         let seen = by_name_seen.entry(s.name.as_str()).or_insert(0);
         *seen += 1;
         let occ = *seen;
         let total = *counts.get(s.name.as_str()).unwrap_or(&1);
-        let disambig = if total > 1 { format!("[{occ}]") } else { String::new() };
+        let disambig = if total > 1 {
+            format!("[{occ}]")
+        } else {
+            String::new()
+        };
         let indent = "  ".repeat(s.depth);
         lines.push(format!(
             "{indent}{kind:>6}  {name}{disambig}   (lines {a}..{b})",
-            kind = s.kind, name = s.name,
-            a = s.start_line, b = s.end_line,
+            kind = s.kind,
+            name = s.name,
+            a = s.start_line,
+            b = s.end_line,
         ));
     }
     lines.push(end_banner(target, "symbols", symbols.len()));
@@ -238,42 +286,65 @@ fn render_symbol_focus(target: &str, sym: &Symbol, bytes: &[u8]) -> String {
     let mut out = String::new();
     out.push_str(&format!(
         "{kind} {name} in {target} (lines {a}..{b})\n\n",
-        kind = sym.kind, name = sym.name, target = target,
-        a = sym.start_line, b = sym.end_line,
+        kind = sym.kind,
+        name = sym.name,
+        target = target,
+        a = sym.start_line,
+        b = sym.end_line,
     ));
     for (i, line) in text.lines().enumerate() {
         out.push_str(&format!("{:>6}  {line}\n", sym.start_line + i));
     }
     out.push_str(&format!(
         "\n--- inspect: {target:?} symbol {:?}[1..{a}..{b}] of file ---\n",
-        sym.name, a = sym.start_line, b = sym.end_line,
+        sym.name,
+        a = sym.start_line,
+        b = sym.end_line,
     ));
     out
 }
 
 fn kind_label(k: char) -> &'static str {
-    match k { 'd' => "dir", 'l' => "link", 'f' => "file", _ => "other" }
+    match k {
+        'd' => "dir",
+        'l' => "link",
+        'f' => "file",
+        _ => "other",
+    }
 }
 
-fn inspect_dir(box_id: &str, executor: &dyn Executor,
-               target: &str, window: &Window, turns: &[Turn]) -> String {
+fn inspect_dir(
+    box_id: &str,
+    executor: &dyn Executor,
+    target: &str,
+    window: &Window,
+    turns: &[Turn],
+) -> String {
     let mut entries: Vec<(String, String)> = match executor.list_dir(box_id, target) {
-        Ok(es) => es.into_iter().map(|(name, k)| (kind_label(k).to_string(), name))
-                                .collect(),
+        Ok(es) => es
+            .into_iter()
+            .map(|(name, k)| (kind_label(k).to_string(), name))
+            .collect(),
         Err(e) => return format!("inspect: {e}"),
     };
     entries.sort_by(|a, b| a.1.cmp(&b.1));
     let n = entries.len();
     let (a, b) = window_indices(window, n, ENTRIES_PER_PAGE);
     let slice = &entries[a.saturating_sub(1)..b.min(n)];
-    let body: String = slice.iter()
+    let body: String = slice
+        .iter()
         .map(|(k, name)| format!("{k:>5}  {name}"))
         .collect::<Vec<_>>()
         .join("\n");
-    let head = format!("dir {target}: {n} entries ({} dirs, {} files, {} other)\n\n",
-                       entries.iter().filter(|(k, _)| k == "dir").count(),
-                       entries.iter().filter(|(k, _)| k == "file").count(),
-                       entries.iter().filter(|(k, _)| !matches!(k.as_str(), "dir"|"file")).count());
+    let head = format!(
+        "dir {target}: {n} entries ({} dirs, {} files, {} other)\n\n",
+        entries.iter().filter(|(k, _)| k == "dir").count(),
+        entries.iter().filter(|(k, _)| k == "file").count(),
+        entries
+            .iter()
+            .filter(|(k, _)| !matches!(k.as_str(), "dir" | "file"))
+            .count()
+    );
     let mut text = format!("{head}{body}");
     let paged = a > 1 || b < n;
     if paged {
@@ -282,14 +353,22 @@ fn inspect_dir(box_id: &str, executor: &dyn Executor,
         text.push_str(&end_banner(target, "entries", n));
     }
     let mut hint_ids: Vec<&str> = vec!["inspect-dir"];
-    if paged { hint_ids.push("inspect-cursor"); }
+    if paged {
+        hint_ids.push("inspect-cursor");
+    }
     text + &crate::oaita::hints::append(turns, &hint_ids)
 }
 
-fn inspect_file(box_id: &str, executor: &dyn Executor,
-                target: &str, window: &Window, turns: &[Turn]) -> String {
+fn inspect_file(
+    box_id: &str,
+    executor: &dyn Executor,
+    target: &str,
+    window: &Window,
+    turns: &[Turn],
+) -> String {
     let bytes = match executor.read_file(box_id, target) {
-        Ok(b) => b, Err(e) => return format!("inspect: {e}"),
+        Ok(b) => b,
+        Err(e) => return format!("inspect: {e}"),
     };
     if bytes.iter().any(|&b| b == 0) {
         return format!("inspect: {target}: binary ({} bytes)", bytes.len());
@@ -299,8 +378,12 @@ fn inspect_file(box_id: &str, executor: &dyn Executor,
     let n = lines.len();
     let (a, b) = window_indices(window, n, LINES_PER_PAGE);
     let slice = &lines[a.saturating_sub(1)..b.min(n)];
-    let body: String = slice.iter().enumerate()
-        .map(|(i, l)| format!("{:>6}  {l}", a + i)).collect::<Vec<_>>().join("\n");
+    let body: String = slice
+        .iter()
+        .enumerate()
+        .map(|(i, l)| format!("{:>6}  {l}", a + i))
+        .collect::<Vec<_>>()
+        .join("\n");
     let head = format!("file {target}: {n} lines\n\n");
     let mut text = format!("{head}{body}");
     let paged = a > 1 || b < n;
@@ -310,12 +393,13 @@ fn inspect_file(box_id: &str, executor: &dyn Executor,
         text.push_str(&end_banner(target, "lines", n));
     }
     let mut hint_ids: Vec<&str> = vec!["inspect-file-lines"];
-    if paged { hint_ids.push("inspect-cursor"); }
+    if paged {
+        hint_ids.push("inspect-cursor");
+    }
     text + &crate::oaita::hints::append(turns, &hint_ids)
 }
 
-fn inspect_box(rest: &str, _window: &Window, turns: &[Turn],
-               outer_box: &str) -> String {
+fn inspect_box(rest: &str, _window: &Window, turns: &[Turn], outer_box: &str) -> String {
     // box:<id>           → list the change set as one entry per file
     // box:<id>/<file>    → that file's diff hunks
     //
@@ -337,10 +421,13 @@ fn inspect_box(rest: &str, _window: &Window, turns: &[Turn],
     let full_name = resolve_box_name(raw_id, outer_box);
     let sid = match resolve_sid(&full_name) {
         Some(id) => id,
-        None => return format!(
-            "inspect: box:{raw_id}: no such box (looked up {full_name:?}). \
+        None => {
+            return format!(
+                "inspect: box:{raw_id}: no such box (looked up {full_name:?}). \
              Sub-agent IDs (e.g. `ejcoo`) are nested under the current \
-             agent — use the bare ID from the `ask` tool result."),
+             agent — use the bare ID from the `ask` tool result."
+            );
+        }
     };
     if let Some(file) = sub {
         return inspect_box_file(sid, raw_id, file, turns);
@@ -353,7 +440,11 @@ fn inspect_box(rest: &str, _window: &Window, turns: &[Turn],
 /// target=X` agree on what X means.
 fn resolve_box_name(raw: &str, outer_box: &str) -> String {
     let up = raw.to_uppercase();
-    let inner = if up.starts_with("OAITA-") { up } else { format!("OAITA-{up}") };
+    let inner = if up.starts_with("OAITA-") {
+        up
+    } else {
+        format!("OAITA-{up}")
+    };
     format!("{outer_box}.{inner}")
 }
 
@@ -361,8 +452,7 @@ fn resolve_box_name(raw: &str, outer_box: &str) -> String {
 /// `session_dicts`. Returns None on miss — the caller's error message tells
 /// the model what was looked up.
 fn resolve_sid(display_path: &str) -> Option<i64> {
-    let r = crate::oaita::exec::ctrl_rpc("session_dicts",
-        serde_json::json!([])).ok()?;
+    let r = crate::oaita::exec::ctrl_rpc("session_dicts", serde_json::json!([])).ok()?;
     let arr = r.as_array()?;
     for v in arr {
         let path = v.get("path").and_then(serde_json::Value::as_str)?;
@@ -378,44 +468,65 @@ fn resolve_sid(display_path: &str) -> Option<i64> {
 /// UI shows. Filters out internal directory-connector rows so the model
 /// sees just the leaves it can act on with read/write/apply.
 fn inspect_box_changes(sid: i64, raw_id: &str, turns: &[Turn]) -> String {
-    let opened = match crate::oaita::exec::ctrl_rpc("view.open",
-        serde_json::json!(["changes", sid, serde_json::Value::Null]))
-    {
+    let opened = match crate::oaita::exec::ctrl_rpc(
+        "view.open",
+        serde_json::json!(["changes", sid, serde_json::Value::Null]),
+    ) {
         Ok(v) => v,
         Err(e) => return format!("inspect: box:{raw_id}: view.open: {e}"),
     };
-    let vid = opened.get("view_id").and_then(serde_json::Value::as_u64).unwrap_or(0);
-    let total = opened.get("total").and_then(serde_json::Value::as_u64)
+    let vid = opened
+        .get("view_id")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let total = opened
+        .get("total")
+        .and_then(serde_json::Value::as_u64)
         .unwrap_or(0) as usize;
-    let rows = if total == 0 { Vec::new() } else {
-        match crate::oaita::exec::ctrl_rpc("view.window",
-            serde_json::json!([vid, 0, total]))
-        {
-            Ok(v) => v.get("rows").and_then(|r| r.as_array().cloned())
-                      .unwrap_or_default(),
+    let rows = if total == 0 {
+        Vec::new()
+    } else {
+        match crate::oaita::exec::ctrl_rpc("view.window", serde_json::json!([vid, 0, total])) {
+            Ok(v) => v
+                .get("rows")
+                .and_then(|r| r.as_array().cloned())
+                .unwrap_or_default(),
             Err(_) => Vec::new(),
         }
     };
-    let _ = crate::oaita::exec::ctrl_rpc("view.close",
-        serde_json::json!([vid]));
+    let _ = crate::oaita::exec::ctrl_rpc("view.close", serde_json::json!([vid]));
     // Drop synthetic directory-connector rows; keep file/symlink/deleted
     // leaves and any xattr children. `kind == "dir"` IS the connector
     // marker (real directory writes don't surface as their own rows).
-    let leaves: Vec<&serde_json::Value> = rows.iter()
-        .filter(|r| r.get("kind").and_then(serde_json::Value::as_str)
-                   .map(|k| k != "dir").unwrap_or(true))
+    let leaves: Vec<&serde_json::Value> = rows
+        .iter()
+        .filter(|r| {
+            r.get("kind")
+                .and_then(serde_json::Value::as_str)
+                .map(|k| k != "dir")
+                .unwrap_or(true)
+        })
         .collect();
     if leaves.is_empty() {
         return format!(
             "box:{raw_id}: no staged changes \
-             (the sub-agent settled without writing anything captured by the overlay)")
-            + &crate::oaita::hints::append(turns, &["inspect-box"]);
+             (the sub-agent settled without writing anything captured by the overlay)"
+        ) + &crate::oaita::hints::append(turns, &["inspect-box"]);
     }
     let mut out = format!("box:{raw_id}: {} changed path(s)\n\n", leaves.len());
     for r in &leaves {
-        let path = r.get("path").and_then(serde_json::Value::as_str).unwrap_or("");
-        let kind = r.get("kind").and_then(serde_json::Value::as_str).unwrap_or("?");
-        let size = r.get("size").and_then(serde_json::Value::as_i64).unwrap_or(0);
+        let path = r
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let kind = r
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?");
+        let size = r
+            .get("size")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0);
         out.push_str(&format!("  {kind:>7}  {size:>8}  {path}\n"));
     }
     out + &crate::oaita::hints::append(turns, &["inspect-box"])
@@ -424,18 +535,28 @@ fn inspect_box_changes(sid: i64, raw_id: &str, turns: &[Turn]) -> String {
 /// `box:<id>/<file>` — that file's diff hunks, via the same `review.hunks`
 /// RPC the UI's right-pane diff viewer consumes.
 fn inspect_box_file(sid: i64, raw_id: &str, file: &str, turns: &[Turn]) -> String {
-    let r = match crate::oaita::exec::ctrl_rpc("review.hunks",
-        serde_json::json!([sid.to_string(), file]))
-    {
+    let r = match crate::oaita::exec::ctrl_rpc(
+        "review.hunks",
+        serde_json::json!([sid.to_string(), file]),
+    ) {
         Ok(v) => v,
         Err(e) => return format!("inspect: box:{raw_id}/{file}: {e}"),
     };
-    let is_text = r.get("is_text").and_then(serde_json::Value::as_bool).unwrap_or(false);
-    let diff_kind = r.get("diff").and_then(|d| d.get("kind"))
-        .and_then(serde_json::Value::as_str).unwrap_or("");
+    let is_text = r
+        .get("is_text")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let diff_kind = r
+        .get("diff")
+        .and_then(|d| d.get("kind"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
     if diff_kind == "error" {
-        let err = r.get("diff").and_then(|d| d.get("error"))
-            .and_then(serde_json::Value::as_str).unwrap_or("not in change set");
+        let err = r
+            .get("diff")
+            .and_then(|d| d.get("error"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("not in change set");
         return format!("inspect: box:{raw_id}/{file}: {err}");
     }
     if !is_text {
@@ -443,14 +564,27 @@ fn inspect_box_file(sid: i64, raw_id: &str, file: &str, turns: &[Turn]) -> Strin
     }
     let mut out = format!("box:{raw_id}/{file}: diff\n\n");
     let empty = vec![];
-    let hunks = r.get("hunks").and_then(serde_json::Value::as_array).unwrap_or(&empty);
+    let hunks = r
+        .get("hunks")
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or(&empty);
     for hk in hunks {
-        let lines = hk.get("lines").and_then(serde_json::Value::as_array)
+        let lines = hk
+            .get("lines")
+            .and_then(serde_json::Value::as_array)
             .unwrap_or(&empty);
         for line in lines {
-            let Some(pair) = line.as_array() else { continue; };
-            let tag = pair.first().and_then(serde_json::Value::as_str).unwrap_or(" ");
-            let txt = pair.get(1).and_then(serde_json::Value::as_str).unwrap_or("");
+            let Some(pair) = line.as_array() else {
+                continue;
+            };
+            let tag = pair
+                .first()
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(" ");
+            let txt = pair
+                .get(1)
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
             if tag == "hdr" {
                 out.push_str(&format!("{txt}\n"));
             } else {
@@ -483,12 +617,19 @@ pub(crate) fn window_indices(window: &Window, n: usize, default_page: usize) -> 
 pub(crate) fn resolve_page_key(key: &str, turns: &[Turn]) -> Option<(String, Window)> {
     // Walk the .tool turns in reverse looking for the footer line.
     let re = regex::Regex::new(
-        r#"--- inspect: "(?P<target>[^"]+)" (?P<unit>\w+) (?P<a>\d+)\.\.(?P<b>\d+) of (?P<n>\d+)"#
-    ).unwrap();
+        r#"--- inspect: "(?P<target>[^"]+)" (?P<unit>\w+) (?P<a>\d+)\.\.(?P<b>\d+) of (?P<n>\d+)"#,
+    )
+    .unwrap();
     for t in turns.iter().rev() {
-        if t.kind != "tool" { continue; }
-        let Ok(content) = t.read() else { continue; };
-        let Some(caps) = re.captures(&content) else { continue; };
+        if t.kind != "tool" {
+            continue;
+        }
+        let Ok(content) = t.read() else {
+            continue;
+        };
+        let Some(caps) = re.captures(&content) else {
+            continue;
+        };
         let target = caps["target"].to_string();
         let _unit = caps["unit"].to_string();
         let a: usize = caps["a"].parse().ok()?;
@@ -499,8 +640,7 @@ pub(crate) fn resolve_page_key(key: &str, turns: &[Turn]) -> Option<(String, Win
             "first" => Window::Range(1, page),
             "last" => Window::Range(n.saturating_sub(page) + 1, n),
             "next" => Window::Range(b + 1, (b + page).min(n)),
-            "previous" => Window::Range(a.saturating_sub(page).max(1),
-                                        a.saturating_sub(1).max(1)),
+            "previous" => Window::Range(a.saturating_sub(page).max(1), a.saturating_sub(1).max(1)),
             _ => Window::Default,
         };
         return Some((target, window));
@@ -511,8 +651,12 @@ pub(crate) fn resolve_page_key(key: &str, turns: &[Turn]) -> Option<(String, Win
 /// `read` — raw bytes of a file/slice, using inspect's locator grammar.
 /// Routes through the executor's box overlay (same view a shell-inside-the-
 /// box gets).
-pub fn read_path(locator: &Locator, turns: &[Turn],
-                 box_id: &str, executor: &dyn Executor) -> String {
+pub fn read_path(
+    locator: &Locator,
+    turns: &[Turn],
+    box_id: &str,
+    executor: &dyn Executor,
+) -> String {
     let (target, window) = match &locator.window {
         Window::PageKey(k) => match resolve_page_key(k, turns) {
             Some((t, w)) => (t, w),
@@ -522,10 +666,12 @@ pub fn read_path(locator: &Locator, turns: &[Turn],
     };
     if target.starts_with("box:") {
         return "read: box: locators are inspect-only — use shell in that box \
-                to read STAGED file contents".to_string();
+                to read STAGED file contents"
+            .to_string();
     }
     let bytes = match executor.read_file(box_id, &target) {
-        Ok(b) => b, Err(e) => return format!("read: {e}"),
+        Ok(b) => b,
+        Err(e) => return format!("read: {e}"),
     };
     // Symbol-targeted read returns the raw source of the named definition —
     // the byte-faithful counterpart of `inspect ... symbol foo`.
@@ -533,13 +679,13 @@ pub fn read_path(locator: &Locator, turns: &[Turn],
         let Some(symbols) = parse_symbols(&target, &bytes) else {
             return format!(
                 "read: {target}: no tree-sitter grammar for this extension \
-                 (currently: .rs, .py, .sh, .bash).");
+                 (currently: .rs, .py, .sh, .bash)."
+            );
         };
         let Some(sym) = find_symbol(&symbols, name, *occurrence) else {
             return format!("read: {target}: no symbol named {name:?}");
         };
-        let mut out = String::from_utf8_lossy(
-            &bytes[sym.start_byte..sym.end_byte]).into_owned();
+        let mut out = String::from_utf8_lossy(&bytes[sym.start_byte..sym.end_byte]).into_owned();
         if out.len() > RESULT_BUDGET {
             out = out.chars().take(RESULT_BUDGET).collect();
         }
@@ -548,7 +694,8 @@ pub fn read_path(locator: &Locator, turns: &[Turn],
     if matches!(window, Window::Symbols) {
         return "read: `path symbols` is inspect-only — use \
                 `inspect <path> symbols` to enumerate, then \
-                `read <path> symbol <name>` for the bytes".to_string();
+                `read <path> symbol <name>` for the bytes"
+            .to_string();
     }
     let text = String::from_utf8_lossy(&bytes);
     let lines: Vec<&str> = text.lines().collect();
@@ -563,7 +710,8 @@ pub fn read_path(locator: &Locator, turns: &[Turn],
 }
 
 // Hush an unused-import warning when `Value` is wired in later.
-#[allow(dead_code)] fn _v(_: Value) {}
+#[allow(dead_code)]
+fn _v(_: Value) {}
 
 // ── write — replace the slice named by a locator ─────────────────────────────
 //
@@ -593,9 +741,14 @@ pub fn read_path(locator: &Locator, turns: &[Turn],
 /// Tool entry point — match-by-locator write. Returns a human-readable status
 /// line; conflicts/errors are also returned as text (no Result) to match how
 /// the other dispatch_* functions hand their bodies back to the call result.
-pub fn write_at_locator(locator: &Locator, content: &str, force: bool,
-                        turns: &[Turn], box_id: &str,
-                        executor: &dyn Executor) -> String {
+pub fn write_at_locator(
+    locator: &Locator,
+    content: &str,
+    force: bool,
+    turns: &[Turn],
+    box_id: &str,
+    executor: &dyn Executor,
+) -> String {
     let (target, window) = match &locator.window {
         Window::PageKey(k) => match resolve_page_key(k, turns) {
             Some((t, w)) => (t, w),
@@ -605,7 +758,8 @@ pub fn write_at_locator(locator: &Locator, content: &str, force: bool,
     };
     if target.starts_with("box:") {
         return "write: box: locators are inspect-only — staged box contents \
-                are reachable only through shell inside the box".to_string();
+                are reachable only through shell inside the box"
+            .to_string();
     }
     let kind = executor.path_kind(box_id, &target);
 
@@ -614,20 +768,26 @@ pub fn write_at_locator(locator: &Locator, content: &str, force: bool,
     if matches!(window, Window::Default) {
         let exists = kind == 'f';
         let prev_n = if exists {
-            executor.read_file(box_id, &target)
+            executor
+                .read_file(box_id, &target)
                 .map(|b| String::from_utf8_lossy(&b).lines().count())
                 .unwrap_or(0)
-        } else { 0 };
+        } else {
+            0
+        };
         if exists && !force {
-            if let Some(conflict) = check_conflict_whole_file(
-                box_id, executor, &target, turns) {
+            if let Some(conflict) = check_conflict_whole_file(box_id, executor, &target, turns) {
                 return conflict;
             }
         }
         if let Err(e) = executor.write_file(box_id, &target, content.as_bytes()) {
             return format!("write: {e}");
         }
-        let new_n = if content.is_empty() { 0 } else { content.lines().count().max(1) };
+        let new_n = if content.is_empty() {
+            0
+        } else {
+            content.lines().count().max(1)
+        };
         return format!("write: {target}: replaced whole file ({prev_n} -> {new_n} lines)");
     }
 
@@ -648,34 +808,38 @@ pub fn write_at_locator(locator: &Locator, content: &str, force: bool,
             return format!(
                 "write: {target}: no tree-sitter grammar for this extension \
                  (currently: .rs, .py, .sh, .bash). Use `path lines A..B` \
-                 instead.");
+                 instead."
+            );
         };
         let Some(sym) = find_symbol(&symbols, name, *occurrence) else {
-            let matches: Vec<&Symbol> = symbols.iter()
-                .filter(|s| s.name == *name).collect();
+            let matches: Vec<&Symbol> = symbols.iter().filter(|s| s.name == *name).collect();
             return if matches.is_empty() {
-                format!("write: {target}: no symbol named {name:?} (use \
-                         `{target} symbols` to list)")
+                format!(
+                    "write: {target}: no symbol named {name:?} (use \
+                         `{target} symbols` to list)"
+                )
             } else {
-                format!("write: {target}: symbol {name:?} has only {} \
+                format!(
+                    "write: {target}: symbol {name:?} has only {} \
                          occurrence(s); asked for #{occurrence}",
-                        matches.len())
+                    matches.len()
+                )
             };
         };
         if !force {
-            if let Some(conflict) = check_conflict_symbol(
-                &target, &original_bytes, sym, turns) {
+            if let Some(conflict) = check_conflict_symbol(&target, &original_bytes, sym, turns) {
                 return conflict;
             }
         }
         let mut out = Vec::with_capacity(
-            original_bytes.len() - (sym.end_byte - sym.start_byte) + content.len() + 1);
+            original_bytes.len() - (sym.end_byte - sym.start_byte) + content.len() + 1,
+        );
         out.extend_from_slice(&original_bytes[..sym.start_byte]);
         out.extend_from_slice(content.as_bytes());
         // Preserve a trailing newline if the original symbol's slice ended
         // with one (most language definitions do — a `}` followed by `\n`).
-        let original_had_trailing_nl = original_bytes
-            .get(sym.end_byte.saturating_sub(1)) == Some(&b'\n');
+        let original_had_trailing_nl =
+            original_bytes.get(sym.end_byte.saturating_sub(1)) == Some(&b'\n');
         if original_had_trailing_nl && !content.ends_with('\n') {
             out.push(b'\n');
         }
@@ -685,10 +849,15 @@ pub fn write_at_locator(locator: &Locator, content: &str, force: bool,
         }
         let was = sym.end_line.saturating_sub(sym.start_line) + 1;
         let now = content.lines().count()
-            + if content.is_empty() || content.ends_with('\n') { 0 } else { 1 };
+            + if content.is_empty() || content.ends_with('\n') {
+                0
+            } else {
+                1
+            };
         return format!(
             "write: {target}: replaced {kind} {name} ({was} lines -> {now})",
-            kind = sym.kind, name = sym.name,
+            kind = sym.kind,
+            name = sym.name,
         );
     }
 
@@ -703,7 +872,8 @@ pub fn write_at_locator(locator: &Locator, content: &str, force: bool,
         return format!(
             "write: {target}: `around N` is an inspect/read locator only — \
              for a write you must name the exact range with \
-             `{target} lines A..B`. (No default radius for destructive edits.)");
+             `{target} lines A..B`. (No default radius for destructive edits.)"
+        );
     }
 
     let original = String::from_utf8_lossy(&original_bytes).into_owned();
@@ -731,7 +901,9 @@ pub fn write_at_locator(locator: &Locator, content: &str, force: bool,
     }
     if !content.is_empty() {
         out.push_str(content);
-        if !content.ends_with('\n') { out.push('\n'); }
+        if !content.ends_with('\n') {
+            out.push('\n');
+        }
     }
     for ln in &lines[suffix_start..] {
         out.push_str(ln);
@@ -749,7 +921,11 @@ pub fn write_at_locator(locator: &Locator, content: &str, force: bool,
     let was = hi.saturating_sub(lo) + 1;
     let was = if hi < lo { 0 } else { was };
     let now = content.lines().count()
-        + if content.is_empty() || content.ends_with('\n') { 0 } else { 1 };
+        + if content.is_empty() || content.ends_with('\n') {
+            0
+        } else {
+            1
+        };
     format!(
         "write: {target}: replaced lines {lo}..{hi} ({was} lines -> {now}); \
          file now {} lines",
@@ -760,19 +936,24 @@ pub fn write_at_locator(locator: &Locator, content: &str, force: bool,
 /// Symbol-grain conflict check. If the model previously inspected/read this
 /// SAME (target, symbol-name, occurrence), compare the captured bytes to the
 /// symbol's current bytes — return a conflict if they differ.
-fn check_conflict_symbol(target: &str, current_bytes: &[u8], sym: &Symbol,
-                         turns: &[Turn]) -> Option<String> {
+fn check_conflict_symbol(
+    target: &str,
+    current_bytes: &[u8],
+    sym: &Symbol,
+    turns: &[Turn],
+) -> Option<String> {
     // Walk back to find the most recent (read or inspect) of the SAME
     // structural locator. We don't compare against line-range baselines
     // here — the symbol-grain edit doesn't promise anything about lines.
     let (call_args, captured) = last_read_for_path(target, turns)?;
     let prev = parse_locator(&call_args);
     if let Window::Symbol(prev_name, prev_n) = prev.window {
-        if prev_name == sym.name && prev_n == 1 /* current Symbol.depth-aware
-                                                   matching is a later pass */
+        if prev_name == sym.name && prev_n == 1
+        /* current Symbol.depth-aware
+        matching is a later pass */
         {
-            let now = String::from_utf8_lossy(
-                &current_bytes[sym.start_byte..sym.end_byte]).into_owned();
+            let now =
+                String::from_utf8_lossy(&current_bytes[sym.start_byte..sym.end_byte]).into_owned();
             // The captured `read`/`inspect` result includes our own framing
             // (line-numbered prefix for inspect, plain for read). Bail when
             // the captured content doesn't byte-contain the current source —
@@ -784,7 +965,8 @@ fn check_conflict_symbol(target: &str, current_bytes: &[u8], sym: &Symbol,
                      what was last read in this session. Re-read it, \
                      reconcile, then write again (or pass force=true to \
                      overwrite anyway).",
-                    kind = sym.kind, name = sym.name,
+                    kind = sym.kind,
+                    name = sym.name,
                 ));
             }
         }
@@ -797,8 +979,12 @@ fn check_conflict_symbol(target: &str, current_bytes: &[u8], sym: &Symbol,
 /// one, compare its captured content to what the file holds now and return a
 /// conflict string when they differ. Returns None when no prior read exists
 /// (=> nothing to compare, write proceeds) or when contents still match.
-fn check_conflict_whole_file(box_id: &str, executor: &dyn Executor,
-                             target: &str, turns: &[Turn]) -> Option<String> {
+fn check_conflict_whole_file(
+    box_id: &str,
+    executor: &dyn Executor,
+    target: &str,
+    turns: &[Turn],
+) -> Option<String> {
     let (call_args, captured) = last_read_for_path(target, turns)?;
     // Only treat WHOLE-FILE prior reads as a baseline for whole-file writes.
     // A prior `read(path lines 1..3)` doesn't certify the rest of the file
@@ -820,8 +1006,13 @@ fn check_conflict_whole_file(box_id: &str, executor: &dyn Executor,
     }
 }
 
-fn check_conflict_slice(target: &str, lines: &[&str], lo: usize, hi: usize,
-                        turns: &[Turn]) -> Option<String> {
+fn check_conflict_slice(
+    target: &str,
+    lines: &[&str],
+    lo: usize,
+    hi: usize,
+    turns: &[Turn],
+) -> Option<String> {
     let (call_args, captured) = last_read_for_path(target, turns)?;
     let prev_loc = parse_locator(&call_args);
     // Compute the prior read's effective window so we can intersect it.
@@ -840,7 +1031,9 @@ fn check_conflict_slice(target: &str, lines: &[&str], lo: usize, hi: usize,
     };
     // Require the prior read to fully cover the write window — otherwise we
     // have no baseline for some of the bytes we're about to replace.
-    if pa > lo || pb < hi { return None; }
+    if pa > lo || pb < hi {
+        return None;
+    }
     // The prior captured content is `read`'s output: the raw slice lines
     // joined by '\n' (no trailing newline). Reconstruct the current
     // equivalent for the same window and compare.
@@ -862,9 +1055,7 @@ fn check_conflict_slice(target: &str, lines: &[&str], lo: usize, hi: usize,
 /// tool-result content. Inspect results are skipped — their numbered-line
 /// rendering doesn't byte-equal the raw on-disk text, so we'd never get a
 /// clean comparison; `read` is the byte-faithful baseline.
-fn last_read_for_path(target: &str, turns: &[Turn])
-    -> Option<(String, String)>
-{
+fn last_read_for_path(target: &str, turns: &[Turn]) -> Option<(String, String)> {
     // The turn list is in chronological order; pair a c.assistant call turn
     // with the immediately following .tool result turn.
     let pairs: Vec<(&Turn, &Turn)> = {
@@ -886,27 +1077,39 @@ fn last_read_for_path(target: &str, turns: &[Turn])
         out
     };
     for (call, result) in pairs.iter().rev() {
-        let Ok(envelope) = call.read() else { continue; };
-        let Ok(v) = serde_json::from_str::<Value>(&envelope) else { continue; };
+        let Ok(envelope) = call.read() else {
+            continue;
+        };
+        let Ok(v) = serde_json::from_str::<Value>(&envelope) else {
+            continue;
+        };
         let tool = v.get("tool").and_then(Value::as_str).unwrap_or("");
-        if tool != "read" { continue; }
-        let path_arg = v.get("arguments").and_then(|a| a.get("path"))
-            .and_then(Value::as_str).unwrap_or("").to_string();
+        if tool != "read" {
+            continue;
+        }
+        let path_arg = v
+            .get("arguments")
+            .and_then(|a| a.get("path"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
         let prev_loc = parse_locator(&path_arg);
         // Resolve page-key locators too — they refer to the cursor that
         // existed when the call ran; we approximate by using the current
         // turns list (the cursor is still latest-wins for the same key).
         let resolved_target = match &prev_loc.window {
-            Window::PageKey(k) => {
-                match resolve_page_key(k, turns) {
-                    Some((t, _)) => t,
-                    None => continue,
-                }
-            }
+            Window::PageKey(k) => match resolve_page_key(k, turns) {
+                Some((t, _)) => t,
+                None => continue,
+            },
             _ => prev_loc.path.clone(),
         };
-        if resolved_target != target { continue; }
-        let Ok(captured) = result.read() else { continue; };
+        if resolved_target != target {
+            continue;
+        }
+        let Ok(captured) = result.read() else {
+            continue;
+        };
         return Some((path_arg, captured));
     }
     None

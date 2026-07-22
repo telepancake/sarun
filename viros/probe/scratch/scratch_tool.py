@@ -17,7 +17,9 @@ from probe.probe_tool import (  # noqa: E402
     AuditError,
     ElfObject,
     EM_AARCH64,
+    EM_ARM,
     EM_MIPS,
+    EM_X86_64,
     _sha256_file,
     _write_json_atomic,
     gnu_build_id,
@@ -82,8 +84,21 @@ def discover_regions(vmlinux: Path, runtime_offset: int = 0) -> dict:
         raise ScratchError("runtime offset must be an unsigned 64-bit integer")
     elf = ElfObject(vmlinux)
     if elf.machine == EM_AARCH64:
+        if elf.elf_class != 64 or elf.endian != "<":
+            raise ScratchError(
+                f"{vmlinux}: aarch64 scratch requires ELF64 little-endian"
+            )
         arch = "aarch64"
         address_limit = UINT64_LIMIT
+        supported_page_sizes = SUPPORTED_PAGE_SIZES
+    elif elf.machine == EM_ARM:
+        if elf.elf_class != 32 or elf.endian != "<":
+            raise ScratchError(
+                f"{vmlinux}: arm scratch requires ELF32 little-endian"
+            )
+        arch = "arm"
+        address_limit = UINT32_LIMIT
+        supported_page_sizes = (4096,)
     elif elf.machine == EM_MIPS:
         if elf.elf_class != 32 or elf.endian != "<":
             raise ScratchError(
@@ -91,10 +106,20 @@ def discover_regions(vmlinux: Path, runtime_offset: int = 0) -> dict:
             )
         arch = "mmips"
         address_limit = UINT32_LIMIT
+        supported_page_sizes = SUPPORTED_PAGE_SIZES
+    elif elf.machine == EM_X86_64:
+        if elf.elf_class != 64 or elf.endian != "<":
+            raise ScratchError(
+                f"{vmlinux}: x86_64 scratch requires ELF64 little-endian"
+            )
+        arch = "x86_64"
+        address_limit = UINT64_LIMIT
+        supported_page_sizes = (4096,)
     else:
         raise ScratchError(
-            f"{vmlinux}: expected AArch64 ({EM_AARCH64}) or MIPS "
-            f"({EM_MIPS}) machine, got {elf.machine}"
+            f"{vmlinux}: expected x86-64 ({EM_X86_64}), ARM ({EM_ARM}), "
+            f"AArch64 ({EM_AARCH64}), or MIPS ({EM_MIPS}) machine, "
+            f"got {elf.machine}"
         )
 
     raw_regions = {}
@@ -107,7 +132,7 @@ def discover_regions(vmlinux: Path, runtime_offset: int = 0) -> dict:
         raw_regions[name] = (start, end, size, start_name, end_name)
 
     sizes = {region[2] for region in raw_regions.values()}
-    if len(sizes) != 1 or next(iter(sizes)) not in SUPPORTED_PAGE_SIZES:
+    if len(sizes) != 1 or next(iter(sizes)) not in supported_page_sizes:
         raise ScratchError(
             f"scratch regions must each occupy one supported {arch} page"
         )

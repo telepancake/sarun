@@ -5,6 +5,20 @@ obj-m += viros_probe.o
 ccflags-y += -I$(src)/../include
 CFLAGS_viros_probe.o += -fno-stack-protector -fno-pic -fno-pie
 
+# RouterOS's published ARM configuration uses an ARM-state kernel.  Keep both
+# the C entry point and the retained completion boundary out of Thumb mode and
+# omit unwind tables which are not meaningful in the injected flat image.
+ifeq ($(CONFIG_ARM),y)
+CFLAGS_viros_probe.o += -marm -fno-unwind-tables -fno-asynchronous-unwind-tables
+endif
+
+# The x86-64 entry wrapper performs a normal SysV call on the dedicated stack.
+# Kernel code must never use the userspace red zone, and the flat image has no
+# unwinder metadata consumer.
+ifeq ($(CONFIG_X86_64),y)
+CFLAGS_viros_probe.o += -mno-red-zone -fno-unwind-tables -fno-asynchronous-unwind-tables
+endif
+
 # The MMIPS call gate enters this symbol using the Linux MIPS o32 C ABI.  Keep
 # the whole leaf object in the four-byte MIPS32 instruction set: the injected
 # image has no ELF mode-switching veneer or ABI-call GOT setup.

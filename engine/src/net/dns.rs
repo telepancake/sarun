@@ -27,16 +27,23 @@ struct State {
 
 impl DnsServer {
     pub fn new(subnet: BoxSubnet) -> Self {
-        Self { subnet, state: Arc::new(Mutex::new(State {
-            by_domain: Default::default(), by_ip: Default::default(), next: 0,
-        }))}
+        Self {
+            subnet,
+            state: Arc::new(Mutex::new(State {
+                by_domain: Default::default(),
+                by_ip: Default::default(),
+                next: 0,
+            })),
+        }
     }
 
     /// Allocate or look up the synthetic IP for `host` (lowercased).
     fn alloc_for(&self, host: &str) -> Option<[u8; 4]> {
         let host = host.trim_end_matches('.').to_ascii_lowercase();
         let mut g = self.state.lock();
-        if let Some(ip) = g.by_domain.get(&host) { return Some(*ip); }
+        if let Some(ip) = g.by_domain.get(&host) {
+            return Some(*ip);
+        }
         let ip = self.subnet.synth_ip(g.next)?;
         g.next += 1;
         g.by_domain.insert(host.clone(), ip);
@@ -62,7 +69,8 @@ impl DnsServer {
         // reply → the box's resolve times out mysteriously. Log them so a
         // failed answer is visible.
         let mut builder = match MessageBuilder::new_vec()
-            .start_answer(&msg, domain::base::iana::Rcode::NOERROR) {
+            .start_answer(&msg, domain::base::iana::Rcode::NOERROR)
+        {
             Ok(b) => b,
             Err(e) => {
                 eprintln!("sarun-engine: net: dns start_answer {qname}: {e}");
@@ -82,11 +90,14 @@ impl DnsServer {
         } else {
             // SERVFAIL for anything else.
             let b = match MessageBuilder::new_vec()
-                .start_answer(&msg, domain::base::iana::Rcode::SERVFAIL) {
+                .start_answer(&msg, domain::base::iana::Rcode::SERVFAIL)
+            {
                 Ok(b) => b, // finish() consumes self; no `mut` needed
                 Err(e) => {
-                    eprintln!("sarun-engine: net: dns start_answer(servfail) \
-                               {qname}: {e}");
+                    eprintln!(
+                        "sarun-engine: net: dns start_answer(servfail) \
+                               {qname}: {e}"
+                    );
                     return None;
                 }
             };

@@ -14,9 +14,10 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use parking_lot::Mutex;
-use rcgen::{Certificate, CertificateParams, DistinguishedName, DnType, IsCa,
-            KeyPair, KeyUsagePurpose, BasicConstraints, ExtendedKeyUsagePurpose,
-            SanType};
+use rcgen::{
+    BasicConstraints, Certificate, CertificateParams, DistinguishedName, DnType,
+    ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose, SanType,
+};
 
 use crate::paths;
 
@@ -48,24 +49,34 @@ pub fn root_spki_sha256_b64() -> anyhow::Result<String> {
         .encode(sha2::Sha256::digest(ca.key.public_key_der())))
 }
 
-fn cert_path() -> PathBuf { paths::data_home().join("ca.pem") }
-fn key_path() -> PathBuf { paths::data_home().join("ca.key") }
+fn cert_path() -> PathBuf {
+    paths::data_home().join("ca.pem")
+}
+fn key_path() -> PathBuf {
+    paths::data_home().join("ca.key")
+}
 
 impl Ca {
     pub fn load_or_create() -> anyhow::Result<Self> {
         fs::create_dir_all(paths::data_home())?;
-        let (cert_pem, key_pem) = match (fs::read_to_string(cert_path()),
-                                         fs::read_to_string(key_path())) {
+        let (cert_pem, key_pem) = match (
+            fs::read_to_string(cert_path()),
+            fs::read_to_string(key_path()),
+        ) {
             (Ok(c), Ok(k)) => (c, k),
             _ => Self::mint_root()?,
         };
         let key = KeyPair::from_pem(&key_pem).context("CA key parse")?;
-        let params = CertificateParams::from_ca_cert_pem(&cert_pem)
-            .context("CA cert parse")?;
+        let params = CertificateParams::from_ca_cert_pem(&cert_pem).context("CA cert parse")?;
         let cert = params.self_signed(&key)?;
         let cert_der = cert.der().to_vec();
-        Ok(Self { cert_pem, cert_der, cert, key,
-                  leaves: Mutex::new(Default::default()) })
+        Ok(Self {
+            cert_pem,
+            cert_der,
+            cert,
+            key,
+            leaves: Mutex::new(Default::default()),
+        })
     }
 
     fn mint_root() -> anyhow::Result<(String, String)> {
@@ -99,7 +110,9 @@ impl Ca {
 
     /// Mint (or return cached) a leaf cert valid for `host`.
     pub fn leaf_for(&self, host: &str) -> anyhow::Result<Arc<Leaf>> {
-        if let Some(l) = self.leaves.lock().get(host) { return Ok(l.clone()); }
+        if let Some(l) = self.leaves.lock().get(host) {
+            return Ok(l.clone());
+        }
         let mut params = CertificateParams::new(vec![host.to_string()])?;
         let mut dn = DistinguishedName::new();
         dn.push(DnType::CommonName, host);

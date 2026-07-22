@@ -88,7 +88,8 @@ impl Dependencies for BrushFindDeps {
 
     fn run(&self, argv: &[std::ffi::OsString], cwd: Option<&std::path::Path>) -> i32 {
         // Serial: find dispatches one -exec at a time; block for the exit code.
-        self.submitter.run(argv, cwd.map(std::path::Path::to_path_buf))
+        self.submitter
+            .run(argv, cwd.map(std::path::Path::to_path_buf))
     }
 }
 
@@ -108,8 +109,8 @@ pub(crate) fn parser(
     input: brush_core::builtins::BuiltinParserInput,
 ) -> brush_core::builtins::BuiltinParserObservation {
     use brush_core::builtins::{
-        BuiltinParseStatus, BuiltinParserObservation, ParserArgumentEvidence,
-        ParserDiagnostic, ParserLiteralContinuation,
+        BuiltinParseStatus, BuiltinParserObservation, ParserArgumentEvidence, ParserDiagnostic,
+        ParserLiteralContinuation,
     };
     use findutils::find::probe::{ArgumentIdentity, ProbeArgument, ProbeStatus};
 
@@ -310,8 +311,12 @@ impl brush_core::builtins::Command for FindBuiltin {
         argv.extend(self.args.iter().cloned());
 
         // Capture logical I/O as owned Send values for the worker thread.
-        let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
-        let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
+        let out = context
+            .try_fd(1)
+            .unwrap_or_else(|| std::io::stdout().into());
+        let err = context
+            .try_fd(2)
+            .unwrap_or_else(|| std::io::stderr().into());
         let input = context.stdin();
         let cwd = context.shell.working_dir().to_path_buf();
 
@@ -351,7 +356,9 @@ impl brush_core::builtins::Command for FindBuiltin {
             Ok(handle) => handle.join().unwrap_or(1),
             Err(_) => 1,
         };
-        Ok(brush_core::results::ExecutionResult::new(exit_code_to_u8(code)))
+        Ok(brush_core::results::ExecutionResult::new(exit_code_to_u8(
+            code,
+        )))
     }
 }
 
@@ -420,10 +427,12 @@ mod parser_tests {
             suffix: String::new(),
             after: Vec::new(),
         });
-        assert!(stdin
-            .literal_continuations
-            .iter()
-            .any(|continuation| continuation.literal == "-"));
+        assert!(
+            stdin
+                .literal_continuations
+                .iter()
+                .any(|continuation| continuation.literal == "-")
+        );
     }
 
     #[test]

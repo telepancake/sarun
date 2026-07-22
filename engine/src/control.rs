@@ -10,8 +10,10 @@ use base64::Engine as _;
 
 use std::io::BufRead;
 use std::io::BufReader;
+use std::io::Seek;
+use std::io::SeekFrom;
 use std::io::Write;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixListener;
 use std::os::unix::net::UnixStream;
@@ -20,6 +22,7 @@ use std::sync::Mutex;
 
 use serde_json::Value;
 use serde_json::json;
+use sha2::Digest as _;
 
 use crate::discover;
 
@@ -55,9 +58,14 @@ pub struct Shared {
     /// Active SUD shared-ring transports, each serving a scoped clone of the
     /// same SarunFs through the common FUSE message decoder.
     pub sud_filesystems: std::collections::HashMap<i64, crate::sud_ring::SudFsSession>,
+    /// Trusted in-process filesystem transports for FUSE Brush boxes. These
+    /// share the box's canonical SarunFs and are never exposed to recipe
+    /// children.
+    pub direct_filesystems: std::collections::HashMap<i64, crate::sud_ring::DirectFsSession>,
     /// Per-box packet stacks, retained solely so box teardown can stop their
     /// poll/dispatcher threads and close TAP or QEMU packet fds deterministically.
-    pub network_stacks: std::collections::HashMap<i64, std::sync::Arc<crate::net::stack::StackRuntime>>,
+    pub network_stacks:
+        std::collections::HashMap<i64, std::sync::Arc<crate::net::stack::StackRuntime>>,
 }
 
 /// Open a pidfd for `pid` (>=0 on success). A live `pid` yields a valid fd; a
@@ -99,10 +107,7 @@ pub fn terminate_runners(state: &State) {
         pidfd_signal(fd, libc::SIGTERM);
     }
     wait_pidfds(&fds, 3000);
-    let remaining: Vec<i32> = fds
-        .into_iter()
-        .filter(|&fd| !pidfd_exited(fd))
-        .collect();
+    let remaining: Vec<i32> = fds.into_iter().filter(|&fd| !pidfd_exited(fd)).collect();
     for &fd in &remaining {
         pidfd_signal(fd, libc::SIGKILL);
     }
@@ -120,8 +125,8 @@ fn pidfd_exited(fd: i32) -> bool {
 }
 
 fn wait_pidfds(fds: &[i32], timeout_ms: i32) {
-    let deadline = std::time::Instant::now()
-        + std::time::Duration::from_millis(timeout_ms.max(0) as u64);
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms.max(0) as u64);
     loop {
         let mut descriptors: Vec<libc::pollfd> = fds
             .iter()
@@ -151,7 +156,7 @@ fn wait_pidfds(fds: &[i32], timeout_ms: i32) {
 /// ("Pid:" line; its FIRST field is the pid in our (init) namespace). 0 on any
 /// failure. This is the wrap-immune identity path — the pidfd names one exact
 /// process incarnation, so a reused pid can never alias a finished runner.
-fn host_pid_from_pidfd(pidfd: i32) -> i32 {
+pub(crate) fn host_pid_from_pidfd(pidfd: i32) -> i32 {
     let Ok(s) = std::fs::read_to_string(format!("/proc/self/fdinfo/{pidfd}")) else {
         return 0;
     };
@@ -698,11 +703,14 @@ fn lock(state: &State) -> std::sync::MutexGuard<'_, Shared> {
 }
 
 fn stop_live_transports(state: &State, box_id: i64) {
-    let (export, sud_filesystem, network) = {
+    let (export, sud_filesystem, direct_filesystem, network) = {
         let mut shared = lock(state);
-        (shared.virtio_exports.remove(&box_id),
-         shared.sud_filesystems.remove(&box_id),
-         shared.network_stacks.remove(&box_id))
+        (
+            shared.virtio_exports.remove(&box_id),
+            shared.sud_filesystems.remove(&box_id),
+            shared.direct_filesystems.remove(&box_id),
+            shared.network_stacks.remove(&box_id),
+        )
     };
     if let Some(network) = network {
         network.stop();
@@ -717,6 +725,11 @@ fn stop_live_transports(state: &State, box_id: i64) {
             eprintln!("sarun-engine: SUD filesystem box {box_id} teardown: {error}");
         }
     }
+    if let Some(filesystem) = direct_filesystem {
+        if let Err(error) = filesystem.stop() {
+            eprintln!("sarun-engine: direct filesystem box {box_id} teardown: {error}");
+        }
+    }
 }
 
 /// Undo the live resources installed by a registration that failed before its
@@ -728,7 +741,9 @@ fn abort_registration(state: &State, overlay: &crate::overlay::Overlay, box_id: 
     overlay.remove_box(box_id);
     let mut shared = lock(state);
     if let Some(fd) = shared.box_pids.remove(&box_id) {
-        unsafe { libc::close(fd); }
+        unsafe {
+            libc::close(fd);
+        }
     }
     shared.box_runpids.remove(&box_id);
     if let Some(proxy) = shared.api_proxy.clone() {
@@ -748,9 +763,7 @@ pub fn broadcast_api_log(box_id: i64) {
     if let (Some(state), Ok(r#box)) = (STATE_HANDLE.read().clone(), u64::try_from(box_id)) {
         broadcast(
             &state,
-            &crate::generated_wire::SubscriptionEvent::ApiLogAdded {
-                r#box,
-            },
+            &crate::generated_wire::SubscriptionEvent::ApiLogAdded { r#box },
         );
     }
 }
@@ -761,9 +774,7 @@ pub fn broadcast_webcap(box_id: i64) {
     if let (Some(state), Ok(r#box)) = (STATE_HANDLE.read().clone(), u64::try_from(box_id)) {
         broadcast(
             &state,
-            &crate::generated_wire::SubscriptionEvent::WebCaptureAdded {
-                r#box,
-            },
+            &crate::generated_wire::SubscriptionEvent::WebCaptureAdded { r#box },
         );
     }
 }
@@ -800,8 +811,12 @@ fn record_brush_prov(
     let spawn_ts = rec.get("spawn_ts").and_then(Value::as_f64).unwrap_or(0.0);
     let local_uid = rec.get("uid").and_then(Value::as_u64).unwrap_or(0);
     let local_parent_uid = rec.get("parent_uid").and_then(Value::as_u64).unwrap_or(0);
-    let Ok(uid) = scoped_pipeline_id(producer, local_uid) else { return };
-    let Ok(parent_uid) = scoped_pipeline_id(producer, local_parent_uid) else { return };
+    let Ok(uid) = scoped_pipeline_id(producer, local_uid) else {
+        return;
+    };
+    let Ok(parent_uid) = scoped_pipeline_id(producer, local_parent_uid) else {
+        return;
+    };
     if let Value::Object(fields) = &mut rec {
         fields.insert("uid".into(), Value::from(uid));
         fields.insert("parent_uid".into(), Value::from(parent_uid));
@@ -827,8 +842,10 @@ fn record_brush_prov(
         }
     }
     if let (Ok(r#box), Ok(row)) = (u64::try_from(id), u64::try_from(prov_id)) {
-        broadcast(state,
-            &crate::generated_wire::SubscriptionEvent::BrushProvenanceAdded { r#box, row });
+        broadcast(
+            state,
+            &crate::generated_wire::SubscriptionEvent::BrushProvenanceAdded { r#box, row },
+        );
     }
 }
 
@@ -846,32 +863,56 @@ fn brush_prov_nested(
     peer_pidfd: Option<i32>,
 ) -> Result<u64, String> {
     let (id, producer) = enclosing_brush_scope_from_pidfd(state, peer_pidfd)?;
-    let records = records.iter().map(|record| {
-        if !record.nested { return Err("nested provenance record is not marked nested".into()); }
-        let sequence = i64::try_from(record.sequence)
-            .map_err(|_| "pipeline sequence exceeds SQLite range")?;
-        let uid = scoped_pipeline_id(producer, record.uid)?;
-        let parent_uid = scoped_pipeline_id(producer, record.parent_uid)?;
-        let targets = record.output_targets.as_slice().iter().map(|target|
-            std::str::from_utf8(target.as_slice()).map(str::to_owned)
-                .map_err(|_| "pipeline output target is not UTF-8".to_owned()))
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut relation = crate::discover::pipeline_provenance_json(record);
-        if let Value::Object(fields) = &mut relation {
-            fields.insert("uid".into(), Value::from(uid));
-            fields.insert("parent_uid".into(), Value::from(parent_uid));
-        }
-        Ok((record.command.as_str().to_owned(), relation.to_string(),
-            sequence, record.spawned_at, uid, parent_uid, targets))
-    }).collect::<Result<Vec<_>, String>>()?;
+    let records = records
+        .iter()
+        .map(|record| {
+            if !record.nested {
+                return Err("nested provenance record is not marked nested".into());
+            }
+            let sequence = i64::try_from(record.sequence)
+                .map_err(|_| "pipeline sequence exceeds SQLite range")?;
+            let uid = scoped_pipeline_id(producer, record.uid)?;
+            let parent_uid = scoped_pipeline_id(producer, record.parent_uid)?;
+            let targets = record
+                .output_targets
+                .as_slice()
+                .iter()
+                .map(|target| {
+                    std::str::from_utf8(target.as_slice())
+                        .map(str::to_owned)
+                        .map_err(|_| "pipeline output target is not UTF-8".to_owned())
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut relation = crate::discover::pipeline_provenance_json(record);
+            if let Value::Object(fields) = &mut relation {
+                fields.insert("uid".into(), Value::from(uid));
+                fields.insert("parent_uid".into(), Value::from(parent_uid));
+            }
+            Ok((
+                record.command.as_str().to_owned(),
+                relation.to_string(),
+                sequence,
+                record.spawned_at,
+                uid,
+                parent_uid,
+                targets,
+            ))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     let ov = lock(state).overlay.clone();
     let mut count = 0u64;
     for (command, record_json, sequence, spawned_at, uid, parent_uid, targets) in records {
         let mut prov_id = 0i64;
         if let Some(ov) = ov.as_ref() {
             if let Some(b) = ov.live_box(id) {
-                prov_id =
-                    b.add_brushprov_nested(&command, &record_json, sequence, spawned_at, uid, parent_uid);
+                prov_id = b.add_brushprov_nested(
+                    &command,
+                    &record_json,
+                    sequence,
+                    spawned_at,
+                    uid,
+                    parent_uid,
+                );
                 b.on_brush_prov(prov_id, targets);
                 // Set cur_brush_pipeline to the FIRST pipeline in this
                 // complete-command — that is the one that executes first and
@@ -886,8 +927,10 @@ fn brush_prov_nested(
             }
         }
         if let (Ok(r#box), Ok(row)) = (u64::try_from(id), u64::try_from(prov_id)) {
-            broadcast(state,
-                &crate::generated_wire::SubscriptionEvent::BrushProvenanceAdded { r#box, row });
+            broadcast(
+                state,
+                &crate::generated_wire::SubscriptionEvent::BrushProvenanceAdded { r#box, row },
+            );
         }
         count += 1;
     }
@@ -916,7 +959,9 @@ fn enclosing_box_from_pidfd(state: &State, peer_pidfd: Option<i32>) -> Result<i6
 /// `/proc/PID/stat` field 22, parsed after the parenthesized comm field.
 /// Paired with the host pid, this names an exact process incarnation.
 fn host_process_start(pid: i32) -> i64 {
-    if pid <= 0 { return 0; }
+    if pid <= 0 {
+        return 0;
+    }
     let Ok(raw) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
         return 0;
     };
@@ -931,9 +976,10 @@ fn host_process_start(pid: i32) -> i64 {
 /// identity. Producer occupies the high 31 bits and the local counter the low
 /// 32, so the mapping is reversible and always a positive SQLite INTEGER.
 fn scoped_pipeline_id(producer: i64, local: u64) -> Result<i64, String> {
-    if local == 0 { return Ok(0); }
-    let producer = u64::try_from(producer)
-        .map_err(|_| "invalid Brush producer id".to_owned())?;
+    if local == 0 {
+        return Ok(0);
+    }
+    let producer = u64::try_from(producer).map_err(|_| "invalid Brush producer id".to_owned())?;
     if producer == 0 || producer > 0x7fff_ffff {
         return Err("Brush producer id exceeds relation range".into());
     }
@@ -957,11 +1003,14 @@ fn enclosing_brush_scope_from_pidfd(
         .unwrap_or(0);
     let host_start = host_process_start(host_pid);
     if let Some(fd) = peer_pidfd {
-        unsafe { libc::close(fd); }
+        unsafe {
+            libc::close(fd);
+        }
     }
     let id = derive_parent_box(state, host_pid).ok_or_else(|| "no enclosing box".to_owned())?;
     let ov = lock(state).overlay.clone();
-    let producer = ov.as_ref()
+    let producer = ov
+        .as_ref()
         .and_then(|overlay| overlay.live_box(id))
         .map(|r#box| r#box.brush_producer(host_pid as u32, host_start))
         .unwrap_or(0);
@@ -979,7 +1028,9 @@ fn brush_prov_done(
     peer_pidfd: Option<i32>,
 ) -> Result<(), String> {
     let (id, producer) = enclosing_brush_scope_from_pidfd(state, peer_pidfd)?;
-    let pipelines = pipelines.iter().map(|value| scoped_pipeline_id(producer, *value))
+    let pipelines = pipelines
+        .iter()
+        .map(|value| scoped_pipeline_id(producer, *value))
         .collect::<Result<Vec<_>, _>>()?;
     let ov = lock(state).overlay.clone();
     if let Some(ov) = ov.as_ref() {
@@ -1002,7 +1053,9 @@ fn recipe_fixup(
     peer_pidfd: Option<i32>,
 ) -> Result<(), String> {
     let (id, producer) = enclosing_brush_scope_from_pidfd(state, peer_pidfd)?;
-    let pipelines = pipelines.iter().map(|value| scoped_pipeline_id(producer, *value))
+    let pipelines = pipelines
+        .iter()
+        .map(|value| scoped_pipeline_id(producer, *value))
         .collect::<Result<Vec<_>, _>>()?;
     let ov = lock(state).overlay.clone();
     if let Some(ov) = ov.as_ref() {
@@ -1032,17 +1085,33 @@ fn build_edges(
     peer_pidfd: Option<i32>,
 ) -> Result<u64, String> {
     let id = enclosing_box_from_pidfd(state, peer_pidfd)?;
-    let path = |value: &crate::generated_wire::Path| std::str::from_utf8(value.as_slice())
-        .map(str::to_owned).map_err(|_| "build graph path is not UTF-8".to_owned());
-    let edges = edges.iter().map(|edge| {
-        let outputs = edge.outputs.as_slice().iter().map(&path)
-            .collect::<Result<Vec<_>, _>>()?;
-        let inputs = edge.inputs.as_slice().iter().map(&path)
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok((serde_json::to_string(&outputs).map_err(|error| error.to_string())?,
-            serde_json::to_string(&inputs).map_err(|error| error.to_string())?,
-            edge.command.as_ref().map(|value| value.as_str().to_owned())))
-    }).collect::<Result<Vec<_>, String>>()?;
+    let path = |value: &crate::generated_wire::Path| {
+        std::str::from_utf8(value.as_slice())
+            .map(str::to_owned)
+            .map_err(|_| "build graph path is not UTF-8".to_owned())
+    };
+    let edges = edges
+        .iter()
+        .map(|edge| {
+            let outputs = edge
+                .outputs
+                .as_slice()
+                .iter()
+                .map(&path)
+                .collect::<Result<Vec<_>, _>>()?;
+            let inputs = edge
+                .inputs
+                .as_slice()
+                .iter()
+                .map(&path)
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok((
+                serde_json::to_string(&outputs).map_err(|error| error.to_string())?,
+                serde_json::to_string(&inputs).map_err(|error| error.to_string())?,
+                edge.command.as_ref().map(|value| value.as_str().to_owned()),
+            ))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     let ov = lock(state).overlay.clone();
     let mut count = 0u64;
     if let Some(ov) = ov.as_ref() {
@@ -1052,9 +1121,13 @@ fn build_edges(
         }
     }
     if let Ok(r#box) = u64::try_from(id) {
-        broadcast(state, &crate::generated_wire::SubscriptionEvent::BuildGraphChanged {
-            r#box, phase: crate::generated_wire::EdgePhase::Rebuilt,
-        });
+        broadcast(
+            state,
+            &crate::generated_wire::SubscriptionEvent::BuildGraphChanged {
+                r#box,
+                phase: crate::generated_wire::EdgePhase::Rebuilt,
+            },
+        );
     }
     Ok(count)
 }
@@ -1091,20 +1164,31 @@ fn make_vars(
     peer_pidfd: Option<i32>,
 ) -> Result<(), String> {
     let (id, producer) = enclosing_brush_scope_from_pidfd(state, peer_pidfd)?;
-    let string = |value: &[u8], field: &str| std::str::from_utf8(value)
-        .map(str::to_owned).map_err(|_| format!("make variable {field} is not UTF-8"));
-    let rows = rows.iter().map(|row| Ok(MakeVarRow {
-        name: string(row.name.as_slice(), "name")?,
-        loc: string(row.location.as_slice(), "location")?,
-        value: string(row.value.as_slice(), "value")?,
-        make_dir: string(row.make_directory.as_slice(), "directory")?,
-        edge_out: row.edge_output.as_ref().map(|value|
-            string(value.as_slice(), "edge output")).transpose()?,
-        uid: scoped_pipeline_id(producer, row.pipeline)?,
-        rhs: string(row.rhs.as_slice(), "rhs")?,
-        refs: string(row.references.as_slice(), "references")?,
-        flags: row.flags.as_str().to_owned(),
-    })).collect::<Result<Vec<_>, String>>()?;
+    let string = |value: &[u8], field: &str| {
+        std::str::from_utf8(value)
+            .map(str::to_owned)
+            .map_err(|_| format!("make variable {field} is not UTF-8"))
+    };
+    let rows = rows
+        .iter()
+        .map(|row| {
+            Ok(MakeVarRow {
+                name: string(row.name.as_slice(), "name")?,
+                loc: string(row.location.as_slice(), "location")?,
+                value: string(row.value.as_slice(), "value")?,
+                make_dir: string(row.make_directory.as_slice(), "directory")?,
+                edge_out: row
+                    .edge_output
+                    .as_ref()
+                    .map(|value| string(value.as_slice(), "edge output"))
+                    .transpose()?,
+                uid: scoped_pipeline_id(producer, row.pipeline)?,
+                rhs: string(row.rhs.as_slice(), "rhs")?,
+                refs: string(row.references.as_slice(), "references")?,
+                flags: row.flags.as_str().to_owned(),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     let ov = lock(state).overlay.clone();
     if let Some(ov) = ov.as_ref() {
         if let Some(b) = ov.live_box(id) {
@@ -1123,12 +1207,16 @@ fn box_activity(
     peer_pidfd: Option<i32>,
 ) -> Result<(), String> {
     let id = enclosing_box_from_pidfd(state, peer_pidfd)?;
-    let items = items.iter().map(|item|
-        (item.description.as_str().to_owned(), item.age_seconds)).collect();
+    let items = items
+        .iter()
+        .map(|item| (item.description.as_str().to_owned(), item.age_seconds))
+        .collect();
     let ov = lock(state).overlay.clone();
     if let Some(ov) = ov.as_ref() {
         if let Some(b) = ov.live_box(id) {
-            *b.activity.lock().map_err(|_| "box activity lock poisoned")? = items;
+            *b.activity
+                .lock()
+                .map_err(|_| "box activity lock poisoned")? = items;
         }
     }
     Ok(())
@@ -1141,22 +1229,40 @@ fn build_edge_state(
 ) -> Result<(), String> {
     use crate::generated_wire::{BuildEdgeTransition, EdgePhase, SubscriptionEvent};
     fn text_path(value: &crate::generated_wire::Path) -> Result<&str, String> {
-        std::str::from_utf8(value.as_slice())
-            .map_err(|_| "build edge output is not UTF-8".into())
+        std::str::from_utf8(value.as_slice()).map_err(|_| "build edge output is not UTF-8".into())
     }
     let id = enclosing_box_from_pidfd(state, peer_pidfd)?;
     let ov = lock(state).overlay.clone();
     if let Some(ov) = ov.as_ref() {
         if let Some(b) = ov.live_box(id) {
             match transition {
-                BuildEdgeTransition::Start { at, output, command } => {
+                BuildEdgeTransition::Start {
+                    at,
+                    output,
+                    command,
+                } => {
                     let output = output.as_ref().map(text_path).transpose()?;
-                    b.mark_build_edge_started(output, command.as_ref().map(|value| value.as_str()), *at);
+                    b.mark_build_edge_started(
+                        output,
+                        command.as_ref().map(|value| value.as_str()),
+                        *at,
+                    );
                 }
-                BuildEdgeTransition::Done { at, output, command, code, excerpt } => {
+                BuildEdgeTransition::Done {
+                    at,
+                    output,
+                    command,
+                    code,
+                    excerpt,
+                } => {
                     let output = output.as_ref().map(text_path).transpose()?;
-                    b.mark_build_edge_done(output, command.as_ref().map(|value| value.as_str()),
-                        i64::from(*code), *at, excerpt.as_ref().map(|value| value.as_str()));
+                    b.mark_build_edge_done(
+                        output,
+                        command.as_ref().map(|value| value.as_str()),
+                        i64::from(*code),
+                        *at,
+                        excerpt.as_ref().map(|value| value.as_str()),
+                    );
                 }
             }
         }
@@ -1166,7 +1272,10 @@ fn build_edge_state(
         BuildEdgeTransition::Start { .. } => EdgePhase::Started,
         BuildEdgeTransition::Done { .. } => EdgePhase::Done,
     };
-    broadcast(state, &SubscriptionEvent::BuildGraphChanged { r#box, phase });
+    broadcast(
+        state,
+        &SubscriptionEvent::BuildGraphChanged { r#box, phase },
+    );
     Ok(())
 }
 
@@ -1182,18 +1291,23 @@ fn dispatch_reply_transport(
             brush_prov_nested(state, records.as_slice(), peer_pidfd)
                 .map(|count| TransportResponse::Recorded { count })
         }
-        TransportRequest::BrushDone { pipelines, code, done_at } => {
+        TransportRequest::BrushDone {
+            pipelines,
+            code,
+            done_at,
+        } => {
             brush_prov_done(state, pipelines.as_slice(), code, done_at, peer_pidfd)?;
             Ok(TransportResponse::Empty)
         }
-        TransportRequest::RecipeStarted { pipelines, started_at } => {
+        TransportRequest::RecipeStarted {
+            pipelines,
+            started_at,
+        } => {
             recipe_fixup(state, pipelines.as_slice(), started_at, peer_pidfd)?;
             Ok(TransportResponse::Empty)
         }
-        TransportRequest::BuildGraph { edges } => {
-            build_edges(state, edges.as_slice(), peer_pidfd)
-                .map(|count| TransportResponse::Recorded { count })
-        }
+        TransportRequest::BuildGraph { edges } => build_edges(state, edges.as_slice(), peer_pidfd)
+            .map(|count| TransportResponse::Recorded { count }),
         TransportRequest::MakeVariables { rows } => {
             make_vars(state, rows.as_slice(), peer_pidfd)?;
             Ok(TransportResponse::Empty)
@@ -1208,34 +1322,59 @@ fn dispatch_reply_transport(
         }
         TransportRequest::BudgetGrant { target, amount } => {
             if let Some(fd) = peer_pidfd {
-                unsafe { libc::close(fd); }
+                unsafe {
+                    libc::close(fd);
+                }
             }
             let id = match target {
                 BoxTarget::Broker => hint_box_id,
-                BoxTarget::Selector { r#box } => {
-                    resolve(&discover::discover(), r#box.as_str())
-                }
-            }.ok_or("box not resolvable")?;
+                BoxTarget::Selector { r#box } => resolve(&discover::discover(), r#box.as_str()),
+            }
+            .ok_or("box not resolvable")?;
             crate::oaita::budget::grant(state, id, amount);
             let remaining = crate::oaita::budget::remaining(state, id).unwrap_or(0);
             Ok(TransportResponse::Budget { remaining })
         }
-        TransportRequest::ServiceDeclare { name, argv, net_mode } => {
+        TransportRequest::ServiceDeclare {
+            name,
+            argv,
+            client_argv,
+            net_mode,
+        } => {
             if let Some(fd) = peer_pidfd {
-                unsafe { libc::close(fd); }
+                unsafe {
+                    libc::close(fd);
+                }
             }
             if !svc_name_ok(name.as_str()) {
                 return Err("service name is invalid".into());
             }
-            let argv = argv.into_inner().into_iter().map(|value|
-                String::from_utf8(value.into_inner())
-                    .map_err(|_| "service argv is not UTF-8".to_string()))
+            let argv = argv
+                .into_inner()
+                .into_iter()
+                .map(|value| {
+                    String::from_utf8(value.into_inner())
+                        .map_err(|_| "service argv is not UTF-8".to_string())
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let client_argv = client_argv
+                .into_inner()
+                .into_iter()
+                .map(|value| {
+                    String::from_utf8(value.into_inner())
+                        .map_err(|_| "service client argv is not UTF-8".to_string())
+                })
                 .collect::<Result<Vec<_>, _>>()?;
             let id = hint_box_id.ok_or("service declaration has no enclosing box")?;
-            let overlay = lock(state).overlay.clone().ok_or("overlay is unavailable")?;
+            let overlay = lock(state)
+                .overlay
+                .clone()
+                .ok_or("overlay is unavailable")?;
             let r#box = overlay.box_of(id).ok_or("service box is not live")?;
             let argv = serde_json::to_string(&argv)
                 .map_err(|error| format!("encode service argv: {error}"))?;
+            let client_argv = serde_json::to_string(&client_argv)
+                .map_err(|error| format!("encode service client argv: {error}"))?;
             let net_mode = match net_mode {
                 None => "",
                 Some(crate::generated_wire::NetMode::Off) => "off",
@@ -1244,14 +1383,20 @@ fn dispatch_reply_transport(
             };
             r#box.set_meta("svc_provide", name.as_str());
             r#box.set_meta("svc_argv", &argv);
+            r#box.set_meta("svc_client_argv", &client_argv);
             r#box.set_meta("svc_net", net_mode);
             Ok(TransportResponse::Empty)
         }
         other => {
             if let Some(fd) = peer_pidfd {
-                unsafe { libc::close(fd); }
+                unsafe {
+                    libc::close(fd);
+                }
             }
-            Err(format!("transport opcode {} is not a reply-mode request", other.code()))
+            Err(format!(
+                "transport opcode {} is not a reply-mode request",
+                other.code()
+            ))
         }
     }
 }
@@ -1291,7 +1436,11 @@ fn legacy_subscription_event(event: &crate::generated_wire::SubscriptionEvent) -
     // coordinated client/server cutover. Event meaning is already closed and
     // typed here; this projection is deleted with that listener.
     match event {
-        SubscriptionEvent::BoxAdded { r#box, name, parent } => json!({
+        SubscriptionEvent::BoxAdded {
+            r#box,
+            name,
+            parent,
+        } => json!({
             "type": "session_added", "sid": r#box.to_string(),
             "name": name.as_ref().map(|value| value.as_str()), "parent": parent,
         }),
@@ -1302,7 +1451,11 @@ fn legacy_subscription_event(event: &crate::generated_wire::SubscriptionEvent) -
             "type": "session_renamed", "session_id": r#box.to_string(),
             "name": name.as_str(),
         }),
-        SubscriptionEvent::OverlayChanged { r#box, count, latest_path } => json!({
+        SubscriptionEvent::OverlayChanged {
+            r#box,
+            count,
+            latest_path,
+        } => json!({
             "type": "overlay", "sid": r#box.to_string(), "n": count,
             "rel": latest_path.as_ref().map(|path|
                 String::from_utf8_lossy(path.as_slice()).into_owned()),
@@ -1328,6 +1481,11 @@ fn legacy_subscription_event(event: &crate::generated_wire::SubscriptionEvent) -
             "type": "webcap_added", "sid": r#box.to_string(),
         }),
         SubscriptionEvent::Pong => json!({"type": "pong"}),
+        SubscriptionEvent::DebugConsoleReady { r#box, service } => json!({
+            "type": "debug_console_ready",
+            "sid": r#box.to_string(),
+            "service": service.as_str(),
+        }),
     }
 }
 
@@ -1347,8 +1505,15 @@ pub fn broadcast(state: &State, event: &crate::generated_wire::SubscriptionEvent
 /// close any extras.
 /// MSG_PEEK leaves the data bytes queued for the BufReader, and the real
 /// (no-ancillary) read later discards the duplicate fd delivery.
-fn recv_first_fd(conn: &UnixStream) ->
-    (Option<i32>, Option<i32>, Option<i32>, Option<i32>, Option<i32>) {
+fn recv_first_fd(
+    conn: &UnixStream,
+) -> (
+    Option<i32>,
+    Option<i32>,
+    Option<i32>,
+    Option<i32>,
+    Option<i32>,
+) {
     // Wait (bounded) for the first bytes to arrive before peeking: the runner's
     // sendmsg may still be in flight when we accept, and a non-blocking peek
     // that races ahead of it would miss the pidfd — dropping a nested box's
@@ -1439,15 +1604,22 @@ fn first_data_byte(conn: &UnixStream) -> Option<u8> {
 }
 
 fn binary_error(message: String) -> crate::generated_wire::ConnectionMode {
-    use crate::generated_wire::{ConnectionMode, ErrorCategory, TransportResponse};
+    binary_error_with_category(
+        crate::generated_wire::ErrorCategory::InvalidRequest,
+        message,
+    )
+}
+
+fn binary_error_with_category(
+    category: crate::generated_wire::ErrorCategory,
+    message: String,
+) -> crate::generated_wire::ConnectionMode {
+    use crate::generated_wire::{ConnectionMode, TransportResponse};
     let message = crate::wire::BoundedText::new(message).unwrap_or_else(|_| {
         crate::wire::BoundedText::new("binary request failed".to_owned()).unwrap()
     });
     ConnectionMode::Reply {
-        response: TransportResponse::Error {
-            category: ErrorCategory::InvalidRequest,
-            message,
-        },
+        response: TransportResponse::Error { category, message },
     }
 }
 
@@ -1478,8 +1650,8 @@ fn record_guest_process_frame(state: &State, id: i64, payload: &[u8]) {
 }
 
 /// Direct generated binary ui.sock request handling. Ordinary actions receive
-/// one typed reply and close. QEMU registration then hands the same connection
-/// over to the runner's lifetime channel, exactly like FUSE/SUD registration.
+/// one typed reply and close. Service requests and QEMU registration switch
+/// the same connection into their catalog-declared streaming mode.
 fn handle_binary_request(
     state: State,
     mut conn: UnixStream,
@@ -1500,10 +1672,20 @@ fn handle_binary_request(
             let _ = crate::socket_wire::write_mode(&mut conn, &mode);
             return;
         }
-        Ok(RequestEnvelope::Transport(request @ TransportRequest::Register {
-            backend: RunBackend::Qemu,
-            ..
-        })) => request,
+        Ok(RequestEnvelope::Transport(TransportRequest::ServiceAccept { name })) => {
+            handle_binary_service_accept(conn, name.as_str(), authenticated_parent);
+            return;
+        }
+        Ok(RequestEnvelope::Transport(TransportRequest::ServiceDial { name })) => {
+            handle_binary_service_dial(conn, name.as_str());
+            return;
+        }
+        Ok(RequestEnvelope::Transport(
+            request @ TransportRequest::Register {
+                backend: RunBackend::Qemu,
+                ..
+            },
+        )) => request,
         Ok(_) => {
             let _ = crate::socket_wire::write_mode(
                 &mut conn,
@@ -1529,7 +1711,7 @@ fn handle_binary_request(
         fd5.map(std::os::fd::IntoRawFd::into_raw_fd),
         authenticated_parent,
     );
-    let registration = match result {
+    let mut registration = match result {
         Ok(registration) => registration,
         Err(error) => {
             let _ = crate::socket_wire::write_mode(&mut conn, &binary_error(error));
@@ -1546,29 +1728,118 @@ fn handle_binary_request(
             return;
         }
     };
-    let virtiofs = registration.virtiofs_socket.as_ref().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::NotFound, "registration omitted virtio-fs socket")
-    }).and_then(|socket| {
-        use std::os::unix::ffi::OsStrExt;
-        let path = std::path::Path::new(std::ffi::OsStr::from_bytes(socket.as_slice()));
-        UnixStream::connect(path)
-    });
+    let selected_pair = match selected_kernel_initramfs_payload(&state, &request, id) {
+        Ok(value) => value,
+        Err(error) => {
+            if let Some(overlay) = lock(&state).overlay.clone() {
+                abort_registration(&state, &overlay, id);
+            } else {
+                stop_live_transports(&state, id);
+            }
+            let _ = crate::socket_wire::write_mode(&mut conn, &binary_error(error));
+            return;
+        }
+    };
+    let debug_resources = match resolve_debug_service_launch(&state, &request, id) {
+        Ok(value) => value,
+        Err(error) => {
+            if let Some(overlay) = lock(&state).overlay.clone() {
+                abort_registration(&state, &overlay, id);
+            } else {
+                stop_live_transports(&state, id);
+            }
+            let _ = crate::socket_wire::write_mode(&mut conn, &binary_error(error));
+            return;
+        }
+    };
+    let mut debug_launch = match debug_resources {
+        Some(resources) => match prepare_debug_launch(&state, id, resources, selected_pair) {
+            Ok(value) => Some(value),
+            Err(error) => {
+                if let Some(overlay) = lock(&state).overlay.clone() {
+                    abort_registration(&state, &overlay, id);
+                } else {
+                    stop_live_transports(&state, id);
+                }
+                let _ = crate::socket_wire::write_mode(&mut conn, &binary_error(error));
+                return;
+            }
+        },
+        None => None,
+    };
+    registration.debug_image = debug_launch
+        .as_ref()
+        .and_then(|debug| debug.image.as_ref().map(|image| image.start.clone()));
+    let virtiofs = registration
+        .virtiofs_socket
+        .as_ref()
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "registration omitted virtio-fs socket",
+            )
+        })
+        .and_then(|socket| {
+            use std::os::unix::ffi::OsStrExt;
+            let path = std::path::Path::new(std::ffi::OsStr::from_bytes(socket.as_slice()));
+            UnixStream::connect(path)
+        });
     let channel_ready = match &virtiofs {
         Err(error) => {
             let _ = crate::socket_wire::write_mode(
                 &mut conn,
-                &binary_error(format!("registered QEMU export is not connectable: {error}")),
+                &binary_error(format!(
+                    "registered QEMU export is not connectable: {error}"
+                )),
             );
             false
         }
-        Ok(export) => crate::socket_wire::write_mode(
-            &mut conn,
-            &ConnectionMode::Box { registration },
-        ).is_ok() && send_stream_with_fd(
-            &conn,
-            &crate::frames::encode(crate::frames::FRAME_APPLIANCE_FS, &[]),
-            export.as_raw_fd(),
-        ).is_ok(),
+        Ok(export) => {
+            let mut ready =
+                crate::socket_wire::write_mode(&mut conn, &ConnectionMode::Box { registration })
+                    .is_ok()
+                    && send_stream_with_fd(
+                        &conn,
+                        &crate::frames::encode(crate::frames::FRAME_APPLIANCE_FS, &[]),
+                        export.as_raw_fd(),
+                    )
+                    .is_ok();
+            if let Some(debug) = &debug_launch {
+                ready = ready
+                    && send_stream_with_fd(
+                        &conn,
+                        &crate::frames::encode(crate::frames::FRAME_DEBUG_KERNEL, &[]),
+                        debug.kernel.as_raw_fd(),
+                    )
+                    .is_ok()
+                    && send_stream_with_fd(
+                        &conn,
+                        &crate::frames::encode(crate::frames::FRAME_DEBUG_RSP, &[]),
+                        debug.qemu_rsp.as_raw_fd(),
+                    )
+                    .is_ok();
+                if ready {
+                    if let Some(image) = &debug.image {
+                        let mut payload = Vec::new();
+                        ready = <crate::generated_wire::DebugGuestImageStart as crate::wire::WireValue>::encode_atom(
+                            &image.start,
+                            &mut payload,
+                        )
+                        .is_ok()
+                            && send_stream_with_fd(
+                                &conn,
+                                &crate::frames::encode(
+                                    crate::frames::FRAME_DEBUG_IMAGE,
+                                    &payload,
+                                ),
+                                image.initramfs.as_raw_fd(),
+                            )
+                            .is_ok();
+                    }
+                }
+            }
+            ready
+        }
     };
     // SCM_RIGHTS has duplicated the endpoint into the runner. The engine must
     // not retain its temporary connected copy: doing so keeps virtiofsd's
@@ -1578,20 +1849,83 @@ fn handle_binary_request(
         stop_live_transports(&state, id);
     } else {
         let overlay = lock(&state).overlay.clone();
-        if let (Some(overlay), Ok(writer)) = (overlay.as_ref(), conn.try_clone()) {
-            overlay.set_echo(id, Arc::new(Mutex::new(writer)));
+        let box_writer = conn
+            .try_clone()
+            .ok()
+            .map(|writer| Arc::new(Mutex::new(writer)));
+        if let (Some(overlay), Some(writer)) = (overlay.as_ref(), box_writer.as_ref()) {
+            overlay.set_echo(id, writer.clone());
         }
         let mut bytes = [0u8; 4096];
         let mut frames = Vec::new();
-        loop {
+        let mut debug_barrier_released = false;
+        'channel: loop {
             match std::io::Read::read(&mut conn, &mut bytes) {
                 Ok(0) | Err(_) => break,
                 Ok(count) => frames.extend_from_slice(&bytes[..count]),
             }
             let (decoded, used) = crate::frames::decode(&frames);
             for (kind, payload) in decoded {
-                if kind == crate::frames::FRAME_GUEST_PROCESS {
+                if kind == crate::frames::FRAME_DEBUG_PREPARED {
+                    if debug_barrier_released {
+                        eprintln!("sarun-engine: duplicate debug barrier from box {id}");
+                        break 'channel;
+                    }
+                    let session_service = debug_launch
+                        .as_ref()
+                        .map(|debug| debug.session_service.as_str());
+                    let provider_exited = debug_launch
+                        .as_ref()
+                        .map(|debug| debug._service.exited.as_ref());
+                    let Some(writer) = box_writer.as_ref() else {
+                        eprintln!("sarun-engine: box {id}: box channel writer is unavailable");
+                        break 'channel;
+                    };
+                    if let Err(error) = wait_debug_provider(
+                        session_service,
+                        provider_exited,
+                        std::time::Duration::from_secs(120),
+                    ) {
+                        eprintln!("sarun-engine: box {id}: {error}");
+                        break 'channel;
+                    }
+                    let Some(debug) = debug_launch.as_mut() else {
+                        eprintln!("sarun-engine: box {id}: debug resources disappeared");
+                        break 'channel;
+                    };
+                    let console_service = match start_managed_debug_client(&state, id, debug) {
+                        Ok(service) => service,
+                        Err(error) => {
+                            eprintln!("sarun-engine: box {id}: {error}");
+                            break 'channel;
+                        }
+                    };
+                    let Ok(r#box) = u64::try_from(id) else {
+                        eprintln!("sarun-engine: box {id}: invalid debug box identity");
+                        break 'channel;
+                    };
+                    let Ok(service) = crate::wire::BoundedText::new(console_service) else {
+                        eprintln!(
+                            "sarun-engine: box {id}: debug console identity exceeds protocol bound"
+                        );
+                        break 'channel;
+                    };
+                    broadcast(
+                        &state,
+                        &crate::generated_wire::SubscriptionEvent::DebugConsoleReady {
+                            r#box,
+                            service,
+                        },
+                    );
+                    if let Err(error) = send_debug_start(writer) {
+                        eprintln!("sarun-engine: box {id}: {error}");
+                        break 'channel;
+                    }
+                    debug_barrier_released = true;
+                    continue;
+                } else if kind == crate::frames::FRAME_GUEST_PROCESS {
                     record_guest_process_frame(&state, id, &payload);
+                    continue;
                 } else if kind != crate::frames::FRAME_OPEN_CONN {
                     continue;
                 }
@@ -1604,10 +1938,10 @@ fn handle_binary_request(
                     continue;
                 };
                 let handler_state = state.clone();
-                std::thread::spawn(move || {
-                    handle_guarded(handler_state, server_side, Some(id))
-                });
-                let writer = lock(&state).overlay.as_ref()
+                std::thread::spawn(move || handle_guarded(handler_state, server_side, Some(id)));
+                let writer = lock(&state)
+                    .overlay
+                    .as_ref()
                     .and_then(|overlay| overlay.echo_writer(id));
                 if let Some(writer) = writer {
                     let writer = writer.lock().unwrap();
@@ -1631,7 +1965,9 @@ fn handle_binary_request(
     {
         let mut shared = lock(&state);
         if let Some(fd) = shared.box_pids.remove(&id) {
-            unsafe { libc::close(fd); }
+            unsafe {
+                libc::close(fd);
+            }
         }
         shared.box_runpids.remove(&id);
         if let Some(proxy) = shared.api_proxy.clone() {
@@ -1639,8 +1975,83 @@ fn handle_binary_request(
         }
     }
     if let Ok(r#box) = u64::try_from(id) {
-        broadcast(&state, &crate::generated_wire::SubscriptionEvent::BoxRemoved { r#box });
+        broadcast(
+            &state,
+            &crate::generated_wire::SubscriptionEvent::BoxRemoved { r#box },
+        );
     }
+}
+
+/// Park one generated-protocol service acceptor. The broker-authenticated box
+/// identity is mandatory for this mode, matching the catalog's `broker_box`
+/// policy; a direct host connection cannot impersonate an in-box provider.
+fn handle_binary_service_accept(
+    mut conn: UnixStream,
+    name: &str,
+    authenticated_parent: Option<i64>,
+) {
+    if authenticated_parent.is_none() {
+        let _ = crate::socket_wire::write_mode(
+            &mut conn,
+            &binary_error_with_category(
+                crate::generated_wire::ErrorCategory::Unauthorized,
+                "service accept requires an authenticated broker box".into(),
+            ),
+        );
+        return;
+    }
+    if !svc_name_ok(name) {
+        let _ = crate::socket_wire::write_mode(
+            &mut conn,
+            &binary_error("service accept name is invalid".into()),
+        );
+        return;
+    }
+    if crate::socket_wire::write_mode(
+        &mut conn,
+        &crate::generated_wire::ConnectionMode::ServiceAccept,
+    )
+    .is_err()
+    {
+        return;
+    }
+    SVC_PARKED
+        .lock()
+        .unwrap()
+        .entry(name.to_owned())
+        .or_default()
+        .push_back(ParkedServiceSlot::Binary(conn));
+    SVC_PARKED_CHANGED.notify_all();
+}
+
+/// Select a live parked service slot, acknowledge raw mode to the generated
+/// dialer, then use the same byte splice as the legacy path. `read_request`
+/// consumes exactly one atom, so bytes pipelined behind the request remain on
+/// `conn` and enter the raw stream unchanged.
+fn handle_binary_service_dial(mut conn: UnixStream, name: &str) {
+    if !svc_name_ok(name) {
+        let _ = crate::socket_wire::write_mode(
+            &mut conn,
+            &binary_error("service dial name is invalid".into()),
+        );
+        return;
+    }
+    let Some(slot) = svc_pair(name) else {
+        let _ = crate::socket_wire::write_mode(
+            &mut conn,
+            &binary_error(format!("no live '{name}' service")),
+        );
+        return;
+    };
+    if crate::socket_wire::write_mode(
+        &mut conn,
+        &crate::generated_wire::ConnectionMode::RawService,
+    )
+    .is_err()
+    {
+        return;
+    }
+    svc_splice(conn, slot);
 }
 
 fn dispatch(state: &State, msg: &Value) -> Value {
@@ -1649,7 +2060,8 @@ fn dispatch(state: &State, msg: &Value) -> Value {
         "subscribe" => json!({"ok": true, "_subscribe": true}),
         "register" => match legacy_register_request(msg) {
             Ok(request) => legacy_register_reply(register(
-                state, &request, None, None, None, None, None, None)),
+                state, &request, None, None, None, None, None, None,
+            )),
             Err(error) => json!({"ok": false, "error": error}),
         },
         "select" => {
@@ -1786,7 +2198,9 @@ fn dispatch(state: &State, msg: &Value) -> Value {
 /// listener cutover removes those outer projections and calls it directly.
 fn existing_box_id(sid: u64) -> Result<i64, String> {
     let id = i64::try_from(sid).map_err(|_| "box id exceeds engine range")?;
-    discover::discover().contains_key(&id).then_some(id)
+    discover::discover()
+        .contains_key(&id)
+        .then_some(id)
         .ok_or_else(|| "no slopbox".into())
 }
 
@@ -1797,11 +2211,16 @@ fn action_relative_path(path: &crate::generated_wire::Path) -> Result<&str, Stri
     }
     let path = std::str::from_utf8(bytes)
         .map_err(|_| "the current overlay index cannot address a non-UTF-8 box path")?;
-    if path.starts_with('/') || std::path::Path::new(path).components().any(|component| {
-        matches!(component, std::path::Component::ParentDir
-            | std::path::Component::RootDir
-            | std::path::Component::Prefix(_))
-    }) {
+    if path.starts_with('/')
+        || std::path::Path::new(path).components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
         return Err("box path must be relative and cannot contain '..'".into());
     }
     Ok(path)
@@ -1891,7 +2310,8 @@ fn dispatch_action(
             broadcast(
                 state,
                 &crate::generated_wire::SubscriptionEvent::BoxRenamed {
-                    r#box: sid, name: new.clone(),
+                    r#box: sid,
+                    name: new.clone(),
                 },
             );
             Ok(ActionSuccess::Rename {
@@ -1913,10 +2333,11 @@ fn dispatch_action(
             let id = i64::try_from(sid).map_err(|_| "box id exceeds engine range")?;
             let live = lock(state).box_runpids.contains_key(&id);
             let value = if live {
-                Some(crate::wire::BoundedVec::new(discover::processes_typed(id)?)
-                    .map_err(|error| format!(
-                        "live process rows exceed relation bound: {error:?}"
-                    ))?)
+                Some(
+                    crate::wire::BoundedVec::new(discover::processes_typed(id)?).map_err(
+                        |error| format!("live process rows exceed relation bound: {error:?}"),
+                    )?,
+                )
             } else {
                 None
             };
@@ -1984,10 +2405,10 @@ fn dispatch_action(
         }
         ActionRequest::PipelineProcs { sid, pipeline } => {
             let id = existing_box_id(sid)?;
-            let value = crate::wire::BoundedVec::new(
-                discover::pipeline_procs_typed(id, pipeline)?)
-                .map_err(|error| format!(
-                    "pipeline process rows exceed relation bound: {error:?}"))?;
+            let value = crate::wire::BoundedVec::new(discover::pipeline_procs_typed(id, pipeline)?)
+                .map_err(|error| {
+                    format!("pipeline process rows exceed relation bound: {error:?}")
+                })?;
             Ok(ActionSuccess::PipelineProcs { value })
         }
         ActionRequest::OutputDetail { sid, output } => {
@@ -1998,22 +2419,27 @@ fn dispatch_action(
         }
         ActionRequest::ProcInfo { sid, row } => {
             let id = existing_box_id(sid)?;
-            Ok(ActionSuccess::ProcInfo { value: discover::proc_info_typed(id, row)? })
+            Ok(ActionSuccess::ProcInfo {
+                value: discover::proc_info_typed(id, row)?,
+            })
         }
         ActionRequest::ProcProv { sid, row } => {
             let id = existing_box_id(sid)?;
-            Ok(ActionSuccess::ProcProv { value: discover::proc_prov_typed(id, row)? })
+            Ok(ActionSuccess::ProcProv {
+                value: discover::proc_prov_typed(id, row)?,
+            })
         }
         ActionRequest::ProcRoots { sid } => {
             let id = existing_box_id(sid)?;
             let value = crate::wire::BoundedVec::new(discover::proc_roots_typed(id)?)
-                .map_err(|error| format!(
-                    "process root rows exceed relation bound: {error:?}"))?;
+                .map_err(|error| format!("process root rows exceed relation bound: {error:?}"))?;
             Ok(ActionSuccess::ProcRoots { value })
         }
         ActionRequest::ProcessEnv { sid, row } => {
             let id = existing_box_id(sid)?;
-            Ok(ActionSuccess::ProcessEnv { value: discover::process_env_typed(id, row)? })
+            Ok(ActionSuccess::ProcessEnv {
+                value: discover::process_env_typed(id, row)?,
+            })
         }
         ActionRequest::WriterId { sid, rel } => {
             let id = existing_box_id(sid)?;
@@ -2037,10 +2463,11 @@ fn dispatch_action(
             let id = i64::try_from(sid).map_err(|_| "box id exceeds engine range")?;
             let boxes = discover::discover();
             let value = if boxes.contains_key(&id) {
-                Some(crate::wire::BoundedText::new(discover::display_path(&boxes, id))
-                    .map_err(|error| {
-                        format!("display path exceeds relation bound: {error:?}")
-                    })?)
+                Some(
+                    crate::wire::BoundedText::new(discover::display_path(&boxes, id)).map_err(
+                        |error| format!("display path exceeds relation bound: {error:?}"),
+                    )?,
+                )
             } else {
                 None
             };
@@ -2048,8 +2475,7 @@ fn dispatch_action(
         }
         ActionRequest::ResolveBox { name_or_id } => {
             let boxes = discover::discover();
-            let value = resolve(&boxes, name_or_id.as_str())
-                .and_then(|id| u64::try_from(id).ok());
+            let value = resolve(&boxes, name_or_id.as_str()).and_then(|id| u64::try_from(id).ok());
             Ok(ActionSuccess::ResolveBox { value })
         }
         ActionRequest::Select { sid } => {
@@ -2073,28 +2499,36 @@ fn dispatch_action(
                 let shared = lock(state);
                 (shared.box_runpids.clone(), shared.overlay.clone())
             };
-            let rows = boxes.values().map(|row| {
-                let errors = overlay.as_ref()
-                    .map(|overlay| overlay.ext_errors(row.box_id))
-                    .unwrap_or_default();
-                discover::session_typed(
-                    &boxes,
-                    row,
-                    run_pids.get(&row.box_id).copied(),
-                    &errors,
-                )
-            }).collect::<Result<Vec<_>, _>>()?;
+            let rows = boxes
+                .values()
+                .map(|row| {
+                    let errors = overlay
+                        .as_ref()
+                        .map(|overlay| overlay.ext_errors(row.box_id))
+                        .unwrap_or_default();
+                    discover::session_typed(
+                        &boxes,
+                        row,
+                        run_pids.get(&row.box_id).copied(),
+                        &errors,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?;
             let value = crate::wire::BoundedVec::new(rows)
                 .map_err(|error| format!("session rows exceed relation bound: {error:?}"))?;
             Ok(ActionSuccess::SessionDicts { value })
         }
         ActionRequest::BoxNew { parent_sid } => {
-            let overlay = lock(state).overlay.clone()
-                .ok_or("overlay not mounted")?;
+            let overlay = lock(state).overlay.clone().ok_or("overlay not mounted")?;
             let parent = parent_sid.map(existing_box_id).transpose()?;
             let boxes = discover::discover();
-            let id = boxes.keys().max().copied().unwrap_or(0)
-                .max(overlay.box_ids().into_iter().max().unwrap_or(0)) + 1;
+            let id = boxes
+                .keys()
+                .max()
+                .copied()
+                .unwrap_or(0)
+                .max(overlay.box_ids().into_iter().max().unwrap_or(0))
+                + 1;
             let capture = crate::capture::BoxState::create(id)
                 .map_err(|error| format!("box_new: {error}"))?;
             capture.set_parent(parent);
@@ -2102,12 +2536,16 @@ fn dispatch_action(
                 capture.set_meta("parent_box_id", &parent.to_string());
             }
             overlay.add_box(std::sync::Arc::new(capture));
-            broadcast(state, &crate::generated_wire::SubscriptionEvent::BoxAdded {
-                r#box: u64::try_from(id).map_err(|_| "negative allocated box id")?,
-                name: None,
-                parent: parent.map(|value| u64::try_from(value)
-                    .map_err(|_| "negative parent box id")).transpose()?,
-            });
+            broadcast(
+                state,
+                &crate::generated_wire::SubscriptionEvent::BoxAdded {
+                    r#box: u64::try_from(id).map_err(|_| "negative allocated box id")?,
+                    name: None,
+                    parent: parent
+                        .map(|value| u64::try_from(value).map_err(|_| "negative parent box id"))
+                        .transpose()?,
+                },
+            );
             let root = crate::paths::mnt_point().join(id.to_string());
             let root = crate::wire::BoundedBytes::new(root.as_os_str().as_bytes().to_vec())
                 .map_err(|error| format!("box root path exceeds relation bound: {error:?}"))?;
@@ -2120,17 +2558,16 @@ fn dispatch_action(
         }
         ActionRequest::BoxDrop { sid } => {
             let id = existing_box_id(sid)?;
-            let overlay = lock(state).overlay.clone()
-                .ok_or("overlay not mounted")?;
+            let overlay = lock(state).overlay.clone().ok_or("overlay not mounted")?;
             stop_live_transports(state, id);
             overlay.remove_box(id);
             Ok(ActionSuccess::BoxDrop { value: () })
         }
         ActionRequest::BoxFileRead { r#box, path } => {
             let id = existing_box_id(r#box)?;
-            let overlay = lock(state).overlay.clone()
-                .ok_or("overlay not available")?;
-            let bytes = overlay.box_read_file(id, action_relative_path(&path)?)
+            let overlay = lock(state).overlay.clone().ok_or("overlay not available")?;
+            let bytes = overlay
+                .box_read_file(id, action_relative_path(&path)?)
                 .map_err(|error| error.to_string())?;
             let value = crate::wire::BoundedBytes::new(bytes)
                 .map_err(|error| format!("box file exceeds relation bound: {error:?}"))?;
@@ -2138,8 +2575,7 @@ fn dispatch_action(
         }
         ActionRequest::BoxFileWrite { r#box, path, b64 } => {
             let id = existing_box_id(r#box)?;
-            let overlay = lock(state).overlay.clone()
-                .ok_or("overlay not available")?;
+            let overlay = lock(state).overlay.clone().ok_or("overlay not available")?;
             let value = crate::review::write_file_checked_typed(
                 id,
                 action_relative_path(&path)?,
@@ -2151,15 +2587,19 @@ fn dispatch_action(
         }
         ActionRequest::BoxDirList { r#box, path } => {
             let id = existing_box_id(r#box)?;
-            let overlay = lock(state).overlay.clone()
-                .ok_or("overlay not available")?;
-            let rows = overlay.box_list_dir(id, action_relative_path(&path)?)
-                .map_err(|error| error.to_string())?.into_iter()
-                .map(|(name, kind)| Ok(crate::generated_wire::DirectoryEntry {
-                    name: crate::wire::BoundedBytes::new(name.into_bytes())
-                        .map_err(|error| format!("directory name exceeds relation bound: {error:?}"))?,
-                    kind: relation_path_kind(kind)?,
-                }))
+            let overlay = lock(state).overlay.clone().ok_or("overlay not available")?;
+            let rows = overlay
+                .box_list_dir(id, action_relative_path(&path)?)
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .map(|(name, kind)| {
+                    Ok(crate::generated_wire::DirectoryEntry {
+                        name: crate::wire::BoundedBytes::new(name.into_bytes()).map_err(
+                            |error| format!("directory name exceeds relation bound: {error:?}"),
+                        )?,
+                        kind: relation_path_kind(kind)?,
+                    })
+                })
                 .collect::<Result<Vec<_>, String>>()?;
             let value = crate::wire::BoundedVec::new(rows)
                 .map_err(|error| format!("directory listing exceeds relation bound: {error:?}"))?;
@@ -2167,10 +2607,9 @@ fn dispatch_action(
         }
         ActionRequest::BoxPathKind { r#box, path } => {
             let id = existing_box_id(r#box)?;
-            let overlay = lock(state).overlay.clone()
-                .ok_or("overlay not available")?;
-            let value = relation_path_kind(
-                overlay.box_path_kind(id, action_relative_path(&path)?))?;
+            let overlay = lock(state).overlay.clone().ok_or("overlay not available")?;
+            let value =
+                relation_path_kind(overlay.box_path_kind(id, action_relative_path(&path)?))?;
             Ok(ActionSuccess::BoxPathKind { value })
         }
         ActionRequest::ReviewFileBytes { sid, rel } => {
@@ -2184,7 +2623,12 @@ fn dispatch_action(
             let id = existing_box_id(sid)?;
             let overlay = lock(state).overlay.clone().ok_or("overlay not available")?;
             let value = crate::review::write_file_checked_typed(
-                id, action_relative_path(&rel)?, b64.as_slice(), &overlay, false)?;
+                id,
+                action_relative_path(&rel)?,
+                b64.as_slice(),
+                &overlay,
+                false,
+            )?;
             Ok(ActionSuccess::ReviewWriteFile { value })
         }
         ActionRequest::ReviewPatchText { sid } => {
@@ -2200,30 +2644,37 @@ fn dispatch_action(
         }
         ActionRequest::ReviewSessionChanges { sid } => {
             let id = existing_box_id(sid)?;
-            let value = crate::wire::BoundedVec::new(
-                crate::review::session_changes_typed(id)?)
+            let value = crate::wire::BoundedVec::new(crate::review::session_changes_typed(id)?)
                 .map_err(|error| format!("change list exceeds relation bound: {error:?}"))?;
             Ok(ActionSuccess::ReviewSessionChanges { value })
         }
         ActionRequest::ReviewFileGroups { sid } => {
             let id = existing_box_id(sid)?;
             let changes = crate::review::session_changes_typed(id)?;
-            let groups = crate::overlay::file_groups().into_iter().map(|group| {
-                let paths = changes.iter().filter(|change| {
-                    std::str::from_utf8(change.path.as_slice()).ok()
-                        .is_some_and(|path| group.matches(path))
-                }).map(|change| change.path.clone()).collect::<Vec<_>>();
-                Ok(crate::generated_wire::FileGroup {
-                    name: crate::wire::BoundedText::new(group.name)
-                        .map_err(|error| format!(
-                            "file group name exceeds relation bound: {error:?}"))?,
-                    count: u64::try_from(paths.len())
-                        .map_err(|_| "file group count exceeds u64")?,
-                    paths: crate::wire::BoundedVec::new(paths)
-                        .map_err(|error| format!(
-                            "file group paths exceed relation bound: {error:?}"))?,
+            let groups = crate::overlay::file_groups()
+                .into_iter()
+                .map(|group| {
+                    let paths = changes
+                        .iter()
+                        .filter(|change| {
+                            std::str::from_utf8(change.path.as_slice())
+                                .ok()
+                                .is_some_and(|path| group.matches(path))
+                        })
+                        .map(|change| change.path.clone())
+                        .collect::<Vec<_>>();
+                    Ok(crate::generated_wire::FileGroup {
+                        name: crate::wire::BoundedText::new(group.name).map_err(|error| {
+                            format!("file group name exceeds relation bound: {error:?}")
+                        })?,
+                        count: u64::try_from(paths.len())
+                            .map_err(|_| "file group count exceeds u64")?,
+                        paths: crate::wire::BoundedVec::new(paths).map_err(|error| {
+                            format!("file group paths exceed relation bound: {error:?}")
+                        })?,
+                    })
                 })
-            }).collect::<Result<Vec<_>, String>>()?;
+                .collect::<Result<Vec<_>, String>>()?;
             let value = crate::wire::BoundedVec::new(groups)
                 .map_err(|error| format!("file groups exceed relation bound: {error:?}"))?;
             Ok(ActionSuccess::ReviewFileGroups { value })
@@ -2240,19 +2691,22 @@ fn dispatch_action(
         }
         ActionRequest::ReviewDecorateMany { sid, rels } => {
             let id = existing_box_id(sid)?;
-            let paths = rels.as_slice().iter().map(action_relative_path)
+            let paths = rels
+                .as_slice()
+                .iter()
+                .map(action_relative_path)
                 .collect::<Result<Vec<_>, String>>()?;
-            let value = crate::wire::BoundedVec::new(
-                crate::review::decorate_many_typed(id, &paths)?)
-                .map_err(|error| format!("decorations exceed relation bound: {error:?}"))?;
+            let value =
+                crate::wire::BoundedVec::new(crate::review::decorate_many_typed(id, &paths)?)
+                    .map_err(|error| format!("decorations exceed relation bound: {error:?}"))?;
             Ok(ActionSuccess::ReviewDecorateMany { value })
         }
         ActionRequest::ReviewRecentChanges { sid, limit } => {
             let id = existing_box_id(sid)?;
             let limit = bounded_review_limit(limit, 200)?;
-            let value = crate::wire::BoundedVec::new(
-                crate::review::recent_changes_typed(id, limit)?)
-                .map_err(|error| format!("recent changes exceed relation bound: {error:?}"))?;
+            let value =
+                crate::wire::BoundedVec::new(crate::review::recent_changes_typed(id, limit)?)
+                    .map_err(|error| format!("recent changes exceed relation bound: {error:?}"))?;
             Ok(ActionSuccess::ReviewRecentChanges { value })
         }
         ActionRequest::ReviewBoxSummary { sid, limit } => {
@@ -2261,15 +2715,23 @@ fn dispatch_action(
             let mut value = crate::review::box_summary_typed(id, limit)?;
             let overlay = lock(state).overlay.clone();
             if let Some(r#box) = overlay.as_ref().and_then(|overlay| overlay.live_box(id)) {
-                let activity = r#box.activity.lock()
-                    .map_err(|_| "box activity lock poisoned")?.iter().map(
-                        |(description, age_seconds)| Ok(crate::generated_wire::ActivityItem {
+                let activity = r#box
+                    .activity
+                    .lock()
+                    .map_err(|_| "box activity lock poisoned")?
+                    .iter()
+                    .map(|(description, age_seconds)| {
+                        Ok(crate::generated_wire::ActivityItem {
                             description: crate::wire::BoundedText::new(description.clone())
-                                .map_err(|error| format!(
-                                    "activity description exceeds relation bound: {error:?}"))?,
+                                .map_err(|error| {
+                                    format!(
+                                        "activity description exceeds relation bound: {error:?}"
+                                    )
+                                })?,
                             age_seconds: *age_seconds,
-                        }),
-                    ).collect::<Result<Vec<_>, String>>()?;
+                        })
+                    })
+                    .collect::<Result<Vec<_>, String>>()?;
                 value.activity = crate::wire::BoundedVec::new(activity)
                     .map_err(|error| format!("activity exceeds relation bound: {error:?}"))?;
             }
@@ -2281,26 +2743,39 @@ fn dispatch_action(
             Ok(ActionSuccess::ReviewPipelineContext { value })
         }
         ActionRequest::ReviewMakevars {
-            sid, name_pat, value_pat, limit, any,
+            sid,
+            name_pat,
+            value_pat,
+            limit,
+            any,
         } => {
             let id = existing_box_id(sid)?;
             let name_pat = name_pat.as_ref().map(|value| value.as_str()).unwrap_or("");
             let value_pat = value_pat.as_ref().map(|value| value.as_str()).unwrap_or("");
             let limit = bounded_review_limit(limit, 500)?;
             let value = crate::wire::BoundedVec::new(crate::review::makevars_typed(
-                id, name_pat, value_pat, limit, any.unwrap_or(false))?)
-                .map_err(|error| format!("make variables exceed relation bound: {error:?}"))?;
+                id,
+                name_pat,
+                value_pat,
+                limit,
+                any.unwrap_or(false),
+            )?)
+            .map_err(|error| format!("make variables exceed relation bound: {error:?}"))?;
             Ok(ActionSuccess::ReviewMakevars { value })
         }
         ActionRequest::ReviewMapIds { sid, from, ids, to } => {
             let id = existing_box_id(sid)?;
             let value = crate::wire::BoundedVec::new(crate::review::map_ids_typed(
-                id, from, ids.as_slice(), to)?)
-                .map_err(|error| format!("mapped ids exceed relation bound: {error:?}"))?;
+                id,
+                from,
+                ids.as_slice(),
+                to,
+            )?)
+            .map_err(|error| format!("mapped ids exceed relation bound: {error:?}"))?;
             Ok(ActionSuccess::ReviewMapIds { value })
         }
         request @ (ActionRequest::ReviewApply { sid, .. }
-            | ActionRequest::ReviewDiscard { sid, .. }) => {
+        | ActionRequest::ReviewDiscard { sid, .. }) => {
             let applying = matches!(&request, ActionRequest::ReviewApply { .. });
             let paths = match request {
                 ActionRequest::ReviewApply { paths, .. }
@@ -2308,15 +2783,22 @@ fn dispatch_action(
                 _ => unreachable!(),
             };
             let id = existing_box_id(sid)?;
-            let selected = paths.as_slice().iter().map(action_relative_path)
+            let selected = paths
+                .as_slice()
+                .iter()
+                .map(action_relative_path)
                 .collect::<Result<Vec<_>, String>>()?;
             if box_is_running(state, id) {
-                let message = crate::wire::BoundedText::new(
-                    "box is running; stop it first".to_owned())
-                    .map_err(|error| format!("review error exceeds relation bound: {error:?}"))?;
-                let errors = crate::wire::BoundedVec::new(vec![
-                    crate::generated_wire::PathError { path: None, message }])
-                    .map_err(|error| format!("review errors exceed relation bound: {error:?}"))?;
+                let message =
+                    crate::wire::BoundedText::new("box is running; stop it first".to_owned())
+                        .map_err(|error| {
+                            format!("review error exceeds relation bound: {error:?}")
+                        })?;
+                let errors = crate::wire::BoundedVec::new(vec![crate::generated_wire::PathError {
+                    path: None,
+                    message,
+                }])
+                .map_err(|error| format!("review errors exceed relation bound: {error:?}"))?;
                 return Ok(if applying {
                     ActionSuccess::ReviewApply {
                         value: crate::generated_wire::ApplyResult {
@@ -2384,7 +2866,10 @@ fn dispatch_action(
         }
         ActionRequest::Kill { sid } => {
             let id = existing_box_id(sid)?;
-            let pidfd = lock(state).box_pids.get(&id).copied()
+            let pidfd = lock(state)
+                .box_pids
+                .get(&id)
+                .copied()
                 .ok_or("box not running")?;
             pidfd_signal(pidfd, libc::SIGTERM);
             Ok(ActionSuccess::Kill { value: () })
@@ -2402,23 +2887,24 @@ fn dispatch_action(
             })
         }
         ActionRequest::PromptsPeek => {
-            let prompt = lock(state).net.clone()
-                .and_then(|net| net.prompts.peek());
-            let value = prompt.map(|prompt| -> Result<_, String> {
-                Ok(crate::generated_wire::NetworkPrompt {
-                    id: prompt.id,
-                    r#box: crate::wire::BoundedText::new(prompt.box_name)
-                        .map_err(|error| format!(
-                            "prompt box name exceeds relation bound: {error:?}"))?,
-                    host: crate::wire::BoundedText::new(prompt.host)
-                        .map_err(|error| format!(
-                            "prompt host exceeds relation bound: {error:?}"))?,
-                    port: prompt.port,
-                    scheme: crate::wire::BoundedText::new(prompt.scheme)
-                        .map_err(|error| format!(
-                            "prompt scheme exceeds relation bound: {error:?}"))?,
+            let prompt = lock(state).net.clone().and_then(|net| net.prompts.peek());
+            let value = prompt
+                .map(|prompt| -> Result<_, String> {
+                    Ok(crate::generated_wire::NetworkPrompt {
+                        id: prompt.id,
+                        r#box: crate::wire::BoundedText::new(prompt.box_name).map_err(|error| {
+                            format!("prompt box name exceeds relation bound: {error:?}")
+                        })?,
+                        host: crate::wire::BoundedText::new(prompt.host).map_err(|error| {
+                            format!("prompt host exceeds relation bound: {error:?}")
+                        })?,
+                        port: prompt.port,
+                        scheme: crate::wire::BoundedText::new(prompt.scheme).map_err(|error| {
+                            format!("prompt scheme exceeds relation bound: {error:?}")
+                        })?,
+                    })
                 })
-            }).transpose()?;
+                .transpose()?;
             Ok(ActionSuccess::PromptsPeek { value })
         }
         ActionRequest::PromptsAnswer { id, verdict } => {
@@ -2443,8 +2929,7 @@ fn dispatch_action(
         ActionRequest::FlowsList { sid } => {
             let id = action_flow_box(state, sid)?;
             let directory = flows_dir_for(id).ok_or("no flows dir for box")?;
-            let value = crate::wire::BoundedVec::new(
-                crate::net::flows::tshark_list(&directory)?)
+            let value = crate::wire::BoundedVec::new(crate::net::flows::tshark_list(&directory)?)
                 .map_err(|error| format!("flow rows exceed relation bound: {error:?}"))?;
             Ok(ActionSuccess::FlowsList { value })
         }
@@ -2454,31 +2939,40 @@ fn dispatch_action(
             }
             let id = action_flow_box(state, sid)?;
             let directory = flows_dir_for(id).ok_or("no flows dir for box")?;
-            let value = crate::wire::BoundedText::new(
-                crate::net::flows::tshark_detail(&directory, frame)?)
-                .map_err(|error| format!("flow detail exceeds relation bound: {error:?}"))?;
+            let value =
+                crate::wire::BoundedText::new(crate::net::flows::tshark_detail(&directory, frame)?)
+                    .map_err(|error| format!("flow detail exceeds relation bound: {error:?}"))?;
             Ok(ActionSuccess::FlowsDetail { value })
         }
         ActionRequest::FlowsPackets { sid, stream } => {
             let id = action_flow_box(state, sid)?;
             let stream = i64::try_from(stream).map_err(|_| "flow stream exceeds i64")?;
             let directory = flows_dir_for(id).ok_or("no flows dir for box")?;
-            let value = crate::wire::BoundedVec::new(
-                crate::net::flows::tshark_packets(&directory, stream)?)
-                .map_err(|error| format!("packet rows exceed relation bound: {error:?}"))?;
+            let value = crate::wire::BoundedVec::new(crate::net::flows::tshark_packets(
+                &directory, stream,
+            )?)
+            .map_err(|error| format!("packet rows exceed relation bound: {error:?}"))?;
             Ok(ActionSuccess::FlowsPackets { value })
         }
         ActionRequest::OaitaModels => {
             use crate::generated_wire::{ModelCatalog, ModelEntry};
             let (entries, source) = crate::oaita::models::catalog();
-            let models = entries.into_iter().map(|entry| Ok(ModelEntry {
-                name: crate::wire::BoundedText::new(entry.name)
-                    .map_err(|error| format!("model name exceeds relation bound: {error:?}"))?,
-                url: crate::wire::BoundedText::new(entry.url)
-                    .map_err(|error| format!("model URL exceeds relation bound: {error:?}"))?,
-                note: crate::wire::BoundedText::new(entry.note)
-                    .map_err(|error| format!("model note exceeds relation bound: {error:?}"))?,
-            })).collect::<Result<Vec<_>, String>>()?;
+            let models = entries
+                .into_iter()
+                .map(|entry| {
+                    Ok(ModelEntry {
+                        name: crate::wire::BoundedText::new(entry.name).map_err(|error| {
+                            format!("model name exceeds relation bound: {error:?}")
+                        })?,
+                        url: crate::wire::BoundedText::new(entry.url).map_err(|error| {
+                            format!("model URL exceeds relation bound: {error:?}")
+                        })?,
+                        note: crate::wire::BoundedText::new(entry.note).map_err(|error| {
+                            format!("model note exceeds relation bound: {error:?}")
+                        })?,
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?;
             let value = ModelCatalog {
                 source: crate::wire::BoundedText::new(source)
                     .map_err(|error| format!("model source exceeds relation bound: {error:?}"))?,
@@ -2490,15 +2984,23 @@ fn dispatch_action(
         ActionRequest::OaitaStatus => {
             use crate::generated_wire::{OaitaStatus, OaitaStatusKind};
             let host_cfg = crate::oaita::config::Config::load();
-            let external = host_cfg.model.as_deref()
+            let external = host_cfg
+                .model
+                .as_deref()
                 .is_some_and(|model| !model.trim().is_empty());
             let local = service_declared("oaita-local");
             let (kind, model, endpoint) = if external {
-                (OaitaStatusKind::External,
-                 host_cfg.model.unwrap_or_default(),
-                 host_cfg.base_url.unwrap_or_default())
+                (
+                    OaitaStatusKind::External,
+                    host_cfg.model.unwrap_or_default(),
+                    host_cfg.base_url.unwrap_or_default(),
+                )
             } else if local {
-                (OaitaStatusKind::Local, "local".to_owned(), "svc://oaita-local".to_owned())
+                (
+                    OaitaStatusKind::Local,
+                    "local".to_owned(),
+                    "svc://oaita-local".to_owned(),
+                )
             } else {
                 (OaitaStatusKind::None, String::new(), String::new())
             };
@@ -2522,8 +3024,8 @@ fn dispatch_action(
                 return Err("set a model name first".into());
             }
             crate::oaita::client::block_on(async {
-                let client = crate::oaita::client::Client::from_resolved(
-                    base_url, spec.api_key.as_str())?;
+                let client =
+                    crate::oaita::client::Client::from_resolved(base_url, spec.api_key.as_str())?;
                 let body = json!({
                     "model": spec.model.as_str(),
                     "messages": [{"role": "user", "content": "ping"}],
@@ -2531,19 +3033,20 @@ fn dispatch_action(
                     "stream": false,
                 });
                 client.post("/chat/completions", body).await
-            }).map_err(|error| format!("{base_url}: {error}"))?;
+            })
+            .map_err(|error| format!("{base_url}: {error}"))?;
             let detail = format!("connected · {} @ {base_url}", spec.model.as_str());
             let value = crate::wire::BoundedText::new(detail)
                 .map_err(|error| format!("probe result exceeds relation bound: {error:?}"))?;
             Ok(ActionSuccess::OaitaProbe { value })
         }
-        ActionRequest::SvcUp { name } => {
-            Ok(ActionSuccess::SvcUp { value: svc_has(name.as_str()) })
-        }
+        ActionRequest::SvcUp { name } => Ok(ActionSuccess::SvcUp {
+            value: svc_has(name.as_str()),
+        }),
         ActionRequest::OciLoad { reference, name } => {
-            let outcome = crate::oci::load_blocking(
-                reference.as_str(), name.map(|value| value.into_inner()))
-                .map_err(|error| format!("{error:#}"))?;
+            let outcome =
+                crate::oci::load_blocking(reference.as_str(), name.map(|value| value.into_inner()))
+                    .map_err(|error| format!("{error:#}"))?;
             let value = crate::generated_wire::OciLoadResult {
                 base: u64::try_from(outcome.base_id).map_err(|_| "negative OCI base box id")?,
                 base_name: crate::wire::BoundedText::new(outcome.base_name)
@@ -2558,25 +3061,33 @@ fn dispatch_action(
             Ok(ActionSuccess::OciLoad { value })
         }
         ActionRequest::OciImages => {
-            let rows = crate::discover::discover().into_iter()
+            let rows = crate::discover::discover()
+                .into_iter()
                 .filter(|(_, image)| image.meta.contains_key("oci_config"))
                 .map(|(id, image)| {
-                    let reference = image.meta.get("oci_reference")
+                    let reference = image
+                        .meta
+                        .get("oci_reference")
                         .ok_or_else(|| format!("OCI image box {id} has no reference"))?;
                     Ok(crate::generated_wire::OciImage {
                         top: u64::try_from(id).map_err(|_| "negative OCI image box id")?,
-                        name: crate::wire::BoundedText::new(image.name)
-                            .map_err(|error| format!(
-                                "OCI image name exceeds relation bound: {error:?}"))?,
-                        reference: crate::wire::BoundedText::new(reference.clone())
-                            .map_err(|error| format!(
-                                "OCI reference exceeds relation bound: {error:?}"))?,
-                        digest: crate::wire::BoundedText::new(image.meta
-                            .get("oci_manifest_digest").cloned().unwrap_or_default())
-                            .map_err(|error| format!(
-                                "OCI digest exceeds relation bound: {error:?}"))?,
+                        name: crate::wire::BoundedText::new(image.name).map_err(|error| {
+                            format!("OCI image name exceeds relation bound: {error:?}")
+                        })?,
+                        reference: crate::wire::BoundedText::new(reference.clone()).map_err(
+                            |error| format!("OCI reference exceeds relation bound: {error:?}"),
+                        )?,
+                        digest: crate::wire::BoundedText::new(
+                            image
+                                .meta
+                                .get("oci_manifest_digest")
+                                .cloned()
+                                .unwrap_or_default(),
+                        )
+                        .map_err(|error| format!("OCI digest exceeds relation bound: {error:?}"))?,
                     })
-                }).collect::<Result<Vec<_>, String>>()?;
+                })
+                .collect::<Result<Vec<_>, String>>()?;
             let value = crate::wire::BoundedVec::new(rows)
                 .map_err(|error| format!("OCI image list exceeds relation bound: {error:?}"))?;
             Ok(ActionSuccess::OciImages { value })
@@ -2586,14 +3097,14 @@ fn dispatch_action(
                 .map_err(|error| format!("{error:#}"))?;
             let value = crate::generated_wire::OciResolveResult {
                 top: u64::try_from(top).map_err(|_| "negative OCI top box id")?,
-                note: crate::wire::BoundedText::new(note)
-                    .map_err(|error| format!("OCI resolution note exceeds relation bound: {error:?}"))?,
+                note: crate::wire::BoundedText::new(note).map_err(|error| {
+                    format!("OCI resolution note exceeds relation bound: {error:?}")
+                })?,
             };
             Ok(ActionSuccess::OciResolve { value })
         }
         ActionRequest::OciBuild { spec } => {
-            let value = crate::oci::build_in_engine(&spec)
-                .map_err(|error| format!("{error:#}"))?;
+            let value = crate::oci::build_in_engine(&spec).map_err(|error| format!("{error:#}"))?;
             Ok(ActionSuccess::OciBuild { value })
         }
         ActionRequest::RoAttach { r#box, attachments } => {
@@ -2641,20 +3152,33 @@ fn dispatch_action(
             overlay.invalidate_ext(sid);
             Ok(ActionSuccess::RoAttach { value: () })
         }
-        ActionRequest::WikiAttach { sid, root, page, prefix } => {
+        ActionRequest::WikiAttach {
+            sid,
+            root,
+            page,
+            prefix,
+        } => {
             let overlay = lock(state).overlay.clone().ok_or("no overlay")?;
             let sid = i64::try_from(sid).map_err(|_| "box id exceeds engine range")?;
             let owner = hydrate_box(&overlay, sid).ok_or("no such box")?;
             let root = std::str::from_utf8(root.as_slice())
                 .map_err(|_| "the wiki root path is not UTF-8")?;
-            let prefix = prefix.as_ref().map(action_relative_path)
-                .transpose()?.unwrap_or("");
+            let prefix = prefix
+                .as_ref()
+                .map(action_relative_path)
+                .transpose()?
+                .unwrap_or("");
             let instance = open_wiki_instance(root)?;
             let (page_id, resolved_title) = match page.as_str().parse::<u64>() {
                 Ok(id) => (id, None),
-                Err(_) => match instance.page_by_title(page.as_str()).map_err(|e| e.to_string())? {
+                Err(_) => match instance
+                    .page_by_title(page.as_str())
+                    .map_err(|e| e.to_string())?
+                {
                     (Some(id), hits) => {
-                        let title = hits.into_iter().find(|(candidate, _)| *candidate == id)
+                        let title = hits
+                            .into_iter()
+                            .find(|(candidate, _)| *candidate == id)
                             .map(|(_, title)| title);
                         (id, title)
                     }
@@ -2662,27 +3186,38 @@ fn dispatch_action(
                         return Err(format!("no page titled {:?}", page.as_str()));
                     }
                     (None, hits) => {
-                        let candidates = hits.into_iter().map(|(id, title)| format!(
-                            "{title} ({id})")).collect::<Vec<_>>();
-                        return Err(format!("title {:?} is ambiguous: {}",
-                            page.as_str(), candidates.join(", ")));
+                        let candidates = hits
+                            .into_iter()
+                            .map(|(id, title)| format!("{title} ({id})"))
+                            .collect::<Vec<_>>();
+                        return Err(format!(
+                            "title {:?} is ambiguous: {}",
+                            page.as_str(),
+                            candidates.join(", ")
+                        ));
                     }
                 },
             };
             let title = match resolved_title {
                 Some(title) => title,
-                None => instance.page_current_title(page_id).map_err(|e| e.to_string())?
+                None => instance
+                    .page_current_title(page_id)
+                    .map_err(|e| e.to_string())?
                     .unwrap_or_else(|| format!("page-{page_id}")),
             };
-            let head = instance.page_head(page_id).map_err(|e| e.to_string())?
+            let head = instance
+                .page_head(page_id)
+                .map_err(|e| e.to_string())?
                 .ok_or_else(|| format!("no page {page_id}"))?;
-            let wiki = std::path::Path::new(root).file_name()
+            let wiki = std::path::Path::new(root)
+                .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "wiki".into());
             let name = format!("wiki:{wiki}/{title}@r{}", head.rev_id);
             let value = crate::generated_wire::WikiAttachmentResult {
-                name: crate::wire::BoundedText::new(name.clone())
-                    .map_err(|error| format!("wiki attachment name exceeds relation bound: {error:?}"))?,
+                name: crate::wire::BoundedText::new(name.clone()).map_err(|error| {
+                    format!("wiki attachment name exceeds relation bound: {error:?}")
+                })?,
                 page: page_id,
                 title: crate::wire::BoundedText::new(title.clone())
                     .map_err(|error| format!("wiki title exceeds relation bound: {error:?}"))?,
@@ -2701,24 +3236,35 @@ fn dispatch_action(
             overlay.invalidate_ext(sid);
             Ok(ActionSuccess::WikiAttach { value })
         }
-        ActionRequest::IetfAttach { sid, root, draft, prefix } => {
+        ActionRequest::IetfAttach {
+            sid,
+            root,
+            draft,
+            prefix,
+        } => {
             let overlay = lock(state).overlay.clone().ok_or("no overlay")?;
             let sid = i64::try_from(sid).map_err(|_| "box id exceeds engine range")?;
             let owner = hydrate_box(&overlay, sid).ok_or("no such box")?;
             let root = std::str::from_utf8(root.as_slice())
                 .map_err(|_| "the IETF root path is not UTF-8")?;
-            let prefix = prefix.as_ref().map(action_relative_path)
-                .transpose()?.unwrap_or("");
-            let mirror = ietf_mirror::Mirror::open_read(
-                ietf_mirror::MirrorConfig::new(root.into()))
-                .map_err(|error| error.to_string())?;
-            let head_revision = mirror.head(draft.as_str())
+            let prefix = prefix
+                .as_ref()
+                .map(action_relative_path)
+                .transpose()?
+                .unwrap_or("");
+            let mirror =
+                ietf_mirror::Mirror::open_read(ietf_mirror::MirrorConfig::new(root.into()))
+                    .map_err(|error| error.to_string())?;
+            let head_revision = mirror
+                .head(draft.as_str())
                 .map_err(|error| error.to_string())?
-                .ok_or_else(|| format!("no draft {}", draft.as_str()))?.rev;
+                .ok_or_else(|| format!("no draft {}", draft.as_str()))?
+                .rev;
             let name = format!("ietf:{}@{head_revision}", draft.as_str());
             let value = crate::generated_wire::IetfAttachmentResult {
-                name: crate::wire::BoundedText::new(name.clone())
-                    .map_err(|error| format!("IETF attachment name exceeds relation bound: {error:?}"))?,
+                name: crate::wire::BoundedText::new(name.clone()).map_err(|error| {
+                    format!("IETF attachment name exceeds relation bound: {error:?}")
+                })?,
                 revision: crate::wire::BoundedText::new(head_revision.clone())
                     .map_err(|error| format!("IETF revision exceeds relation bound: {error:?}"))?,
             };
@@ -2735,7 +3281,13 @@ fn dispatch_action(
             overlay.invalidate_ext(sid);
             Ok(ActionSuccess::IetfAttach { value })
         }
-        ActionRequest::GitCheckout { sid, store, r#ref, dest, subpath } => {
+        ActionRequest::GitCheckout {
+            sid,
+            store,
+            r#ref,
+            dest,
+            subpath,
+        } => {
             let value = git_checkout_typed(state, sid, store, r#ref, dest, subpath)?;
             Ok(ActionSuccess::GitCheckout { value })
         }
@@ -2744,7 +3296,12 @@ fn dispatch_action(
                 .map_err(|error| format!("mirror jobs exceed relation bound: {error:?}"))?;
             Ok(ActionSuccess::MirrorJobs { value })
         }
-        ActionRequest::MirrorAdd { kind, src, dest, interval_secs } => {
+        ActionRequest::MirrorAdd {
+            kind,
+            src,
+            dest,
+            interval_secs,
+        } => {
             let destination = std::str::from_utf8(dest.as_slice())
                 .map_err(|_| "the mirror scheduler cannot address a non-UTF-8 destination")?;
             let interval = i64::try_from(interval_secs.unwrap_or(24 * 3600))
@@ -2755,12 +3312,12 @@ fn dispatch_action(
             })
         }
         ActionRequest::MirrorRun { id } => {
-            crate::mirrors::job_run(
-                i64::try_from(id).map_err(|_| "mirror job id exceeds i64")?)?;
+            crate::mirrors::job_run(i64::try_from(id).map_err(|_| "mirror job id exceeds i64")?)?;
             Ok(ActionSuccess::MirrorRun { value: () })
         }
         ActionRequest::MirrorRunPending => {
-            let ids = crate::mirrors::run_pending()?.into_iter()
+            let ids = crate::mirrors::run_pending()?
+                .into_iter()
                 .map(|id| u64::try_from(id).map_err(|_| "negative mirror job id"))
                 .collect::<Result<Vec<_>, _>>()?;
             let value = crate::wire::BoundedVec::new(ids)
@@ -2769,14 +3326,18 @@ fn dispatch_action(
         }
         ActionRequest::MirrorPause { id, paused } => {
             crate::mirrors::job_set_paused(
-                i64::try_from(id).map_err(|_| "mirror job id exceeds i64")?, paused)?;
+                i64::try_from(id).map_err(|_| "mirror job id exceeds i64")?,
+                paused,
+            )?;
             Ok(ActionSuccess::MirrorPause { value: () })
         }
         ActionRequest::MirrorRm { id } => {
             let note = crate::mirrors::job_remove(
-                i64::try_from(id).map_err(|_| "mirror job id exceeds i64")?)?;
-            let value = crate::wire::BoundedText::new(note)
-                .map_err(|error| format!("mirror removal note exceeds relation bound: {error:?}"))?;
+                i64::try_from(id).map_err(|_| "mirror job id exceeds i64")?,
+            )?;
+            let value = crate::wire::BoundedText::new(note).map_err(|error| {
+                format!("mirror removal note exceeds relation bound: {error:?}")
+            })?;
             Ok(ActionSuccess::MirrorRm { value })
         }
         ActionRequest::StructQuick { sid, rel } => {
@@ -2806,15 +3367,8 @@ fn dispatch_action(
                 next_view_id,
                 ..
             } = &mut *shared;
-            crate::views::open(
-                views,
-                next_view_id,
-                kind,
-                id,
-                filter,
-                running_only && live,
-            )
-            .map(|value| ActionSuccess::ViewOpen { value })
+            crate::views::open(views, next_view_id, kind, id, filter, running_only && live)
+                .map(|value| ActionSuccess::ViewOpen { value })
         }
         ActionRequest::ViewFilter { view, filter } => {
             crate::views::set_filter(&mut lock(state).views, view, filter)
@@ -2964,8 +3518,7 @@ fn legacy_bounded_text<const MAXIMUM: usize>(
     value: String,
     field: &str,
 ) -> Result<crate::wire::BoundedText<MAXIMUM>, String> {
-    crate::wire::BoundedText::new(value)
-        .map_err(|_| format!("{field} exceeds relation bound"))
+    crate::wire::BoundedText::new(value).map_err(|_| format!("{field} exceeds relation bound"))
 }
 
 fn legacy_pipeline_provenance(record: crate::generated_wire::PipelineProvenance) -> Value {
@@ -3019,14 +3572,18 @@ fn legacy_file_diff(value: crate::generated_wire::FileDiff) -> Value {
                 "diff": format!("symlink → {}", legacy_bytes(target)),
             },
         }),
-        FileDiff::Binary { kind, content, content_before } => {
+        FileDiff::Binary {
+            kind,
+            content,
+            content_before,
+        } => {
             let mut diff = json!({
                 "kind": legacy_change_kind(kind),
                 "content": base64::engine::general_purpose::STANDARD.encode(content.as_slice()),
             });
             if let Some(before) = content_before {
-                diff["content_before"] = json!(
-                    base64::engine::general_purpose::STANDARD.encode(before.as_slice()));
+                diff["content_before"] =
+                    json!(base64::engine::general_purpose::STANDARD.encode(before.as_slice()));
             }
             json!({"is_text": false, "hunks": [], "diff": diff})
         }
@@ -3045,10 +3602,16 @@ fn legacy_review_errors(
         { crate::generated_wire::LIMIT_COLLECTION_ITEMS },
     >,
 ) -> Vec<Value> {
-    errors.into_inner().into_iter().map(|error| json!({
-        "path": error.path.map(legacy_bytes).unwrap_or_default(),
-        "error": error.message.into_inner(),
-    })).collect()
+    errors
+        .into_inner()
+        .into_iter()
+        .map(|error| {
+            json!({
+                "path": error.path.map(legacy_bytes).unwrap_or_default(),
+                "error": error.message.into_inner(),
+            })
+        })
+        .collect()
 }
 
 fn legacy_view_window(value: crate::generated_wire::ViewWindow) -> Value {
@@ -3229,15 +3792,14 @@ fn legacy_structural_lines(
         { crate::generated_wire::LIMIT_COLLECTION_ITEMS },
     >,
 ) -> Vec<Value> {
-    lines.into_inner().into_iter().map(|line| json!([
-        line.style.into_inner(),
-        line.text.into_inner(),
-    ])).collect()
+    lines
+        .into_inner()
+        .into_iter()
+        .map(|line| json!([line.style.into_inner(), line.text.into_inner(),]))
+        .collect()
 }
 
-fn legacy_ui_action_reply(
-    result: Result<crate::generated_wire::ActionSuccess, String>,
-) -> Value {
+fn legacy_ui_action_reply(result: Result<crate::generated_wire::ActionSuccess, String>) -> Value {
     use crate::generated_wire::ActionSuccess;
     let payload = match result {
         Ok(ActionSuccess::ViewOpen { value }) => json!({
@@ -3245,7 +3807,9 @@ fn legacy_ui_action_reply(
             "total": value.total,
         }),
         Ok(ActionSuccess::ViewFilter { value }) => json!({"total": value.total}),
-        Ok(ActionSuccess::ViewFind { value: Some(position) }) => {
+        Ok(ActionSuccess::ViewFind {
+            value: Some(position),
+        }) => {
             json!({"ok": true, "pos": position})
         }
         Ok(ActionSuccess::ViewFind { value: None }) => {
@@ -3253,55 +3817,73 @@ fn legacy_ui_action_reply(
         }
         Ok(ActionSuccess::ViewWindow { value }) => legacy_view_window(value),
         Ok(ActionSuccess::ViewClose { .. }) => json!({"ok": true}),
-        Ok(ActionSuccess::Processes { value }) => {
-            discover::process_rows_json(value.as_slice())
-        }
+        Ok(ActionSuccess::Processes { value }) => discover::process_rows_json(value.as_slice()),
         Ok(ActionSuccess::ProcessesLive { value }) => match value {
             Some(rows) => discover::process_rows_json(rows.as_slice()),
             None => Value::Null,
         },
-        Ok(ActionSuccess::Outputs { value }) => {
-            discover::output_rows_json(value.as_slice())
-        }
-        Ok(ActionSuccess::Brushprov { value }) => {
-            discover::pipeline_rows_json(value.as_slice())
-        }
-        Ok(ActionSuccess::BuildEdges { value }) => {
-            discover::build_edge_rows_json(value.as_slice())
-        }
+        Ok(ActionSuccess::Outputs { value }) => discover::output_rows_json(value.as_slice()),
+        Ok(ActionSuccess::Brushprov { value }) => discover::pipeline_rows_json(value.as_slice()),
+        Ok(ActionSuccess::BuildEdges { value }) => discover::build_edge_rows_json(value.as_slice()),
         Ok(ActionSuccess::ApiLog { value }) => discover::api_log_rows_json(value.as_slice()),
-        Ok(ActionSuccess::ApiLogDetail { value }) => value.as_ref()
-            .map(discover::api_log_detail_json).unwrap_or(Value::Null),
+        Ok(ActionSuccess::ApiLogDetail { value }) => value
+            .as_ref()
+            .map(discover::api_log_detail_json)
+            .unwrap_or(Value::Null),
         Ok(ActionSuccess::Webcap { value }) => discover::webcap_rows_json(value.as_slice()),
-        Ok(ActionSuccess::WebcapDetail { value }) => value.as_ref()
-            .map(discover::webcap_detail_json).unwrap_or(Value::Null),
-        Ok(ActionSuccess::WebcapBody { value }) => value.as_ref()
-            .map(discover::webcap_body_json).unwrap_or(Value::Null),
-        Ok(ActionSuccess::ProcPipeline { value })
-        | Ok(ActionSuccess::OutputPipeline { value }) => value.as_ref()
-            .map(discover::pipeline_summary_json).unwrap_or(Value::Null),
-        Ok(ActionSuccess::PipelineProcs { value })
-        | Ok(ActionSuccess::ProcRoots { value }) => json!(value.as_slice()),
-        Ok(ActionSuccess::OutputDetail { value }) => value.as_ref()
-            .map(discover::output_detail_json).unwrap_or(Value::Null),
-        Ok(ActionSuccess::ProcInfo { value }) => value.as_ref()
-            .map(discover::process_info_json).unwrap_or(Value::Null),
-        Ok(ActionSuccess::ProcProv { value }) => value.as_ref()
-            .map(discover::process_subject_json).unwrap_or(Value::Null),
+        Ok(ActionSuccess::WebcapDetail { value }) => value
+            .as_ref()
+            .map(discover::webcap_detail_json)
+            .unwrap_or(Value::Null),
+        Ok(ActionSuccess::WebcapBody { value }) => value
+            .as_ref()
+            .map(discover::webcap_body_json)
+            .unwrap_or(Value::Null),
+        Ok(ActionSuccess::ProcPipeline { value }) | Ok(ActionSuccess::OutputPipeline { value }) => {
+            value
+                .as_ref()
+                .map(discover::pipeline_summary_json)
+                .unwrap_or(Value::Null)
+        }
+        Ok(ActionSuccess::PipelineProcs { value }) | Ok(ActionSuccess::ProcRoots { value }) => {
+            json!(value.as_slice())
+        }
+        Ok(ActionSuccess::OutputDetail { value }) => value
+            .as_ref()
+            .map(discover::output_detail_json)
+            .unwrap_or(Value::Null),
+        Ok(ActionSuccess::ProcInfo { value }) => value
+            .as_ref()
+            .map(discover::process_info_json)
+            .unwrap_or(Value::Null),
+        Ok(ActionSuccess::ProcProv { value }) => value
+            .as_ref()
+            .map(discover::process_subject_json)
+            .unwrap_or(Value::Null),
         Ok(ActionSuccess::ProcessEnv { value }) => discover::environment_json(&value),
-        Ok(ActionSuccess::WriterId { value })
-        | Ok(ActionSuccess::FirstWriterId { value }) => json!(value),
-        Ok(ActionSuccess::FirstWriterProv { value }) => value.as_ref()
-            .map(discover::writer_provenance_json).unwrap_or(Value::Null),
+        Ok(ActionSuccess::WriterId { value }) | Ok(ActionSuccess::FirstWriterId { value }) => {
+            json!(value)
+        }
+        Ok(ActionSuccess::FirstWriterProv { value }) => value
+            .as_ref()
+            .map(discover::writer_provenance_json)
+            .unwrap_or(Value::Null),
         Ok(ActionSuccess::DisplayPath { value }) => value
-            .map(|value| Value::String(value.into_inner())).unwrap_or(Value::Null),
+            .map(|value| Value::String(value.into_inner()))
+            .unwrap_or(Value::Null),
         Ok(ActionSuccess::ResolveBox { value }) => value
-            .map(|value| Value::String(value.to_string())).unwrap_or(Value::Null),
+            .map(|value| Value::String(value.to_string()))
+            .unwrap_or(Value::Null),
         Ok(ActionSuccess::Select { .. }) => json!({"ok": true}),
         Ok(ActionSuccess::Ping { .. }) => json!("pong"),
         Ok(ActionSuccess::ReloadRules { .. }) => Value::Null,
-        Ok(ActionSuccess::SessionDicts { value }) => Value::Array(value.into_inner()
-            .into_iter().map(legacy_box_session).collect()),
+        Ok(ActionSuccess::SessionDicts { value }) => Value::Array(
+            value
+                .into_inner()
+                .into_iter()
+                .map(legacy_box_session)
+                .collect(),
+        ),
         Ok(ActionSuccess::BoxNew { value }) => json!({
             "sid": value.r#box.to_string(),
             "root": legacy_bytes(value.root),
@@ -3312,11 +3894,18 @@ fn legacy_ui_action_reply(
             json!({"bytes": BASE64_STANDARD.encode(value.as_slice())})
         }
         Ok(ActionSuccess::BoxFileWrite { value }) => json!({"len": value}),
-        Ok(ActionSuccess::BoxDirList { value }) => Value::Array(value.into_inner()
-            .into_iter().map(|row| json!({
-                "name": legacy_bytes(row.name),
-                "kind": legacy_path_kind(row.kind),
-            })).collect()),
+        Ok(ActionSuccess::BoxDirList { value }) => Value::Array(
+            value
+                .into_inner()
+                .into_iter()
+                .map(|row| {
+                    json!({
+                        "name": legacy_bytes(row.name),
+                        "kind": legacy_path_kind(row.kind),
+                    })
+                })
+                .collect(),
+        ),
         Ok(ActionSuccess::BoxPathKind { value }) => {
             json!({"kind": legacy_path_kind(value)})
         }
@@ -3328,14 +3917,22 @@ fn legacy_ui_action_reply(
         Ok(ActionSuccess::ReviewPatchText { value }) => json!({
             "__b": base64::engine::general_purpose::STANDARD.encode(value.as_slice()),
         }),
-        Ok(ActionSuccess::ReviewChangeMode { value }) => value
-            .map(|mode| json!(mode)).unwrap_or(Value::Null),
-        Ok(ActionSuccess::ReviewSessionChanges { value }) => Value::Array(value.into_inner()
-            .into_iter().map(|change| json!({
-                "path": legacy_bytes(change.path),
-                "kind": legacy_change_kind(change.kind),
-                "size": change.size,
-            })).collect()),
+        Ok(ActionSuccess::ReviewChangeMode { value }) => {
+            value.map(|mode| json!(mode)).unwrap_or(Value::Null)
+        }
+        Ok(ActionSuccess::ReviewSessionChanges { value }) => Value::Array(
+            value
+                .into_inner()
+                .into_iter()
+                .map(|change| {
+                    json!({
+                        "path": legacy_bytes(change.path),
+                        "kind": legacy_change_kind(change.kind),
+                        "size": change.size,
+                    })
+                })
+                .collect(),
+        ),
         Ok(ActionSuccess::ReviewFileGroups { value }) => json!({
             "ok": true,
             "groups": value.into_inner().into_iter().map(|group| json!({
@@ -3347,14 +3944,26 @@ fn legacy_ui_action_reply(
         }),
         Ok(ActionSuccess::ReviewHunks { value }) => legacy_file_diff(value),
         Ok(ActionSuccess::ReviewDecorate { value }) => legacy_change_decoration(value),
-        Ok(ActionSuccess::ReviewDecorateMany { value }) => Value::Array(value.into_inner()
-            .into_iter().map(legacy_change_decoration).collect()),
-        Ok(ActionSuccess::ReviewRecentChanges { value }) => Value::Array(value.into_inner()
-            .into_iter().map(|change| json!({
-                "path": legacy_bytes(change.path),
-                "kind": legacy_change_kind(change.kind),
-                "size": change.size,
-            })).collect()),
+        Ok(ActionSuccess::ReviewDecorateMany { value }) => Value::Array(
+            value
+                .into_inner()
+                .into_iter()
+                .map(legacy_change_decoration)
+                .collect(),
+        ),
+        Ok(ActionSuccess::ReviewRecentChanges { value }) => Value::Array(
+            value
+                .into_inner()
+                .into_iter()
+                .map(|change| {
+                    json!({
+                        "path": legacy_bytes(change.path),
+                        "kind": legacy_change_kind(change.kind),
+                        "size": change.size,
+                    })
+                })
+                .collect(),
+        ),
         Ok(ActionSuccess::ReviewBoxSummary { value }) => json!({
             "outputs": value.outputs.into_inner().into_iter().map(|row| json!({
                 "id": row.id,
@@ -3415,11 +4024,13 @@ fn legacy_ui_action_reply(
             })).collect::<Vec<_>>(),
         }),
         Ok(ActionSuccess::ReviewPipelineContext { value }) => {
-            let item = |item: crate::generated_wire::PipelineContextItem| json!({
-                "id": item.id,
-                "cmd": item.command.into_inner(),
-                "exit_code": item.exit_code,
-            });
+            let item = |item: crate::generated_wire::PipelineContextItem| {
+                json!({
+                    "id": item.id,
+                    "cmd": item.command.into_inner(),
+                    "exit_code": item.exit_code,
+                })
+            };
             json!({
                 "parent": value.parent.map(&item),
                 "children": value.children.into_inner().into_iter().map(item)
@@ -3427,21 +4038,28 @@ fn legacy_ui_action_reply(
                 "edge_out": value.edge_output.map(legacy_bytes).unwrap_or_default(),
             })
         }
-        Ok(ActionSuccess::ReviewMakevars { value }) => Value::Array(value.into_inner()
-            .into_iter().map(|row| json!({
-                "id": row.id,
-                "name": legacy_bytes(row.name),
-                "loc": legacy_bytes(row.location),
-                "value": legacy_bytes(row.value),
-                "make": legacy_bytes(row.make_directory),
-                "rhs": legacy_bytes(row.rhs),
-                "refs": legacy_bytes(row.references),
-                "flags": row.flags.into_inner(),
-                "edge_out": row.edge_output.map(legacy_bytes),
-                "uid": row.pipeline_uid,
-                "edge_id": row.edge,
-                "pipeline_id": row.pipeline,
-            })).collect()),
+        Ok(ActionSuccess::ReviewMakevars { value }) => Value::Array(
+            value
+                .into_inner()
+                .into_iter()
+                .map(|row| {
+                    json!({
+                        "id": row.id,
+                        "name": legacy_bytes(row.name),
+                        "loc": legacy_bytes(row.location),
+                        "value": legacy_bytes(row.value),
+                        "make": legacy_bytes(row.make_directory),
+                        "rhs": legacy_bytes(row.rhs),
+                        "refs": legacy_bytes(row.references),
+                        "flags": row.flags.into_inner(),
+                        "edge_out": row.edge_output.map(legacy_bytes),
+                        "uid": row.pipeline_uid,
+                        "edge_id": row.edge,
+                        "pipeline_id": row.pipeline,
+                    })
+                })
+                .collect(),
+        ),
         Ok(ActionSuccess::ReviewMapIds { value }) => json!(value.into_inner()),
         Ok(ActionSuccess::ReviewApply { value }) => json!({
             "applied": value.applied.into_inner().into_iter()
@@ -3453,8 +4071,9 @@ fn legacy_ui_action_reply(
                 .map(legacy_bytes).collect::<Vec<_>>(),
             "errors": legacy_review_errors(value.errors),
         }),
-        Ok(ActionSuccess::ReviewApplyHunk { .. })
-        | Ok(ActionSuccess::ReviewDiscardHunk { .. }) => json!({"ok": true}),
+        Ok(ActionSuccess::ReviewApplyHunk { .. }) | Ok(ActionSuccess::ReviewDiscardHunk { .. }) => {
+            json!({"ok": true})
+        }
         Ok(ActionSuccess::Delete { value }) | Ok(ActionSuccess::Dissolve { value }) => json!({
             "ok": true,
             "reparented": value.reparented.into_inner(),
@@ -3556,13 +4175,20 @@ fn legacy_ui_action_reply(
             "n_layers": value.layer_count,
             "verified": value.verified,
         }),
-        Ok(ActionSuccess::OciImages { value }) => Value::Array(value.into_inner()
-            .into_iter().map(|image| json!({
-                "id": image.top,
-                "name": image.name.into_inner(),
-                "reference": image.reference.into_inner(),
-                "digest": image.digest.into_inner(),
-            })).collect()),
+        Ok(ActionSuccess::OciImages { value }) => Value::Array(
+            value
+                .into_inner()
+                .into_iter()
+                .map(|image| {
+                    json!({
+                        "id": image.top,
+                        "name": image.name.into_inner(),
+                        "reference": image.reference.into_inner(),
+                        "digest": image.digest.into_inner(),
+                    })
+                })
+                .collect(),
+        ),
         Ok(ActionSuccess::OciResolve { value }) => json!({
             "top_id": value.top,
             "note": value.note.into_inner(),
@@ -3591,21 +4217,28 @@ fn legacy_ui_action_reply(
             "files": value.files,
             "bytes": value.bytes,
         }),
-        Ok(ActionSuccess::MirrorJobs { value }) => Value::Array(value.into_inner()
-            .into_iter().map(|job| json!({
-                "id": job.id,
-                "kind": job.kind.into_inner(),
-                "src": job.source.into_inner(),
-                "dest": legacy_bytes(job.destination),
-                "interval_secs": job.interval_seconds,
-                "paused": job.paused,
-                "last_start": job.last_start,
-                "last_end": job.last_end,
-                "last_exit": job.last_exit,
-                "last_detail": job.last_detail.into_inner(),
-                "state": legacy_mirror_state(job.state),
-                "next_due": job.next_due,
-            })).collect()),
+        Ok(ActionSuccess::MirrorJobs { value }) => Value::Array(
+            value
+                .into_inner()
+                .into_iter()
+                .map(|job| {
+                    json!({
+                        "id": job.id,
+                        "kind": job.kind.into_inner(),
+                        "src": job.source.into_inner(),
+                        "dest": legacy_bytes(job.destination),
+                        "interval_secs": job.interval_seconds,
+                        "paused": job.paused,
+                        "last_start": job.last_start,
+                        "last_end": job.last_end,
+                        "last_exit": job.last_exit,
+                        "last_detail": job.last_detail.into_inner(),
+                        "state": legacy_mirror_state(job.state),
+                        "next_due": job.next_due,
+                    })
+                })
+                .collect(),
+        ),
         Ok(ActionSuccess::MirrorAdd { value }) => json!({"ok": true, "id": value}),
         Ok(ActionSuccess::MirrorRun { .. }) | Ok(ActionSuccess::MirrorPause { .. }) => {
             json!({"ok": true})
@@ -3698,6 +4331,33 @@ fn resolve(boxes: &std::collections::BTreeMap<i64, discover::Box_>, ident: &str)
         .map(|b| b.box_id)
 }
 
+fn resolve_unique_box_selector(
+    boxes: &std::collections::BTreeMap<i64, discover::Box_>,
+    selector: &str,
+) -> Result<i64, String> {
+    if let Ok(id) = selector.parse::<i64>() {
+        if boxes.contains_key(&id) {
+            return Ok(id);
+        }
+    }
+    let mut matches = boxes
+        .values()
+        .filter(|r#box| {
+            r#box.name == selector || discover::display_path(boxes, r#box.box_id) == selector
+        })
+        .map(|r#box| r#box.box_id)
+        .collect::<Vec<_>>();
+    matches.sort_unstable();
+    matches.dedup();
+    match matches.as_slice() {
+        [id] => Ok(*id),
+        [] => Err(format!("box selector {selector:?} does not exist")),
+        _ => Err(format!(
+            "box selector {selector:?} is ambiguous; select its full box path"
+        )),
+    }
+}
+
 /// The box_id of the box NAMED `name` whose parent is `parent` (None=top-level),
 /// else None — the rerun/uniqueness lookup (siblings have unique NAMEs). Mirrors
 /// the Python Supervisor._find_named_child (scans discovered on-disk boxes).
@@ -3715,7 +4375,9 @@ fn find_named_child(
 fn action_flow_box(state: &State, requested: Option<u64>) -> Result<i64, String> {
     let sid = match requested {
         Some(sid) => sid,
-        None => lock(state).selected.as_ref()
+        None => lock(state)
+            .selected
+            .as_ref()
             .and_then(|sid| sid.parse::<u64>().ok())
             .ok_or("no box selected")?,
     };
@@ -3757,39 +4419,54 @@ fn legacy_path_arg(args: &[Value], index: usize) -> Option<crate::generated_wire
     crate::wire::BoundedBytes::new(args.get(index)?.as_str()?.as_bytes().to_vec()).ok()
 }
 
-fn legacy_path_list(value: Option<&Value>) -> Result<crate::wire::BoundedVec<
-    crate::generated_wire::Path,
-    0,
-    { crate::generated_wire::LIMIT_COLLECTION_ITEMS },
->, String> {
+fn legacy_path_list(
+    value: Option<&Value>,
+) -> Result<
+    crate::wire::BoundedVec<
+        crate::generated_wire::Path,
+        0,
+        { crate::generated_wire::LIMIT_COLLECTION_ITEMS },
+    >,
+    String,
+> {
     let values = match value {
         None | Some(Value::Null) => &[][..],
         Some(Value::Array(values)) => values.as_slice(),
         Some(_) => return Err("paths must be an array".into()),
     };
-    let paths = values.iter().map(|value| {
-        let path = value.as_str().ok_or("path must be text")?;
-        crate::wire::BoundedBytes::new(path.as_bytes().to_vec())
-            .map_err(|error| format!("path exceeds relation bound: {error:?}"))
-    }).collect::<Result<Vec<_>, String>>()?;
+    let paths = values
+        .iter()
+        .map(|value| {
+            let path = value.as_str().ok_or("path must be text")?;
+            crate::wire::BoundedBytes::new(path.as_bytes().to_vec())
+                .map_err(|error| format!("path exceeds relation bound: {error:?}"))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     crate::wire::BoundedVec::new(paths)
         .map_err(|error| format!("path list exceeds relation bound: {error:?}"))
 }
 
 fn legacy_transport_paths<const MINIMUM: usize>(
     value: Option<&Value>,
-) -> Result<crate::wire::BoundedVec<
-    crate::generated_wire::Path,
-    MINIMUM,
-    { crate::generated_wire::LIMIT_COLLECTION_ITEMS },
->, String> {
-    let values = value.and_then(Value::as_array)
+) -> Result<
+    crate::wire::BoundedVec<
+        crate::generated_wire::Path,
+        MINIMUM,
+        { crate::generated_wire::LIMIT_COLLECTION_ITEMS },
+    >,
+    String,
+> {
+    let values = value
+        .and_then(Value::as_array)
         .ok_or("build edge paths must be an array")?;
-    let paths = values.iter().map(|value| {
-        let path = value.as_str().ok_or("build edge path must be text")?;
-        crate::wire::BoundedBytes::new(path.as_bytes().to_vec())
-            .map_err(|_| "build edge path exceeds relation bound")
-    }).collect::<Result<Vec<_>, _>>()?;
+    let paths = values
+        .iter()
+        .map(|value| {
+            let path = value.as_str().ok_or("build edge path must be text")?;
+            crate::wire::BoundedBytes::new(path.as_bytes().to_vec())
+                .map_err(|_| "build edge path exceeds relation bound")
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     crate::wire::BoundedVec::new(paths)
         .map_err(|error| format!("build edge paths exceed relation bound: {error:?}"))
 }
@@ -3811,7 +4488,10 @@ fn reap(state: &State, id: i64) {
     let _ = std::fs::remove_dir_all(crate::paths::live_home().join(id.to_string()));
     let _ = std::fs::remove_dir_all(crate::paths::live_home().join("blob").join(id.to_string()));
     if let Ok(r#box) = u64::try_from(id) {
-        broadcast(state, &crate::generated_wire::SubscriptionEvent::BoxRemoved { r#box });
+        broadcast(
+            state,
+            &crate::generated_wire::SubscriptionEvent::BoxRemoved { r#box },
+        );
     }
 }
 
@@ -3844,10 +4524,7 @@ fn reap(state: &State, id: i64) {
 /// A running box is refused when work needs its blobs stable (a copy-down to
 /// children). A leaf delete (no children) is a plain reap and may proceed
 /// even while running.
-fn free_box_typed(
-    state: &State,
-    id: i64,
-) -> Result<crate::generated_wire::FreeResult, String> {
+fn free_box_typed(state: &State, id: i64) -> Result<crate::generated_wire::FreeResult, String> {
     let boxes = discover::discover();
     let me = boxes.get(&id).ok_or("no slopbox")?;
     let grandparent = me.parent;
@@ -3911,7 +4588,8 @@ fn free_box_typed(
         }
     }
     reap(state, id);
-    let children = children.into_iter()
+    let children = children
+        .into_iter()
         .map(|child| u64::try_from(child).map_err(|_| "negative child box id"))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(crate::generated_wire::FreeResult {
@@ -3932,15 +4610,21 @@ fn apply_to_copy_typed(
     id: i64,
 ) -> Result<crate::generated_wire::ApplyCopyResult, String> {
     let me = boxes.get(&id).ok_or("no slopbox")?;
-    let parent = me.parent.ok_or(
-        "box has no parent box to copy (a top-level box applies to the host)")?;
+    let parent = me
+        .parent
+        .ok_or("box has no parent box to copy (a top-level box applies to the host)")?;
     if box_is_running(state, id) || box_is_running(state, parent) {
         return Err("box or its parent is running; stop it first".into());
     }
     let grandparent = boxes.get(&parent).and_then(|b| b.parent);
     let ov = lock(state).overlay.clone().ok_or("overlay not mounted")?;
-    let new_id = boxes.keys().max().copied().unwrap_or(0)
-        .max(ov.box_ids().into_iter().max().unwrap_or(0)) + 1;
+    let new_id = boxes
+        .keys()
+        .max()
+        .copied()
+        .unwrap_or(0)
+        .max(ov.box_ids().into_iter().max().unwrap_or(0))
+        + 1;
     let parent_name = boxes
         .get(&parent)
         .map(|b| b.name.clone())
@@ -3972,13 +4656,18 @@ fn apply_to_copy_typed(
             .map_err(|error| format!("apply '{rel}' onto copy: {error}"))?;
         applied += 1;
     }
-    if let (Ok(r#box), Ok(name)) = (u64::try_from(new_id),
-        crate::wire::BoundedText::new(new_name.clone()))
-    {
-        broadcast(state, &crate::generated_wire::SubscriptionEvent::BoxAdded {
-            r#box, name: Some(name),
-            parent: grandparent.and_then(|value| u64::try_from(value).ok()),
-        });
+    if let (Ok(r#box), Ok(name)) = (
+        u64::try_from(new_id),
+        crate::wire::BoundedText::new(new_name.clone()),
+    ) {
+        broadcast(
+            state,
+            &crate::generated_wire::SubscriptionEvent::BoxAdded {
+                r#box,
+                name: Some(name),
+                parent: grandparent.and_then(|value| u64::try_from(value).ok()),
+            },
+        );
     }
     Ok(crate::generated_wire::ApplyCopyResult {
         r#box: u64::try_from(new_id).map_err(|_| "negative allocated box id")?,
@@ -3996,15 +4685,20 @@ fn rotate_typed(
 ) -> Result<crate::generated_wire::RotateResult, String> {
     let (overlay, run_pids) = {
         let shared = lock(state);
-        (shared.overlay.clone().ok_or("overlay not mounted")?,
-         shared.box_runpids.clone())
+        (
+            shared.overlay.clone().ok_or("overlay not mounted")?,
+            shared.box_runpids.clone(),
+        )
     };
     if overlay.box_of(child_id).is_none() {
-        if !crate::paths::state_home().join(format!("{child_id}.sqlar")).exists() {
+        if !crate::paths::state_home()
+            .join(format!("{child_id}.sqlar"))
+            .exists()
+        {
             return Err("no such box".into());
         }
-        let child = crate::capture::BoxState::create(child_id)
-            .map_err(|error| error.to_string())?;
+        let child =
+            crate::capture::BoxState::create(child_id).map_err(|error| error.to_string())?;
         child.load_mirror();
         overlay.add_box(std::sync::Arc::new(child));
     }
@@ -4046,16 +4740,13 @@ fn rotate_typed(
     {
         let connection = child.conn.lock().unwrap();
         crate::depot::archive_clear(&connection, child_id)
-            .and_then(|_| crate::depot::import_layer(
-                &connection, child_id, &new_child_layer))?;
+            .and_then(|_| crate::depot::import_layer(&connection, child_id, &new_child_layer))?;
     }
     {
         let connection = parent.conn.lock().unwrap();
         crate::depot::archive_clear(&connection, parent_id)
-            .and_then(|_| crate::depot::import_layer(
-                &connection, parent_id, &new_parent_layer))
-            .map_err(|error| format!(
-                "parent import after child rewrite: {error}"))?;
+            .and_then(|_| crate::depot::import_layer(&connection, parent_id, &new_parent_layer))
+            .map_err(|error| format!("parent import after child rewrite: {error}"))?;
     }
 
     let grandparent = parent.parent();
@@ -4074,25 +4765,34 @@ fn rotate_typed(
     })
 }
 
-fn stuck_typed(
-    state: &State,
-    id: i64,
-) -> Result<crate::generated_wire::StuckReport, String> {
+fn stuck_typed(state: &State, id: i64) -> Result<crate::generated_wire::StuckReport, String> {
     use crate::generated_wire::{StuckReport, StuckThread};
-    let runner = lock(state).box_runpids.get(&id).copied()
+    let runner = lock(state)
+        .box_runpids
+        .get(&id)
+        .copied()
         .ok_or("box not running")?;
-    let state_of = |path: &str| std::fs::read_to_string(path)
-        .ok()
-        .and_then(|text| text.rfind(')')
-            .and_then(|index| text[index + 1..].trim().chars().next())
-            .map(|state| state.to_string()))
-        .unwrap_or_default();
+    let state_of = |path: &str| {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|text| {
+                text.rfind(')')
+                    .and_then(|index| text[index + 1..].trim().chars().next())
+                    .map(|state| state.to_string())
+            })
+            .unwrap_or_default()
+    };
 
     let mut box_pids = Vec::new();
     if let Ok(entries) = std::fs::read_dir("/proc") {
         for entry in entries.flatten() {
-            let Some(pid) = entry.file_name().to_str()
-                .and_then(|text| text.parse::<i32>().ok()) else { continue };
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|text| text.parse::<i32>().ok())
+            else {
+                continue;
+            };
             let mut current = pid;
             for _ in 0..64 {
                 if current == runner {
@@ -4109,14 +4809,21 @@ fn stuck_typed(
     }
 
     let mut file_descriptors: std::collections::HashMap<
-        i32, std::collections::HashMap<i32, String>> = Default::default();
+        i32,
+        std::collections::HashMap<i32, String>,
+    > = Default::default();
     let mut holders: std::collections::HashMap<String, Vec<i32>> = Default::default();
     for &pid in &box_pids {
         let mut table = std::collections::HashMap::new();
         if let Ok(entries) = std::fs::read_dir(format!("/proc/{pid}/fd")) {
             for entry in entries.flatten() {
-                let Some(number) = entry.file_name().to_str()
-                    .and_then(|text| text.parse::<i32>().ok()) else { continue };
+                let Some(number) = entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|text| text.parse::<i32>().ok())
+                else {
+                    continue;
+                };
                 if let Ok(target) = std::fs::read_link(entry.path()) {
                     let target = target.to_string_lossy().into_owned();
                     if target.starts_with("pipe:") || target.starts_with("socket:") {
@@ -4146,30 +4853,47 @@ fn stuck_typed(
     }
 
     let short = |value: String| -> Result<
-        crate::wire::BoundedText<{ crate::generated_wire::LIMIT_SHORT_BYTES }>, String> {
+        crate::wire::BoundedText<{ crate::generated_wire::LIMIT_SHORT_BYTES }>,
+        String,
+    > {
         crate::wire::BoundedText::new(value)
             .map_err(|error| format!("stuck short text exceeds relation bound: {error:?}"))
     };
     let text = |value: String| -> Result<
-        crate::wire::BoundedText<{ crate::generated_wire::LIMIT_TEXT_BYTES }>, String> {
+        crate::wire::BoundedText<{ crate::generated_wire::LIMIT_TEXT_BYTES }>,
+        String,
+    > {
         crate::wire::BoundedText::new(value)
             .map_err(|error| format!("stuck text exceeds relation bound: {error:?}"))
     };
     let mut threads = Vec::new();
     for &pid in &box_pids {
-        let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else { continue };
+        let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+            continue;
+        };
         for task in tasks.flatten() {
-            let Some(tid) = task.file_name().to_str()
-                .and_then(|value| value.parse::<i32>().ok()) else { continue };
+            let Some(tid) = task
+                .file_name()
+                .to_str()
+                .and_then(|value| value.parse::<i32>().ok())
+            else {
+                continue;
+            };
             let base = format!("/proc/{pid}/task/{tid}");
-            let read = |name: &str| std::fs::read_to_string(format!("{base}/{name}"))
-                .unwrap_or_default().trim().to_string();
+            let read = |name: &str| {
+                std::fs::read_to_string(format!("{base}/{name}"))
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string()
+            };
             let command = read("comm");
             let wait_channel = read("wchan");
             let thread_state = state_of(&format!("{base}/stat"));
             let syscall_raw = read("syscall");
             let syscall_fields = syscall_raw.split_whitespace().collect::<Vec<_>>();
-            let number = syscall_fields.first().and_then(|field| field.parse::<i64>().ok());
+            let number = syscall_fields
+                .first()
+                .and_then(|field| field.parse::<i64>().ok());
             let detail = match number {
                 Some(number) if number >= 0 => {
                     let name = syscall_name(number);
@@ -4179,21 +4903,25 @@ fn stuck_typed(
                         name.to_string()
                     };
                     if syscall_arg0_is_fd(number) {
-                        let descriptor = syscall_fields.get(1).and_then(|field|
-                            i64::from_str_radix(field.trim_start_matches("0x"), 16).ok());
+                        let descriptor = syscall_fields.get(1).and_then(|field| {
+                            i64::from_str_radix(field.trim_start_matches("0x"), 16).ok()
+                        });
                         match descriptor {
                             Some(descriptor) => {
-                                let target = file_descriptors.get(&pid)
+                                let target = file_descriptors
+                                    .get(&pid)
                                     .and_then(|table| table.get(&(descriptor as i32)))
-                                    .cloned().unwrap_or_else(|| "?".into());
-                                let mut detail = format!(
-                                    "{name}(fd {descriptor} → {target})");
+                                    .cloned()
+                                    .unwrap_or_else(|| "?".into());
+                                let mut detail = format!("{name}(fd {descriptor} → {target})");
                                 if let Some(processes) = holders.get(&target) {
-                                    let peers = processes.iter().filter(|peer| **peer != pid)
-                                        .map(ToString::to_string).collect::<Vec<_>>();
+                                    let peers = processes
+                                        .iter()
+                                        .filter(|peer| **peer != pid)
+                                        .map(ToString::to_string)
+                                        .collect::<Vec<_>>();
                                     if !peers.is_empty() {
-                                        detail.push_str(&format!(
-                                            "  peer pid {}", peers.join(",")));
+                                        detail.push_str(&format!("  peer pid {}", peers.join(",")));
                                     }
                                 }
                                 detail
@@ -4207,8 +4935,14 @@ fn stuck_typed(
                 _ if wait_channel.is_empty() || wait_channel == "0" => "running".into(),
                 _ => wait_channel.clone(),
             };
-            let frames = backtraces.get(&tid).into_iter().flatten().take(6)
-                .cloned().map(text).collect::<Result<Vec<_>, _>>()?;
+            let frames = backtraces
+                .get(&tid)
+                .into_iter()
+                .flatten()
+                .take(6)
+                .cloned()
+                .map(text)
+                .collect::<Result<Vec<_>, _>>()?;
             threads.push(StuckThread {
                 pid: u32::try_from(pid).map_err(|_| "invalid process id in stuck report")?,
                 tid: u32::try_from(tid).map_err(|_| "invalid thread id in stuck report")?,
@@ -4217,17 +4951,13 @@ fn stuck_typed(
                 wait_channel: text(wait_channel)?,
                 syscall: short(syscall_fields.first().copied().unwrap_or("").to_string())?,
                 detail: text(detail)?,
-                backtrace: crate::wire::BoundedVec::new(frames)
-                    .map_err(|error| format!(
-                        "stuck backtrace exceeds relation bound: {error:?}"))?,
+                backtrace: crate::wire::BoundedVec::new(frames).map_err(|error| {
+                    format!("stuck backtrace exceeds relation bound: {error:?}")
+                })?,
             });
         }
     }
-    threads.sort_by_key(|thread| (
-        thread.state.as_str() == "R",
-        thread.pid,
-        thread.tid,
-    ));
+    threads.sort_by_key(|thread| (thread.state.as_str() == "R", thread.pid, thread.tid));
     Ok(StuckReport {
         runner: u32::try_from(runner).map_err(|_| "invalid runner process id")?,
         threads: crate::wire::BoundedVec::new(threads)
@@ -4254,8 +4984,7 @@ fn drop_if_empty(state: &State, id: i64) {
     if has_children(id) {
         return;
     }
-    if crate::review::session_changes_typed(id)
-        .is_ok_and(|changes| changes.is_empty()) {
+    if crate::review::session_changes_typed(id).is_ok_and(|changes| changes.is_empty()) {
         reap(state, id);
     }
 }
@@ -4268,41 +4997,65 @@ fn valid_name(s: &str) -> bool {
         && !s.ends_with('-')
 }
 
-fn legacy_process_provenance(value: &Value)
-    -> Result<crate::generated_wire::ProcessProvenance, String>
-{
+fn legacy_process_provenance(
+    value: &Value,
+) -> Result<crate::generated_wire::ProcessProvenance, String> {
     let bytes = |name: &str| {
-        let value = value.get(name).and_then(Value::as_str)
+        let value = value
+            .get(name)
+            .and_then(Value::as_str)
             .ok_or_else(|| format!("process provenance has no {name}"))?;
         crate::wire::BoundedBytes::new(value.as_bytes().to_vec())
             .map_err(|error| format!("process {name} exceeds relation bound: {error:?}"))
     };
-    let argv = value.get("argv").and_then(Value::as_array)
-        .ok_or("process provenance has no argv")?.iter().map(|value| {
+    let argv = value
+        .get("argv")
+        .and_then(Value::as_array)
+        .ok_or("process provenance has no argv")?
+        .iter()
+        .map(|value| {
             let value = value.as_str().ok_or("process argument is not text")?;
             crate::wire::BoundedBytes::new(value.as_bytes().to_vec())
                 .map_err(|error| format!("process argument exceeds relation bound: {error:?}"))
-        }).collect::<Result<Vec<_>, String>>()?;
-    let environment = value.get("env").map(|environment| {
-        let entries = environment.as_object().ok_or("process environment is not an object")?
-            .iter().map(|(key, value)| {
-                let value = value.as_str().ok_or("process environment value is not text")?;
-                Ok((
-                    crate::wire::BoundedBytes::new(key.as_bytes().to_vec())
-                        .map_err(|_| "process environment key exceeds relation bound")?,
-                    crate::wire::BoundedBytes::new(value.as_bytes().to_vec())
-                        .map_err(|_| "process environment value exceeds relation bound")?,
-                ))
-            }).collect::<Result<std::collections::BTreeMap<_, _>, String>>()?;
-        crate::wire::BoundedMap::new(entries)
-            .map_err(|error| format!("process environment exceeds relation bound: {error:?}"))
-    }).transpose()?;
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let environment = value
+        .get("env")
+        .map(|environment| {
+            let entries = environment
+                .as_object()
+                .ok_or("process environment is not an object")?
+                .iter()
+                .map(|(key, value)| {
+                    let value = value
+                        .as_str()
+                        .ok_or("process environment value is not text")?;
+                    Ok((
+                        crate::wire::BoundedBytes::new(key.as_bytes().to_vec())
+                            .map_err(|_| "process environment key exceeds relation bound")?,
+                        crate::wire::BoundedBytes::new(value.as_bytes().to_vec())
+                            .map_err(|_| "process environment value exceeds relation bound")?,
+                    ))
+                })
+                .collect::<Result<std::collections::BTreeMap<_, _>, String>>()?;
+            crate::wire::BoundedMap::new(entries)
+                .map_err(|error| format!("process environment exceeds relation bound: {error:?}"))
+        })
+        .transpose()?;
     Ok(crate::generated_wire::ProcessProvenance {
-        tgid: value.get("tgid").or_else(|| value.get("pid"))
-            .and_then(Value::as_u64).ok_or("process provenance has no tgid")?
-            .try_into().map_err(|_| "process tgid exceeds u32")?,
-        ppid: value.get("ppid").and_then(Value::as_i64).unwrap_or(0)
-            .try_into().map_err(|_| "process ppid exceeds i32")?,
+        tgid: value
+            .get("tgid")
+            .or_else(|| value.get("pid"))
+            .and_then(Value::as_u64)
+            .ok_or("process provenance has no tgid")?
+            .try_into()
+            .map_err(|_| "process tgid exceeds u32")?,
+        ppid: value
+            .get("ppid")
+            .and_then(Value::as_i64)
+            .unwrap_or(0)
+            .try_into()
+            .map_err(|_| "process ppid exceeds i32")?,
         executable: bytes("exe")?,
         cwd: bytes("cwd")?,
         argv: crate::wire::BoundedVec::new(argv)
@@ -4311,22 +5064,29 @@ fn legacy_process_provenance(value: &Value)
     })
 }
 
-fn legacy_register_request(msg: &Value)
-    -> Result<crate::generated_wire::TransportRequest, String>
-{
+fn legacy_register_request(msg: &Value) -> Result<crate::generated_wire::TransportRequest, String> {
     use crate::generated_wire::{NetMode, RegistrationName, RunBackend, TransportRequest};
-    let command = msg.get("cmd").and_then(Value::as_array)
-        .ok_or("register has no command")?.iter().map(|value| {
-            let value = value.as_str().ok_or("register command argument is not text")?;
+    let command = msg
+        .get("cmd")
+        .and_then(Value::as_array)
+        .ok_or("register has no command")?
+        .iter()
+        .map(|value| {
+            let value = value
+                .as_str()
+                .ok_or("register command argument is not text")?;
             crate::wire::BoundedBytes::new(value.as_bytes().to_vec())
                 .map_err(|error| format!("register command exceeds relation bound: {error:?}"))
-        }).collect::<Result<Vec<_>, String>>()?;
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     let name = if let Some(name) = msg.get("relname").and_then(Value::as_str) {
         RegistrationName::Nested {
             name: crate::wire::BoundedText::new(name.to_owned())
                 .map_err(|_| "nested registration name exceeds relation bound")?,
         }
-    } else if let Some(selector) = msg.get("session_id").and_then(Value::as_str)
+    } else if let Some(selector) = msg
+        .get("session_id")
+        .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
     {
         RegistrationName::Host {
@@ -4345,50 +5105,97 @@ fn legacy_register_request(msg: &Value)
     Ok(TransportRequest::Register {
         command: crate::wire::BoundedVec::new(command)
             .map_err(|error| format!("register command exceeds relation bound: {error:?}"))?,
-        provenance: legacy_process_provenance(msg.get("prov")
-            .ok_or("register has no process provenance")?)?,
+        provenance: legacy_process_provenance(
+            msg.get("prov")
+                .ok_or("register has no process provenance")?,
+        )?,
         name,
-        backend: if msg.get("want_sud").and_then(Value::as_bool).unwrap_or(false) {
+        backend: if msg
+            .get("want_sud")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
             RunBackend::Sud
-        } else { RunBackend::Fuse },
+        } else {
+            RunBackend::Fuse
+        },
         architecture: None,
+        debug_mode: crate::generated_wire::DebugMode::Off,
+        selected_boot: None,
         net_mode,
-        capture: msg.get("want_capture").and_then(Value::as_bool).unwrap_or(true),
-        direct: msg.get("want_direct").and_then(Value::as_bool).unwrap_or(false),
-        capture_environment: msg.get("want_env").and_then(Value::as_bool).unwrap_or(false),
-        brush: msg.get("want_brush").and_then(Value::as_bool).unwrap_or(false),
-        api: msg.get("want_api").and_then(Value::as_bool).unwrap_or(false),
-        web_capture: msg.get("want_webcap").and_then(Value::as_bool).unwrap_or(false),
-        web_filter: msg.get("want_webfilter").and_then(Value::as_bool).unwrap_or(false),
+        capture: msg
+            .get("want_capture")
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
+        direct: msg
+            .get("want_direct")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        capture_environment: msg
+            .get("want_env")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        brush: msg
+            .get("want_brush")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        api: msg
+            .get("want_api")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        web_capture: msg
+            .get("want_webcap")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        web_filter: msg
+            .get("want_webfilter")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
         replay_from: msg.get("replay_from").and_then(Value::as_u64),
-        no_parent: msg.get("want_no_parent").and_then(Value::as_bool).unwrap_or(false),
-        readonly_parent: msg.get("want_readonly_parent").and_then(Value::as_bool)
+        no_parent: msg
+            .get("want_no_parent")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        readonly_parent: msg
+            .get("want_readonly_parent")
+            .and_then(Value::as_bool)
             .unwrap_or(false),
     })
 }
 
-fn legacy_register_reply(
-    result: Result<crate::generated_wire::RegisterReply, String>,
-) -> Value {
+fn legacy_register_reply(result: Result<crate::generated_wire::RegisterReply, String>) -> Value {
     use crate::generated_wire::RegisterReply;
     let RegisterReply {
-        mount, shared_memory, dns, ca_bundle, owner, r#box, name,
-        capture, api, no_host, oci, virtiofs_socket: _,
+        mount,
+        shared_memory,
+        dns,
+        ca_bundle,
+        owner,
+        r#box,
+        name,
+        capture,
+        api,
+        no_host,
+        oci,
+        virtiofs_socket: _,
+        debug_image: _,
     } = match result {
         Ok(reply) => reply,
         Err(error) => return json!({"ok": false, "error": error}),
     };
     let bytes = |value: crate::generated_wire::OsString| legacy_bytes(value);
-    let oci = oci.map(|runtime| json!({
-        "env": runtime.environment.map(|values|
-            values.into_inner().into_iter().map(&bytes).collect::<Vec<_>>()),
-        "cwd": runtime.cwd.map(legacy_bytes),
-        "cmd": runtime.command.map(|values|
-            values.into_inner().into_iter().map(&bytes).collect::<Vec<_>>()),
-        "entrypoint": runtime.entrypoint.map(|values|
-            values.into_inner().into_iter().map(&bytes).collect::<Vec<_>>()),
-        "user": runtime.user.map(legacy_bytes),
-    }));
+    let oci = oci.map(|runtime| {
+        json!({
+            "env": runtime.environment.map(|values|
+                values.into_inner().into_iter().map(&bytes).collect::<Vec<_>>()),
+            "cwd": runtime.cwd.map(legacy_bytes),
+            "cmd": runtime.command.map(|values|
+                values.into_inner().into_iter().map(&bytes).collect::<Vec<_>>()),
+            "entrypoint": runtime.entrypoint.map(|values|
+                values.into_inner().into_iter().map(&bytes).collect::<Vec<_>>()),
+            "user": runtime.user.map(legacy_bytes),
+        })
+    });
     let mut reply = json!({
         "ok": true,
         "mount": legacy_bytes(mount),
@@ -4439,6 +5246,639 @@ fn qemu_architecture(
     }
 }
 
+/// Resolve a debug registration entirely through recorded Sarun identities.
+/// Its output feeds `OwnedComposedService::prepare_resolved` as service name,
+/// service-provider box, and the bundle-provider box attachment. Artifact
+/// descriptors remain provider-root-relative and retain their checked hashes.
+fn resolve_debug_service_launch(
+    state: &State,
+    request: &crate::generated_wire::TransportRequest,
+    box_id: i64,
+) -> Result<Option<crate::debug_resources::ResolvedDebugResources>, String> {
+    use crate::generated_wire::{DebugMode, TransportRequest};
+    let TransportRequest::Register {
+        architecture,
+        debug_mode,
+        selected_boot,
+        ..
+    } = request
+    else {
+        return Err("debug service resolution requires a register request".into());
+    };
+    match debug_mode {
+        DebugMode::Off => Ok(None),
+        DebugMode::AttachBeforeCommand => {
+            let architecture = architecture.ok_or("debug registration has no QEMU architecture")?;
+            let overlay = lock(state)
+                .overlay
+                .clone()
+                .ok_or("overlay is unavailable")?;
+            let resources =
+                crate::debug_resources::resolve_debug_resources(&overlay, box_id, architecture)
+                    .map_err(|error| error.to_string())?;
+            let has_selected_pair = matches!(
+                selected_boot,
+                Some(crate::generated_wire::SelectedBoot::KernelInitramfs { .. })
+            );
+            if !has_selected_pair
+                && matches!(
+                    architecture,
+                    crate::generated_wire::QemuArchitecture::Arm
+                        | crate::generated_wire::QemuArchitecture::Mmips
+                )
+                && resources.image.is_none()
+            {
+                return Err(format!(
+                    "qemu {} debugging requires a matching image bundle or selected kernel/initramfs pair",
+                    crate::appliance::architecture_name(architecture)
+                ));
+            }
+            Ok(Some(resources))
+        }
+    }
+}
+
+struct PreparedDebugLaunch {
+    kernel: std::fs::File,
+    qemu_rsp: UnixStream,
+    image: Option<PreparedGuestImage>,
+    session_service: String,
+    manifest: String,
+    image_catalog: Option<crate::generated_wire::DebugImageCatalog>,
+    service_provider_box: i64,
+    bundle_provider_box: i64,
+    client_argv: Vec<String>,
+    client: Option<OwnedManagedDebugClient>,
+    _service: OwnedComposedService,
+}
+
+struct PreparedGuestImage {
+    initramfs: std::fs::File,
+    start: crate::generated_wire::DebugGuestImageStart,
+}
+
+struct SelectedKernelInitramfsPayload {
+    kernel: Vec<u8>,
+    initramfs: Vec<u8>,
+}
+
+fn read_registered_boot_artifact(
+    overlay: &crate::overlay::Overlay,
+    consumer_box: i64,
+    role: &str,
+) -> Result<Vec<u8>, String> {
+    let consumer = overlay
+        .box_of(consumer_box)
+        .ok_or_else(|| format!("selected boot box {consumer_box} is unavailable"))?;
+    let meta = |suffix: &str| {
+        consumer
+            .get_meta(&format!("selected_{role}_{suffix}"))
+            .ok_or_else(|| format!("selected {role} identity is incomplete"))
+    };
+    let source_box = meta("box")?
+        .parse::<i64>()
+        .map_err(|_| format!("selected {role} box identity is invalid"))?;
+    let path = meta("path")?;
+    let expected_size = meta("size")?
+        .parse::<u64>()
+        .map_err(|_| format!("selected {role} size identity is invalid"))?;
+    let expected_sha256 = meta("sha256")?;
+    let contents = overlay
+        .box_read_file(source_box, &path)
+        .map_err(|error| format!("read selected {role} box {source_box}:{path}: {error}"))?;
+    if contents.len() as u64 != expected_size {
+        return Err(format!("selected {role} changed size before QEMU handoff"));
+    }
+    if format!("{:x}", sha2::Sha256::digest(&contents)) != expected_sha256 {
+        return Err(format!(
+            "selected {role} changed content before QEMU handoff"
+        ));
+    }
+    Ok(contents)
+}
+
+fn selected_kernel_initramfs_payload(
+    state: &State,
+    request: &crate::generated_wire::TransportRequest,
+    consumer_box: i64,
+) -> Result<Option<SelectedKernelInitramfsPayload>, String> {
+    let crate::generated_wire::TransportRequest::Register { selected_boot, .. } = request else {
+        return Err("selected boot payload requires a register request".into());
+    };
+    if !matches!(
+        selected_boot,
+        Some(crate::generated_wire::SelectedBoot::KernelInitramfs { .. })
+    ) {
+        return Ok(None);
+    }
+    let overlay = lock(state)
+        .overlay
+        .clone()
+        .ok_or("overlay is unavailable")?;
+    Ok(Some(SelectedKernelInitramfsPayload {
+        kernel: read_registered_boot_artifact(&overlay, consumer_box, "kernel")?,
+        initramfs: read_registered_boot_artifact(&overlay, consumer_box, "initramfs")?,
+    }))
+}
+
+impl Drop for PreparedDebugLaunch {
+    fn drop(&mut self) {
+        // A provider may have parked without GDB ever dialing (registration
+        // failure, box kill, or user cancellation).  The unique name must not
+        // retain that dead endpoint in the engine-global service registry.
+        SVC_PARKED.lock().unwrap().remove(&self.session_service);
+        SVC_PARKED_CHANGED.notify_all();
+    }
+}
+
+/// One provider-declared debugger client running on an engine-owned PTY.
+/// `stop` is a clone of the PTY mux endpoint; shutting it down terminates the
+/// mux, which in turn terminates the child.  The console endpoint is parked as
+/// a one-use named raw stream for the TUI and is removed if it was never
+/// attached.
+struct OwnedManagedDebugClient {
+    console_service: String,
+    stop: UnixStream,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for OwnedManagedDebugClient {
+    fn drop(&mut self) {
+        SVC_PARKED.lock().unwrap().remove(&self.console_service);
+        SVC_PARKED_CHANGED.notify_all();
+        let _ = self.stop.shutdown(std::net::Shutdown::Both);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+fn sealed_debug_artifact(bytes: &[u8]) -> Result<std::fs::File, String> {
+    let name = std::ffi::CStr::from_bytes_with_nul(b"sarun-debug-artifact\0").unwrap();
+    let fd =
+        unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING) };
+    if fd < 0 {
+        return Err(format!(
+            "create debug artifact descriptor: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    file.write_all(bytes)
+        .map_err(|error| format!("write debug artifact descriptor: {error}"))?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| format!("rewind debug artifact descriptor: {error}"))?;
+    let seals = libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_ADD_SEALS, seals) } < 0 {
+        return Err(format!(
+            "seal debug artifact descriptor: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(file)
+}
+
+fn prepare_debug_launch(
+    state: &State,
+    box_id: i64,
+    resources: crate::debug_resources::ResolvedDebugResources,
+    selected_pair: Option<SelectedKernelInitramfsPayload>,
+) -> Result<PreparedDebugLaunch, String> {
+    let overlay = lock(state)
+        .overlay
+        .clone()
+        .ok_or("overlay is unavailable")?;
+    let selected_initramfs = selected_pair.as_ref().map(|pair| pair.initramfs.as_slice());
+    let kernel_bytes = match selected_pair.as_ref() {
+        Some(pair) => {
+            let actual: [u8; 32] = sha2::Sha256::digest(&pair.kernel).into();
+            if actual != resources.bundle.kernel.boot_image.sha256 {
+                return Err(
+                    "selected kernel does not match the boot image associated with the resolved vmlinux"
+                        .into(),
+                );
+            }
+            pair.kernel.clone()
+        }
+        None => crate::debug_resources::read_resolved_artifact(
+            &overlay,
+            resources.bundle.provider_box,
+            &resources.bundle.kernel.boot_image,
+        )
+        .map_err(|error| error.to_string())?,
+    };
+    let kernel = sealed_debug_artifact(&kernel_bytes)?;
+    let matching_image = resources.image.as_ref().filter(|image| {
+        selected_initramfs.is_none_or(|contents| {
+            <[u8; 32]>::from(sha2::Sha256::digest(contents)) == image.initramfs.sha256
+        })
+    });
+    let image = match selected_pair {
+        Some(pair) => Some(PreparedGuestImage {
+            initramfs: sealed_debug_artifact(&pair.initramfs)?,
+            start: crate::generated_wire::DebugGuestImageStart {
+                profile: crate::debug_resources::wire_image_profile(resources.bundle.architecture),
+                init: crate::wire::BoundedBytes::new(b"/init".to_vec())
+                    .expect("/init fits the generated path bound"),
+            },
+        }),
+        None => matching_image
+            .map(|image| {
+                let bytes = crate::debug_resources::read_resolved_artifact(
+                    &overlay,
+                    image.provider_box,
+                    &image.initramfs,
+                )
+                .map_err(|error| error.to_string())?;
+                Ok::<PreparedGuestImage, String>(PreparedGuestImage {
+                    initramfs: sealed_debug_artifact(&bytes)?,
+                    start: crate::generated_wire::DebugGuestImageStart {
+                        profile: crate::debug_resources::wire_image_profile(image.architecture),
+                        init: crate::wire::BoundedBytes::new(image.init.as_bytes().to_vec())
+                            .map_err(|error| {
+                                format!("image init path exceeds protocol bound: {error:?}")
+                            })?,
+                    },
+                })
+            })
+            .transpose()?,
+    };
+    let (qemu_rsp, mut provider_rsp) =
+        UnixStream::pair().map_err(|error| format!("create debug RSP stream: {error}"))?;
+    let session_service = debug_session_service_name(box_id);
+    let manifest_path = resources.bundle.entrypoints.callgate.path.clone();
+    let image_catalog = matching_image
+        .map(crate::debug_resources::wire_image_catalog)
+        .transpose()?;
+    let manifest = crate::wire::BoundedBytes::new(
+        resources
+            .bundle
+            .entrypoints
+            .callgate
+            .path
+            .as_bytes()
+            .to_vec(),
+    )
+    .map_err(|_| "debug callgate manifest path exceeds protocol bound".to_string())?;
+    let service_name = crate::wire::BoundedText::new(session_service.clone())
+        .map_err(|_| "generated debug service name exceeds protocol bound".to_string())?;
+    crate::socket_wire::write_versioned(
+        &mut provider_rsp,
+        &crate::generated_wire::DebugProviderStart {
+            manifest,
+            service: service_name,
+            image: image_catalog.clone(),
+        },
+    )
+    .and_then(|()| provider_rsp.flush())
+    .map_err(|error| format!("send debug provider start: {error}"))?;
+    let mut attachment_ids = vec![resources.bundle.provider_box];
+    if let Some(image) = matching_image {
+        if !attachment_ids.contains(&image.provider_box) {
+            attachment_ids.push(image.provider_box);
+        }
+    }
+    let service = OwnedComposedService::prepare_resolved(
+        state,
+        resources.service.name,
+        resources.service.provider_box,
+        &attachment_ids,
+        ComposedServiceStreams::bidirectional(provider_rsp),
+    )?;
+    let client_argv =
+        declared_service_client_argv(resources.service.name, resources.service.provider_box)?;
+    Ok(PreparedDebugLaunch {
+        kernel,
+        qemu_rsp,
+        image,
+        session_service,
+        manifest: manifest_path,
+        image_catalog,
+        service_provider_box: resources.service.provider_box,
+        bundle_provider_box: resources.bundle.provider_box,
+        client_argv,
+        client: None,
+        _service: service,
+    })
+}
+
+fn declared_service_client_argv(name: &str, expected_provider: i64) -> Result<Vec<String>, String> {
+    let boxes = discover::discover();
+    let provider = declared_service_provider(&boxes, name)?;
+    if provider != expected_provider {
+        return Err(format!(
+            "service '{name}' provider changed during client resolution"
+        ));
+    }
+    let argv: Vec<String> = boxes
+        .get(&provider)
+        .and_then(|provider| provider.meta.get("svc_client_argv"))
+        .and_then(|value| serde_json::from_str(value).ok())
+        .ok_or_else(|| format!("service '{name}': malformed svc_client_argv"))?;
+    if argv.is_empty() {
+        return Err(format!(
+            "service '{name}': no debugger client entrypoint declared"
+        ));
+    }
+    Ok(argv)
+}
+
+/// Encode the generated, versioned client-start value into a single ASCII
+/// line.  A PTY begins in canonical mode and may transform arbitrary binary
+/// input before the provider wrapper can change its termios settings; hex is
+/// the lossless terminal projection of the canonical wire bytes.
+fn debug_client_start_line(
+    manifest: &str,
+    image: Option<crate::generated_wire::DebugImageCatalog>,
+    service: &str,
+) -> Result<Vec<u8>, String> {
+    let start = crate::generated_wire::DebugClientStart {
+        manifest: crate::wire::BoundedBytes::new(manifest.as_bytes().to_vec())
+            .map_err(|_| "debug client manifest path exceeds protocol bound".to_string())?,
+        image,
+        service: crate::wire::BoundedText::new(service.to_owned())
+            .map_err(|_| "debug client service name exceeds protocol bound".to_string())?,
+    };
+    let mut encoded = Vec::new();
+    crate::socket_wire::write_versioned(&mut encoded, &start)
+        .map_err(|error| format!("encode debug client start: {error}"))?;
+    let mut line = Vec::with_capacity(24 + encoded.len() * 2);
+    line.extend_from_slice(b"SARUN-DEBUG-CLIENT/1 ");
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for byte in encoded {
+        line.push(HEX[usize::from(byte >> 4)]);
+        line.push(HEX[usize::from(byte & 0x0f)]);
+    }
+    line.push(b'\n');
+    Ok(line)
+}
+
+fn start_managed_debug_client(
+    state: &State,
+    box_id: i64,
+    debug: &mut PreparedDebugLaunch,
+) -> Result<String, String> {
+    if debug.client.is_some() {
+        return Err("debugger client was already started".into());
+    }
+    let _create = COMPOSED_SERVICE_CREATE.lock().unwrap();
+    let boxes = discover::discover();
+    let provider = declared_service_provider(&boxes, crate::debug_resources::DEBUG_SERVICE_NAME)?;
+    if provider != debug.service_provider_box {
+        return Err("debug service provider changed before client launch".into());
+    }
+    validate_service_attachments(&boxes, &[debug.bundle_provider_box])?;
+    let overlay = lock(state)
+        .overlay
+        .clone()
+        .ok_or("overlay is unavailable")?;
+    if overlay.box_of(debug.bundle_provider_box).is_none() {
+        let attached_box = crate::capture::BoxState::create(debug.bundle_provider_box)
+            .map_err(|error| format!("open debug bundle box: {error}"))?;
+        attached_box.load_mirror();
+        overlay.add_box(std::sync::Arc::new(attached_box));
+    }
+
+    let live_max = overlay.box_ids().into_iter().max().unwrap_or(0);
+    let id = boxes.keys().max().copied().unwrap_or(0).max(live_max) + 1;
+    let child_name = composed_service_child_name("viros-debug-client", id);
+    let child = crate::capture::BoxState::create(id)
+        .map_err(|error| format!("create debugger client box: {error}"))?;
+    child.set_parent(Some(provider));
+    child.set_meta("parent_box_id", &provider.to_string());
+    child.set_meta("name", &child_name);
+    child.set_meta("ephemeral_service", "viros-debug-client");
+    child.set_ro_attachments(service_attachment_rows(&[debug.bundle_provider_box]));
+    overlay.add_box(std::sync::Arc::new(child));
+    if let (Ok(r#box), Ok(name)) = (
+        u64::try_from(id),
+        crate::wire::BoundedText::new(child_name.clone()),
+    ) {
+        broadcast(
+            state,
+            &crate::generated_wire::SubscriptionEvent::BoxAdded {
+                r#box,
+                name: Some(name),
+                parent: u64::try_from(provider).ok(),
+            },
+        );
+    }
+
+    let provider_path = discover::display_path(&boxes, provider);
+    let selector = format!("{provider_path}.{child_name}");
+    let executable = std::env::current_exe()
+        .map_err(|error| format!("locate debugger client runner: {error}"))?;
+    let net = boxes
+        .get(&provider)
+        .and_then(|provider| provider.meta.get("svc_net"))
+        .filter(|value| !value.is_empty())
+        .cloned()
+        .unwrap_or_else(|| {
+            if crate::net::tap::tap_available() {
+                "tap".into()
+            } else {
+                "host".into()
+            }
+        });
+    let mut argv = vec![
+        executable.to_string_lossy().into_owned(),
+        "run".into(),
+        "--net".into(),
+        net,
+        selector,
+        "--".into(),
+    ];
+    argv.extend(debug.client_argv.iter().cloned());
+
+    let (pty_stream, mut console_stream) =
+        UnixStream::pair().map_err(|error| format!("create debugger console stream: {error}"))?;
+    let stop = pty_stream
+        .try_clone()
+        .map_err(|error| format!("clone debugger console stop lane: {error}"))?;
+    let start_line = debug_client_start_line(
+        &debug.manifest,
+        debug.image_catalog.clone(),
+        &debug.session_service,
+    )?;
+    console_stream
+        .write_all(&crate::frames::encode(
+            crate::frames::FRAME_PTY_DATA,
+            &start_line,
+        ))
+        .and_then(|()| console_stream.flush())
+        .map_err(|error| format!("send debugger client start: {error}"))?;
+
+    let console_service = debug_console_service_name(box_id);
+    SVC_PARKED
+        .lock()
+        .unwrap()
+        .entry(console_service.clone())
+        .or_default()
+        .push_back(ParkedServiceSlot::Raw(console_stream));
+    SVC_PARKED_CHANGED.notify_all();
+
+    let worker_state = state.clone();
+    let worker = std::thread::spawn(move || {
+        crate::pty::serve_pty(&argv, 24, 80, pty_stream, None, None, &[]);
+        reap_composed_service_after_runner(&worker_state, id);
+    });
+    debug.client = Some(OwnedManagedDebugClient {
+        console_service: console_service.clone(),
+        stop,
+        worker: Some(worker),
+    });
+    Ok(console_service)
+}
+
+fn release_debug_barrier(
+    session_service: Option<&str>,
+    provider_exited: Option<&std::sync::atomic::AtomicBool>,
+    writer: &Arc<Mutex<UnixStream>>,
+    timeout: std::time::Duration,
+) -> Result<(), String> {
+    wait_debug_provider(session_service, provider_exited, timeout)?;
+    send_debug_start(writer)
+}
+
+fn wait_debug_provider(
+    session_service: Option<&str>,
+    provider_exited: Option<&std::sync::atomic::AtomicBool>,
+    timeout: std::time::Duration,
+) -> Result<(), String> {
+    let service = session_service
+        .ok_or("runner reported a debug barrier for a registration without debug resources")?;
+    match wait_for_parked_service(service, provider_exited, timeout) {
+        ServiceWait::Ready => {}
+        ServiceWait::ProviderExited => {
+            return Err(format!(
+                "debug provider exited before publishing session service '{service}'"
+            ));
+        }
+        ServiceWait::TimedOut => {
+            return Err(format!(
+                "debug provider did not publish session service '{service}' in time"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn send_debug_start(writer: &Arc<Mutex<UnixStream>>) -> Result<(), String> {
+    let mut writer = writer.lock().unwrap();
+    writer
+        .write_all(&crate::frames::encode(
+            crate::frames::FRAME_DEBUG_START,
+            &[],
+        ))
+        .and_then(|()| writer.flush())
+        .map_err(|error| format!("release debug barrier: {error}"))
+}
+
+#[derive(Clone, Debug)]
+struct RegisteredBootArtifact {
+    source_box: i64,
+    path: String,
+    sha256: String,
+    size: u64,
+    ancestry_artifacts: usize,
+}
+
+#[derive(Clone, Debug)]
+enum RegisteredSelectedBoot {
+    Image(RegisteredBootArtifact),
+    KernelInitramfs {
+        kernel: RegisteredBootArtifact,
+        initramfs: RegisteredBootArtifact,
+    },
+}
+
+impl RegisteredSelectedBoot {
+    fn attachment_ids(&self) -> Vec<i64> {
+        let mut ids = match self {
+            Self::Image(image) => vec![image.source_box],
+            Self::KernelInitramfs { kernel, initramfs } => {
+                vec![kernel.source_box, initramfs.source_box]
+            }
+        };
+        ids.dedup();
+        ids
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RegistrationFdRole {
+    Network,
+    Trace,
+    FilesystemRing,
+    DescriptorLane,
+    Unused,
+}
+
+fn registration_fd_roles(
+    sud: bool,
+    direct_filesystem: bool,
+    network: bool,
+) -> [RegistrationFdRole; 4] {
+    use RegistrationFdRole::{DescriptorLane, FilesystemRing, Network, Trace, Unused};
+    match (sud, direct_filesystem, network) {
+        (true, _, true) => [Network, Trace, FilesystemRing, DescriptorLane],
+        (true, _, false) => [Trace, FilesystemRing, DescriptorLane, Unused],
+        (false, true, true) => [Network, FilesystemRing, DescriptorLane, Unused],
+        (false, true, false) => [FilesystemRing, DescriptorLane, Unused, Unused],
+        (false, false, true) => [Network, Unused, Unused, Unused],
+        (false, false, false) => [Unused; 4],
+    }
+}
+
+#[cfg(test)]
+mod registration_fd_role_tests {
+    use super::{RegistrationFdRole as Role, registration_fd_roles};
+
+    #[test]
+    fn fuse_brush_tail_places_ring_and_lane_after_optional_network() {
+        assert_eq!(
+            registration_fd_roles(false, true, false),
+            [
+                Role::FilesystemRing,
+                Role::DescriptorLane,
+                Role::Unused,
+                Role::Unused
+            ]
+        );
+        assert_eq!(
+            registration_fd_roles(false, true, true),
+            [
+                Role::Network,
+                Role::FilesystemRing,
+                Role::DescriptorLane,
+                Role::Unused
+            ]
+        );
+    }
+
+    #[test]
+    fn existing_sud_tail_keeps_trace_before_ring_and_lane() {
+        assert_eq!(
+            registration_fd_roles(true, false, false),
+            [
+                Role::Trace,
+                Role::FilesystemRing,
+                Role::DescriptorLane,
+                Role::Unused
+            ]
+        );
+        assert_eq!(
+            registration_fd_roles(true, false, true),
+            [
+                Role::Network,
+                Role::Trace,
+                Role::FilesystemRing,
+                Role::DescriptorLane
+            ]
+        );
+    }
+}
+
 fn register(
     state: &State,
     request: &crate::generated_wire::TransportRequest,
@@ -4451,55 +5891,86 @@ fn register(
 ) -> Result<crate::generated_wire::RegisterReply, String> {
     use crate::generated_wire::{NetMode, RegistrationName, RunBackend, TransportRequest};
     let TransportRequest::Register {
-        command, provenance, name: registration_name, backend, architecture, net_mode,
-        capture, direct, capture_environment, brush, api, web_capture,
-        web_filter, replay_from, no_parent, readonly_parent,
-    } = request else {
+        command,
+        provenance,
+        name: registration_name,
+        backend,
+        architecture,
+        debug_mode,
+        selected_boot,
+        net_mode,
+        capture,
+        direct,
+        capture_environment,
+        brush,
+        api,
+        web_capture,
+        web_filter,
+        replay_from,
+        no_parent,
+        readonly_parent,
+    } = request
+    else {
         return Err("expected register request".into());
     };
     let qemu_architecture = qemu_architecture(*backend, *architecture)?;
-    // Assign the post-pidfd SCM_RIGHTS fds to roles from the message. The
-    // runner sends them in a fixed order: [network (if required)] then
-    // [sud trace pipe (if want_sud)]. So:
-    //   fuse+tap : fd2=tap
-    //   sud+tap  : fd2=tap,   fd3=trace
-    //   sud+!tap : fd2=trace
-    //   qemu+tap: fd2=packet socket (qemu host uses its user-net backend)
-    // Own each as an OwnedFd so every early-return path closes it; the tap
-    // fd moves into prepare_net and the trace fd into stream_events only on
-    // the success path.
+    if qemu_architecture.is_some_and(|architecture| {
+        matches!(
+            architecture,
+            crate::generated_wire::QemuArchitecture::Arm
+                | crate::generated_wire::QemuArchitecture::Mmips
+        )
+    }) && *debug_mode == crate::generated_wire::DebugMode::Off
+    {
+        return Err("qemu arm/mmips requires debug mode".into());
+    }
+    if *backend != RunBackend::Qemu && *debug_mode != crate::generated_wire::DebugMode::Off {
+        return Err("debug mode is only valid for the qemu backend".into());
+    }
+    // Assign the ordered SCM_RIGHTS tail after the runner pidfd. FUSE Brush
+    // has no trace-pipe fd, so its ring/lane immediately follow the optional
+    // network fd. All unexpected descriptors are closed here.
     let want_sud_fd = *backend == RunBackend::Sud;
+    let want_direct_fs = *backend == RunBackend::Fuse && *brush && !*direct;
     let has_network_fd = *net_mode == NetMode::Tap;
-    let (network_raw, trace_raw, ring_raw, lane_raw) = match (want_sud_fd, has_network_fd) {
-        (true, true) => (fd2_raw, fd3_raw, fd4_raw, fd5_raw),
-        (true, false) => (None, fd2_raw, fd3_raw, fd4_raw),
-        (false, _) => (fd2_raw, None, None, None),
-    };
-    // Close any fd that didn't get a role (shouldn't happen in normal flow).
-    if want_sud_fd && !has_network_fd {
-        if let Some(fd) = fd5_raw {
-            unsafe {
-                libc::close(fd);
+    let mut network_raw = None;
+    let mut trace_raw = None;
+    let mut ring_raw = None;
+    let mut lane_raw = None;
+    for (role, fd) in registration_fd_roles(want_sud_fd, want_direct_fs, has_network_fd)
+        .into_iter()
+        .zip([fd2_raw, fd3_raw, fd4_raw, fd5_raw])
+    {
+        match role {
+            RegistrationFdRole::Network => network_raw = fd,
+            RegistrationFdRole::Trace => trace_raw = fd,
+            RegistrationFdRole::FilesystemRing => ring_raw = fd,
+            RegistrationFdRole::DescriptorLane => lane_raw = fd,
+            RegistrationFdRole::Unused => {
+                if let Some(fd) = fd {
+                    unsafe { libc::close(fd) };
+                }
             }
-        }
-    } else if !want_sud_fd {
-        for fd in [fd3_raw, fd4_raw, fd5_raw].into_iter().flatten() {
-            unsafe { libc::close(fd); }
         }
     }
     let network_fd: Option<std::os::fd::OwnedFd> = network_raw
         .map(|fd| unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) });
     let sud_trace_owned: Option<std::os::fd::OwnedFd> = trace_raw
         .map(|fd| unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) });
-    let sud_ring_owned: Option<std::os::fd::OwnedFd> = ring_raw
+    let mut sud_ring_owned: Option<std::os::fd::OwnedFd> = ring_raw
         .map(|fd| unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) });
-    let sud_lane_owned: Option<std::os::fd::OwnedFd> = lane_raw
+    let mut sud_lane_owned: Option<std::os::fd::OwnedFd> = lane_raw
         .map(|fd| unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) });
-    if want_sud_fd && (sud_ring_owned.is_none() || sud_lane_owned.is_none()) {
+    if (want_sud_fd || want_direct_fs) && (sud_ring_owned.is_none() || sud_lane_owned.is_none()) {
         if let Some(fd) = peer_pidfd {
-            unsafe { libc::close(fd); }
+            unsafe {
+                libc::close(fd);
+            }
         }
-        return Err("SUD registration requires its filesystem ring and descriptor lane fds".into());
+        return Err(format!(
+            "{} registration requires its filesystem ring and descriptor lane fds",
+            if want_sud_fd { "SUD" } else { "FUSE Brush" }
+        ));
     }
     let ov = lock(state).overlay.clone();
     let Some(ov) = ov else {
@@ -4515,11 +5986,78 @@ fn register(
     let host_pid = peer_pidfd
         .map(host_pid_from_pidfd)
         .filter(|p| *p > 0)
-        .or_else(|| {
-            i32::try_from(provenance.tgid).ok()
-        })
+        .or_else(|| i32::try_from(provenance.tgid).ok())
         .unwrap_or(0);
     let boxes = discover::discover();
+    let resolve_selected_artifact = |selected: &crate::generated_wire::SelectedArtifact,
+                                     role: &str| {
+        if *backend != RunBackend::Qemu
+            || *debug_mode != crate::generated_wire::DebugMode::AttachBeforeCommand
+        {
+            return Err("selected boot artifacts require qemu debug mode".to_string());
+        }
+        let source_box = resolve_unique_box_selector(&boxes, selected.r#box.as_str())?;
+        let path = std::str::from_utf8(selected.path.as_slice())
+            .map_err(|_| format!("selected {role} path is not UTF-8"))?;
+        if !crate::image_provenance::normalized_relative_path(path) {
+            return Err(format!(
+                "selected {role} path must be normalized and relative"
+            ));
+        }
+        let source = ov
+            .box_of(source_box)
+            .ok_or_else(|| format!("selected {role} box {source_box} is unavailable"))?;
+        if !source
+            .regular_captured_paths_snapshot()
+            .iter()
+            .any(|candidate| candidate == path)
+        {
+            return Err(format!(
+                "selected {role}: box {source_box} has no own-layer captured regular file {path:?}"
+            ));
+        }
+        let provenance =
+            crate::image_provenance::resolve_selected_image_from_engine(&ov, source_box, path)
+                .map_err(|error| error.to_string())?;
+        if provenance.artifacts_truncated {
+            return Err(format!(
+                "selected {role} build ancestry exceeds {} recorded artifacts",
+                crate::image_provenance::MAX_ANCESTRY_ARTIFACTS,
+            ));
+        }
+        let contents = ov
+            .box_read_file(source_box, path)
+            .map_err(|error| format!("read selected {role} box {source_box}:{path}: {error}"))?;
+        if contents.len() as u64 != provenance.selected.size {
+            return Err(format!("selected {role} changed size during registration"));
+        }
+        let sha256 = format!("{:x}", sha2::Sha256::digest(&contents));
+        Ok(RegisteredBootArtifact {
+            source_box,
+            path: path.to_owned(),
+            sha256,
+            size: provenance.selected.size,
+            ancestry_artifacts: provenance.artifacts.len(),
+        })
+    };
+    let selected_boot = selected_boot
+        .as_ref()
+        .map(|selected| match selected {
+            crate::generated_wire::SelectedBoot::Image { image } => {
+                resolve_selected_artifact(image, "image").map(RegisteredSelectedBoot::Image)
+            }
+            crate::generated_wire::SelectedBoot::KernelInitramfs { kernel, initramfs } => {
+                let kernel = resolve_selected_artifact(kernel, "kernel")?;
+                let initramfs = resolve_selected_artifact(initramfs, "initramfs")?;
+                if kernel.source_box == initramfs.source_box && kernel.path == initramfs.path {
+                    return Err(
+                        "selected kernel and initramfs must be different captured files".into(),
+                    );
+                }
+                Ok(RegisteredSelectedBoot::KernelInitramfs { kernel, initramfs })
+            }
+        })
+        .transpose()?;
     // ── PARENT + NAME RESOLUTION ───────────────────────────────────────────
     // IN-BOX (relname present): parent = kernel-derived enclosing box; the box
     //   supplies only a single-segment relative NAME (or "" → auto A<n>).
@@ -4579,10 +6117,7 @@ fn register(
     // known after that parent has been resolved.  Resolve it here, before any
     // box state is created, and put the effective non-empty argv into the root
     // provenance row.  Do not weaken the actual-process invariant.
-    let oci = oci_runtime_from_chain(
-        &boxes,
-        if *no_parent { None } else { parent },
-    )?;
+    let oci = oci_runtime_from_chain(&boxes, if *no_parent { None } else { parent })?;
     let effective_command = registration_command(command, oci.as_ref())?;
     let mut provenance = provenance.clone();
     provenance.argv = crate::wire::BoundedVec::new(effective_command)
@@ -4608,6 +6143,14 @@ fn register(
             }
         }
         return Err("slopbox is already running".into());
+    }
+    if rerun && selected_boot.is_some() {
+        if let Some(fd) = peer_pidfd {
+            unsafe {
+                libc::close(fd);
+            }
+        }
+        return Err("selected boot artifacts must run in a fresh child box".into());
     }
     let live_max = ov.box_ids().into_iter().max().unwrap_or(0);
     let id =
@@ -4658,11 +6201,45 @@ fn register(
     // on this flag (see overlay.rs).
     b.set_is_tap(*net_mode == NetMode::Tap);
     b.set_meta("name", &name);
+    if let Some(selected) = &selected_boot {
+        b.set_ro_attachments(
+            selected
+                .attachment_ids()
+                .into_iter()
+                .map(crate::capture::RoAttachment::Box)
+                .collect(),
+        );
+        let store = |role: &str, artifact: &RegisteredBootArtifact| {
+            b.set_meta(
+                &format!("selected_{role}_box"),
+                &artifact.source_box.to_string(),
+            );
+            b.set_meta(&format!("selected_{role}_path"), &artifact.path);
+            b.set_meta(&format!("selected_{role}_sha256"), &artifact.sha256);
+            b.set_meta(&format!("selected_{role}_size"), &artifact.size.to_string());
+            b.set_meta(
+                &format!("selected_{role}_ancestry_artifacts"),
+                &artifact.ancestry_artifacts.to_string(),
+            );
+        };
+        match selected {
+            RegisteredSelectedBoot::Image(image) => store("image", image),
+            RegisteredSelectedBoot::KernelInitramfs { kernel, initramfs } => {
+                store("kernel", kernel);
+                store("initramfs", initramfs);
+            }
+        }
+    }
     if let Some(architecture) = qemu_architecture {
-        b.set_meta("qemu_architecture", match architecture {
-            crate::generated_wire::QemuArchitecture::Aarch64 => "aarch64",
-            crate::generated_wire::QemuArchitecture::X8664 => "x86_64",
-        });
+        b.set_meta(
+            "qemu_architecture",
+            match architecture {
+                crate::generated_wire::QemuArchitecture::Aarch64 => "aarch64",
+                crate::generated_wire::QemuArchitecture::X8664 => "x86_64",
+                crate::generated_wire::QemuArchitecture::Arm => "arm",
+                crate::generated_wire::QemuArchitecture::Mmips => "mmips",
+            },
+        );
     }
     // SUD uses the same live BoxState/SarunFs capture as FUSE and QEMU. Its
     // trace pipe remains independent of the filesystem transport, so a SUD
@@ -4708,7 +6285,8 @@ fn register(
                 }
                 return Err(format!(
                     "sud nesting is same-in-same: enclosing box {enc} is \
-                     not a sud box (see engine/DESIGN-sud.md)"));
+                     not a sud box (see engine/DESIGN-sud.md)"
+                ));
             }
         }
     }
@@ -4724,7 +6302,11 @@ fn register(
     match b.root_process(&provenance, i64::from(host_pid)) {
         Ok(()) => (),
         Err(error) => {
-            if let Some(fd) = peer_pidfd { unsafe { libc::close(fd); } }
+            if let Some(fd) = peer_pidfd {
+                unsafe {
+                    libc::close(fd);
+                }
+            }
             return Err(error);
         }
     }
@@ -4775,8 +6357,10 @@ fn register(
             .clamp(4, 32);
         let filesystem = match crate::sud_ring::SudFsSession::start(
             scoped,
-            sud_ring_owned.expect("SUD ring checked above"),
-            sud_lane_owned.expect("SUD descriptor lane checked above"),
+            sud_ring_owned.take().expect("SUD ring checked above"),
+            sud_lane_owned
+                .take()
+                .expect("SUD descriptor lane checked above"),
             workers,
         ) {
             Ok(filesystem) => filesystem,
@@ -4787,17 +6371,55 @@ fn register(
         };
         lock(state).sud_filesystems.insert(id, filesystem);
     }
+    if want_direct_fs {
+        let scoped = match ov.export_box_for_host_consumer(id) {
+            Ok(scoped) => scoped,
+            Err(error) => {
+                abort_registration(state, &ov, id);
+                return Err(format!("direct filesystem root: {error}"));
+            }
+        };
+        let workers = std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(4)
+            .clamp(4, 32);
+        let filesystem = match crate::sud_ring::DirectFsSession::start(
+            scoped,
+            sud_ring_owned
+                .take()
+                .expect("direct filesystem ring checked above"),
+            sud_lane_owned
+                .take()
+                .expect("direct descriptor lane checked above"),
+            workers,
+        ) {
+            Ok(filesystem) => filesystem,
+            Err(error) => {
+                abort_registration(state, &ov, id);
+                return Err(format!("direct filesystem transport: {error}"));
+            }
+        };
+        lock(state).direct_filesystems.insert(id, filesystem);
+    }
     // The same target-architecture sarun binary is PID 1. Project it read-only
     // through the filesystem core before exposing the root to QEMU. It is
     // engine presentation state, never a captured change that `apply` could
     // accidentally write to the host's /init.
-    if let Some(architecture) = qemu_architecture {
+    if let Some(architecture) = qemu_architecture.filter(|architecture| {
+        matches!(
+            architecture,
+            crate::generated_wire::QemuArchitecture::Aarch64
+                | crate::generated_wire::QemuArchitecture::X8664
+        )
+    }) {
         let init_path = crate::appliance::target_init(architecture);
         if let Err(error) = ov.project_file(id, "init", init_path.clone()) {
             ov.remove_box(id);
             let mut shared = lock(state);
             if let Some(fd) = shared.box_pids.remove(&id) {
-                unsafe { libc::close(fd); }
+                unsafe {
+                    libc::close(fd);
+                }
             }
             shared.box_runpids.remove(&id);
             return Err(format!(
@@ -4817,7 +6439,9 @@ fn register(
                 ov.remove_box(id);
                 let mut shared = lock(state);
                 if let Some(fd) = shared.box_pids.remove(&id) {
-                    unsafe { libc::close(fd); }
+                    unsafe {
+                        libc::close(fd);
+                    }
                 }
                 shared.box_runpids.remove(&id);
                 return Err(format!(
@@ -4838,7 +6462,9 @@ fn register(
                 ov.remove_box(id);
                 let mut shared = lock(state);
                 if let Some(fd) = shared.box_pids.remove(&id) {
-                    unsafe { libc::close(fd); }
+                    unsafe {
+                        libc::close(fd);
+                    }
                 }
                 shared.box_runpids.remove(&id);
                 if let Some(proxy) = shared.api_proxy.clone() {
@@ -4889,16 +6515,33 @@ fn register(
         }
     };
 
+    // FUSE has no separate tracer process: emit the same compact TRACE v3
+    // bytes directly from SarunFs. Start only after every fallible registration
+    // resource is ready, but before the runner receives its acknowledgement.
+    if *backend == RunBackend::Fuse {
+        if let Err(error) = crate::sud::start_fuse_trace(id, &backing.join("sud.trace")) {
+            abort_registration(state, &ov, id);
+            return Err(format!("FUSE trace: {error}"));
+        }
+        if let Some(box_state) = ov.live_box(id) {
+            box_state.set_meta("trace_backend", "fuse");
+        }
+    }
+
     // Announce only after every registration resource is live. In particular,
     // a failed network setup must never flash a dead box into subscribers.
-    if let (Ok(r#box), Ok(name)) = (u64::try_from(id),
-        crate::wire::BoundedText::new(name.clone()))
-    {
-        broadcast(state, &crate::generated_wire::SubscriptionEvent::BoxAdded {
-            r#box,
-            name: Some(name),
-            parent: parent.and_then(|value| u64::try_from(value).ok()),
-        });
+    if let (Ok(r#box), Ok(name)) = (
+        u64::try_from(id),
+        crate::wire::BoundedText::new(name.clone()),
+    ) {
+        broadcast(
+            state,
+            &crate::generated_wire::SubscriptionEvent::BoxAdded {
+                r#box,
+                name: Some(name),
+                parent: parent.and_then(|value| u64::try_from(value).ok()),
+            },
+        );
     }
 
     // D-oci: if any ancestor in the parent chain has an oci_config meta key
@@ -4915,15 +6558,18 @@ fn register(
     let dns = if dns_ip.is_empty() {
         None
     } else {
-        let address = dns_ip.parse::<std::net::Ipv4Addr>()
+        let address = dns_ip
+            .parse::<std::net::Ipv4Addr>()
             .map_err(|error| format!("invalid generated DNS address {dns_ip:?}: {error}"))?;
         Some(crate::wire::FixedBytes(address.octets()))
     };
     let ca_bundle = if ca_pem.is_empty() {
         None
     } else {
-        Some(crate::wire::BoundedBytes::new(ca_pem.into_bytes())
-            .map_err(|error| format!("CA bundle exceeds relation bound: {error:?}"))?)
+        Some(
+            crate::wire::BoundedBytes::new(ca_pem.into_bytes())
+                .map_err(|error| format!("CA bundle exceeds relation bound: {error:?}"))?,
+        )
     };
     let owner = std::process::id() as u128
         ^ (id as u128) << 64
@@ -4944,9 +6590,11 @@ fn register(
         api: want_api,
         no_host,
         oci,
-        virtiofs_socket: virtiofs_socket.as_deref()
+        virtiofs_socket: virtiofs_socket
+            .as_deref()
             .map(|path| bounded_path(path, "virtio-fs socket"))
             .transpose()?,
+        debug_image: None,
     })
 }
 
@@ -4965,7 +6613,9 @@ fn oci_runtime_from_chain(
         if !seen.insert(id) {
             return Ok(None);
         }
-        let Some(b) = boxes.get(&id) else { return Ok(None) };
+        let Some(b) = boxes.get(&id) else {
+            return Ok(None);
+        };
         if let Some(cfg_json) = b.meta.get("oci_config") {
             return parse_oci_runtime(cfg_json);
         }
@@ -4985,7 +6635,8 @@ fn registration_command(
     if !override_command.as_slice().is_empty() {
         return Ok(override_command.as_slice().to_vec());
     }
-    let mut command = oci.and_then(|runtime| runtime.entrypoint.as_ref())
+    let mut command = oci
+        .and_then(|runtime| runtime.entrypoint.as_ref())
         .map(|values| values.as_slice().to_vec())
         .unwrap_or_default();
     if let Some(values) = oci.and_then(|runtime| runtime.command.as_ref()) {
@@ -5028,52 +6679,76 @@ fn chain_has_no_host(
 /// JSON. We don't link `oci_spec` here on purpose — those fields are stable
 /// across the OCI spec versions and a hand-rolled extractor avoids dragging
 /// the dep into control.rs just to read five fields.
-fn parse_oci_runtime(cfg_json: &str)
-    -> Result<Option<crate::generated_wire::OciRuntime>, String>
-{
+fn parse_oci_runtime(cfg_json: &str) -> Result<Option<crate::generated_wire::OciRuntime>, String> {
     use crate::generated_wire::OciRuntime;
     let value: Value = serde_json::from_str(cfg_json)
         .map_err(|error| format!("invalid stored OCI config: {error}"))?;
-    let Some(config) = value.get("config") else { return Ok(None) };
+    let Some(config) = value.get("config") else {
+        return Ok(None);
+    };
     let strings = |name: &str| -> Result<Option<Vec<crate::generated_wire::OsString>>, String> {
-        config.get(name).map(|value| {
-            let values = value.as_array().ok_or_else(|| format!("OCI {name} is not an array"))?
-                .iter().map(|value| {
-                    let value = value.as_str().ok_or_else(|| format!("OCI {name} item is not text"))?;
-                    crate::wire::BoundedBytes::new(value.as_bytes().to_vec())
-                        .map_err(|error| format!("OCI {name} item exceeds relation bound: {error:?}"))
-                }).collect::<Result<Vec<_>, String>>()?;
-            Ok(values)
-        }).transpose()
+        config
+            .get(name)
+            .map(|value| {
+                let values = value
+                    .as_array()
+                    .ok_or_else(|| format!("OCI {name} is not an array"))?
+                    .iter()
+                    .map(|value| {
+                        let value = value
+                            .as_str()
+                            .ok_or_else(|| format!("OCI {name} item is not text"))?;
+                        crate::wire::BoundedBytes::new(value.as_bytes().to_vec()).map_err(|error| {
+                            format!("OCI {name} item exceeds relation bound: {error:?}")
+                        })
+                    })
+                    .collect::<Result<Vec<_>, String>>()?;
+                Ok(values)
+            })
+            .transpose()
     };
     let bytes = |name: &str| -> Result<Option<_>, String> {
-        config.get(name).map(|value| {
-            let value = value.as_str().ok_or_else(|| format!("OCI {name} is not text"))?;
-            crate::wire::BoundedBytes::new(value.as_bytes().to_vec())
-                .map_err(|error| format!("OCI {name} exceeds relation bound: {error:?}"))
-        }).transpose()
+        config
+            .get(name)
+            .map(|value| {
+                let value = value
+                    .as_str()
+                    .ok_or_else(|| format!("OCI {name} is not text"))?;
+                crate::wire::BoundedBytes::new(value.as_bytes().to_vec())
+                    .map_err(|error| format!("OCI {name} exceeds relation bound: {error:?}"))
+            })
+            .transpose()
     };
     let runtime = OciRuntime {
-        environment: strings("Env")?.map(|values|
-            crate::wire::BoundedVec::<_, 0,
+        environment: strings("Env")?
+            .map(|values| {
+                crate::wire::BoundedVec::<_, 0,
                 { crate::generated_wire::LIMIT_ENVIRONMENT_ENTRIES }>::new(values)
-                .map_err(|error| format!("OCI Env exceeds relation bound: {error:?}")))
+                .map_err(|error| format!("OCI Env exceeds relation bound: {error:?}"))
+            })
             .transpose()?,
         cwd: bytes("WorkingDir")?,
-        command: strings("Cmd")?.map(|values|
-            crate::wire::BoundedVec::<_, 0,
+        command: strings("Cmd")?
+            .map(|values| {
+                crate::wire::BoundedVec::<_, 0,
                 { crate::generated_wire::LIMIT_COMMAND_ITEMS }>::new(values)
-                .map_err(|error| format!("OCI Cmd exceeds relation bound: {error:?}")))
+                .map_err(|error| format!("OCI Cmd exceeds relation bound: {error:?}"))
+            })
             .transpose()?,
-        entrypoint: strings("Entrypoint")?.map(|values|
-            crate::wire::BoundedVec::<_, 0,
+        entrypoint: strings("Entrypoint")?
+            .map(|values| {
+                crate::wire::BoundedVec::<_, 0,
                 { crate::generated_wire::LIMIT_COMMAND_ITEMS }>::new(values)
-                .map_err(|error| format!("OCI Entrypoint exceeds relation bound: {error:?}")))
+                .map_err(|error| format!("OCI Entrypoint exceeds relation bound: {error:?}"))
+            })
             .transpose()?,
         user: bytes("User")?,
     };
-    let empty = runtime.environment.is_none() && runtime.cwd.is_none()
-        && runtime.command.is_none() && runtime.entrypoint.is_none() && runtime.user.is_none();
+    let empty = runtime.environment.is_none()
+        && runtime.cwd.is_none()
+        && runtime.command.is_none()
+        && runtime.entrypoint.is_none()
+        && runtime.user.is_none();
     Ok((!empty).then_some(runtime))
 }
 
@@ -5103,9 +6778,13 @@ fn prepare_net(
             "box {id} registered networked but sent no packet fd"
         ));
     };
-    let net = lock(state).net.clone()
+    let net = lock(state)
+        .net
+        .clone()
         .ok_or_else(|| format!("net stack unavailable; networking refused for box {id}"))?;
-    let rt = lock(state).net_rt.clone()
+    let rt = lock(state)
+        .net_rt
+        .clone()
         .ok_or_else(|| format!("network runtime unavailable; networking refused for box {id}"))?;
     // Fixed addressing — every box's TAP is identical; we key by box id.
     let box_id_u16 = id as u16;
@@ -6609,31 +8288,47 @@ fn handle_pty_spawn(
     prebuf: Vec<u8>,
 ) {
     let crate::generated_wire::TransportRequest::PtySpawn {
-        argv, rows, columns, cwd, environment,
-    } = request else {
+        argv,
+        rows,
+        columns,
+        cwd,
+        environment,
+    } = request
+    else {
         let _ = writer.write_all(b"{\"ok\":false,\"error\":\"expected PTY request\"}\n");
         return;
     };
-    let decoded: Result<(
-        Vec<String>,
-        Option<std::path::PathBuf>,
-        Vec<(String, String)>,
-    ), String> = (|| {
-        let argv = argv.into_inner().into_iter().map(|value|
-            String::from_utf8(value.into_inner())
-                .map_err(|_| "PTY argv is not UTF-8".to_string()))
+    let decoded: Result<
+        (
+            Vec<String>,
+            Option<std::path::PathBuf>,
+            Vec<(String, String)>,
+        ),
+        String,
+    > = (|| {
+        let argv = argv
+            .into_inner()
+            .into_iter()
+            .map(|value| {
+                String::from_utf8(value.into_inner())
+                    .map_err(|_| "PTY argv is not UTF-8".to_string())
+            })
             .collect::<Result<Vec<_>, _>>()?;
         let cwd = cwd.map(|value| {
             use std::os::unix::ffi::OsStringExt;
             std::path::PathBuf::from(std::ffi::OsString::from_vec(value.into_inner()))
         });
-        let environment = environment.into_inner().into_iter().map(|(key, value)| {
-            let key = String::from_utf8(key.into_inner())
-                .map_err(|_| "PTY environment key is not UTF-8".to_string())?;
-            let value = String::from_utf8(value.into_inner())
-                .map_err(|_| "PTY environment value is not UTF-8".to_string())?;
-            Ok((key, value))
-        }).collect::<Result<Vec<_>, String>>()?;
+        let environment = environment
+            .into_inner()
+            .into_iter()
+            .map(|(key, value)| {
+                let key = String::from_utf8(key.into_inner())
+                    .map_err(|_| "PTY environment key is not UTF-8".to_string())?;
+                let value = String::from_utf8(value.into_inner())
+                    .map_err(|_| "PTY environment value is not UTF-8".to_string())?;
+                Ok((key, value))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
         Ok((argv, cwd, environment))
     })();
     let (argv, cwd, environment) = match decoded {
@@ -6667,7 +8362,15 @@ fn handle_pty_spawn(
         pos: 0,
         inner: stream,
     };
-    crate::pty::serve_pty(&argv, rows, columns, chan, None, cwd.as_deref(), &environment);
+    crate::pty::serve_pty(
+        &argv,
+        rows,
+        columns,
+        chan,
+        None,
+        cwd.as_deref(),
+        &environment,
+    );
 }
 
 /// Top-level handler for a control connection. `hint_box_id` is the box id
@@ -6703,8 +8406,7 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
     // The register handshake carries the runner's pidfd as the connection's
     // first SCM_RIGHTS fd; keep it for host-pid derivation + kill. It belongs
     // to the FIRST message only (a register); close it if that never comes.
-    let (mut peer_pidfd, peer_tapfd_raw, peer_thirdfd_raw, peer_fourthfd_raw,
-         peer_fifthfd_raw) =
+    let (mut peer_pidfd, peer_tapfd_raw, peer_thirdfd_raw, peer_fourthfd_raw, peer_fifthfd_raw) =
         recv_first_fd(&conn);
     // The TAP fd (tap boxes) and the sud trace-pipe fd (sud boxes) ride the
     // register message's SCM_RIGHTS after the pidfd. Own both so every
@@ -6784,38 +8486,58 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
                 }
             }
             let request: Result<crate::generated_wire::TransportRequest, String> = (|| {
-                let values = msg.get("argv").and_then(Value::as_array)
+                let values = msg
+                    .get("argv")
+                    .and_then(Value::as_array)
                     .ok_or("pty_spawn: missing argv")?;
-                let argv = values.iter().map(|value| {
-                    let value = value.as_str().ok_or("pty_spawn: argv item is not text")?;
-                    crate::wire::BoundedBytes::new(value.as_bytes().to_vec())
-                        .map_err(|_| "pty_spawn: argv item exceeds relation bound")
-                }).collect::<Result<Vec<_>, _>>()?;
-                let argv = crate::wire::BoundedVec::new(argv)
-                    .map_err(|error| format!("pty_spawn: argv exceeds relation bound: {error:?}"))?;
+                let argv = values
+                    .iter()
+                    .map(|value| {
+                        let value = value.as_str().ok_or("pty_spawn: argv item is not text")?;
+                        crate::wire::BoundedBytes::new(value.as_bytes().to_vec())
+                            .map_err(|_| "pty_spawn: argv item exceeds relation bound")
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let argv = crate::wire::BoundedVec::new(argv).map_err(|error| {
+                    format!("pty_spawn: argv exceeds relation bound: {error:?}")
+                })?;
                 let dimension = |name: &str, default: u16| {
-                    let value = msg.get(name).and_then(Value::as_u64)
+                    let value = msg
+                        .get(name)
+                        .and_then(Value::as_u64)
                         .unwrap_or(u64::from(default));
                     u16::try_from(value).map_err(|_| format!("pty_spawn: {name} exceeds u16"))
                 };
-                let cwd = msg.get("cwd").and_then(Value::as_str).map(|value|
-                    crate::wire::BoundedBytes::new(value.as_bytes().to_vec())
-                        .map_err(|_| "pty_spawn: cwd exceeds relation bound".to_string()))
+                let cwd = msg
+                    .get("cwd")
+                    .and_then(Value::as_str)
+                    .map(|value| {
+                        crate::wire::BoundedBytes::new(value.as_bytes().to_vec())
+                            .map_err(|_| "pty_spawn: cwd exceeds relation bound".to_string())
+                    })
                     .transpose()?;
                 let mut entries = std::collections::BTreeMap::new();
-                for (key, value) in msg.get("env").and_then(Value::as_object)
-                    .into_iter().flatten()
+                for (key, value) in msg
+                    .get("env")
+                    .and_then(Value::as_object)
+                    .into_iter()
+                    .flatten()
                 {
-                    let value = value.as_str()
+                    let value = value
+                        .as_str()
                         .ok_or_else(|| "pty_spawn: environment value is not text".to_string())?;
-                    let key = crate::wire::BoundedBytes::new(key.as_bytes().to_vec())
-                        .map_err(|_| "pty_spawn: environment key exceeds relation bound".to_string())?;
-                    let value = crate::wire::BoundedBytes::new(value.as_bytes().to_vec())
-                        .map_err(|_| "pty_spawn: environment value exceeds relation bound".to_string())?;
+                    let key =
+                        crate::wire::BoundedBytes::new(key.as_bytes().to_vec()).map_err(|_| {
+                            "pty_spawn: environment key exceeds relation bound".to_string()
+                        })?;
+                    let value = crate::wire::BoundedBytes::new(value.as_bytes().to_vec()).map_err(
+                        |_| "pty_spawn: environment value exceeds relation bound".to_string(),
+                    )?;
                     entries.insert(key, value);
                 }
-                let environment = crate::wire::BoundedMap::new(entries)
-                    .map_err(|error| format!("pty_spawn: environment exceeds relation bound: {error:?}"))?;
+                let environment = crate::wire::BoundedMap::new(entries).map_err(|error| {
+                    format!("pty_spawn: environment exceeds relation bound: {error:?}")
+                })?;
                 Ok(crate::generated_wire::TransportRequest::PtySpawn {
                     argv,
                     rows: dimension("rows", 24)?,
@@ -6948,14 +8670,21 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
                     libc::close(fd);
                 }
             }
-            let request = msg.get("name").and_then(Value::as_str)
+            let request = msg
+                .get("name")
+                .and_then(Value::as_str)
                 .ok_or_else(|| "svc.serve: missing name".to_string())
-                .and_then(|name| crate::wire::BoundedText::new(name.to_owned())
-                    .map_err(|_| "svc.serve: name exceeds relation bound".to_string()))
+                .and_then(|name| {
+                    crate::wire::BoundedText::new(name.to_owned())
+                        .map_err(|_| "svc.serve: name exceeds relation bound".to_string())
+                })
                 .map(|name| crate::generated_wire::TransportRequest::ServiceAccept { name });
             let name = match request {
                 Ok(crate::generated_wire::TransportRequest::ServiceAccept { name })
-                    if svc_name_ok(name.as_str()) => name,
+                    if svc_name_ok(name.as_str()) =>
+                {
+                    name
+                }
                 Ok(_) => {
                     let _ = writer.write_all(b"{\"ok\":false,\"error\":\"svc.serve: bad name\"}\n");
                     return;
@@ -6978,7 +8707,8 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
                 .unwrap()
                 .entry(name.into_inner())
                 .or_default()
-                .push_back(writer);
+                .push_back(ParkedServiceSlot::Legacy(writer));
+            SVC_PARKED_CHANGED.notify_all();
             return;
         }
         // svc.declare: a box declares that IT provides an on-demand service.
@@ -6996,19 +8726,45 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
                 }
             }
             let request: Result<crate::generated_wire::TransportRequest, String> = (|| {
-                let name = msg.get("name").and_then(Value::as_str)
+                let name = msg
+                    .get("name")
+                    .and_then(Value::as_str)
                     .ok_or("svc.declare: missing name")?;
                 let name = crate::wire::BoundedText::new(name.to_owned())
                     .map_err(|_| "svc.declare: name exceeds relation bound")?;
-                let values = msg.get("argv").and_then(Value::as_array)
+                let values = msg
+                    .get("argv")
+                    .and_then(Value::as_array)
                     .ok_or("svc.declare: missing argv")?;
-                let argv = values.iter().map(|value| {
-                    let value = value.as_str().ok_or("svc.declare: argv item is not text")?;
-                    crate::wire::BoundedBytes::new(value.as_bytes().to_vec())
-                        .map_err(|_| "svc.declare: argv item exceeds relation bound")
-                }).collect::<Result<Vec<_>, _>>()?;
-                let argv = crate::wire::BoundedVec::new(argv)
-                    .map_err(|error| format!("svc.declare: argv exceeds relation bound: {error:?}"))?;
+                let argv = values
+                    .iter()
+                    .map(|value| {
+                        let value = value.as_str().ok_or("svc.declare: argv item is not text")?;
+                        crate::wire::BoundedBytes::new(value.as_bytes().to_vec())
+                            .map_err(|_| "svc.declare: argv item exceeds relation bound")
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let argv = crate::wire::BoundedVec::new(argv).map_err(|error| {
+                    format!("svc.declare: argv exceeds relation bound: {error:?}")
+                })?;
+                let client_values = msg
+                    .get("client_argv")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                let client_argv = client_values
+                    .iter()
+                    .map(|value| {
+                        let value = value
+                            .as_str()
+                            .ok_or("svc.declare: client argv item is not text")?;
+                        crate::wire::BoundedBytes::new(value.as_bytes().to_vec())
+                            .map_err(|_| "svc.declare: client argv item exceeds relation bound")
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let client_argv = crate::wire::BoundedVec::new(client_argv).map_err(|error| {
+                    format!("svc.declare: client argv exceeds relation bound: {error:?}")
+                })?;
                 let net_mode = match msg.get("net").and_then(Value::as_str).unwrap_or("") {
                     "" => None,
                     "off" => Some(crate::generated_wire::NetMode::Off),
@@ -7017,11 +8773,14 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
                     _ => return Err("svc.declare: invalid network mode".into()),
                 };
                 Ok(crate::generated_wire::TransportRequest::ServiceDeclare {
-                    name, argv, net_mode,
+                    name,
+                    argv,
+                    client_argv,
+                    net_mode,
                 })
             })();
-            let response = request.and_then(|request|
-                dispatch_reply_transport(&state, request, hint_box_id, None));
+            let response = request
+                .and_then(|request| dispatch_reply_transport(&state, request, hint_box_id, None));
             let reply = legacy_transport_response(response);
             let _ = writer.write_all(format!("{reply}\n").as_bytes());
             return;
@@ -7036,14 +8795,21 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
                     libc::close(fd);
                 }
             }
-            let request = msg.get("name").and_then(Value::as_str)
+            let request = msg
+                .get("name")
+                .and_then(Value::as_str)
                 .ok_or_else(|| "svc.dial: missing name".to_string())
-                .and_then(|name| crate::wire::BoundedText::new(name.to_owned())
-                    .map_err(|_| "svc.dial: name exceeds relation bound".to_string()))
+                .and_then(|name| {
+                    crate::wire::BoundedText::new(name.to_owned())
+                        .map_err(|_| "svc.dial: name exceeds relation bound".to_string())
+                })
                 .map(|name| crate::generated_wire::TransportRequest::ServiceDial { name });
             let name = match request {
                 Ok(crate::generated_wire::TransportRequest::ServiceDial { name })
-                    if svc_name_ok(name.as_str()) => name,
+                    if svc_name_ok(name.as_str()) =>
+                {
+                    name
+                }
                 Ok(_) => {
                     let _ = writer.write_all(b"{\"ok\":false,\"error\":\"svc.dial: bad name\"}\n");
                     return;
@@ -7062,7 +8828,8 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
                 let _ = writer.write_all(
                     format!(
                         "{{\"ok\":false,\"error\":\"svc.dial: no live \
-                     '{}' service (is its box running?)\"}}\n", name.as_str()
+                     '{}' service (is its box running?)\"}}\n",
+                        name.as_str()
                     )
                     .as_bytes(),
                 );
@@ -7090,21 +8857,22 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
                 }
             }
             let request: Result<crate::generated_wire::TransportRequest, String> = (|| {
-                let amount = msg.get("amount").and_then(Value::as_i64)
+                let amount = msg
+                    .get("amount")
+                    .and_then(Value::as_i64)
                     .ok_or_else(|| "budget.grant: missing integer amount".to_string())?;
                 let target = match msg.get("box").and_then(Value::as_str) {
-                    Some(name) if !name.is_empty() => {
-                        crate::generated_wire::BoxTarget::Selector {
-                            r#box: crate::wire::BoundedText::new(name.to_owned())
-                                .map_err(|_| "budget.grant: box selector exceeds relation bound".to_string())?,
-                        }
-                    }
+                    Some(name) if !name.is_empty() => crate::generated_wire::BoxTarget::Selector {
+                        r#box: crate::wire::BoundedText::new(name.to_owned()).map_err(|_| {
+                            "budget.grant: box selector exceeds relation bound".to_string()
+                        })?,
+                    },
                     _ => crate::generated_wire::BoxTarget::Broker,
                 };
                 Ok(crate::generated_wire::TransportRequest::BudgetGrant { target, amount })
             })();
-            let response = request.and_then(|request|
-                dispatch_reply_transport(&state, request, hint_box_id, None));
+            let response = request
+                .and_then(|request| dispatch_reply_transport(&state, request, hint_box_id, None));
             let reply = legacy_transport_response(response);
             let _ = writer.write_all(format!("{reply}\n").as_bytes());
             return;
@@ -7119,14 +8887,18 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
                     &state,
                     &request,
                     peer_pidfd.take(),
-                    peer_tapfd.take().map(|fd|
-                        <std::os::fd::OwnedFd as std::os::fd::IntoRawFd>::into_raw_fd(fd)),
-                    peer_thirdfd.take().map(|fd|
-                        <std::os::fd::OwnedFd as std::os::fd::IntoRawFd>::into_raw_fd(fd)),
-                    peer_fourthfd.take().map(|fd|
-                        <std::os::fd::OwnedFd as std::os::fd::IntoRawFd>::into_raw_fd(fd)),
-                    peer_fifthfd.take().map(|fd|
-                        <std::os::fd::OwnedFd as std::os::fd::IntoRawFd>::into_raw_fd(fd)),
+                    peer_tapfd.take().map(|fd| {
+                        <std::os::fd::OwnedFd as std::os::fd::IntoRawFd>::into_raw_fd(fd)
+                    }),
+                    peer_thirdfd.take().map(|fd| {
+                        <std::os::fd::OwnedFd as std::os::fd::IntoRawFd>::into_raw_fd(fd)
+                    }),
+                    peer_fourthfd.take().map(|fd| {
+                        <std::os::fd::OwnedFd as std::os::fd::IntoRawFd>::into_raw_fd(fd)
+                    }),
+                    peer_fifthfd.take().map(|fd| {
+                        <std::os::fd::OwnedFd as std::os::fd::IntoRawFd>::into_raw_fd(fd)
+                    }),
                     None,
                 )),
                 Err(error) => json!({"ok": false, "error": error}),
@@ -7137,18 +8909,29 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
             // the enclosing box from /proc ancestry. NOT a box channel — record
             // and reply once, then the connection closes. The pidfd is consumed.
             let result: Result<crate::generated_wire::TransportRequest, String> = (|| {
-                let values = msg.get("records").and_then(Value::as_array)
+                let values = msg
+                    .get("records")
+                    .and_then(Value::as_array)
                     .ok_or("brush_prov_nested: missing records")?;
-                let records = values.iter().map(crate::discover::relation_pipeline_provenance)
+                let records = values
+                    .iter()
+                    .map(crate::discover::relation_pipeline_provenance)
                     .collect::<Result<Vec<_>, _>>()?;
-                let records = crate::wire::BoundedVec::<_, 1,
-                    { crate::generated_wire::LIMIT_COLLECTION_ITEMS }>::new(records)
-                    .map_err(|error| format!("pipeline records exceed relation bound: {error:?}"))?;
+                let records = crate::wire::BoundedVec::<
+                    _,
+                    1,
+                    { crate::generated_wire::LIMIT_COLLECTION_ITEMS },
+                >::new(records)
+                .map_err(|error| format!("pipeline records exceed relation bound: {error:?}"))?;
                 Ok(crate::generated_wire::TransportRequest::BrushProvenance { records })
             })();
             match result {
                 Ok(request) => legacy_transport_response(dispatch_reply_transport(
-                    &state, request, hint_box_id, peer_pidfd.take())),
+                    &state,
+                    request,
+                    hint_box_id,
+                    peer_pidfd.take(),
+                )),
                 Err(error) => json!({"ok": false, "error": error}),
             }
         } else if msg.get("type").and_then(Value::as_str) == Some("brush_prov_done") {
@@ -7157,46 +8940,81 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
             // brush_prov_nested) so we resolve the box, then stamp done_ts +
             // exit_code on the matching brushprov rows (by uid).
             let result: Result<crate::generated_wire::TransportRequest, String> = (|| {
-                let values = msg.get("uids").and_then(Value::as_array)
+                let values = msg
+                    .get("uids")
+                    .and_then(Value::as_array)
                     .ok_or("brush_prov_done: missing uids")?;
-                let pipelines = values.iter().map(|value| value.as_u64()
-                    .ok_or("brush_prov_done: pipeline id must be unsigned"))
+                let pipelines = values
+                    .iter()
+                    .map(|value| {
+                        value
+                            .as_u64()
+                            .ok_or("brush_prov_done: pipeline id must be unsigned")
+                    })
                     .collect::<Result<Vec<_>, _>>()?;
                 let code = i32::try_from(msg.get("code").and_then(Value::as_i64).unwrap_or(0))
                     .map_err(|_| "brush_prov_done: code exceeds i32")?;
-                let done_at = msg.get("done_ts").and_then(Value::as_f64)
+                let done_at = msg
+                    .get("done_ts")
+                    .and_then(Value::as_f64)
                     .ok_or("brush_prov_done: missing done_ts")?;
-                let pipelines = crate::wire::BoundedVec::<_, 1,
-                    { crate::generated_wire::LIMIT_COLLECTION_ITEMS }>::new(pipelines)
-                    .map_err(|error| format!("pipeline ids exceed relation bound: {error:?}"))?;
+                let pipelines = crate::wire::BoundedVec::<
+                    _,
+                    1,
+                    { crate::generated_wire::LIMIT_COLLECTION_ITEMS },
+                >::new(pipelines)
+                .map_err(|error| format!("pipeline ids exceed relation bound: {error:?}"))?;
                 Ok(crate::generated_wire::TransportRequest::BrushDone {
-                    pipelines, code, done_at,
+                    pipelines,
+                    code,
+                    done_at,
                 })
             })();
             match result {
                 Ok(request) => legacy_transport_response(dispatch_reply_transport(
-                    &state, request, hint_box_id, peer_pidfd.take())),
+                    &state,
+                    request,
+                    hint_box_id,
+                    peer_pidfd.take(),
+                )),
                 Err(error) => json!({"ok": false, "error": error}),
             }
         } else if msg.get("type").and_then(Value::as_str) == Some("recipe_fixup") {
             let result: Result<crate::generated_wire::TransportRequest, String> = (|| {
-                let values = msg.get("uids").and_then(Value::as_array)
+                let values = msg
+                    .get("uids")
+                    .and_then(Value::as_array)
                     .ok_or("recipe_fixup: missing uids")?;
-                let pipelines = values.iter().map(|value| value.as_u64()
-                    .ok_or("recipe_fixup: pipeline id must be unsigned"))
+                let pipelines = values
+                    .iter()
+                    .map(|value| {
+                        value
+                            .as_u64()
+                            .ok_or("recipe_fixup: pipeline id must be unsigned")
+                    })
                     .collect::<Result<Vec<_>, _>>()?;
-                let started_at = msg.get("start_ts").and_then(Value::as_f64)
+                let started_at = msg
+                    .get("start_ts")
+                    .and_then(Value::as_f64)
                     .ok_or("recipe_fixup: missing start_ts")?;
-                let pipelines = crate::wire::BoundedVec::<_, 1,
-                    { crate::generated_wire::LIMIT_COLLECTION_ITEMS }>::new(pipelines)
-                    .map_err(|error| format!("pipeline ids exceed relation bound: {error:?}"))?;
+                let pipelines = crate::wire::BoundedVec::<
+                    _,
+                    1,
+                    { crate::generated_wire::LIMIT_COLLECTION_ITEMS },
+                >::new(pipelines)
+                .map_err(|error| format!("pipeline ids exceed relation bound: {error:?}"))?;
                 Ok(crate::generated_wire::TransportRequest::RecipeStarted {
-                    pipelines, started_at,
+                    pipelines,
+                    started_at,
                 })
             })();
             match result {
                 Ok(request) => legacy_transport_response(dispatch_reply_transport(
-                    &state, request, hint_box_id, peer_pidfd.take())),
+                    &state,
+                    request,
+                    hint_box_id,
+                    peer_pidfd.take(),
+                )),
                 Err(error) => json!({"ok": false, "error": error}),
             }
         } else if msg.get("type").and_then(Value::as_str) == Some("build_edges") {
@@ -7204,89 +9022,148 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
             // shadowed `ninja` (vendored n2) carrying its OWN pidfd, resolved to
             // the enclosing box by /proc ancestry exactly like brush_prov_nested.
             let result: Result<crate::generated_wire::TransportRequest, String> = (|| {
-                let values = msg.get("edges").and_then(Value::as_array)
+                let values = msg
+                    .get("edges")
+                    .and_then(Value::as_array)
                     .ok_or("build_edges: missing edges")?;
-                let edges = values.iter().map(|value| Ok(crate::generated_wire::BuildEdge {
-                    outputs: legacy_transport_paths::<1>(value.get("outs"))?,
-                    inputs: legacy_transport_paths::<0>(value.get("ins"))?,
-                    command: value.get("cmd").and_then(Value::as_str).map(|command|
-                        crate::wire::BoundedText::new(command.to_owned())
-                            .map_err(|_| "build edge command exceeds relation bound"))
-                        .transpose()?,
-                })).collect::<Result<Vec<_>, String>>()?;
-                let edges = crate::wire::BoundedVec::<_, 1,
-                    { crate::generated_wire::LIMIT_COLLECTION_ITEMS }>::new(edges)
-                    .map_err(|error| format!("build graph exceeds relation bound: {error:?}"))?;
+                let edges = values
+                    .iter()
+                    .map(|value| {
+                        Ok(crate::generated_wire::BuildEdge {
+                            outputs: legacy_transport_paths::<1>(value.get("outs"))?,
+                            inputs: legacy_transport_paths::<0>(value.get("ins"))?,
+                            command: value
+                                .get("cmd")
+                                .and_then(Value::as_str)
+                                .map(|command| {
+                                    crate::wire::BoundedText::new(command.to_owned())
+                                        .map_err(|_| "build edge command exceeds relation bound")
+                                })
+                                .transpose()?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, String>>()?;
+                let edges = crate::wire::BoundedVec::<
+                    _,
+                    1,
+                    { crate::generated_wire::LIMIT_COLLECTION_ITEMS },
+                >::new(edges)
+                .map_err(|error| format!("build graph exceeds relation bound: {error:?}"))?;
                 Ok(crate::generated_wire::TransportRequest::BuildGraph { edges })
             })();
             match result {
                 Ok(request) => legacy_transport_response(dispatch_reply_transport(
-                    &state, request, hint_box_id, peer_pidfd.take())),
+                    &state,
+                    request,
+                    hint_box_id,
+                    peer_pidfd.take(),
+                )),
                 Err(error) => json!({"ok": false, "error": error}),
             }
         } else if msg.get("type").and_then(Value::as_str) == Some("make_vars") {
             let result: Result<crate::generated_wire::TransportRequest, String> = (|| {
-                let values = msg.get("rows").and_then(Value::as_array)
+                let values = msg
+                    .get("rows")
+                    .and_then(Value::as_array)
                     .ok_or("make_vars: missing rows")?;
-                let rows = values.iter().map(|row| {
-                    let bytes = |name: &str, default: bool| {
-                        let value = row.get(name).and_then(Value::as_str);
-                        let value = if default { value.unwrap_or("") }
-                            else { value.ok_or("make variable name is required")? };
-                        crate::wire::BoundedBytes::new(value.as_bytes().to_vec())
-                            .map_err(|_| "make variable field exceeds relation bound")
-                    };
-                    Ok(crate::generated_wire::MakeVariable {
-                        name: bytes("name", false)?,
-                        location: bytes("loc", true)?,
-                        value: bytes("value", true)?,
-                        make_directory: bytes("make", true)?,
-                        rhs: bytes("rhs", true)?,
-                        references: bytes("refs", true)?,
-                        edge_output: row.get("edge").and_then(Value::as_str).map(|value|
+                let rows = values
+                    .iter()
+                    .map(|row| {
+                        let bytes = |name: &str, default: bool| {
+                            let value = row.get(name).and_then(Value::as_str);
+                            let value = if default {
+                                value.unwrap_or("")
+                            } else {
+                                value.ok_or("make variable name is required")?
+                            };
                             crate::wire::BoundedBytes::new(value.as_bytes().to_vec())
-                                .map_err(|_| "make variable edge exceeds relation bound"))
-                            .transpose()?,
-                        pipeline: row.get("uid").and_then(Value::as_u64).unwrap_or(0),
-                        flags: crate::wire::BoundedText::new(row.get("flags")
-                            .and_then(Value::as_str).unwrap_or("").to_owned())
+                                .map_err(|_| "make variable field exceeds relation bound")
+                        };
+                        Ok(crate::generated_wire::MakeVariable {
+                            name: bytes("name", false)?,
+                            location: bytes("loc", true)?,
+                            value: bytes("value", true)?,
+                            make_directory: bytes("make", true)?,
+                            rhs: bytes("rhs", true)?,
+                            references: bytes("refs", true)?,
+                            edge_output: row
+                                .get("edge")
+                                .and_then(Value::as_str)
+                                .map(|value| {
+                                    crate::wire::BoundedBytes::new(value.as_bytes().to_vec())
+                                        .map_err(|_| "make variable edge exceeds relation bound")
+                                })
+                                .transpose()?,
+                            pipeline: row.get("uid").and_then(Value::as_u64).unwrap_or(0),
+                            flags: crate::wire::BoundedText::new(
+                                row.get("flags")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("")
+                                    .to_owned(),
+                            )
                             .map_err(|_| "make variable flags exceed relation bound")?,
+                        })
                     })
-                }).collect::<Result<Vec<_>, String>>()?;
-                let rows = crate::wire::BoundedVec::<_, 1,
-                    { crate::generated_wire::LIMIT_COLLECTION_ITEMS }>::new(rows)
-                    .map_err(|error| format!("make variables exceed relation bound: {error:?}"))?;
+                    .collect::<Result<Vec<_>, String>>()?;
+                let rows = crate::wire::BoundedVec::<
+                    _,
+                    1,
+                    { crate::generated_wire::LIMIT_COLLECTION_ITEMS },
+                >::new(rows)
+                .map_err(|error| format!("make variables exceed relation bound: {error:?}"))?;
                 Ok(crate::generated_wire::TransportRequest::MakeVariables { rows })
             })();
             match result {
                 Ok(request) => legacy_transport_response(dispatch_reply_transport(
-                    &state, request, hint_box_id, peer_pidfd.take())),
+                    &state,
+                    request,
+                    hint_box_id,
+                    peer_pidfd.take(),
+                )),
                 Err(error) => json!({"ok": false, "error": error}),
             }
         } else if msg.get("type").and_then(Value::as_str) == Some("box_activity") {
             let result: Result<crate::generated_wire::TransportRequest, String> = (|| {
-                let values = msg.get("items").and_then(Value::as_array)
+                let values = msg
+                    .get("items")
+                    .and_then(Value::as_array)
                     .ok_or("box_activity: missing items")?;
-                let items = values.iter().map(|value| {
-                    let fields = value.as_array().ok_or("box activity item must be an array")?;
-                    let description = fields.first().and_then(Value::as_str)
-                        .ok_or("box activity description must be text")?;
-                    let age_seconds = fields.get(1).and_then(Value::as_u64)
-                        .ok_or("box activity age must be unsigned")?;
-                    Ok(crate::generated_wire::ActivityItem {
-                        description: crate::wire::BoundedText::new(description.to_owned())
-                            .map_err(|_| "box activity description exceeds relation bound")?,
-                        age_seconds,
+                let items = values
+                    .iter()
+                    .map(|value| {
+                        let fields = value
+                            .as_array()
+                            .ok_or("box activity item must be an array")?;
+                        let description = fields
+                            .first()
+                            .and_then(Value::as_str)
+                            .ok_or("box activity description must be text")?;
+                        let age_seconds = fields
+                            .get(1)
+                            .and_then(Value::as_u64)
+                            .ok_or("box activity age must be unsigned")?;
+                        Ok(crate::generated_wire::ActivityItem {
+                            description: crate::wire::BoundedText::new(description.to_owned())
+                                .map_err(|_| "box activity description exceeds relation bound")?,
+                            age_seconds,
+                        })
                     })
-                }).collect::<Result<Vec<_>, String>>()?;
-                let items = crate::wire::BoundedVec::<_, 1,
-                    { crate::generated_wire::LIMIT_COLLECTION_ITEMS }>::new(items)
-                    .map_err(|error| format!("box activity exceeds relation bound: {error:?}"))?;
+                    .collect::<Result<Vec<_>, String>>()?;
+                let items = crate::wire::BoundedVec::<
+                    _,
+                    1,
+                    { crate::generated_wire::LIMIT_COLLECTION_ITEMS },
+                >::new(items)
+                .map_err(|error| format!("box activity exceeds relation bound: {error:?}"))?;
                 Ok(crate::generated_wire::TransportRequest::BoxActivity { items })
             })();
             match result {
                 Ok(request) => legacy_transport_response(dispatch_reply_transport(
-                    &state, request, hint_box_id, peer_pidfd.take())),
+                    &state,
+                    request,
+                    hint_box_id,
+                    peer_pidfd.take(),
+                )),
                 Err(error) => json!({"ok": false, "error": error}),
             }
         } else if msg.get("type").and_then(Value::as_str) == Some("build_edge_state") {
@@ -7294,24 +9171,40 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
             // the in-process make/ninja executor around each recipe — stamps the
             // box's build_edges row so the targets pane shows live build progress.
             let result: Result<crate::generated_wire::TransportRequest, String> = (|| {
-                let path = |name: &str| msg.get(name).and_then(Value::as_str)
-                    .map(|value| crate::wire::BoundedBytes::new(value.as_bytes().to_vec())
-                        .map_err(|_| "build edge path exceeds relation bound"))
-                    .transpose();
-                let text = |name: &str| msg.get(name).and_then(Value::as_str)
-                    .map(|value| crate::wire::BoundedText::new(value.to_owned())
-                        .map_err(|_| "build edge text exceeds relation bound"))
-                    .transpose();
-                let at = msg.get("ts").and_then(Value::as_f64)
+                let path = |name: &str| {
+                    msg.get(name)
+                        .and_then(Value::as_str)
+                        .map(|value| {
+                            crate::wire::BoundedBytes::new(value.as_bytes().to_vec())
+                                .map_err(|_| "build edge path exceeds relation bound")
+                        })
+                        .transpose()
+                };
+                let text = |name: &str| {
+                    msg.get(name)
+                        .and_then(Value::as_str)
+                        .map(|value| {
+                            crate::wire::BoundedText::new(value.to_owned())
+                                .map_err(|_| "build edge text exceeds relation bound")
+                        })
+                        .transpose()
+                };
+                let at = msg
+                    .get("ts")
+                    .and_then(Value::as_f64)
                     .ok_or("build_edge_state: missing timestamp")?;
                 let transition = match msg.get("state").and_then(Value::as_str) {
                     Some("start") => crate::generated_wire::BuildEdgeTransition::Start {
-                        at, output: path("out")?, command: text("cmd")?,
+                        at,
+                        output: path("out")?,
+                        command: text("cmd")?,
                     },
                     Some("done") => crate::generated_wire::BuildEdgeTransition::Done {
-                        at, output: path("out")?, command: text("cmd")?,
-                        code: i32::try_from(msg.get("code").and_then(Value::as_i64)
-                            .unwrap_or(0)).map_err(|_| "build edge code exceeds i32")?,
+                        at,
+                        output: path("out")?,
+                        command: text("cmd")?,
+                        code: i32::try_from(msg.get("code").and_then(Value::as_i64).unwrap_or(0))
+                            .map_err(|_| "build edge code exceeds i32")?,
                         excerpt: text("excerpt")?,
                     },
                     _ => return Err("build_edge_state: invalid state".into()),
@@ -7320,7 +9213,11 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
             })();
             match result {
                 Ok(request) => legacy_transport_response(dispatch_reply_transport(
-                    &state, request, hint_box_id, peer_pidfd.take())),
+                    &state,
+                    request,
+                    hint_box_id,
+                    peer_pidfd.take(),
+                )),
                 Err(error) => json!({"ok": false, "error": error}),
             }
         } else {
@@ -7344,6 +9241,10 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
             // pidfd (SCM_RIGHTS) → resolve its host pid and mute it (its echo
             // readback is not re-recorded); UNMUTE / EOF unmutes. EOF = teardown.
             let ov = lock(&state).overlay.clone();
+            let ephemeral_service = ov
+                .as_ref()
+                .and_then(|overlay| overlay.live_box(id))
+                .is_some_and(|r#box| r#box.get_meta("ephemeral_service").is_some());
             if let Some(ov) = ov.as_ref() {
                 if let Ok(w) = writer.try_clone() {
                     ov.set_echo(id, Arc::new(Mutex::new(w)));
@@ -7399,9 +9300,7 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
                 // broadcast a `brush_prov` event so live UIs see it.
                 for (ft, payload) in &frames {
                     if *ft == crate::frames::FRAME_PROV {
-                        record_brush_prov(
-                            &state, &ov, id, brush_producer, payload,
-                        );
+                        record_brush_prov(&state, &ov, id, brush_producer, payload);
                     }
                     if *ft == crate::frames::FRAME_GUEST_PROCESS {
                         record_guest_process_frame(&state, id, payload);
@@ -7472,9 +9371,7 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
                 // race-free pass (no-op for non-brush boxes).
                 if let Some(b) = ov.live_box(id) {
                     b.finalize_brush_links();
-                    if b.get_meta("sud").as_deref() == Some("1") {
-                        crate::sud::finish_stream(&b, id);
-                    }
+                    crate::sud::finish_stream(&b, id);
                 }
                 ov.clear_echo(id);
                 stop_live_transports(&state, id);
@@ -7492,9 +9389,13 @@ fn handle_with_box(state: State, conn: UnixStream, hint_box_id: Option<i64>) {
                     p.disable_box(id);
                 }
             }
-            if let Ok(r#box) = u64::try_from(id) {
-                broadcast(&state,
-                    &crate::generated_wire::SubscriptionEvent::BoxRemoved { r#box });
+            if ephemeral_service {
+                reap(&state, id);
+            } else if let Ok(r#box) = u64::try_from(id) {
+                broadcast(
+                    &state,
+                    &crate::generated_wire::SubscriptionEvent::BoxRemoved { r#box },
+                );
             }
             return;
         }
@@ -7561,11 +9462,19 @@ fn git_checkout_typed(
     if store.as_slice().contains(&0) {
         return Err("git store path contains NUL".into());
     }
-    let store = std::str::from_utf8(store.as_slice())
-        .map_err(|_| "the git store path is not UTF-8")?;
-    let dest = dest.as_ref().map(action_relative_path).transpose()?.unwrap_or("")
+    let store =
+        std::str::from_utf8(store.as_slice()).map_err(|_| "the git store path is not UTF-8")?;
+    let dest = dest
+        .as_ref()
+        .map(action_relative_path)
+        .transpose()?
+        .unwrap_or("")
         .trim_end_matches('/');
-    let subpath = subpath.as_ref().map(action_relative_path).transpose()?.unwrap_or("")
+    let subpath = subpath
+        .as_ref()
+        .map(action_relative_path)
+        .transpose()?
+        .unwrap_or("")
         .trim_end_matches('/');
     let store_path = std::path::Path::new(store);
     let resolved = match gitdepot::resolve_ref(store_path, reference.as_str()) {
@@ -7575,10 +9484,12 @@ fn git_checkout_typed(
         Err(error) => return Err(format!("store: {error}")),
     };
     let layers = gitdepot::store::Store::open(store_path)
-        .and_then(|store| store.union()).map_err(|error| format!("store: {error}"))?;
+        .and_then(|store| store.union())
+        .map_err(|error| format!("store: {error}"))?;
     let (sha, revision) = match resolved {
         gitdepot::Resolved::Commit { sha, .. } => {
-            let revision = layers.rev_of(&sha)
+            let revision = layers
+                .rev_of(&sha)
                 .ok_or_else(|| format!("commit {sha} not in the union store"))?;
             (sha, revision)
         }
@@ -7589,8 +9500,7 @@ fn git_checkout_typed(
     let mut files = 0u64;
     let mut bytes = 0u64;
     let mut directories = std::collections::HashSet::new();
-    let ensure_directories = |path: &str,
-                              directories: &mut std::collections::HashSet<String>| {
+    let ensure_directories = |path: &str, directories: &mut std::collections::HashSet<String>| {
         let mut at = 0usize;
         while let Some(index) = path[at..].find('/') {
             let directory = &path[..at + index];
@@ -7600,52 +9510,78 @@ fn git_checkout_typed(
             at += index + 1;
         }
     };
-    layers.checkout_entries_at(revision, subpath.as_bytes(), &mut |rel, mode, content| {
-        let rel = std::str::from_utf8(rel).map_err(|_| gitdepot::Error::Chain(
-            "checkout path cannot be represented by the current UTF-8 overlay index".into()))?;
-        if rel.contains('\0') || rel.starts_with('/') || std::path::Path::new(rel)
-            .components().any(|component| matches!(component,
-                std::path::Component::ParentDir | std::path::Component::RootDir
-                | std::path::Component::Prefix(_)))
-        {
-            return Err(gitdepot::Error::Chain(format!("unsafe checkout path {rel:?}")));
-        }
-        let path = if dest.is_empty() { rel.to_owned() } else { format!("{dest}/{rel}") };
-        ensure_directories(&path, &mut directories);
-        use gitdepot::layer::Mode;
-        match mode {
-            Mode::Symlink => {
-                let target = std::str::from_utf8(content).map_err(|_| gitdepot::Error::Chain(
-                    format!("symlink target for {path:?} is not UTF-8")))?;
-                owner.set_symlink(&path, std::path::Path::new(target), 0);
+    layers
+        .checkout_entries_at(revision, subpath.as_bytes(), &mut |rel, mode, content| {
+            let rel = std::str::from_utf8(rel).map_err(|_| {
+                gitdepot::Error::Chain(
+                    "checkout path cannot be represented by the current UTF-8 overlay index".into(),
+                )
+            })?;
+            if rel.contains('\0')
+                || rel.starts_with('/')
+                || std::path::Path::new(rel).components().any(|component| {
+                    matches!(
+                        component,
+                        std::path::Component::ParentDir
+                            | std::path::Component::RootDir
+                            | std::path::Component::Prefix(_)
+                    )
+                })
+            {
+                return Err(gitdepot::Error::Chain(format!(
+                    "unsafe checkout path {rel:?}"
+                )));
             }
-            Mode::Gitlink => {}
-            mode => {
-                let full_mode = match mode {
-                    Mode::File => 0o100644,
-                    Mode::Exec => 0o100755,
-                    Mode::Other(value) => value,
-                    _ => 0o100644,
-                };
-                let row = owner.ensure_file_row(&path, full_mode, 0);
-                let blob = crate::depot::blob_path(sid, row);
-                if let Some(directory) = blob.parent() {
-                    std::fs::create_dir_all(directory).map_err(|error| gitdepot::Error::Chain(
-                        format!("create {}: {error}", directory.display())))?;
+            let path = if dest.is_empty() {
+                rel.to_owned()
+            } else {
+                format!("{dest}/{rel}")
+            };
+            ensure_directories(&path, &mut directories);
+            use gitdepot::layer::Mode;
+            match mode {
+                Mode::Symlink => {
+                    let target = std::str::from_utf8(content).map_err(|_| {
+                        gitdepot::Error::Chain(format!("symlink target for {path:?} is not UTF-8"))
+                    })?;
+                    owner.set_symlink(&path, std::path::Path::new(target), 0);
                 }
-                std::fs::write(&blob, content).map_err(|error| gitdepot::Error::Chain(
-                    format!("write {}: {error}", blob.display())))?;
-                let size = i64::try_from(content.len()).map_err(|_| gitdepot::Error::Chain(
-                    format!("checkout content for {path:?} exceeds i64")))?;
-                owner.finalize_file(&path, size, 0, 0);
-                files = files.checked_add(1).ok_or_else(|| gitdepot::Error::Chain(
-                    "checkout file count overflow".into()))?;
-                bytes = bytes.checked_add(content.len() as u64).ok_or_else(||
-                    gitdepot::Error::Chain("checkout byte count overflow".into()))?;
+                Mode::Gitlink => {}
+                mode => {
+                    let full_mode = match mode {
+                        Mode::File => 0o100644,
+                        Mode::Exec => 0o100755,
+                        Mode::Other(value) => value,
+                        _ => 0o100644,
+                    };
+                    let row = owner.ensure_file_row(&path, full_mode, 0);
+                    let blob = crate::depot::blob_path(sid, row);
+                    if let Some(directory) = blob.parent() {
+                        std::fs::create_dir_all(directory).map_err(|error| {
+                            gitdepot::Error::Chain(format!(
+                                "create {}: {error}",
+                                directory.display()
+                            ))
+                        })?;
+                    }
+                    std::fs::write(&blob, content).map_err(|error| {
+                        gitdepot::Error::Chain(format!("write {}: {error}", blob.display()))
+                    })?;
+                    let size = i64::try_from(content.len()).map_err(|_| {
+                        gitdepot::Error::Chain(format!("checkout content for {path:?} exceeds i64"))
+                    })?;
+                    owner.finalize_file(&path, size, 0, 0);
+                    files = files.checked_add(1).ok_or_else(|| {
+                        gitdepot::Error::Chain("checkout file count overflow".into())
+                    })?;
+                    bytes = bytes.checked_add(content.len() as u64).ok_or_else(|| {
+                        gitdepot::Error::Chain("checkout byte count overflow".into())
+                    })?;
+                }
             }
-        }
-        Ok(())
-    }).map_err(|error| format!("checkout: {error}"))?;
+            Ok(())
+        })
+        .map_err(|error| format!("checkout: {error}"))?;
     owner.load_mirror();
     Ok(crate::generated_wire::CheckoutResult {
         revision: revision_name,
@@ -7667,10 +9603,10 @@ fn open_wiki_instance(root: &str) -> Result<wikimak_wikipedia::Instance, String>
 }
 
 // ── svc: engine-spliced host↔box service streams ────────────────────────────
-// State is engine-global (one namespace of service names). Parked slots are
-// plain blocking UnixStreams; the splice is two copy threads per paired
-// stream. A dead slot (box exited) is detected at pairing time — the
-// "paired" line write fails — and the next slot is tried.
+// State is engine-global (one namespace of service names). Each parked slot
+// remembers the framing used to create it; after its protocol-specific paired
+// acknowledgement, the stream becomes unframed bytes for the common splice.
+// A dead slot (box exited) is detected at pairing time and the next is tried.
 
 fn svc_name_ok(name: &str) -> bool {
     !name.is_empty()
@@ -7681,9 +9617,415 @@ fn svc_name_ok(name: &str) -> bool {
         && !name.starts_with('.')
 }
 
+enum ParkedServiceSlot {
+    Legacy(UnixStream),
+    Binary(UnixStream),
+    /// Engine-owned endpoint already speaking the raw service protocol.  It
+    /// has no accept-side handshake to acknowledge before pairing.
+    Raw(UnixStream),
+}
+
+impl ParkedServiceSlot {
+    fn pair(self) -> Option<UnixStream> {
+        match self {
+            Self::Legacy(mut stream) => stream
+                .write_all(b"{\"ok\":true,\"r\":\"paired\"}\n")
+                .ok()
+                .map(|()| stream),
+            Self::Binary(mut stream) => crate::socket_wire::write_atom(
+                &mut stream,
+                &crate::generated_wire::ServiceAcceptFrame::Paired,
+            )
+            .and_then(|()| stream.flush())
+            .ok()
+            .map(|()| stream),
+            Self::Raw(stream) => Some(stream),
+        }
+    }
+}
+
 static SVC_PARKED: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<String, std::collections::VecDeque<UnixStream>>>,
+    std::sync::Mutex<
+        std::collections::HashMap<String, std::collections::VecDeque<ParkedServiceSlot>>,
+    >,
 > = std::sync::LazyLock::new(Default::default);
+static SVC_PARKED_CHANGED: std::sync::Condvar = std::sync::Condvar::new();
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ServiceWait {
+    Ready,
+    ProviderExited,
+    TimedOut,
+}
+
+fn wait_for_parked_service(
+    name: &str,
+    provider_exited: Option<&std::sync::atomic::AtomicBool>,
+    timeout: std::time::Duration,
+) -> ServiceWait {
+    use std::sync::atomic::Ordering;
+    let deadline = std::time::Instant::now() + timeout;
+    let mut parked = SVC_PARKED.lock().unwrap();
+    loop {
+        if parked.get(name).is_some_and(|slots| !slots.is_empty()) {
+            return ServiceWait::Ready;
+        }
+        if provider_exited.is_some_and(|exited| exited.load(Ordering::Acquire)) {
+            return ServiceWait::ProviderExited;
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return ServiceWait::TimedOut;
+        }
+        let (next, result) = SVC_PARKED_CHANGED.wait_timeout(parked, remaining).unwrap();
+        parked = next;
+        if result.timed_out() {
+            return if parked.get(name).is_some_and(|slots| !slots.is_empty()) {
+                ServiceWait::Ready
+            } else if provider_exited.is_some_and(|exited| exited.load(Ordering::Acquire)) {
+                ServiceWait::ProviderExited
+            } else {
+                ServiceWait::TimedOut
+            };
+        }
+    }
+}
+
+static NEXT_DEBUG_SESSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+static NEXT_DEBUG_CONSOLE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn debug_session_service_name(box_id: i64) -> String {
+    use std::sync::atomic::Ordering;
+    let serial = NEXT_DEBUG_SESSION.fetch_add(1, Ordering::Relaxed);
+    format!("viros-debug-session-{box_id}-{serial}")
+}
+
+fn debug_console_service_name(box_id: i64) -> String {
+    use std::sync::atomic::Ordering;
+    let serial = NEXT_DEBUG_CONSOLE.fetch_add(1, Ordering::Relaxed);
+    format!("viros-debug-console-{box_id}-{serial}")
+}
+
+/// Serialize the small create-vs-register window for composed service boxes.
+/// The normal runner then reopens the precreated named child through the
+/// existing rerun path, so its ordered attachments are present before exec.
+static COMPOSED_SERVICE_CREATE: std::sync::LazyLock<std::sync::Mutex<()>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// One connected, bidirectional byte stream inherited by a composed service.
+/// The explicit wrapper keeps descriptor handoff out of argv and environment.
+pub(crate) struct ComposedServiceStreams {
+    stream: UnixStream,
+}
+
+impl ComposedServiceStreams {
+    pub(crate) fn bidirectional(stream: UnixStream) -> Self {
+        Self { stream }
+    }
+}
+
+/// A normal Sarun runner whose filesystem is a declared provider plus an
+/// ordered list of read-only box attachments.  The owner is the stream: peer
+/// EOF, explicit drop, runner exit, or launch failure all reap the process and
+/// remove the ephemeral box. Sarun's normal chain semantics put these RO
+/// attachments above the provider parent, so an attachment can shadow a
+/// provider path. Callers that require exact executable/artifact identity must
+/// pass validated box-owned descriptors, not reopen a path through this view.
+pub(crate) struct OwnedComposedService {
+    state: State,
+    stop: UnixStream,
+    exited: Arc<std::sync::atomic::AtomicBool>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl OwnedComposedService {
+    pub(crate) fn prepare_resolved(
+        state: &State,
+        declared_service_name: &str,
+        provider_box: i64,
+        attachment_ids: &[i64],
+        streams: ComposedServiceStreams,
+    ) -> Result<Self, String> {
+        let boxes = discover::discover();
+        let resolved = declared_service_provider(&boxes, declared_service_name)?;
+        if resolved != provider_box {
+            return Err(format!(
+                "service '{declared_service_name}' provider changed during resolution"
+            ));
+        }
+        Self::prepare(state, declared_service_name, attachment_ids, streams)
+    }
+
+    pub(crate) fn prepare(
+        state: &State,
+        declared_service_name: &str,
+        attachment_ids: &[i64],
+        streams: ComposedServiceStreams,
+    ) -> Result<Self, String> {
+        if !svc_name_ok(declared_service_name) {
+            return Err("service name is invalid".into());
+        }
+        let _create = COMPOSED_SERVICE_CREATE.lock().unwrap();
+        let boxes = discover::discover();
+        let provider = declared_service_provider(&boxes, declared_service_name)?;
+        validate_service_attachments(&boxes, attachment_ids)?;
+        let argv: Vec<String> = boxes
+            .get(&provider)
+            .and_then(|provider| provider.meta.get("svc_argv"))
+            .and_then(|value| serde_json::from_str(value).ok())
+            .ok_or_else(|| format!("service '{declared_service_name}': malformed svc_argv"))?;
+        if argv.is_empty() {
+            return Err(format!("service '{declared_service_name}': empty svc_argv"));
+        }
+        let net = boxes
+            .get(&provider)
+            .and_then(|provider| provider.meta.get("svc_net"))
+            .filter(|value| !value.is_empty())
+            .cloned()
+            .unwrap_or_else(|| {
+                if crate::net::tap::tap_available() {
+                    "tap".into()
+                } else {
+                    "host".into()
+                }
+            });
+        let overlay = lock(state)
+            .overlay
+            .clone()
+            .ok_or("overlay is unavailable")?;
+        for attached in attachment_ids {
+            if overlay.box_of(*attached).is_none() {
+                let attached_box = crate::capture::BoxState::create(*attached)
+                    .map_err(|error| format!("open attachment box {attached}: {error}"))?;
+                attached_box.load_mirror();
+                overlay.add_box(std::sync::Arc::new(attached_box));
+            }
+        }
+        let live_max = overlay.box_ids().into_iter().max().unwrap_or(0);
+        let id = boxes.keys().max().copied().unwrap_or(0).max(live_max) + 1;
+        let child_name = composed_service_child_name(declared_service_name, id);
+        let child = crate::capture::BoxState::create(id)
+            .map_err(|error| format!("create service box: {error}"))?;
+        child.set_parent(Some(provider));
+        child.set_meta("parent_box_id", &provider.to_string());
+        child.set_meta("name", &child_name);
+        child.set_meta("ephemeral_service", declared_service_name);
+        child.set_ro_attachments(service_attachment_rows(attachment_ids));
+        overlay.add_box(std::sync::Arc::new(child));
+        if let (Ok(r#box), Ok(name)) = (
+            u64::try_from(id),
+            crate::wire::BoundedText::new(child_name.clone()),
+        ) {
+            broadcast(
+                state,
+                &crate::generated_wire::SubscriptionEvent::BoxAdded {
+                    r#box,
+                    name: Some(name),
+                    parent: u64::try_from(provider).ok(),
+                },
+            );
+        }
+
+        let provider_path = discover::display_path(&boxes, provider);
+        let selector = format!("{provider_path}.{child_name}");
+        let prepared = (|| {
+            let executable = std::env::current_exe()
+                .map_err(|error| format!("locate service runner: {error}"))?;
+            let input = streams
+                .stream
+                .try_clone()
+                .map_err(|error| format!("clone service input: {error}"))?;
+            let output = streams
+                .stream
+                .try_clone()
+                .map_err(|error| format!("clone service output: {error}"))?;
+            let monitor = streams
+                .stream
+                .try_clone()
+                .map_err(|error| format!("clone service lifetime stream: {error}"))?;
+            let (stop, worker_stop) =
+                UnixStream::pair().map_err(|error| format!("service lifetime lane: {error}"))?;
+            Ok::<_, String>((executable, input, output, monitor, stop, worker_stop))
+        })();
+        let (executable, input, output, monitor, stop, worker_stop) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                reap(state, id);
+                return Err(error);
+            }
+        };
+        let mut command = std::process::Command::new(executable);
+        command.args(["run", "--net", net.as_str(), selector.as_str(), "--"]);
+        command.args(&argv);
+        command
+            .stdin(std::process::Stdio::from(std::os::fd::OwnedFd::from(input)))
+            .stdout(std::process::Stdio::from(std::os::fd::OwnedFd::from(
+                output,
+            )))
+            .stderr(std::process::Stdio::inherit());
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+        let child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                reap(state, id);
+                return Err(format!("start service '{declared_service_name}': {error}"));
+            }
+        };
+        drop(streams.stream);
+        let worker_state = state.clone();
+        let exited = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_exited = exited.clone();
+        let worker = std::thread::spawn(move || {
+            supervise_composed_service(child, monitor, worker_stop);
+            worker_exited.store(true, std::sync::atomic::Ordering::Release);
+            SVC_PARKED_CHANGED.notify_all();
+            reap_composed_service_after_runner(&worker_state, id);
+        });
+        Ok(Self {
+            state: state.clone(),
+            stop,
+            exited,
+            worker: Some(worker),
+        })
+    }
+}
+
+impl Drop for OwnedComposedService {
+    fn drop(&mut self) {
+        let _ = self.stop.write_all(&[1]);
+        if let Some(worker) = self.worker.take() {
+            // `reap` briefly takes State. Most owners drop without that lock
+            // and synchronously join. If a caller is unwinding while it holds
+            // State, detaching this already-signalled bounded worker avoids a
+            // self-deadlock; it reaps as soon as that guard is released.
+            let state_available = match self.state.try_lock() {
+                Ok(guard) => {
+                    drop(guard);
+                    true
+                }
+                Err(_) => false,
+            };
+            if state_available {
+                let _ = worker.join();
+            }
+        }
+    }
+}
+
+fn declared_service_provider(
+    boxes: &std::collections::BTreeMap<i64, discover::Box_>,
+    name: &str,
+) -> Result<i64, String> {
+    let providers = boxes
+        .iter()
+        .filter_map(|(id, provider)| {
+            (provider.meta.get("svc_provide").map(String::as_str) == Some(name)).then_some(*id)
+        })
+        .collect::<Vec<_>>();
+    match providers.as_slice() {
+        [provider] => Ok(*provider),
+        [] => Err(format!("no box provides service '{name}'")),
+        _ => Err(format!("multiple boxes provide service '{name}'")),
+    }
+}
+
+fn validate_service_attachments(
+    boxes: &std::collections::BTreeMap<i64, discover::Box_>,
+    attachment_ids: &[i64],
+) -> Result<(), String> {
+    for attached in attachment_ids {
+        if !boxes.contains_key(attached) {
+            return Err(format!("no attachment box {attached}"));
+        }
+    }
+    Ok(())
+}
+
+fn service_attachment_rows(attachment_ids: &[i64]) -> Vec<crate::capture::RoAttachment> {
+    attachment_ids
+        .iter()
+        .copied()
+        .map(crate::capture::RoAttachment::Box)
+        .collect()
+}
+
+fn composed_service_child_name(service: &str, id: i64) -> String {
+    let service = service
+        .to_ascii_uppercase()
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '-' {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    format!("SVC-{service}-{id}")
+}
+
+fn supervise_composed_service(
+    mut child: std::process::Child,
+    lifetime: UnixStream,
+    stop: UnixStream,
+) {
+    let pid = child.id() as i32;
+    loop {
+        if child.try_wait().ok().flatten().is_some() {
+            return;
+        }
+        let mut polls = [
+            libc::pollfd {
+                fd: lifetime.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: stop.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let _ = unsafe { libc::poll(polls.as_mut_ptr(), polls.len() as _, 25) };
+        let ended = libc::POLLHUP | libc::POLLERR | libc::POLLNVAL;
+        if polls[0].revents & ended != 0 || polls[1].revents & (ended | libc::POLLIN) != 0 {
+            break;
+        }
+    }
+    if child.try_wait().ok().flatten().is_none() {
+        unsafe { libc::kill(-pid, libc::SIGTERM) };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            if child.try_wait().ok().flatten().is_some() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        unsafe { libc::kill(-pid, libc::SIGKILL) };
+    }
+    let _ = child.wait();
+}
+
+fn reap_composed_service_after_runner(state: &State, id: i64) {
+    // A successfully registered runner owns the normal box-channel teardown.
+    // Wait for it to remove the live pid identity before touching persistent
+    // state; that handler sees `ephemeral_service` and reaps the box itself.
+    // If registration failed before the identity was installed, this loop is
+    // skipped and the precreated box is removed here.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while lock(state).box_pids.contains_key(&id) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    if lock(state).box_pids.contains_key(&id) {
+        eprintln!("sarun-engine: service box {id} teardown did not finish in time");
+        return;
+    }
+    let sqlar = crate::paths::state_home().join(format!("{id}.sqlar"));
+    if sqlar.exists() {
+        reap(state, id);
+    }
+}
 
 /// (Re)write the safe-for-box `oaita.toml` from the CURRENT host config: the
 /// model name, no api_key, and a marker base_url (the in-box client uses the
@@ -7848,9 +10190,8 @@ fn svc_pair(name: &str) -> Option<UnixStream> {
             .unwrap()
             .get_mut(name)
             .and_then(|q| q.pop_front())?;
-        let mut slot = slot;
-        if slot.write_all(b"{\"ok\":true,\"r\":\"paired\"}\n").is_ok() {
-            return Some(slot);
+        if let Some(stream) = slot.pair() {
+            return Some(stream);
         }
     }
 }
@@ -8553,12 +10894,13 @@ mod verb_tests {
         let mut bytes = [0u8; 64];
         let mut received_fd = None;
         let received = crate::runner::recv_box_frame_bytes_pub(
-            receiver.as_raw_fd(), &mut bytes, &mut received_fd,
+            receiver.as_raw_fd(),
+            &mut bytes,
+            &mut received_fd,
         );
         assert_eq!(&bytes[..received as usize], frame.as_slice());
-        let transferred = unsafe {
-            std::os::fd::OwnedFd::from_raw_fd(received_fd.expect("descriptor attached"))
-        };
+        let transferred =
+            unsafe { std::os::fd::OwnedFd::from_raw_fd(received_fd.expect("descriptor attached")) };
         let mut transferred = UnixStream::from(transferred);
         payload_sender.write_all(b"connected").unwrap();
         let mut payload = [0u8; 9];
@@ -8602,9 +10944,31 @@ mod verb_tests {
     }
 
     #[test]
+    fn selected_pair_attachment_order_is_role_ordered_and_deduplicated() {
+        let artifact = |source_box, path: &str| RegisteredBootArtifact {
+            source_box,
+            path: path.into(),
+            sha256: "00".repeat(32),
+            size: 1,
+            ancestry_artifacts: 0,
+        };
+        let separate = RegisteredSelectedBoot::KernelInitramfs {
+            kernel: artifact(7, "out/kernel"),
+            initramfs: artifact(9, "out/initramfs"),
+        };
+        assert_eq!(separate.attachment_ids(), vec![7, 9]);
+        let shared = RegisteredSelectedBoot::KernelInitramfs {
+            kernel: artifact(7, "out/kernel"),
+            initramfs: artifact(7, "out/initramfs"),
+        };
+        assert_eq!(shared.attachment_ids(), vec![7]);
+    }
+
+    #[test]
     fn binary_ui_sock_dispatches_generated_actions() {
-        use crate::generated_wire::{ActionRequest, ActionSuccess, ConnectionMode,
-            RequestEnvelope, TransportResponse};
+        use crate::generated_wire::{
+            ActionRequest, ActionSuccess, ConnectionMode, RequestEnvelope, TransportResponse,
+        };
         let (server, mut client) = UnixStream::pair().unwrap();
         let state: State = Default::default();
         let thread = std::thread::spawn(move || {
@@ -8613,12 +10977,14 @@ mod verb_tests {
         crate::socket_wire::write_request(
             &mut client,
             &RequestEnvelope::Action(ActionRequest::Ping),
-        ).unwrap();
+        )
+        .unwrap();
         match crate::socket_wire::read_mode(&mut client).unwrap() {
             ConnectionMode::Reply {
-                response: TransportResponse::Action {
-                    value: ActionSuccess::Ping { value: () },
-                },
+                response:
+                    TransportResponse::Action {
+                        value: ActionSuccess::Ping { value: () },
+                    },
             } => {}
             other => panic!("unexpected binary action response: {other:?}"),
         }
@@ -8626,11 +10992,160 @@ mod verb_tests {
         thread.join().unwrap();
     }
 
+    fn service_test_name(label: &str) -> crate::generated_wire::ServiceName {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        crate::wire::BoundedText::new(format!(
+            "typed-service-test-{label}-{}",
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn binary_service_accept_requires_broker_identity() {
+        use crate::generated_wire::{ConnectionMode, RequestEnvelope, TransportRequest};
+
+        let (server, mut client) = UnixStream::pair().unwrap();
+        let state: State = Default::default();
+        let thread = std::thread::spawn(move || {
+            handle_binary_request(state, server, None, None, None, None, None, None)
+        });
+        crate::socket_wire::write_request(
+            &mut client,
+            &RequestEnvelope::Transport(TransportRequest::ServiceAccept {
+                name: service_test_name("unauthenticated"),
+            }),
+        )
+        .unwrap();
+        match crate::socket_wire::read_mode(&mut client).unwrap() {
+            ConnectionMode::Reply {
+                response:
+                    crate::generated_wire::TransportResponse::Error {
+                        category: crate::generated_wire::ErrorCategory::Unauthorized,
+                        message,
+                    },
+            } => assert!(message.as_str().contains("authenticated broker box")),
+            other => panic!("unexpected service accept response: {other:?}"),
+        }
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn binary_service_accept_and_dial_switch_to_a_raw_bidirectional_stream() {
+        use crate::generated_wire::{
+            ConnectionMode, RequestEnvelope, ServiceAcceptFrame, TransportRequest,
+        };
+        use std::io::{Read, Write};
+        use std::time::Duration;
+
+        let name = service_test_name("raw-stream");
+        let (accept_server, mut accept_client) = UnixStream::pair().unwrap();
+        accept_client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let accept_thread = std::thread::spawn(move || {
+            handle_binary_request(
+                Default::default(),
+                accept_server,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(42),
+            )
+        });
+        crate::socket_wire::write_request(
+            &mut accept_client,
+            &RequestEnvelope::Transport(TransportRequest::ServiceAccept { name: name.clone() }),
+        )
+        .unwrap();
+        assert_eq!(
+            crate::socket_wire::read_mode(&mut accept_client).unwrap(),
+            ConnectionMode::ServiceAccept
+        );
+        accept_thread.join().unwrap();
+
+        let (dial_server, mut dial_client) = UnixStream::pair().unwrap();
+        dial_client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let dial_thread = std::thread::spawn(move || {
+            handle_binary_request(
+                Default::default(),
+                dial_server,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+        });
+        crate::socket_wire::write_request(
+            &mut dial_client,
+            &RequestEnvelope::Transport(TransportRequest::ServiceDial { name }),
+        )
+        .unwrap();
+        dial_client.write_all(b"pipelined").unwrap();
+        assert_eq!(
+            crate::socket_wire::read_atom::<_, ServiceAcceptFrame>(&mut accept_client).unwrap(),
+            ServiceAcceptFrame::Paired
+        );
+        assert_eq!(
+            crate::socket_wire::read_mode(&mut dial_client).unwrap(),
+            ConnectionMode::RawService
+        );
+        dial_thread.join().unwrap();
+
+        let mut pipelined = [0u8; 9];
+        accept_client.read_exact(&mut pipelined).unwrap();
+        assert_eq!(&pipelined, b"pipelined");
+
+        accept_client.write_all(b"provider").unwrap();
+        let mut from_provider = [0u8; 8];
+        dial_client.read_exact(&mut from_provider).unwrap();
+        assert_eq!(&from_provider, b"provider");
+
+        dial_client.write_all(b"caller").unwrap();
+        let mut from_caller = [0u8; 6];
+        accept_client.read_exact(&mut from_caller).unwrap();
+        assert_eq!(&from_caller, b"caller");
+    }
+
+    #[test]
+    fn parked_service_slots_preserve_their_pairing_framing() {
+        use crate::generated_wire::ServiceAcceptFrame;
+        use std::io::{BufRead, BufReader};
+
+        let (legacy_server, legacy_client) = UnixStream::pair().unwrap();
+        let _legacy_stream = ParkedServiceSlot::Legacy(legacy_server).pair().unwrap();
+        let mut line = String::new();
+        BufReader::new(legacy_client).read_line(&mut line).unwrap();
+        assert_eq!(line, "{\"ok\":true,\"r\":\"paired\"}\n");
+
+        let (binary_server, mut binary_client) = UnixStream::pair().unwrap();
+        let _binary_stream = ParkedServiceSlot::Binary(binary_server).pair().unwrap();
+        assert_eq!(
+            crate::socket_wire::read_atom::<_, ServiceAcceptFrame>(&mut binary_client).unwrap(),
+            ServiceAcceptFrame::Paired
+        );
+
+        let (raw_server, mut raw_client) = UnixStream::pair().unwrap();
+        raw_client.write_all(b"terminal").unwrap();
+        let mut raw_stream = ParkedServiceSlot::Raw(raw_server).pair().unwrap();
+        let mut bytes = [0; 8];
+        std::io::Read::read_exact(&mut raw_stream, &mut bytes).unwrap();
+        assert_eq!(&bytes, b"terminal");
+    }
+
     #[test]
     fn typed_box_paths_reject_unsafe_or_unaddressable_overlay_keys() {
         let path = |bytes| crate::wire::BoundedBytes::new(bytes).unwrap();
-        assert_eq!(action_relative_path(&path(b"src/main.rs".to_vec())).unwrap(),
-                   "src/main.rs");
+        assert_eq!(
+            action_relative_path(&path(b"src/main.rs".to_vec())).unwrap(),
+            "src/main.rs"
+        );
         assert_eq!(action_relative_path(&path(Vec::new())).unwrap(), "");
         assert!(action_relative_path(&path(b"../host".to_vec())).is_err());
         assert!(action_relative_path(&path(b"/etc/passwd".to_vec())).is_err());
@@ -8734,6 +11249,7 @@ mod verb_tests {
                 user: Some(raw(b"1000:1000")),
             }),
             virtiofs_socket: None,
+            debug_image: None,
         }));
         assert_eq!(reply["mount"], "/mnt/7");
         assert_eq!(reply["dns_ip"], "240.0.0.1");
@@ -8757,11 +11273,15 @@ mod verb_tests {
 
     #[test]
     fn stored_oci_runtime_is_materialized_as_a_closed_type() {
-        let runtime = parse_oci_runtime(
-            r#"{"config":{"Env":["A=B"],"WorkingDir":"/work","Cmd":["make"]}}"#,
-        ).unwrap().unwrap();
+        let runtime =
+            parse_oci_runtime(r#"{"config":{"Env":["A=B"],"WorkingDir":"/work","Cmd":["make"]}}"#)
+                .unwrap()
+                .unwrap();
         assert_eq!(legacy_bytes(runtime.cwd.unwrap()), "/work");
-        assert_eq!(legacy_bytes(runtime.command.unwrap().into_inner().remove(0)), "make");
+        assert_eq!(
+            legacy_bytes(runtime.command.unwrap().into_inner().remove(0)),
+            "make"
+        );
         assert!(parse_oci_runtime(r#"{"config":{"Cmd":"make"}}"#).is_err());
         assert!(parse_oci_runtime("not json").is_err());
     }
@@ -8844,7 +11364,8 @@ mod verb_tests {
         .unwrap();
         let ActionSuccess::ViewWindow {
             value: crate::generated_wire::ViewWindow::Pipelines { start, total, rows },
-        } = window else {
+        } = window
+        else {
             panic!("wrong typed view window variant")
         };
         assert_eq!((start, total), (0, 1));
@@ -8898,5 +11419,258 @@ mod verb_tests {
             dispatch_ui_verb(&state, "flows.packets", &[json!(-1)], &boxes)["error"],
             "bad args"
         );
+    }
+
+    fn service_box(name: &str, parent: Option<i64>, service: Option<&str>) -> discover::Box_ {
+        let mut meta = std::collections::HashMap::new();
+        meta.insert("name".into(), name.into());
+        if let Some(service) = service {
+            meta.insert("svc_provide".into(), service.into());
+        }
+        discover::Box_ {
+            box_id: 0,
+            name: name.into(),
+            parent,
+            cmd: Vec::new(),
+            started: 0.0,
+            has_sqlar: true,
+            meta,
+        }
+    }
+
+    #[test]
+    fn composed_service_requires_one_declared_provider() {
+        let mut boxes = std::collections::BTreeMap::new();
+        boxes.insert(4, service_box("TOOLS", None, Some("language-service")));
+        assert_eq!(
+            declared_service_provider(&boxes, "language-service").unwrap(),
+            4
+        );
+        assert!(declared_service_provider(&boxes, "missing").is_err());
+        boxes.insert(9, service_box("OTHER", None, Some("language-service")));
+        assert!(
+            declared_service_provider(&boxes, "language-service")
+                .unwrap_err()
+                .contains("multiple")
+        );
+    }
+
+    #[test]
+    fn composed_service_attachment_order_is_exact() {
+        let rows = service_attachment_rows(&[17, 3, 29]);
+        assert!(matches!(
+            rows.as_slice(),
+            [
+                crate::capture::RoAttachment::Box(17),
+                crate::capture::RoAttachment::Box(3),
+                crate::capture::RoAttachment::Box(29),
+            ]
+        ));
+        let mut boxes = std::collections::BTreeMap::new();
+        boxes.insert(3, service_box("THREE", None, None));
+        boxes.insert(17, service_box("SEVENTEEN", None, None));
+        boxes.insert(29, service_box("TWENTYNINE", None, None));
+        validate_service_attachments(&boxes, &[17, 3, 29]).unwrap();
+        assert!(validate_service_attachments(&boxes, &[17, 99]).is_err());
+    }
+
+    #[test]
+    fn composed_service_peer_eof_reaps_owned_child() {
+        use std::os::unix::process::CommandExt;
+        let (lifetime, peer) = UnixStream::pair().unwrap();
+        let (_owner_stop, worker_stop) = UnixStream::pair().unwrap();
+        let mut command = std::process::Command::new("/bin/sh");
+        command.args(["-c", "exec sleep 60"]).process_group(0);
+        let child = command.spawn().unwrap();
+        let pid = child.id() as i32;
+        drop(peer);
+        supervise_composed_service(child, lifetime, worker_stop);
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH),
+        );
+    }
+
+    #[test]
+    fn composed_service_drop_does_not_join_while_state_is_locked() {
+        use std::io::Read;
+        let state: State = Default::default();
+        let (stop, mut worker_stop) = UnixStream::pair().unwrap();
+        let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_finished = finished.clone();
+        let worker = std::thread::spawn(move || {
+            let mut byte = [0u8; 1];
+            let _ = worker_stop.read(&mut byte);
+            worker_finished.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        let service = OwnedComposedService {
+            state: state.clone(),
+            stop,
+            exited: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            worker: Some(worker),
+        };
+        let guard = lock(&state);
+        drop(service);
+        drop(guard);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while !finished.load(std::sync::atomic::Ordering::SeqCst)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(finished.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn generated_debug_session_services_are_valid_and_unique() {
+        let first = debug_session_service_name(41);
+        let second = debug_session_service_name(41);
+        let third = debug_session_service_name(42);
+        assert!(svc_name_ok(&first));
+        assert!(svc_name_ok(&second));
+        assert!(svc_name_ok(&third));
+        assert_ne!(first, second);
+        assert_ne!(second, third);
+    }
+
+    #[test]
+    fn debug_client_prelude_is_a_terminal_safe_versioned_wire_value() {
+        use crate::generated_wire::{
+            DebugExecutable, DebugImageCatalog, DebugImageProfile, DebugSourceView,
+        };
+        let image = DebugImageCatalog {
+            manifest: crate::wire::BoundedBytes::new(b"images/openwrt/image-bundle.json".to_vec())
+                .unwrap(),
+            profile: DebugImageProfile::VirtInitramfsAarch64V1,
+            init: crate::wire::BoundedBytes::new(b"/init".to_vec()).unwrap(),
+            executables: crate::wire::BoundedVec::new(vec![DebugExecutable {
+                guest_path: crate::wire::BoundedBytes::new(b"/usr/sbin/quagga".to_vec()).unwrap(),
+                build_id: crate::wire::BoundedBytes::new(b"0123456789abcdef".to_vec()).unwrap(),
+                runtime_sha256: crate::wire::FixedBytes([7; 32]),
+                runtime_size: 4096,
+                debug_elf: crate::wire::BoundedBytes::new(b"images/openwrt/debug/quagga".to_vec())
+                    .unwrap(),
+                debug_sha256: crate::wire::FixedBytes([9; 32]),
+                debug_size: 8192,
+                elf_class: 64,
+                elf_machine: 183,
+                source_view: DebugSourceView::ProviderRoot,
+            }])
+            .unwrap(),
+        };
+        let line =
+            debug_client_start_line("debug/arm/callgate.json", Some(image), "viros-session-1")
+                .unwrap();
+        let prefix = b"SARUN-DEBUG-CLIENT/1 ";
+        assert!(line.starts_with(prefix));
+        assert_eq!(line.last(), Some(&b'\n'));
+        let hex = &line[prefix.len()..line.len() - 1];
+        assert!(hex.iter().all(u8::is_ascii_hexdigit));
+        let encoded = hex
+            .chunks_exact(2)
+            .map(|pair| {
+                let digit = |byte: u8| match byte {
+                    b'0'..=b'9' => byte - b'0',
+                    b'a'..=b'f' => byte - b'a' + 10,
+                    _ => unreachable!(),
+                };
+                digit(pair[0]) << 4 | digit(pair[1])
+            })
+            .collect::<Vec<_>>();
+        let mut reader = encoded.as_slice();
+        let start: crate::generated_wire::DebugClientStart =
+            crate::socket_wire::read_versioned(&mut reader).unwrap();
+        assert_eq!(start.manifest.as_slice(), b"debug/arm/callgate.json");
+        let image = start.image.as_ref().unwrap();
+        assert_eq!(
+            image.manifest.as_slice(),
+            b"images/openwrt/image-bundle.json"
+        );
+        assert_eq!(
+            image.executables.as_slice()[0].guest_path.as_slice(),
+            b"/usr/sbin/quagga"
+        );
+        assert_eq!(
+            image.executables.as_slice()[0].debug_elf.as_slice(),
+            b"images/openwrt/debug/quagga"
+        );
+        assert_eq!(start.service.as_str(), "viros-session-1");
+        assert!(reader.is_empty());
+    }
+
+    #[test]
+    fn generated_debug_console_services_are_valid_and_unique() {
+        let first = debug_console_service_name(41);
+        let second = debug_console_service_name(41);
+        assert!(svc_name_ok(&first));
+        assert!(svc_name_ok(&second));
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn debug_barrier_is_released_only_after_session_service_parks() {
+        use std::io::Read;
+
+        let name = debug_session_service_name(77);
+        let (writer, mut runner) = UnixStream::pair().unwrap();
+        let writer = Arc::new(Mutex::new(writer));
+        let release_name = name.clone();
+        let release_writer = writer.clone();
+        let release = std::thread::spawn(move || {
+            release_debug_barrier(
+                Some(&release_name),
+                None,
+                &release_writer,
+                std::time::Duration::from_secs(1),
+            )
+        });
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!(!release.is_finished());
+
+        let (parked, peer) = UnixStream::pair().unwrap();
+        SVC_PARKED
+            .lock()
+            .unwrap()
+            .entry(name.clone())
+            .or_default()
+            .push_back(ParkedServiceSlot::Binary(parked));
+        SVC_PARKED_CHANGED.notify_all();
+
+        release.join().unwrap().unwrap();
+        let expected = crate::frames::encode(crate::frames::FRAME_DEBUG_START, &[]);
+        let mut actual = vec![0; expected.len()];
+        runner.read_exact(&mut actual).unwrap();
+        assert_eq!(actual, expected);
+        drop(peer);
+        SVC_PARKED.lock().unwrap().remove(&name);
+    }
+
+    #[test]
+    fn debug_barrier_rejects_a_non_debug_registration() {
+        let (writer, _runner) = UnixStream::pair().unwrap();
+        let error = release_debug_barrier(
+            None,
+            None,
+            &Arc::new(Mutex::new(writer)),
+            std::time::Duration::ZERO,
+        )
+        .unwrap_err();
+        assert!(error.contains("without debug resources"));
+    }
+
+    #[test]
+    fn debug_barrier_fails_immediately_when_provider_exits() {
+        let name = debug_session_service_name(78);
+        let exited = std::sync::atomic::AtomicBool::new(true);
+        let (writer, _runner) = UnixStream::pair().unwrap();
+        let error = release_debug_barrier(
+            Some(&name),
+            Some(&exited),
+            &Arc::new(Mutex::new(writer)),
+            std::time::Duration::from_secs(120),
+        )
+        .unwrap_err();
+        assert!(error.contains("provider exited"));
     }
 }

@@ -174,7 +174,10 @@ fn run_editor_case(
                 last_down = now;
                 phase = 4;
             } else if phase == 4
-                && terminal.screen().contents().contains("relation completions")
+                && terminal
+                    .screen()
+                    .contents()
+                    .contains("relation completions")
             {
                 if terminal.screen().contents().contains(&completion_marker) {
                     let seen = identity_seen.get_or_insert(now);

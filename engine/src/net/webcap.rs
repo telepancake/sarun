@@ -50,12 +50,32 @@ impl WebCapSink {
     /// the RAM mirror lock are both sync), best-effort — mirrors
     /// `oaita::proxy::log_call`.
     #[allow(clippy::too_many_arguments)]
-    pub fn record(&self, ts: f64, req: &ReqCap, status: i32, mime: &str,
-                  resp_headers: &str, resp_body: &[u8], truncated: bool) {
-        let Some(b) = self.overlay.live_box(self.box_id) else { return; };
-        b.add_web_capture(ts, &req.method, &req.url, &req.host, status, mime,
-                          &req.headers, resp_headers, &req.body, resp_body,
-                          truncated);
+    pub fn record(
+        &self,
+        ts: f64,
+        req: &ReqCap,
+        status: i32,
+        mime: &str,
+        resp_headers: &str,
+        resp_body: &[u8],
+        truncated: bool,
+    ) {
+        let Some(b) = self.overlay.live_box(self.box_id) else {
+            return;
+        };
+        b.add_web_capture(
+            ts,
+            &req.method,
+            &req.url,
+            &req.host,
+            status,
+            mime,
+            &req.headers,
+            resp_headers,
+            &req.body,
+            resp_body,
+            truncated,
+        );
         crate::control::broadcast_webcap(self.box_id);
     }
 }
@@ -89,9 +109,11 @@ pub fn mime_of(h: &HeaderMap) -> String {
 /// enforce the byte cap; a declared length over the cap → skip inline capture
 /// (stream through untouched, record header-only).
 pub fn length_within_cap(h: &HeaderMap) -> bool {
-    match h.get(hyper::header::CONTENT_LENGTH)
-             .and_then(|v| v.to_str().ok())
-             .and_then(|s| s.parse::<usize>().ok()) {
+    match h
+        .get(hyper::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<usize>().ok())
+    {
         Some(n) => n <= WEBCAP_BODY_MAX,
         None => true,
     }
@@ -104,7 +126,8 @@ pub fn length_within_cap(h: &HeaderMap) -> bool {
 /// returns the bytes unchanged. `resp_headers` is the stored "K: V\n" block.
 pub fn decode_body(resp_headers: &str, body: &[u8]) -> Vec<u8> {
     let enc = header_value(resp_headers, "content-encoding")
-        .unwrap_or_default().to_ascii_lowercase();
+        .unwrap_or_default()
+        .to_ascii_lowercase();
     let enc = enc.trim();
     match enc {
         "" | "identity" => body.to_vec(),
@@ -112,7 +135,11 @@ pub fn decode_body(resp_headers: &str, body: &[u8]) -> Vec<u8> {
             use std::io::Read;
             let mut out = Vec::new();
             let mut d = flate2::read::GzDecoder::new(body);
-            if d.read_to_end(&mut out).is_ok() { out } else { body.to_vec() }
+            if d.read_to_end(&mut out).is_ok() {
+                out
+            } else {
+                body.to_vec()
+            }
         }
         "deflate" => {
             use std::io::Read;
@@ -120,21 +147,29 @@ pub fn decode_body(resp_headers: &str, body: &[u8]) -> Vec<u8> {
             // some raw. Try zlib first, fall back to raw, then to the bytes.
             let mut out = Vec::new();
             let mut z = flate2::read::ZlibDecoder::new(body);
-            if z.read_to_end(&mut out).is_ok() { return out; }
+            if z.read_to_end(&mut out).is_ok() {
+                return out;
+            }
             out.clear();
             let mut r = flate2::read::DeflateDecoder::new(body);
-            if r.read_to_end(&mut out).is_ok() { out } else { body.to_vec() }
-        }
-        "zstd" => {
-            match ruzstd::StreamingDecoder::new(body) {
-                Ok(mut dec) => {
-                    use std::io::Read;
-                    let mut out = Vec::new();
-                    if dec.read_to_end(&mut out).is_ok() { out } else { body.to_vec() }
-                }
-                Err(_) => body.to_vec(),
+            if r.read_to_end(&mut out).is_ok() {
+                out
+            } else {
+                body.to_vec()
             }
         }
+        "zstd" => match ruzstd::StreamingDecoder::new(body) {
+            Ok(mut dec) => {
+                use std::io::Read;
+                let mut out = Vec::new();
+                if dec.read_to_end(&mut out).is_ok() {
+                    out
+                } else {
+                    body.to_vec()
+                }
+            }
+            Err(_) => body.to_vec(),
+        },
         // brotli ("br") and anything else: stored-and-noted, returned raw.
         _ => body.to_vec(),
     }
@@ -160,7 +195,10 @@ mod tests {
     #[test]
     fn header_lookup_is_case_insensitive() {
         let h = "Content-Type: text/html\nContent-Encoding: gzip\n";
-        assert_eq!(header_value(h, "content-type").as_deref(), Some("text/html"));
+        assert_eq!(
+            header_value(h, "content-type").as_deref(),
+            Some("text/html")
+        );
         assert_eq!(header_value(h, "CONTENT-ENCODING").as_deref(), Some("gzip"));
         assert_eq!(header_value(h, "missing"), None);
     }
@@ -168,24 +206,28 @@ mod tests {
     #[test]
     fn identity_and_unknown_pass_through() {
         assert_eq!(decode_body("", b"hello"), b"hello");
-        assert_eq!(decode_body("Content-Encoding: br\n", b"\x01\x02"), b"\x01\x02");
+        assert_eq!(
+            decode_body("Content-Encoding: br\n", b"\x01\x02"),
+            b"\x01\x02"
+        );
     }
 
     #[test]
     fn gzip_roundtrips_through_decode() {
         use std::io::Write;
-        let mut e = flate2::write::GzEncoder::new(Vec::new(),
-                                                  flate2::Compression::default());
+        let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         e.write_all(b"the quick brown fox").unwrap();
         let gz = e.finish().unwrap();
-        assert_eq!(decode_body("Content-Encoding: gzip\n", &gz), b"the quick brown fox");
+        assert_eq!(
+            decode_body("Content-Encoding: gzip\n", &gz),
+            b"the quick brown fox"
+        );
     }
 
     #[test]
     fn deflate_zlib_roundtrips() {
         use std::io::Write;
-        let mut e = flate2::write::ZlibEncoder::new(Vec::new(),
-                                                    flate2::Compression::default());
+        let mut e = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
         e.write_all(b"payload").unwrap();
         let z = e.finish().unwrap();
         assert_eq!(decode_body("Content-Encoding: deflate\n", &z), b"payload");

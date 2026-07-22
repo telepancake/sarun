@@ -381,13 +381,10 @@ impl BackingFile {
     }
 
     pub(crate) fn lseek(&self, offset: u64, whence: u32) -> io::Result<u64> {
-        self.store.inner.fs.lseek(
-            context(),
-            self.inode,
-            self.handle,
-            offset,
-            whence,
-        )
+        self.store
+            .inner
+            .fs
+            .lseek(context(), self.inode, self.handle, offset, whence)
     }
 
     pub(crate) fn read_at(&self, buffer: &mut [u8], offset: u64) -> io::Result<usize> {

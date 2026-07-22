@@ -21,10 +21,10 @@
 
 use std::path::PathBuf;
 
-use rusqlite::params;
 use rusqlite::Connection;
+use rusqlite::params;
 
-use crate::capture::{now_ns, BoxState, Entry, S_IFCHR};
+use crate::capture::{BoxState, Entry, S_IFCHR, now_ns};
 use crate::paths;
 
 /// The loose content file for a regular-file node, named by its sqlar
@@ -58,15 +58,20 @@ pub struct ArchiveNode {
 
 pub fn archive_node(conn: &Connection, rel: &str) -> Option<ArchiveNode> {
     conn.query_row(
-        "SELECT rowid,mode,mtime,sz,data,opaque FROM sqlar WHERE name=?1", [rel],
-        |r| Ok(ArchiveNode {
-            rowid: r.get(0)?,
-            mode: r.get::<_, i64>(1)? as u32,
-            mtime: r.get(2)?,
-            sz: r.get(3)?,
-            data: r.get(4)?,
-            opaque: r.get::<_, i64>(5)? != 0,
-        })).ok()
+        "SELECT rowid,mode,mtime,sz,data,opaque FROM sqlar WHERE name=?1",
+        [rel],
+        |r| {
+            Ok(ArchiveNode {
+                rowid: r.get(0)?,
+                mode: r.get::<_, i64>(1)? as u32,
+                mtime: r.get(2)?,
+                sz: r.get(3)?,
+                data: r.get(4)?,
+                opaque: r.get::<_, i64>(5)? != 0,
+            })
+        },
+    )
+    .ok()
 }
 
 pub fn archive_exists(conn: &Connection, rel: &str) -> bool {
@@ -75,27 +80,36 @@ pub fn archive_exists(conn: &Connection, rel: &str) -> bool {
 }
 
 pub fn archive_mode(conn: &Connection, rel: &str) -> Option<u32> {
-    conn.query_row("SELECT mode FROM sqlar WHERE name=?1", [rel],
-                   |r| r.get::<_, i64>(0).map(|m| m as u32)).ok()
+    conn.query_row("SELECT mode FROM sqlar WHERE name=?1", [rel], |r| {
+        r.get::<_, i64>(0).map(|m| m as u32)
+    })
+    .ok()
 }
 
 pub fn archive_mtime(conn: &Connection, rel: &str) -> Option<i64> {
-    conn.query_row("SELECT mtime FROM sqlar WHERE name=?1", [rel],
-                   |r| r.get(0)).ok()
+    conn.query_row("SELECT mtime FROM sqlar WHERE name=?1", [rel], |r| r.get(0))
+        .ok()
 }
 
 /// All nodes with content + opaque, name-ordered — the layer-export walk
 /// (OCI build_layer_tar).
 #[allow(clippy::type_complexity)]
-pub fn archive_all_nodes(conn: &Connection)
-    -> rusqlite::Result<Vec<(i64, String, u32, Option<Vec<u8>>, i64)>>
-{
-    let mut st = conn.prepare(
-        "SELECT rowid,name,mode,data,opaque FROM sqlar ORDER BY name")?;
-    let rows = st.query_map([], |r| Ok((
-        r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)? as u32,
-        r.get::<_, Option<Vec<u8>>>(3)?, r.get::<_, i64>(4)?,
-    )))?.filter_map(|r| r.ok()).collect();
+pub fn archive_all_nodes(
+    conn: &Connection,
+) -> rusqlite::Result<Vec<(i64, String, u32, Option<Vec<u8>>, i64)>> {
+    let mut st = conn.prepare("SELECT rowid,name,mode,data,opaque FROM sqlar ORDER BY name")?;
+    let rows = st
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)? as u32,
+                r.get::<_, Option<Vec<u8>>>(3)?,
+                r.get::<_, i64>(4)?,
+            ))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
     Ok(rows)
 }
 
@@ -104,22 +118,29 @@ pub fn archive_names_modes(conn: &Connection) -> Vec<(String, u32)> {
     let Ok(mut st) = conn.prepare("SELECT name,mode FROM sqlar") else {
         return vec![];
     };
-    let Ok(rows) = st.query_map([], |r| Ok((
-        r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u32))) else {
+    let Ok(rows) = st.query_map([], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u32))
+    }) else {
         return vec![];
     };
     rows.flatten().collect()
 }
 
 /// Most-recently-touched nodes: (name, mode, sz, mtime), mtime-descending.
-pub fn archive_recent(conn: &Connection, limit: i64)
-    -> rusqlite::Result<Vec<(String, i64, i64, i64)>>
-{
-    let mut st = conn.prepare(
-        "SELECT name, mode, sz, mtime FROM sqlar ORDER BY mtime DESC LIMIT ?1")?;
-    let it = st.query_map([limit], |r| Ok((
-        r.get::<_, String>(0)?, r.get::<_, i64>(1)?,
-        r.get::<_, i64>(2)?, r.get::<_, i64>(3)?)))?;
+pub fn archive_recent(
+    conn: &Connection,
+    limit: i64,
+) -> rusqlite::Result<Vec<(String, i64, i64, i64)>> {
+    let mut st =
+        conn.prepare("SELECT name, mode, sz, mtime FROM sqlar ORDER BY mtime DESC LIMIT ?1")?;
+    let it = st.query_map([limit], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, i64>(1)?,
+            r.get::<_, i64>(2)?,
+            r.get::<_, i64>(3)?,
+        ))
+    })?;
     it.collect()
 }
 
@@ -130,11 +151,15 @@ pub fn archive_delete(conn: &Connection, rel: &str) {
 
 /// Write content INLINE into an existing node row (discard-hunk revert),
 /// returning its rowid so the caller can drop the stale pool blob.
-pub fn archive_write_inline(conn: &Connection, rel: &str, data: &[u8])
-    -> rusqlite::Result<Option<i64>>
-{
-    conn.execute("UPDATE sqlar SET sz=?1, data=?2 WHERE name=?3",
-                 params![data.len() as i64, data, rel])?;
+pub fn archive_write_inline(
+    conn: &Connection,
+    rel: &str,
+    data: &[u8],
+) -> rusqlite::Result<Option<i64>> {
+    conn.execute(
+        "UPDATE sqlar SET sz=?1, data=?2 WHERE name=?3",
+        params![data.len() as i64, data, rel],
+    )?;
     Ok(archive_node(conn, rel).map(|n| n.rowid))
 }
 
@@ -149,15 +174,21 @@ pub fn archive_clear_inline(conn: &Connection, rel: &str) -> rusqlite::Result<()
 
 /// INSERT OR REPLACE a full node row (apply-promote / copy-down target),
 /// returning the new rowid.
-pub fn archive_upsert(conn: &Connection, rel: &str, mode: u32, mtime: i64,
-                      sz: i64, data: Option<&[u8]>, opaque: i64)
-    -> Result<i64, String>
-{
+pub fn archive_upsert(
+    conn: &Connection,
+    rel: &str,
+    mode: u32,
+    mtime: i64,
+    sz: i64,
+    data: Option<&[u8]>,
+    opaque: i64,
+) -> Result<i64, String> {
     conn.execute(
         "INSERT OR REPLACE INTO sqlar(name,mode,mtime,sz,data,opaque) \
          VALUES(?1,?2,?3,?4,?5,?6)",
-        params![rel, mode as i64, mtime, sz, data, opaque])
-        .map_err(|x| x.to_string())?;
+        params![rel, mode as i64, mtime, sz, data, opaque],
+    )
+    .map_err(|x| x.to_string())?;
     Ok(conn.last_insert_rowid())
 }
 
@@ -166,13 +197,20 @@ pub fn archive_upsert(conn: &Connection, rel: &str, mode: u32, mtime: i64,
 /// outputs, meta, …) are untouched. Used by rotation before re-importing
 /// the rewritten encoding.
 pub fn archive_clear(conn: &Connection, box_id: i64) -> Result<(), String> {
-    let mut st = conn.prepare("SELECT rowid,mode,data FROM sqlar")
+    let mut st = conn
+        .prepare("SELECT rowid,mode,data FROM sqlar")
         .map_err(|e| e.to_string())?;
-    let rows: Vec<(i64, u32, bool)> = st.query_map([], |r| Ok((
-        r.get::<_, i64>(0)?, r.get::<_, i64>(1)? as u32,
-        r.get::<_, Option<Vec<u8>>>(2)?.is_some())))
+    let rows: Vec<(i64, u32, bool)> = st
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)? as u32,
+                r.get::<_, Option<Vec<u8>>>(2)?.is_some(),
+            ))
+        })
         .map_err(|e| e.to_string())?
-        .filter_map(|r| r.ok()).collect();
+        .filter_map(|r| r.ok())
+        .collect();
     drop(st);
     for (rowid, mode, has_inline) in rows {
         if mode & 0o170000 == 0o100000 && !has_inline {
@@ -282,7 +320,6 @@ fn move_metadata_mirrors(state: &BoxState, old: &str, new: &str) {
 }
 
 impl BoxDepot for BoxState {
-
     /// Upsert the file row for `rel` (data stays NULL — D4) and return its
     /// rowid, which names the pool blob. First writer sticks; last_writer moves.
     fn ensure_file_row(&self, rel: &str, mode: u32, writer: i64) -> i64 {
@@ -303,7 +340,9 @@ impl BoxDepot for BoxState {
             .unwrap_or(0);
         drop(conn);
         clear_metadata_mirrors(self, rel);
-        self.kinds.write().unwrap()
+        self.kinds
+            .write()
+            .unwrap()
             .insert(rel.to_string(), Entry::File { rowid, mode });
         rowid
     }
@@ -325,7 +364,9 @@ impl BoxDepot for BoxState {
     fn outline_inline_row(&self, rel: &str) -> std::io::Result<bool> {
         let (rowid, data) = {
             let conn = self.conn.lock().unwrap();
-            let Some(n) = archive_node(&conn, rel) else { return Ok(false) };
+            let Some(n) = archive_node(&conn, rel) else {
+                return Ok(false);
+            };
             if n.mode & 0o170000 != 0o100000 {
                 return Ok(false); // symlink target / whiteout — inline is right
             }
@@ -355,8 +396,10 @@ impl BoxDepot for BoxState {
     fn set_mode(&self, rel: &str, full_mode: u32) {
         {
             let conn = self.conn.lock().unwrap();
-            let _ = conn.execute("UPDATE sqlar SET mode=?2 WHERE name=?1",
-                                 params![rel, full_mode]);
+            let _ = conn.execute(
+                "UPDATE sqlar SET mode=?2 WHERE name=?1",
+                params![rel, full_mode],
+            );
         }
         if let Some(e) = self.kinds.write().unwrap().get_mut(rel) {
             match e {
@@ -371,10 +414,11 @@ impl BoxDepot for BoxState {
     /// in the sqlar row, so this is a single UPDATE + mirror touch for dirs.
     fn set_mtime(&self, rel: &str, mtime_ns: i64) {
         let conn = self.conn.lock().unwrap();
-        let _ = conn.execute("UPDATE sqlar SET mtime=?2 WHERE name=?1",
-                             rusqlite::params![rel, mtime_ns]);
-        if let Some(Entry::Dir { mtime_ns: m, .. }) =
-            self.kinds.write().unwrap().get_mut(rel) {
+        let _ = conn.execute(
+            "UPDATE sqlar SET mtime=?2 WHERE name=?1",
+            rusqlite::params![rel, mtime_ns],
+        );
+        if let Some(Entry::Dir { mtime_ns: m, .. }) = self.kinds.write().unwrap().get_mut(rel) {
             *m = mtime_ns;
         }
     }
@@ -387,7 +431,10 @@ impl BoxDepot for BoxState {
             rusqlite::params![rel, atime_ns],
         );
         drop(conn);
-        self.atimes.write().unwrap().insert(rel.to_owned(), atime_ns);
+        self.atimes
+            .write()
+            .unwrap()
+            .insert(rel.to_owned(), atime_ns);
     }
 
     fn atime_of(&self, rel: &str) -> Option<i64> {
@@ -401,9 +448,13 @@ impl BoxDepot for BoxState {
         let _ = conn.execute(
             "INSERT INTO ownership(name,uid,gid) VALUES(?1,?2,?3)
              ON CONFLICT(name) DO UPDATE SET uid=excluded.uid, gid=excluded.gid",
-            rusqlite::params![rel, uid, gid]);
+            rusqlite::params![rel, uid, gid],
+        );
         drop(conn);
-        self.owners.write().unwrap().insert(rel.to_owned(), (uid, gid));
+        self.owners
+            .write()
+            .unwrap()
+            .insert(rel.to_owned(), (uid, gid));
     }
 
     fn owner_of(&self, rel: &str) -> Option<(u32, u32)> {
@@ -416,13 +467,20 @@ impl BoxDepot for BoxState {
         let _ = conn.execute(
             "INSERT INTO xattr(name,key,value) VALUES(?1,?2,?3)
              ON CONFLICT(name,key) DO UPDATE SET value=excluded.value",
-            rusqlite::params![rel, key, value]);
+            rusqlite::params![rel, key, value],
+        );
     }
 
     fn get_xattr(&self, rel: &str, key: &str) -> Option<Vec<u8>> {
-        self.conn.lock().unwrap().query_row(
-            "SELECT value FROM xattr WHERE name=?1 AND key=?2",
-            rusqlite::params![rel, key], |r| r.get(0)).ok()
+        self.conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT value FROM xattr WHERE name=?1 AND key=?2",
+                rusqlite::params![rel, key],
+                |r| r.get(0),
+            )
+            .ok()
     }
 
     fn list_xattr(&self, rel: &str) -> Vec<String> {
@@ -438,8 +496,12 @@ impl BoxDepot for BoxState {
 
     fn remove_xattr(&self, rel: &str, key: &str) -> bool {
         let conn = self.conn.lock().unwrap();
-        conn.execute("DELETE FROM xattr WHERE name=?1 AND key=?2",
-                     rusqlite::params![rel, key]).map(|n| n > 0).unwrap_or(false)
+        conn.execute(
+            "DELETE FROM xattr WHERE name=?1 AND key=?2",
+            rusqlite::params![rel, key],
+        )
+        .map(|n| n > 0)
+        .unwrap_or(false)
     }
 
     /// mknod/mkfifo: a special-file row (mode carries S_IFIFO/S_IFCHR/S_IFBLK);
@@ -451,15 +513,19 @@ impl BoxDepot for BoxState {
                 "INSERT INTO sqlar(name,mode,mtime,sz,data,writer,last_writer)
                  VALUES(?1,?2,?3,0,NULL,?4,?4)
                  ON CONFLICT(name) DO UPDATE SET mode=excluded.mode",
-                rusqlite::params![rel, mode, now_ns(), writer]);
+                rusqlite::params![rel, mode, now_ns(), writer],
+            );
             if rdev != 0 {
                 let _ = conn.execute(
                     "INSERT INTO rdev(name,dev) VALUES(?1,?2)
                      ON CONFLICT(name) DO UPDATE SET dev=excluded.dev",
-                    rusqlite::params![rel, rdev as i64]);
+                    rusqlite::params![rel, rdev as i64],
+                );
             }
         }
-        self.kinds.write().unwrap()
+        self.kinds
+            .write()
+            .unwrap()
             .insert(rel.to_string(), Entry::Special { mode, rdev });
     }
 
@@ -478,12 +544,20 @@ impl BoxDepot for BoxState {
         // creation (use set_opaque() to flip).
         let mut kinds = self.kinds.write().unwrap();
         let (was_opaque, was_rebased) = match kinds.get(rel) {
-            Some(Entry::Dir { opaque, rebased, .. }) => (*opaque, *rebased),
+            Some(Entry::Dir {
+                opaque, rebased, ..
+            }) => (*opaque, *rebased),
             _ => (false, false),
         };
-        kinds.insert(rel.to_string(),
-            Entry::Dir { mode: m, mtime_ns: now_ns(), opaque: was_opaque,
-                         rebased: was_rebased });
+        kinds.insert(
+            rel.to_string(),
+            Entry::Dir {
+                mode: m,
+                mtime_ns: now_ns(),
+                opaque: was_opaque,
+                rebased: was_rebased,
+            },
+        );
     }
 
     /// Mark `rel` as an OPAQUE directory (OCI/AUFS `.wh..wh..opq` semantics):
@@ -506,14 +580,32 @@ impl BoxDepot for BoxState {
         }
         let mut kinds = self.kinds.write().unwrap();
         match kinds.get(rel).cloned() {
-            Some(Entry::Dir { mode, mtime_ns, rebased, .. }) => {
-                kinds.insert(rel.to_string(),
-                    Entry::Dir { mode, mtime_ns, opaque: true, rebased });
+            Some(Entry::Dir {
+                mode,
+                mtime_ns,
+                rebased,
+                ..
+            }) => {
+                kinds.insert(
+                    rel.to_string(),
+                    Entry::Dir {
+                        mode,
+                        mtime_ns,
+                        opaque: true,
+                        rebased,
+                    },
+                );
             }
             _ => {
-                kinds.insert(rel.to_string(), Entry::Dir {
-                    mode: 0o040755, mtime_ns: now_ns(), opaque: true,
-                    rebased: false });
+                kinds.insert(
+                    rel.to_string(),
+                    Entry::Dir {
+                        mode: 0o040755,
+                        mtime_ns: now_ns(),
+                        opaque: true,
+                        rebased: false,
+                    },
+                );
             }
         }
     }
@@ -521,8 +613,10 @@ impl BoxDepot for BoxState {
     /// Is `rel` an opaque directory in this box? (Used by the overlay
     /// resolve/scan_dir paths to honor the OCI opaque-dir semantics.)
     fn is_opaque(&self, rel: &str) -> bool {
-        matches!(self.kinds.read().unwrap().get(rel),
-            Some(Entry::Dir { opaque: true, .. }))
+        matches!(
+            self.kinds.read().unwrap().get(rel),
+            Some(Entry::Dir { opaque: true, .. })
+        )
     }
 
     fn set_symlink(&self, rel: &str, target: &std::path::Path, writer: i64) {
@@ -552,8 +646,12 @@ impl BoxDepot for BoxState {
         if let Some(rowid) = stale_rowid {
             let _ = std::fs::remove_file(blob_path(self.id, rowid));
         }
-        self.kinds.write().unwrap()
-            .insert(rel.to_string(), Entry::Symlink { target: target.to_path_buf() });
+        self.kinds.write().unwrap().insert(
+            rel.to_string(),
+            Entry::Symlink {
+                target: target.to_path_buf(),
+            },
+        );
     }
 
     /// Refresh the in-RAM `kinds` mirror entry for ONE path from the
@@ -564,18 +662,25 @@ impl BoxDepot for BoxState {
     /// mirror entry is removed. sarun: keeps live/at-rest writes uniform.
     fn reload_entry(&self, rel: &str) {
         let conn = self.conn.lock().unwrap();
-        let row = conn.query_row(
-            "SELECT mode,sz,data FROM sqlar WHERE name=?1", [rel],
-            |r| Ok((r.get::<_, i64>(0)? as u32, r.get::<_, i64>(1)?,
-                    r.get::<_, Option<Vec<u8>>>(2)?))).ok();
-        let atime = conn.query_row(
-            "SELECT ns FROM atime WHERE name=?1", [rel], |r| r.get::<_, i64>(0),
-        ).ok();
-        let owner = conn.query_row(
-            "SELECT uid,gid FROM ownership WHERE name=?1", [rel],
-            |r| Ok((r.get::<_, i64>(0)? as u32,
-                   r.get::<_, i64>(1)? as u32)),
-        ).ok();
+        let row = conn
+            .query_row("SELECT mode,sz,data FROM sqlar WHERE name=?1", [rel], |r| {
+                Ok((
+                    r.get::<_, i64>(0)? as u32,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, Option<Vec<u8>>>(2)?,
+                ))
+            })
+            .ok();
+        let atime = conn
+            .query_row("SELECT ns FROM atime WHERE name=?1", [rel], |r| {
+                r.get::<_, i64>(0)
+            })
+            .ok();
+        let owner = conn
+            .query_row("SELECT uid,gid FROM ownership WHERE name=?1", [rel], |r| {
+                Ok((r.get::<_, i64>(0)? as u32, r.get::<_, i64>(1)? as u32))
+            })
+            .ok();
         let mut kinds = self.kinds.write().unwrap();
         match row {
             Some((mode, sz, data)) => {
@@ -588,12 +693,20 @@ impl BoxDepot for BoxState {
         }
         drop(kinds);
         match atime {
-            Some(value) => { self.atimes.write().unwrap().insert(rel.to_owned(), value); }
-            None => { self.atimes.write().unwrap().remove(rel); }
+            Some(value) => {
+                self.atimes.write().unwrap().insert(rel.to_owned(), value);
+            }
+            None => {
+                self.atimes.write().unwrap().remove(rel);
+            }
         }
         match owner {
-            Some(value) => { self.owners.write().unwrap().insert(rel.to_owned(), value); }
-            None => { self.owners.write().unwrap().remove(rel); }
+            Some(value) => {
+                self.owners.write().unwrap().insert(rel.to_owned(), value);
+            }
+            None => {
+                self.owners.write().unwrap().remove(rel);
+            }
         }
     }
 
@@ -615,7 +728,10 @@ impl BoxDepot for BoxState {
         if let Some(rid) = stale_rowid {
             let _ = std::fs::remove_file(blob_path(self.id, rid));
         }
-        self.kinds.write().unwrap().insert(rel.to_string(), Entry::Whiteout);
+        self.kinds
+            .write()
+            .unwrap()
+            .insert(rel.to_string(), Entry::Whiteout);
     }
 
     /// Move the upper row old->new (reusing the blob — rowid is stable, so the
@@ -633,8 +749,7 @@ impl BoxDepot for BoxState {
             let conn = self.conn.lock().unwrap();
             let _ = conn.execute("DELETE FROM sqlar WHERE name=?1", [new]);
             move_node_metadata(&conn, old, new);
-            let _ = conn.execute("UPDATE sqlar SET name=?2 WHERE name=?1",
-                                 params![old, new]);
+            let _ = conn.execute("UPDATE sqlar SET name=?2 WHERE name=?1", params![old, new]);
         }
         move_metadata_mirrors(self, old, new);
         if let Some(rid) = stale_rowid {
@@ -651,37 +766,49 @@ impl BoxDepot for BoxState {
         let op = format!("{old}/");
         let conn = self.conn.lock().unwrap();
         let names: Vec<String> = {
-            let mut st = match conn.prepare(
-                "SELECT name FROM sqlar WHERE name=?1 OR name LIKE ?2") {
-                Ok(s) => s, Err(_) => return,
+            let mut st = match conn.prepare("SELECT name FROM sqlar WHERE name=?1 OR name LIKE ?2")
+            {
+                Ok(s) => s,
+                Err(_) => return,
             };
             let like = format!("{op}%");
             let it = st.query_map(params![old, like], |r| r.get::<_, String>(0));
-            match it { Ok(it) => it.flatten().collect(), Err(_) => return }
+            match it {
+                Ok(it) => it.flatten().collect(),
+                Err(_) => return,
+            }
         };
         let kinds = self.kinds.read().unwrap();
         for name in &names {
-            let nn = if name == old { new.to_string() }
-                     else { format!("{new}/{}", &name[op.len()..]) };
+            let nn = if name == old {
+                new.to_string()
+            } else {
+                format!("{new}/{}", &name[op.len()..])
+            };
             if let Some(Entry::File { rowid, .. }) = kinds.get(&nn) {
                 let _ = std::fs::remove_file(blob_path(self.id, *rowid));
             }
             let _ = conn.execute("DELETE FROM sqlar WHERE name=?1", [&nn]);
             move_node_metadata(&conn, name, &nn);
-            let _ = conn.execute("UPDATE sqlar SET name=?2 WHERE name=?1",
-                                 params![name, nn]);
+            let _ = conn.execute("UPDATE sqlar SET name=?2 WHERE name=?1", params![name, nn]);
         }
         drop(kinds);
         drop(conn);
         for name in &names {
-            let nn = if name == old { new.to_string() }
-                     else { format!("{new}/{}", &name[op.len()..]) };
+            let nn = if name == old {
+                new.to_string()
+            } else {
+                format!("{new}/{}", &name[op.len()..])
+            };
             move_metadata_mirrors(self, name, &nn);
         }
         let mut k = self.kinds.write().unwrap();
         for name in names {
-            let nn = if name == old { new.to_string() }
-                     else { format!("{new}/{}", &name[op.len()..]) };
+            let nn = if name == old {
+                new.to_string()
+            } else {
+                format!("{new}/{}", &name[op.len()..])
+            };
             if let Some(e) = k.remove(&name) {
                 k.insert(nn, e);
             }
@@ -741,7 +868,9 @@ fn a(v: impl ToString) -> Vec<u8> {
 }
 
 fn parse_a<T: std::str::FromStr>(attrs: &depot_model::Attrs, key: &[u8]) -> Option<T> {
-    attrs.get(key).and_then(|v| std::str::from_utf8(v).ok())
+    attrs
+        .get(key)
+        .and_then(|v| std::str::from_utf8(v).ok())
         .and_then(|s| s.parse().ok())
 }
 
@@ -754,7 +883,9 @@ fn tree_insert(root: &mut depot_model::Node, name: &str, node: depot_model::Node
             // Merge: an implicit interior node may already exist (children
             // inserted first under ORDER BY name they cannot — parents sort
             // first — but "" segments aside, be safe and keep children).
-            let entry = cur.children.entry(seg.as_bytes().to_vec())
+            let entry = cur
+                .children
+                .entry(seg.as_bytes().to_vec())
                 .or_insert_with(depot_model::Node::keep);
             let kids = std::mem::take(&mut entry.children);
             *entry = node;
@@ -763,23 +894,23 @@ fn tree_insert(root: &mut depot_model::Node, name: &str, node: depot_model::Node
             }
             return;
         }
-        cur = cur.children.entry(seg.as_bytes().to_vec())
+        cur = cur
+            .children
+            .entry(seg.as_bytes().to_vec())
             .or_insert_with(depot_model::Node::keep);
     }
 }
 
 /// Export a box's captured layer as a canonical depot layer. `conn` is an
 /// open connection to the box's sqlar; `box_id` names its blob pool.
-pub fn export_layer(conn: &Connection, box_id: i64)
-    -> Result<depot_model::Layer, String>
-{
+pub fn export_layer(conn: &Connection, box_id: i64) -> Result<depot_model::Layer, String> {
     use depot_model::{BlobOp, Node};
     let mut side: std::collections::HashMap<String, depot_model::Attrs> =
         std::collections::HashMap::new();
     let mut load_side = |sql: &str, key: &[u8]| -> Result<(), String> {
         let mut st = conn.prepare(sql).map_err(|e| e.to_string())?;
-        let rows = st.query_map([], |r| Ok((
-            r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+        let rows = st
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
             .map_err(|e| e.to_string())?;
         for (name, v) in rows.flatten() {
             side.entry(name).or_default().insert(key.to_vec(), a(v));
@@ -790,11 +921,18 @@ pub fn export_layer(conn: &Connection, box_id: i64)
     load_side("SELECT name,gid FROM ownership", b"gid")?;
     load_side("SELECT name,dev FROM rdev", b"rdev")?;
     {
-        let mut st = conn.prepare("SELECT name,key,value FROM xattr")
+        let mut st = conn
+            .prepare("SELECT name,key,value FROM xattr")
             .map_err(|e| e.to_string())?;
-        let rows = st.query_map([], |r| Ok((
-            r.get::<_, String>(0)?, r.get::<_, String>(1)?,
-            r.get::<_, Vec<u8>>(2)?))).map_err(|e| e.to_string())?;
+        let rows = st
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Vec<u8>>(2)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?;
         for (name, k, v) in rows.flatten() {
             let mut key = b"x:".to_vec();
             key.extend_from_slice(k.as_bytes());
@@ -804,14 +942,21 @@ pub fn export_layer(conn: &Connection, box_id: i64)
 
     let mut root = Node::keep();
     let mut root_attrs: Option<depot_model::Attrs> = None;
-    let mut st = conn.prepare(
-        "SELECT rowid,name,mode,mtime,data,opaque FROM sqlar ORDER BY name")
+    let mut st = conn
+        .prepare("SELECT rowid,name,mode,mtime,data,opaque FROM sqlar ORDER BY name")
         .map_err(|e| e.to_string())?;
-    let rows = st.query_map([], |r| Ok((
-        r.get::<_, i64>(0)?, r.get::<_, String>(1)?,
-        r.get::<_, i64>(2)? as u32, r.get::<_, i64>(3)?,
-        r.get::<_, Option<Vec<u8>>>(4)?, r.get::<_, i64>(5)?,
-    ))).map_err(|e| e.to_string())?;
+    let rows = st
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)? as u32,
+                r.get::<_, i64>(3)?,
+                r.get::<_, Option<Vec<u8>>>(4)?,
+                r.get::<_, i64>(5)?,
+            ))
+        })
+        .map_err(|e| e.to_string())?;
     for row in rows.flatten() {
         let (rowid, name, mode, mtime, data, opaque) = row;
         if name.is_empty() {
@@ -823,8 +968,11 @@ pub fn export_layer(conn: &Connection, box_id: i64)
         if mode == S_IFCHR {
             // opaque bit 1 = backdrop anchor: an anchored whiteout row IS
             // a hole ("not occluded"), not a deletion.
-            let node = if opaque & 2 != 0 { Node::hole() }
-                       else { Node::tombstone() };
+            let node = if opaque & 2 != 0 {
+                Node::hole()
+            } else {
+                Node::tombstone()
+            };
             tree_insert(&mut root, &name, node);
             continue;
         }
@@ -843,7 +991,10 @@ pub fn export_layer(conn: &Connection, box_id: i64)
             match data {
                 Some(d) => BlobOp::Set(d.into()),
                 None => BlobOp::Set(
-                    std::fs::read(blob_path(box_id, rowid)).unwrap_or_default().into()),
+                    std::fs::read(blob_path(box_id, rowid))
+                        .unwrap_or_default()
+                        .into(),
+                ),
             }
         };
         let node = Node {
@@ -851,8 +1002,11 @@ pub fn export_layer(conn: &Connection, box_id: i64)
             blob,
             opaque: ft == 0o040000 && opaque & 1 != 0,
             attrs: Some(attrs),
-            anchor: if opaque & 2 != 0 { depot_model::Anchor::Backdrop }
-                    else { depot_model::Anchor::Lower },
+            anchor: if opaque & 2 != 0 {
+                depot_model::Anchor::Backdrop
+            } else {
+                depot_model::Anchor::Lower
+            },
             children: Default::default(),
         };
         tree_insert(&mut root, &name, node);
@@ -863,42 +1017,58 @@ pub fn export_layer(conn: &Connection, box_id: i64)
     Ok(depot_model::Layer { root })
 }
 
-fn import_node(conn: &Connection, box_id: i64, name: &str,
-               node: &depot_model::Node) -> Result<(), String> {
+fn import_node(
+    conn: &Connection,
+    box_id: i64,
+    name: &str,
+    node: &depot_model::Node,
+) -> Result<(), String> {
     use depot_model::{BlobOp, Presence};
     if node.presence == Presence::Tombstone {
         archive_upsert(conn, name, S_IFCHR, 0, 0, None, 0)?;
         return Ok(());
     }
-    let anchor_bit: i64 = if node.anchor == depot_model::Anchor::Backdrop { 2 }
-                          else { 0 };
-    if node.attrs.is_none() && anchor_bit != 0
-        && matches!(node.blob, BlobOp::Keep)
-    {
+    let anchor_bit: i64 = if node.anchor == depot_model::Anchor::Backdrop {
+        2
+    } else {
+        0
+    };
+    if node.attrs.is_none() && anchor_bit != 0 && matches!(node.blob, BlobOp::Keep) {
         // A backdrop-anchored node without recorded facets is a HOLE.
         archive_upsert(conn, name, S_IFCHR, 0, 0, None, anchor_bit)?;
         // (A hole may still carry children in the model; the sqlar
         // variant's rows are per-name, so children import normally.)
     }
     if let Some(attrs) = &node.attrs {
-        let mode: u32 = parse_a(attrs, b"mode")
-            .ok_or_else(|| format!("{name}: node without mode attr"))?;
+        let mode: u32 =
+            parse_a(attrs, b"mode").ok_or_else(|| format!("{name}: node without mode attr"))?;
         let mtime: i64 = parse_a(attrs, b"mtime").unwrap_or(0);
         let ft = mode & 0o170000;
         let rowid = match (&node.blob, ft) {
-            (_, 0o040000) => {
-                archive_upsert(conn, name, mode, mtime, 0, None,
-                               node.opaque as i64 | anchor_bit)?
-            }
+            (_, 0o040000) => archive_upsert(
+                conn,
+                name,
+                mode,
+                mtime,
+                0,
+                None,
+                node.opaque as i64 | anchor_bit,
+            )?,
             (BlobOp::Set(t), 0o120000) => {
                 // Symlink: target inline, sz == len (the "not deflated" mark).
-                archive_upsert(conn, name, mode, mtime, t.len() as i64,
-                               Some(t), anchor_bit)?
+                archive_upsert(conn, name, mode, mtime, t.len() as i64, Some(t), anchor_bit)?
             }
             (BlobOp::Set(bytes), _) => {
                 // Regular file: bytes ALWAYS to the pool blob (D4).
-                let rid = archive_upsert(conn, name, mode, mtime,
-                                         bytes.len() as i64, None, anchor_bit)?;
+                let rid = archive_upsert(
+                    conn,
+                    name,
+                    mode,
+                    mtime,
+                    bytes.len() as i64,
+                    None,
+                    anchor_bit,
+                )?;
                 let bp = blob_path(box_id, rid);
                 if let Some(p) = bp.parent() {
                     std::fs::create_dir_all(p).map_err(|e| e.to_string())?;
@@ -916,17 +1086,20 @@ fn import_node(conn: &Connection, box_id: i64, name: &str,
         };
         let _ = rowid;
         if let (Some(uid), Some(gid)) =
-            (parse_a::<i64>(attrs, b"uid"), parse_a::<i64>(attrs, b"gid")) {
+            (parse_a::<i64>(attrs, b"uid"), parse_a::<i64>(attrs, b"gid"))
+        {
             let _ = conn.execute(
                 "INSERT INTO ownership(name,uid,gid) VALUES(?1,?2,?3)
                  ON CONFLICT(name) DO UPDATE SET uid=excluded.uid, gid=excluded.gid",
-                params![name, uid, gid]);
+                params![name, uid, gid],
+            );
         }
         if let Some(dev) = parse_a::<i64>(attrs, b"rdev") {
             let _ = conn.execute(
                 "INSERT INTO rdev(name,dev) VALUES(?1,?2)
                  ON CONFLICT(name) DO UPDATE SET dev=excluded.dev",
-                params![name, dev]);
+                params![name, dev],
+            );
         }
         for (k, v) in attrs {
             if let Some(xk) = k.strip_prefix(b"x:".as_slice()) {
@@ -934,7 +1107,8 @@ fn import_node(conn: &Connection, box_id: i64, name: &str,
                 let _ = conn.execute(
                     "INSERT INTO xattr(name,key,value) VALUES(?1,?2,?3)
                      ON CONFLICT(name,key) DO UPDATE SET value=excluded.value",
-                    params![name, xk, v]);
+                    params![name, xk, v],
+                );
             }
         }
     }
@@ -953,14 +1127,18 @@ fn import_node(conn: &Connection, box_id: i64, name: &str,
 /// inverse of `export_layer`; existing rows with the same names are
 /// replaced. The caller refreshes any live mirror afterwards
 /// (`load_mirror`/`reload_entry`).
-pub fn import_layer(conn: &Connection, box_id: i64,
-                    layer: &depot_model::Layer) -> Result<(), String> {
+pub fn import_layer(
+    conn: &Connection,
+    box_id: i64,
+    layer: &depot_model::Layer,
+) -> Result<(), String> {
     if layer.root.opaque {
         let _ = conn.execute(
             "INSERT INTO sqlar(name,mode,mtime,sz,data,opaque) \
              VALUES('',?1,0,0,NULL,1)
              ON CONFLICT(name) DO UPDATE SET opaque=1",
-            params![0o040755u32]);
+            params![0o040755u32],
+        );
     }
     import_node(conn, box_id, "", &layer.root)
 }
@@ -980,13 +1158,14 @@ mod tests {
     #[test]
     fn export_import_roundtrip_canonical() {
         let _g = TEST_STATE_HOME_LOCK.lock().unwrap();
-        let tmp = std::env::temp_dir()
-            .join(format!("sarun-depotrt-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("sarun-depotrt-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
         // SAFETY: serialized by TEST_STATE_HOME_LOCK with the other
         // state-home-dependent test.
-        unsafe { std::env::set_var("XDG_STATE_HOME", &tmp); }
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", &tmp);
+        }
         std::fs::create_dir_all(crate::paths::state_home()).unwrap();
 
         let src_id = 9101;
@@ -1034,7 +1213,8 @@ mod tests {
             export_layer(&conn, dst_id).unwrap()
         };
         assert_eq!(
-            codec::encode(&back), bytes,
+            codec::encode(&back),
+            bytes,
             "transfer through import lost fidelity"
         );
 
@@ -1043,18 +1223,22 @@ mod tests {
             let conn = dst.conn.lock().unwrap();
             archive_node(&conn, "dir/file.txt").unwrap()
         };
-        assert_eq!(std::fs::read(blob_path(dst_id, n.rowid)).unwrap(),
-                   b"contents");
+        assert_eq!(
+            std::fs::read(blob_path(dst_id, n.rowid)).unwrap(),
+            b"contents"
+        );
         assert_eq!(n.mtime, 1234);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
     fn fresh_box(label: &str) -> (BoxState, i64, std::path::PathBuf) {
-        let tmp = std::env::temp_dir()
-            .join(format!("sarun-depotblob-{}-{}", std::process::id(), label));
+        let tmp =
+            std::env::temp_dir().join(format!("sarun-depotblob-{}-{}", std::process::id(), label));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
-        unsafe { std::env::set_var("XDG_STATE_HOME", &tmp); }
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", &tmp);
+        }
         std::fs::create_dir_all(crate::paths::state_home()).unwrap();
         let id = 9201;
         let b = BoxState::create(id).unwrap();
@@ -1066,13 +1250,15 @@ mod tests {
         let _g = TEST_STATE_HOME_LOCK.lock().unwrap();
         let (b, _id, tmp) = fresh_box("write-ahead-log");
         let conn = b.conn.lock().unwrap();
-        let mode: String = conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
             .unwrap();
-        let limit: i64 = conn.query_row("PRAGMA journal_size_limit", [], |row| row.get(0))
+        let limit: i64 = conn
+            .query_row("PRAGMA journal_size_limit", [], |row| row.get(0))
             .unwrap();
-        let checkpoint_pages: i64 = conn.query_row(
-            "PRAGMA wal_autocheckpoint", [], |row| row.get(0),
-        ).unwrap();
+        let checkpoint_pages: i64 = conn
+            .query_row("PRAGMA wal_autocheckpoint", [], |row| row.get(0))
+            .unwrap();
         assert_eq!(mode, "wal");
         assert_eq!(limit, 64 * 1024 * 1024);
         assert_eq!(checkpoint_pages, 16 * 1024);
@@ -1085,16 +1271,21 @@ mod tests {
         let _g = TEST_STATE_HOME_LOCK.lock().unwrap();
         let (b, _id, tmp) = fresh_box("output-attribution-index");
         let conn = b.conn.lock().unwrap();
-        let mut plan = conn.prepare(
-            "EXPLAIN QUERY PLAN UPDATE outputs SET brush_pipeline_id=1 \
+        let mut plan = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN UPDATE outputs SET brush_pipeline_id=1 \
              WHERE ts >= 0.0 AND stream=1 AND brush_pipeline_id IS NOT 1",
-        ).unwrap();
-        let details: Vec<String> = plan.query_map([], |row| row.get(3))
+            )
+            .unwrap();
+        let details: Vec<String> = plan
+            .query_map([], |row| row.get(3))
             .unwrap()
             .map(Result::unwrap)
             .collect();
         assert!(
-            details.iter().any(|detail| detail.contains("idx_outputs_stream_ts")),
+            details
+                .iter()
+                .any(|detail| detail.contains("idx_outputs_stream_ts")),
             "output attribution plan does not use its index: {details:?}",
         );
         drop(plan);
@@ -1107,17 +1298,24 @@ mod tests {
         let _g = TEST_STATE_HOME_LOCK.lock().unwrap();
         let (b, _id, tmp) = fresh_box("recorder-read-isolation");
         let recorder = b.recorder_conn.lock().unwrap();
-        recorder.execute_batch(
-            "BEGIN IMMEDIATE; \
+        recorder
+            .execute_batch(
+                "BEGIN IMMEDIATE; \
              INSERT INTO brushprov(ts,cmd,record,pipeline) \
              VALUES(1.0,'pending','{}',0);",
-        ).unwrap();
-        let overlay = b.conn.try_lock()
+            )
+            .unwrap();
+        let overlay = b
+            .conn
+            .try_lock()
             .expect("recorder must not hold the overlay connection mutex");
-        let count: i64 = overlay.query_row(
-            "SELECT count(*) FROM brushprov", [], |row| row.get(0),
-        ).unwrap();
-        assert_eq!(count, 0, "overlay reader observed an uncommitted recorder row");
+        let count: i64 = overlay
+            .query_row("SELECT count(*) FROM brushprov", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "overlay reader observed an uncommitted recorder row"
+        );
         drop(overlay);
         recorder.execute_batch("ROLLBACK").unwrap();
         drop(recorder);
@@ -1180,11 +1378,18 @@ mod tests {
         add_file(&b, id, "tree/file", b"file");
         add_file(&b, id, "tree/deep/file", b"deep");
         b.set_whiteout("tree/gone", 2);
-        b.kinds.write().unwrap().insert("tree/hole".into(), Entry::Hole);
+        b.kinds
+            .write()
+            .unwrap()
+            .insert("tree/hole".into(), Entry::Hole);
 
         assert_eq!(
             sorted_children(&b, "tree"),
-            (vec!["gone".into()], vec!["file".into()], vec!["hole".into()]),
+            (
+                vec!["gone".into()],
+                vec!["file".into()],
+                vec!["hole".into()]
+            ),
             "a descendant must not become an immediate child",
         );
 
@@ -1260,34 +1465,53 @@ mod tests {
     fn build_edge_transitions_use_the_newest_indexed_graph() {
         let _g = TEST_STATE_HOME_LOCK.lock().unwrap();
         let (b, _id, tmp) = fresh_box("build-edge-index");
-        assert_eq!(b.add_build_edges(&[
-            (r#"["same"]"#.into(), "[]".into(), Some("same command".into())),
-            (r#"["same"]"#.into(), "[]".into(), Some("same command".into())),
-        ]), 2);
+        assert_eq!(
+            b.add_build_edges(&[
+                (
+                    r#"["same"]"#.into(),
+                    "[]".into(),
+                    Some("same command".into())
+                ),
+                (
+                    r#"["same"]"#.into(),
+                    "[]".into(),
+                    Some("same command".into())
+                ),
+            ]),
+            2
+        );
         let (old, current): (i64, i64) = {
             let conn = b.conn.lock().unwrap();
-            conn.query_row(
-                "SELECT min(id),max(id) FROM build_edges",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            ).unwrap()
+            conn.query_row("SELECT min(id),max(id) FROM build_edges", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap()
         };
 
         b.mark_build_edge_started(Some("same"), None, 10.0);
         b.mark_build_edge_done(Some("same"), None, 0, 20.0, Some("done"));
         let conn = b.conn.lock().unwrap();
-        let state = |id| conn.query_row(
-            "SELECT started_ts,ended_ts FROM build_edges WHERE id=?1", [id],
-            |row| Ok((row.get::<_, Option<f64>>(0)?,
-                      row.get::<_, Option<f64>>(1)?)),
-        ).unwrap();
+        let state = |id| {
+            conn.query_row(
+                "SELECT started_ts,ended_ts FROM build_edges WHERE id=?1",
+                [id],
+                |row| Ok((row.get::<_, Option<f64>>(0)?, row.get::<_, Option<f64>>(1)?)),
+            )
+            .unwrap()
+        };
         assert_eq!(state(old), (None, None));
         assert_eq!(state(current), (Some(10.0), Some(20.0)));
         for name in ["idx_build_edges_primary_out", "idx_build_edges_cmd"] {
-            assert_eq!(conn.query_row(
-                "SELECT count(*) FROM sqlite_master WHERE type='index' AND name=?1",
-                [name], |row| row.get::<_, i64>(0),
-            ).unwrap(), 1, "missing transition index {name}");
+            assert_eq!(
+                conn.query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type='index' AND name=?1",
+                    [name],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+                1,
+                "missing transition index {name}"
+            );
         }
         drop(conn);
         let _ = std::fs::remove_dir_all(&tmp);
@@ -1322,26 +1546,40 @@ mod tests {
         let (b, id, tmp) = fresh_box("symlink-replace");
 
         b.set_whiteout("link", 11);
-        b.set_symlink("link", std::path::Path::new("../../../scripts/syscall.tbl"), 12);
+        b.set_symlink(
+            "link",
+            std::path::Path::new("../../../scripts/syscall.tbl"),
+            12,
+        );
         {
             let conn = b.conn.lock().unwrap();
-            let (mode, data, last_writer): (u32, Vec<u8>, i64) = conn.query_row(
-                "SELECT mode,data,last_writer FROM sqlar WHERE name='link'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            ).unwrap();
-            assert_eq!(mode & 0o170000, 0o120000,
-                       "recreated symlink retained the whiteout type");
+            let (mode, data, last_writer): (u32, Vec<u8>, i64) = conn
+                .query_row(
+                    "SELECT mode,data,last_writer FROM sqlar WHERE name='link'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                mode & 0o170000,
+                0o120000,
+                "recreated symlink retained the whiteout type"
+            );
             assert_eq!(data, b"../../../scripts/syscall.tbl");
             assert_eq!(last_writer, 12);
         }
-        assert!(matches!(b.kinds.read().unwrap().get("link"),
-                         Some(Entry::Symlink { .. })));
+        assert!(matches!(
+            b.kinds.read().unwrap().get("link"),
+            Some(Entry::Symlink { .. })
+        ));
 
         let blob = add_file(&b, id, "file-to-link", b"stale blob");
         assert!(blob.exists());
         b.set_symlink("file-to-link", std::path::Path::new("target"), 13);
-        assert!(!blob.exists(), "replacing a file with a symlink orphaned its blob");
+        assert!(
+            !blob.exists(),
+            "replacing a file with a symlink orphaned its blob"
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

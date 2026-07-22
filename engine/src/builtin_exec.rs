@@ -45,7 +45,10 @@ impl ExecSubmitter {
     /// lossily decoded to `String` (brush command words are `String`s).
     pub fn submit(&self, argv: &[OsString], cwd: Option<PathBuf>) -> ExecTicket {
         let (reply, rx) = std::sync::mpsc::sync_channel(1);
-        let argv = argv.iter().map(|a| a.to_string_lossy().into_owned()).collect();
+        let argv = argv
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
         // If the executor is gone the send fails; the ticket then yields 127.
         let _ = self.tx.send(ExecRequest { argv, cwd, reply });
         ExecTicket { rx }

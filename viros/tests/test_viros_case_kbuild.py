@@ -180,6 +180,81 @@ class CaseKbuildTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, result.stdout)
 
+    def test_kernel_support_installs_external_tree_idempotently(self):
+        with tempfile.TemporaryDirectory(prefix="kernel-support-", dir=PROJECT) as raw:
+            work = Path(raw)
+            source = work / "linux"
+            (source / "kernel").mkdir(parents=True)
+            (source / "Makefile").write_text("VERSION = 5\n", encoding="utf-8")
+            (source / "Kconfig").write_text("mainmenu test\n", encoding="utf-8")
+            (source / "kernel/Makefile").write_text("", encoding="utf-8")
+            for _ in range(2):
+                result = subprocess.run(
+                    [str(PROJECT / "viros.sh"), "kernel-support", str(source)],
+                    cwd=work,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout)
+            support = source / "kernel/viros"
+            for name in (
+                "Kbuild",
+                "viros_scratch.S",
+                "viros_event.c",
+                "viros_event_abi.h",
+            ):
+                self.assertTrue((support / name).is_file(), name)
+            kernel_makefile = (source / "kernel/Makefile").read_text()
+            self.assertEqual(kernel_makefile.count("obj-y += viros/"), 1)
+            top_makefile = (source / "Makefile").read_text()
+            self.assertEqual(
+                top_makefile.count("# viros debugger workspace link anchor"), 1
+            )
+
+    def test_kernel_support_updates_the_requested_out_of_tree_config(self):
+        with tempfile.TemporaryDirectory(prefix="kernel-config-", dir=PROJECT) as raw:
+            work = Path(raw)
+            source = work / "linux"
+            scripts = source / "scripts"
+            (source / "kernel").mkdir(parents=True)
+            scripts.mkdir()
+            (source / "Makefile").write_text("VERSION = 5\n", encoding="utf-8")
+            (source / "Kconfig").write_text("mainmenu test\n", encoding="utf-8")
+            (source / "kernel/Makefile").write_text("", encoding="utf-8")
+            config = work / "output/.config"
+            config.parent.mkdir()
+            config.write_text("# test config\n", encoding="utf-8")
+            config_tool = scripts / "config"
+            config_tool.write_text(
+                "#!/bin/sh\n"
+                "printf '%s\\n' \"$@\" > \"$(dirname -- \"$0\")/config.calls\"\n",
+                encoding="utf-8",
+            )
+            config_tool.chmod(0o755)
+
+            result = subprocess.run(
+                [
+                    str(PROJECT / "viros.sh"),
+                    "kernel-support",
+                    str(source),
+                    str(config),
+                ],
+                cwd=work,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout)
+            arguments = (scripts / "config.calls").read_text(encoding="utf-8")
+            self.assertIn(f"--file\n{config.resolve()}\n", arguments)
+            for option in ("DEBUG_INFO", "GDB_SCRIPTS", "TRACEPOINTS"):
+                self.assertIn(f"--enable\n{option}\n", arguments)
+            for option in ("DEBUG_INFO_REDUCED", "DEBUG_INFO_SPLIT"):
+                self.assertIn(f"--disable\n{option}\n", arguments)
+
     def test_worker_preserves_failure_status_while_requesting_seed_retention(self):
         with tempfile.TemporaryDirectory(prefix="case-seed-", dir=PROJECT) as raw:
             work = Path(raw)
@@ -455,7 +530,7 @@ class CaseKbuildTests(unittest.TestCase):
                 "\n".join(
                     [
                         "format viros-case-kbuild-v2",
-                        "config_revision 1",
+                        "config_revision 2",
                         "target arm",
                         "linux_version 5.6.3",
                         "gpl_commit c3e110db1d35886c96ee14e16fc5a06bcac59692",
@@ -483,6 +558,9 @@ class CaseKbuildTests(unittest.TestCase):
                 setup_kernel_build_context() {
                     export ARCH=arm CROSS_COMPILE=fixture-
                 }
+                SCRIPT_DIR=$(dirname -- "$1")
+                printf 'debug_source_sha256 %s\n' "$(kernel_debug_source_hash)" >> \
+                    "$WORKDIR/retained/.viros-case-kbuild"
                 export VIROS_KBUILD_TMPFS_ACTIVE=1
                 export VIROS_KBUILD_RETAINED="$WORKDIR/retained"
                 export VIROS_KBUILD_EXPORT="$WORKDIR/module"

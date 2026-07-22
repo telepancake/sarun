@@ -16,7 +16,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// The read half of a CDP transport: blocking, one whole message per call,
 /// `Ok(None)` on clean close.
@@ -79,25 +79,27 @@ impl Cdp {
         let rinner = inner.clone();
         std::thread::Builder::new()
             .name("cdp-reader".into())
-            .spawn(move || loop {
-                match reader.recv() {
-                    Ok(Some(text)) => {
-                        let Ok(msg) = serde_json::from_str::<Value>(&text) else {
-                            continue; // ignore non-JSON noise
-                        };
-                        if let Some(id) = msg.get("id").and_then(Value::as_u64) {
-                            let tx = rinner.pending.lock().unwrap().remove(&id);
-                            if let Some(tx) = tx {
-                                let _ = tx.send(msg);
+            .spawn(move || {
+                loop {
+                    match reader.recv() {
+                        Ok(Some(text)) => {
+                            let Ok(msg) = serde_json::from_str::<Value>(&text) else {
+                                continue; // ignore non-JSON noise
+                            };
+                            if let Some(id) = msg.get("id").and_then(Value::as_u64) {
+                                let tx = rinner.pending.lock().unwrap().remove(&id);
+                                if let Some(tx) = tx {
+                                    let _ = tx.send(msg);
+                                }
+                            } else {
+                                rinner.events.lock().unwrap().push(msg);
+                                rinner.poke();
                             }
-                        } else {
-                            rinner.events.lock().unwrap().push(msg);
-                            rinner.poke();
                         }
-                    }
-                    Ok(None) | Err(_) => {
-                        rinner.fail_all();
-                        return;
+                        Ok(None) | Err(_) => {
+                            rinner.fail_all();
+                            return;
+                        }
                     }
                 }
             })
@@ -185,7 +187,9 @@ pub fn pipe_transport(
     let r = unsafe { std::fs::File::from_raw_fd(read_fd) };
     let w = unsafe { std::fs::File::from_raw_fd(write_fd) };
     (
-        Box::new(PipeReader { r: BufReader::new(r) }),
+        Box::new(PipeReader {
+            r: BufReader::new(r),
+        }),
         Box::new(PipeWriter { w }),
     )
 }
@@ -239,7 +243,7 @@ mod tests {
         assert_eq!(r.recv().unwrap().as_deref(), Some("{\"id\":2}"));
     }
 
-            // A mock transport backed by channels, so the client's correlation logic
+    // A mock transport backed by channels, so the client's correlation logic
     // is testable without a browser: the "server" reads what the client sent
     // and pushes replies/events back.
     struct MockReader {
@@ -328,7 +332,7 @@ mod tests {
     // client handshakes (Chromium's origin check accepts our no-Origin
     // request) and the CDP round-trip works. Ignored by default — needs a
     // browser; run with `--ignored`. Path via $CELLULOSE_BROWSER.
-        #[test]
+    #[test]
     fn call_fails_fast_once_closed() {
         let (cdp, to_client, _from_client) = mock_pair();
         drop(to_client); // server closes → reader sees None → fail_all

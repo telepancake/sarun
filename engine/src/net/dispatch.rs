@@ -12,13 +12,13 @@
 
 use std::sync::Arc;
 
+use super::ProxyHooks;
 use super::bridge::SmoltcpStream;
 use super::ca::Ca;
 use super::dns::DnsServer;
 use super::mitm::KeyLogFile;
 use super::prompt::{PromptQueue, Verdict};
 use super::stack::{AcceptedConn, StackRuntime};
-use super::ProxyHooks;
 
 pub struct Dispatcher {
     pub stack: Arc<StackRuntime>,
@@ -36,14 +36,30 @@ pub struct Dispatcher {
 
 impl Dispatcher {
     #[allow(clippy::too_many_arguments)]
-    pub fn start(stack: Arc<StackRuntime>, dns: Arc<DnsServer>,
-                 box_name: String, ca: Arc<Ca>, keylog: Arc<KeyLogFile>,
-                 upstream_tls: Arc<rustls::ClientConfig>,
-                 prompts: Arc<PromptQueue>,
-                 hooks: Option<Arc<ProxyHooks>>,
-                 rt: tokio::runtime::Handle) {
-        let Some(rx) = stack.take_accept_rx() else { return; };
-        let me = Self { stack, dns, box_name, ca, keylog, upstream_tls, prompts, hooks };
+    pub fn start(
+        stack: Arc<StackRuntime>,
+        dns: Arc<DnsServer>,
+        box_name: String,
+        ca: Arc<Ca>,
+        keylog: Arc<KeyLogFile>,
+        upstream_tls: Arc<rustls::ClientConfig>,
+        prompts: Arc<PromptQueue>,
+        hooks: Option<Arc<ProxyHooks>>,
+        rt: tokio::runtime::Handle,
+    ) {
+        let Some(rx) = stack.take_accept_rx() else {
+            return;
+        };
+        let me = Self {
+            stack,
+            dns,
+            box_name,
+            ca,
+            keylog,
+            upstream_tls,
+            prompts,
+            hooks,
+        };
         std::thread::Builder::new()
             .name("sarun-net-dispatch".into())
             .spawn(move || {
@@ -56,26 +72,39 @@ impl Dispatcher {
                     let up = me.upstream_tls.clone();
                     let prompts = me.prompts.clone();
                     let hooks = me.hooks.clone();
-                    rt.spawn(handle_conn(stack, dns, box_name, ca, keylog,
-                                          up, prompts, hooks, acc));
+                    rt.spawn(handle_conn(
+                        stack, dns, box_name, ca, keylog, up, prompts, hooks, acc,
+                    ));
                 }
-            }).expect("spawn dispatcher");
+            })
+            .expect("spawn dispatcher");
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn handle_conn(stack: Arc<StackRuntime>, dns: Arc<DnsServer>,
-                     box_name: String,
-                     ca: Arc<Ca>, keylog: Arc<KeyLogFile>,
-                     upstream_tls: Arc<rustls::ClientConfig>,
-                     prompts: Arc<PromptQueue>,
-                     hooks: Option<Arc<ProxyHooks>>,
-                     acc: AcceptedConn) {
-    let host = dns.host_for_ip(acc.dst_ip)
+async fn handle_conn(
+    stack: Arc<StackRuntime>,
+    dns: Arc<DnsServer>,
+    box_name: String,
+    ca: Arc<Ca>,
+    keylog: Arc<KeyLogFile>,
+    upstream_tls: Arc<rustls::ClientConfig>,
+    prompts: Arc<PromptQueue>,
+    hooks: Option<Arc<ProxyHooks>>,
+    acc: AcceptedConn,
+) {
+    let host = dns
+        .host_for_ip(acc.dst_ip)
         .unwrap_or_else(|| ipv4(acc.dst_ip));
     let port = acc.dst_port;
-    let scheme = if port == 443 { "https" } else if port == 80 { "http" }
-                 else { "tcp" }.to_string();
+    let scheme = if port == 443 {
+        "https"
+    } else if port == 80 {
+        "http"
+    } else {
+        "tcp"
+    }
+    .to_string();
 
     // ── policy gate ─────────────────────────────────────────────────────
     let subj = super::policy::NetSubject {
@@ -97,13 +126,16 @@ async fn handle_conn(stack: Arc<StackRuntime>, dns: Arc<DnsServer>,
             // Banner-prompt the user (deny-if-no-TUI is enforced inside
             // PromptQueue::ask). On AllowSave/DenySave persist a new rule
             // line to filerules so the next conn skips the banner.
-            let v = prompts.ask(box_name.clone(), host.clone(),
-                                port, scheme.clone()).await;
+            let v = prompts
+                .ask(box_name.clone(), host.clone(), port, scheme.clone())
+                .await;
             if v.is_persistent() {
-                let act = if v == Verdict::AllowSave { "apply" } else { "discard" };
-                if let Err(e) = prepend_rule_line(
-                    &format!("{act} host:{host}\n"))
-                {
+                let act = if v == Verdict::AllowSave {
+                    "apply"
+                } else {
+                    "discard"
+                };
+                if let Err(e) = prepend_rule_line(&format!("{act} host:{host}\n")) {
                     eprintln!("sarun-net: persist {act} host:{host}: {e}");
                 }
             }
@@ -154,7 +186,10 @@ fn prepend_rule_line(line: &str) -> std::io::Result<()> {
     let tmp = dir.join("filerules.tmp");
     {
         let mut f = std::fs::OpenOptions::new()
-            .create(true).truncate(true).write(true).open(&tmp)?;
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&tmp)?;
         f.write_all(line.as_bytes())?;
         f.write_all(prev.as_bytes())?;
         // Best-effort durability: the atomic rename below is what guarantees a

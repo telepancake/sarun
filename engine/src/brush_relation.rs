@@ -32,9 +32,7 @@ mod tests {
         let mut parser = brush_parser::Parser::new(reader, &options);
         match parser.parse_program() {
             Ok(_) => "complete",
-            Err(brush_parser::ParseError::Tokenizing { inner, .. })
-                if inner.is_incomplete() =>
-            {
+            Err(brush_parser::ParseError::Tokenizing { inner, .. }) if inner.is_incomplete() => {
                 "incomplete"
             }
             Err(brush_parser::ParseError::ParsingAtEndOfInput) => "incomplete",
@@ -44,10 +42,9 @@ mod tests {
 
     #[test]
     fn reference_corpus_pins_shell_parse_status() {
-        let cases: Vec<ReferenceCase> = serde_json::from_str(include_str!(
-            "../testdata/brush_relation_reference.json"
-        ))
-        .expect("valid Brush relation reference corpus");
+        let cases: Vec<ReferenceCase> =
+            serde_json::from_str(include_str!("../testdata/brush_relation_reference.json"))
+                .expect("valid Brush relation reference corpus");
         assert!(cases.len() >= 14);
         for case in &cases {
             assert_eq!(

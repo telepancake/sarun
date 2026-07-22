@@ -12,7 +12,9 @@
 pub const CLASS_E_PREFIX: u8 = 0b1111_0000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct BoxSubnet { pub id: u16 } // 12 bits valid
+pub struct BoxSubnet {
+    pub id: u16,
+} // 12 bits valid
 
 impl BoxSubnet {
     pub fn new(id: u16) -> Self {
@@ -21,8 +23,8 @@ impl BoxSubnet {
     }
 
     fn octets_prefix(self) -> (u8, u8) {
-        let hi = (self.id >> 8) as u8 & 0x0F;   // 4 bits
-        let lo = (self.id & 0xff) as u8;        // 8 bits
+        let hi = (self.id >> 8) as u8 & 0x0F; // 4 bits
+        let lo = (self.id & 0xff) as u8; // 8 bits
         (CLASS_E_PREFIX | hi, lo)
     }
 
@@ -36,26 +38,31 @@ impl BoxSubnet {
         [a, b, 0, 2]
     }
 
-    pub fn netmask(self) -> [u8; 4] { [255, 255, 0, 0] }
+    pub fn netmask(self) -> [u8; 4] {
+        [255, 255, 0, 0]
+    }
 
     /// /30 — what the BOX's kernel sees on the TAP. With only .0.1 (gw)
     /// and .0.2 (box) in the subnet, anything else (including synth pool
     /// IPs) routes via the default route → gateway → engine. Without this
     /// the box would believe synth IPs are on-link and try to ARP them
     /// directly (and smoltcp won't proxy-ARP for the whole /16).
-    pub fn box_prefix_len(self) -> u8 { 30 }
+    pub fn box_prefix_len(self) -> u8 {
+        30
+    }
 
     /// Yield synth-pool addresses .1.0 .. .255.254 (skipping .1.255 etc. broadcasts
     /// would be over-engineered: the /16 has one bcast at .255.255 and we just
     /// avoid the entire .0.* row reserved for gateway/box).
     pub fn synth_ip(self, idx: u32) -> Option<[u8; 4]> {
         // 65280 usable slots: .1.0 to .255.255 minus one bcast → just exclude .255.255.
-        if idx >= 65279 { return None; }
+        if idx >= 65279 {
+            return None;
+        }
         let off = idx + 256; // skip .0.*
         let (a, b) = self.octets_prefix();
         Some([a, b, (off >> 8) as u8, (off & 0xff) as u8])
     }
-
 }
 
 #[cfg(test)]

@@ -284,8 +284,8 @@ mod tests {
                 resolved = Some(reply);
                 break;
             }
-            let graph = crate::prolog::context_query_nodes_from_values(&reply.context_queries)
-                .unwrap();
+            let graph =
+                crate::prolog::context_query_nodes_from_values(&reply.context_queries).unwrap();
             let observations =
                 crate::parser::execute_context_graph(prolog, &graph, &crate::parser::EmptyContext)
                     .unwrap()

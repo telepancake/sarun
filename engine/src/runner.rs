@@ -19,7 +19,7 @@
 use std::io::BufRead;
 use std::io::BufReader;
 use std::io::Write;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
@@ -62,13 +62,12 @@ pub fn engine_connection() -> std::io::Result<UnixStream> {
         // before constructing the guest environment: neither the integer nor
         // the descriptor has meaning across the VM boundary.
         unsafe { std::env::remove_var("SARUN_ENGINE_FD") };
-        let fd = value
-            .to_string_lossy()
-            .parse::<i32>()
-            .map_err(|_| std::io::Error::new(
+        let fd = value.to_string_lossy().parse::<i32>().map_err(|_| {
+            std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "invalid inherited Sarun engine descriptor",
-            ))?;
+            )
+        })?;
         if fd < 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -82,7 +81,10 @@ pub fn engine_connection() -> std::io::Result<UnixStream> {
         use std::os::fd::FromRawFd;
         return Ok(unsafe { UnixStream::from_raw_fd(fd) });
     }
-    match std::env::var("SARUN_BROKER").ok().filter(|value| !value.is_empty()) {
+    match std::env::var("SARUN_BROKER")
+        .ok()
+        .filter(|value| !value.is_empty())
+    {
         Some(name) => broker_dial(&name),
         None => UnixStream::connect(paths::sock_path()),
     }
@@ -94,7 +96,9 @@ pub fn engine_connection() -> std::io::Result<UnixStream> {
 // paths::shadow_*_glob_path() for the config files that drive it.
 
 /// pidfd_open, exposed for the brush module (same capture/MUTE wiring).
-pub fn pidfd_open_pub(pid: i32) -> i32 { pidfd_open(pid) }
+pub fn pidfd_open_pub(pid: i32) -> i32 {
+    pidfd_open(pid)
+}
 
 /// D9 nested-shell provenance: the brush-sh shim (see brush::brush_sh) sends ONE
 /// newline-terminated JSON line to the engine, carrying ITS OWN pidfd as
@@ -114,19 +118,31 @@ pub fn send_nested_prov(line: &[u8]) {
     let broker = std::env::var("SARUN_BROKER").ok().filter(|s| !s.is_empty());
     let conn = match broker {
         Some(name) => {
-            let Ok(c) = broker_dial(&name) else { return; };
+            let Ok(c) = broker_dial(&name) else {
+                return;
+            };
             c
         }
         None => {
-            let Ok(sock) = std::env::var("SARUN_SUD_PROV") else { return; };
-            if sock.is_empty() { return; }
-            let Ok(c) = UnixStream::connect(&sock) else { return; };
+            let Ok(sock) = std::env::var("SARUN_SUD_PROV") else {
+                return;
+            };
+            if sock.is_empty() {
+                return;
+            }
+            let Ok(c) = UnixStream::connect(&sock) else {
+                return;
+            };
             c
         }
     };
     let pidfd = pidfd_open(std::process::id() as i32);
     send_register(&conn, line, pidfd, None);
-    if pidfd >= 0 { unsafe { libc::close(pidfd); } }
+    if pidfd >= 0 {
+        unsafe {
+            libc::close(pidfd);
+        }
+    }
     // Drain the engine's one-line ack (best-effort) so it isn't an abrupt RST.
     let mut s = String::new();
     let _ = BufReader::new(&conn).read_line(&mut s);
@@ -138,14 +154,15 @@ pub fn send_frame_pub(conn_fd: i32, frame: &[u8], pidfd: Option<i32>) {
 
 /// recv_box_frame_bytes, exposed for the brush + pty readers so their
 /// channel pump can pick up an SCM_RIGHTS-attached fd from FRAME_CONN.
-pub fn recv_box_frame_bytes_pub(raw: i32, buf: &mut [u8],
-                                fd: &mut Option<i32>) -> isize {
+pub fn recv_box_frame_bytes_pub(raw: i32, buf: &mut [u8], fd: &mut Option<i32>) -> isize {
     recv_box_frame_bytes(raw, buf, fd)
 }
 
 /// runner_broker_handoff, exposed for the brush + pty readers so they
 /// can complete the FD broker handshake.
-pub fn runner_broker_handoff_pub(fd: i32) { runner_broker_handoff(fd) }
+pub fn runner_broker_handoff_pub(fd: i32) {
+    runner_broker_handoff(fd)
+}
 
 /// Send one register line plus our own pidfd as SCM_RIGHTS ancillary data, so
 /// the engine derives our HOST-namespace pid from /proc/self/fdinfo/<pidfd>
@@ -156,21 +173,166 @@ fn send_register(conn: &UnixStream, line: &[u8], pidfd: i32, tap_fd: Option<i32>
     send_register_fds(conn, line, pidfd, tap_fd, None, None, None)
 }
 
+/// Runner-owned endpoints for the trusted in-process filesystem transport of
+/// one FUSE Brush box. The engine receives duplicates of `ring` and
+/// `lane_engine` during registration; only `ring` and `lane_client` enter the
+/// box, and `inner` adopts them before starting Brush.
+struct DirectFsLaunch {
+    ring: crate::sud_ring::RingMapping,
+    lane_engine: Option<OwnedFd>,
+    lane_client: OwnedFd,
+}
+
+impl DirectFsLaunch {
+    fn create() -> std::io::Result<Self> {
+        let ring = crate::sud_ring::RingMapping::create()?;
+        let mut lanes = [-1; 2];
+        if unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+                0,
+                lanes.as_mut_ptr(),
+            )
+        } < 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self {
+            ring,
+            lane_engine: Some(unsafe { OwnedFd::from_raw_fd(lanes[0]) }),
+            lane_client: unsafe { OwnedFd::from_raw_fd(lanes[1]) },
+        })
+    }
+
+    fn registration_fds(&self) -> (i32, i32) {
+        (
+            self.ring.as_raw_fd(),
+            self.lane_engine
+                .as_ref()
+                .expect("registration endpoint is still present")
+                .as_raw_fd(),
+        )
+    }
+
+    fn registration_complete(&mut self) {
+        self.lane_engine.take();
+    }
+
+    fn client_fds(&self) -> (i32, i32) {
+        (self.ring.as_raw_fd(), self.lane_client.as_raw_fd())
+    }
+}
+
+fn duplicate_outside_direct_fs_abi(fd: i32) -> std::io::Result<i32> {
+    // Keep an accidentally allocated reserved descriptor open while retrying;
+    // F_DUPFD_CLOEXEC then advances past it. At most both reserved positions
+    // can be encountered before a safe descriptor is returned.
+    let mut held = [-1; 2];
+    let mut held_count = 0;
+    loop {
+        let copy = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
+        if copy < 0 {
+            let error = std::io::Error::last_os_error();
+            for held in held.into_iter().take(held_count) {
+                unsafe { libc::close(held) };
+            }
+            return Err(error);
+        }
+        if copy != crate::sud_ring::RING_FD && copy != crate::sud_ring::FD_LANE_FD {
+            for held in held.into_iter().take(held_count) {
+                unsafe { libc::close(held) };
+            }
+            return Ok(copy);
+        }
+        held[held_count] = copy;
+        held_count += 1;
+    }
+}
+
+/// Install the two transport descriptors at the ABI positions shared with the
+/// SUD client. Copy both sources away from those positions first so neither
+/// dup2 can overwrite the other source, without assuming a large RLIMIT_NOFILE.
+fn install_direct_fs_descriptors(ring: i32, lane: i32) -> std::io::Result<()> {
+    let ring_copy = duplicate_outside_direct_fs_abi(ring)?;
+    let lane_copy = match duplicate_outside_direct_fs_abi(lane) {
+        Ok(copy) => copy,
+        Err(error) => {
+            unsafe { libc::close(ring_copy) };
+            return Err(error);
+        }
+    };
+    let result = unsafe {
+        libc::dup2(ring_copy, crate::sud_ring::RING_FD) >= 0
+            && libc::dup2(lane_copy, crate::sud_ring::FD_LANE_FD) >= 0
+    };
+    let error = (!result).then(std::io::Error::last_os_error);
+    unsafe {
+        libc::close(ring_copy);
+        libc::close(lane_copy);
+    }
+    error.map_or(Ok(()), Err)
+}
+
+#[cfg(test)]
+mod direct_fs_launch_tests {
+    use super::*;
+
+    #[test]
+    fn launch_builds_a_valid_shared_ring_and_seqpacket_lane() {
+        let launch = DirectFsLaunch::create().unwrap();
+        let duplicate = launch.ring.duplicate_fd().unwrap();
+        crate::sud_ring::RingMapping::from_fd(duplicate).unwrap();
+
+        let engine = launch.lane_engine.as_ref().unwrap().as_raw_fd();
+        let client = launch.lane_client.as_raw_fd();
+        for packet in [b"first".as_slice(), b"second".as_slice()] {
+            assert_eq!(
+                unsafe { libc::send(engine, packet.as_ptr().cast(), packet.len(), 0) },
+                packet.len() as isize
+            );
+        }
+        let mut received = [0u8; 16];
+        for packet in [b"first".as_slice(), b"second".as_slice()] {
+            let length =
+                unsafe { libc::recv(client, received.as_mut_ptr().cast(), received.len(), 0) };
+            assert_eq!(length, packet.len() as isize);
+            assert_eq!(&received[..length as usize], packet);
+        }
+    }
+}
+
 /// Like send_register but with an ORDERED extra-fd tail after the pidfd:
 /// fd[0] = pidfd, then the TAP fd (tap boxes), then the sud trace-pipe fd,
 /// then the SUD filesystem ring and exceptional descriptor lane
 /// (sud boxes). The engine (recv_first_fd + register) assigns roles from the
 /// same want_sud/net_mode it reads out of `line`, so the order must match:
 /// [pidfd, tap?, trace?, ring?, lane?].
-fn send_register_fds(conn: &UnixStream, line: &[u8], pidfd: i32,
-                     tap_fd: Option<i32>, trace_fd: Option<i32>,
-                     ring_fd: Option<i32>, lane_fd: Option<i32>) -> bool {
+fn send_register_fds(
+    conn: &UnixStream,
+    line: &[u8],
+    pidfd: i32,
+    tap_fd: Option<i32>,
+    trace_fd: Option<i32>,
+    ring_fd: Option<i32>,
+    lane_fd: Option<i32>,
+) -> bool {
     let mut fds: Vec<i32> = Vec::with_capacity(5);
-    if pidfd >= 0 { fds.push(pidfd); }
-    if let Some(t) = tap_fd { fds.push(t); }
-    if let Some(t) = trace_fd { fds.push(t); }
-    if let Some(r) = ring_fd { fds.push(r); }
-    if let Some(l) = lane_fd { fds.push(l); }
+    if pidfd >= 0 {
+        fds.push(pidfd);
+    }
+    if let Some(t) = tap_fd {
+        fds.push(t);
+    }
+    if let Some(t) = trace_fd {
+        fds.push(t);
+    }
+    if let Some(r) = ring_fd {
+        fds.push(r);
+    }
+    if let Some(l) = lane_fd {
+        fds.push(l);
+    }
     if fds.is_empty() {
         return conn_write_all(conn, line);
     }
@@ -196,8 +358,7 @@ fn send_register_fds(conn: &UnixStream, line: &[u8], pidfd: i32,
         (*c).cmsg_level = libc::SOL_SOCKET;
         (*c).cmsg_type = libc::SCM_RIGHTS;
         (*c).cmsg_len = libc::CMSG_LEN(nbytes) as _;
-        std::ptr::copy_nonoverlapping(
-            fds.as_ptr().cast(), libc::CMSG_DATA(c), nbytes as usize);
+        std::ptr::copy_nonoverlapping(fds.as_ptr().cast(), libc::CMSG_DATA(c), nbytes as usize);
         libc::sendmsg(conn.as_raw_fd(), &msg, 0)
     };
     if sent < 0 {
@@ -212,11 +373,163 @@ fn conn_write_all(conn: &UnixStream, data: &[u8]) -> bool {
     c.write_all(data).is_ok()
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ServiceRelayMode {
+    Accept,
+    Dial,
+}
+
+fn service_relay_connection(
+    mut conn: UnixStream,
+    mode: ServiceRelayMode,
+    name: &str,
+) -> std::io::Result<UnixStream> {
+    use crate::generated_wire::{
+        ConnectionMode, RequestEnvelope, ServiceAcceptFrame, TransportRequest, TransportResponse,
+    };
+    let name = crate::wire::BoundedText::new(name.to_owned()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "service name exceeds the protocol bound",
+        )
+    })?;
+    let request = match mode {
+        ServiceRelayMode::Accept => TransportRequest::ServiceAccept { name },
+        ServiceRelayMode::Dial => TransportRequest::ServiceDial { name },
+    };
+    crate::socket_wire::write_request(&mut conn, &RequestEnvelope::Transport(request))?;
+    match (mode, crate::socket_wire::read_mode(&mut conn)?) {
+        (ServiceRelayMode::Accept, ConnectionMode::ServiceAccept) => {
+            let paired: ServiceAcceptFrame = crate::socket_wire::read_atom(&mut conn)?;
+            if paired != ServiceAcceptFrame::Paired {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "unexpected service accept frame",
+                ));
+            }
+        }
+        (ServiceRelayMode::Dial, ConnectionMode::RawService) => {}
+        (
+            _,
+            ConnectionMode::Reply {
+                response: TransportResponse::Error { message, .. },
+            },
+        ) => {
+            return Err(std::io::Error::other(message.into_inner()));
+        }
+        (_, other) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("unexpected service connection mode {other:?}"),
+            ));
+        }
+    }
+    Ok(conn)
+}
+
+/// Turn stdin/stdout into one authenticated named Sarun service stream.
+/// Resource selection never enters this interface: NAME is the engine-issued
+/// runtime session identity or an ordinary declared service name.
+pub fn service_relay(mode: ServiceRelayMode, name: &str) -> i32 {
+    let conn = match engine_connection().and_then(|conn| service_relay_connection(conn, mode, name))
+    {
+        Ok(conn) => conn,
+        Err(error) => {
+            eprintln!("sarun service: {error}");
+            return 1;
+        }
+    };
+    let mut input = match conn.try_clone() {
+        Ok(conn) => conn,
+        Err(error) => {
+            eprintln!("sarun service: clone stream: {error}");
+            return 1;
+        }
+    };
+    let input_worker = std::thread::spawn(move || {
+        let _ = std::io::copy(&mut std::io::stdin().lock(), &mut input);
+        let _ = input.shutdown(std::net::Shutdown::Write);
+    });
+    let mut output = conn;
+    let copied = std::io::copy(&mut output, &mut std::io::stdout().lock());
+    let _ = output.shutdown(std::net::Shutdown::Read);
+    let _ = input_worker.join();
+    match copied {
+        Ok(_) => 0,
+        Err(error) => {
+            eprintln!("sarun service: {error}");
+            1
+        }
+    }
+}
+
+/// Record the fixed provider and interactive client entry points of a named
+/// service on the authenticated enclosing box.
+fn service_declare_connection(
+    mut conn: UnixStream,
+    name: &str,
+    provider: &str,
+    client: &str,
+) -> std::io::Result<()> {
+    use crate::generated_wire::{
+        ConnectionMode, RequestEnvelope, TransportRequest, TransportResponse,
+    };
+    let request = (|| -> std::io::Result<TransportRequest> {
+        let name = crate::wire::BoundedText::new(name.to_owned())
+            .map_err(|_| std::io::Error::other("service name exceeds the protocol bound"))?;
+        let argv = crate::wire::BoundedVec::new(vec![
+            crate::wire::BoundedBytes::new(provider.as_bytes().to_vec()).map_err(|_| {
+                std::io::Error::other("provider entry point exceeds the protocol bound")
+            })?,
+        ])
+        .map_err(|_| std::io::Error::other("provider command exceeds the protocol bound"))?;
+        let client_argv = crate::wire::BoundedVec::new(vec![
+            crate::wire::BoundedBytes::new(client.as_bytes().to_vec()).map_err(|_| {
+                std::io::Error::other("client entry point exceeds the protocol bound")
+            })?,
+        ])
+        .map_err(|_| std::io::Error::other("client command exceeds the protocol bound"))?;
+        Ok(TransportRequest::ServiceDeclare {
+            name,
+            argv,
+            client_argv,
+            net_mode: None,
+        })
+    })();
+    crate::socket_wire::write_request(&mut conn, &RequestEnvelope::Transport(request?))?;
+    match crate::socket_wire::read_mode(&mut conn)? {
+        ConnectionMode::Reply {
+            response: TransportResponse::Empty,
+        } => Ok(()),
+        ConnectionMode::Reply {
+            response: TransportResponse::Error { message, .. },
+        } => Err(std::io::Error::other(message.into_inner())),
+        other => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("unexpected service declaration mode {other:?}"),
+        )),
+    }
+}
+
+pub fn service_declare(name: &str, provider: &str, client: &str) -> i32 {
+    let result = engine_connection()
+        .and_then(|conn| service_declare_connection(conn, name, provider, client));
+    match result {
+        Ok(()) => 0,
+        Err(error) => {
+            eprintln!("sarun service declare: {error}");
+            1
+        }
+    }
+}
+
 fn provenance(cmd: &[String], full_env: bool) -> Value {
     let exe = std::fs::read_link("/proc/self/exe")
-        .map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
     let cwd = std::env::current_dir()
-        .map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
     let mut v = json!({
         "tgid": std::process::id(),
         "ppid": unsafe { libc::getppid() },
@@ -225,7 +538,9 @@ fn provenance(cmd: &[String], full_env: bool) -> Value {
     // -e: send our full HOST env so the box's ROOT process row has it even when
     // the engine can't /proc-read our tgid (a nested runner). Mirrors the Python
     // runner's read_provenance(full_env=True).
-    if full_env { v["env"] = self_environ(); }
+    if full_env {
+        v["env"] = self_environ();
+    }
     v
 }
 
@@ -235,7 +550,9 @@ fn self_environ() -> Value {
     let raw = std::fs::read("/proc/self/environ").unwrap_or_default();
     let mut map = serde_json::Map::new();
     for kv in raw.split(|b| *b == 0) {
-        if kv.is_empty() { continue; }
+        if kv.is_empty() {
+            continue;
+        }
         let s = String::from_utf8_lossy(kv);
         if let Some((k, v)) = s.split_once('=') {
             map.insert(k.to_string(), json!(v));
@@ -247,7 +564,9 @@ fn self_environ() -> Value {
 fn clear_cloexec(fd: i32) {
     unsafe {
         let f = libc::fcntl(fd, libc::F_GETFD);
-        if f >= 0 { libc::fcntl(fd, libc::F_SETFD, f & !libc::FD_CLOEXEC); }
+        if f >= 0 {
+            libc::fcntl(fd, libc::F_SETFD, f & !libc::FD_CLOEXEC);
+        }
     }
 }
 
@@ -261,15 +580,17 @@ fn clear_cloexec(fd: i32) {
 fn write_all_fd(fd: i32, data: &[u8]) -> bool {
     let mut off = 0usize;
     while off < data.len() {
-        let n = unsafe {
-            libc::write(fd, data[off..].as_ptr().cast(), data.len() - off)
-        };
+        let n = unsafe { libc::write(fd, data[off..].as_ptr().cast(), data.len() - off) };
         if n < 0 {
             let e = std::io::Error::last_os_error();
-            if e.raw_os_error() == Some(libc::EINTR) { continue; }
+            if e.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
             return false; // real write error (EPIPE, EBADF, …)
         }
-        if n == 0 { return false; } // no progress: treat as EOF
+        if n == 0 {
+            return false;
+        } // no progress: treat as EOF
         off += n as usize;
     }
     true
@@ -304,11 +625,18 @@ fn tty_give(tty_fd: Option<i32>, child_pid: i32) -> Option<libc::sighandler_t> {
 }
 
 /// Restore the saved foreground pgrp + SIGTTOU handler after the child exits.
-fn tty_restore(tty_fd: Option<i32>, old_fg: Option<i32>,
-               old_ttou: Option<libc::sighandler_t>) {
+fn tty_restore(tty_fd: Option<i32>, old_fg: Option<i32>, old_ttou: Option<libc::sighandler_t>) {
     if let Some(fd) = tty_fd {
-        if let Some(fg) = old_fg { unsafe { libc::tcsetpgrp(fd, fg); } }
-        if let Some(h) = old_ttou { unsafe { libc::signal(libc::SIGTTOU, h); } }
+        if let Some(fg) = old_fg {
+            unsafe {
+                libc::tcsetpgrp(fd, fg);
+            }
+        }
+        if let Some(h) = old_ttou {
+            unsafe {
+                libc::signal(libc::SIGTTOU, h);
+            }
+        }
     }
 }
 
@@ -337,8 +665,13 @@ pub fn prepare_tap_or_reexec() -> Result<(), anyhow::Error> {
             crate::net::tap::keep_prepared_tap(tap);
             Ok(())
         }
-        Err(error) if error.downcast_ref::<crate::net::tap::EarlyUserNamespaceRequired>()
-            .is_some() => reexec_for_early_tap(),
+        Err(error)
+            if error
+                .downcast_ref::<crate::net::tap::EarlyUserNamespaceRequired>()
+                .is_some() =>
+        {
+            reexec_for_early_tap()
+        }
         Err(error) => Err(error),
     }
 }
@@ -348,11 +681,20 @@ fn create_runner_tap() -> Result<std::os::fd::OwnedFd, anyhow::Error> {
     crate::net::tap::create_netns_tap()
 }
 
-pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
-           pty: bool, brush: bool, api: bool,
-           no_parent: bool, readonly_parent: bool, chdir: Option<String>,
-           net_mode: crate::net::NetMode,
-           cmd: Vec<String>) -> i32 {
+pub fn run(
+    name: Option<String>,
+    passthrough: bool,
+    direct: bool,
+    env: bool,
+    pty: bool,
+    brush: bool,
+    api: bool,
+    no_parent: bool,
+    readonly_parent: bool,
+    chdir: Option<String>,
+    net_mode: crate::net::NetMode,
+    cmd: Vec<String>,
+) -> i32 {
     // Note: an EMPTY cmd is no longer fatal here — when the parent chain
     // carries an OCI image config, we fall back to the image's
     // Entrypoint + Cmd after the register ack returns. A non-OCI box with
@@ -362,8 +704,10 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
     // here rather than letting the box fall through to a plain /bin/sh run (the
     // D9 no-silent-downgrade rule applies at selection time too).
     if brush && direct {
-        eprintln!("sarun-engine run: -b (brush shell) is incompatible with -d \
-                   (no overlay to capture provenance/writes into).");
+        eprintln!(
+            "sarun-engine run: -b (brush shell) is incompatible with -d \
+                   (no overlay to capture provenance/writes into)."
+        );
         return 2;
     }
     // -t passthrough suppresses output capture; -d direct has no overlay so no
@@ -372,8 +716,7 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
     // even under -t (but never under -d: there is no overlay to capture into).
     // -b brush also wants capture (so provenance frames + writes are recorded),
     // mirroring -p; never under -d (no overlay to capture/provenance into).
-    let want_capture = (!passthrough && !direct) || (pty && !direct)
-        || (brush && !direct);
+    let want_capture = (!passthrough && !direct) || (pty && !direct) || (brush && !direct);
     // IN-BOX vs HOST: presence of SARUN_BROKER is the sole in-box signal.
     // bwrap propagates SARUN_BROKER to every box child; the parent inner
     // serves it as an abstract UDS, so the FD broker is reachable from
@@ -389,8 +732,10 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
     let conn = match engine_connection() {
         Ok(c) => c,
         Err(_) => {
-            eprintln!("sarun-engine: no engine running (control socket {}).",
-                      sock.display());
+            eprintln!(
+                "sarun-engine: no engine running (control socket {}).",
+                sock.display()
+            );
             return 3;
         }
     };
@@ -444,28 +789,63 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
     // unshare(CLONE_NEWNET) moves THIS process into the fresh netns; bwrap,
     // spawned later WITHOUT --unshare-net, inherits it. Fail LOUD on error —
     // never silently fall through to some other network.
-    let tap_fd: Option<std::os::fd::OwnedFd> =
-        if net_mode == crate::net::NetMode::Tap {
-            match create_runner_tap() {
-                Ok(fd) => Some(fd),
-                Err(e) => {
-                    eprintln!("sarun-engine: tap setup failed: {e}");
-                    eprintln!("hint: tap now self-acquires netns privileges via \
+    let tap_fd: Option<std::os::fd::OwnedFd> = if net_mode == crate::net::NetMode::Tap {
+        match create_runner_tap() {
+            Ok(fd) => Some(fd),
+            Err(e) => {
+                eprintln!("sarun-engine: tap setup failed: {e}");
+                eprintln!(
+                    "hint: tap now self-acquires netns privileges via \
                                an unprivileged user namespace, so this is most \
                                likely /dev/net/tun being root-only — `ls -l \
                                /dev/net/tun` should be crw-rw-rw- (0666); \
-                               otherwise pass `--net host` (-N) or `--net off`");
-                    return 1;
-                }
+                               otherwise pass `--net host` (-N) or `--net off`"
+                );
+                return 1;
             }
-        } else { None };
+        }
+    } else {
+        None
+    };
+    // A FUSE Brush box gets a userspace path to the same scoped SarunFs. No
+    // option or environment marker selects this: the existing backend + Brush
+    // registration is the capability boundary.
+    let mut direct_fs = if brush {
+        match DirectFsLaunch::create() {
+            Ok(launch) => Some(launch),
+            Err(error) => {
+                eprintln!("sarun-engine: direct Brush filesystem transport: {error}");
+                return 1;
+            }
+        }
+    } else {
+        None
+    };
     let pidfd = pidfd_open(std::process::id() as i32);
     let tap_raw = tap_fd.as_ref().map(|f| f.as_raw_fd());
-    if !send_register(&conn, format!("{reg}\n").as_bytes(), pidfd, tap_raw) {
+    let direct_registration = direct_fs.as_ref().map(DirectFsLaunch::registration_fds);
+    if !send_register_fds(
+        &conn,
+        format!("{reg}\n").as_bytes(),
+        pidfd,
+        tap_raw,
+        None,
+        direct_registration.map(|(ring, _)| ring),
+        direct_registration.map(|(_, lane)| lane),
+    ) {
         eprintln!("sarun-engine: register write failed");
         return 1;
     }
-    if pidfd >= 0 { unsafe { libc::close(pidfd); } }
+    if let Some(launch) = direct_fs.as_mut() {
+        // SCM_RIGHTS has duplicated this endpoint into the engine. Keeping a
+        // runner copy would hide an unexpected engine-side lane closure.
+        launch.registration_complete();
+    }
+    if pidfd >= 0 {
+        unsafe {
+            libc::close(pidfd);
+        }
+    }
     // The engine dup'd the TAP fd via SCM_RIGHTS; close our copy (the device
     // stays alive on the engine's fd + our netns).
     drop(tap_fd);
@@ -475,16 +855,36 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
         return 1;
     }
     let ack: Value = match serde_json::from_str(&line) {
-        Ok(v) => v, Err(_) => { eprintln!("sarun-engine: bad ack"); return 1; }
+        Ok(v) => v,
+        Err(_) => {
+            eprintln!("sarun-engine: bad ack");
+            return 1;
+        }
     };
     if ack.get("ok").and_then(Value::as_bool) != Some(true) {
-        eprintln!("sarun-engine: {}",
-                  ack.get("error").and_then(Value::as_str).unwrap_or("register failed"));
+        eprintln!(
+            "sarun-engine: {}",
+            ack.get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("register failed")
+        );
         return 1;
     }
-    let mount = ack.get("mount").and_then(Value::as_str).unwrap_or("").to_string();
-    let sid = ack.get("session_id").and_then(Value::as_str).unwrap_or("?").to_string();
-    let _box_name_str = ack.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+    let mount = ack
+        .get("mount")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let sid = ack
+        .get("session_id")
+        .and_then(Value::as_str)
+        .unwrap_or("?")
+        .to_string();
+    let _box_name_str = ack
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
     // Pulled up so `inner_args` (built earlier) can pass `--api` straight
     // to the inner; the later `--api` block re-uses this same value.
     let api_on = ack.get("api").and_then(Value::as_bool).unwrap_or(false);
@@ -497,16 +897,26 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
     //   * the image's Env is unioned INTO the inherited host env (entries
     //     in the image win on collision)
     let oci_runtime = ack.get("oci").cloned();
-    let oci_cwd = oci_runtime.as_ref()
-        .and_then(|o| o.get("cwd")).and_then(Value::as_str)
+    let oci_cwd = oci_runtime
+        .as_ref()
+        .and_then(|o| o.get("cwd"))
+        .and_then(Value::as_str)
         .map(String::from)
         .filter(|s| !s.is_empty());
-    let oci_env: Vec<String> = oci_runtime.as_ref()
-        .and_then(|o| o.get("env")).and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+    let oci_env: Vec<String> = oci_runtime
+        .as_ref()
+        .and_then(|o| o.get("env"))
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
-    let oci_user = oci_runtime.as_ref()
-        .and_then(|o| o.get("user")).and_then(Value::as_str)
+    let oci_user = oci_runtime
+        .as_ref()
+        .and_then(|o| o.get("user"))
+        .and_then(Value::as_str)
         .map(String::from)
         .filter(|s| !s.is_empty());
     // Working directory: -C wins, else the image's WorkingDir, else a default
@@ -518,31 +928,43 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
     //   * has host visibility (a plain host-rooted box) → the runner's own cwd,
     //     so `sarun run -- cmd` behaves like a shell: it runs where you are.
     let no_host_box = ack.get("no_host").and_then(Value::as_bool).unwrap_or(false);
-    let cwd = chdir
-        .or(oci_cwd)
-        .unwrap_or_else(|| {
-            if no_host_box {
-                "/".to_string()
-            } else {
-                std::env::current_dir()
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .unwrap_or_else(|_| "/".into())
-            }
-        });
+    let cwd = chdir.or(oci_cwd).unwrap_or_else(|| {
+        if no_host_box {
+            "/".to_string()
+        } else {
+            std::env::current_dir()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| "/".into())
+        }
+    });
     // No-cmd path: pull Entrypoint + Cmd from the image config and use it.
     let cmd = if cmd.is_empty() {
-        let mut combined: Vec<String> = oci_runtime.as_ref()
-            .and_then(|o| o.get("entrypoint")).and_then(Value::as_array)
-            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        let mut combined: Vec<String> = oci_runtime
+            .as_ref()
+            .and_then(|o| o.get("entrypoint"))
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default();
-        let oci_cmd: Vec<String> = oci_runtime.as_ref()
-            .and_then(|o| o.get("cmd")).and_then(Value::as_array)
-            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        let oci_cmd: Vec<String> = oci_runtime
+            .as_ref()
+            .and_then(|o| o.get("cmd"))
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default();
         combined.extend(oci_cmd);
         if combined.is_empty() {
-            eprintln!("sarun-engine: no command given (and the image config \
-                       has neither Entrypoint nor Cmd to fall back on).");
+            eprintln!(
+                "sarun-engine: no command given (and the image config \
+                       has neither Entrypoint nor Cmd to fall back on)."
+            );
             return 2;
         }
         combined
@@ -556,18 +978,22 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
     let fd = conn.as_raw_fd();
     clear_cloexec(fd);
     let self_exe = std::env::current_exe()
-        .map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| "sarun-engine".into());
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "sarun-engine".into());
     // Root: a top-level box binds its overlay by host path (<mnt>/<id>); a
     // NESTED box can't reach that path inside the parent, so it binds the
     // parent-exposed synthetic /<KIDS_DIR>/<id> (served by the same overlay,
     // routing to this child's real root). Both bind a directory bwrap holds
     // CAP_SYS_ADMIN over inside its own userns — no ambient caps needed.
-    let root_src = if in_box { format!("/{KIDS_DIR}/{sid}") } else { mount.clone() };
+    let root_src = if in_box {
+        format!("/{KIDS_DIR}/{sid}")
+    } else {
+        mount.clone()
+    };
     let fd_s = fd.to_string();
     // Honor the engine's capture decision (it downgrades for -t/-d): only pass
     // --capture to inner when the ack confirms capture is active.
-    let capture_on = want_capture
-        && ack.get("capture").and_then(Value::as_bool).unwrap_or(false);
+    let capture_on = want_capture && ack.get("capture").and_then(Value::as_bool).unwrap_or(false);
     // Ferry the engine binary into the box as an INHERITED fd and exec it as
     // /proc/self/fd/N (fexecve-style) — no bind mount, no /run/sarun tmpfs. A
     // bind needed an engine-owned mountpoint under the box root, and that tmpfs
@@ -579,28 +1005,40 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
     // start, with nothing engine-owned bound inside the box.
     let bin_fd = unsafe {
         libc::open(
-            std::ffi::CString::new(self_exe.as_bytes()).unwrap().as_ptr(),
-            libc::O_RDONLY | libc::O_CLOEXEC)
+            std::ffi::CString::new(self_exe.as_bytes())
+                .unwrap()
+                .as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC,
+        )
     };
     if bin_fd < 0 {
-        eprintln!("sarun-engine: open engine binary {self_exe}: {}",
-                  std::io::Error::last_os_error());
+        eprintln!(
+            "sarun-engine: open engine binary {self_exe}: {}",
+            std::io::Error::last_os_error()
+        );
         return 1;
     }
     clear_cloexec(bin_fd);
     let inner_exe = format!("/proc/self/fd/{bin_fd}");
-    let mut inner_args: Vec<&str> = vec![
-        inner_exe.as_str(), "inner", "--conn-fd", &fd_s];
-    if capture_on { inner_args.push("--capture"); }
+    let mut inner_args: Vec<&str> = vec![inner_exe.as_str(), "inner", "--conn-fd", &fd_s];
+    if capture_on {
+        inner_args.push("--capture");
+    }
     // PTY needs the capture sink files to record into; if the engine declined
     // capture (-d) there is nothing to PTY into, so gate --pty on capture_on.
-    if pty && capture_on { inner_args.push("--pty"); }
+    if pty && capture_on {
+        inner_args.push("--pty");
+    }
     // -b brush likewise needs the capture sinks to record provenance + writes.
-    if brush && capture_on { inner_args.push("--brush"); }
+    if brush && capture_on {
+        inner_args.push("--brush");
+    }
     // --api passes through to inner so an in-box `oaita` client knows to reach
     // the engine's LLM proxy by dialing the FD broker (SARUN_BROKER abstract
     // UDS) per call — no in-box socket node, no host UDS, attribution implicit.
-    if api_on { inner_args.push("--api"); }
+    if api_on {
+        inner_args.push("--api");
+    }
     inner_args.push("--");
     // A top-level FUSE runner is already root in the broker's complete
     // subordinate-ID namespace. Do not ask bwrap to select a uid in that case:
@@ -608,14 +1046,25 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
     // namespace.
     let canonical_id_map = crate::fuse_broker::runner_has_canonical_id_map();
     let mut bwrap = Command::new("bwrap");
-    bwrap.args(["--bind", &root_src, "/",
-                "--proc", "/proc", "--dev", "/dev",
-                // Expose the TUN device node so a NESTED box can build its own
-                // TAP netns the same way a top-level runner does (it creates the
-                // TAP inside its own network namespace — netns isolation means
-                // this grants no host reach). --dev-bind-try: harmless if absent.
-                "--dev-bind-try", "/dev/net/tun", "/dev/net/tun",
-                "--ro-bind-try", "/sys", "/sys"]);
+    bwrap.args([
+        "--bind",
+        &root_src,
+        "/",
+        "--proc",
+        "/proc",
+        "--dev",
+        "/dev",
+        // Expose the TUN device node so a NESTED box can build its own
+        // TAP netns the same way a top-level runner does (it creates the
+        // TAP inside its own network namespace — netns isolation means
+        // this grants no host reach). --dev-bind-try: harmless if absent.
+        "--dev-bind-try",
+        "/dev/net/tun",
+        "/dev/net/tun",
+        "--ro-bind-try",
+        "/sys",
+        "/sys",
+    ]);
     // /tmp policy: non-api boxes get the bwrap-private tmpfs (clean
     // isolation, but nothing written there ever reaches the overlay —
     // apply/inspect can't see it, the model's strongest write-target
@@ -637,8 +1086,7 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
         let p = crate::paths::oaita_state_home().join(".tmp").join(&key);
         let _ = std::fs::create_dir_all(&p);
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&p,
-            std::fs::Permissions::from_mode(0o700));
+        let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700));
     } else {
         bwrap.args(["--tmpfs", "/tmp"]);
     }
@@ -700,7 +1148,8 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
     // keeps us safe rather than crashing on a non-numeric User.
     let mut box_uid = None;
     if let Some(u) = &oci_user {
-        let (uid, gid) = u.split_once(':')
+        let (uid, gid) = u
+            .split_once(':')
             .map(|(a, b)| (a, Some(b)))
             .unwrap_or((u.as_str(), None));
         if let Ok(uid_n) = uid.parse::<u32>() {
@@ -723,7 +1172,9 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
         bwrap.args(["--uid", "0", "--gid", "0"]);
         box_uid = Some(0);
     }
-    if box_uid.is_none() { box_uid = Some(0); }
+    if box_uid.is_none() {
+        box_uid = Some(0);
+    }
     if box_uid == Some(0) {
         bwrap.args(["--cap-add", "ALL"]);
     }
@@ -743,20 +1194,32 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
         // on its re-exec — not an env marker.
         bwrap.args(["--setenv", "OPENAI_BASE_URL", "http://oaita-proxy/v1"]);
     }
-    bwrap.args(["--unshare-pid", "--unshare-ipc", "--unshare-uts",
-                "--die-with-parent"]);
+    bwrap.args([
+        "--unshare-pid",
+        "--unshare-ipc",
+        "--unshare-uts",
+        "--die-with-parent",
+    ]);
     // Netns dispatch:
     //   Off  → bwrap --unshare-net  (brand new empty netns; dials fail closed)
     //   Tap  → WE already unshare(CLONE_NEWNET)'d above (create_netns_tap) and
     //          handed the engine the TAP fd, so this process is ALREADY in the
     //          equipped netns. bwrap must NOT --unshare-net — it inherits ours.
     //   Host → no --unshare-net (box shares the launcher's netns).
-    let _dns_ip = ack.get("dns_ip").and_then(Value::as_str)
-        .map(|s| s.to_string()).unwrap_or_default();
-    let ca_pem = ack.get("ca_pem").and_then(Value::as_str)
-        .map(|s| s.to_string()).unwrap_or_default();
+    let _dns_ip = ack
+        .get("dns_ip")
+        .and_then(Value::as_str)
+        .map(|s| s.to_string())
+        .unwrap_or_default();
+    let ca_pem = ack
+        .get("ca_pem")
+        .and_then(Value::as_str)
+        .map(|s| s.to_string())
+        .unwrap_or_default();
     match net_mode {
-        crate::net::NetMode::Off => { bwrap.arg("--unshare-net"); }
+        crate::net::NetMode::Off => {
+            bwrap.arg("--unshare-net");
+        }
         crate::net::NetMode::Host => { /* leave the launcher's netns */ }
         crate::net::NetMode::Tap => { /* already in our own TAP netns */ }
     }
@@ -769,10 +1232,19 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
     // anything). Non-loopback proxy values are kept — they may be
     // reachable through the tap.
     if net_mode == crate::net::NetMode::Tap {
-        for k in ["http_proxy", "https_proxy", "ftp_proxy", "all_proxy",
-                  "HTTP_PROXY", "HTTPS_PROXY", "FTP_PROXY", "ALL_PROXY"] {
-            if std::env::var(k).is_ok_and(|v| v.contains("127.0.0.")
-                || v.contains("localhost") || v.contains("[::1]")) {
+        for k in [
+            "http_proxy",
+            "https_proxy",
+            "ftp_proxy",
+            "all_proxy",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "FTP_PROXY",
+            "ALL_PROXY",
+        ] {
+            if std::env::var(k).is_ok_and(|v| {
+                v.contains("127.0.0.") || v.contains("localhost") || v.contains("[::1]")
+            }) {
                 bwrap.env_remove(k);
             }
         }
@@ -791,11 +1263,13 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
         // that look up SSL_CERT_FILE / CURL_CA_BUNDLE / etc resolve to
         // it.
         let canonical_inside = "/etc/ssl/certs/ca-certificates.crt";
-        for (k, v) in [("SSL_CERT_FILE", canonical_inside),
-                       ("CURL_CA_BUNDLE", canonical_inside),
-                       ("NODE_EXTRA_CA_CERTS", canonical_inside),
-                       ("REQUESTS_CA_BUNDLE", canonical_inside),
-                       ("GIT_SSL_CAINFO", canonical_inside)] {
+        for (k, v) in [
+            ("SSL_CERT_FILE", canonical_inside),
+            ("CURL_CA_BUNDLE", canonical_inside),
+            ("NODE_EXTRA_CA_CERTS", canonical_inside),
+            ("REQUESTS_CA_BUNDLE", canonical_inside),
+            ("GIT_SSL_CAINFO", canonical_inside),
+        ] {
             bwrap.args(["--setenv", k, v]);
         }
     }
@@ -803,17 +1277,221 @@ pub fn run(name: Option<String>, passthrough: bool, direct: bool, env: bool,
     // overlay synthesizes "nameserver <dns_ip>\n" when the box reads
     // /etc/resolv.conf. No bwrap bind required.
     bwrap.args(["--chdir", &cwd, "--"]);
+    if let Some(launch) = direct_fs.as_ref() {
+        let (ring, lane) = launch.client_fds();
+        unsafe {
+            bwrap.pre_exec(move || install_direct_fs_descriptors(ring, lane));
+        }
+    }
     let status = bwrap.args(&inner_args).args(&cmd).status();
     drop(conn); // our copy; inner (in the box) is the channel's sole holder now
     match status {
         Ok(s) => s.code().unwrap_or(1),
-        Err(e) => { eprintln!("sarun-engine: bwrap failed: {e}"); 1 }
+        Err(e) => {
+            eprintln!("sarun-engine: bwrap failed: {e}");
+            1
+        }
     }
 }
 
 /// Architecture appliance runner. Registration and the PID-1 control channel
 /// are both generated binary values; Prolog participates only when another
 /// representation is requested, never in this hot transport path.
+fn finish_qemu_box_channel(conn: &UnixStream) {
+    let _ = conn.shutdown(std::net::Shutdown::Write);
+    let mut drain = conn;
+    let mut bytes = [0u8; 64];
+    loop {
+        match std::io::Read::read(&mut drain, &mut bytes) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+    }
+}
+
+fn nested_debug_supported(mode: crate::generated_wire::DebugMode) -> Result<(), &'static str> {
+    if mode == crate::generated_wire::DebugMode::Off {
+        Ok(())
+    } else {
+        Err("--debug is not supported for nested appliances")
+    }
+}
+
+fn receive_registration_descriptor(
+    conn: &UnixStream,
+    expected_kind: u8,
+) -> std::io::Result<std::os::fd::OwnedFd> {
+    receive_registration_descriptor_frame(
+        conn,
+        &crate::frames::encode(expected_kind, &[]),
+        expected_kind,
+    )
+}
+
+fn receive_registration_descriptor_frame(
+    conn: &UnixStream,
+    expected: &[u8],
+    expected_kind: u8,
+) -> std::io::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd;
+
+    let mut bytes = vec![0u8; expected.len()];
+    let mut used = 0;
+    let mut received_fd = None;
+    while used < bytes.len() {
+        let count = recv_box_frame_bytes(conn.as_raw_fd(), &mut bytes[used..], &mut received_fd);
+        if count <= 0 {
+            if let Some(fd) = received_fd {
+                unsafe { libc::close(fd) };
+            }
+            return Err(if count == 0 {
+                std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "registration descriptor channel closed",
+                )
+            } else {
+                std::io::Error::last_os_error()
+            });
+        }
+        used += count as usize;
+    }
+    let fd = received_fd.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "registration frame omitted its descriptor",
+        )
+    })?;
+    let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+    if bytes != expected {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("unexpected registration descriptor frame {expected_kind}"),
+        ));
+    }
+    Ok(owned)
+}
+
+#[cfg(test)]
+mod qemu_debug_tests {
+    use super::nested_debug_supported;
+    use crate::generated_wire::DebugMode;
+
+    #[test]
+    fn nested_appliances_reject_debug_mode() {
+        assert!(nested_debug_supported(DebugMode::Off).is_ok());
+        assert_eq!(
+            nested_debug_supported(DebugMode::AttachBeforeCommand),
+            Err("--debug is not supported for nested appliances"),
+        );
+    }
+}
+
+#[cfg(test)]
+mod service_relay_tests {
+    use super::{ServiceRelayMode, service_declare_connection, service_relay_connection};
+    use crate::generated_wire::{
+        ConnectionMode, RequestEnvelope, ServiceAcceptFrame, TransportRequest, TransportResponse,
+    };
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+
+    #[test]
+    fn accept_waits_for_typed_pairing_before_returning_raw_stream() {
+        let (client, mut engine) = UnixStream::pair().unwrap();
+        let worker = std::thread::spawn(move || {
+            let request = crate::socket_wire::read_request(&mut engine).unwrap();
+            assert!(matches!(
+                request,
+                RequestEnvelope::Transport(TransportRequest::ServiceAccept { ref name })
+                    if name.as_str() == "viros-debug-session-7"
+            ));
+            crate::socket_wire::write_mode(&mut engine, &ConnectionMode::ServiceAccept).unwrap();
+            crate::socket_wire::write_atom(&mut engine, &ServiceAcceptFrame::Paired).unwrap();
+            engine.write_all(b"gdb").unwrap();
+        });
+        let mut raw =
+            service_relay_connection(client, ServiceRelayMode::Accept, "viros-debug-session-7")
+                .unwrap();
+        let mut bytes = [0u8; 3];
+        raw.read_exact(&mut bytes).unwrap();
+        assert_eq!(&bytes, b"gdb");
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn dial_switches_to_raw_mode_without_text_acknowledgement() {
+        let (client, mut engine) = UnixStream::pair().unwrap();
+        let worker = std::thread::spawn(move || {
+            let request = crate::socket_wire::read_request(&mut engine).unwrap();
+            assert!(matches!(
+                request,
+                RequestEnvelope::Transport(TransportRequest::ServiceDial { ref name })
+                    if name.as_str() == "viros-debug-session-9"
+            ));
+            crate::socket_wire::write_mode(&mut engine, &ConnectionMode::RawService).unwrap();
+            engine.write_all(b"rsp").unwrap();
+        });
+        let mut raw =
+            service_relay_connection(client, ServiceRelayMode::Dial, "viros-debug-session-9")
+                .unwrap();
+        let mut bytes = [0u8; 3];
+        raw.read_exact(&mut bytes).unwrap();
+        assert_eq!(&bytes, b"rsp");
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn declare_records_fixed_provider_and_client_entrypoints() {
+        let (client, mut engine) = UnixStream::pair().unwrap();
+        let worker = std::thread::spawn(move || {
+            let request = crate::socket_wire::read_request(&mut engine).unwrap();
+            match request {
+                RequestEnvelope::Transport(TransportRequest::ServiceDeclare {
+                    name,
+                    argv,
+                    client_argv,
+                    net_mode,
+                }) => {
+                    assert_eq!(name.as_str(), "viros-debug");
+                    assert_eq!(argv.as_slice()[0].as_slice(), b"/opt/viros/viros-facade");
+                    assert_eq!(
+                        client_argv.as_slice()[0].as_slice(),
+                        b"/opt/viros/viros-gdb-managed"
+                    );
+                    assert_eq!(net_mode, None);
+                }
+                other => panic!("unexpected service declaration: {other:?}"),
+            }
+            crate::socket_wire::write_mode(
+                &mut engine,
+                &ConnectionMode::Reply {
+                    response: TransportResponse::Empty,
+                },
+            )
+            .unwrap();
+        });
+        service_declare_connection(
+            client,
+            "viros-debug",
+            "/opt/viros/viros-facade",
+            "/opt/viros/viros-gdb-managed",
+        )
+        .unwrap();
+        worker.join().unwrap();
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SelectedBootInput {
+    Image {
+        image: (String, String),
+    },
+    KernelInitramfs {
+        kernel: (String, String),
+        initramfs: (String, String),
+    },
+}
+
 pub fn run_qemu(
     architecture: crate::generated_wire::QemuArchitecture,
     name: Option<String>,
@@ -823,6 +1501,8 @@ pub fn run_qemu(
     chdir: Option<String>,
     net_mode: crate::net::NetMode,
     brush: bool,
+    debug_mode: crate::generated_wire::DebugMode,
+    selected_boot: Option<SelectedBootInput>,
     cmd: Vec<String>,
 ) -> i32 {
     use crate::generated_wire::{
@@ -836,8 +1516,19 @@ pub fn run_qemu(
         return 2;
     }
     if let Some(broker) = std::env::var("SARUN_APPLIANCE_BROKER")
-        .ok().filter(|value| !value.is_empty())
+        .ok()
+        .filter(|value| !value.is_empty())
     {
+        if selected_boot.is_some() {
+            eprintln!(
+                "sarun-engine run --qemu: selected boot artifacts must be launched by the host engine"
+            );
+            return 2;
+        }
+        if let Err(error) = nested_debug_supported(debug_mode) {
+            eprintln!("sarun-engine run --qemu: {error}");
+            return 2;
+        }
         let request = match crate::appliance::wire_nested_request(
             architecture,
             name,
@@ -863,12 +1554,13 @@ pub fn run_qemu(
             }
         };
     }
+    let debug_requested = debug_mode == crate::generated_wire::DebugMode::AttachBeforeCommand;
     let inherited_parent = std::env::var_os("SARUN_ENGINE_PARENT").is_some();
     if inherited_parent {
         unsafe { std::env::remove_var("SARUN_ENGINE_PARENT") };
     }
-    let in_box = inherited_parent
-        || std::env::var("SARUN_BROKER").is_ok_and(|value| !value.is_empty());
+    let in_box =
+        inherited_parent || std::env::var("SARUN_BROKER").is_ok_and(|value| !value.is_empty());
     // Consume a host-inherited nested connection before `wire_command`
     // snapshots the environment for the guest.
     let conn = match engine_connection() {
@@ -888,6 +1580,7 @@ pub fn run_qemu(
         chdir.as_deref(),
         net_mode,
         brush,
+        debug_mode,
     ) {
         Ok(value) => value,
         Err(error) => {
@@ -907,9 +1600,8 @@ pub fn run_qemu(
             ppid: unsafe { libc::getppid() },
             executable,
             cwd,
-            argv: crate::wire::BoundedVec::new(
-                appliance_command.command.as_slice().to_vec(),
-            ).expect("a validated appliance command fits the looser provenance bound"),
+            argv: crate::wire::BoundedVec::new(appliance_command.command.as_slice().to_vec())
+                .expect("a validated appliance command fits the looser provenance bound"),
             environment: env.then(|| appliance_command.environment.clone()),
         },
         (Err(error), _) | (_, Err(error)) => {
@@ -948,14 +1640,52 @@ pub fn run_qemu(
     } else {
         (None, None)
     };
+    let selected_artifact = |(r#box, path): (String, String), role: &str| {
+        let r#box = match crate::wire::BoundedText::new(r#box) {
+            Ok(value) => value,
+            Err(error) => {
+                eprintln!(
+                    "sarun-engine run --qemu: {role} box selector exceeds relation bound: {error:?}"
+                );
+                return Err(());
+            }
+        };
+        let path = match crate::wire::BoundedBytes::new(path.into_bytes()) {
+            Ok(value) => value,
+            Err(error) => {
+                eprintln!("sarun-engine run --qemu: {role} path exceeds relation bound: {error:?}");
+                return Err(());
+            }
+        };
+        Ok(crate::generated_wire::SelectedArtifact { r#box, path })
+    };
+    let selected_boot = match selected_boot {
+        Some(SelectedBootInput::Image { image }) => {
+            let Ok(image) = selected_artifact(image, "image") else {
+                return 2;
+            };
+            Some(crate::generated_wire::SelectedBoot::Image { image })
+        }
+        Some(SelectedBootInput::KernelInitramfs { kernel, initramfs }) => {
+            let Ok(kernel) = selected_artifact(kernel, "kernel") else {
+                return 2;
+            };
+            let Ok(initramfs) = selected_artifact(initramfs, "initramfs") else {
+                return 2;
+            };
+            Some(crate::generated_wire::SelectedBoot::KernelInitramfs { kernel, initramfs })
+        }
+        None => None,
+    };
     let request = RequestEnvelope::Transport(TransportRequest::Register {
-        command: crate::wire::BoundedVec::new(
-            appliance_command.command.as_slice().to_vec(),
-        ).expect("a validated appliance command fits the looser register bound"),
+        command: crate::wire::BoundedVec::new(appliance_command.command.as_slice().to_vec())
+            .expect("a validated appliance command fits the looser register bound"),
         provenance,
         name,
         backend: RunBackend::Qemu,
         architecture: Some(architecture),
+        debug_mode,
+        selected_boot,
         net_mode: wire_net_mode,
         capture: true,
         direct: false,
@@ -1008,32 +1738,69 @@ pub fn run_qemu(
             return 1;
         }
     };
+    let debug_image_start = registration.debug_image.clone();
     if registration.virtiofs_socket.is_none() {
         eprintln!("sarun-engine run --qemu: engine omitted the virtio-fs socket");
         return 1;
     }
-    let mut descriptor_frame = [0u8; 64];
-    let mut virtiofs_fd = None;
-    let received = recv_box_frame_bytes(
-        conn.as_raw_fd(),
-        &mut descriptor_frame,
-        &mut virtiofs_fd,
-    );
-    let descriptor_valid = received > 0 && {
-        let (frames, used) = crate::frames::decode(&descriptor_frame[..received as usize]);
-        used == received as usize
-            && frames.len() == 1
-            && frames[0].0 == crate::frames::FRAME_APPLIANCE_FS
-    };
-    let Some(virtiofs_fd) = virtiofs_fd.filter(|_| descriptor_valid) else {
-        if let Some(fd) = virtiofs_fd {
-            unsafe { libc::close(fd) };
+    let virtiofs = match receive_registration_descriptor(&conn, crate::frames::FRAME_APPLIANCE_FS) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("sarun-engine run --qemu: virtio-fs descriptor: {error}");
+            return 1;
         }
-        eprintln!("sarun-engine run --qemu: engine omitted the virtio-fs descriptor");
-        return 1;
     };
-    let virtiofs = unsafe {
-        <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(virtiofs_fd)
+    let debug = if debug_requested {
+        let kernel = receive_registration_descriptor(&conn, crate::frames::FRAME_DEBUG_KERNEL);
+        let rsp = receive_registration_descriptor(&conn, crate::frames::FRAME_DEBUG_RSP);
+        let image = debug_image_start.map(|start| {
+            use crate::wire::WireValue;
+            let mut payload = Vec::new();
+            start
+                .encode_atom(&mut payload)
+                .expect("a generated fixed image profile is encodable");
+            let expected = crate::frames::encode(crate::frames::FRAME_DEBUG_IMAGE, &payload);
+            receive_registration_descriptor_frame(
+                &conn,
+                &expected,
+                crate::frames::FRAME_DEBUG_IMAGE,
+            )
+            .and_then(|initramfs| {
+                let init = String::from_utf8(start.init.as_slice().to_vec()).map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "debug image init path is not UTF-8",
+                    )
+                })?;
+                Ok(crate::debug_session::DebugGuestImage::from_registration(
+                    initramfs,
+                    start.profile,
+                    init,
+                ))
+            })
+        });
+        match (kernel, rsp, image.transpose()) {
+            (Ok(kernel), Ok(rsp), Ok(image)) => Some(
+                crate::debug_session::DebugSessionResources::from_registration(
+                    kernel,
+                    UnixStream::from(rsp),
+                    image,
+                ),
+            ),
+            (kernel, rsp, image) => {
+                let error = kernel
+                    .err()
+                    .or_else(|| rsp.err())
+                    .or_else(|| image.err())
+                    .unwrap();
+                eprintln!("sarun-engine run --qemu: debug descriptors: {error}");
+                drop(virtiofs);
+                finish_qemu_box_channel(&conn);
+                return 2;
+            }
+        }
+    } else {
+        None
     };
     let result = match crate::appliance::run(
         architecture,
@@ -1047,6 +1814,7 @@ pub fn run_qemu(
                 return 1;
             }
         },
+        debug,
     ) {
         Ok(code) => code,
         Err(error) => {
@@ -1059,15 +1827,7 @@ pub fn run_qemu(
     // box before returning to the caller. Without this barrier an immediate
     // same-name rerun could race the engine reader and report a dead box as
     // still running.
-    let _ = conn.shutdown(std::net::Shutdown::Write);
-    let mut drain = &conn;
-    let mut bytes = [0u8; 64];
-    loop {
-        match std::io::Read::read(&mut drain, &mut bytes) {
-            Ok(0) | Err(_) => break,
-            Ok(_) => {}
-        }
-    }
+    finish_qemu_box_channel(&conn);
     result
 }
 
@@ -1087,14 +1847,17 @@ const SUD_STATE_FD: i32 = 1022;
 /// Resolve `cmd0` through PATH like sudtrace's build_wrapper_argv (only
 /// used for probing the target — the wrapper gets the user's argv).
 fn sud_resolve_target(cmd0: &str) -> String {
-    if cmd0.contains('/') { return cmd0.to_string(); }
-    let pathenv = std::env::var("PATH")
-        .unwrap_or_else(|_| "/usr/bin:/bin".into());
+    if cmd0.contains('/') {
+        return cmd0.to_string();
+    }
+    let pathenv = std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into());
     for seg in pathenv.split(':').filter(|s| !s.is_empty()) {
         let cand = format!("{seg}/{cmd0}");
         if unsafe {
-            libc::access(std::ffi::CString::new(cand.as_bytes())
-                .unwrap().as_ptr(), libc::X_OK) == 0
+            libc::access(
+                std::ffi::CString::new(cand.as_bytes()).unwrap().as_ptr(),
+                libc::X_OK,
+            ) == 0
         } {
             return cand;
         }
@@ -1113,15 +1876,19 @@ fn sud_shebang(path: &str) -> Option<(String, Option<String>)> {
         let n = f.read(&mut buf).ok()?;
         buf[..n].to_vec()
     };
-    if head.len() < 3 || &head[..2] != b"#!" { return None; }
-    let line_end = head.iter().position(|b| *b == b'\n')
-        .unwrap_or(head.len());
+    if head.len() < 3 || &head[..2] != b"#!" {
+        return None;
+    }
+    let line_end = head.iter().position(|b| *b == b'\n').unwrap_or(head.len());
     let line = String::from_utf8_lossy(&head[2..line_end]).into_owned();
     let line = line.trim_matches(|c| c == ' ' || c == '\t' || c == '\r');
     let mut it = line.splitn(2, [' ', '\t']);
     let interp = it.next()?.to_string();
-    if interp.is_empty() { return None; }
-    let arg = it.next()
+    if interp.is_empty() {
+        return None;
+    }
+    let arg = it
+        .next()
         .map(|a| a.trim_matches(|c| c == ' ' || c == '\t' || c == '\r'))
         .filter(|a| !a.is_empty())
         .map(String::from);
@@ -1131,18 +1898,25 @@ fn sud_shebang(path: &str) -> Option<(String, Option<String>)> {
 /// ELF class of `path`: 1 = 32-bit, 2 = 64-bit, 0 = not readable/ELF.
 fn sud_elf_class(path: &str) -> u8 {
     use std::io::Read;
-    let Ok(mut f) = std::fs::File::open(path) else { return 0 };
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return 0;
+    };
     let mut e = [0u8; 5];
-    if f.read_exact(&mut e).is_err() { return 0; }
-    if &e[..4] != b"\x7fELF" { return 0; }
+    if f.read_exact(&mut e).is_err() {
+        return 0;
+    }
+    if &e[..4] != b"\x7fELF" {
+        return 0;
+    }
     e[4]
 }
 
 /// /proc/<pid>/status field parse with sudtrace's fallbacks
 /// (tgid → pid, ppid → 0) — reaped pids read back absent.
 fn sud_proc_field(pid: i32, field: &str, fallback: i32) -> i32 {
-    let Ok(s) = std::fs::read_to_string(format!("/proc/{pid}/status"))
-        else { return fallback };
+    let Ok(s) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
+        return fallback;
+    };
     s.lines()
         .find_map(|l| l.strip_prefix(field))
         .and_then(|v| v.trim().parse::<i32>().ok())
@@ -1158,16 +1932,23 @@ fn sud_proc_field(pid: i32, field: &str, fallback: i32) -> i32 {
 /// the filesystem session.
 ///
 /// The body is orchestration only; each labelled step is a named helper below.
-pub fn run_sud(name: Option<String>, env: bool, chdir: Option<String>,
-               net_mode: crate::net::NetMode, brush: bool,
-               cmd: Vec<String>) -> i32 {
+pub fn run_sud(
+    name: Option<String>,
+    env: bool,
+    chdir: Option<String>,
+    net_mode: crate::net::NetMode,
+    brush: bool,
+    cmd: Vec<String>,
+) -> i32 {
     if cmd.is_empty() {
         eprintln!("sarun-engine run --sud: needs a command");
         return 2;
     }
     if std::env::var("SARUN_BROKER").is_ok_and(|s| !s.is_empty()) {
-        eprintln!("sarun-engine run --sud: nested sud boxes are not \
-                   supported yet (see engine/DESIGN-sud.md).");
+        eprintln!(
+            "sarun-engine run --sud: nested sud boxes are not \
+                   supported yet (see engine/DESIGN-sud.md)."
+        );
         return 2;
     }
     let (sud64, sud32) = sud_wrapper_paths();
@@ -1175,8 +1956,10 @@ pub fn run_sud(name: Option<String>, env: bool, chdir: Option<String>,
     let conn = match UnixStream::connect(&sock) {
         Ok(c) => c,
         Err(_) => {
-            eprintln!("sarun-engine: no engine running (control socket {}).",
-                      sock.display());
+            eprintln!(
+                "sarun-engine: no engine running (control socket {}).",
+                sock.display()
+            );
             return 3;
         }
     };
@@ -1184,15 +1967,20 @@ pub fn run_sud(name: Option<String>, env: bool, chdir: Option<String>,
     // without a half-open pipe to clean up.
     let tap_fd = match sud_netns_setup(net_mode) {
         Ok(f) => f,
-        Err(e) => { eprintln!("sarun-engine run --sud: {e}"); return 1; }
+        Err(e) => {
+            eprintln!("sarun-engine run --sud: {e}");
+            return 1;
+        }
     };
     // Trace pipe: the wrapper contract's fd 1023 is the WRITE end; the READ
     // end rides to the engine as an SCM_RIGHTS fd (it streams events live and
     // tees the raw bytes to live/<id>/sud.trace).
     let mut pfd = [0i32; 2];
     if unsafe { libc::pipe(pfd.as_mut_ptr()) } < 0 {
-        eprintln!("sarun-engine: trace pipe: {}",
-                  std::io::Error::last_os_error());
+        eprintln!(
+            "sarun-engine: trace pipe: {}",
+            std::io::Error::last_os_error()
+        );
         return 1;
     }
     let (trace_r, trace_w) = (pfd[0], pfd[1]);
@@ -1208,28 +1996,53 @@ pub fn run_sud(name: Option<String>, env: bool, chdir: Option<String>,
         }
     };
     let mut lane = [-1i32; 2];
-    if unsafe { libc::socketpair(libc::AF_UNIX,
-                                 libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
-                                 0, lane.as_mut_ptr()) } < 0 {
-        eprintln!("sarun-engine: SUD descriptor lane: {}",
-                  std::io::Error::last_os_error());
-        unsafe { libc::close(trace_r); libc::close(trace_w); }
+    if unsafe {
+        libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+            0,
+            lane.as_mut_ptr(),
+        )
+    } < 0
+    {
+        eprintln!(
+            "sarun-engine: SUD descriptor lane: {}",
+            std::io::Error::last_os_error()
+        );
+        unsafe {
+            libc::close(trace_r);
+            libc::close(trace_w);
+        }
         return 1;
     }
     let (lane_engine, lane_client) = (lane[0], lane[1]);
     // Register (consumes duplicates of tap_fd, trace_r, and the ring fd) and
     // validate the ack. The runner keeps its mapping through child spawn.
-    let ack = match sud_register(&conn, &cmd, env, &name, net_mode,
-                                 tap_fd, trace_r, fs_ring.as_raw_fd(),
-                                 lane_engine) {
+    let ack = match sud_register(
+        &conn,
+        &cmd,
+        env,
+        &name,
+        net_mode,
+        tap_fd,
+        trace_r,
+        fs_ring.as_raw_fd(),
+        lane_engine,
+    ) {
         Ok(a) => a,
         Err(code) => {
-            unsafe { libc::close(trace_w); libc::close(lane_client); }
+            unsafe {
+                libc::close(trace_w);
+                libc::close(lane_client);
+            }
             return code;
         }
     };
-    let sid = ack.get("session_id").and_then(Value::as_str)
-        .unwrap_or("?").to_string();
+    let sid = ack
+        .get("session_id")
+        .and_then(Value::as_str)
+        .unwrap_or("?")
+        .to_string();
     eprintln!("sarun-engine: box {sid}");
     // -b brush: the box's shell IS the embedded brush, run as the TRACED
     // target — the engine binary under the wrapper via `brush-sh`, so brush +
@@ -1238,24 +2051,36 @@ pub fn run_sud(name: Option<String>, env: bool, chdir: Option<String>,
     // FD broker either); semantic provenance — per-pipeline records, build
     // edges, done/state stamps — reaches the engine over its control socket
     // directly via SARUN_SUD_PROV (see send_nested_prov).
-    let self_exe: Option<String> = std::env::current_exe().ok()
+    let self_exe: Option<String> = std::env::current_exe()
+        .ok()
         .and_then(|p| p.to_str().map(String::from));
     let cmd = if brush {
         let Some(exe) = self_exe.as_deref() else {
             eprintln!("sarun-engine run --sud: -b needs current_exe()");
-            unsafe { libc::close(trace_w); libc::close(lane_client); }
+            unsafe {
+                libc::close(trace_w);
+                libc::close(lane_client);
+            }
             return 1;
         };
         brush_cmd(exe, &cmd)
-    } else { cmd };
+    } else {
+        cmd
+    };
     // Probe the target the way sudtrace did: PATH-resolve, shebang, ELF class
     // → pick sud32 or sud64 for the initial exec (the wrapper handles
     // cross-class children itself via its dir-sibling paths).
     let resolved = sud_resolve_target(&cmd[0]);
     let shebang = sud_shebang(&resolved);
-    let probe = shebang.as_ref().map(|(i, _)| i.as_str())
+    let probe = shebang
+        .as_ref()
+        .map(|(i, _)| i.as_str())
         .unwrap_or(resolved.as_str());
-    let wrapper = if sud_elf_class(probe) == 1 { &sud32 } else { &sud64 };
+    let wrapper = if sud_elf_class(probe) == 1 {
+        &sud32
+    } else {
+        &sud64
+    };
     // The wrapper receives only the target command. Filesystem composition,
     // network shadows, brush shadows, layering, and capture are all properties
     // of the engine-owned scoped SarunFs; no policy is serialized into argv.
@@ -1265,13 +2090,19 @@ pub fn run_sud(name: Option<String>, env: bool, chdir: Option<String>,
             // Script: run the interpreter with the kernel's shebang argv shape
             // (interp [arg] script args…).
             sc.arg(interp);
-            if let Some(a) = arg { sc.arg(a); }
+            if let Some(a) = arg {
+                sc.arg(a);
+            }
             sc.arg(&resolved);
             sc.args(&cmd[1..]);
         }
-        None => { sc.args(&cmd); }
+        None => {
+            sc.args(&cmd);
+        }
     }
-    if let Some(d) = &chdir { sc.current_dir(d); }
+    if let Some(d) = &chdir {
+        sc.current_dir(d);
+    }
     // Semantic-provenance channel: no inner in a sud box, so no FD broker.
     // Hand the traced tree the engine's control-socket path instead —
     // send_nested_prov dials it directly for brush pipeline records, build
@@ -1294,10 +2125,11 @@ pub fn run_sud(name: Option<String>, env: bool, chdir: Option<String>,
     // Without this, quitting the engine left a wedged build running with
     // nothing attached to it.
     unsafe {
-        libc::signal(libc::SIGTERM,
-                     sud_on_term as *const () as libc::sighandler_t);
-        libc::signal(libc::SIGINT,
-                     sud_on_term as *const () as libc::sighandler_t);
+        libc::signal(
+            libc::SIGTERM,
+            sud_on_term as *const () as libc::sighandler_t,
+        );
+        libc::signal(libc::SIGINT, sud_on_term as *const () as libc::sighandler_t);
     }
     {
         use std::os::fd::AsRawFd;
@@ -1305,21 +2137,28 @@ pub fn run_sud(name: Option<String>, env: bool, chdir: Option<String>,
         std::thread::spawn(move || {
             let mut b = [0u8; 256];
             loop {
-                let n = unsafe {
-                    libc::read(raw, b.as_mut_ptr().cast(), b.len())
-                };
-                if n > 0 { continue; }              // stray frame: ignore
-                if n < 0 && std::io::Error::last_os_error().raw_os_error()
-                    == Some(libc::EINTR) { continue; }
-                break;                              // EOF / error
+                let n = unsafe { libc::read(raw, b.as_mut_ptr().cast(), b.len()) };
+                if n > 0 {
+                    continue;
+                } // stray frame: ignore
+                if n < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                break; // EOF / error
             }
             let p = SUD_WRAPPER_PID.load(std::sync::atomic::Ordering::SeqCst);
             if p > 0 {
-                eprintln!("sarun-engine: engine gone — stopping the box's \
-                           process group");
-                unsafe { libc::kill(-p, libc::SIGTERM); }
+                eprintln!(
+                    "sarun-engine: engine gone — stopping the box's \
+                           process group"
+                );
+                unsafe {
+                    libc::kill(-p, libc::SIGTERM);
+                }
                 std::thread::sleep(std::time::Duration::from_secs(3));
-                unsafe { libc::kill(-p, libc::SIGKILL); }
+                unsafe {
+                    libc::kill(-p, libc::SIGKILL);
+                }
             }
         });
     }
@@ -1337,14 +2176,16 @@ pub fn run_sud(name: Option<String>, env: bool, chdir: Option<String>,
 /// uses to find its twin).
 fn sud_wrapper_paths() -> (String, String) {
     let sud64 = std::env::var("SARUN_SUD64")
-        .ok().filter(|s| !s.is_empty())
+        .ok()
+        .filter(|s| !s.is_empty())
         .or_else(|| {
             let sib = std::env::current_exe().ok()?.with_file_name("sud64");
             sib.is_file().then(|| sib.to_string_lossy().into_owned())
         })
         .unwrap_or_else(|| "sud64".to_string());
     let sud32 = std::env::var("SARUN_SUD32")
-        .ok().filter(|s| !s.is_empty())
+        .ok()
+        .filter(|s| !s.is_empty())
         .unwrap_or_else(|| match sud64.rsplit_once('/') {
             Some((dir, _)) => format!("{dir}/sud32"),
             None => "sud32".to_string(),
@@ -1357,17 +2198,18 @@ fn sud_wrapper_paths() -> (String, String) {
 /// into the fresh netns; the wrapper, spawned later, inherits it) and return
 /// the TAP fd to hand the engine. Off → an empty netns where every dial fails
 /// closed. Host → share the launcher's netns. Fails loud on tap/off error.
-fn sud_netns_setup(net_mode: crate::net::NetMode)
-                   -> Result<Option<std::os::fd::OwnedFd>, String> {
+fn sud_netns_setup(net_mode: crate::net::NetMode) -> Result<Option<std::os::fd::OwnedFd>, String> {
     match net_mode {
-        crate::net::NetMode::Tap =>
-            create_runner_tap().map(Some).map_err(|e|
-                format!("tap setup failed: {e}\n\
+        crate::net::NetMode::Tap => create_runner_tap().map(Some).map_err(|e| {
+            format!(
+                "tap setup failed: {e}\n\
                          hint: `ls -l /dev/net/tun` should be 0666; \
-                         otherwise pass `--net host` or `--net off`")),
-        crate::net::NetMode::Off =>
-            crate::net::tap::unshare_netns().map(|_| None)
-                .map_err(|e| format!("--net off netns: {e}")),
+                         otherwise pass `--net host` or `--net off`"
+            )
+        }),
+        crate::net::NetMode::Off => crate::net::tap::unshare_netns()
+            .map(|_| None)
+            .map_err(|e| format!("--net off netns: {e}")),
         crate::net::NetMode::Host => Ok(None),
     }
 }
@@ -1376,11 +2218,17 @@ fn sud_netns_setup(net_mode: crate::net::NetMode)
 /// [pidfd, tap?, trace_r, ring, lane], drop our copies of the fds the engine dup'd
 /// (`tap_fd` + `trace_r` are consumed here), read the ack, and return it once
 /// validated. `Err(code)` carries the process exit code on any failure.
-fn sud_register(conn: &UnixStream, cmd: &[String], env: bool,
-                name: &Option<String>, net_mode: crate::net::NetMode,
-                tap_fd: Option<std::os::fd::OwnedFd>, trace_r: i32,
-                ring_fd: i32, lane_fd: i32)
-                -> Result<Value, i32> {
+fn sud_register(
+    conn: &UnixStream,
+    cmd: &[String],
+    env: bool,
+    name: &Option<String>,
+    net_mode: crate::net::NetMode,
+    tap_fd: Option<std::os::fd::OwnedFd>,
+    trace_r: i32,
+    ring_fd: i32,
+    lane_fd: i32,
+) -> Result<Value, i32> {
     let reg = json!({"type": "register",
                      "cmd": cmd, "prov": provenance(cmd, env),
                      "want_capture": false,
@@ -1392,18 +2240,41 @@ fn sud_register(conn: &UnixStream, cmd: &[String], env: bool,
                      "want_rerun": name.is_some()});
     let pidfd = pidfd_open(std::process::id() as i32);
     let tap_raw = tap_fd.as_ref().map(|f| f.as_raw_fd());
-    if !send_register_fds(conn, format!("{reg}\n").as_bytes(), pidfd,
-                          tap_raw, Some(trace_r), Some(ring_fd), Some(lane_fd)) {
+    if !send_register_fds(
+        conn,
+        format!("{reg}\n").as_bytes(),
+        pidfd,
+        tap_raw,
+        Some(trace_r),
+        Some(ring_fd),
+        Some(lane_fd),
+    ) {
         eprintln!("sarun-engine: register write failed");
-        if pidfd >= 0 { unsafe { libc::close(pidfd); } }
-        unsafe { libc::close(trace_r); }
-        unsafe { libc::close(lane_fd); }
+        if pidfd >= 0 {
+            unsafe {
+                libc::close(pidfd);
+            }
+        }
+        unsafe {
+            libc::close(trace_r);
+        }
+        unsafe {
+            libc::close(lane_fd);
+        }
         return Err(1);
     }
-    if pidfd >= 0 { unsafe { libc::close(pidfd); } }
+    if pidfd >= 0 {
+        unsafe {
+            libc::close(pidfd);
+        }
+    }
     drop(tap_fd); // engine dup'd it; device stays alive on its fd + our netns
-    unsafe { libc::close(trace_r); } // engine holds its dup now
-    unsafe { libc::close(lane_fd); } // engine holds its dup now
+    unsafe {
+        libc::close(trace_r);
+    } // engine holds its dup now
+    unsafe {
+        libc::close(lane_fd);
+    } // engine holds its dup now
     let mut line = String::new();
     if BufReader::new(conn).read_line(&mut line).is_err() {
         eprintln!("sarun-engine: register read failed");
@@ -1411,12 +2282,18 @@ fn sud_register(conn: &UnixStream, cmd: &[String], env: bool,
     }
     let ack: Value = match serde_json::from_str(&line) {
         Ok(v) => v,
-        Err(_) => { eprintln!("sarun-engine: bad ack"); return Err(1); }
+        Err(_) => {
+            eprintln!("sarun-engine: bad ack");
+            return Err(1);
+        }
     };
     if ack.get("ok").and_then(Value::as_bool) != Some(true) {
-        eprintln!("sarun-engine: {}",
-                  ack.get("error").and_then(Value::as_str)
-                      .unwrap_or("register failed"));
+        eprintln!(
+            "sarun-engine: {}",
+            ack.get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("register failed")
+        );
         return Err(1);
     }
     Ok(ack)
@@ -1429,8 +2306,14 @@ fn brush_cmd(exe: &str, cmd: &[String]) -> Vec<String> {
     // Parse mode follows the user's shell: `bash -c …` must be BASH-mode
     // brush (brush_sh dispatches mode on this argv0 basename).
     let shell = crate::brush::shell_name_from_argv(cmd);
-    vec![exe.to_string(), "brush-sh".into(), "--".into(),
-         shell.into(), "-c".into(), script]
+    vec![
+        exe.to_string(),
+        "brush-sh".into(),
+        "--".into(),
+        shell.into(),
+        "-c".into(),
+        script,
+    ]
 }
 
 /// The wire-state page + launcher wait loop, absorbed from tv/sud/sudtrace.c.
@@ -1449,12 +2332,10 @@ fn brush_cmd(exe: &str, cmd: &[String]) -> Vec<String> {
 /// The wrapper child's pid (== its process-group id; the launcher setpgids
 /// it), for the SIGTERM forwarder + the engine-EOF watchdog. 0 = not
 /// launched yet.
-static SUD_WRAPPER_PID: std::sync::atomic::AtomicI32 =
-    std::sync::atomic::AtomicI32::new(0);
+static SUD_WRAPPER_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 /// Signal escalation: first SIGTERM/SIGINT forwards SIGTERM to the group,
 /// the second forwards SIGKILL (a wedged tree may ignore SIGTERM).
-static SUD_TERM_SEEN: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static SUD_TERM_SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 extern "C" fn sud_on_term(_sig: i32) {
     use std::sync::atomic::Ordering;
@@ -1465,11 +2346,15 @@ extern "C" fn sud_on_term(_sig: i32) {
         } else {
             libc::SIGTERM
         };
-        unsafe { libc::kill(-p, sig); }
+        unsafe {
+            libc::kill(-p, sig);
+        }
         // Do NOT exit: the wait loop reaps the dying tree and the normal
         // teardown (sweep, box-channel close) still runs.
     } else {
-        unsafe { libc::_exit(143); }
+        unsafe {
+            libc::_exit(143);
+        }
     }
 }
 
@@ -1496,30 +2381,53 @@ unsafe fn wire_lock(word: *mut u32) {
     use std::sync::atomic::Ordering::{Acquire, Relaxed};
     let a = unsafe { std::sync::atomic::AtomicU32::from_ptr(word) };
     let me = unsafe { libc::syscall(libc::SYS_gettid) } as u32;
-    if a.compare_exchange(0, me, Acquire, Relaxed).is_ok() { return; }
+    if a.compare_exchange(0, me, Acquire, Relaxed).is_ok() {
+        return;
+    }
     loop {
         let cur = a.load(Relaxed);
         if cur == 0 {
             if a.compare_exchange(0, me | WIRE_WAITERS, Acquire, Relaxed)
-                .is_ok() { return; }
+                .is_ok()
+            {
+                return;
+            }
             continue;
         }
         let cur = if cur & WIRE_WAITERS == 0 {
             if a.compare_exchange(cur, cur | WIRE_WAITERS, Relaxed, Relaxed)
-                .is_err() { continue; }
+                .is_err()
+            {
+                continue;
+            }
             cur | WIRE_WAITERS
-        } else { cur };
-        let ts = libc::timespec { tv_sec: 1, tv_nsec: 0 };
+        } else {
+            cur
+        };
+        let ts = libc::timespec {
+            tv_sec: 1,
+            tv_nsec: 0,
+        };
         unsafe {
-            libc::syscall(libc::SYS_futex, word, 0 /*FUTEX_WAIT*/, cur,
-                          &ts as *const libc::timespec, 0, 0);
+            libc::syscall(
+                libc::SYS_futex,
+                word,
+                0, /*FUTEX_WAIT*/
+                cur,
+                &ts as *const libc::timespec,
+                0,
+                0,
+            );
         }
         let cur = a.load(Relaxed);
         if cur != 0 {
             let holder = cur & !WIRE_WAITERS;
-            if holder != 0 && holder != me && unsafe { wire_tid_dead(holder) }
-                && a.compare_exchange(cur, me | WIRE_WAITERS,
-                                      Acquire, Relaxed).is_ok() {
+            if holder != 0
+                && holder != me
+                && unsafe { wire_tid_dead(holder) }
+                && a.compare_exchange(cur, me | WIRE_WAITERS, Acquire, Relaxed)
+                    .is_ok()
+            {
                 return; // stole a dead holder's lock
             }
         }
@@ -1528,32 +2436,46 @@ unsafe fn wire_lock(word: *mut u32) {
 unsafe fn wire_unlock(word: *mut u32) {
     let a = unsafe { std::sync::atomic::AtomicU32::from_ptr(word) };
     if a.swap(0, std::sync::atomic::Ordering::Release) & WIRE_WAITERS != 0 {
-        unsafe { libc::syscall(libc::SYS_futex, word, 1 /*FUTEX_WAKE*/, 1, 0, 0, 0); }
+        unsafe {
+            libc::syscall(libc::SYS_futex, word, 1 /*FUTEX_WAKE*/, 1, 0, 0, 0);
+        }
     }
 }
 
-fn sud_launcher_exec(mut sc: Command, wrapper: &str, trace_w: i32,
-                     fs_ring: crate::sud_ring::RingMapping,
-                     fd_lane: i32) -> i32 {
+fn sud_launcher_exec(
+    mut sc: Command,
+    wrapper: &str,
+    trace_w: i32,
+    fs_ring: crate::sud_ring::RingMapping,
+    fd_lane: i32,
+) -> i32 {
     let stream_id: u32;
     let state_page: *mut u32;
     let mfd: i32;
     unsafe {
-        mfd = libc::syscall(libc::SYS_memfd_create,
-                            c"sud_wire_state".as_ptr(), 0u32) as i32;
+        mfd = libc::syscall(libc::SYS_memfd_create, c"sud_wire_state".as_ptr(), 0u32) as i32;
         if mfd < 0 || libc::ftruncate(mfd, 4096) < 0 {
-            eprintln!("sarun-engine: wire state page: {}",
-                      std::io::Error::last_os_error());
+            eprintln!(
+                "sarun-engine: wire state page: {}",
+                std::io::Error::last_os_error()
+            );
             libc::close(trace_w);
             libc::close(fd_lane);
             return 1;
         }
-        let p = libc::mmap(std::ptr::null_mut(), 4096,
-                           libc::PROT_READ | libc::PROT_WRITE,
-                           libc::MAP_SHARED, mfd, 0);
+        let p = libc::mmap(
+            std::ptr::null_mut(),
+            4096,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            mfd,
+            0,
+        );
         if p == libc::MAP_FAILED {
-            eprintln!("sarun-engine: mmap wire state: {}",
-                      std::io::Error::last_os_error());
+            eprintln!(
+                "sarun-engine: mmap wire state: {}",
+                std::io::Error::last_os_error()
+            );
             libc::close(mfd);
             libc::close(trace_w);
             libc::close(fd_lane);
@@ -1564,7 +2486,8 @@ fn sud_launcher_exec(mut sc: Command, wrapper: &str, trace_w: i32,
         // zero-filled; the post-increment value is our stream id (launcher = 1,
         // children take 2, 3, … off the same counter).
         stream_id = (*std::sync::atomic::AtomicU32::from_ptr(state_page))
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
         let va = crate::sudwire::version_atom();
         let lock_word = state_page.add(1); // sud_shared.wire_write_lock
         wire_lock(lock_word);
@@ -1584,7 +2507,8 @@ fn sud_launcher_exec(mut sc: Command, wrapper: &str, trace_w: i32,
             if libc::dup2(trace_w, SUD_OUTPUT_FD) < 0
                 || libc::dup2(mfd, SUD_STATE_FD) < 0
                 || libc::dup2(fs_ring.as_raw_fd(), crate::sud_ring::RING_FD) < 0
-                || libc::dup2(fd_lane, crate::sud_ring::FD_LANE_FD) < 0 {
+                || libc::dup2(fd_lane, crate::sud_ring::FD_LANE_FD) < 0
+            {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(())
@@ -1593,10 +2517,12 @@ fn sud_launcher_exec(mut sc: Command, wrapper: &str, trace_w: i32,
     let child = match sc.spawn() {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("sarun-engine: exec {wrapper}: {e}\n\
+            eprintln!(
+                "sarun-engine: exec {wrapper}: {e}\n\
                        hint: build it with `make -C tv sud64 sud32` and put \
                        them on PATH or \
-                       point SARUN_SUD64/SARUN_SUD32 at them.");
+                       point SARUN_SUD64/SARUN_SUD32 at them."
+            );
             unsafe {
                 libc::munmap(state_page.cast(), 4096);
                 libc::close(mfd);
@@ -1606,7 +2532,9 @@ fn sud_launcher_exec(mut sc: Command, wrapper: &str, trace_w: i32,
             return 127;
         }
     };
-    unsafe { libc::close(fd_lane); }
+    unsafe {
+        libc::close(fd_lane);
+    }
     // Launcher wait loop (sudtrace's): reap every descendant that lands on us,
     // emit an EV_EXIT per real termination of a thread-group leader, stop when
     // the wrapper child itself is done.
@@ -1619,10 +2547,14 @@ fn sud_launcher_exec(mut sc: Command, wrapper: &str, trace_w: i32,
         let wpid = unsafe { libc::waitpid(-1, &mut wstatus, libc::__WALL) };
         if wpid < 0 {
             let e = std::io::Error::last_os_error();
-            if e.raw_os_error() == Some(libc::EINTR) { continue; }
+            if e.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
             break; // ECHILD: nothing left to reap
         }
-        if wpid == 0 { continue; }
+        if wpid == 0 {
+            continue;
+        }
         if !libc::WIFEXITED(wstatus) && !libc::WIFSIGNALED(wstatus) {
             continue; // stopped/continued — keep waiting
         }
@@ -1631,9 +2563,16 @@ fn sud_launcher_exec(mut sc: Command, wrapper: &str, trace_w: i32,
             let ppid = sud_proc_field(wpid, "PPid:", 0);
             let ts = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos() as i64).unwrap_or(0);
-            let buf = ev.build_exit(stream_id, ts, wpid as i64,
-                                    tgid as i64, ppid as i64, wstatus);
+                .map(|d| d.as_nanos() as i64)
+                .unwrap_or(0);
+            let buf = ev.build_exit(
+                stream_id,
+                ts,
+                wpid as i64,
+                tgid as i64,
+                ppid as i64,
+                wstatus,
+            );
             unsafe {
                 let lock_word = state_page.add(1);
                 wire_lock(lock_word);
@@ -1696,13 +2635,22 @@ fn send_frame(conn_fd: i32, frame: &[u8], pidfd: Option<i32>) {
 /// for every in-box re-exec site (inner CMD, oaita driver, brush builtins).
 pub fn in_box_self_exe() -> String {
     std::env::var("SARUN_EXE")
-        .ok().filter(|s| !s.is_empty())
+        .ok()
+        .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "/proc/self/exe".to_string())
 }
 
-pub fn inner(conn_fd: i32, capture: bool, pty: bool, brush: bool,
-             api: bool, mut cmd: Vec<String>) -> i32 {
-    if cmd.is_empty() { return 2; }
+pub fn inner(
+    conn_fd: i32,
+    capture: bool,
+    pty: bool,
+    brush: bool,
+    api: bool,
+    mut cmd: Vec<String>,
+) -> i32 {
+    if cmd.is_empty() {
+        return 2;
+    }
     // The box CMD may name `/proc/self/exe` as argv[0] to mean "re-exec the
     // engine" (e.g. `oaita run --on <box>` ships `/proc/self/exe oaita run
     // --inbox …`). Resolve it through the ferried fd so it works when the box
@@ -1712,7 +2660,18 @@ pub fn inner(conn_fd: i32, capture: bool, pty: bool, brush: bool,
     }
     // Hold the box-channel fd open (not CLOEXEC) so the engine sees EOF — its
     // teardown signal — only when this process (and CMD) finally exits.
-    if conn_fd >= 0 { clear_cloexec(conn_fd); }
+    if conn_fd >= 0 {
+        clear_cloexec(conn_fd);
+    }
+    if brush {
+        // Consume the inherited capability before starting the broker thread or
+        // any Brush work. `adopt_inherited` owns the descriptors and marks them
+        // CLOEXEC, so a recipe's external commands cannot inherit this path.
+        if let Err(error) = crate::direct_fs::adopt_inherited() {
+            eprintln!("sarun-engine inner: direct Brush filesystem transport: {error}");
+            return 127;
+        }
+    }
     // FD broker: bind the abstract UDS named by SARUN_BROKER so box-
     // internal processes (a nested `sarun run`, in-box `oaita`) can ask
     // for their OWN fresh engine connection without us bind-mounting a
@@ -1740,8 +2699,10 @@ pub fn inner(conn_fd: i32, capture: bool, pty: bool, brush: bool,
     // and we error VISIBLY rather than silently exec'ing /bin/sh.
     if brush {
         if !capture || conn_fd < 0 {
-            eprintln!("sarun-engine inner: -b (brush) requires capture; \
-                       it is incompatible with -d (no overlay).");
+            eprintln!(
+                "sarun-engine inner: -b (brush) requires capture; \
+                       it is incompatible with -d (no overlay)."
+            );
             return 2;
         }
         // -b -p: the brush branch used to win and SWALLOW -p — no box pty
@@ -1759,8 +2720,7 @@ pub fn inner(conn_fd: i32, capture: bool, pty: bool, brush: bool,
             } else {
                 "/bin/sh"
             };
-            return inner_pty(conn_fd, vec![shell.to_string(),
-                                           "-c".to_string(), script]);
+            return inner_pty(conn_fd, vec![shell.to_string(), "-c".to_string(), script]);
         }
         return crate::brush::inner_brush(conn_fd, cmd);
     }
@@ -1790,7 +2750,9 @@ pub fn inner(conn_fd: i32, capture: bool, pty: bool, brush: bool,
                 loop {
                     let mut got_fd: Option<i32> = None;
                     let n = recv_box_frame_bytes(conn_fd, &mut tmp, &mut got_fd);
-                    if n <= 0 { break; }
+                    if n <= 0 {
+                        break;
+                    }
                     buf.extend_from_slice(&tmp[..n as usize]);
                     let (frames, used) = crate::frames::decode(&buf);
                     buf.drain(..used);
@@ -1801,15 +2763,25 @@ pub fn inner(conn_fd: i32, capture: bool, pty: bool, brush: bool,
                             }
                         }
                     }
-                    if let Some(fd) = got_fd { unsafe { libc::close(fd); } }
+                    if let Some(fd) = got_fd {
+                        unsafe {
+                            libc::close(fd);
+                        }
+                    }
                 }
             });
         }
         let (tty_fd, old_fg) = tty_grab();
-        let mut child = match Command::new(&cmd[0]).args(&cmd[1..])
-            .process_group(0).spawn() {
+        let mut child = match Command::new(&cmd[0])
+            .args(&cmd[1..])
+            .process_group(0)
+            .spawn()
+        {
             Ok(c) => c,
-            Err(e) => { eprintln!("sarun-engine inner: spawn {}: {e}", cmd[0]); return 127; }
+            Err(e) => {
+                eprintln!("sarun-engine inner: spawn {}: {e}", cmd[0]);
+                return 127;
+            }
         };
         let old_ttou = tty_give(tty_fd, child.id() as i32);
         let code = child.wait().ok().and_then(|s| s.code()).unwrap_or(1);
@@ -1843,17 +2815,17 @@ use std::sync::OnceLock;
 // child that asked for it. Attribution is intrinsic — the channel IS the
 // box.
 
-static BROKER_QUEUE: OnceLock<Mutex<VecDeque<std::os::unix::net::UnixStream>>>
-    = OnceLock::new();
+static BROKER_QUEUE: OnceLock<Mutex<VecDeque<std::os::unix::net::UnixStream>>> = OnceLock::new();
 
 /// Bind the broker's abstract UDS inside the box and spawn the accept thread.
 /// `abstract_name` is the SARUN_BROKER name (bwrap propagated it to us and to
 /// every box child). Idempotent.
 fn inner_broker_serve(conn_fd: i32, abstract_name: &str) {
-    if BROKER_QUEUE.get().is_some() { return; }
+    if BROKER_QUEUE.get().is_some() {
+        return;
+    }
     use std::os::linux::net::SocketAddrExt;
-    let addr = match std::os::unix::net::SocketAddr::from_abstract_name(
-        abstract_name.as_bytes()) {
+    let addr = match std::os::unix::net::SocketAddr::from_abstract_name(abstract_name.as_bytes()) {
         Ok(a) => a,
         Err(e) => {
             eprintln!("sarun-engine inner: broker addr: {e}");
@@ -1872,10 +2844,17 @@ fn inner_broker_serve(conn_fd: i32, abstract_name: &str) {
         for client in listener.incoming().flatten() {
             // Queue first, THEN send the request, so the reader's FRAME_CONN
             // handler is guaranteed to find a waiter.
-            BROKER_QUEUE.get().unwrap().lock().unwrap().push_back(client);
-            send_frame(conn_fd,
+            BROKER_QUEUE
+                .get()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .push_back(client);
+            send_frame(
+                conn_fd,
                 &crate::frames::encode(crate::frames::FRAME_OPEN_CONN, &[]),
-                None);
+                None,
+            );
         }
     });
 }
@@ -1884,10 +2863,13 @@ fn inner_broker_serve(conn_fd: i32, abstract_name: &str) {
 /// via SCM_RIGHTS. Closes our copy. If nothing is waiting (shouldn't happen
 /// in normal flow), drops the fd.
 fn runner_broker_handoff(fd: i32) {
-    let waiter = BROKER_QUEUE.get()
+    let waiter = BROKER_QUEUE
+        .get()
         .and_then(|q| q.lock().unwrap().pop_front());
     let Some(client) = waiter else {
-        unsafe { libc::close(fd); }
+        unsafe {
+            libc::close(fd);
+        }
         return;
     };
     // One-byte body so the SCM cmsg has data to ride on. The child ignores
@@ -1908,8 +2890,7 @@ fn runner_broker_handoff(fd: i32) {
         (*c).cmsg_level = libc::SOL_SOCKET;
         (*c).cmsg_type = libc::SCM_RIGHTS;
         (*c).cmsg_len = libc::CMSG_LEN(4) as _;
-        std::ptr::copy_nonoverlapping((&fd as *const i32).cast(),
-                                       libc::CMSG_DATA(c), 4);
+        std::ptr::copy_nonoverlapping((&fd as *const i32).cast(), libc::CMSG_DATA(c), 4);
         libc::sendmsg(client.as_raw_fd(), &msg, 0);
         libc::close(fd);
     }
@@ -1935,13 +2916,18 @@ pub(crate) fn recv_box_frame_bytes(raw: i32, buf: &mut [u8], fd: &mut Option<i32
         unsafe {
             let mut c = libc::CMSG_FIRSTHDR(&msg);
             while !c.is_null() {
-                if (*c).cmsg_level == libc::SOL_SOCKET
-                    && (*c).cmsg_type == libc::SCM_RIGHTS {
+                if (*c).cmsg_level == libc::SOL_SOCKET && (*c).cmsg_type == libc::SCM_RIGHTS {
                     let mut got = 0i32;
                     std::ptr::copy_nonoverlapping(
-                        libc::CMSG_DATA(c), (&mut got as *mut i32).cast(), 4);
-                    if fd.is_none() { *fd = Some(got); }
-                    else { libc::close(got); }
+                        libc::CMSG_DATA(c),
+                        (&mut got as *mut i32).cast(),
+                        4,
+                    );
+                    if fd.is_none() {
+                        *fd = Some(got);
+                    } else {
+                        libc::close(got);
+                    }
                 }
                 c = libc::CMSG_NXTHDR(&msg, c);
             }
@@ -1956,8 +2942,7 @@ pub(crate) fn recv_box_frame_bytes(raw: i32, buf: &mut [u8], fd: &mut Option<i32
 pub fn broker_dial(abstract_name: &str) -> std::io::Result<UnixStream> {
     use std::os::fd::FromRawFd;
     use std::os::linux::net::SocketAddrExt;
-    let addr = std::os::unix::net::SocketAddr::from_abstract_name(
-        abstract_name.as_bytes())?;
+    let addr = std::os::unix::net::SocketAddr::from_abstract_name(abstract_name.as_bytes())?;
     let conn = UnixStream::connect_addr(&addr)?;
     // recvmsg the one-byte body + SCM_RIGHTS fd. Loop tolerates EINTR.
     let mut buf = [0u8; 1];
@@ -1979,20 +2964,22 @@ pub fn broker_dial(abstract_name: &str) -> std::io::Result<UnixStream> {
     unsafe {
         let mut c = libc::CMSG_FIRSTHDR(&msg);
         while !c.is_null() {
-            if (*c).cmsg_level == libc::SOL_SOCKET
-                && (*c).cmsg_type == libc::SCM_RIGHTS {
+            if (*c).cmsg_level == libc::SOL_SOCKET && (*c).cmsg_type == libc::SCM_RIGHTS {
                 let mut f = 0i32;
-                std::ptr::copy_nonoverlapping(
-                    libc::CMSG_DATA(c), (&mut f as *mut i32).cast(), 4);
-                if got.is_none() { got = Some(f); }
-                else { libc::close(f); }
+                std::ptr::copy_nonoverlapping(libc::CMSG_DATA(c), (&mut f as *mut i32).cast(), 4);
+                if got.is_none() {
+                    got = Some(f);
+                } else {
+                    libc::close(f);
+                }
             }
             c = libc::CMSG_NXTHDR(&msg, c);
         }
     }
     drop(conn);
-    let fd = got.ok_or_else(|| std::io::Error::new(
-        std::io::ErrorKind::Other, "broker reply: no fd attached"))?;
+    let fd = got.ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::Other, "broker reply: no fd attached")
+    })?;
     Ok(unsafe { UnixStream::from_raw_fd(fd) })
 }
 
@@ -2007,19 +2994,38 @@ fn inner_capture(conn_fd: i32, cmd: Vec<String>) -> i32 {
     use std::os::fd::FromRawFd;
     use std::os::fd::IntoRawFd;
     use std::process::Stdio;
-    let out = match std::fs::OpenOptions::new().write(true).open("/.slopbox-stdout") {
-        Ok(f) => f, Err(e) => { eprintln!("inner: open stdout sink: {e}"); return 127; }
+    let out = match std::fs::OpenOptions::new()
+        .write(true)
+        .open("/.slopbox-stdout")
+    {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("inner: open stdout sink: {e}");
+            return 127;
+        }
     };
-    let err = match std::fs::OpenOptions::new().write(true).open("/.slopbox-stderr") {
-        Ok(f) => f, Err(e) => { eprintln!("inner: open stderr sink: {e}"); return 127; }
+    let err = match std::fs::OpenOptions::new()
+        .write(true)
+        .open("/.slopbox-stderr")
+    {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("inner: open stderr sink: {e}");
+            return 127;
+        }
     };
     // MUTE: tell the engine not to RECORD writes by our host pid (only echo
     // them) — sent before the child can emit a byte that loops back to us.
     let pidfd = pidfd_open(std::process::id() as i32);
     if pidfd >= 0 {
-        send_frame(conn_fd, &crate::frames::encode(crate::frames::FRAME_MUTE, &[]),
-                   Some(pidfd));
-        unsafe { libc::close(pidfd); }
+        send_frame(
+            conn_fd,
+            &crate::frames::encode(crate::frames::FRAME_MUTE, &[]),
+            Some(pidfd),
+        );
+        unsafe {
+            libc::close(pidfd);
+        }
     }
     // Reader: ECHO frames → real fd 1/2; ECHO_DONE → stop. Runs until the engine
     // closes the channel or flags ECHO_DONE (all captured bytes framed).
@@ -2036,7 +3042,9 @@ fn inner_capture(conn_fd: i32, cmd: Vec<String>) -> i32 {
             // the first FRAME_CONN frame in this batch.
             let mut got_fd: Option<i32> = None;
             let n = recv_box_frame_bytes(rfd, &mut tmp, &mut got_fd);
-            if n <= 0 { break; }
+            if n <= 0 {
+                break;
+            }
             buf.extend_from_slice(&tmp[..n as usize]);
             let (frames, used) = crate::frames::decode(&buf);
             buf.drain(..used);
@@ -2059,14 +3067,19 @@ fn inner_capture(conn_fd: i32, cmd: Vec<String>) -> i32 {
             }
             // A FRAME_CONN sent with no matching waiter (e.g. lost-race or
             // engine sent an extra) — close the dangling fd rather than leak.
-            if let Some(fd) = got_fd { unsafe { libc::close(fd); } }
+            if let Some(fd) = got_fd {
+                unsafe {
+                    libc::close(fd);
+                }
+            }
         }
     });
     // tty job-control: child in its own group, given the terminal foreground
     // (stdin stays the inherited tty; stdout/stderr are the sinks).
     let (tty_fd, old_fg) = tty_grab();
     let child = unsafe {
-        Command::new(&cmd[0]).args(&cmd[1..])
+        Command::new(&cmd[0])
+            .args(&cmd[1..])
             .process_group(0)
             .stdout(Stdio::from_raw_fd(out.into_raw_fd()))
             .stderr(Stdio::from_raw_fd(err.into_raw_fd()))
@@ -2074,7 +3087,10 @@ fn inner_capture(conn_fd: i32, cmd: Vec<String>) -> i32 {
     };
     let mut child = match child {
         Ok(c) => c,
-        Err(e) => { eprintln!("sarun-engine inner: spawn {}: {e}", cmd[0]); return 127; }
+        Err(e) => {
+            eprintln!("sarun-engine inner: spawn {}: {e}", cmd[0]);
+            return 127;
+        }
     };
     let old_ttou = tty_give(tty_fd, child.id() as i32);
     let code = child.wait().ok().and_then(|s| s.code()).unwrap_or(1);
@@ -2083,11 +3099,14 @@ fn inner_capture(conn_fd: i32, cmd: Vec<String>) -> i32 {
     // remaining ECHO then ECHO_DONE. Wait briefly for the reader to drain so the
     // tail of the output isn't truncated, then unmute and let the channel close.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while !done.load(std::sync::atomic::Ordering::SeqCst)
-        && std::time::Instant::now() < deadline {
+    while !done.load(std::sync::atomic::Ordering::SeqCst) && std::time::Instant::now() < deadline {
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
-    send_frame(conn_fd, &crate::frames::encode(crate::frames::FRAME_UNMUTE, &[]), None);
+    send_frame(
+        conn_fd,
+        &crate::frames::encode(crate::frames::FRAME_UNMUTE, &[]),
+        None,
+    );
     let _ = reader;
     code
 }
@@ -2106,8 +3125,7 @@ fn inner_capture(conn_fd: i32, cmd: Vec<String>) -> i32 {
 // Window size is propagated initially (TIOCGWINSZ→TIOCSWINSZ) and on SIGWINCH.
 // On exit we restore termios + the terminal foreground group.
 
-static WINCH_FLAG: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static WINCH_FLAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 extern "C" fn on_winch(_sig: i32) {
     WINCH_FLAG.store(true, std::sync::atomic::Ordering::SeqCst);
 }
@@ -2120,7 +3138,9 @@ fn get_winsize(fd: i32) -> Option<libc::winsize> {
 }
 
 fn set_winsize(fd: i32, ws: &libc::winsize) {
-    unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, ws as *const libc::winsize); }
+    unsafe {
+        libc::ioctl(fd, libc::TIOCSWINSZ, ws as *const libc::winsize);
+    }
 }
 
 fn inner_pty(conn_fd: i32, cmd: Vec<String>) -> i32 {
@@ -2128,34 +3148,51 @@ fn inner_pty(conn_fd: i32, cmd: Vec<String>) -> i32 {
     use std::process::Stdio;
 
     // The real terminal among our fds (its size + termios we mirror/restore).
-    let real_tty = (0..3).find(|&fd| unsafe { libc::isatty(fd) } == 1).unwrap_or(0);
+    let real_tty = (0..3)
+        .find(|&fd| unsafe { libc::isatty(fd) } == 1)
+        .unwrap_or(0);
 
     // Allocate the pty pair, seeding the master's window size from the real tty.
     let mut master: i32 = -1;
     let mut slave: i32 = -1;
     let initial_ws = get_winsize(real_tty);
-    let ws_ptr = initial_ws.as_ref()
-        .map(|w| w as *const libc::winsize).unwrap_or(std::ptr::null());
+    let ws_ptr = initial_ws
+        .as_ref()
+        .map(|w| w as *const libc::winsize)
+        .unwrap_or(std::ptr::null());
     let rc = unsafe {
-        libc::openpty(&mut master, &mut slave, std::ptr::null_mut(),
-                      std::ptr::null(), ws_ptr)
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            ws_ptr,
+        )
     };
     if rc != 0 {
         // Can't honor -p at all: error VISIBLY rather than silently producing a
         // non-pty box (per the no-silent-downgrade rule).
-        eprintln!("sarun-engine inner: -p requested but openpty failed: {}",
-                  std::io::Error::last_os_error());
+        eprintln!(
+            "sarun-engine inner: -p requested but openpty failed: {}",
+            std::io::Error::last_os_error()
+        );
         return 1;
     }
 
     // Open the box stdout sink: bytes we write here flow through the overlay and
     // are RECORDED (per-write pid attribution → us, the runner). The child's tty
     // I/O goes to the master/slave, not here; we relay master→sink ourselves.
-    let sink = match std::fs::OpenOptions::new().write(true).open("/.slopbox-stdout") {
+    let sink = match std::fs::OpenOptions::new()
+        .write(true)
+        .open("/.slopbox-stdout")
+    {
         Ok(f) => f,
         Err(e) => {
             eprintln!("sarun-engine inner: -p capture sink unavailable: {e}");
-            unsafe { libc::close(master); libc::close(slave); }
+            unsafe {
+                libc::close(master);
+                libc::close(slave);
+            }
             return 1;
         }
     };
@@ -2166,12 +3203,18 @@ fn inner_pty(conn_fd: i32, cmd: Vec<String>) -> i32 {
     let have_termios = unsafe { libc::tcgetattr(real_tty, &mut saved_termios) } == 0;
     if have_termios {
         let mut raw = saved_termios;
-        unsafe { libc::cfmakeraw(&mut raw); }
-        unsafe { libc::tcsetattr(real_tty, libc::TCSANOW, &raw); }
+        unsafe {
+            libc::cfmakeraw(&mut raw);
+        }
+        unsafe {
+            libc::tcsetattr(real_tty, libc::TCSANOW, &raw);
+        }
     }
 
     // SIGWINCH → propagate the new size to the master on the next loop tick.
-    unsafe { libc::signal(libc::SIGWINCH, on_winch as *const () as libc::sighandler_t); }
+    unsafe {
+        libc::signal(libc::SIGWINCH, on_winch as *const () as libc::sighandler_t);
+    }
 
     // Spawn the child with the SLAVE as stdin/stdout/stderr and as its
     // controlling terminal: new session (setsid) + TIOCSCTTY in a pre_exec.
@@ -2184,7 +3227,9 @@ fn inner_pty(conn_fd: i32, cmd: Vec<String>) -> i32 {
             .stderr(Stdio::from_raw_fd(libc::dup(slave)));
         c.pre_exec(move || {
             // Own session → no controlling tty inherited; then claim the slave.
-            if libc::setsid() < 0 { return Err(std::io::Error::last_os_error()); }
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
             if libc::ioctl(slave_for_pre, libc::TIOCSCTTY, 0) < 0 {
                 return Err(std::io::Error::last_os_error());
             }
@@ -2196,14 +3241,23 @@ fn inner_pty(conn_fd: i32, cmd: Vec<String>) -> i32 {
         Ok(c) => c,
         Err(e) => {
             eprintln!("sarun-engine inner: spawn {}: {e}", cmd[0]);
-            if have_termios { unsafe { libc::tcsetattr(real_tty, libc::TCSANOW, &saved_termios); } }
-            unsafe { libc::close(master); libc::close(slave); }
+            if have_termios {
+                unsafe {
+                    libc::tcsetattr(real_tty, libc::TCSANOW, &saved_termios);
+                }
+            }
+            unsafe {
+                libc::close(master);
+                libc::close(slave);
+            }
             return 127;
         }
     };
     // The child holds its own dup'd slave fds; close ours so the master sees EOF
     // when the child exits (otherwise the master read never ends).
-    unsafe { libc::close(slave); }
+    unsafe {
+        libc::close(slave);
+    }
 
     // Drain the box channel (engine echoes our sink writes back as ECHO; we
     // DISCARD them — the master is our live source). Watch for ECHO_DONE.
@@ -2220,7 +3274,9 @@ fn inner_pty(conn_fd: i32, cmd: Vec<String>) -> i32 {
             // ECHO_DONE marker to know capture has flushed).
             let mut got_fd: Option<i32> = None;
             let n = recv_box_frame_bytes(rfd, &mut tmp, &mut got_fd);
-            if n <= 0 { break; }
+            if n <= 0 {
+                break;
+            }
             buf.extend_from_slice(&tmp[..n as usize]);
             let (frames, used) = crate::frames::decode(&buf);
             buf.drain(..used);
@@ -2231,9 +3287,15 @@ fn inner_pty(conn_fd: i32, cmd: Vec<String>) -> i32 {
                     }
                     continue;
                 }
-                if ft == crate::frames::FRAME_ECHO_DONE { return; }
+                if ft == crate::frames::FRAME_ECHO_DONE {
+                    return;
+                }
             }
-            if let Some(fd) = got_fd { unsafe { libc::close(fd); } }
+            if let Some(fd) = got_fd {
+                unsafe {
+                    libc::close(fd);
+                }
+            }
         }
     });
 
@@ -2248,25 +3310,37 @@ fn inner_pty(conn_fd: i32, cmd: Vec<String>) -> i32 {
     let mut stdin_open = true;
     while !master_eof {
         if WINCH_FLAG.swap(false, std::sync::atomic::Ordering::SeqCst) {
-            if let Some(ws) = get_winsize(real_tty) { set_winsize(master, &ws); }
+            if let Some(ws) = get_winsize(real_tty) {
+                set_winsize(master, &ws);
+            }
         }
         let mut fds = [
-            libc::pollfd { fd: master, events: libc::POLLIN, revents: 0 },
-            libc::pollfd { fd: if stdin_open { stdin_fd } else { -1 },
-                           events: libc::POLLIN, revents: 0 },
+            libc::pollfd {
+                fd: master,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: if stdin_open { stdin_fd } else { -1 },
+                events: libc::POLLIN,
+                revents: 0,
+            },
         ];
         let pr = unsafe { libc::poll(fds.as_mut_ptr(), 2, 200) };
         if pr < 0 {
             let e = std::io::Error::last_os_error();
-            if e.raw_os_error() == Some(libc::EINTR) { continue; } // SIGWINCH
+            if e.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            } // SIGWINCH
             break;
         }
         // master → real stdout (live) + sink (recorded)
         if fds[0].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
             let mut b = [0u8; 65536];
             let n = unsafe { libc::read(master, b.as_mut_ptr().cast(), b.len()) };
-            if n <= 0 { master_eof = true; }
-            else {
+            if n <= 0 {
+                master_eof = true;
+            } else {
                 let s = &b[..n as usize];
                 // Full write to the live tty: a short write would drop part of
                 // the child's terminal output (audit L4).
@@ -2284,10 +3358,11 @@ fn inner_pty(conn_fd: i32, cmd: Vec<String>) -> i32 {
                 // Feed every keystroke byte to the pty master; a short write
                 // would drop input the child never sees (audit L4).
                 let _ = write_all_fd(master, &b[..n as usize]);
-            } else { stdin_open = false; } // EOF
+            } else {
+                stdin_open = false;
+            } // EOF
         }
-        if stdin_open && fds[1].revents & (libc::POLLHUP | libc::POLLERR
-                                           | libc::POLLNVAL) != 0 {
+        if stdin_open && fds[1].revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
             stdin_open = false;
         }
     }
@@ -2295,9 +3370,17 @@ fn inner_pty(conn_fd: i32, cmd: Vec<String>) -> i32 {
     let code = child.wait().ok().and_then(|s| s.code()).unwrap_or(1);
     // Close the sink so the engine flushes ECHO_DONE; restore the terminal.
     drop(sink);
-    if have_termios { unsafe { libc::tcsetattr(real_tty, libc::TCSANOW, &saved_termios); } }
-    unsafe { libc::signal(libc::SIGWINCH, libc::SIG_DFL); }
-    unsafe { libc::close(master); }
+    if have_termios {
+        unsafe {
+            libc::tcsetattr(real_tty, libc::TCSANOW, &saved_termios);
+        }
+    }
+    unsafe {
+        libc::signal(libc::SIGWINCH, libc::SIG_DFL);
+    }
+    unsafe {
+        libc::close(master);
+    }
     // Drain the channel briefly so the recorded tail isn't lost, then let it go.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while !drainer.is_finished() && std::time::Instant::now() < deadline {

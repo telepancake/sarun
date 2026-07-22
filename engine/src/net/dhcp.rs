@@ -6,8 +6,9 @@
 // info each time. Lease time = 24h; the box will renew transparently.
 
 use anyhow::{Context, Result};
-use dhcproto::v4::{Decodable, Decoder, Encodable, Encoder,
-                   Message, MessageType, Opcode, OptionCode, DhcpOption};
+use dhcproto::v4::{
+    Decodable, Decoder, DhcpOption, Encodable, Encoder, Message, MessageType, Opcode, OptionCode,
+};
 
 use super::subnet::BoxSubnet;
 
@@ -19,14 +20,16 @@ impl DhcpServer {
     pub fn handle(&self, raw: &[u8]) -> Result<Option<Vec<u8>>> {
         let mut dec = Decoder::new(raw);
         let req = Message::decode(&mut dec).context("decode dhcp")?;
-        if req.opcode() != Opcode::BootRequest { return Ok(None); }
+        if req.opcode() != Opcode::BootRequest {
+            return Ok(None);
+        }
         // A BOOTREQUEST without an explicit DHCP message-type option is legacy
         // BOOTP; treating it as Discover is the correct default, not a dropped
         // error (genuine decode failures already returned via `?` above).
         let mt = req.opts().msg_type().unwrap_or(MessageType::Discover);
         match mt {
             MessageType::Discover => Ok(Some(self.reply(&req, MessageType::Offer)?)),
-            MessageType::Request  => Ok(Some(self.reply(&req, MessageType::Ack)?)),
+            MessageType::Request => Ok(Some(self.reply(&req, MessageType::Ack)?)),
             MessageType::Release | MessageType::Decline => Ok(None),
             _ => Ok(None),
         }
@@ -43,15 +46,22 @@ impl DhcpServer {
         m.set_yiaddr(std::net::Ipv4Addr::from(self.subnet.box_ip()));
         m.set_siaddr(std::net::Ipv4Addr::from(self.subnet.gateway_ip()));
         m.opts_mut().insert(DhcpOption::MessageType(mt));
-        m.opts_mut().insert(DhcpOption::ServerIdentifier(
-            std::net::Ipv4Addr::from(self.subnet.gateway_ip())));
+        m.opts_mut()
+            .insert(DhcpOption::ServerIdentifier(std::net::Ipv4Addr::from(
+                self.subnet.gateway_ip(),
+            )));
         m.opts_mut().insert(DhcpOption::AddressLeaseTime(86_400));
-        m.opts_mut().insert(DhcpOption::SubnetMask(
-            std::net::Ipv4Addr::from(self.subnet.netmask())));
-        m.opts_mut().insert(DhcpOption::Router(vec![
-            std::net::Ipv4Addr::from(self.subnet.gateway_ip())]));
+        m.opts_mut()
+            .insert(DhcpOption::SubnetMask(std::net::Ipv4Addr::from(
+                self.subnet.netmask(),
+            )));
+        m.opts_mut()
+            .insert(DhcpOption::Router(vec![std::net::Ipv4Addr::from(
+                self.subnet.gateway_ip(),
+            )]));
         m.opts_mut().insert(DhcpOption::DomainNameServer(vec![
-            std::net::Ipv4Addr::from(self.subnet.gateway_ip())]));
+            std::net::Ipv4Addr::from(self.subnet.gateway_ip()),
+        ]));
         // End option is added by the encoder automatically.
         let mut out = Vec::with_capacity(548);
         let mut enc = Encoder::new(&mut out);

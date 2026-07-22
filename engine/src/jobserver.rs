@@ -33,9 +33,8 @@ pub fn explicit_jobs(argv: &[String]) -> Option<usize> {
     let mut i = 1;
     while i < argv.len() {
         let a = &argv[i];
-        let val_after = |i: usize| -> Option<usize> {
-            argv.get(i + 1).and_then(|s| s.parse::<usize>().ok())
-        };
+        let val_after =
+            |i: usize| -> Option<usize> { argv.get(i + 1).and_then(|s| s.parse::<usize>().ok()) };
         if let Some(rest) = a.strip_prefix("-j") {
             if rest.is_empty() {
                 return Some(val_after(i).unwrap_or_else(cpu_count));
@@ -78,7 +77,9 @@ pub fn advertise(local_jobs: usize) {
     // open() never blocks (only read()=acquire does), so this is safe even when
     // the pool is momentarily empty. If the path can't be opened we're likely not
     // in a box with the pool mounted — leave MAKEFLAGS alone (serial).
-    let Ok(cpath) = std::ffi::CString::new(JOBSERVER_PATH) else { return };
+    let Ok(cpath) = std::ffi::CString::new(JOBSERVER_PATH) else {
+        return;
+    };
     let r = unsafe { libc::open(cpath.as_ptr(), libc::O_RDWR) };
     if r < 0 {
         return;
@@ -93,9 +94,8 @@ pub fn advertise(local_jobs: usize) {
     clear_cloexec(r);
     clear_cloexec(w);
 
-    let auth = format!(
-        "-j{local_jobs} --jobserver-auth=fifo:{JOBSERVER_PATH} --jobserver-fds={r},{w}",
-    );
+    let auth =
+        format!("-j{local_jobs} --jobserver-auth=fifo:{JOBSERVER_PATH} --jobserver-fds={r},{w}",);
     let combined = match std::env::var("MAKEFLAGS") {
         Ok(prev) if !prev.trim().is_empty() => format!("{prev} {auth}"),
         _ => auth,

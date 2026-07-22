@@ -33,20 +33,17 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use anyhow::{Context, Result, anyhow, bail};
-use serde_json::Value;
 use oci_client::Reference;
 use oci_client::client::{Client, ClientConfig, ImageLayer};
-use oci_client::manifest::{
-    IMAGE_LAYER_GZIP_MEDIA_TYPE, IMAGE_LAYER_MEDIA_TYPE,
-};
+use oci_client::manifest::{IMAGE_LAYER_GZIP_MEDIA_TYPE, IMAGE_LAYER_MEDIA_TYPE};
 use oci_client::secrets::RegistryAuth;
+use serde_json::Value;
 
 use crate::capture::BoxState;
 use crate::paths;
 
 const ZSTD_LAYER_MEDIA_TYPE: &str = "application/vnd.oci.image.layer.v1.tar+zstd";
-const DOCKER_LAYER_GZIP_MEDIA_TYPE: &str =
-    "application/vnd.docker.image.rootfs.diff.tar.gzip";
+const DOCKER_LAYER_GZIP_MEDIA_TYPE: &str = "application/vnd.docker.image.rootfs.diff.tar.gzip";
 
 /// CLI dispatch: `sarun oci <subverb> <args...>`.
 pub fn cli_oci(args: &[String]) -> i32 {
@@ -70,8 +67,10 @@ pub fn cli_oci(args: &[String]) -> i32 {
             println!("       populate at-rest boxes from an OCI image, one per layer");
             println!("  sarun oci run [--name NAME] [--net off|tap|host] <ref> [-- CMD...]");
             println!("       run a container on top of an image's box stack");
-            println!("  sarun oci build [-t NAME] [-f FILE] [--net MODE] \
-                      [--build-arg K=V]... [CONTEXT]");
+            println!(
+                "  sarun oci build [-t NAME] [-f FILE] [--net MODE] \
+                      [--build-arg K=V]... [CONTEXT]"
+            );
             println!("       build an image box stack from a Dockerfile/Containerfile");
             println!("  sarun oci save <box> [-o FILE.tar]");
             println!("       export an image/container box stack to an oci-archive");
@@ -86,8 +85,10 @@ pub fn cli_oci(args: &[String]) -> i32 {
             0
         }
         other => {
-            eprintln!("sarun oci: unknown subcommand '{other}' \
-                       (try `sarun oci --help`)");
+            eprintln!(
+                "sarun oci: unknown subcommand '{other}' \
+                       (try `sarun oci --help`)"
+            );
             2
         }
     }
@@ -103,18 +104,26 @@ fn cli_dockerfile(args: &[String]) -> i32 {
         return 2;
     };
     match emit_dockerfile(boxname) {
-        Ok(s) => { print!("{s}"); 0 }
-        Err(e) => { eprintln!("sarun oci dockerfile: {e:#}"); 1 }
+        Ok(s) => {
+            print!("{s}");
+            0
+        }
+        Err(e) => {
+            eprintln!("sarun oci dockerfile: {e:#}");
+            1
+        }
     }
 }
 
 fn emit_dockerfile(boxname: &str) -> Result<String> {
     let boxes = crate::discover::discover();
-    let id = resolve_box(&boxes, boxname)
-        .ok_or_else(|| anyhow!("no such box '{boxname}'"))?;
+    let id = resolve_box(&boxes, boxname).ok_or_else(|| anyhow!("no such box '{boxname}'"))?;
     let mut chain = vec![id];
     let mut cur = id;
-    while let Some(p) = boxes.get(&cur).and_then(|b| b.parent) { chain.push(p); cur = p; }
+    while let Some(p) = boxes.get(&cur).and_then(|b| b.parent) {
+        chain.push(p);
+        cur = p;
+    }
     chain.reverse(); // base..top
     let has_frame = |b: &i64| boxes.get(b).is_some_and(|x| x.meta.contains_key("frame"));
     let first_build = chain.iter().position(has_frame);
@@ -130,7 +139,8 @@ fn emit_dockerfile(boxname: &str) -> Result<String> {
         let bx = boxes.get(&bt);
         // Prefer a real registry reference; fall back to the box NAME (which
         // `oci build`'s FROM resolves) for archive/layout-loaded bases.
-        let from = bx.and_then(|b| b.meta.get("oci_reference"))
+        let from = bx
+            .and_then(|b| b.meta.get("oci_reference"))
             .filter(|r| !r.starts_with("oci-archive:") && !r.starts_with("oci-layout:"))
             .cloned()
             .or_else(|| bx.map(|b| b.name.clone()))
@@ -138,14 +148,30 @@ fn emit_dockerfile(boxname: &str) -> Result<String> {
         out.push_str(&format!("FROM {from}\n"));
     }
     for &bx in build {
-        let Some(fr) = boxes.get(&bx).and_then(|b| b.meta.get("frame")) else { continue };
-        let Ok(v) = serde_json::from_str::<Value>(fr) else { continue };
-        for d in v.get("directives").and_then(Value::as_array).into_iter().flatten() {
+        let Some(fr) = boxes.get(&bx).and_then(|b| b.meta.get("frame")) else {
+            continue;
+        };
+        let Ok(v) = serde_json::from_str::<Value>(fr) else {
+            continue;
+        };
+        for d in v
+            .get("directives")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
             let op = d.get("op").and_then(Value::as_str).unwrap_or("");
             let text = d.get("text").and_then(Value::as_str).unwrap_or("");
-            if op.is_empty() { continue; }
-            if text.is_empty() { out.push_str(op); }
-            else { out.push_str(op); out.push(' '); out.push_str(text); }
+            if op.is_empty() {
+                continue;
+            }
+            if text.is_empty() {
+                out.push_str(op);
+            } else {
+                out.push_str(op);
+                out.push(' ');
+                out.push_str(text);
+            }
             out.push('\n');
         }
         // Advisory: the longest common path this box's RUN wrote to. If those
@@ -164,13 +190,24 @@ fn emit_dockerfile(boxname: &str) -> Result<String> {
 /// `(search)> ` while reverse-searching history).
 struct AuthorPrompt;
 impl reedline::Prompt for AuthorPrompt {
-    fn render_prompt_left(&self) -> std::borrow::Cow<'_, str> { "author".into() }
-    fn render_prompt_right(&self) -> std::borrow::Cow<'_, str> { "".into() }
-    fn render_prompt_indicator(&self, _: reedline::PromptEditMode)
-        -> std::borrow::Cow<'_, str> { "> ".into() }
-    fn render_prompt_multiline_indicator(&self) -> std::borrow::Cow<'_, str> { "::: ".into() }
-    fn render_prompt_history_search_indicator(&self, _: reedline::PromptHistorySearch)
-        -> std::borrow::Cow<'_, str> { "(search)> ".into() }
+    fn render_prompt_left(&self) -> std::borrow::Cow<'_, str> {
+        "author".into()
+    }
+    fn render_prompt_right(&self) -> std::borrow::Cow<'_, str> {
+        "".into()
+    }
+    fn render_prompt_indicator(&self, _: reedline::PromptEditMode) -> std::borrow::Cow<'_, str> {
+        "> ".into()
+    }
+    fn render_prompt_multiline_indicator(&self) -> std::borrow::Cow<'_, str> {
+        "::: ".into()
+    }
+    fn render_prompt_history_search_indicator(
+        &self,
+        _: reedline::PromptHistorySearch,
+    ) -> std::borrow::Cow<'_, str> {
+        "(search)> ".into()
+    }
 }
 
 /// Where the authoring REPL reads instruction lines from. At a tty we use
@@ -200,7 +237,7 @@ impl AuthorLines {
                 Ok(reedline::Signal::Success(s)) => Some(s),
                 Ok(reedline::Signal::CtrlC) => Some(String::new()),
                 Ok(reedline::Signal::CtrlD) => None,
-                Ok(_) => None,   // Signal is #[non_exhaustive]
+                Ok(_) => None, // Signal is #[non_exhaustive]
                 Err(_) => None,
             },
             AuthorLines::Pipe(stdin, buf) => {
@@ -234,9 +271,16 @@ fn cli_author(args: &[String]) -> i32 {
         match a.as_str() {
             "-t" | "--tag" => tag = it.next().cloned(),
             "--from" => from = it.next().cloned(),
-            "--net" => match it.next().map(String::as_str).and_then(crate::net::NetMode::parse) {
+            "--net" => match it
+                .next()
+                .map(String::as_str)
+                .and_then(crate::net::NetMode::parse)
+            {
                 Some(nm) => net_mode = nm,
-                None => { eprintln!("sarun oci author: --net wants off|tap|host"); return 2; }
+                None => {
+                    eprintln!("sarun oci author: --net wants off|tap|host");
+                    return 2;
+                }
             },
             "-h" | "--help" => {
                 println!("usage: sarun oci author -t NAME --from BASE [--net MODE]");
@@ -250,7 +294,10 @@ fn cli_author(args: &[String]) -> i32 {
                 println!("    done             → finalize the image (EOF also works)");
                 return 0;
             }
-            other => { eprintln!("sarun oci author: unexpected argument '{other}'"); return 2; }
+            other => {
+                eprintln!("sarun oci author: unexpected argument '{other}'");
+                return 2;
+            }
         }
     }
     let (Some(tag), Some(from)) = (tag, from) else {
@@ -258,25 +305,37 @@ fn cli_author(args: &[String]) -> i32 {
         return 2;
     };
     if in_box() {
-        eprintln!("sarun oci author: run on the host (RUN executes in a box and \
-                   needs the engine)");
+        eprintln!(
+            "sarun oci author: run on the host (RUN executes in a box and \
+                   needs the engine)"
+        );
         return 1;
     }
-    if let Err(e) = paths::ensure_dirs() { eprintln!("sarun oci author: {e}"); return 1; }
-    let mut b = Builder::new(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-                             net_mode, Vec::new());
+    if let Err(e) = paths::ensure_dirs() {
+        eprintln!("sarun oci author: {e}");
+        return 1;
+    }
+    let mut b = Builder::new(
+        std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        net_mode,
+        Vec::new(),
+    );
     if let Err(e) = b.do_from(&from, &None) {
         eprintln!("sarun oci author: FROM {from}: {e:#}");
         return 1;
     }
-    eprintln!("authoring '{tag}' FROM {from} — one instruction per line; \
-               `undo`, `print`, `done`.");
+    eprintln!(
+        "authoring '{tag}' FROM {from} — one instruction per line; \
+               `undo`, `print`, `done`."
+    );
     let mut lines = AuthorLines::new();
     let mut undo: Vec<(Builder, String)> = Vec::new();
     loop {
-        let Some(line) = lines.next_line() else { break };   // EOF / Ctrl-D = done
+        let Some(line) = lines.next_line() else { break }; // EOF / Ctrl-D = done
         let t = line.trim().to_string();
-        if t.is_empty() { continue; }
+        if t.is_empty() {
+            continue;
+        }
         match t.as_str() {
             "done" | "save" => break,
             "print" | "dockerfile" => {
@@ -290,9 +349,15 @@ fn cli_author(args: &[String]) -> i32 {
                 if let Some((snap, undone)) = undo.pop() {
                     // Delete any box the undone instruction created (a RUN/COPY
                     // layer); a config-only instruction created none.
-                    let new_boxes: Vec<i64> = b.frames.keys()
-                        .filter(|k| !snap.frames.contains_key(k)).copied().collect();
-                    for id in new_boxes { delete_box(id); }
+                    let new_boxes: Vec<i64> = b
+                        .frames
+                        .keys()
+                        .filter(|k| !snap.frames.contains_key(k))
+                        .copied()
+                        .collect();
+                    for id in new_boxes {
+                        delete_box(id);
+                    }
                     b = snap;
                     eprintln!("undone: {undone}");
                 } else {
@@ -317,19 +382,26 @@ fn cli_author(args: &[String]) -> i32 {
                         }
                         undo.push((snap, t.clone()));
                     }
-                    Err(e) => { eprintln!("error: {e:#}"); b = snap; }
+                    Err(e) => {
+                        eprintln!("error: {e:#}");
+                        b = snap;
+                    }
                 }
             }
         }
     }
     match b.finish(Some(tag.clone())) {
-        Ok(()) => {
-            match emit_dockerfile(&tag) {
-                Ok(df) => { println!("--- Dockerfile ---\n{df}"); 0 }
-                Err(_) => 0,
+        Ok(()) => match emit_dockerfile(&tag) {
+            Ok(df) => {
+                println!("--- Dockerfile ---\n{df}");
+                0
             }
+            Err(_) => 0,
+        },
+        Err(e) => {
+            eprintln!("sarun oci author: {e:#}");
+            1
         }
-        Err(e) => { eprintln!("sarun oci author: {e:#}"); 1 }
     }
 }
 
@@ -345,9 +417,24 @@ fn author_line_to_instruction(t: &str) -> Instruction {
             return Instruction::Env(vec![(k.trim().to_string(), v.trim().to_string())]);
         }
     }
-    const KW: &[&str] = &["RUN", "COPY", "ADD", "ENV", "WORKDIR", "USER", "CMD",
-        "ENTRYPOINT", "LABEL", "EXPOSE", "VOLUME", "SHELL", "STOPSIGNAL", "ARG",
-        "ONBUILD", "HEALTHCHECK"];
+    const KW: &[&str] = &[
+        "RUN",
+        "COPY",
+        "ADD",
+        "ENV",
+        "WORKDIR",
+        "USER",
+        "CMD",
+        "ENTRYPOINT",
+        "LABEL",
+        "EXPOSE",
+        "VOLUME",
+        "SHELL",
+        "STOPSIGNAL",
+        "ARG",
+        "ONBUILD",
+        "HEALTHCHECK",
+    ];
     let kw = t.split_whitespace().next().unwrap_or("").to_uppercase();
     if KW.contains(&kw.as_str()) {
         if let Ok(df) = crate::dockerfile::Dockerfile::parse(t) {
@@ -389,14 +476,20 @@ fn cli_save(args: &[String]) -> i32 {
         match a.as_str() {
             "-o" | "--output" => match it.next() {
                 Some(v) => dest = Some(v.clone()),
-                None => { eprintln!("sarun oci save: {a} needs an argument"); return 2; }
+                None => {
+                    eprintln!("sarun oci save: {a} needs an argument");
+                    return 2;
+                }
             },
             "-h" | "--help" => {
                 println!("usage: sarun oci save <box> [-o FILE.tar]");
                 return 0;
             }
             other if boxname.is_none() => boxname = Some(other.to_string()),
-            other => { eprintln!("sarun oci save: unexpected argument '{other}'"); return 2; }
+            other => {
+                eprintln!("sarun oci save: unexpected argument '{other}'");
+                return 2;
+            }
         }
     }
     let Some(boxname) = boxname else {
@@ -404,8 +497,10 @@ fn cli_save(args: &[String]) -> i32 {
         return 2;
     };
     if in_box() {
-        eprintln!("sarun oci save: run on the host — it reads at-rest box state, \
-                   which a closed box can't see");
+        eprintln!(
+            "sarun oci save: run on the host — it reads at-rest box state, \
+                   which a closed box can't see"
+        );
         return 1;
     }
     match save_box(&boxname, dest.as_deref()) {
@@ -413,14 +508,16 @@ fn cli_save(args: &[String]) -> i32 {
             println!("saved box '{boxname}' → oci-archive '{path}' ({n} layer(s))");
             0
         }
-        Err(e) => { eprintln!("sarun oci save: {e:#}"); 1 }
+        Err(e) => {
+            eprintln!("sarun oci save: {e:#}");
+            1
+        }
     }
 }
 
 fn save_box(boxname: &str, dest: Option<&str>) -> Result<(String, usize)> {
     let boxes = crate::discover::discover();
-    let id = resolve_box(&boxes, boxname)
-        .ok_or_else(|| anyhow!("no such box '{boxname}'"))?;
+    let id = resolve_box(&boxes, boxname).ok_or_else(|| anyhow!("no such box '{boxname}'"))?;
     // Walk the parent chain to the root, then reverse → base..top (= layer order).
     let mut chain = vec![id];
     let mut cur = id;
@@ -430,31 +527,44 @@ fn save_box(boxname: &str, dest: Option<&str>) -> Result<(String, usize)> {
     }
     chain.reverse();
     let base = chain[0];
-    if boxes.get(&base).and_then(|b| b.meta.get("no_host_fallback")).map(String::as_str)
-        != Some("1") {
-        bail!("box '{boxname}' is not a closed image stack (its base falls through \
-               to the host) — `oci save` needs a load/build/run image base");
+    if boxes
+        .get(&base)
+        .and_then(|b| b.meta.get("no_host_fallback"))
+        .map(String::as_str)
+        != Some("1")
+    {
+        bail!(
+            "box '{boxname}' is not a closed image stack (its base falls through \
+               to the host) — `oci save` needs a load/build/run image base"
+        );
     }
     // The image config: the highest oci_config in the chain (top→base).
-    let cfg_json = chain.iter().rev()
+    let cfg_json = chain
+        .iter()
+        .rev()
         .find_map(|b| boxes.get(b).and_then(|x| x.meta.get("oci_config")).cloned())
-        .ok_or_else(|| anyhow!("box '{boxname}' carries no oci_config — not an OCI \
-                                image (load/build it first)"))?;
+        .ok_or_else(|| {
+            anyhow!(
+                "box '{boxname}' carries no oci_config — not an OCI \
+                                image (load/build it first)"
+            )
+        })?;
 
-    let layout = paths::runtime_home()
-        .join(format!("oci-save-{}-{}", std::process::id(), now_ns()));
+    let layout =
+        paths::runtime_home().join(format!("oci-save-{}-{}", std::process::id(), now_ns()));
     let blobs = layout.join("blobs").join("sha256");
     std::fs::create_dir_all(&blobs).context("create save layout")?;
-    let _guard = TmpCleanup { dir: layout.clone(), file: layout.join(".none") };
+    let _guard = TmpCleanup {
+        dir: layout.clone(),
+        file: layout.join(".none"),
+    };
 
     let mut diff_ids: Vec<String> = Vec::new();
     let mut layer_descs: Vec<Value> = Vec::new();
     for &bx in &chain {
-        let tar = build_layer_tar(bx)
-            .with_context(|| format!("export layer box {bx}"))?;
+        let tar = build_layer_tar(bx).with_context(|| format!("export layer box {bx}"))?;
         diff_ids.push(format!("sha256:{}", sha256_hex(&tar)));
-        let mut enc = flate2::write::GzEncoder::new(Vec::new(),
-                                                    flate2::Compression::default());
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         std::io::Write::write_all(&mut enc, &tar).context("gzip layer")?;
         let gz = enc.finish().context("finish gzip layer")?;
         let ldg = format!("sha256:{}", sha256_hex(&gz));
@@ -470,18 +580,29 @@ fn save_box(boxname: &str, dest: Option<&str>) -> Result<(String, usize)> {
     // re-emitted layers and ensuring architecture/os are present.
     let mut cfg: Value = serde_json::from_str(&cfg_json).context("parse oci_config")?;
     if let Value::Object(ref mut m) = cfg {
-        m.insert("rootfs".into(), serde_json::json!({
-            "type": "layers", "diff_ids": diff_ids.clone() }));
-        m.entry("architecture").or_insert_with(|| Value::String("amd64".into()));
-        m.entry("os").or_insert_with(|| Value::String("linux".into()));
+        m.insert(
+            "rootfs".into(),
+            serde_json::json!({
+            "type": "layers", "diff_ids": diff_ids.clone() }),
+        );
+        m.entry("architecture")
+            .or_insert_with(|| Value::String("amd64".into()));
+        m.entry("os")
+            .or_insert_with(|| Value::String("linux".into()));
         // Preserve the build/load history (created_by recipe). It carries no
         // layer digests, only an ordered empty_layer flag sequence, so it stays
         // valid across re-emission AS LONG AS its non-empty count matches the
         // layer count. Pad with generic entries when a box on top (e.g. a
         // modified container) added layers the history doesn't mention.
-        let hist = m.remove("history").and_then(|h| match h {
-            Value::Array(a) => Some(a), _ => None }).unwrap_or_default();
-        let non_empty = hist.iter()
+        let hist = m
+            .remove("history")
+            .and_then(|h| match h {
+                Value::Array(a) => Some(a),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let non_empty = hist
+            .iter()
             .filter(|e| e.get("empty_layer").and_then(Value::as_bool) != Some(true))
             .count();
         let mut hist = hist;
@@ -489,7 +610,9 @@ fn save_box(boxname: &str, dest: Option<&str>) -> Result<(String, usize)> {
             hist.push(serde_json::json!({
                 "created_by": "sarun: box changes", "empty_layer": false }));
         }
-        if !hist.is_empty() { m.insert("history".into(), Value::Array(hist)); }
+        if !hist.is_empty() {
+            m.insert("history".into(), Value::Array(hist));
+        }
     }
     let cfg_b = serde_json::to_vec(&cfg).context("serialize config")?;
     let cfg_d = format!("sha256:{}", sha256_hex(&cfg_b));
@@ -516,14 +639,20 @@ fn save_box(boxname: &str, dest: Option<&str>) -> Result<(String, usize)> {
             "annotations": {"org.opencontainers.image.ref.name": boxname},
         }],
     });
-    std::fs::write(layout.join("index.json"),
-                   serde_json::to_vec(&index).context("serialize index")?)
-        .context("write index.json")?;
-    std::fs::write(layout.join("oci-layout"),
-                   serde_json::json!({"imageLayoutVersion": "1.0.0"}).to_string())
-        .context("write oci-layout")?;
+    std::fs::write(
+        layout.join("index.json"),
+        serde_json::to_vec(&index).context("serialize index")?,
+    )
+    .context("write index.json")?;
+    std::fs::write(
+        layout.join("oci-layout"),
+        serde_json::json!({"imageLayoutVersion": "1.0.0"}).to_string(),
+    )
+    .context("write oci-layout")?;
 
-    let dest = dest.map(String::from).unwrap_or_else(|| format!("{boxname}.tar"));
+    let dest = dest
+        .map(String::from)
+        .unwrap_or_else(|| format!("{boxname}.tar"));
     _tar_layout_to(&layout, Path::new(&dest)).context("write oci-archive")?;
     Ok((dest, chain.len()))
 }
@@ -534,9 +663,9 @@ fn save_box(boxname: &str, dest: Option<&str>) -> Result<(String, usize)> {
 /// whiteout tombstones (→ `.wh.<name>`). Ownership rides along.
 fn build_layer_tar(box_id: i64) -> Result<Vec<u8>> {
     let sqlar = paths::state_home().join(format!("{box_id}.sqlar"));
-    let conn = rusqlite::Connection::open_with_flags(
-        &sqlar, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .with_context(|| format!("open {}", sqlar.display()))?;
+    let conn =
+        rusqlite::Connection::open_with_flags(&sqlar, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .with_context(|| format!("open {}", sqlar.display()))?;
     let mut tb = tar::Builder::new(Vec::new());
     let rows = crate::depot::archive_all_nodes(&conn)?;
     for (rowid, name, mode, data, opaque) in rows {
@@ -545,34 +674,42 @@ fn build_layer_tar(box_id: i64) -> Result<Vec<u8>> {
         let (uid, gid) = owner_lookup(&conn, &name);
         if name.is_empty() {
             // The box-root opaque marker (name="") — emit it at the tar root.
-            if opaque != 0 { append_empty_file(&mut tb, ".wh..wh..opq")?; }
+            if opaque != 0 {
+                append_empty_file(&mut tb, ".wh..wh..opq")?;
+            }
             continue;
         }
         match kind {
-            0o040000 => {   // directory
+            0o040000 => {
+                // directory
                 let mut h = tar::Header::new_gnu();
                 h.set_entry_type(tar::EntryType::Directory);
-                h.set_mode(perm); h.set_size(0);
-                h.set_uid(uid as u64); h.set_gid(gid as u64);
+                h.set_mode(perm);
+                h.set_size(0);
+                h.set_uid(uid as u64);
+                h.set_gid(gid as u64);
                 tb.append_data(&mut h, &name, std::io::empty())?;
                 if opaque != 0 {
                     append_empty_file(&mut tb, &format!("{name}/.wh..wh..opq"))?;
                 }
             }
-            0o120000 => {   // symlink — target is the sqlar data
-                let target = String::from_utf8_lossy(&data.unwrap_or_default())
-                    .into_owned();
+            0o120000 => {
+                // symlink — target is the sqlar data
+                let target = String::from_utf8_lossy(&data.unwrap_or_default()).into_owned();
                 let mut h = tar::Header::new_gnu();
                 h.set_entry_type(tar::EntryType::Symlink);
-                h.set_mode(perm); h.set_size(0);
-                h.set_uid(uid as u64); h.set_gid(gid as u64);
+                h.set_mode(perm);
+                h.set_size(0);
+                h.set_uid(uid as u64);
+                h.set_gid(gid as u64);
                 tb.append_link(&mut h, &name, &target)?;
             }
             0o020000 if rdev_lookup(&conn, &name).is_none() => {
                 // S_IFCHR with no device row = a whiteout tombstone → `.wh.<name>`.
                 append_empty_file(&mut tb, &whiteout_path(&name))?;
             }
-            0o020000 | 0o060000 | 0o010000 => {   // char / block / fifo device
+            0o020000 | 0o060000 | 0o010000 => {
+                // char / block / fifo device
                 let dev = rdev_lookup(&conn, &name).unwrap_or(0);
                 let et = match kind {
                     0o020000 => tar::EntryType::Char,
@@ -581,19 +718,24 @@ fn build_layer_tar(box_id: i64) -> Result<Vec<u8>> {
                 };
                 let mut h = tar::Header::new_gnu();
                 h.set_entry_type(et);
-                h.set_mode(perm); h.set_size(0);
-                h.set_uid(uid as u64); h.set_gid(gid as u64);
+                h.set_mode(perm);
+                h.set_size(0);
+                h.set_uid(uid as u64);
+                h.set_gid(gid as u64);
                 let _ = h.set_device_major(((dev >> 8) & 0xfff) as u32);
                 let _ = h.set_device_minor((dev & 0xff) as u32);
                 tb.append_data(&mut h, &name, std::io::empty())?;
             }
-            _ => {   // regular file — bytes live in the blob pool
-                let bytes = std::fs::read(crate::depot::blob_path(box_id, rowid))
-                    .unwrap_or_default();
+            _ => {
+                // regular file — bytes live in the blob pool
+                let bytes =
+                    std::fs::read(crate::depot::blob_path(box_id, rowid)).unwrap_or_default();
                 let mut h = tar::Header::new_gnu();
                 h.set_entry_type(tar::EntryType::Regular);
-                h.set_mode(perm); h.set_size(bytes.len() as u64);
-                h.set_uid(uid as u64); h.set_gid(gid as u64);
+                h.set_mode(perm);
+                h.set_size(bytes.len() as u64);
+                h.set_uid(uid as u64);
+                h.set_gid(gid as u64);
                 tb.append_data(&mut h, &name, &bytes[..])?;
             }
         }
@@ -609,24 +751,28 @@ fn whiteout_path(name: &str) -> String {
     }
 }
 
-fn append_empty_file<W: std::io::Write>(tb: &mut tar::Builder<W>, path: &str)
-    -> Result<()> {
+fn append_empty_file<W: std::io::Write>(tb: &mut tar::Builder<W>, path: &str) -> Result<()> {
     let mut h = tar::Header::new_gnu();
     h.set_entry_type(tar::EntryType::Regular);
-    h.set_mode(0o644); h.set_size(0);
+    h.set_mode(0o644);
+    h.set_size(0);
     tb.append_data(&mut h, path, std::io::empty())?;
     Ok(())
 }
 
 fn owner_lookup(conn: &rusqlite::Connection, name: &str) -> (u32, u32) {
-    conn.query_row("SELECT uid,gid FROM ownership WHERE name=?1", [name],
-                   |r| Ok((r.get::<_, i64>(0)? as u32, r.get::<_, i64>(1)? as u32)))
-        .unwrap_or((0, 0))
+    conn.query_row("SELECT uid,gid FROM ownership WHERE name=?1", [name], |r| {
+        Ok((r.get::<_, i64>(0)? as u32, r.get::<_, i64>(1)? as u32))
+    })
+    .unwrap_or((0, 0))
 }
 
 fn rdev_lookup(conn: &rusqlite::Connection, name: &str) -> Option<u64> {
-    conn.query_row("SELECT dev FROM rdev WHERE name=?1", [name],
-                   |r| r.get::<_, i64>(0)).ok().map(|d| d as u64)
+    conn.query_row("SELECT dev FROM rdev WHERE name=?1", [name], |r| {
+        r.get::<_, i64>(0)
+    })
+    .ok()
+    .map(|d| d as u64)
 }
 
 /// Component-wise longest common prefix of a set of paths. A single path is its
@@ -634,13 +780,21 @@ fn rdev_lookup(conn: &rusqlite::Connection, name: &str) -> Option<u64> {
 /// yield "" (the worst case the caller treats as "no useful hint").
 fn paths_lcp(paths: &[String]) -> String {
     let mut it = paths.iter();
-    let Some(first) = it.next() else { return String::new() };
+    let Some(first) = it.next() else {
+        return String::new();
+    };
     let mut prefix: Vec<&str> = first.split('/').collect();
     for p in it {
         let comps: Vec<&str> = p.split('/').collect();
-        let n = prefix.iter().zip(comps.iter()).take_while(|(a, b)| a == b).count();
+        let n = prefix
+            .iter()
+            .zip(comps.iter())
+            .take_while(|(a, b)| a == b)
+            .count();
         prefix.truncate(n);
-        if prefix.is_empty() { break; }
+        if prefix.is_empty() {
+            break;
+        }
     }
     prefix.join("/")
 }
@@ -652,25 +806,39 @@ fn paths_lcp(paths: &[String]) -> String {
 /// no file writes or they're too scattered to share a prefix.
 fn box_write_lcp(box_id: i64) -> String {
     let sqlar = paths::state_home().join(format!("{box_id}.sqlar"));
-    let Ok(conn) = rusqlite::Connection::open_with_flags(
-        &sqlar, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY) else { return String::new() };
+    let Ok(conn) =
+        rusqlite::Connection::open_with_flags(&sqlar, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+    else {
+        return String::new();
+    };
     let mut names = Vec::new();
     for (name, mode) in crate::depot::archive_names_modes(&conn) {
-        if name.is_empty() { continue; }
+        if name.is_empty() {
+            continue;
+        }
         let kind = mode & 0o170000;
-        if kind == 0o040000 { continue; }                                   // dir
-        if kind == 0o020000 && rdev_lookup(&conn, &name).is_none() { continue; } // whiteout
+        if kind == 0o040000 {
+            continue;
+        } // dir
+        if kind == 0o020000 && rdev_lookup(&conn, &name).is_none() {
+            continue;
+        } // whiteout
         names.push(name);
     }
-    if names.is_empty() { return String::new(); }
+    if names.is_empty() {
+        return String::new();
+    }
     let lcp = paths_lcp(&names);
-    if lcp.is_empty() { String::new() } else { format!("/{lcp}") }
+    if lcp.is_empty() {
+        String::new()
+    } else {
+        format!("/{lcp}")
+    }
 }
 
 /// Tar an oci-layout dir into `dest` (oci-archive format).
 fn _tar_layout_to(layout: &Path, dest: &Path) -> Result<()> {
-    let f = File::create(dest)
-        .with_context(|| format!("create {}", dest.display()))?;
+    let f = File::create(dest).with_context(|| format!("create {}", dest.display()))?;
     let mut tb = tar::Builder::new(f);
     tb.append_path_with_name(layout.join("oci-layout"), "oci-layout")?;
     tb.append_path_with_name(layout.join("index.json"), "index.json")?;
@@ -690,32 +858,38 @@ fn cli_load(args: &[String]) -> i32 {
     // Fall back to a local pull only when no engine is reachable (host, no
     // `serve`); an in-box caller must use the engine (broker), never local.
     match engine_conn() {
-        Some(conn) => {
-            match engine_rpc_on(conn, "oci.load",
-                                serde_json::json!([reference, name])) {
-                Ok(r) => {
-                    if r.get("verified").and_then(Value::as_bool) == Some(true) {
-                        eprintln!("sarun oci: cosign signature verified for \
-                                   '{reference}'");
-                    }
-                    println!("loaded image '{reference}': base box '{}' (id={}) → \
-                              top box '{}' (id={}), {} layer(s)",
-                        r.get("base_name").and_then(Value::as_str).unwrap_or("?"),
-                        r.get("base_id").and_then(Value::as_i64).unwrap_or(0),
-                        r.get("top_name").and_then(Value::as_str).unwrap_or("?"),
-                        r.get("top_id").and_then(Value::as_i64).unwrap_or(0),
-                        r.get("n_layers").and_then(Value::as_i64).unwrap_or(0));
-                    return 0;
+        Some(conn) => match engine_rpc_on(conn, "oci.load", serde_json::json!([reference, name])) {
+            Ok(r) => {
+                if r.get("verified").and_then(Value::as_bool) == Some(true) {
+                    eprintln!(
+                        "sarun oci: cosign signature verified for \
+                                   '{reference}'"
+                    );
                 }
-                Err(e) => { eprintln!("sarun oci load: {e}"); return 1; }
+                println!(
+                    "loaded image '{reference}': base box '{}' (id={}) → \
+                              top box '{}' (id={}), {} layer(s)",
+                    r.get("base_name").and_then(Value::as_str).unwrap_or("?"),
+                    r.get("base_id").and_then(Value::as_i64).unwrap_or(0),
+                    r.get("top_name").and_then(Value::as_str).unwrap_or("?"),
+                    r.get("top_id").and_then(Value::as_i64).unwrap_or(0),
+                    r.get("n_layers").and_then(Value::as_i64).unwrap_or(0)
+                );
+                return 0;
             }
-        }
+            Err(e) => {
+                eprintln!("sarun oci load: {e}");
+                return 1;
+            }
+        },
         None if in_box() => {
-            eprintln!("sarun oci load: in a box but the engine broker is \
-                       unreachable — cannot pull");
+            eprintln!(
+                "sarun oci load: in a box but the engine broker is \
+                       unreachable — cannot pull"
+            );
             return 1;
         }
-        None => {}  // host, no engine: fall through to a local pull
+        None => {} // host, no engine: fall through to a local pull
     }
     if let Err(e) = paths::ensure_dirs() {
         eprintln!("sarun oci load: {e}");
@@ -729,9 +903,11 @@ fn cli_load(args: &[String]) -> i32 {
             // Spell out both ends of the chain so the user can address the
             // image as either `<base>` (full merged view) or `<base>.L<n>`
             // (a specific layer). Single-layer images have base == top.
-            println!("loaded image '{reference}': base box '{}' (id={}) → \
+            println!(
+                "loaded image '{reference}': base box '{}' (id={}) → \
                       top box '{}' (id={}), {} layer(s)",
-                     r.base_name, r.base_id, r.top_name, r.top_id, r.n_layers);
+                r.base_name, r.base_id, r.top_name, r.top_id, r.n_layers
+            );
             0
         }
         Err(e) => {
@@ -768,7 +944,10 @@ fn cli_run(args: &[String]) -> i32 {
         match a.as_str() {
             "--name" => match it.next() {
                 Some(v) => name = Some(v.clone()),
-                None => { eprintln!("sarun oci run: --name needs an argument"); return 2; }
+                None => {
+                    eprintln!("sarun oci run: --name needs an argument");
+                    return 2;
+                }
             },
             "-n" => net_mode = crate::net::NetMode::Tap,
             "-N" => net_mode = crate::net::NetMode::Host,
@@ -789,20 +968,30 @@ fn cli_run(args: &[String]) -> i32 {
             //           toggle the `sarun run` parser sets; read at the
             //           register message in runner::run. The browser and the
             //           crawler pass this.
-            "--webcap" => unsafe { std::env::set_var("SARUN_WEBCAP", "1"); },
+            "--webcap" => unsafe {
+                std::env::set_var("SARUN_WEBCAP", "1");
+            },
             // --webfilter  proxy-side adblock + rewrite (DESIGN-web.md W7).
-            "--webfilter" => unsafe { std::env::set_var("SARUN_WEBFILTER", "1"); },
+            "--webfilter" => unsafe {
+                std::env::set_var("SARUN_WEBFILTER", "1");
+            },
             // --replay <box>  serve requests from <box>'s webcap instead of
             //                 upstream (DESIGN-web.md W4.2). The value is the
             //                 source box id; read at register via SARUN_REPLAY.
             "--replay" => match it.next() {
-                Some(v) if v.parse::<i64>().is_ok() =>
-                    unsafe { std::env::set_var("SARUN_REPLAY", v); },
-                _ => { eprintln!("sarun oci run: --replay needs a box id"); return 2; }
+                Some(v) if v.parse::<i64>().is_ok() => unsafe {
+                    std::env::set_var("SARUN_REPLAY", v);
+                },
+                _ => {
+                    eprintln!("sarun oci run: --replay needs a box id");
+                    return 2;
+                }
             },
             "-h" | "--help" => {
-                println!("usage: sarun oci run [--name NAME] [--net off|tap|host] \
-                          [--webcap] [--webfilter] [--replay BOX] <ref> [-- CMD...]");
+                println!(
+                    "usage: sarun oci run [--name NAME] [--net off|tap|host] \
+                          [--webcap] [--webfilter] [--replay BOX] <ref> [-- CMD...]"
+                );
                 return 0;
             }
             other if reference.is_none() => reference = Some(other.to_string()),
@@ -813,8 +1002,10 @@ fn cli_run(args: &[String]) -> i32 {
         }
     }
     let Some(reference) = reference else {
-        eprintln!("usage: sarun oci run [--name NAME] [--net off|tap|host] \
-                   <ref> [-- CMD...]");
+        eprintln!(
+            "usage: sarun oci run [--name NAME] [--net off|tap|host] \
+                   <ref> [-- CMD...]"
+        );
         return 2;
     };
     // Rootless Tap needs its user+network namespace while the process is
@@ -848,8 +1039,11 @@ fn cli_run(args: &[String]) -> i32 {
     // Interactive when stdin is a tty (so `oci run … -- sh` gives a real shell),
     // mirroring `docker run -it`'s default for an attached terminal.
     let pty = unsafe { libc::isatty(0) == 1 };
-    eprintln!("sarun oci run: container '{container}' on image top box {top_id} \
-               (net={})", net_mode.as_str());
+    eprintln!(
+        "sarun oci run: container '{container}' on image top box {top_id} \
+               (net={})",
+        net_mode.as_str()
+    );
     crate::runner::run(
         Some(session),
         /* passthrough */ false,
@@ -892,16 +1086,27 @@ fn engine_conn() -> Option<std::os::unix::net::UnixStream> {
 /// One `{"type":"ui","verb":...}` round trip over `conn`; returns the reply's
 /// `r` payload, or an error carrying the engine's message. The pull can take a
 /// while — there is no read timeout, by design.
-fn engine_rpc_on(mut conn: std::os::unix::net::UnixStream, verb: &str, args: Value)
-    -> Result<Value> {
+fn engine_rpc_on(
+    mut conn: std::os::unix::net::UnixStream,
+    verb: &str,
+    args: Value,
+) -> Result<Value> {
     use std::io::{BufRead, BufReader, Write};
     let msg = serde_json::json!({"type": "ui", "verb": verb, "args": args});
-    conn.write_all(format!("{msg}\n").as_bytes()).context("engine rpc write")?;
+    conn.write_all(format!("{msg}\n").as_bytes())
+        .context("engine rpc write")?;
     let mut line = String::new();
-    BufReader::new(&conn).read_line(&mut line).context("engine rpc read")?;
+    BufReader::new(&conn)
+        .read_line(&mut line)
+        .context("engine rpc read")?;
     let rep: Value = serde_json::from_str(&line).context("engine rpc parse")?;
     if rep.get("ok").and_then(Value::as_bool) != Some(true) {
-        bail!("{}", rep.get("error").and_then(Value::as_str).unwrap_or("rpc failed"));
+        bail!(
+            "{}",
+            rep.get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("rpc failed")
+        );
     }
     Ok(rep.get("r").cloned().unwrap_or(Value::Null))
 }
@@ -911,7 +1116,9 @@ fn engine_rpc_on(mut conn: std::os::unix::net::UnixStream, verb: &str, args: Val
 /// engine's `oci.load` RPC handler (host-side, where credentials live).
 pub(crate) fn load_blocking(reference: &str, name: Option<String>) -> Result<LoadOutcome> {
     let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all().build().context("tokio init")?;
+        .enable_all()
+        .build()
+        .context("tokio init")?;
     rt.block_on(load(reference, name))
 }
 
@@ -928,17 +1135,25 @@ fn resolve_image_top(reference: &str) -> Result<i64> {
         // Surface the engine's reuse/pull note on the caller's terminal (it ran
         // host-side, so its own eprintln went to the engine log, not here).
         if let Some(note) = r.get("note").and_then(Value::as_str) {
-            if !note.is_empty() { eprintln!("{note}"); }
+            if !note.is_empty() {
+                eprintln!("{note}");
+            }
         }
-        return r.get("top_id").and_then(Value::as_i64)
+        return r
+            .get("top_id")
+            .and_then(Value::as_i64)
             .ok_or_else(|| anyhow!("engine oci.resolve returned no top_id"));
     }
     if in_box() {
-        bail!("in a box but the engine broker is unreachable — cannot resolve \
-               image '{reference}'");
+        bail!(
+            "in a box but the engine broker is unreachable — cannot resolve \
+               image '{reference}'"
+        );
     }
     let (top, note) = resolve_image_top_local(reference)?;
-    if !note.is_empty() { eprintln!("{note}"); }
+    if !note.is_empty() {
+        eprintln!("{note}");
+    }
     Ok(top)
 }
 
@@ -963,8 +1178,10 @@ pub(crate) fn resolve_image_top_local(reference: &str) -> Result<(i64, String)> 
     let probed = probe_manifest_digest(reference).ok();
     if let Some(dg) = probed.as_deref() {
         if let Some(start) = find_loaded_by_manifest_digest(&boxes, dg) {
-            let note = format!("sarun oci: reusing already-loaded image \
-                                '{reference}' (manifest {dg}, box {start})");
+            let note = format!(
+                "sarun oci: reusing already-loaded image \
+                                '{reference}' (manifest {dg}, box {start})"
+            );
             return Ok((follow_to_top(&boxes, start), note));
         }
     }
@@ -980,24 +1197,33 @@ pub(crate) fn resolve_image_top_local(reference: &str) -> Result<(i64, String)> 
     // digest-pinned image on every run (e.g. the cellulose browser image).
     let is_digest_pin = reference.contains("@sha256:");
     if let Some(start) = find_loaded_by_reference(&boxes, reference) {
-        let stored = boxes.get(&start).and_then(|b| b.meta.get("oci_manifest_digest"));
+        let stored = boxes
+            .get(&start)
+            .and_then(|b| b.meta.get("oci_manifest_digest"));
         let stale = !is_digest_pin
             && matches!((probed.as_deref(), stored),
                         (Some(p), Some(s)) if p != s.as_str());
         if stale {
-            prefix = format!("sarun oci: image '{reference}' tag moved (manifest \
-                              changed) — re-pulling\n");
+            prefix = format!(
+                "sarun oci: image '{reference}' tag moved (manifest \
+                              changed) — re-pulling\n"
+            );
         } else {
-            let note = format!("sarun oci: reusing already-loaded image \
-                                '{reference}' (box {start})");
+            let note = format!(
+                "sarun oci: reusing already-loaded image \
+                                '{reference}' (box {start})"
+            );
             return Ok((follow_to_top(&boxes, start), note));
         }
     }
     // Not loaded → treat as an image reference and pull it.
-    let outcome = load_blocking(reference, None)
-        .with_context(|| format!("load image '{reference}'"))?;
-    let note = format!("{prefix}sarun oci run: loaded image '{reference}' → \
-                        top box {} ({} layer(s))", outcome.top_id, outcome.n_layers);
+    let outcome =
+        load_blocking(reference, None).with_context(|| format!("load image '{reference}'"))?;
+    let note = format!(
+        "{prefix}sarun oci run: loaded image '{reference}' → \
+                        top box {} ({} layer(s))",
+        outcome.top_id, outcome.n_layers
+    );
     Ok((outcome.top_id, note))
 }
 
@@ -1005,9 +1231,13 @@ pub(crate) fn resolve_image_top_local(reference: &str) -> Result<(i64, String)> 
 /// image-cache v2 key. The lowest id is the stack's base.
 fn find_loaded_by_manifest_digest(
     boxes: &std::collections::BTreeMap<i64, crate::discover::Box_>,
-    digest: &str) -> Option<i64> {
-    if digest.is_empty() { return None; }
-    boxes.values()
+    digest: &str,
+) -> Option<i64> {
+    if digest.is_empty() {
+        return None;
+    }
+    boxes
+        .values()
         .filter(|b| b.meta.get("oci_manifest_digest").map(String::as_str) == Some(digest))
         .map(|b| b.box_id)
         .min()
@@ -1026,12 +1256,14 @@ fn probe_manifest_digest(reference: &str) -> Result<String> {
         return index_manifest_digest(&idx);
     }
     // Registry: a cheap manifest fetch (no blobs).
-    let r = Reference::from_str(reference)
-        .with_context(|| format!("parse reference '{reference}'"))?;
+    let r =
+        Reference::from_str(reference).with_context(|| format!("parse reference '{reference}'"))?;
     let auth = registry_auth_for(reference);
     let client = Client::new(ClientConfig::default());
     let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all().build().context("tokio init")?;
+        .enable_all()
+        .build()
+        .context("tokio init")?;
     rt.block_on(client.fetch_manifest_digest(&r, &auth))
         .context("fetch manifest digest")
 }
@@ -1039,8 +1271,7 @@ fn probe_manifest_digest(reference: &str) -> Result<String> {
 /// Read just `index.json` out of an oci-archive tar (top-level entry) and return
 /// its platform-matched manifest digest — no layer extraction.
 fn archive_index_manifest_digest(path: &Path) -> Result<String> {
-    let file = File::open(path)
-        .with_context(|| format!("open {}", path.display()))?;
+    let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
     let mut ar = tar::Archive::new(file);
     for entry in ar.entries().context("read archive entries")? {
         let mut e = entry.context("archive entry")?;
@@ -1061,9 +1292,12 @@ fn archive_index_manifest_digest(path: &Path) -> Result<String> {
 /// (find_loaded_by_manifest_digest) keys on the manifest digest and is tried
 /// first; this remains the fallback when no digest probe is available. The
 /// lowest id is the stack's base, so follow_to_top reaches that stack's top.
-fn find_loaded_by_reference(boxes: &std::collections::BTreeMap<i64, crate::discover::Box_>,
-                            reference: &str) -> Option<i64> {
-    boxes.values()
+fn find_loaded_by_reference(
+    boxes: &std::collections::BTreeMap<i64, crate::discover::Box_>,
+    reference: &str,
+) -> Option<i64> {
+    boxes
+        .values()
         .filter(|b| b.meta.get("oci_reference").map(String::as_str) == Some(reference))
         .map(|b| b.box_id)
         .min()
@@ -1072,14 +1306,18 @@ fn find_loaded_by_reference(boxes: &std::collections::BTreeMap<i64, crate::disco
 /// Box id for `ident` as a numeric id, an exact NAME, or a dotted display path
 /// (the same identifiers `control::resolve` accepts, replicated here so the CLI
 /// path doesn't depend on the control module's private resolver).
-fn resolve_box(boxes: &std::collections::BTreeMap<i64, crate::discover::Box_>,
-               ident: &str) -> Option<i64> {
+fn resolve_box(
+    boxes: &std::collections::BTreeMap<i64, crate::discover::Box_>,
+    ident: &str,
+) -> Option<i64> {
     if let Ok(id) = ident.parse::<i64>() {
-        if boxes.contains_key(&id) { return Some(id); }
+        if boxes.contains_key(&id) {
+            return Some(id);
+        }
     }
-    boxes.values()
-        .find(|b| b.name == ident
-              || crate::discover::display_path(boxes, b.box_id) == ident)
+    boxes
+        .values()
+        .find(|b| b.name == ident || crate::discover::display_path(boxes, b.box_id) == ident)
         .map(|b| b.box_id)
 }
 
@@ -1087,17 +1325,21 @@ fn resolve_box(boxes: &std::collections::BTreeMap<i64, crate::discover::Box_>,
 /// loader builds a linear stack (each layer's parent is the one below), so we
 /// step to the unique child that is itself an OCI layer — skipping any
 /// non-layer children (e.g. previous run-containers parented under the image).
-fn follow_to_top(boxes: &std::collections::BTreeMap<i64, crate::discover::Box_>,
-                 start: i64) -> i64 {
+fn follow_to_top(
+    boxes: &std::collections::BTreeMap<i64, crate::discover::Box_>,
+    start: i64,
+) -> i64 {
     let mut cur = start;
     let mut seen = std::collections::HashSet::new();
     loop {
-        if !seen.insert(cur) { break; } // cycle guard
+        if !seen.insert(cur) {
+            break;
+        } // cycle guard
         // Step to the unique child that is itself an OCI image layer
         // (loader-stamped `oci_layer_index` meta), skipping run-containers.
-        let next = boxes.values()
-            .find(|b| b.parent == Some(cur)
-                  && b.meta.contains_key("oci_layer_index"))
+        let next = boxes
+            .values()
+            .find(|b| b.parent == Some(cur) && b.meta.contains_key("oci_layer_index"))
             .map(|b| b.box_id);
         match next {
             Some(n) => cur = n,
@@ -1111,8 +1353,10 @@ fn follow_to_top(boxes: &std::collections::BTreeMap<i64, crate::discover::Box_>,
 /// name, so each run CREATEs a fresh box instead of re-running a sibling.
 fn unique_container_name() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let n = SystemTime::now().duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos()).unwrap_or(0) as u64;
+    let n = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0) as u64;
     format!("R{:X}", n & 0xFFFF_FFFF)
 }
 
@@ -1151,11 +1395,17 @@ fn cli_build(args: &[String]) -> i32 {
         match a.as_str() {
             "-t" | "--tag" => match it.next() {
                 Some(v) => tag = Some(v.clone()),
-                None => { eprintln!("sarun oci build: {a} needs an argument"); return 2; }
+                None => {
+                    eprintln!("sarun oci build: {a} needs an argument");
+                    return 2;
+                }
             },
             "-f" | "--file" => match it.next() {
                 Some(v) => file = Some(v.clone()),
-                None => { eprintln!("sarun oci build: {a} needs an argument"); return 2; }
+                None => {
+                    eprintln!("sarun oci build: {a} needs an argument");
+                    return 2;
+                }
             },
             "-n" => net_mode = crate::net::NetMode::Tap,
             "-N" => net_mode = crate::net::NetMode::Host,
@@ -1167,30 +1417,48 @@ fn cli_build(args: &[String]) -> i32 {
                         return 2;
                     }
                 },
-                None => { eprintln!("sarun oci build: --net needs an argument"); return 2; }
+                None => {
+                    eprintln!("sarun oci build: --net needs an argument");
+                    return 2;
+                }
             },
             "--build-arg" => match it.next() {
                 Some(kv) => match kv.split_once('=') {
                     Some((k, v)) => build_args.push((k.to_string(), v.to_string())),
-                    None => { eprintln!("sarun oci build: --build-arg wants K=V"); return 2; }
+                    None => {
+                        eprintln!("sarun oci build: --build-arg wants K=V");
+                        return 2;
+                    }
                 },
-                None => { eprintln!("sarun oci build: --build-arg needs an argument"); return 2; }
+                None => {
+                    eprintln!("sarun oci build: --build-arg needs an argument");
+                    return 2;
+                }
             },
             "-h" | "--help" => {
-                println!("usage: sarun oci build [-t NAME] [-f FILE] [--net MODE] \
-                          [--build-arg K=V]... [CONTEXT]");
+                println!(
+                    "usage: sarun oci build [-t NAME] [-f FILE] [--net MODE] \
+                          [--build-arg K=V]... [CONTEXT]"
+                );
                 return 0;
             }
             other if context.is_none() => context = Some(other.to_string()),
-            other => { eprintln!("sarun oci build: unexpected argument '{other}'"); return 2; }
+            other => {
+                eprintln!("sarun oci build: unexpected argument '{other}'");
+                return 2;
+            }
         }
     }
     let context = PathBuf::from(context.unwrap_or_else(|| ".".to_string()));
-    let df_path = file.map(PathBuf::from)
+    let df_path = file
+        .map(PathBuf::from)
         .unwrap_or_else(|| context.join("Dockerfile"));
     let text = match std::fs::read_to_string(&df_path) {
         Ok(t) => t,
-        Err(e) => { eprintln!("sarun oci build: read {}: {e}", df_path.display()); return 1; }
+        Err(e) => {
+            eprintln!("sarun oci build: read {}: {e}", df_path.display());
+            return 1;
+        }
     };
     // In a box the build MUST run host-side in the engine: its layer boxes
     // (FROM/COPY/ADD/RUN) have to be created in the engine's state, not through
@@ -1204,48 +1472,71 @@ fn cli_build(args: &[String]) -> i32 {
     // RUN steps need a live engine to execute in; fail fast with a clear message
     // rather than mid-build.
     if let Ok(df) = crate::dockerfile::Dockerfile::parse(&text) {
-        let has_run = df.instructions.iter()
+        let has_run = df
+            .instructions
+            .iter()
             .any(|(_, i)| matches!(i, crate::dockerfile::Instruction::Run(_)));
         if has_run && std::os::unix::net::UnixStream::connect(paths::sock_path()).is_err() {
-            eprintln!("sarun oci build: this Dockerfile has RUN steps, which execute \
+            eprintln!(
+                "sarun oci build: this Dockerfile has RUN steps, which execute \
                        in a box — start the sarun engine/UI first \
-                       (control socket {}).", paths::sock_path().display());
+                       (control socket {}).",
+                paths::sock_path().display()
+            );
             return 3;
         }
     }
     match run_dockerfile(context, &text, tag, net_mode, build_args) {
         Ok(_) => 0,
-        Err(e) => { eprintln!("sarun oci build: {e:#}"); 1 }
+        Err(e) => {
+            eprintln!("sarun oci build: {e:#}");
+            1
+        }
     }
 }
 
 /// Run a parsed Dockerfile to completion against `context`, returning the top
 /// layer box id. Shared by the host build and the engine-side build worker.
-fn run_dockerfile(context: PathBuf, text: &str, tag: Option<String>,
-                  net_mode: crate::net::NetMode,
-                  build_args: Vec<(String, String)>) -> Result<i64> {
+fn run_dockerfile(
+    context: PathBuf,
+    text: &str,
+    tag: Option<String>,
+    net_mode: crate::net::NetMode,
+    build_args: Vec<(String, String)>,
+) -> Result<i64> {
     let df = crate::dockerfile::Dockerfile::parse(text).map_err(|e| anyhow!("{e}"))?;
     paths::ensure_dirs().map_err(|e| anyhow!("ensure dirs: {e}"))?;
     let mut b = Builder::new(context, net_mode, build_args);
     for (line, instr) in &df.instructions {
-        b.exec(instr).with_context(|| format!("Dockerfile line {line}"))?;
+        b.exec(instr)
+            .with_context(|| format!("Dockerfile line {line}"))?;
     }
     b.finish(tag)?;
-    b.current.ok_or_else(|| anyhow!("build produced no top box"))
+    b.current
+        .ok_or_else(|| anyhow!("build produced no top box"))
 }
 
 /// In-box `oci build`: pack the context (gzip tar, base64) and ship it with the
 /// Dockerfile to the engine's `oci.build` RPC, which runs the build host-side.
 /// The engine returns the worker's combined output + exit code; we replay both.
-fn build_via_engine(context: &Path, df_text: &str, tag: Option<String>,
-                    net_mode: crate::net::NetMode,
-                    build_args: &[(String, String)]) -> i32 {
+fn build_via_engine(
+    context: &Path,
+    df_text: &str,
+    tag: Option<String>,
+    net_mode: crate::net::NetMode,
+    build_args: &[(String, String)],
+) -> i32 {
     let tar_b64 = match tar_gz_dir_b64(context) {
         Ok(s) => s,
-        Err(e) => { eprintln!("sarun oci build: pack context: {e:#}"); return 1; }
+        Err(e) => {
+            eprintln!("sarun oci build: pack context: {e:#}");
+            return 1;
+        }
     };
-    let bargs: Vec<Value> = build_args.iter()
-        .map(|(k, v)| serde_json::json!([k, v])).collect();
+    let bargs: Vec<Value> = build_args
+        .iter()
+        .map(|(k, v)| serde_json::json!([k, v]))
+        .collect();
     let spec = serde_json::json!([{
         "context_tar_gz": tar_b64,
         "dockerfile": df_text,
@@ -1259,10 +1550,15 @@ fn build_via_engine(context: &Path, df_text: &str, tag: Option<String>,
     };
     match engine_rpc_on(conn, "oci.build", spec) {
         Ok(r) => {
-            if let Some(log) = r.get("log").and_then(Value::as_str) { print!("{log}"); }
+            if let Some(log) = r.get("log").and_then(Value::as_str) {
+                print!("{log}");
+            }
             r.get("code").and_then(Value::as_i64).unwrap_or(1) as i32
         }
-        Err(e) => { eprintln!("sarun oci build: {e}"); 1 }
+        Err(e) => {
+            eprintln!("sarun oci build: {e}");
+            1
+        }
     }
 }
 
@@ -1270,8 +1566,7 @@ fn build_via_engine(context: &Path, df_text: &str, tag: Option<String>,
 /// shipped to the engine.
 fn tar_gz_dir_b64(dir: &Path) -> Result<String> {
     use base64::{Engine as _, prelude::BASE64_STANDARD};
-    let mut gz = flate2::write::GzEncoder::new(Vec::new(),
-                                               flate2::Compression::default());
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
     {
         let mut tb = tar::Builder::new(&mut gz);
         tb.append_dir_all(".", dir).context("tar context")?;
@@ -1299,27 +1594,43 @@ pub(crate) fn build_in_engine(
     let ctx = paths::runtime_home().join(format!("oci-build-{stamp}"));
     std::fs::create_dir_all(&ctx).context("create build context dir")?;
     let result_file = paths::runtime_home().join(format!("oci-build-{stamp}.result"));
-    let _guard = TmpCleanup { dir: ctx.clone(), file: result_file.clone() };
+    let _guard = TmpCleanup {
+        dir: ctx.clone(),
+        file: result_file.clone(),
+    };
     unpack_tar_gz(spec.context_tar_gz.as_slice(), &ctx)?;
     let df_path = ctx.join(".sarun-Dockerfile");
     std::fs::write(&df_path, spec.dockerfile.as_slice()).context("write shipped Dockerfile")?;
 
     let mut cmd = Command::new("/proc/self/exe");
-    cmd.arg("oci").arg("__build-worker")
-        .arg("--context").arg(&ctx)
-        .arg("-f").arg(&df_path)
-        .arg("--net").arg(net)
-        .arg("--result-file").arg(&result_file);
-    if let Some(tag) = &spec.tag { cmd.arg("-t").arg(tag.as_str()); }
-    for (key, value) in spec.build_arguments.as_map() {
-        cmd.arg("--build-arg").arg(format!("{}={}", key.as_str(), value.as_str()));
+    cmd.arg("oci")
+        .arg("__build-worker")
+        .arg("--context")
+        .arg(&ctx)
+        .arg("-f")
+        .arg(&df_path)
+        .arg("--net")
+        .arg(net)
+        .arg("--result-file")
+        .arg(&result_file);
+    if let Some(tag) = &spec.tag {
+        cmd.arg("-t").arg(tag.as_str());
     }
-    let out = cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped())
-        .output().context("spawn build worker")?;
+    for (key, value) in spec.build_arguments.as_map() {
+        cmd.arg("--build-arg")
+            .arg(format!("{}={}", key.as_str(), value.as_str()));
+    }
+    let out = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .context("spawn build worker")?;
     let mut log = String::from_utf8_lossy(&out.stdout).into_owned();
     log.push_str(&String::from_utf8_lossy(&out.stderr));
     let code = out.status.code().unwrap_or(1);
-    let top_id = std::fs::read_to_string(&result_file).ok()
+    let top_id = std::fs::read_to_string(&result_file)
+        .ok()
         .and_then(|text| text.trim().parse::<u64>().ok());
     Ok(crate::generated_wire::OciBuildResult {
         code,
@@ -1330,7 +1641,10 @@ pub(crate) fn build_in_engine(
 }
 
 /// Best-effort cleanup of the engine-side build temp dir + result file.
-struct TmpCleanup { dir: PathBuf, file: PathBuf }
+struct TmpCleanup {
+    dir: PathBuf,
+    file: PathBuf,
+}
 impl Drop for TmpCleanup {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.dir);
@@ -1340,7 +1654,9 @@ impl Drop for TmpCleanup {
 
 fn unpack_tar_gz(bytes: &[u8], dest: &Path) -> Result<()> {
     let gz = flate2::read::GzDecoder::new(&bytes[..]);
-    tar::Archive::new(gz).unpack(dest).context("unpack context")?;
+    tar::Archive::new(gz)
+        .unpack(dest)
+        .context("unpack context")?;
     Ok(())
 }
 
@@ -1362,20 +1678,41 @@ fn cli_build_worker(args: &[String]) -> i32 {
             "-f" | "--file" => file = it.next().cloned(),
             "-t" | "--tag" => tag = it.next().cloned(),
             "--result-file" => result_file = it.next().cloned(),
-            "--net" => match it.next().map(String::as_str).and_then(crate::net::NetMode::parse) {
+            "--net" => match it
+                .next()
+                .map(String::as_str)
+                .and_then(crate::net::NetMode::parse)
+            {
                 Some(nm) => net_mode = nm,
-                None => { eprintln!("__build-worker: bad --net"); return 2; }
+                None => {
+                    eprintln!("__build-worker: bad --net");
+                    return 2;
+                }
             },
-            "--build-arg" => if let Some((k, v)) = it.next().and_then(|kv| kv.split_once('=')
-                .map(|(k, v)| (k.to_string(), v.to_string()))) { build_args.push((k, v)); },
-            other => { eprintln!("__build-worker: unexpected arg '{other}'"); return 2; }
+            "--build-arg" => {
+                if let Some((k, v)) = it.next().and_then(|kv| {
+                    kv.split_once('=')
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                }) {
+                    build_args.push((k, v));
+                }
+            }
+            other => {
+                eprintln!("__build-worker: unexpected arg '{other}'");
+                return 2;
+            }
         }
     }
     let context = PathBuf::from(context.unwrap_or_else(|| ".".to_string()));
-    let df_path = file.map(PathBuf::from).unwrap_or_else(|| context.join("Dockerfile"));
+    let df_path = file
+        .map(PathBuf::from)
+        .unwrap_or_else(|| context.join("Dockerfile"));
     let text = match std::fs::read_to_string(&df_path) {
         Ok(t) => t,
-        Err(e) => { eprintln!("sarun oci build: read {}: {e}", df_path.display()); return 1; }
+        Err(e) => {
+            eprintln!("sarun oci build: read {}: {e}", df_path.display());
+            return 1;
+        }
     };
     match run_dockerfile(context, &text, tag, net_mode, build_args) {
         Ok(top) => {
@@ -1390,12 +1727,15 @@ fn cli_build_worker(args: &[String]) -> i32 {
             }
             0
         }
-        Err(e) => { eprintln!("sarun oci build: {e:#}"); 1 }
+        Err(e) => {
+            eprintln!("sarun oci build: {e:#}");
+            1
+        }
     }
 }
 
-use crate::dockerfile::{Cmdline, Instruction};
 use crate::dockerfile::expand;
+use crate::dockerfile::{Cmdline, Instruction};
 
 /// Render a Cmdline as it reads in a Dockerfile, for history/frame text: the
 /// shell form is the raw command string; the exec form is its JSON array.
@@ -1457,21 +1797,38 @@ struct Builder {
 }
 
 impl Builder {
-    fn new(context: PathBuf, net_mode: crate::net::NetMode,
-           build_args: Vec<(String, String)>) -> Self {
+    fn new(
+        context: PathBuf,
+        net_mode: crate::net::NetMode,
+        build_args: Vec<(String, String)>,
+    ) -> Self {
         let mut vars = HashMap::new();
-        for (k, v) in build_args { vars.insert(k, v); }
+        for (k, v) in build_args {
+            vars.insert(k, v);
+        }
         Builder {
-            context, net_mode, vars,
-            env: Vec::new(), workdir: "/".to_string(), user: None,
-            cmd: None, entrypoint: None, labels: Vec::new(),
-            exposed: Vec::new(), volumes: Vec::new(),
+            context,
+            net_mode,
+            vars,
+            env: Vec::new(),
+            workdir: "/".to_string(),
+            user: None,
+            cmd: None,
+            entrypoint: None,
+            labels: Vec::new(),
+            exposed: Vec::new(),
+            volumes: Vec::new(),
             shell: vec!["/bin/sh".to_string(), "-c".to_string()],
             shell_set: false,
-            stopsignal: None, onbuild: Vec::new(), healthcheck: None,
+            stopsignal: None,
+            onbuild: Vec::new(),
+            healthcheck: None,
             healthcheck_raw: None,
-            current: None, started: false, step: 0,
-            stages: HashMap::new(), pending_stage: None,
+            current: None,
+            started: false,
+            step: 0,
+            stages: HashMap::new(),
+            pending_stage: None,
             history: Vec::new(),
             frames: std::collections::HashMap::new(),
             copy_hints: std::collections::HashMap::new(),
@@ -1491,37 +1848,63 @@ impl Builder {
     /// structured directive — the per-box record the Dockerfile emitter and the
     /// interactive authoring/undo path read. FROM/ARG/unsupported add nothing.
     fn record_history(&mut self, instr: &Instruction) {
-        if !self.started { return; }
+        if !self.started {
+            return;
+        }
         // (op, text, empty_layer). `text` is the directive body as it reads in a
         // Dockerfile (after the keyword) — so `<op> <text>` reconstructs the line.
         let (op, text, empty_layer): (&str, String, bool) = match instr {
             Instruction::Run(c) => ("RUN", cmdline_display(c), false),
-            Instruction::Copy { sources, dest, from, .. } => {
-                let pfx = from.as_ref().map(|s| format!("--from={s} ")).unwrap_or_default();
+            Instruction::Copy {
+                sources,
+                dest,
+                from,
+                ..
+            } => {
+                let pfx = from
+                    .as_ref()
+                    .map(|s| format!("--from={s} "))
+                    .unwrap_or_default();
                 ("COPY", format!("{pfx}{} {dest}", sources.join(" ")), false)
             }
-            Instruction::Add { sources, dest, .. } =>
-                ("ADD", format!("{} {dest}", sources.join(" ")), false),
-            Instruction::Env(p) => ("ENV",
-                p.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(" "), true),
+            Instruction::Add { sources, dest, .. } => {
+                ("ADD", format!("{} {dest}", sources.join(" ")), false)
+            }
+            Instruction::Env(p) => (
+                "ENV",
+                p.iter()
+                    .map(|(k, v)| format!("{k}={v}"))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                true,
+            ),
             Instruction::Workdir(p) => ("WORKDIR", p.clone(), true),
             Instruction::User(u) => ("USER", u.clone(), true),
             Instruction::Cmd(c) => ("CMD", cmdline_display(c), true),
             Instruction::Entrypoint(c) => ("ENTRYPOINT", cmdline_display(c), true),
-            Instruction::Label(p) => ("LABEL",
-                p.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(" "), true),
+            Instruction::Label(p) => (
+                "LABEL",
+                p.iter()
+                    .map(|(k, v)| format!("{k}={v}"))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                true,
+            ),
             Instruction::Expose(s) => ("EXPOSE", s.clone(), true),
             Instruction::Volume(v) => ("VOLUME", v.join(" "), true),
-            Instruction::Shell(v) => ("SHELL",
-                serde_json::to_string(v).unwrap_or_default(), true),
+            Instruction::Shell(v) => ("SHELL", serde_json::to_string(v).unwrap_or_default(), true),
             Instruction::Stopsignal(s) => ("STOPSIGNAL", s.clone(), true),
             Instruction::Onbuild(s) => ("ONBUILD", s.clone(), true),
             Instruction::Healthcheck(_) => ("HEALTHCHECK", String::new(), true),
-            Instruction::From { .. } | Instruction::Arg { .. }
+            Instruction::From { .. }
+            | Instruction::Arg { .. }
             | Instruction::Unsupported { .. } => return,
         };
-        let created_by = if text.is_empty() { op.to_string() }
-                         else { format!("{op} {text}") };
+        let created_by = if text.is_empty() {
+            op.to_string()
+        } else {
+            format!("{op} {text}")
+        };
         // `created` (RFC3339) is optional in the OCI spec; omit it rather than
         // pull in a date dep.
         self.history.push(serde_json::json!({
@@ -1529,7 +1912,9 @@ impl Builder {
         // Attach the directive to the box that was current when it ran. Frames
         // are stamped in finish().
         if let Some(id) = self.current {
-            self.frames.entry(id).or_default()
+            self.frames
+                .entry(id)
+                .or_default()
                 .push(serde_json::json!({"op": op, "text": text}));
         }
         // Refresh the current box's stamped config so its oci_config carries the
@@ -1539,12 +1924,18 @@ impl Builder {
 
     fn dispatch(&mut self, instr: &Instruction) -> Result<()> {
         match instr {
-            Instruction::From { image, platform: _, stage_as } => self.do_from(image, stage_as),
+            Instruction::From {
+                image,
+                platform: _,
+                stage_as,
+            } => self.do_from(image, stage_as),
             Instruction::Arg { name, default } => {
                 // ARG may precede FROM (global). It only seeds a default when the
                 // var isn't already set (a --build-arg or earlier ARG wins).
                 if !self.vars.contains_key(name) {
-                    let d = default.as_deref().map(|d| expand(d, &self.vars))
+                    let d = default
+                        .as_deref()
+                        .map(|d| expand(d, &self.vars))
                         .unwrap_or_default();
                     self.vars.insert(name.clone(), d);
                 }
@@ -1552,14 +1943,33 @@ impl Builder {
             }
             _ if !self.started => bail!("instruction before any FROM"),
             Instruction::Run(c) => self.do_run(c),
-            Instruction::Copy { sources, dest, from, chown, chmod } => {
-                self.do_copy(sources, dest, from.as_deref(),
-                             chown.as_deref(), chmod.as_deref(), false)
-            }
-            Instruction::Add { sources, dest, chown, chmod } => {
-                self.do_copy(sources, dest, None,
-                             chown.as_deref(), chmod.as_deref(), true)
-            }
+            Instruction::Copy {
+                sources,
+                dest,
+                from,
+                chown,
+                chmod,
+            } => self.do_copy(
+                sources,
+                dest,
+                from.as_deref(),
+                chown.as_deref(),
+                chmod.as_deref(),
+                false,
+            ),
+            Instruction::Add {
+                sources,
+                dest,
+                chown,
+                chmod,
+            } => self.do_copy(
+                sources,
+                dest,
+                None,
+                chown.as_deref(),
+                chmod.as_deref(),
+                true,
+            ),
             Instruction::Env(pairs) => {
                 for (k, v) in pairs {
                     let ve = expand(v, &self.vars);
@@ -1574,9 +1984,15 @@ impl Builder {
                 self.stamp_current();
                 Ok(())
             }
-            Instruction::Cmd(c) => { self.cmd = Some(self.cmdline_vec(c)); self.stamp_current(); Ok(()) }
+            Instruction::Cmd(c) => {
+                self.cmd = Some(self.cmdline_vec(c));
+                self.stamp_current();
+                Ok(())
+            }
             Instruction::Entrypoint(c) => {
-                self.entrypoint = Some(self.cmdline_vec(c)); self.stamp_current(); Ok(())
+                self.entrypoint = Some(self.cmdline_vec(c));
+                self.stamp_current();
+                Ok(())
             }
             Instruction::Label(pairs) => {
                 for (k, v) in pairs {
@@ -1587,9 +2003,15 @@ impl Builder {
                 self.stamp_current();
                 Ok(())
             }
-            Instruction::Expose(s) => { self.exposed.push(expand(s, &self.vars)); self.stamp_current(); Ok(()) }
+            Instruction::Expose(s) => {
+                self.exposed.push(expand(s, &self.vars));
+                self.stamp_current();
+                Ok(())
+            }
             Instruction::Volume(v) => {
-                for p in v { self.volumes.push(expand(p, &self.vars)); }
+                for p in v {
+                    self.volumes.push(expand(p, &self.vars));
+                }
                 self.stamp_current();
                 Ok(())
             }
@@ -1616,8 +2038,10 @@ impl Builder {
                 Ok(())
             }
             Instruction::Unsupported { verb, .. } => {
-                eprintln!("sarun oci build: warning: {verb} is recognized but not \
-                           acted on (skipped)");
+                eprintln!(
+                    "sarun oci build: warning: {verb} is recognized but not \
+                           acted on (skipped)"
+                );
                 Ok(())
             }
         }
@@ -1634,13 +2058,15 @@ impl Builder {
         } else if let Some(&sid) = self.stages.get(&img) {
             self.begin_stage(Some(sid), Some(sid))?;
         } else {
-            let top = resolve_image_top(&img)
-                .with_context(|| format!("FROM {img}"))?;
+            let top = resolve_image_top(&img).with_context(|| format!("FROM {img}"))?;
             self.begin_stage(Some(top), Some(top))?;
         }
         self.pending_stage = stage_as.clone();
         self.started = true;
-        eprintln!("sarun oci build: FROM {img} → layer box {}", self.current.unwrap());
+        eprintln!(
+            "sarun oci build: FROM {img} → layer box {}",
+            self.current.unwrap()
+        );
         Ok(())
     }
 
@@ -1649,13 +2075,21 @@ impl Builder {
     /// base image's env/cmd/etc. carry into the build.
     fn begin_stage(&mut self, parent: Option<i64>, seed_from: Option<i64>) -> Result<()> {
         self.reset_config();
-        if let Some(s) = seed_from { self.seed_config_from(s); }
+        if let Some(s) = seed_from {
+            self.seed_config_from(s);
+        }
         let id = mint_box_id();
         let bx = BoxState::create(id).with_context(|| format!("create box {id}"))?;
         bx.set_meta("name", &format!("B{id}"));
         match parent {
-            Some(p) => { bx.set_parent(Some(p)); bx.set_meta("parent_box_id", &p.to_string()); }
-            None => { bx.set_no_host_fallback(true); bx.set_meta("no_host_fallback", "1"); }
+            Some(p) => {
+                bx.set_parent(Some(p));
+                bx.set_meta("parent_box_id", &p.to_string());
+            }
+            None => {
+                bx.set_no_host_fallback(true);
+                bx.set_meta("no_host_fallback", "1");
+            }
         }
         self.current = Some(id);
         // Register this build box (even with no directives yet) so it's
@@ -1666,7 +2100,9 @@ impl Builder {
     }
 
     fn do_run(&mut self, c: &Cmdline) -> Result<()> {
-        let parent = self.current.ok_or_else(|| anyhow!("RUN with no current layer"))?;
+        let parent = self
+            .current
+            .ok_or_else(|| anyhow!("RUN with no current layer"))?;
         // Make sure the current layer carries the latest config so the engine
         // applies env/workdir/user to the RUN box via the parent-chain walk.
         self.stamp(parent);
@@ -1677,10 +2113,17 @@ impl Builder {
         eprintln!("sarun oci build: RUN ({}) {:?}", step_name, cmd);
         let code = crate::runner::run(
             Some(session),
-            /* passthrough */ false, /* direct */ false, /* env */ false,
-            /* pty */ false, /* brush */ false, /* api */ false,
-            /* no_parent */ false, /* readonly_parent */ false, /* chdir */ None,
-            self.net_mode, cmd,
+            /* passthrough */ false,
+            /* direct */ false,
+            /* env */ false,
+            /* pty */ false,
+            /* brush */ false,
+            /* api */ false,
+            /* no_parent */ false,
+            /* readonly_parent */ false,
+            /* chdir */ None,
+            self.net_mode,
+            cmd,
         );
         if code != 0 {
             bail!("RUN step '{step_name}' exited with status {code}");
@@ -1705,7 +2148,9 @@ impl Builder {
         // creates WORKDIR if missing).
         let rel = normalize_rel(&self.workdir);
         if !rel.is_empty() {
-            let cur = self.current.ok_or_else(|| anyhow!("WORKDIR with no layer"))?;
+            let cur = self
+                .current
+                .ok_or_else(|| anyhow!("WORKDIR with no layer"))?;
             let bx = BoxState::create(cur)?;
             ensure_dir_chain(&bx, &rel);
         }
@@ -1713,8 +2158,15 @@ impl Builder {
         Ok(())
     }
 
-    fn do_copy(&mut self, sources: &[String], dest: &str, from: Option<&str>,
-               chown: Option<&str>, chmod: Option<&str>, is_add: bool) -> Result<()> {
+    fn do_copy(
+        &mut self,
+        sources: &[String],
+        dest: &str,
+        from: Option<&str>,
+        chown: Option<&str>,
+        chmod: Option<&str>,
+        is_add: bool,
+    ) -> Result<()> {
         let verb = if is_add { "ADD" } else { "COPY" };
         let srcs: Vec<String> = sources.iter().map(|s| expand(s, &self.vars)).collect();
         let dst = expand(dest, &self.vars);
@@ -1725,7 +2177,8 @@ impl Builder {
         let bx = BoxState::create(id).with_context(|| format!("create box {id}"))?;
         bx.set_meta("name", &format!("B{id}"));
         if let Some(p) = self.current {
-            bx.set_parent(Some(p)); bx.set_meta("parent_box_id", &p.to_string());
+            bx.set_parent(Some(p));
+            bx.set_meta("parent_box_id", &p.to_string());
         }
         // dest is a directory if it ends in `/` or there are multiple sources.
         let dst_is_dir = dst.ends_with('/') || srcs.len() > 1;
@@ -1743,24 +2196,35 @@ impl Builder {
 
     /// COPY/ADD whose sources live in the build context (no `--from`). Handles
     /// glob expansion, ADD-of-URL fetch, and ADD-of-local-tar auto-extract.
-    fn copy_from_context(&self, bx: &BoxState, srcs: &[String], dst_rel: &str,
-                         dst_is_dir: bool, owner: Option<(u32, u32)>,
-                         mode: Option<u32>, is_add: bool) -> Result<()> {
+    fn copy_from_context(
+        &self,
+        bx: &BoxState,
+        srcs: &[String],
+        dst_rel: &str,
+        dst_is_dir: bool,
+        owner: Option<(u32, u32)>,
+        mode: Option<u32>,
+        is_add: bool,
+    ) -> Result<()> {
         let verb = if is_add { "ADD" } else { "COPY" };
-        let canon_ctx = self.context.canonicalize().unwrap_or_else(|_| self.context.clone());
+        let canon_ctx = self
+            .context
+            .canonicalize()
+            .unwrap_or_else(|_| self.context.clone());
         for src in srcs {
             // ADD <url>: fetch into dest. Docker does NOT auto-extract URL
             // sources (only local archives), so this is a plain file write.
             if is_add && (src.starts_with("http://") || src.starts_with("https://")) {
-                let bytes = fetch_url(src)
-                    .with_context(|| format!("ADD fetch '{src}'"))?;
+                let bytes = fetch_url(src).with_context(|| format!("ADD fetch '{src}'"))?;
                 let base = url_basename(src);
                 if base.is_empty() {
                     bail!("ADD URL '{src}' has no filename to write to");
                 }
                 let target = join_dest(dst_rel, dst_is_dir, &base);
                 put_file_bytes(bx, &target, &bytes, mode.unwrap_or(0o644), now_ns())?;
-                if let Some((u, g)) = owner { bx.set_owner(&target, u, g); }
+                if let Some((u, g)) = owner {
+                    bx.set_owner(&target, u, g);
+                }
                 continue;
             }
             // Local source(s): glob-expand if the pattern has wildcards.
@@ -1774,20 +2238,23 @@ impl Builder {
                 vec![self.context.join(src)]
             };
             for src_abs in matches {
-                let canon_src = src_abs.canonicalize()
-                    .with_context(|| format!("{verb} source '{}' not found in context",
-                                             src_abs.display()))?;
+                let canon_src = src_abs.canonicalize().with_context(|| {
+                    format!("{verb} source '{}' not found in context", src_abs.display())
+                })?;
                 if !canon_src.starts_with(&canon_ctx) {
-                    bail!("{verb} source '{}' escapes the build context", src_abs.display());
+                    bail!(
+                        "{verb} source '{}' escapes the build context",
+                        src_abs.display()
+                    );
                 }
                 // ADD auto-extracts a local tar (gzip/zstd/xz/bzip2/plain).
                 if is_add && canon_src.is_file() {
                     match archive_kind(&canon_src)? {
                         ArchiveKind::Tar => {
                             let blob = std::fs::read(&canon_src)?;
-                            extract_tar_into(bx, &blob, dst_rel, owner, mode)
-                                .with_context(|| format!("ADD extract '{}'",
-                                                         canon_src.display()))?;
+                            extract_tar_into(bx, &blob, dst_rel, owner, mode).with_context(
+                                || format!("ADD extract '{}'", canon_src.display()),
+                            )?;
                             continue;
                         }
                         ArchiveKind::NotArchive => {} // plain copy below
@@ -1796,8 +2263,10 @@ impl Builder {
                 if canon_src.is_dir() {
                     copy_tree(bx, &canon_src, dst_rel, owner, mode)?;
                 } else {
-                    let base = canon_src.file_name()
-                        .map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    let base = canon_src
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default();
                     let target = join_dest(dst_rel, dst_is_dir, &base);
                     copy_file(bx, &canon_src, &target, owner, mode)?;
                 }
@@ -1810,26 +2279,36 @@ impl Builder {
     /// an external image's) MERGED view and stage it into this layer. We reuse
     /// the Overlay resolver host-side (no FUSE mount) so the parent-chain /
     /// whiteout / opaque semantics are exactly what a box would see.
-    fn copy_from_stage(&self, bx: &BoxState, from: &str, srcs: &[String],
-                       dst_rel: &str, dst_is_dir: bool, owner: Option<(u32, u32)>,
-                       mode: Option<u32>) -> Result<()> {
+    fn copy_from_stage(
+        &self,
+        bx: &BoxState,
+        from: &str,
+        srcs: &[String],
+        dst_rel: &str,
+        dst_is_dir: bool,
+        owner: Option<(u32, u32)>,
+        mode: Option<u32>,
+    ) -> Result<()> {
         let src_id = if let Some(&sid) = self.stages.get(from) {
             sid
         } else {
-            resolve_image_top(from)
-                .with_context(|| format!("COPY --from={from}"))?
+            resolve_image_top(from).with_context(|| format!("COPY --from={from}"))?
         };
         let ov = crate::overlay::Overlay::new(PathBuf::from("/"));
         for src in srcs {
             let rel = normalize_rel(src);
             match ov.box_path_kind(src_id, &rel) {
                 'd' => {
-                    let base_dst = if dst_rel.is_empty() { String::new() }
-                                   else { dst_rel.to_string() };
+                    let base_dst = if dst_rel.is_empty() {
+                        String::new()
+                    } else {
+                        dst_rel.to_string()
+                    };
                     copy_box_tree(&ov, src_id, &rel, bx, &base_dst, owner, mode)?;
                 }
                 'f' => {
-                    let bytes = ov.box_read_file(src_id, &rel)
+                    let bytes = ov
+                        .box_read_file(src_id, &rel)
                         .with_context(|| format!("COPY --from={from} read '{src}'"))?;
                     let src_mode = mode
                         .or_else(|| ov.box_file_mode(src_id, &rel))
@@ -1837,16 +2316,24 @@ impl Builder {
                     let base = leaf_name(&rel);
                     let target = join_dest(dst_rel, dst_is_dir, &base);
                     put_file_bytes(bx, &target, &bytes, src_mode, now_ns())?;
-                    if let Some((u, g)) = owner { bx.set_owner(&target, u, g); }
+                    if let Some((u, g)) = owner {
+                        bx.set_owner(&target, u, g);
+                    }
                 }
                 'l' => {
-                    let tgt = ov.box_read_file(src_id, &rel)
+                    let tgt = ov
+                        .box_read_file(src_id, &rel)
                         .with_context(|| format!("COPY --from={from} readlink '{src}'"))?;
                     let base = leaf_name(&rel);
                     let target = join_dest(dst_rel, dst_is_dir, &base);
-                    bx.set_symlink(&target,
-                        Path::new(&String::from_utf8_lossy(&tgt).into_owned()), 0);
-                    if let Some((u, g)) = owner { bx.set_owner(&target, u, g); }
+                    bx.set_symlink(
+                        &target,
+                        Path::new(&String::from_utf8_lossy(&tgt).into_owned()),
+                        0,
+                    );
+                    if let Some((u, g)) = owner {
+                        bx.set_owner(&target, u, g);
+                    }
                 }
                 _ => bail!("COPY --from={from}: source '{src}' not found"),
             }
@@ -1859,10 +2346,10 @@ impl Builder {
         let joined = self.context.join(pattern);
         let pat = joined.to_string_lossy();
         let mut out = Vec::new();
-        for entry in glob::glob(&pat)
-            .map_err(|e| anyhow!("bad glob pattern '{pattern}': {e}"))?
-        {
-            if let Ok(p) = entry { out.push(p); }
+        for entry in glob::glob(&pat).map_err(|e| anyhow!("bad glob pattern '{pattern}': {e}"))? {
+            if let Ok(p) = entry {
+                out.push(p);
+            }
         }
         Ok(out)
     }
@@ -1920,14 +2407,20 @@ impl Builder {
 
     fn seed_config_from(&mut self, id: i64) {
         let meta = crate::discover::box_meta(id);
-        let Some(j) = meta.get("oci_config") else { return; };
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(j) else { return; };
+        let Some(j) = meta.get("oci_config") else {
+            return;
+        };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(j) else {
+            return;
+        };
         // Seed the base image's history as our prefix so the built image's
         // `history` is base steps + this build's steps.
         if let Some(h) = v.get("history").and_then(|x| x.as_array()) {
             self.history = h.clone();
         }
-        let Some(inner) = v.get("config") else { return; };
+        let Some(inner) = v.get("config") else {
+            return;
+        };
         if let Some(env) = inner.get("Env").and_then(|e| e.as_array()) {
             for e in env {
                 if let Some(s) = e.as_str() {
@@ -1939,26 +2432,49 @@ impl Builder {
             }
         }
         if let Some(w) = inner.get("WorkingDir").and_then(|x| x.as_str()) {
-            if !w.is_empty() { self.workdir = w.to_string(); }
+            if !w.is_empty() {
+                self.workdir = w.to_string();
+            }
         }
         if let Some(u) = inner.get("User").and_then(|x| x.as_str()) {
-            if !u.is_empty() { self.user = Some(u.to_string()); }
+            if !u.is_empty() {
+                self.user = Some(u.to_string());
+            }
         }
         if let Some(c) = inner.get("Cmd").and_then(|x| x.as_array()) {
-            self.cmd = Some(c.iter().filter_map(|v| v.as_str().map(String::from)).collect());
+            self.cmd = Some(
+                c.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect(),
+            );
         }
         if let Some(e) = inner.get("Entrypoint").and_then(|x| x.as_array()) {
-            self.entrypoint = Some(e.iter().filter_map(|v| v.as_str().map(String::from)).collect());
+            self.entrypoint = Some(
+                e.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect(),
+            );
         }
         if let Some(sh) = inner.get("Shell").and_then(|x| x.as_array()) {
-            let v: Vec<String> = sh.iter().filter_map(|x| x.as_str().map(String::from)).collect();
-            if !v.is_empty() { self.shell = v; self.shell_set = true; }
+            let v: Vec<String> = sh
+                .iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect();
+            if !v.is_empty() {
+                self.shell = v;
+                self.shell_set = true;
+            }
         }
         if let Some(s) = inner.get("StopSignal").and_then(|x| x.as_str()) {
-            if !s.is_empty() { self.stopsignal = Some(s.to_string()); }
+            if !s.is_empty() {
+                self.stopsignal = Some(s.to_string());
+            }
         }
         if let Some(ob) = inner.get("OnBuild").and_then(|x| x.as_array()) {
-            self.onbuild = ob.iter().filter_map(|x| x.as_str().map(String::from)).collect();
+            self.onbuild = ob
+                .iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect();
         }
         // Healthcheck is carried as-is from the base (already in nanosecond
         // form) when this build doesn't override it. Stored back verbatim in
@@ -1973,22 +2489,37 @@ impl Builder {
         let mut cfg = serde_json::Map::new();
         cfg.insert("Env".into(), serde_json::json!(env));
         cfg.insert("WorkingDir".into(), serde_json::json!(self.workdir));
-        if let Some(u) = &self.user { cfg.insert("User".into(), serde_json::json!(u)); }
-        if let Some(c) = &self.cmd { cfg.insert("Cmd".into(), serde_json::json!(c)); }
-        if let Some(e) = &self.entrypoint { cfg.insert("Entrypoint".into(), serde_json::json!(e)); }
+        if let Some(u) = &self.user {
+            cfg.insert("User".into(), serde_json::json!(u));
+        }
+        if let Some(c) = &self.cmd {
+            cfg.insert("Cmd".into(), serde_json::json!(c));
+        }
+        if let Some(e) = &self.entrypoint {
+            cfg.insert("Entrypoint".into(), serde_json::json!(e));
+        }
         if !self.labels.is_empty() {
-            let m: serde_json::Map<String, serde_json::Value> = self.labels.iter()
-                .map(|(k, v)| (k.clone(), serde_json::json!(v))).collect();
+            let m: serde_json::Map<String, serde_json::Value> = self
+                .labels
+                .iter()
+                .map(|(k, v)| (k.clone(), serde_json::json!(v)))
+                .collect();
             cfg.insert("Labels".into(), serde_json::Value::Object(m));
         }
         if !self.exposed.is_empty() {
-            let m: serde_json::Map<String, serde_json::Value> = self.exposed.iter()
-                .map(|p| (p.clone(), serde_json::json!({}))).collect();
+            let m: serde_json::Map<String, serde_json::Value> = self
+                .exposed
+                .iter()
+                .map(|p| (p.clone(), serde_json::json!({})))
+                .collect();
             cfg.insert("ExposedPorts".into(), serde_json::Value::Object(m));
         }
         if !self.volumes.is_empty() {
-            let m: serde_json::Map<String, serde_json::Value> = self.volumes.iter()
-                .map(|p| (p.clone(), serde_json::json!({}))).collect();
+            let m: serde_json::Map<String, serde_json::Value> = self
+                .volumes
+                .iter()
+                .map(|p| (p.clone(), serde_json::json!({})))
+                .collect();
             cfg.insert("Volumes".into(), serde_json::Value::Object(m));
         }
         if self.shell_set {
@@ -2020,7 +2551,9 @@ impl Builder {
     }
 
     fn stamp_current(&self) {
-        if let Some(c) = self.current { self.stamp(c); }
+        if let Some(c) = self.current {
+            self.stamp(c);
+        }
     }
 
     /// Stamp each build box's accumulated directive list as its `frame` meta.
@@ -2045,7 +2578,9 @@ impl Builder {
         if let (Some(name), Some(cur)) = (self.pending_stage.take(), self.current) {
             self.stages.insert(name, cur);
         }
-        let top = self.current.ok_or_else(|| anyhow!("empty build (no FROM)"))?;
+        let top = self
+            .current
+            .ok_or_else(|| anyhow!("empty build (no FROM)"))?;
         self.stamp(top);
         self.stamp_frames();
         let name = if let Some(t) = tag {
@@ -2100,7 +2635,9 @@ fn healthcheck_json(spec: &crate::dockerfile::HealthcheckSpec) -> serde_json::Va
 /// None on any malformed input so the caller simply omits the field.
 fn parse_duration_ns(s: &str) -> Option<i64> {
     let s = s.trim();
-    if s.is_empty() { return None; }
+    if s.is_empty() {
+        return None;
+    }
     let bytes = s.as_bytes();
     let mut i = 0usize;
     let mut total: i64 = 0;
@@ -2108,12 +2645,18 @@ fn parse_duration_ns(s: &str) -> Option<i64> {
     while i < bytes.len() {
         // number (digits + optional fraction)
         let num_start = i;
-        while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'.') { i += 1; }
-        if i == num_start { return None; }
+        while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'.') {
+            i += 1;
+        }
+        if i == num_start {
+            return None;
+        }
         let val: f64 = s[num_start..i].parse().ok()?;
         // unit
         let unit_start = i;
-        while i < bytes.len() && !bytes[i].is_ascii_digit() && bytes[i] != b'.' { i += 1; }
+        while i < bytes.len() && !bytes[i].is_ascii_digit() && bytes[i] != b'.' {
+            i += 1;
+        }
         let unit = &s[unit_start..i];
         let scale: f64 = match unit {
             "ns" => 1.0,
@@ -2137,7 +2680,9 @@ fn normalize_rel(p: &str) -> String {
     for comp in p.split('/') {
         match comp {
             "" | "." => {}
-            ".." => { out.pop(); }
+            ".." => {
+                out.pop();
+            }
             c => out.push(c),
         }
     }
@@ -2166,7 +2711,9 @@ fn mint_box_id() -> i64 {
                 let p = ent.path();
                 let stem = p.file_stem().and_then(|s| s.to_str());
                 if let Some(n) = stem.and_then(|s| s.parse::<i64>().ok()) {
-                    if n > max { max = n; }
+                    if n > max {
+                        max = n;
+                    }
                 }
             }
         }
@@ -2180,8 +2727,10 @@ fn mint_box_id() -> i64 {
 fn find_child_named(parent: i64, name: &str) -> Option<i64> {
     for _ in 0..50 {
         let boxes = crate::discover::discover();
-        if let Some(b) = boxes.values()
-            .find(|b| b.parent == Some(parent) && b.name == name) {
+        if let Some(b) = boxes
+            .values()
+            .find(|b| b.parent == Some(parent) && b.name == name)
+        {
             return Some(b.box_id);
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
@@ -2193,52 +2742,84 @@ fn find_child_named(parent: i64, name: &str) -> Option<i64> {
 fn ensure_dir_chain(b: &BoxState, rel: &str) {
     let mut acc = String::new();
     for comp in rel.split('/') {
-        if comp.is_empty() { continue; }
-        if acc.is_empty() { acc.push_str(comp); } else { acc.push('/'); acc.push_str(comp); }
+        if comp.is_empty() {
+            continue;
+        }
+        if acc.is_empty() {
+            acc.push_str(comp);
+        } else {
+            acc.push('/');
+            acc.push_str(comp);
+        }
         b.set_dir(&acc, 0o755, 0);
     }
 }
 
 /// Copy a single host file into box `b` at `target_rel`, creating ancestors.
-fn copy_file(b: &BoxState, src: &Path, target_rel: &str,
-             owner: Option<(u32, u32)>, mode_override: Option<u32>) -> Result<()> {
+fn copy_file(
+    b: &BoxState,
+    src: &Path,
+    target_rel: &str,
+    owner: Option<(u32, u32)>,
+    mode_override: Option<u32>,
+) -> Result<()> {
     if let Some(parent) = Path::new(target_rel).parent().and_then(|p| p.to_str()) {
-        if !parent.is_empty() { ensure_dir_chain(b, parent); }
+        if !parent.is_empty() {
+            ensure_dir_chain(b, parent);
+        }
     }
     let meta = std::fs::symlink_metadata(src)?;
     if meta.file_type().is_symlink() {
         let tgt = std::fs::read_link(src)?;
         b.set_symlink(target_rel, &tgt, 0);
-        if let Some((u, g)) = owner { b.set_owner(target_rel, u, g); }
+        if let Some((u, g)) = owner {
+            b.set_owner(target_rel, u, g);
+        }
         return Ok(());
     }
     let mode = mode_override.unwrap_or_else(|| meta.permissions().mode() & 0o7777);
     let rowid = b.ensure_file_row(target_rel, 0o100000 | mode, 0);
     let bp = crate::depot::blob_path(b.id, rowid);
-    if let Some(p) = bp.parent() { std::fs::create_dir_all(p)?; }
-    let sz = std::fs::copy(src, &bp)
-        .with_context(|| format!("copy {} → blob", src.display()))?;
+    if let Some(p) = bp.parent() {
+        std::fs::create_dir_all(p)?;
+    }
+    let sz = std::fs::copy(src, &bp).with_context(|| format!("copy {} → blob", src.display()))?;
     let _ = std::fs::set_permissions(&bp, std::fs::Permissions::from_mode(mode));
-    let mtime_ns = meta.modified().ok()
+    let mtime_ns = meta
+        .modified()
+        .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_nanos() as i64).unwrap_or(0);
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0);
     b.finalize_file(target_rel, sz as i64, mtime_ns, 0);
-    if let Some((u, g)) = owner { b.set_owner(target_rel, u, g); }
+    if let Some((u, g)) = owner {
+        b.set_owner(target_rel, u, g);
+    }
     Ok(())
 }
 
 /// Recursively copy the CONTENTS of host dir `src` into box `b` under `dst_rel`
 /// (Docker COPY-dir semantics: the directory's children land in dest).
-fn copy_tree(b: &BoxState, src: &Path, dst_rel: &str,
-             owner: Option<(u32, u32)>, mode_override: Option<u32>) -> Result<()> {
-    if !dst_rel.is_empty() { ensure_dir_chain(b, dst_rel); }
+fn copy_tree(
+    b: &BoxState,
+    src: &Path,
+    dst_rel: &str,
+    owner: Option<(u32, u32)>,
+    mode_override: Option<u32>,
+) -> Result<()> {
+    if !dst_rel.is_empty() {
+        ensure_dir_chain(b, dst_rel);
+    }
     for ent in std::fs::read_dir(src)? {
         let ent = ent?;
         let name = ent.file_name();
         let name = name.to_string_lossy();
         let child = ent.path();
-        let target = if dst_rel.is_empty() { name.to_string() }
-                     else { format!("{dst_rel}/{name}") };
+        let target = if dst_rel.is_empty() {
+            name.to_string()
+        } else {
+            format!("{dst_rel}/{name}")
+        };
         let ft = ent.file_type()?;
         if ft.is_dir() {
             b.set_dir(&target, 0o755, 0);
@@ -2254,36 +2835,61 @@ fn copy_tree(b: &BoxState, src: &Path, dst_rel: &str,
 /// `src_rel`) into box `b` under `dst_rel` — the box-view analogue of
 /// copy_tree, used by `COPY --from`. Docker copies the source dir's CONTENTS
 /// into dest.
-fn copy_box_tree(ov: &crate::overlay::Overlay, src_id: i64, src_rel: &str,
-                 b: &BoxState, dst_rel: &str, owner: Option<(u32, u32)>,
-                 mode: Option<u32>) -> Result<()> {
-    if !dst_rel.is_empty() { ensure_dir_chain(b, dst_rel); }
-    let entries = ov.box_list_dir(src_id, src_rel)
+fn copy_box_tree(
+    ov: &crate::overlay::Overlay,
+    src_id: i64,
+    src_rel: &str,
+    b: &BoxState,
+    dst_rel: &str,
+    owner: Option<(u32, u32)>,
+    mode: Option<u32>,
+) -> Result<()> {
+    if !dst_rel.is_empty() {
+        ensure_dir_chain(b, dst_rel);
+    }
+    let entries = ov
+        .box_list_dir(src_id, src_rel)
         .map_err(|e| anyhow!("list '{src_rel}' in stage: {e}"))?;
     for (name, kind) in entries {
-        let child_src = if src_rel.is_empty() { name.clone() }
-                        else { format!("{src_rel}/{name}") };
-        let child_dst = if dst_rel.is_empty() { name.clone() }
-                        else { format!("{dst_rel}/{name}") };
+        let child_src = if src_rel.is_empty() {
+            name.clone()
+        } else {
+            format!("{src_rel}/{name}")
+        };
+        let child_dst = if dst_rel.is_empty() {
+            name.clone()
+        } else {
+            format!("{dst_rel}/{name}")
+        };
         match kind {
             'd' => {
                 b.set_dir(&child_dst, 0o755, 0);
                 copy_box_tree(ov, src_id, &child_src, b, &child_dst, owner, mode)?;
             }
             'l' => {
-                let tgt = ov.box_read_file(src_id, &child_src)
+                let tgt = ov
+                    .box_read_file(src_id, &child_src)
                     .map_err(|e| anyhow!("readlink '{child_src}': {e}"))?;
-                b.set_symlink(&child_dst,
-                    Path::new(&String::from_utf8_lossy(&tgt).into_owned()), 0);
-                if let Some((u, g)) = owner { b.set_owner(&child_dst, u, g); }
+                b.set_symlink(
+                    &child_dst,
+                    Path::new(&String::from_utf8_lossy(&tgt).into_owned()),
+                    0,
+                );
+                if let Some((u, g)) = owner {
+                    b.set_owner(&child_dst, u, g);
+                }
             }
             _ => {
-                let bytes = ov.box_read_file(src_id, &child_src)
+                let bytes = ov
+                    .box_read_file(src_id, &child_src)
                     .map_err(|e| anyhow!("read '{child_src}': {e}"))?;
-                let m = mode.or_else(|| ov.box_file_mode(src_id, &child_src))
+                let m = mode
+                    .or_else(|| ov.box_file_mode(src_id, &child_src))
                     .unwrap_or(0o644);
                 put_file_bytes(b, &child_dst, &bytes, m, now_ns())?;
-                if let Some((u, g)) = owner { b.set_owner(&child_dst, u, g); }
+                if let Some((u, g)) = owner {
+                    b.set_owner(&child_dst, u, g);
+                }
             }
         }
     }
@@ -2293,17 +2899,25 @@ fn copy_box_tree(ov: &crate::overlay::Overlay, src_id: i64, src_rel: &str,
 /// Write `bytes` into box `b` at `target_rel` as a regular file with `mode`,
 /// creating ancestor dirs. The box-bytes analogue of copy_file (used by
 /// ADD-of-URL, ADD-tar-extract, and COPY --from).
-fn put_file_bytes(b: &BoxState, target_rel: &str, bytes: &[u8], mode: u32,
-                  mtime_ns: i64) -> Result<()> {
+fn put_file_bytes(
+    b: &BoxState,
+    target_rel: &str,
+    bytes: &[u8],
+    mode: u32,
+    mtime_ns: i64,
+) -> Result<()> {
     if let Some(parent) = Path::new(target_rel).parent().and_then(|p| p.to_str()) {
-        if !parent.is_empty() { ensure_dir_chain(b, parent); }
+        if !parent.is_empty() {
+            ensure_dir_chain(b, parent);
+        }
     }
     let m = mode & 0o7777;
     let rowid = b.ensure_file_row(target_rel, 0o100000 | m, 0);
     let bp = crate::depot::blob_path(b.id, rowid);
-    if let Some(p) = bp.parent() { std::fs::create_dir_all(p)?; }
-    std::fs::write(&bp, bytes)
-        .with_context(|| format!("write blob for {target_rel}"))?;
+    if let Some(p) = bp.parent() {
+        std::fs::create_dir_all(p)?;
+    }
+    std::fs::write(&bp, bytes).with_context(|| format!("write blob for {target_rel}"))?;
     let _ = std::fs::set_permissions(&bp, std::fs::Permissions::from_mode(m));
     b.finalize_file(target_rel, bytes.len() as i64, mtime_ns, 0);
     Ok(())
@@ -2313,7 +2927,11 @@ fn put_file_bytes(b: &BoxState, target_rel: &str, bytes: &[u8], mode: u32,
 /// leaf is appended; otherwise the dest IS the target path (single-file rename).
 fn join_dest(dst_rel: &str, dst_is_dir: bool, base: &str) -> String {
     if dst_is_dir || dst_rel.is_empty() {
-        if dst_rel.is_empty() { base.to_string() } else { format!("{dst_rel}/{base}") }
+        if dst_rel.is_empty() {
+            base.to_string()
+        } else {
+            format!("{dst_rel}/{base}")
+        }
     } else {
         dst_rel.to_string()
     }
@@ -2327,12 +2945,18 @@ fn leaf_name(rel: &str) -> String {
 /// Final path segment of a URL (its filename), query/fragment stripped.
 fn url_basename(url: &str) -> String {
     let no_q = url.split(['?', '#']).next().unwrap_or(url);
-    no_q.trim_end_matches('/').rsplit('/').next().unwrap_or("").to_string()
+    no_q.trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or("")
+        .to_string()
 }
 
 fn now_ns() -> i64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as i64).unwrap_or(0)
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0)
 }
 
 /// What `archive_kind` decided a local ADD source is.
@@ -2354,7 +2978,12 @@ fn archive_kind(path: &Path) -> Result<ArchiveKind> {
     loop {
         match f.read(&mut head[n..]) {
             Ok(0) => break,
-            Ok(k) => { n += k; if n == head.len() { break; } }
+            Ok(k) => {
+                n += k;
+                if n == head.len() {
+                    break;
+                }
+            }
             Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e.into()),
         }
@@ -2375,23 +3004,42 @@ fn archive_kind(path: &Path) -> Result<ArchiveKind> {
 /// the ADD-of-local-tar path. Plain extraction — no AUFS whiteout convention
 /// (a build-context tarball never carries `.wh.` entries). Files/dirs/symlinks
 /// are handled; `--chown`/`--chmod` overrides win over the tar's own metadata.
-fn extract_tar_into(b: &BoxState, blob: &[u8], dst_rel: &str,
-                    owner: Option<(u32, u32)>, mode_override: Option<u32>) -> Result<()> {
+fn extract_tar_into(
+    b: &BoxState,
+    blob: &[u8],
+    dst_rel: &str,
+    owner: Option<(u32, u32)>,
+    mode_override: Option<u32>,
+) -> Result<()> {
     use std::path::Component;
-    if !dst_rel.is_empty() { ensure_dir_chain(b, dst_rel); }
+    if !dst_rel.is_empty() {
+        ensure_dir_chain(b, dst_rel);
+    }
     let reader = decompressor(blob, "")?;
     let mut ar = tar::Archive::new(reader);
     for entry in ar.entries().context("read tar entries")? {
         let mut e = entry.context("tar entry")?;
-        let raw = match e.path() { Ok(p) => p.into_owned(), Err(_) => continue };
+        let raw = match e.path() {
+            Ok(p) => p.into_owned(),
+            Err(_) => continue,
+        };
         if raw.is_absolute()
-            || raw.components().any(|c| matches!(c, Component::ParentDir | Component::Prefix(_)))
-        { continue; }
+            || raw
+                .components()
+                .any(|c| matches!(c, Component::ParentDir | Component::Prefix(_)))
+        {
+            continue;
+        }
         let rel_s = raw.to_string_lossy();
         let rel = rel_s.trim_end_matches('/');
-        if rel.is_empty() { continue; }
-        let target = if dst_rel.is_empty() { rel.to_string() }
-                     else { format!("{dst_rel}/{rel}") };
+        if rel.is_empty() {
+            continue;
+        }
+        let target = if dst_rel.is_empty() {
+            rel.to_string()
+        } else {
+            format!("{dst_rel}/{rel}")
+        };
         let (tmode, mtime_ns, uid, gid, et) = {
             let h = e.header();
             (
@@ -2406,7 +3054,9 @@ fn extract_tar_into(b: &BoxState, blob: &[u8], dst_rel: &str,
         match et {
             tar::EntryType::Directory => {
                 if let Some(p) = Path::new(&target).parent().and_then(|p| p.to_str()) {
-                    if !p.is_empty() { ensure_dir_chain(b, p); }
+                    if !p.is_empty() {
+                        ensure_dir_chain(b, p);
+                    }
                 }
                 b.set_dir(&target, mode, 0);
             }
@@ -2418,7 +3068,9 @@ fn extract_tar_into(b: &BoxState, blob: &[u8], dst_rel: &str,
             tar::EntryType::Symlink => {
                 if let Ok(Some(link)) = e.link_name() {
                     if let Some(p) = Path::new(&target).parent().and_then(|p| p.to_str()) {
-                        if !p.is_empty() { ensure_dir_chain(b, p); }
+                        if !p.is_empty() {
+                            ensure_dir_chain(b, p);
+                        }
                     }
                     b.set_symlink(&target, &link, 0);
                 }
@@ -2428,7 +3080,9 @@ fn extract_tar_into(b: &BoxState, blob: &[u8], dst_rel: &str,
             _ => continue,
         }
         let (u, g) = owner.unwrap_or((uid, gid));
-        if u != 0 || g != 0 { b.set_owner(&target, u, g); }
+        if u != 0 || g != 0 {
+            b.set_owner(&target, u, g);
+        }
     }
     Ok(())
 }
@@ -2437,7 +3091,9 @@ fn extract_tar_into(b: &BoxState, blob: &[u8], dst_rel: &str,
 /// via oci-client) with platform TLS verification + redirect following.
 fn fetch_url(url: &str) -> Result<Vec<u8>> {
     let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all().build().context("build runtime")?;
+        .enable_all()
+        .build()
+        .context("build runtime")?;
     rt.block_on(async {
         let resp = reqwest::get(url).await.context("GET")?;
         let status = resp.status();
@@ -2524,8 +3180,7 @@ async fn fetch_registry(reference: &str) -> Result<PulledImage> {
     // so a policy-mandated local mirror is used without the user having to
     // spell it out. With no config this yields exactly the old behavior
     // (docker.io + library/ via the oci-client defaults).
-    let resolved = crate::containers_conf::ContainersConf::load()
-        .resolve(reference);
+    let resolved = crate::containers_conf::ContainersConf::load().resolve(reference);
     if let Some(msg) = resolved.blocked {
         bail!("{msg}");
     }
@@ -2534,15 +3189,23 @@ async fn fetch_registry(reference: &str) -> Result<PulledImage> {
         match pull_one(&cand.reference).await {
             Ok(img) => {
                 if cand.reference != reference && !cand.via.is_empty() {
-                    eprintln!("sarun oci: '{reference}' → '{}' ({})",
-                              cand.reference, cand.via);
+                    eprintln!(
+                        "sarun oci: '{reference}' → '{}' ({})",
+                        cand.reference, cand.via
+                    );
                 }
                 return Ok(img);
             }
             Err(e) => {
-                let e = e.context(format!("pull '{}'{}", cand.reference,
-                    if cand.via.is_empty() { String::new() }
-                    else { format!(" ({})", cand.via) }));
+                let e = e.context(format!(
+                    "pull '{}'{}",
+                    cand.reference,
+                    if cand.via.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({})", cand.via)
+                    }
+                ));
                 last_err = Some(match last_err {
                     Some(prev) => e.context(format!("{prev:#}")),
                     None => e,
@@ -2554,8 +3217,8 @@ async fn fetch_registry(reference: &str) -> Result<PulledImage> {
 }
 
 async fn pull_one(reference: &str) -> Result<PulledImage> {
-    let r = Reference::from_str(reference)
-        .with_context(|| format!("parse reference '{reference}'"))?;
+    let r =
+        Reference::from_str(reference).with_context(|| format!("parse reference '{reference}'"))?;
     let client = Client::new(ClientConfig::default());
     // Accepted media types: docker + oci variants in gzip / uncompressed /
     // zstd. Passing them all so a server that has multiple variants doesn't
@@ -2567,17 +3230,24 @@ async fn pull_one(reference: &str) -> Result<PulledImage> {
         DOCKER_LAYER_GZIP_MEDIA_TYPE,
     ];
     let auth = registry_auth_for(reference);
-    let img = client.pull(&r, &auth, accepted).await
+    let img = client
+        .pull(&r, &auth, accepted)
+        .await
         .context("pull image")?;
     let mut layers = Vec::with_capacity(img.layers.len());
     for layer in img.layers {
-        let ImageLayer { data, media_type, .. } = layer;
+        let ImageLayer {
+            data, media_type, ..
+        } = layer;
         let bytes = data.to_vec();
         let digest = digest_of(&bytes);
-        layers.push(PulledLayer { media_type, bytes, digest });
+        layers.push(PulledLayer {
+            media_type,
+            bytes,
+            digest,
+        });
     }
-    let config_json = String::from_utf8(img.config.data.to_vec())
-        .context("config is not utf-8")?;
+    let config_json = String::from_utf8(img.config.data.to_vec()).context("config is not utf-8")?;
     let manifest_digest = img.digest.clone().unwrap_or_default();
     // Best-effort: fetch any cosign `.sig` artifact for this digest (only used
     // if the trust policy requires verification — then absence fails closed).
@@ -2596,19 +3266,33 @@ async fn pull_one(reference: &str) -> Result<PulledImage> {
 /// the same registry/repo (`<repo>:sha256-<hex>.sig`). Returns the signatures it
 /// finds; any error (no signature, network, auth) yields an empty list, which
 /// makes a policy-required verification fail closed rather than pass.
-async fn fetch_registry_sigs(r: &Reference, auth: &RegistryAuth, manifest_digest: &str)
-    -> Vec<crate::oci_verify::CosignSig> {
-    let dhex = manifest_digest.strip_prefix("sha256:").unwrap_or(manifest_digest);
-    if dhex.is_empty() { return vec![]; }
+async fn fetch_registry_sigs(
+    r: &Reference,
+    auth: &RegistryAuth,
+    manifest_digest: &str,
+) -> Vec<crate::oci_verify::CosignSig> {
+    let dhex = manifest_digest
+        .strip_prefix("sha256:")
+        .unwrap_or(manifest_digest);
+    if dhex.is_empty() {
+        return vec![];
+    }
     let sig_ref_str = format!("{}/{}:sha256-{}.sig", r.registry(), r.repository(), dhex);
-    let Ok(sig_ref) = Reference::from_str(&sig_ref_str) else { return vec![]; };
+    let Ok(sig_ref) = Reference::from_str(&sig_ref_str) else {
+        return vec![];
+    };
     let client = Client::new(ClientConfig::default());
     let accepted = vec!["application/vnd.dev.cosign.simplesigning.v1+json"];
-    let Ok(img) = client.pull(&sig_ref, auth, accepted).await else { return vec![]; };
+    let Ok(img) = client.pull(&sig_ref, auth, accepted).await else {
+        return vec![];
+    };
     let mut out = vec![];
     for layer in img.layers {
-        if let Some(sig) = layer.annotations.as_ref()
-            .and_then(|a| a.get("dev.cosignproject.cosign/signature")) {
+        if let Some(sig) = layer
+            .annotations
+            .as_ref()
+            .and_then(|a| a.get("dev.cosignproject.cosign/signature"))
+        {
             out.push(crate::oci_verify::CosignSig {
                 payload: layer.data.to_vec(),
                 signature_b64: sig.clone(),
@@ -2624,35 +3308,51 @@ async fn fetch_registry_sigs(r: &Reference, auth: &RegistryAuth, manifest_digest
 /// public pulls are unchanged. Credentials are read HOST-side here in the
 /// engine/CLI and never enter a box.
 fn registry_auth_for(reference: &str) -> RegistryAuth {
-    let Ok(r) = Reference::from_str(reference) else { return RegistryAuth::Anonymous; };
+    let Ok(r) = Reference::from_str(reference) else {
+        return RegistryAuth::Anonymous;
+    };
     let host = r.registry().to_string();
     // Docker Hub creds live under a legacy key in config.json.
     let mut keys = vec![host.clone()];
-    if matches!(host.as_str(),
-                "docker.io" | "registry-1.docker.io" | "index.docker.io") {
+    if matches!(
+        host.as_str(),
+        "docker.io" | "registry-1.docker.io" | "index.docker.io"
+    ) {
         keys.push("https://index.docker.io/v1/".to_string());
     }
-    let Some(cfg) = read_docker_config() else { return RegistryAuth::Anonymous; };
+    let Some(cfg) = read_docker_config() else {
+        return RegistryAuth::Anonymous;
+    };
     // 1. A direct auths[<key>] entry: base64 "user:pass", or username/password.
     if let Some(auths) = cfg.get("auths").and_then(|v| v.as_object()) {
         for k in &keys {
-            let Some(entry) = auths.get(k).and_then(|v| v.as_object()) else { continue };
+            let Some(entry) = auths.get(k).and_then(|v| v.as_object()) else {
+                continue;
+            };
             if let Some(b64) = entry.get("auth").and_then(|v| v.as_str()) {
                 if let Some((u, p)) = decode_basic_auth(b64) {
                     return RegistryAuth::Basic(u, p);
                 }
             }
-            if let (Some(u), Some(p)) = (entry.get("username").and_then(|v| v.as_str()),
-                                         entry.get("password").and_then(|v| v.as_str())) {
+            if let (Some(u), Some(p)) = (
+                entry.get("username").and_then(|v| v.as_str()),
+                entry.get("password").and_then(|v| v.as_str()),
+            ) {
                 return RegistryAuth::Basic(u.to_string(), p.to_string());
             }
         }
     }
     // 2. A credential helper (per-registry credHelpers beats the global credsStore).
-    let helper = cfg.get("credHelpers").and_then(|v| v.as_object())
+    let helper = cfg
+        .get("credHelpers")
+        .and_then(|v| v.as_object())
         .and_then(|m| keys.iter().find_map(|k| m.get(k)).and_then(|v| v.as_str()))
         .map(String::from)
-        .or_else(|| cfg.get("credsStore").and_then(|v| v.as_str()).map(String::from));
+        .or_else(|| {
+            cfg.get("credsStore")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+        });
     if let Some(helper) = helper {
         if let Some(auth) = credential_helper_get(&helper, &host) {
             return auth;
@@ -2664,8 +3364,9 @@ fn registry_auth_for(reference: &str) -> RegistryAuth {
 fn read_docker_config() -> Option<serde_json::Value> {
     let path = std::env::var_os("DOCKER_CONFIG")
         .map(|d| PathBuf::from(d).join("config.json"))
-        .or_else(|| std::env::var_os("HOME")
-            .map(|h| PathBuf::from(h).join(".docker").join("config.json")))?;
+        .or_else(|| {
+            std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".docker").join("config.json"))
+        })?;
     serde_json::from_slice(&std::fs::read(&path).ok()?).ok()
 }
 
@@ -2685,15 +3386,22 @@ fn credential_helper_get(helper: &str, server: &str) -> Option<RegistryAuth> {
     use std::process::{Command, Stdio};
     let mut child = Command::new(format!("docker-credential-{helper}"))
         .arg("get")
-        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null())
-        .spawn().ok()?;
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
     child.stdin.take()?.write_all(server.as_bytes()).ok()?;
     let out = child.wait_with_output().ok()?;
-    if !out.status.success() { return None; }
+    if !out.status.success() {
+        return None;
+    }
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
     let user = v.get("Username").and_then(|x| x.as_str())?;
     let secret = v.get("Secret").and_then(|x| x.as_str())?;
-    if user == "<token>" { return None; }
+    if user == "<token>" {
+        return None;
+    }
     Some(RegistryAuth::Basic(user.to_string(), secret.to_string()))
 }
 
@@ -2702,37 +3410,48 @@ fn fetch_oci_layout(path: &Path) -> Result<PulledImage> {
     // For v1 take the FIRST manifest in index.json; multi-arch indexes pick
     // the first descriptor that points at a manifest (not another index).
     let index_path = path.join("index.json");
-    let idx_bytes = std::fs::read(&index_path)
-        .with_context(|| format!("read {}", index_path.display()))?;
+    let idx_bytes =
+        std::fs::read(&index_path).with_context(|| format!("read {}", index_path.display()))?;
     let manifest_digest = index_manifest_digest(&idx_bytes)?;
     let manifest_bytes = read_blob_by_digest(path, &manifest_digest)?;
-    let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes)
-        .context("parse manifest")?;
-    let config_desc = manifest.get("config")
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&manifest_bytes).context("parse manifest")?;
+    let config_desc = manifest
+        .get("config")
         .ok_or_else(|| anyhow!("manifest has no config"))?;
-    let config_digest = config_desc.get("digest").and_then(|v| v.as_str())
+    let config_digest = config_desc
+        .get("digest")
+        .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("config has no digest"))?;
     let config_bytes = read_blob_by_digest(path, config_digest)?;
-    let config_json = String::from_utf8(config_bytes)
-        .context("config is not utf-8")?;
-    let layers_desc = manifest.get("layers").and_then(|v| v.as_array())
+    let config_json = String::from_utf8(config_bytes).context("config is not utf-8")?;
+    let layers_desc = manifest
+        .get("layers")
+        .and_then(|v| v.as_array())
         .ok_or_else(|| anyhow!("manifest has no layers"))?;
     let mut layers = Vec::with_capacity(layers_desc.len());
     for l in layers_desc {
-        let digest = l.get("digest").and_then(|v| v.as_str())
+        let digest = l
+            .get("digest")
+            .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow!("layer has no digest"))?;
-        let media_type = l.get("mediaType").and_then(|v| v.as_str())
-            .unwrap_or(IMAGE_LAYER_GZIP_MEDIA_TYPE).to_string();
+        let media_type = l
+            .get("mediaType")
+            .and_then(|v| v.as_str())
+            .unwrap_or(IMAGE_LAYER_GZIP_MEDIA_TYPE)
+            .to_string();
         let bytes = read_blob_by_digest(path, digest)?;
         layers.push(PulledLayer {
-            media_type, bytes,
+            media_type,
+            bytes,
             digest: digest.to_string(),
         });
     }
     let idx: Value = serde_json::from_slice(&idx_bytes).unwrap_or(Value::Null);
     let signatures = cosign_sigs_from_layout(path, &idx, &manifest_digest);
     Ok(PulledImage {
-        layers, config_json,
+        layers,
+        config_json,
         reference: format!("oci-layout:{}", path.display()),
         manifest_digest,
         signatures,
@@ -2743,29 +3462,52 @@ fn fetch_oci_layout(path: &Path) -> Result<PulledImage> {
 /// manifest descriptor tagged (annotation `org.opencontainers.image.ref.name`)
 /// `sha256-<hex>.sig`, whose layers carry the simple-signing payload (blob) and
 /// the base64 signature (annotation `dev.cosignproject.cosign/signature`).
-fn cosign_sigs_from_layout(path: &Path, idx: &Value, manifest_digest: &str)
-    -> Vec<crate::oci_verify::CosignSig> {
-    let dhex = manifest_digest.strip_prefix("sha256:").unwrap_or(manifest_digest);
+fn cosign_sigs_from_layout(
+    path: &Path,
+    idx: &Value,
+    manifest_digest: &str,
+) -> Vec<crate::oci_verify::CosignSig> {
+    let dhex = manifest_digest
+        .strip_prefix("sha256:")
+        .unwrap_or(manifest_digest);
     let want = format!("sha256-{dhex}.sig");
     let mut out = vec![];
-    let Some(descs) = idx.get("manifests").and_then(|v| v.as_array()) else { return out };
+    let Some(descs) = idx.get("manifests").and_then(|v| v.as_array()) else {
+        return out;
+    };
     for d in descs {
-        let name = d.get("annotations")
+        let name = d
+            .get("annotations")
             .and_then(|a| a.get("org.opencontainers.image.ref.name"))
             .and_then(Value::as_str);
-        if name != Some(want.as_str()) { continue; }
-        let Some(sig_dg) = d.get("digest").and_then(Value::as_str) else { continue };
-        let Ok(mbytes) = read_blob_by_digest(path, sig_dg) else { continue };
-        let Ok(m) = serde_json::from_slice::<Value>(&mbytes) else { continue };
-        for layer in m.get("layers").and_then(|v| v.as_array()).into_iter().flatten() {
-            let sig = layer.get("annotations")
+        if name != Some(want.as_str()) {
+            continue;
+        }
+        let Some(sig_dg) = d.get("digest").and_then(Value::as_str) else {
+            continue;
+        };
+        let Ok(mbytes) = read_blob_by_digest(path, sig_dg) else {
+            continue;
+        };
+        let Ok(m) = serde_json::from_slice::<Value>(&mbytes) else {
+            continue;
+        };
+        for layer in m
+            .get("layers")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+        {
+            let sig = layer
+                .get("annotations")
                 .and_then(|a| a.get("dev.cosignproject.cosign/signature"))
                 .and_then(Value::as_str);
             let blob_dg = layer.get("digest").and_then(Value::as_str);
             if let (Some(sig), Some(bd)) = (sig, blob_dg) {
                 if let Ok(payload) = read_blob_by_digest(path, bd) {
                     out.push(crate::oci_verify::CosignSig {
-                        payload, signature_b64: sig.to_string(),
+                        payload,
+                        signature_b64: sig.to_string(),
                     });
                 }
             }
@@ -2778,14 +3520,16 @@ fn cosign_sigs_from_layout(path: &Path, idx: &Value, manifest_digest: &str)
 /// Shared by the layout loader and the cheap image-cache probe so both agree
 /// on what "this image's manifest digest" is.
 fn index_manifest_digest(idx_bytes: &[u8]) -> Result<String> {
-    let idx: serde_json::Value = serde_json::from_slice(idx_bytes)
-        .context("parse index.json")?;
-    let descs = idx.get("manifests").and_then(|v| v.as_array())
+    let idx: serde_json::Value = serde_json::from_slice(idx_bytes).context("parse index.json")?;
+    let descs = idx
+        .get("manifests")
+        .and_then(|v| v.as_array())
         .ok_or_else(|| anyhow!("index.json has no manifests array"))?;
     // Multi-arch index: prefer the host arch+os descriptor; fall back to the
     // first (single-arch / unannotated index) rather than failing.
     let (host_arch, host_os) = host_platform();
-    descs.iter()
+    descs
+        .iter()
         .find(|d| matches_platform(d, &host_arch, &host_os))
         .or_else(|| descs.first())
         .and_then(|d| d.get("digest").and_then(|v| v.as_str()))
@@ -2798,8 +3542,7 @@ fn fetch_oci_archive(path: &Path) -> Result<PulledImage> {
     // fetch_oci_layout from there. Cheap given image sizes (an alpine layer
     // is ~3 MB; the archive itself is what the user already had on disk).
     let tmp = tempdir_for_archive()?;
-    let file = File::open(path)
-        .with_context(|| format!("open {}", path.display()))?;
+    let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
     let mut ar = tar::Archive::new(file);
     ar.unpack(&tmp).context("untar oci-archive")?;
     fetch_oci_layout(&tmp)
@@ -2833,14 +3576,17 @@ fn host_platform() -> (String, String) {
 /// host-arch entry, if present, is preferred). The first-fallback caller
 /// handles the no-match-but-some-entry case.
 fn matches_platform(desc: &serde_json::Value, arch: &str, os: &str) -> bool {
-    let Some(p) = desc.get("platform") else { return false; };
+    let Some(p) = desc.get("platform") else {
+        return false;
+    };
     p.get("architecture").and_then(|v| v.as_str()) == Some(arch)
         && p.get("os").and_then(|v| v.as_str()) == Some(os)
 }
 
 fn read_blob_by_digest(layout: &Path, digest: &str) -> Result<Vec<u8>> {
     // digest is "sha256:<hex>"; the blob lives at blobs/sha256/<hex>.
-    let (algo, hex) = digest.split_once(':')
+    let (algo, hex) = digest
+        .split_once(':')
         .ok_or_else(|| anyhow!("malformed digest '{digest}'"))?;
     // A manifest-supplied digest is untrusted: both components index into a host
     // path, so reject anything that isn't a bare path segment or that could
@@ -2857,8 +3603,7 @@ fn read_blob_by_digest(layout: &Path, digest: &str) -> Result<Vec<u8>> {
         bail!("refusing unsafe digest path component in '{digest}'");
     }
     let p = layout.join("blobs").join(algo).join(hex);
-    let bytes = std::fs::read(&p)
-        .with_context(|| format!("read blob {}", p.display()))?;
+    let bytes = std::fs::read(&p).with_context(|| format!("read blob {}", p.display()))?;
     // Content-addressable integrity: the bytes MUST hash to the digest the
     // descriptor/filename claims. Without this an oci-archive/oci-layout with a
     // corrupted or swapped blob is accepted silently. (Registry transfers are
@@ -2867,8 +3612,11 @@ fn read_blob_by_digest(layout: &Path, digest: &str) -> Result<Vec<u8>> {
     if algo == "sha256" {
         let actual = sha256_hex(&bytes);
         if !actual.eq_ignore_ascii_case(hex) {
-            bail!("blob digest mismatch: {} claims {digest} but hashes to \
-                   sha256:{actual}", p.display());
+            bail!(
+                "blob digest mismatch: {} claims {digest} but hashes to \
+                   sha256:{actual}",
+                p.display()
+            );
         }
     }
     Ok(bytes)
@@ -2879,7 +3627,9 @@ fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let d = Sha256::digest(bytes);
     let mut s = String::with_capacity(64);
-    for b in d { s.push_str(&format!("{b:02x}")); }
+    for b in d {
+        s.push_str(&format!("{b:02x}"));
+    }
     s
 }
 
@@ -2894,9 +3644,7 @@ fn digest_of(bytes: &[u8]) -> String {
 
 // ── box chain construction ──────────────────────────────────────────────────
 
-fn install_chain(image: PulledImage, base_name: Option<String>)
-    -> Result<LoadOutcome>
-{
+fn install_chain(image: PulledImage, base_name: Option<String>) -> Result<LoadOutcome> {
     if image.layers.is_empty() {
         bail!("image has no layers");
     }
@@ -2923,8 +3671,7 @@ fn install_chain(image: PulledImage, base_name: Option<String>)
         } else {
             format!("L{id}")
         };
-        let b = BoxState::create(id)
-            .with_context(|| format!("create sqlar for box {id}"))?;
+        let b = BoxState::create(id).with_context(|| format!("create sqlar for box {id}"))?;
         b.set_meta("name", &name);
         b.set_meta("oci_reference", &image.reference);
         if !image.manifest_digest.is_empty() {
@@ -2958,10 +3705,12 @@ fn install_chain(image: PulledImage, base_name: Option<String>)
         top_name = name;
     }
     Ok(LoadOutcome {
-        base_id, base_name: base_name_out,
-        top_id, top_name,
+        base_id,
+        base_name: base_name_out,
+        top_id,
+        top_name,
         n_layers: n,
-        verified: false,   // set by `load` after a policy-required cosign check
+        verified: false, // set by `load` after a policy-required cosign check
     })
 }
 
@@ -2980,25 +3729,29 @@ fn ingest_layer(b: &BoxState, blob: &[u8], media_type: &str) -> Result<()> {
     // even though `foo/bar/baz` lives in this layer — so `ls /foo/bar` would
     // fail. We track which dir rels we've already materialized and create a
     // mode-0o755 placeholder for any ancestor missing one as we walk entries.
-    let mut ensured_dirs: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
-    let ensure_ancestors = |b: &BoxState, rel: &str,
-                            ensured: &mut std::collections::HashSet<String>| {
-        let mut acc = String::new();
-        for comp in rel.split('/') {
-            if acc.is_empty() { acc.push_str(comp); }
-            else { acc.push('/'); acc.push_str(comp); }
-            // The leaf itself isn't an ancestor — only stop one shy.
-            if acc == rel { break; }
-            if ensured.insert(acc.clone()) {
-                // Don't clobber a non-Dir row a real entry will set later.
-                if !matches!(b.entry(&acc),
-                    Some(crate::capture::Entry::Dir { .. })) {
-                    b.set_dir(&acc, 0o755, 0);
+    let mut ensured_dirs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let ensure_ancestors =
+        |b: &BoxState, rel: &str, ensured: &mut std::collections::HashSet<String>| {
+            let mut acc = String::new();
+            for comp in rel.split('/') {
+                if acc.is_empty() {
+                    acc.push_str(comp);
+                } else {
+                    acc.push('/');
+                    acc.push_str(comp);
+                }
+                // The leaf itself isn't an ancestor — only stop one shy.
+                if acc == rel {
+                    break;
+                }
+                if ensured.insert(acc.clone()) {
+                    // Don't clobber a non-Dir row a real entry will set later.
+                    if !matches!(b.entry(&acc), Some(crate::capture::Entry::Dir { .. })) {
+                        b.set_dir(&acc, 0o755, 0);
+                    }
                 }
             }
-        }
-    };
+        };
     for entry in ar.entries().context("read tar entries")? {
         let mut e = entry.context("tar entry")?;
         // Use Entry::path / link_name, NOT header().path() — the Entry-level
@@ -3010,8 +3763,12 @@ fn ingest_layer(b: &BoxState, blob: &[u8], media_type: &str) -> Result<()> {
         };
         // Safety: refuse absolute paths or any `..` traversal.
         if raw_path.is_absolute()
-            || raw_path.components().any(|c| matches!(c,
-                std::path::Component::ParentDir | std::path::Component::Prefix(_)))
+            || raw_path.components().any(|c| {
+                matches!(
+                    c,
+                    std::path::Component::ParentDir | std::path::Component::Prefix(_)
+                )
+            })
         {
             continue;
         }
@@ -3020,7 +3777,8 @@ fn ingest_layer(b: &BoxState, blob: &[u8], media_type: &str) -> Result<()> {
         if rel.is_empty() {
             continue;
         }
-        let basename = raw_path.file_name()
+        let basename = raw_path
+            .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
         // ── AUFS/OCI whiteout convention ──
@@ -3030,7 +3788,8 @@ fn ingest_layer(b: &BoxState, blob: &[u8], media_type: &str) -> Result<()> {
         //                   overlay's resolve()/scan_dir honor it.
         //   .wh.<NAME>    → tombstone for sibling NAME at parent(path).
         if basename == ".wh..wh..opq" {
-            let parent_rel = raw_path.parent()
+            let parent_rel = raw_path
+                .parent()
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_default();
             // An opaque marker at the layer root (.wh..wh..opq directly at
@@ -3041,11 +3800,15 @@ fn ingest_layer(b: &BoxState, blob: &[u8], media_type: &str) -> Result<()> {
             continue;
         }
         if let Some(orig) = basename.strip_prefix(".wh.") {
-            let parent_rel = raw_path.parent()
+            let parent_rel = raw_path
+                .parent()
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            let target = if parent_rel.is_empty() { orig.to_string() }
-                         else { format!("{parent_rel}/{orig}") };
+            let target = if parent_rel.is_empty() {
+                orig.to_string()
+            } else {
+                format!("{parent_rel}/{orig}")
+            };
             b.set_whiteout(&target, writer);
             continue;
         }
@@ -3075,21 +3838,22 @@ fn ingest_layer(b: &BoxState, blob: &[u8], media_type: &str) -> Result<()> {
                 if let Some(p) = bp.parent() {
                     std::fs::create_dir_all(p)?;
                 }
-                let mut out = File::create(&bp)
-                    .with_context(|| format!("create blob {}", bp.display()))?;
+                let mut out =
+                    File::create(&bp).with_context(|| format!("create blob {}", bp.display()))?;
                 let sz = std::io::copy(&mut e, &mut out)
                     .with_context(|| format!("write blob {}", bp.display()))?;
                 drop(out);
-                let _ = std::fs::set_permissions(&bp,
-                    std::fs::Permissions::from_mode(mode));
+                let _ = std::fs::set_permissions(&bp, std::fs::Permissions::from_mode(mode));
                 b.finalize_file(rel, sz as i64, mtime_ns, writer);
             }
             tar::EntryType::Directory => {
                 b.set_dir(rel, mode, writer);
             }
             tar::EntryType::Symlink => {
-                let tgt = e.link_name()
-                    .ok().flatten()
+                let tgt = e
+                    .link_name()
+                    .ok()
+                    .flatten()
                     .map(|p| p.into_owned())
                     .unwrap_or_default();
                 b.set_symlink(rel, &tgt, writer);
@@ -3104,9 +3868,7 @@ fn ingest_layer(b: &BoxState, blob: &[u8], media_type: &str) -> Result<()> {
                 // commonly have mode=0 in the header because the inode metadata
                 // is supposed to be shared with the target.
                 if let Some(src_path) = e.link_name().ok().flatten() {
-                    let src_rel = src_path.to_string_lossy()
-                        .trim_end_matches('/')
-                        .to_string();
+                    let src_rel = src_path.to_string_lossy().trim_end_matches('/').to_string();
                     if let Some((src_rowid, src_mode)) = lookup_file(b, &src_rel) {
                         let src_blob = crate::depot::blob_path(b.id, src_rowid);
                         let new_rowid = b.ensure_file_row(rel, src_mode, writer);
@@ -3153,9 +3915,13 @@ fn ingest_layer(b: &BoxState, blob: &[u8], media_type: &str) -> Result<()> {
 /// images and easy to silently drop. Returns (key without prefix, raw bytes).
 fn read_pax_xattrs<R: Read>(e: &mut tar::Entry<'_, R>) -> Vec<(String, Vec<u8>)> {
     let mut out = Vec::new();
-    let Ok(Some(exts)) = e.pax_extensions() else { return out; };
+    let Ok(Some(exts)) = e.pax_extensions() else {
+        return out;
+    };
     for ext in exts.flatten() {
-        let Ok(key) = ext.key() else { continue; };
+        let Ok(key) = ext.key() else {
+            continue;
+        };
         if let Some(name) = key.strip_prefix("SCHILY.xattr.") {
             out.push((name.to_string(), ext.value_bytes().to_vec()));
         }
@@ -3175,9 +3941,7 @@ fn lookup_file(b: &BoxState, rel: &str) -> Option<(i64, u32)> {
 
 // ── decompression ───────────────────────────────────────────────────────────
 
-fn decompressor<'a>(blob: &'a [u8], media_type: &str)
-    -> Result<Box<dyn Read + 'a>>
-{
+fn decompressor<'a>(blob: &'a [u8], media_type: &str) -> Result<Box<dyn Read + 'a>> {
     // Dispatch on media type first, with a magic-byte safety net for the
     // small but real case of a manifest mis-labelling the layer (some early
     // BuildKit releases shipped zstd bytes under the gzip media type).
@@ -3185,8 +3949,7 @@ fn decompressor<'a>(blob: &'a [u8], media_type: &str)
     match actual {
         Comp::Gzip => Ok(Box::new(flate2::read::GzDecoder::new(blob))),
         Comp::Zstd => {
-            let d = ruzstd::StreamingDecoder::new(blob)
-                .map_err(|e| anyhow!("zstd init: {e}"))?;
+            let d = ruzstd::StreamingDecoder::new(blob).map_err(|e| anyhow!("zstd init: {e}"))?;
             Ok(Box::new(d))
         }
         // xz has no streaming Read adapter in lzma-rs, so decode the whole blob
@@ -3195,8 +3958,7 @@ fn decompressor<'a>(blob: &'a [u8], media_type: &str)
         Comp::Xz => {
             let mut out = Vec::new();
             let mut input = blob;
-            lzma_rs::xz_decompress(&mut input, &mut out)
-                .map_err(|e| anyhow!("xz decode: {e}"))?;
+            lzma_rs::xz_decompress(&mut input, &mut out).map_err(|e| anyhow!("xz decode: {e}"))?;
             Ok(Box::new(std::io::Cursor::new(out)))
         }
         // bzip2-rs DecoderReader streams, borrowing the blob.
@@ -3206,7 +3968,13 @@ fn decompressor<'a>(blob: &'a [u8], media_type: &str)
 }
 
 #[derive(Copy, Clone, Eq, PartialEq)]
-enum Comp { Gzip, Zstd, Xz, Bzip2, None }
+enum Comp {
+    Gzip,
+    Zstd,
+    Xz,
+    Bzip2,
+    None,
+}
 
 fn classify(media_type: &str) -> Comp {
     if media_type.ends_with("+gzip") || media_type.ends_with(".gzip") {
@@ -3243,7 +4011,9 @@ fn sniff(blob: &[u8]) -> Option<Comp> {
 mod tests {
     use super::paths_lcp;
 
-    fn v(xs: &[&str]) -> Vec<String> { xs.iter().map(|s| s.to_string()).collect() }
+    fn v(xs: &[&str]) -> Vec<String> {
+        xs.iter().map(|s| s.to_string()).collect()
+    }
 
     #[test]
     fn lcp_single_path_is_itself() {

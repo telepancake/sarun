@@ -36,11 +36,14 @@ impl SmoltcpStream {
         stack.register_rx(handle, tx_std);
         std::thread::spawn(move || {
             while let Ok(chunk) = rx_std.recv() {
-                if tx_tk.send(chunk).is_err() { break; }
+                if tx_tk.send(chunk).is_err() {
+                    break;
+                }
             }
         });
         Self {
-            stack, handle,
+            stack,
+            handle,
             rx: tokio::sync::Mutex::new(rx_tk),
             leftover: parking_lot::Mutex::new(Vec::new()),
             closed: std::sync::atomic::AtomicBool::new(false),
@@ -49,8 +52,11 @@ impl SmoltcpStream {
 }
 
 impl AsyncRead for SmoltcpStream {
-    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>,
-                 buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
         {
             let mut left = this.leftover.lock();
@@ -64,7 +70,10 @@ impl AsyncRead for SmoltcpStream {
         // Poll the tokio receiver.
         let mut rx = match this.rx.try_lock() {
             Ok(g) => g,
-            Err(_) => { cx.waker().wake_by_ref(); return Poll::Pending; }
+            Err(_) => {
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
         };
         match rx.poll_recv(cx) {
             Poll::Ready(Some(chunk)) => {
@@ -82,18 +91,21 @@ impl AsyncRead for SmoltcpStream {
 }
 
 impl AsyncWrite for SmoltcpStream {
-    fn poll_write(self: Pin<&mut Self>, _cx: &mut Context<'_>,
-                  buf: &[u8]) -> Poll<std::io::Result<usize>> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
         if self.closed.load(std::sync::atomic::Ordering::Acquire) {
             return Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()));
         }
         self.stack.write(self.handle, buf.to_vec());
         Poll::Ready(Ok(buf.len()))
     }
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>)
-                  -> Poll<std::io::Result<()>> { Poll::Ready(Ok(())) }
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>)
-                     -> Poll<std::io::Result<()>> {
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         if !self.closed.swap(true, std::sync::atomic::Ordering::AcqRel) {
             self.stack.close(self.handle);
         }

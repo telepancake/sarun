@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 from pathlib import Path
 import struct
 import tempfile
 import threading
+from types import SimpleNamespace
 import unittest
+from unittest import mock
 import xml.etree.ElementTree as ET
 
 from callgate.architectures import AARCH64, MIPS32EL_MMIPS
@@ -16,8 +19,9 @@ from inferiors.live_facade import (
     _make_runner,
     build_live_facade,
     load_target_descriptions,
+    main,
 )
-from inferiors.linux_oracle import TaskId
+from inferiors.linux_oracle import RegisterRead, TaskId
 from inferiors.partial_registers import (
     AARCH64_USER_REGISTERS,
     PartialRegisterError,
@@ -236,6 +240,19 @@ class FakeClient:
         raise AssertionError("unexpected step")
 
 
+class RunningFakeClient(FakeClient):
+    def __init__(self, stop_reply=b"T02thread:2;"):
+        super().__init__()
+        self.stop_reply = stop_reply
+        self.handoff_calls = 0
+
+    def interrupt_and_wait_for_stop(self):
+        self.handoff_calls += 1
+        if isinstance(self.stop_reply, BaseException):
+            raise self.stop_reply
+        return self.stop_reply
+
+
 class FrozenRunner:
     def __call__(self, cursor):
         if cursor != 0:
@@ -330,6 +347,106 @@ class FakePcTarget:
 
 
 class LiveFacadeTests(unittest.TestCase):
+    def test_stop_on_connect_precedes_existing_stopped_target_validation(self):
+        with tempfile.TemporaryDirectory(dir=".") as directory_text:
+            directory = Path(directory_text)
+            client = RunningFakeClient()
+
+            live = build_live_facade(
+                qemu_socket=str(directory / "qemu.sock"),
+                gdb_socket=str(directory / "gdb.sock"),
+                manifest_path=_manifest(directory),
+                stop_on_connect=True,
+                client_factory=lambda path, timeout: client,
+                runner_factory=lambda target, sealed: FrozenRunner(),
+            )
+            try:
+                self.assertEqual(client.handoff_calls, 1)
+                self.assertEqual(live.facade.handle(b"qC"), b"QCp2a.2a")
+            finally:
+                live.close()
+
+    def test_default_builder_does_not_interrupt_an_already_stopped_target(self):
+        with tempfile.TemporaryDirectory(dir=".") as directory_text:
+            directory = Path(directory_text)
+            client = RunningFakeClient()
+
+            live = build_live_facade(
+                qemu_socket=str(directory / "qemu.sock"),
+                gdb_socket=str(directory / "gdb.sock"),
+                manifest_path=_manifest(directory),
+                client_factory=lambda path, timeout: client,
+                runner_factory=lambda target, sealed: FrozenRunner(),
+            )
+            try:
+                self.assertEqual(client.handoff_calls, 0)
+            finally:
+                live.close()
+
+    def test_failed_stop_on_connect_closes_the_qemu_connection(self):
+        with tempfile.TemporaryDirectory(dir=".") as directory_text:
+            directory = Path(directory_text)
+            client = RunningFakeClient(RspRemoteError(b"OK"))
+
+            with self.assertRaises(RspRemoteError):
+                build_live_facade(
+                    qemu_socket=str(directory / "qemu.sock"),
+                    gdb_socket=str(directory / "gdb.sock"),
+                    manifest_path=_manifest(directory),
+                    stop_on_connect=True,
+                    client_factory=lambda path, timeout: client,
+                    runner_factory=lambda target, sealed: FrozenRunner(),
+                )
+
+            self.assertEqual(client.handoff_calls, 1)
+            self.assertTrue(client.closed)
+
+    def test_cli_threads_stop_on_connect_into_builder(self):
+        live = SimpleNamespace(
+            facade=SimpleNamespace(
+                snapshot=SimpleNamespace(generation=1, tasks=())
+            ),
+            close=mock.Mock(),
+        )
+        with mock.patch(
+            "inferiors.live_facade.build_live_facade", return_value=live
+        ) as builder, mock.patch("sys.stdout", new=io.StringIO()):
+            self.assertEqual(
+                main(
+                    [
+                        "--qemu-socket", "qemu.sock",
+                        "--gdb-socket", "gdb.sock",
+                        "--manifest", "callgate.json",
+                        "--stop-on-connect",
+                        "--snapshot-only",
+                    ]
+                ),
+                0,
+            )
+
+        self.assertTrue(builder.call_args.kwargs["stop_on_connect"])
+        live.close.assert_called_once_with()
+
+    def test_target_description_accepts_qemus_dtd_declared_xinclude_prefix(self):
+        client = FakeClient()
+        client.xml["target.xml"] = (
+            b'<?xml version="1.0"?><!DOCTYPE target SYSTEM "gdb-target.dtd">'
+            b'<target><architecture>i386:x86-64</architecture>'
+            b'<xi:include href="core.xml"/></target>'
+        )
+
+        descriptions = load_target_descriptions(client)
+
+        self.assertEqual(set(descriptions), {b"target.xml", b"core.xml"})
+        self.assertIn(b"xi:include", descriptions[b"target.xml"])
+
+    def test_target_description_does_not_normalize_other_unbound_prefixes(self):
+        client = FakeClient()
+        client.xml["target.xml"] = b'<target><bad:include href="core.xml"/></target>'
+
+        with self.assertRaisesRegex(RspRemoteError, "malformed target description"):
+            load_target_descriptions(client)
+
     def test_recursive_descriptions_are_preserved_for_upstream_gdb(self):
         client = FakeClient()
         descriptions = load_target_descriptions(client)
@@ -401,6 +518,46 @@ class LiveFacadeTests(unittest.TestCase):
             b"T05thread:p2a.2a;",
         )
         self.assertEqual(client.resumes, 0)
+
+    def test_internal_event_stop_supplies_signal_and_registers_without_refresh(self):
+        client = FakeClient()
+        runner = FrozenRunner()
+        oracle = CurrentCpuProbeOracle(ProbeOracle(runner), client, ("1", "2"))
+        target = FakePcTarget(0x80300000)
+        facade = RspFacade(oracle, client, client.xml["target.xml"])
+        original_snapshot = facade.snapshot
+        event_registers = RegisterRead(b"11223344xxxxxxxx")
+        calls = []
+
+        def internal(cpu, pc):
+            calls.append((cpu, pc))
+            return SimpleNamespace(
+                identity=TaskId(42, 42),
+                gdb_signal=11,
+                registers=event_registers,
+                task_snapshot=lambda previous: previous,
+            )
+
+        resolution = qemu_cpu_stop_resolver(
+            client, target, ("1", "2"), internal_stop=internal
+        )(b"T05thread:2;", facade)
+        self.assertEqual(calls, [(1, 0x80300000)])
+        self.assertEqual(facade.snapshot.generation, original_snapshot.generation)
+        self.assertEqual(facade.snapshot.tasks, original_snapshot.tasks)
+        self.assertEqual(resolution.identity, TaskId(42, 42))
+        self.assertEqual(resolution.signal, 11)
+        self.assertIs(resolution.registers, event_registers)
+        self.assertEqual(
+            facade.on_stop(
+                resolution.identity,
+                resolution.signal,
+                resolution.address,
+                resolution.registers,
+                refresh=False,
+            ),
+            b"T0bthread:p2a.2a;",
+        )
+        self.assertEqual(facade.handle(b"g"), event_registers.payload)
 
     def test_same_va_unowned_process_hit_is_auto_resumed(self):
         client = FakeClient()

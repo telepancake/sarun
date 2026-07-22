@@ -18,7 +18,9 @@ SAVED_REGS_V1_SIZE = 304
 ENDIAN_LITTLE = 1
 ENDIAN_BIG = 2
 ARCH_AARCH64 = 1
+ARCH_ARM = 2
 ARCH_MIPS = 3
+ARCH_X86 = 4
 OP_SNAPSHOT = 1
 OP_TRANSLATE_VA = 2
 OP_SAVED_REGS = 3
@@ -115,8 +117,10 @@ class SnapshotAbi:
 
 
 AARCH64_SNAPSHOT_ABI = SnapshotAbi("aarch64", ARCH_AARCH64, "<", 64)
+ARMV7LE_SNAPSHOT_ABI = SnapshotAbi("armv7", ARCH_ARM, "<", 32)
 MIPS32EL_SNAPSHOT_ABI = SnapshotAbi("mips32el", ARCH_MIPS, "<", 32)
 MIPS32BE_SNAPSHOT_ABI = SnapshotAbi("mips32be", ARCH_MIPS, ">", 32)
+X86_64_SNAPSHOT_ABI = SnapshotAbi("x86_64", ARCH_X86, "<", 64)
 
 
 @dataclass(frozen=True)

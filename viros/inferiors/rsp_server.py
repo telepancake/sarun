@@ -7,16 +7,35 @@ import re
 import select
 import socket
 import stat
+from dataclasses import dataclass
 from typing import Callable, Protocol
 
-from .linux_oracle import TaskId
+from .event_stop import KernelEventStop
+from .internal_breakpoints import InternalBreakpointController
+from .linux_oracle import RegisterRead, TaskId
 from .qemu_rsp import QemuRspClient
 from .rsp_codec import Interrupt, Packet
 from .rsp_proxy import FacadeState, RspFacade
-from .rsp_transport import RspDisconnected, RspStream
+from .rsp_transport import DuplexByteStream, RspDisconnected, RspStream
 
 
-StopResolver = Callable[[bytes, RspFacade], tuple[TaskId, int, int | None]]
+@dataclass(frozen=True)
+class StopResolution:
+    identity: TaskId
+    signal: int
+    address: int | None = None
+    registers: RegisterRead | None = None
+
+    def __iter__(self):
+        # Preserve the original three-value resolver boundary for callers
+        # which only need ordinary breakpoint attribution.
+        yield self.identity
+        yield self.signal
+        yield self.address
+
+
+StopResolver = Callable[[bytes, RspFacade], StopResolution]
+InternalStopResolver = Callable[[int, int], KernelEventStop | None]
 
 
 class StoppedCpuRegisterTarget(Protocol):
@@ -27,9 +46,10 @@ class StoppedCpuRegisterTarget(Protocol):
 _STOP_THREAD = re.compile(rb"thread:([^;]+);")
 
 
-def selected_task_stop(packet: bytes, facade: RspFacade) -> tuple[TaskId, int, None]:
+def selected_task_stop(packet: bytes, facade: RspFacade) -> StopResolution:
     """MVP stop resolver used until the live Linux oracle attributes a vCPU."""
 
+    facade.refresh()
     identity = facade.continue_thread or facade.stop_thread or facade.general_thread
     if identity is None:
         raise RuntimeError("cannot attribute a stop without a selected Linux task")
@@ -39,13 +59,14 @@ def selected_task_stop(packet: bytes, facade: RspFacade) -> tuple[TaskId, int, N
             signal = int(packet[1:3], 16)
         except ValueError:
             pass
-    return identity, signal, None
+    return StopResolution(identity, signal)
 
 
 def qemu_cpu_stop_resolver(
     qemu: QemuRspClient,
     target: StoppedCpuRegisterTarget,
     cpu_threads: tuple[str, ...],
+    internal_stop: InternalStopResolver | None = None,
 ) -> StopResolver:
     """Resolve a QEMU vCPU stop to the task reported current by the probe.
 
@@ -59,7 +80,7 @@ def qemu_cpu_stop_resolver(
 
     by_thread = {thread: cpu for cpu, thread in enumerate(cpu_threads)}
 
-    def resolve(packet: bytes, facade: RspFacade) -> tuple[TaskId, int, int | None]:
+    def resolve(packet: bytes, facade: RspFacade) -> StopResolution:
         match = _STOP_THREAD.search(packet)
         if match:
             try:
@@ -72,13 +93,6 @@ def qemu_cpu_stop_resolver(
             cpu = by_thread[thread]
         except KeyError as exc:
             raise RuntimeError(f"QEMU stopped on unknown vCPU thread {thread!r}") from exc
-        candidates = [
-            task for task in facade.snapshot.tasks if task.current_cpu == cpu
-        ]
-        if len(candidates) != 1:
-            raise RuntimeError(
-                f"probe reported {len(candidates)} current tasks on stopped CPU {cpu}"
-            )
         signal = 5
         parsed_signal = False
         if len(packet) >= 3 and packet[:1] in (b"S", b"T"):
@@ -95,6 +109,26 @@ def qemu_cpu_stop_resolver(
         ) is not None
         if parsed_signal and signal == 5 and not watch_stop:
             pc = target.read_register(cpu, "pc")
+            if internal_stop is not None:
+                event = internal_stop(cpu, pc)
+                if event is not None:
+                    facade.merge_event_task(
+                        event.task_snapshot(facade.snapshot.task(event.identity))
+                    )
+                    return StopResolution(
+                        event.identity,
+                        event.gdb_signal,
+                        registers=event.registers,
+                    )
+        facade.refresh()
+        candidates = [
+            task for task in facade.snapshot.tasks if task.current_cpu == cpu
+        ]
+        if len(candidates) != 1:
+            raise RuntimeError(
+                f"probe reported {len(candidates)} current tasks on stopped CPU {cpu}"
+            )
+        if parsed_signal and signal == 5 and not watch_stop:
             # A plain SIGTRAP is also used for single-step.  Only opt into
             # process-breakpoint filtering when this PC is a breakpoint owned
             # by at least one process in the frozen post-stop snapshot.
@@ -103,7 +137,7 @@ def qemu_cpu_stop_resolver(
                 for task in facade.snapshot.tasks
             ):
                 address = pc
-        return candidates[0].identity, signal, address
+        return StopResolution(candidates[0].identity, signal, address)
 
     return resolve
 
@@ -111,15 +145,17 @@ def qemu_cpu_stop_resolver(
 class UnixRspServer:
     def __init__(
         self,
-        path: str,
+        path: str | None,
         facade: RspFacade,
         qemu: QemuRspClient,
         stop_resolver: StopResolver = selected_task_stop,
+        internal_breakpoints: InternalBreakpointController | None = None,
     ) -> None:
-        self.path = os.path.abspath(path)
+        self.path = os.path.abspath(path) if path is not None else None
         self.facade = facade
         self.qemu = qemu
         self.stop_resolver = stop_resolver
+        self.internal_breakpoints = internal_breakpoints
 
     def _handle_upstream(self, upstream: RspStream) -> bool:
         event = upstream.receive_event()
@@ -142,16 +178,46 @@ class UnixRspServer:
         if packet.startswith(b"O"):
             upstream.send_packet(packet)
             return
-        # Re-run the read-only probe after execution stopped, before mapping
-        # QEMU's vCPU identity to a Linux task.  on_stop() then consumes this
-        # exact frozen snapshot rather than probing a second time.
-        self.facade.refresh()
-        identity, signal, address = self.stop_resolver(packet, self.facade)
-        response = self.facade.on_stop(identity, signal, address, refresh=False)
+        if self.internal_breakpoints is not None:
+            match = _STOP_THREAD.search(packet)
+            if match:
+                try:
+                    raw_thread = match.group(1).decode("ascii")
+                except UnicodeDecodeError as exc:
+                    raise RuntimeError(
+                        "QEMU stop has a non-ASCII thread ID"
+                    ) from exc
+            else:
+                raw_thread = self.qemu.current_thread()
+            raw_signal = 5
+            if len(packet) >= 3 and packet[:1] in (b"S", b"T"):
+                try:
+                    raw_signal = int(packet[1:3], 16)
+                except ValueError:
+                    pass
+            watchpoint = re.search(
+                rb"(?:^|;)(?:watch|rwatch|awatch):", packet[3:]
+            ) is not None
+            if self.internal_breakpoints.finish_step(
+                raw_thread, raw_signal, watchpoint=watchpoint
+            ):
+                return
+        # Ordinary stops refresh inside the resolver before CPU attribution.
+        # Exact-kernel event records instead carry their own task identity and
+        # saved frame, avoiding nested task enumeration at a constrained
+        # signal-delivery boundary.
+        resolution = self.stop_resolver(packet, self.facade)
+        response = self.facade.on_stop(
+            resolution.identity,
+            resolution.signal,
+            resolution.address,
+            resolution.registers,
+            refresh=False,
+        )
         if response is not None:
             upstream.send_packet(response)
 
-    def serve_connection(self, sock: socket.socket) -> None:
+    def serve_connection(self, sock: DuplexByteStream) -> None:
         upstream = RspStream(sock)
         try:
             while True:
@@ -171,6 +237,8 @@ class UnixRspServer:
             upstream.close()
 
     def _listener(self) -> socket.socket:
+        if self.path is None:
+            raise RuntimeError("this RSP server has no filesystem listener")
         try:
             mode = os.stat(self.path).st_mode
         except FileNotFoundError:
@@ -189,6 +257,8 @@ class UnixRspServer:
             raise
 
     def serve_once(self) -> None:
+        if self.path is None:
+            raise RuntimeError("this RSP server has no filesystem listener")
         listener = self._listener()
         try:
             connection, _ = listener.accept()

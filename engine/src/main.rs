@@ -14,8 +14,8 @@
 // benchmark harness, kept for the serving-loop scaling measurement it exists
 // for (bench/FINDINGS.md "parallel builds"), not the product entry point.
 
-use std::path::PathBuf;
 use std::os::fd::AsRawFd;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::time::Duration;
 
@@ -31,6 +31,7 @@ mod capture;
 mod containers_conf;
 mod control;
 mod depot;
+mod direct_fs;
 mod discover;
 mod exec_wrappers;
 mod find_builtin;
@@ -42,6 +43,8 @@ mod action_help;
 mod appliance;
 mod attach;
 mod browser;
+mod debug_resources;
+mod debug_session;
 #[allow(dead_code)]
 mod dockerfile;
 mod editor;
@@ -51,6 +54,7 @@ mod fuse_transport;
 #[allow(dead_code)]
 mod generated_wire;
 mod hostfs;
+mod image_provenance;
 mod jobserver;
 mod katirun;
 mod mirrors;
@@ -98,7 +102,9 @@ extern "C" fn on_term(_sig: i32) {
     TERMINATING.store(true, Ordering::Relaxed);
     let listener = LISTENER_FOR_SIGNAL.load(Ordering::Relaxed);
     if listener >= 0 {
-        unsafe { libc::shutdown(listener, libc::SHUT_RDWR); }
+        unsafe {
+            libc::shutdown(listener, libc::SHUT_RDWR);
+        }
     }
 }
 
@@ -125,7 +131,10 @@ fn top_level_help() -> Result<String, String> {
        sarun --once --sock PATH           render one UI frame and exit (headless)\n\
      \n\
      run FLAGS:\n  \
-       --fuse | --sud | --qemu aarch64|x86_64   execution backend (default: fuse)\n  \
+       --fuse | --sud | --qemu aarch64|x86_64|arm|mmips   execution backend (default: fuse)\n  \
+       --image BOX PATH           boot one selected captured firmware image\n  \
+       --kernel BOX PATH --initramfs BOX PATH\n  \
+                                  boot an exact captured kernel/initramfs pair\n  \
        -n / -N / --net off|tap|host   per-box networking (default: tap, a proxied per-box netns)\n  \
        -t passthrough   -d direct (no overlay)   -e record-env   -b brush-shell   -p pty\n  \
        -C DIR   --no-parent   --readonly-parent   --api (oaita proxy)   --vars (variable provenance)\n"
@@ -356,15 +365,17 @@ fn serve() -> i32 {
                     let event = u64::try_from(sid).ok().and_then(|r#box| {
                         let count = u32::try_from(count).ok()?;
                         if kind == "process_added" {
-                            Some(generated_wire::SubscriptionEvent::ProcessAdded {
-                                r#box, count,
-                            })
+                            Some(generated_wire::SubscriptionEvent::ProcessAdded { r#box, count })
                         } else {
-                            let latest_path = if rel.is_empty() { None } else {
+                            let latest_path = if rel.is_empty() {
+                                None
+                            } else {
                                 Some(wire::BoundedBytes::new(rel.as_bytes().to_vec()).ok()?)
                             };
                             Some(generated_wire::SubscriptionEvent::OverlayChanged {
-                                r#box, count, latest_path,
+                                r#box,
+                                count,
+                                latest_path,
                             })
                         }
                     });
@@ -626,18 +637,16 @@ fn main() {
         None => std::process::exit(ui_launch(&argv)),
         Some("attach") => std::process::exit(ui_launch(&argv[1..])),
         Some("--once") | Some("--sock") => std::process::exit(ui_launch(&argv)),
-        Some("-h") | Some("--help") => {
-            match top_level_help() {
-                Ok(help) => {
-                    print!("{help}");
-                    std::process::exit(0);
-                }
-                Err(error) => {
-                    eprintln!("sarun: action relation: {error}");
-                    std::process::exit(1);
-                }
+        Some("-h") | Some("--help") => match top_level_help() {
+            Ok(help) => {
+                print!("{help}");
+                std::process::exit(0);
             }
-        }
+            Err(error) => {
+                eprintln!("sarun: action relation: {error}");
+                std::process::exit(1);
+            }
+        },
         // `engine` is the headless-serve alias Python uses; `serve` still works.
         Some("engine") | Some("serve") => std::process::exit(serve()),
         // ruletest <rulesfile> <rel> <box> <exe> <cwd> [argv...] — test hook for
@@ -684,7 +693,7 @@ fn main() {
             //   --readonly-parent   `apply` refuses to promote into the parent
             let rest = &argv[1..];
             let sep = rest.iter().position(|a| a == "--");
-            let (pre, cmd) = match sep {
+            let (pre, mut cmd) = match sep {
                 Some(i) => (&rest[..i], rest[i + 1..].to_vec()),
                 None => (rest, vec![]),
             };
@@ -698,6 +707,10 @@ fn main() {
             let mut api = false;
             let mut sud = false;
             let mut qemu: Option<generated_wire::QemuArchitecture> = None;
+            let mut debug_mode = generated_wire::DebugMode::Off;
+            let mut selected_image: Option<(String, String)> = None;
+            let mut selected_kernel: Option<(String, String)> = None;
+            let mut selected_initramfs: Option<(String, String)> = None;
             let mut chdir: Option<String> = None;
             let mut name: Option<String> = None;
             // Box networking defaults to Tap (proxied): the box gets a per-box
@@ -777,15 +790,72 @@ fn main() {
                         qemu = match it.next().map(String::as_str) {
                             Some("aarch64") => Some(generated_wire::QemuArchitecture::Aarch64),
                             Some("x86_64") => Some(generated_wire::QemuArchitecture::X8664),
+                            Some("arm") => Some(generated_wire::QemuArchitecture::Arm),
+                            Some("mmips") => Some(generated_wire::QemuArchitecture::Mmips),
                             Some(value) => {
-                                eprintln!("sarun: --qemu wants aarch64|x86_64, got '{value}'");
+                                eprintln!(
+                                    "sarun: --qemu wants aarch64|x86_64|arm|mmips, got '{value}'"
+                                );
                                 std::process::exit(2);
                             }
                             None => {
-                                eprintln!("sarun: --qemu needs an architecture (aarch64|x86_64)");
+                                eprintln!(
+                                    "sarun: --qemu needs an architecture (aarch64|x86_64|arm|mmips)"
+                                );
                                 std::process::exit(2);
                             }
                         };
+                    }
+                    "--debug" => {
+                        debug_mode = generated_wire::DebugMode::AttachBeforeCommand;
+                    }
+                    "--image" => {
+                        let Some(r#box) = it.next().cloned() else {
+                            eprintln!("sarun: --image needs a captured box and relative file path");
+                            std::process::exit(2);
+                        };
+                        let Some(path) = it.next().cloned() else {
+                            eprintln!("sarun: --image needs a relative file path after the box");
+                            std::process::exit(2);
+                        };
+                        if selected_image.replace((r#box, path)).is_some() {
+                            eprintln!("sarun: --image may be specified only once");
+                            std::process::exit(2);
+                        }
+                    }
+                    "--kernel" => {
+                        let Some(r#box) = it.next().cloned() else {
+                            eprintln!(
+                                "sarun: --kernel needs a captured box and relative file path"
+                            );
+                            std::process::exit(2);
+                        };
+                        let Some(path) = it.next().cloned() else {
+                            eprintln!("sarun: --kernel needs a relative file path after the box");
+                            std::process::exit(2);
+                        };
+                        if selected_kernel.replace((r#box, path)).is_some() {
+                            eprintln!("sarun: --kernel may be specified only once");
+                            std::process::exit(2);
+                        }
+                    }
+                    "--initramfs" => {
+                        let Some(r#box) = it.next().cloned() else {
+                            eprintln!(
+                                "sarun: --initramfs needs a captured box and relative file path"
+                            );
+                            std::process::exit(2);
+                        };
+                        let Some(path) = it.next().cloned() else {
+                            eprintln!(
+                                "sarun: --initramfs needs a relative file path after the box"
+                            );
+                            std::process::exit(2);
+                        };
+                        if selected_initramfs.replace((r#box, path)).is_some() {
+                            eprintln!("sarun: --initramfs may be specified only once");
+                            std::process::exit(2);
+                        }
                     }
                     // --webcap  OPT-IN web capture (DESIGN-web.md W2): tee
                     //           every HTTP(S) request/response this tap box
@@ -842,17 +912,44 @@ fn main() {
                     }
                 }
             }
+            if selected_image.is_some()
+                && (selected_kernel.is_some() || selected_initramfs.is_some())
+            {
+                eprintln!("sarun: --image cannot be combined with --kernel/--initramfs");
+                std::process::exit(2);
+            }
+            if selected_kernel.is_some() != selected_initramfs.is_some() {
+                eprintln!("sarun: --kernel and --initramfs must be specified together");
+                std::process::exit(2);
+            }
+            let selected_boot = match (selected_image, selected_kernel, selected_initramfs) {
+                (Some(image), None, None) => Some(runner::SelectedBootInput::Image { image }),
+                (None, Some(kernel), Some(initramfs)) => {
+                    Some(runner::SelectedBootInput::KernelInitramfs { kernel, initramfs })
+                }
+                (None, None, None) => None,
+                _ => unreachable!("selected boot combinations were validated"),
+            };
+            if selected_boot.is_some() && cmd.is_empty() {
+                cmd.push("/init".into());
+            }
             if cmd.is_empty() && !api {
                 eprintln!(
                     "usage: sarun run [FLAGS] [NAME] -- CMD...   (needs a running engine/UI)\n\
                     \x20 flags: -n/-N/--net off|tap|host  -t passthrough  -d direct  -e record-env\n\
-                    \x20        --fuse | --sud | --qemu aarch64|x86_64\n\
+                    \x20        --fuse | --sud | --qemu aarch64|x86_64|arm|mmips [--debug]\n\
+                    \x20        --image BOX PATH | --kernel BOX PATH --initramfs BOX PATH\n\
+                    \x20        (selected boot forms require --qemu ARCH --debug)\n\
                     \x20        -b brush-shell  -p pty  -C DIR  --no-parent  --readonly-parent  --api\n\
                     \x20        --vars record variable assignments (Vars view)"
                 );
                 std::process::exit(2);
             }
             if sud {
+                if debug_mode != generated_wire::DebugMode::Off {
+                    eprintln!("sarun: --debug requires --qemu");
+                    std::process::exit(2);
+                }
                 if passthrough || direct || pty || api {
                     eprintln!(
                         "sarun: --sud is incompatible with \
@@ -864,10 +961,29 @@ fn main() {
                 std::process::exit(runner::run_sud(name, env, chdir, net_mode, brush, cmd));
             }
             if let Some(architecture) = qemu {
-                if passthrough || direct || pty || api {
+                if selected_boot.is_some()
+                    && debug_mode != generated_wire::DebugMode::AttachBeforeCommand
+                {
+                    eprintln!("sarun: selected boot artifacts require --qemu ARCH --debug");
+                    std::process::exit(2);
+                }
+                if matches!(
+                    architecture,
+                    generated_wire::QemuArchitecture::Arm | generated_wire::QemuArchitecture::Mmips
+                ) && debug_mode == generated_wire::DebugMode::Off
+                {
                     eprintln!(
-                        "sarun: --qemu is currently incompatible with -t/-d/-p/--api"
+                        "sarun: --qemu {} requires --debug",
+                        match architecture {
+                            generated_wire::QemuArchitecture::Arm => "arm",
+                            generated_wire::QemuArchitecture::Mmips => "mmips",
+                            _ => unreachable!(),
+                        }
                     );
+                    std::process::exit(2);
+                }
+                if passthrough || direct || pty || api {
+                    eprintln!("sarun: --qemu is currently incompatible with -t/-d/-p/--api");
                     std::process::exit(2);
                 }
                 std::process::exit(runner::run_qemu(
@@ -879,8 +995,18 @@ fn main() {
                     chdir,
                     net_mode,
                     brush,
+                    debug_mode,
+                    selected_boot,
                     cmd,
                 ));
+            }
+            if selected_boot.is_some() {
+                eprintln!("sarun: selected boot artifacts require --qemu ARCH --debug");
+                std::process::exit(2);
+            }
+            if debug_mode != generated_wire::DebugMode::Off {
+                eprintln!("sarun: --debug requires --qemu");
+                std::process::exit(2);
             }
             std::process::exit(runner::run(
                 name,
@@ -896,6 +1022,32 @@ fn main() {
                 net_mode,
                 cmd,
             ));
+        }
+        Some("service") => {
+            if argv.get(1).map(String::as_str) == Some("declare") {
+                let [_, _, name, provider, client] = argv.as_slice() else {
+                    eprintln!("usage: sarun service declare NAME PROVIDER CLIENT");
+                    std::process::exit(2);
+                };
+                std::process::exit(runner::service_declare(name, provider, client));
+            }
+            let mode = match argv.get(1).map(String::as_str) {
+                Some("accept") => runner::ServiceRelayMode::Accept,
+                Some("dial") => runner::ServiceRelayMode::Dial,
+                _ => {
+                    eprintln!(
+                        "usage: sarun service accept|dial NAME\n       sarun service declare NAME PROVIDER CLIENT"
+                    );
+                    std::process::exit(2);
+                }
+            };
+            let Some(name) = argv.get(2).filter(|_| argv.len() == 3) else {
+                eprintln!(
+                    "usage: sarun service accept|dial NAME\n       sarun service declare NAME PROVIDER CLIENT"
+                );
+                std::process::exit(2);
+            };
+            std::process::exit(runner::service_relay(mode, name));
         }
         Some("verbs") => {
             // Help is a local representation projection. It does not involve

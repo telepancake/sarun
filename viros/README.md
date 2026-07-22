@@ -272,18 +272,295 @@ There is also an experimental successor to `gdb_user.py` under
 multiprocess GDB remote facade backed by a small probe compiled through the
 exact guest kernel's configured Kbuild tree. Unlike `viros-user-*`, that
 facade presents the probe's frozen Linux task snapshot as actual GDB
-inferiors. The code path is connected end to end for a locally built AArch64
-OpenWrt kernel and for the matching published MMIPS kernel built by viros; it
-is not a claim that the downloaded OpenWrt release kernel was probed live.
+inferiors. The complete live task path has been exercised with viros' matching
+MMIPS and x86 kernel builds. The external AArch64/OpenWrt path is implemented,
+but this is not a claim that the downloaded OpenWrt release kernel was probed
+with an exact separately configured Kbuild tree.
 
-Two independent pieces have been exercised so far:
+#### Integrating a locally built kernel
+
+The reusable integration supports x86-64, little-endian ARMv7 in ARM state,
+AArch64, and little-endian MIPS32r2/o32 (`mmips`). It requires all of the
+following from one kernel build:
+
+- the configured source tree and generated Kbuild output which produced the
+  guest kernel;
+- its matching cross compiler and binutils;
+- the unstripped `vmlinux`, with full debug information and one GNU build ID;
+- the bootable `bzImage`, `zImage`, `Image`, or ELF produced by that same
+  build; and
+- a QEMU machine which can boot that image and expose its CPUs and memory
+  through the GDB remote protocol.
+
+Do not combine an official boot image with a conveniently similar `vmlinux`,
+or a debug archive's `vmlinux` with a separately configured source tree. The
+probe object, package, scratch map, Linux Python helpers, and running boot
+image must describe the same build. The package tools bind these artifacts by
+SHA-256 and GNU build ID, but the runtime does not independently recover the
+build ID from guest memory.
+
+Install the reserved workspace and event observer before configuring and
+building the kernel. The helper is idempotent, so it is safe to run again when
+updating an existing build tree. Pass the configuration which will actually be
+used for the build when one already exists (including an out-of-tree
+configuration):
+
+```sh
+./viros.sh kernel-support /path/to/linux /path/to/output/.config
+```
+
+This modifies a prepared source tree; it does not rewrite an already-built
+compressed kernel image. Rebuild `vmlinux` and its boot image afterward. A
+post-build binary edit cannot safely add the reserved executable/data pages,
+the event observer, matching DWARF, and the kernel's page-permission setup.
+
+Omit the final argument if the kernel has not been configured yet. In that
+case, enable `CONFIG_TRACEPOINTS=y`, `CONFIG_DEBUG_INFO=y`, and
+`CONFIG_GDB_SCRIPTS=y` in the configuration before building. The command
+copies the versioned support sources into `kernel/viros`, adds that directory
+to `kernel/Makefile`, and adds this guarded link anchor to the top-level
+Makefile:
+
+```make
+ifeq ($(VIROS_SCRATCH),1)
+KBUILD_LDFLAGS += --undefined=__viros_scratch_code_start
+KBUILD_LDFLAGS += --undefined=__viros_scratch_data_start
+KBUILD_LDFLAGS += --undefined=__viros_scratch_stack_start
+endif
+```
+
+When given a configuration, `kernel-support` enables those three options and
+disables reduced and split debug information using the kernel's own
+`scripts/config`. Preserve the kernel's normal architecture, ABI, page-size,
+endianness, and machine configuration. Pass both integration variables on
+every make invocation which can relink `vmlinux` or the boot image:
+
+```sh
+make -C linux O="$KERNEL_OUTPUT" ARCH="$ARCH" \
+  CROSS_COMPILE="$CROSS_COMPILE" \
+  VIROS_SCRATCH=1 VIROS_EVENTS=1 olddefconfig
+make -C linux O="$KERNEL_OUTPUT" ARCH="$ARCH" \
+  CROSS_COMPILE="$CROSS_COMPILE" \
+  VIROS_SCRATCH=1 VIROS_EVENTS=1 -j"$JOBS" \
+  vmlinux scripts_gdb "$BOOT_TARGET"
+```
+
+Use `ARCH=x86_64`, `arm`, `arm64`, or `mips` as appropriate;
+`BOOT_TARGET` is normally `bzImage`, `zImage`, or `Image`, and may be omitted
+when QEMU directly boots the linked ELF. Confirm that the result contains the
+six `__viros_scratch_*` boundary symbols and `viros_event_stop`. The boot image
+passed to QEMU must come from this output directory. An initramfs or disk may
+come from the firmware build being examined, provided it is compatible with
+that exact kernel.
+
+Package that exact output for another runner with `kernel-bundle`. The
+unstripped symbol file defaults to `KBUILD_OUTPUT/vmlinux`. The boot image
+defaults to `arch/x86/boot/bzImage`, `arch/arm/boot/zImage`,
+`arch/arm64/boot/Image`, or `vmlinux` for the fixed MMIPS Malta profile.
+
+Compiler, final linker, objcopy, and make default only when the exact Kbuild
+`.cmd` records contain one unambiguous executable. A bare recorded program is
+resolved through the captured build box's `PATH`; ViroS never invents an SDK
+directory. GNU compiler/linker/objcopy names can also establish the exact
+`CROSS_COMPILE` prefix. Kbuild commonly does not retain the top-level make
+executable, so `--make` is normally the one required tool argument. If any
+identity is absent, unavailable, or ambiguous, publication stops and names the
+specific explicit option needed.
+
+For example, when GNU tools are fully recorded, MMIPS publication is normally:
+
+```sh
+./viros.sh kernel-bundle \
+  --arch mmips \
+  --kbuild-output /path/to/output \
+  --output-dir artifacts/my-kernel.bundle \
+  --make /path/to/sdk/bin/make
+```
+
+Repeat the same Kbuild assignments used for the kernel itself. LLVM tool names
+do not encode `CROSS_COMPILE`, so an LLVM 21 AArch64 build can be packaged with:
+
+```sh
+./viros.sh kernel-bundle \
+  --arch aarch64 \
+  --kbuild-output /path/to/output \
+  --output-dir artifacts/my-kernel.bundle \
+  --cross-compile aarch64-openwrt-linux-musl- \
+  --make /path/to/sdk/bin/make \
+  --make-arg LLVM=-21 --make-arg LLVM_IAS=1 \
+  --code-gpa 0x... --data-gpa 0x... --stack-gpa 0x...
+```
+
+If that Kbuild output did not retain one of the LLVM executable identities,
+add the corresponding `--compiler`, `--cross-ld`, or `--objcopy` option shown
+by the error.
+
+For a GNU build whose command records are incomplete, pass its exact
+`...-gcc`, `...-ld`, `...-objcopy`, and `CROSS_COMPILE` prefix. An explicitly
+empty `CROSS_COMPILE` is written as `--cross-compile ''`. The bundler appends
+the resolved compiler as an absolute `CC=...` assignment for the helper build,
+so a same-named host compiler cannot take its place. X86-64, ARMv7, and
+AArch64 require the three physical addresses from the Sarun/QEMU machine that
+will run the kernel. MMIPS derives its mappings from KSEG0 and rejects those
+three options. `--runtime-offset` applies one measured KASLR offset to both the
+reserved regions and `init_task`; leave it at zero for a non-relocated kernel.
+
+The resulting directory contains the boot image, unstripped `vmlinux`, exact
+configuration, Linux GDB Python helpers, scratch description, built and linked
+probe, call-gate manifest, and build logs. `bundle.json` records the kernel
+build ID, every bundled file's SHA-256 and size, the original input paths, the
+exact cross prefix and Kbuild assignments, and the resolved path, SHA-256, and
+version of every selected tool. The call-gate uses relative paths, so the whole
+directory can be copied to another system without rewriting it.
+
+When Sarun produces this bundle, run the helper build in a network-disabled,
+read-only child of the recorded kernel-build box. Reuse the captured build cwd,
+environment, Kbuild output, cross prefix, assignments, and tool hashes. A
+userspace-only SDK that merely targets the same architecture cannot establish
+that the external helper matches the configured kernel build.
+
+### Install the managed Sarun debugger provider
+
+After `download` and `build`, publish the debugger implementation as one named
+Sarun box:
+
+```sh
+./viros.sh sarun-install
+```
+
+This records the `VIROS-DEBUG` box as the sole provider of the `viros-debug`
+service, with fixed provider and GDB-client entry points. It copies the managed
+GDB and Python runtime into that box and does not record paths to the checkout.
+There are no provider, GDB, Python, session-name, symbol, or source-path options
+on the runtime command.
+
+The provider box needs to be republished after rebuilding GDB or updating the
+viros Python modules. GDB uses a provider-relative Python-library runpath, so a
+captured provider remains usable when the Sarun store is moved to another host
+of the same architecture.
+
+### Publish a complete image from the build box
+
+Run `image-bundle` in the same named Sarun box that built the root filesystem,
+kernel bundle, and unstripped userspace programs. It emits one deterministic
+initramfs and one `viros-image-bundle-v1` manifest. For example:
+
+```sh
+./viros.sh image-bundle \
+  --arch aarch64 \
+  --rootfs bin/targets/armsr/armv8/rootfs \
+  --kernel-bundle artifacts/openwrt-kernel.bundle \
+  --output-dir artifacts/openwrt-debug.image
+```
+
+By default, the publisher examines every regular executable ELF in the rootfs
+and finds its unstripped counterpart by architecture and GNU build ID. It
+searches a bounded, deterministic set consisting of the captured current build
+tree and the rootfs, output, and kernel-bundle parents; the rootfs, output, and
+kernel bundle themselves are excluded. Programs without a matching DWARF ELF
+are simply left uncataloged. Multiple byte-distinct DWARF ELFs claiming one
+needed build ID are rejected instead of choosing by pathname.
+
+`--executable GUEST=ELF` remains available for an exceptional exact
+association. Explicit and discovered associations are combined, with an
+explicit guest path considered once. The runtime file is read from `--rootfs`;
+the second file must be its matching unstripped ELF with DWARF. Publication
+refuses a build-ID mismatch, wrong ELF architecture, absent DWARF line
+information, duplicate explicit guest path, or ambiguous build ID. It copies
+the debugger ELF under its build ID, hashes every published artifact, embeds
+the exact kernel bundle, and generates the initramfs itself instead of
+depending on a host `cpio`.
+
+Run `image-bundle` inside the same captured build box that produced those ELF
+files. The provider receives that box as an attachment, which is what makes the
+absolute compilation directories recorded in DWARF resolve to the captured
+source files automatically; publishing elsewhere cannot reconstruct that
+source identity.
+
+These arguments are paths inside the build box, not runtime resource-selection
+options. After capture, Sarun finds `image.json` and its nested `bundle.json`
+through the selected box's normal parent/attachment chain. The image declares
+one versioned boot profile; it cannot inject arbitrary QEMU arguments. The
+`viros-debug` provider receives the build box as a read-only attachment, so the
+DWARF compilation paths resolve against the immutable captured source tree at
+the same paths used by the compiler.
+
+With the Sarun TUI running, select the exact captured boot payload. A combined
+firmware file uses `--image`; a direct Linux boot selects both QEMU inputs:
+
+```sh
+sarun run --net off --qemu aarch64 --debug \
+  --kernel OPENWRT-BUILD bin/targets/.../Image \
+  --initramfs OPENWRT-BUILD bin/targets/.../rootfs.cpio.gz
+```
+
+The box selectors and captured relative paths identify only the boot payload;
+there is no host path, symbol path, sysroot path, source-map, debugger, or raw
+QEMU option. Sarun rejects a partial pair or a pair combined with `--image`,
+revalidates both immutable identities before launch, and passes the exact bytes
+to QEMU as sealed descriptors. Sarun opens the managed GDB terminal
+automatically after the debug facade is ready. Kernel symbols are already
+loaded; each cataloged userspace process appears as a GDB inferior and receives
+its exact build-ID-checked debug ELF when it is first observed. Missing,
+changed, mismatched, or ambiguous debugger resources are an error.
+
+After the build, `probe/scratch/scratch_tool.py` records the reserved regions
+from `vmlinux`; `probe/probe_tool.py build` compiles the transient snapshot
+code through the same configured Kbuild output. Package it at the recorded
+code address, then create the call-gate manifest as shown below. For KASLR,
+pass the measured runtime relocation to `scratch_tool.py`; otherwise disable
+KASLR or use the default zero offset. AArch64, ARMv7, and x86-64 also require
+the three current guest physical mappings obtained from the stopped VM.
+MMIPS mappings must remain in KSEG0 and are derived from their virtual
+addresses.
+
+The two kernel-side pieces have deliberately different lifetimes:
+
+- `viros_scratch.S` only reserves code, data, and stack pages. During a frozen
+  transaction the host saves those pages and CPU registers, places the
+  audited snapshot executable in the code page, runs it to its completion
+  boundary, reads the result, and restores every byte and register. The
+  executable has no module entry point, kernel thread, exported API, or
+  normal boot-time path.
+- `viros_event.c` is a persistent built-in observer initialized by a
+  `core_initcall`. It keeps one preallocated record per CPU and observes the
+  signal-delivery and kernel-die boundaries without allocation or logging.
+  A facade-owned breakpoint at `viros_event_stop` turns a supported event
+  into a GDB stop with the saved userspace register frame.
+
+The external three-argument launcher currently provided by the shell script
+is the AArch64 form:
+
+```sh
+./viros.sh inferiors openwrt-arm64 CALLGATE.json BOOTABLE_KERNEL
+```
+
+The x86, ARMv7, AArch64, and MMIPS RouterOS targets use the same components
+through their project-managed `kernel-debug`/`inferiors` path. A different
+external board or QEMU machine needs an equivalent launcher supplying its
+machine arguments, console, initramfs or disk, and initial stopped-kernel
+boundary; the manifest and facade formats themselves are not tied to
+OpenWrt.
+
+The following live boundaries have been exercised:
 
 - stock GDB 17.2 recognized synthetic `pTGID.TID` identities from the facade
   as separate inferiors; this test used a host-side test oracle, not live guest
   tasks; and
 - the AArch64 call gate injected a small self-test into a stopped OpenWrt
   guest, restored all scratch pages and registers byte-for-byte, and then let
-  that same VM continue through `/init` and `procd`.
+  that same VM continue through `/init` and `procd`;
+- the MMIPS facade enumerated live PID 1 as a GDB inferior and restored the
+  helper transaction, including the writable fields of CP0 Cause; and
+- the x86 facade entered the helper from a stopped IA32 `/init`, restored its
+  userspace segments and GS bases, exposed PID 1, and ran the matching
+  kernel's `lx-ps` command successfully.
+
+At x86 `/init`'s very first entry stop, its file-backed text page can still be
+demand-paged: QEMU may report that instruction memory unavailable until the
+guest takes the normal first page fault. Continuing proved that `/init` then
+runs and prints its startup messages. This does not affect kernel memory or
+`lx-ps`, and a later process breakpoint sees resident text.
 
 The exact-Kbuild task probe, its stable response ABI, and the host decoder are
 implemented and audited by unit tests. They were not compiled and run against
@@ -420,16 +697,25 @@ and the launcher removes them and terminates/reaps QEMU and the facade on
 normal exit, failure, `SIGINT`, or `SIGTERM`.
 
 The live facade now refreshes task snapshots, exposes their multiprocess IDs,
-and, when the sealed probe advertises `translate-va-aarch64-v1`, supplies
+and, when an AArch64 sealed probe advertises `translate-va-aarch64-v1`, supplies
 read-only selected-process virtual memory through checked page translation.
 For a current task it returns QEMU's stopped-vCPU register block. When the
 sealed ABI 1.2 package also advertises `saved-regs-aarch64-v1`, a sleeping
 native AArch64 task instead gets its validated saved EL0 x0-x30, SP, PC, and
 PSTATE frame; GDB receives literal `x` digits for unavailable FP/system
-registers rather than invented values. Saved compat32 frames, register and
-process-memory writes, automatic userspace ELF symbol loading, ARMv7, and the
-other MIPS variants remain unimplemented. The facade's direct RSP call gate
-has a restoring wall-clock timeout, but it is not an emulated instruction budget and ordinary
+registers rather than invented values. ARMv7, x86-64, and MMIPS packages
+currently advertise task snapshots only; sleeping-task registers and
+selected-process address translation therefore fail explicitly on those
+targets. Saved AArch32 frames under AArch64, register and process-memory
+writes, automatic userspace ELF symbol loading, and the other MIPS variants
+remain unimplemented. The built-in observer records and presents both
+default-fatal userspace signal delivery and kernel `DIE_OOPS`; it is not a
+general syscall or scheduler event stream. A panic which does not pass through
+`DIE_OOPS` is not synthesized because the panic notifier supplies no saved
+register frame. Native ARMv7, native AArch64, MIPS32, native x86-64, and x86
+IA32 signal frames are represented, while AArch32 events under an AArch64
+kernel are withheld. The facade's direct RSP call gate has a restoring
+wall-clock timeout, but it is not an emulated instruction budget and ordinary
 QEMU virtual time can advance during the transaction.
 
 The launcher and facade have lifecycle/unit coverage, but this repository has

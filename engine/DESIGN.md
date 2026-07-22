@@ -156,6 +156,9 @@ These are not alternatives — sarun wants all three, composed:
     (brush-core/brush-parser, verified embeddable). Sits ABOVE FUSE: it adds
     semantic context FUSE can't recover, and removes the sh-storm FUSE would
     otherwise have to capture. Independent of the other two.
+    Path-oriented reads by embedded Brush and Kati use the same `SarunFs`
+    decoder directly; lifecycle and invariants are documented in
+    [DESIGN-direct-filesystem.md](DESIGN-direct-filesystem.md).
 
 What brush actually knows (precise — earlier draft overclaimed "Makefile
 line", which is FALSE: make execs `sh -c '<recipe text>'`, the shell never
@@ -245,6 +248,14 @@ model into box `OAITA-LOCAL` (captured, never applied) and declares the
 `OAITA-LOCAL.SVC-OAITA-LOCAL` (llama-server + the svc bridge) on demand. Any
 box — an oci image, any downloaded-server box — can advertise a server the
 same way by declaring `svc_provide`/`svc_argv`.
+
+**Debugger provider identity.** QEMU debugger composition uses exactly one
+declared service name, `viros-debug`. A debug registration resolves one unique
+box declaring that identity and one architecture-matching
+`viros-kernel-bundle-v1` from the consumer's captured box/RO-attachment/parent
+lookup chain. The result contains box IDs and provider-root-relative artifact
+descriptors only; host paths, environment variables, and user debugger
+arguments are not resource-selection inputs.
 
 **Model picker (Api pane).** Which model `oaita local` downloads is a UI
 choice, not a hardcoded recommendation (those go stale). The Api pane offers

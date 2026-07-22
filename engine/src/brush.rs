@@ -71,8 +71,8 @@
 
 use std::os::fd::AsRawFd;
 
-use serde_json::json;
 use serde_json::Value;
+use serde_json::json;
 
 #[path = "brush_probe_relation.rs"]
 pub(crate) mod probe_relation;
@@ -191,40 +191,57 @@ impl brush_core::builtins::SimpleCommand for CatBuiltin {
         Ok(format!("{name}: native injected-I/O cat builtin\n"))
     }
 
-    fn execute<SE: brush_core::extensions::ShellExtensions,
-               I: Iterator<Item = S>, S: AsRef<str>>(
+    fn execute<
+        SE: brush_core::extensions::ShellExtensions,
+        I: Iterator<Item = S>,
+        S: AsRef<str>,
+    >(
         context: brush_core::commands::ExecutionContext<'_, SE>,
         args: I,
     ) -> Result<brush_core::results::ExecutionResult, brush_core::error::Error> {
         let name = context.command_name.clone();
         let mut argv: Vec<OsString> = args.map(|a| OsString::from(a.as_ref())).collect();
-        if argv.is_empty() { argv.push(OsString::from(&name)); }
+        if argv.is_empty() {
+            argv.push(OsString::from(&name));
+        }
 
-        let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
-        let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
+        let out = context
+            .try_fd(1)
+            .unwrap_or_else(|| std::io::stdout().into());
+        let err = context
+            .try_fd(2)
+            .unwrap_or_else(|| std::io::stderr().into());
         let inp = context.try_fd(0).unwrap_or_else(|| std::io::stdin().into());
 
         let cwd = context.shell.working_dir().to_path_buf();
-        let code = run_coreutil_localized("uu_cat", context.shell.umask(), exported_env_snapshot(&context), move || {
-            use std::io::Write;
-            use std::os::fd::{AsRawFd, BorrowedFd};
-            let mut out = out;
-            let mut err = err;
-            let mut inp = inp;
-            let out_raw = out.try_borrow_as_fd().ok().map(|b| b.as_raw_fd());
-            let in_raw = inp.try_borrow_as_fd().ok().map(|b| b.as_raw_fd());
-            // SAFETY: fd is owned by an OpenFile that outlives this call.
-            let out_fd = out_raw.map(|fd| unsafe { BorrowedFd::borrow_raw(fd) });
-            let in_fd = in_raw.map(|fd| unsafe { BorrowedFd::borrow_raw(fd) });
-            let r = match uu_cat::cat(argv.into_iter(), &cwd, &mut out, out_fd, &mut inp, in_fd) {
-                Ok(()) => 0,
-                Err(e) => finish_uutil_error(&*e, &name, &mut out, &mut err),
-            };
-            let _ = out.flush();
-            let _ = err.flush();
-            r
-        });
-        Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8))
+        let code = run_coreutil_localized(
+            "uu_cat",
+            context.shell.umask(),
+            exported_env_snapshot(&context),
+            move || {
+                use std::io::Write;
+                use std::os::fd::{AsRawFd, BorrowedFd};
+                let mut out = out;
+                let mut err = err;
+                let mut inp = inp;
+                let out_raw = out.try_borrow_as_fd().ok().map(|b| b.as_raw_fd());
+                let in_raw = inp.try_borrow_as_fd().ok().map(|b| b.as_raw_fd());
+                // SAFETY: fd is owned by an OpenFile that outlives this call.
+                let out_fd = out_raw.map(|fd| unsafe { BorrowedFd::borrow_raw(fd) });
+                let in_fd = in_raw.map(|fd| unsafe { BorrowedFd::borrow_raw(fd) });
+                let r = match uu_cat::cat(argv.into_iter(), &cwd, &mut out, out_fd, &mut inp, in_fd)
+                {
+                    Ok(()) => 0,
+                    Err(e) => finish_uutil_error(&*e, &name, &mut out, &mut err),
+                };
+                let _ = out.flush();
+                let _ = err.flush();
+                r
+            },
+        );
+        Ok(brush_core::results::ExecutionResult::new(
+            (code & 0xff) as u8,
+        ))
     }
 }
 
@@ -240,40 +257,63 @@ impl brush_core::builtins::SimpleCommand for HeadBuiltin {
         Ok(format!("{name}: native injected-I/O head builtin\n"))
     }
 
-    fn execute<SE: brush_core::extensions::ShellExtensions,
-               I: Iterator<Item = S>, S: AsRef<str>>(
+    fn execute<
+        SE: brush_core::extensions::ShellExtensions,
+        I: Iterator<Item = S>,
+        S: AsRef<str>,
+    >(
         context: brush_core::commands::ExecutionContext<'_, SE>,
         args: I,
     ) -> Result<brush_core::results::ExecutionResult, brush_core::error::Error> {
         let name = context.command_name.clone();
         let mut argv: Vec<OsString> = args.map(|a| OsString::from(a.as_ref())).collect();
-        if argv.is_empty() { argv.push(OsString::from(&name)); }
+        if argv.is_empty() {
+            argv.push(OsString::from(&name));
+        }
 
-        let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
-        let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
+        let out = context
+            .try_fd(1)
+            .unwrap_or_else(|| std::io::stdout().into());
+        let err = context
+            .try_fd(2)
+            .unwrap_or_else(|| std::io::stderr().into());
         let inp = context.try_fd(0).unwrap_or_else(|| std::io::stdin().into());
 
         let cwd = context.shell.working_dir().to_path_buf();
-        let code = run_coreutil_localized("uu_head", context.shell.umask(), exported_env_snapshot(&context), move || {
-            use std::io::Write;
-            use std::os::fd::{AsRawFd, BorrowedFd};
-            let mut out = out;
-            let mut err = err;
-            let mut inp = inp;
-            let out_raw = out.try_borrow_as_fd().ok().map(|b| b.as_raw_fd());
-            let in_raw = inp.try_borrow_as_fd().ok().map(|b| b.as_raw_fd());
-            // SAFETY: fd is owned by an OpenFile that outlives this call.
-            let out_fd = out_raw.map(|fd| unsafe { BorrowedFd::borrow_raw(fd) });
-            let in_fd = in_raw.map(|fd| unsafe { BorrowedFd::borrow_raw(fd) });
-            let r = match uu_head::head(argv.into_iter(), &cwd, &mut out, out_fd, &mut inp, in_fd) {
-                Ok(()) => 0,
-                Err(e) => finish_uutil_error(&*e, &name, &mut out, &mut err),
-            };
-            let _ = out.flush();
-            let _ = err.flush();
-            r
-        });
-        Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8))
+        let code = run_coreutil_localized(
+            "uu_head",
+            context.shell.umask(),
+            exported_env_snapshot(&context),
+            move || {
+                use std::io::Write;
+                use std::os::fd::{AsRawFd, BorrowedFd};
+                let mut out = out;
+                let mut err = err;
+                let mut inp = inp;
+                let out_raw = out.try_borrow_as_fd().ok().map(|b| b.as_raw_fd());
+                let in_raw = inp.try_borrow_as_fd().ok().map(|b| b.as_raw_fd());
+                // SAFETY: fd is owned by an OpenFile that outlives this call.
+                let out_fd = out_raw.map(|fd| unsafe { BorrowedFd::borrow_raw(fd) });
+                let in_fd = in_raw.map(|fd| unsafe { BorrowedFd::borrow_raw(fd) });
+                let r = match uu_head::head(
+                    argv.into_iter(),
+                    &cwd,
+                    &mut out,
+                    out_fd,
+                    &mut inp,
+                    in_fd,
+                ) {
+                    Ok(()) => 0,
+                    Err(e) => finish_uutil_error(&*e, &name, &mut out, &mut err),
+                };
+                let _ = out.flush();
+                let _ = err.flush();
+                r
+            },
+        );
+        Ok(brush_core::results::ExecutionResult::new(
+            (code & 0xff) as u8,
+        ))
     }
 }
 
@@ -289,40 +329,64 @@ impl brush_core::builtins::SimpleCommand for TailBuiltin {
         Ok(format!("{name}: native injected-I/O tail builtin\n"))
     }
 
-    fn execute<SE: brush_core::extensions::ShellExtensions,
-               I: Iterator<Item = S>, S: AsRef<str>>(
+    fn execute<
+        SE: brush_core::extensions::ShellExtensions,
+        I: Iterator<Item = S>,
+        S: AsRef<str>,
+    >(
         context: brush_core::commands::ExecutionContext<'_, SE>,
         args: I,
     ) -> Result<brush_core::results::ExecutionResult, brush_core::error::Error> {
         let name = context.command_name.clone();
         let mut argv: Vec<OsString> = args.map(|a| OsString::from(a.as_ref())).collect();
-        if argv.is_empty() { argv.push(OsString::from(&name)); }
+        if argv.is_empty() {
+            argv.push(OsString::from(&name));
+        }
 
         let cwd = context.shell.working_dir().to_path_buf();
-        let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
-        let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
+        let out = context
+            .try_fd(1)
+            .unwrap_or_else(|| std::io::stdout().into());
+        let err = context
+            .try_fd(2)
+            .unwrap_or_else(|| std::io::stderr().into());
         let inp = context.try_fd(0).unwrap_or_else(|| std::io::stdin().into());
 
-        let code = run_coreutil_localized("uu_tail", context.shell.umask(), exported_env_snapshot(&context), move || {
-            use std::io::Write;
-            use std::os::fd::{AsRawFd, BorrowedFd};
-            let mut out = out;
-            let mut err = err;
-            let mut inp = inp;
-            let out_raw = out.try_borrow_as_fd().ok().map(|b| b.as_raw_fd());
-            let in_raw = inp.try_borrow_as_fd().ok().map(|b| b.as_raw_fd());
-            // SAFETY: fd is owned by an OpenFile that outlives this call.
-            let out_fd = out_raw.map(|fd| unsafe { BorrowedFd::borrow_raw(fd) });
-            let in_fd = in_raw.map(|fd| unsafe { BorrowedFd::borrow_raw(fd) });
-            let r = match uu_tail::tail(argv.into_iter(), &cwd, &mut out, out_fd, &mut err, &mut inp, in_fd) {
-                Ok(()) => 0,
-                Err(e) => finish_uutil_error(&*e, &name, &mut out, &mut err),
-            };
-            let _ = out.flush();
-            let _ = err.flush();
-            r
-        });
-        Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8))
+        let code = run_coreutil_localized(
+            "uu_tail",
+            context.shell.umask(),
+            exported_env_snapshot(&context),
+            move || {
+                use std::io::Write;
+                use std::os::fd::{AsRawFd, BorrowedFd};
+                let mut out = out;
+                let mut err = err;
+                let mut inp = inp;
+                let out_raw = out.try_borrow_as_fd().ok().map(|b| b.as_raw_fd());
+                let in_raw = inp.try_borrow_as_fd().ok().map(|b| b.as_raw_fd());
+                // SAFETY: fd is owned by an OpenFile that outlives this call.
+                let out_fd = out_raw.map(|fd| unsafe { BorrowedFd::borrow_raw(fd) });
+                let in_fd = in_raw.map(|fd| unsafe { BorrowedFd::borrow_raw(fd) });
+                let r = match uu_tail::tail(
+                    argv.into_iter(),
+                    &cwd,
+                    &mut out,
+                    out_fd,
+                    &mut err,
+                    &mut inp,
+                    in_fd,
+                ) {
+                    Ok(()) => 0,
+                    Err(e) => finish_uutil_error(&*e, &name, &mut out, &mut err),
+                };
+                let _ = out.flush();
+                let _ = err.flush();
+                r
+            },
+        );
+        Ok(brush_core::results::ExecutionResult::new(
+            (code & 0xff) as u8,
+        ))
     }
 }
 
@@ -338,43 +402,64 @@ impl brush_core::builtins::SimpleCommand for WcBuiltin {
         Ok(format!("{name}: native injected-I/O wc builtin\n"))
     }
 
-    fn execute<SE: brush_core::extensions::ShellExtensions,
-               I: Iterator<Item = S>, S: AsRef<str>>(
+    fn execute<
+        SE: brush_core::extensions::ShellExtensions,
+        I: Iterator<Item = S>,
+        S: AsRef<str>,
+    >(
         context: brush_core::commands::ExecutionContext<'_, SE>,
         args: I,
     ) -> Result<brush_core::results::ExecutionResult, brush_core::error::Error> {
         let name = context.command_name.clone();
         let mut argv: Vec<OsString> = args.map(|a| OsString::from(a.as_ref())).collect();
-        if argv.is_empty() { argv.push(OsString::from(&name)); }
+        if argv.is_empty() {
+            argv.push(OsString::from(&name));
+        }
 
         let cwd = context.shell.working_dir().to_path_buf();
         // Shell's LOGICAL exported env: wc reads POSIXLY_CORRECT from this,
         // not the engine process's environment.
         let envv = exported_env_snapshot(&context);
-        let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
-        let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
+        let out = context
+            .try_fd(1)
+            .unwrap_or_else(|| std::io::stdout().into());
+        let err = context
+            .try_fd(2)
+            .unwrap_or_else(|| std::io::stderr().into());
         let inp = context.try_fd(0).unwrap_or_else(|| std::io::stdin().into());
 
-        let code = run_coreutil_localized("uu_wc", context.shell.umask(), envv.clone(), move || {
-            use std::io::Write;
-            use std::os::fd::{AsRawFd, BorrowedFd};
-            let mut out = out;
-            let mut err = err;
-            let mut inp = inp;
-            let out_raw = out.try_borrow_as_fd().ok().map(|b| b.as_raw_fd());
-            let in_raw = inp.try_borrow_as_fd().ok().map(|b| b.as_raw_fd());
-            // SAFETY: fd is owned by an OpenFile that outlives this call.
-            let out_fd = out_raw.map(|fd| unsafe { BorrowedFd::borrow_raw(fd) });
-            let in_fd = in_raw.map(|fd| unsafe { BorrowedFd::borrow_raw(fd) });
-            let r = match uu_wc::wc(argv.into_iter(), &cwd, &envv, &mut out, out_fd, &mut err, &mut inp, in_fd) {
-                Ok(()) => 0,
-                Err(e) => finish_uutil_error(&*e, &name, &mut out, &mut err),
-            };
-            let _ = out.flush();
-            let _ = err.flush();
-            r
-        });
-        Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8))
+        let code =
+            run_coreutil_localized("uu_wc", context.shell.umask(), envv.clone(), move || {
+                use std::io::Write;
+                use std::os::fd::{AsRawFd, BorrowedFd};
+                let mut out = out;
+                let mut err = err;
+                let mut inp = inp;
+                let out_raw = out.try_borrow_as_fd().ok().map(|b| b.as_raw_fd());
+                let in_raw = inp.try_borrow_as_fd().ok().map(|b| b.as_raw_fd());
+                // SAFETY: fd is owned by an OpenFile that outlives this call.
+                let out_fd = out_raw.map(|fd| unsafe { BorrowedFd::borrow_raw(fd) });
+                let in_fd = in_raw.map(|fd| unsafe { BorrowedFd::borrow_raw(fd) });
+                let r = match uu_wc::wc(
+                    argv.into_iter(),
+                    &cwd,
+                    &envv,
+                    &mut out,
+                    out_fd,
+                    &mut err,
+                    &mut inp,
+                    in_fd,
+                ) {
+                    Ok(()) => 0,
+                    Err(e) => finish_uutil_error(&*e, &name, &mut out, &mut err),
+                };
+                let _ = out.flush();
+                let _ = err.flush();
+                r
+            });
+        Ok(brush_core::results::ExecutionResult::new(
+            (code & 0xff) as u8,
+        ))
     }
 }
 
@@ -416,31 +501,47 @@ macro_rules! info_builtin {
                 Ok(format!("{name}: native injected-I/O {} builtin\n", $util))
             }
 
-            fn execute<SE: brush_core::extensions::ShellExtensions,
-                       I: Iterator<Item = S>, S: AsRef<str>>(
+            fn execute<
+                SE: brush_core::extensions::ShellExtensions,
+                I: Iterator<Item = S>,
+                S: AsRef<str>,
+            >(
                 context: brush_core::commands::ExecutionContext<'_, SE>,
                 args: I,
             ) -> Result<brush_core::results::ExecutionResult, brush_core::error::Error> {
                 let name = context.command_name.clone();
                 let mut argv: Vec<OsString> = args.map(|a| OsString::from(a.as_ref())).collect();
-                if argv.is_empty() { argv.push(OsString::from(&name)); }
+                if argv.is_empty() {
+                    argv.push(OsString::from(&name));
+                }
 
-                let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
-                let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
+                let out = context
+                    .try_fd(1)
+                    .unwrap_or_else(|| std::io::stdout().into());
+                let err = context
+                    .try_fd(2)
+                    .unwrap_or_else(|| std::io::stderr().into());
 
-                let code = run_coreutil_localized($thread, context.shell.umask(), exported_env_snapshot(&context), move || {
-                    use std::io::Write;
-                    let mut out = out;
-                    let mut err = err;
-                    let r = match $entry(argv.into_iter(), &mut out, &mut err) {
-                        Ok(()) => 0,
-                        Err(e) => finish_uutil_error(&*e, &name, &mut out, &mut err),
-                    };
-                    let _ = out.flush();
-                    let _ = err.flush();
-                    r
-                });
-                Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8))
+                let code = run_coreutil_localized(
+                    $thread,
+                    context.shell.umask(),
+                    exported_env_snapshot(&context),
+                    move || {
+                        use std::io::Write;
+                        let mut out = out;
+                        let mut err = err;
+                        let r = match $entry(argv.into_iter(), &mut out, &mut err) {
+                            Ok(()) => 0,
+                            Err(e) => finish_uutil_error(&*e, &name, &mut out, &mut err),
+                        };
+                        let _ = out.flush();
+                        let _ = err.flush();
+                        r
+                    },
+                );
+                Ok(brush_core::results::ExecutionResult::new(
+                    (code & 0xff) as u8,
+                ))
             }
         }
     };
@@ -462,32 +563,48 @@ macro_rules! info_env_builtin {
                 Ok(format!("{name}: native injected-I/O {} builtin\n", $util))
             }
 
-            fn execute<SE: brush_core::extensions::ShellExtensions,
-                       I: Iterator<Item = S>, S: AsRef<str>>(
+            fn execute<
+                SE: brush_core::extensions::ShellExtensions,
+                I: Iterator<Item = S>,
+                S: AsRef<str>,
+            >(
                 context: brush_core::commands::ExecutionContext<'_, SE>,
                 args: I,
             ) -> Result<brush_core::results::ExecutionResult, brush_core::error::Error> {
                 let name = context.command_name.clone();
                 let mut argv: Vec<OsString> = args.map(|a| OsString::from(a.as_ref())).collect();
-                if argv.is_empty() { argv.push(OsString::from(&name)); }
+                if argv.is_empty() {
+                    argv.push(OsString::from(&name));
+                }
 
                 let envv = exported_env_snapshot(&context);
-                let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
-                let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
+                let out = context
+                    .try_fd(1)
+                    .unwrap_or_else(|| std::io::stdout().into());
+                let err = context
+                    .try_fd(2)
+                    .unwrap_or_else(|| std::io::stderr().into());
 
-                let code = run_coreutil_localized($thread, context.shell.umask(), envv.clone(), move || {
-                    use std::io::Write;
-                    let mut out = out;
-                    let mut err = err;
-                    let r = match $entry(argv.into_iter(), &envv, &mut out, &mut err) {
-                        Ok(()) => 0,
-                        Err(e) => finish_uutil_error(&*e, &name, &mut out, &mut err),
-                    };
-                    let _ = out.flush();
-                    let _ = err.flush();
-                    r
-                });
-                Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8))
+                let code = run_coreutil_localized(
+                    $thread,
+                    context.shell.umask(),
+                    envv.clone(),
+                    move || {
+                        use std::io::Write;
+                        let mut out = out;
+                        let mut err = err;
+                        let r = match $entry(argv.into_iter(), &envv, &mut out, &mut err) {
+                            Ok(()) => 0,
+                            Err(e) => finish_uutil_error(&*e, &name, &mut out, &mut err),
+                        };
+                        let _ = out.flush();
+                        let _ = err.flush();
+                        r
+                    },
+                );
+                Ok(brush_core::results::ExecutionResult::new(
+                    (code & 0xff) as u8,
+                ))
             }
         }
     };
@@ -509,32 +626,48 @@ macro_rules! fs_builtin {
                 Ok(format!("{name}: native injected-I/O {} builtin\n", $util))
             }
 
-            fn execute<SE: brush_core::extensions::ShellExtensions,
-                       I: Iterator<Item = S>, S: AsRef<str>>(
+            fn execute<
+                SE: brush_core::extensions::ShellExtensions,
+                I: Iterator<Item = S>,
+                S: AsRef<str>,
+            >(
                 context: brush_core::commands::ExecutionContext<'_, SE>,
                 args: I,
             ) -> Result<brush_core::results::ExecutionResult, brush_core::error::Error> {
                 let name = context.command_name.clone();
                 let mut argv: Vec<OsString> = args.map(|a| OsString::from(a.as_ref())).collect();
-                if argv.is_empty() { argv.push(OsString::from(&name)); }
+                if argv.is_empty() {
+                    argv.push(OsString::from(&name));
+                }
 
                 let cwd = context.shell.working_dir().to_path_buf();
-                let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
-                let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
+                let out = context
+                    .try_fd(1)
+                    .unwrap_or_else(|| std::io::stdout().into());
+                let err = context
+                    .try_fd(2)
+                    .unwrap_or_else(|| std::io::stderr().into());
 
-                let code = run_coreutil_localized($thread, context.shell.umask(), exported_env_snapshot(&context), move || {
-                    use std::io::Write;
-                    let mut out = out;
-                    let mut err = err;
-                    let r = match $entry(argv.into_iter(), &cwd, &mut out, &mut err) {
-                        Ok(()) => 0,
-                        Err(e) => finish_uutil_error(&*e, &name, &mut out, &mut err),
-                    };
-                    let _ = out.flush();
-                    let _ = err.flush();
-                    r
-                });
-                Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8))
+                let code = run_coreutil_localized(
+                    $thread,
+                    context.shell.umask(),
+                    exported_env_snapshot(&context),
+                    move || {
+                        use std::io::Write;
+                        let mut out = out;
+                        let mut err = err;
+                        let r = match $entry(argv.into_iter(), &cwd, &mut out, &mut err) {
+                            Ok(()) => 0,
+                            Err(e) => finish_uutil_error(&*e, &name, &mut out, &mut err),
+                        };
+                        let _ = out.flush();
+                        let _ = err.flush();
+                        r
+                    },
+                );
+                Ok(brush_core::results::ExecutionResult::new(
+                    (code & 0xff) as u8,
+                ))
             }
         }
     };
@@ -556,33 +689,49 @@ macro_rules! fs_env_builtin {
                 Ok(format!("{name}: native injected-I/O {} builtin\n", $util))
             }
 
-            fn execute<SE: brush_core::extensions::ShellExtensions,
-                       I: Iterator<Item = S>, S: AsRef<str>>(
+            fn execute<
+                SE: brush_core::extensions::ShellExtensions,
+                I: Iterator<Item = S>,
+                S: AsRef<str>,
+            >(
                 context: brush_core::commands::ExecutionContext<'_, SE>,
                 args: I,
             ) -> Result<brush_core::results::ExecutionResult, brush_core::error::Error> {
                 let name = context.command_name.clone();
                 let mut argv: Vec<OsString> = args.map(|a| OsString::from(a.as_ref())).collect();
-                if argv.is_empty() { argv.push(OsString::from(&name)); }
+                if argv.is_empty() {
+                    argv.push(OsString::from(&name));
+                }
 
                 let cwd = context.shell.working_dir().to_path_buf();
                 let envv = exported_env_snapshot(&context);
-                let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
-                let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
+                let out = context
+                    .try_fd(1)
+                    .unwrap_or_else(|| std::io::stdout().into());
+                let err = context
+                    .try_fd(2)
+                    .unwrap_or_else(|| std::io::stderr().into());
 
-                let code = run_coreutil_localized($thread, context.shell.umask(), envv.clone(), move || {
-                    use std::io::Write;
-                    let mut out = out;
-                    let mut err = err;
-                    let r = match $entry(argv.into_iter(), &cwd, &envv, &mut out, &mut err) {
-                        Ok(()) => 0,
-                        Err(e) => finish_uutil_error(&*e, &name, &mut out, &mut err),
-                    };
-                    let _ = out.flush();
-                    let _ = err.flush();
-                    r
-                });
-                Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8))
+                let code = run_coreutil_localized(
+                    $thread,
+                    context.shell.umask(),
+                    envv.clone(),
+                    move || {
+                        use std::io::Write;
+                        let mut out = out;
+                        let mut err = err;
+                        let r = match $entry(argv.into_iter(), &cwd, &envv, &mut out, &mut err) {
+                            Ok(()) => 0,
+                            Err(e) => finish_uutil_error(&*e, &name, &mut out, &mut err),
+                        };
+                        let _ = out.flush();
+                        let _ = err.flush();
+                        r
+                    },
+                );
+                Ok(brush_core::results::ExecutionResult::new(
+                    (code & 0xff) as u8,
+                ))
             }
         }
     };
@@ -603,35 +752,52 @@ macro_rules! fs_builtin_stdin {
                 Ok(format!("{name}: native injected-I/O {} builtin\n", $util))
             }
 
-            fn execute<SE: brush_core::extensions::ShellExtensions,
-                       I: Iterator<Item = S>, S: AsRef<str>>(
+            fn execute<
+                SE: brush_core::extensions::ShellExtensions,
+                I: Iterator<Item = S>,
+                S: AsRef<str>,
+            >(
                 context: brush_core::commands::ExecutionContext<'_, SE>,
                 args: I,
             ) -> Result<brush_core::results::ExecutionResult, brush_core::error::Error> {
                 let name = context.command_name.clone();
                 let mut argv: Vec<OsString> = args.map(|a| OsString::from(a.as_ref())).collect();
-                if argv.is_empty() { argv.push(OsString::from(&name)); }
+                if argv.is_empty() {
+                    argv.push(OsString::from(&name));
+                }
 
                 let cwd = context.shell.working_dir().to_path_buf();
-                let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
-                let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
+                let out = context
+                    .try_fd(1)
+                    .unwrap_or_else(|| std::io::stdout().into());
+                let err = context
+                    .try_fd(2)
+                    .unwrap_or_else(|| std::io::stderr().into());
                 let inp = context.try_fd(0).unwrap_or_else(|| std::io::stdin().into());
 
-                let code = run_coreutil_localized($thread, context.shell.umask(), exported_env_snapshot(&context), move || {
-                    use std::io::Write;
-                    let mut out = out;
-                    let mut err = err;
-                    let stdin_src: Box<dyn std::io::BufRead> =
-                        Box::new(std::io::BufReader::new(inp));
-                    let r = match $entry(argv.into_iter(), &cwd, &mut out, &mut err, stdin_src) {
-                        Ok(()) => 0,
-                        Err(e) => finish_uutil_error(&*e, &name, &mut out, &mut err),
-                    };
-                    let _ = out.flush();
-                    let _ = err.flush();
-                    r
-                });
-                Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8))
+                let code = run_coreutil_localized(
+                    $thread,
+                    context.shell.umask(),
+                    exported_env_snapshot(&context),
+                    move || {
+                        use std::io::Write;
+                        let mut out = out;
+                        let mut err = err;
+                        let stdin_src: Box<dyn std::io::BufRead> =
+                            Box::new(std::io::BufReader::new(inp));
+                        let r = match $entry(argv.into_iter(), &cwd, &mut out, &mut err, stdin_src)
+                        {
+                            Ok(()) => 0,
+                            Err(e) => finish_uutil_error(&*e, &name, &mut out, &mut err),
+                        };
+                        let _ = out.flush();
+                        let _ = err.flush();
+                        r
+                    },
+                );
+                Ok(brush_core::results::ExecutionResult::new(
+                    (code & 0xff) as u8,
+                ))
             }
         }
     };
@@ -652,34 +818,50 @@ macro_rules! stream_builtin {
                 Ok(format!("{name}: native injected-I/O {} builtin\n", $util))
             }
 
-            fn execute<SE: brush_core::extensions::ShellExtensions,
-                       I: Iterator<Item = S>, S: AsRef<str>>(
+            fn execute<
+                SE: brush_core::extensions::ShellExtensions,
+                I: Iterator<Item = S>,
+                S: AsRef<str>,
+            >(
                 context: brush_core::commands::ExecutionContext<'_, SE>,
                 args: I,
             ) -> Result<brush_core::results::ExecutionResult, brush_core::error::Error> {
                 let name = context.command_name.clone();
                 let mut argv: Vec<OsString> = args.map(|a| OsString::from(a.as_ref())).collect();
-                if argv.is_empty() { argv.push(OsString::from(&name)); }
+                if argv.is_empty() {
+                    argv.push(OsString::from(&name));
+                }
 
                 let cwd = context.shell.working_dir().to_path_buf();
-                let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
-                let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
+                let out = context
+                    .try_fd(1)
+                    .unwrap_or_else(|| std::io::stdout().into());
+                let err = context
+                    .try_fd(2)
+                    .unwrap_or_else(|| std::io::stderr().into());
                 let inp = context.try_fd(0).unwrap_or_else(|| std::io::stdin().into());
 
-                let code = run_coreutil_localized($thread, context.shell.umask(), exported_env_snapshot(&context), move || {
-                    use std::io::Write;
-                    let mut out = out;
-                    let mut err = err;
-                    let mut inp = inp;
-                    let r = match $entry(argv.into_iter(), &cwd, &mut out, &mut err, &mut inp) {
-                        Ok(()) => 0,
-                        Err(e) => finish_uutil_error(&*e, &name, &mut out, &mut err),
-                    };
-                    let _ = out.flush();
-                    let _ = err.flush();
-                    r
-                });
-                Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8))
+                let code = run_coreutil_localized(
+                    $thread,
+                    context.shell.umask(),
+                    exported_env_snapshot(&context),
+                    move || {
+                        use std::io::Write;
+                        let mut out = out;
+                        let mut err = err;
+                        let mut inp = inp;
+                        let r = match $entry(argv.into_iter(), &cwd, &mut out, &mut err, &mut inp) {
+                            Ok(()) => 0,
+                            Err(e) => finish_uutil_error(&*e, &name, &mut out, &mut err),
+                        };
+                        let _ = out.flush();
+                        let _ = err.flush();
+                        r
+                    },
+                );
+                Ok(brush_core::results::ExecutionResult::new(
+                    (code & 0xff) as u8,
+                ))
             }
         }
     };
@@ -701,35 +883,58 @@ macro_rules! stream_env_builtin {
                 Ok(format!("{name}: native injected-I/O {} builtin\n", $util))
             }
 
-            fn execute<SE: brush_core::extensions::ShellExtensions,
-                       I: Iterator<Item = S>, S: AsRef<str>>(
+            fn execute<
+                SE: brush_core::extensions::ShellExtensions,
+                I: Iterator<Item = S>,
+                S: AsRef<str>,
+            >(
                 context: brush_core::commands::ExecutionContext<'_, SE>,
                 args: I,
             ) -> Result<brush_core::results::ExecutionResult, brush_core::error::Error> {
                 let name = context.command_name.clone();
                 let mut argv: Vec<OsString> = args.map(|a| OsString::from(a.as_ref())).collect();
-                if argv.is_empty() { argv.push(OsString::from(&name)); }
+                if argv.is_empty() {
+                    argv.push(OsString::from(&name));
+                }
 
                 let cwd = context.shell.working_dir().to_path_buf();
                 let envv = exported_env_snapshot(&context);
-                let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
-                let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
+                let out = context
+                    .try_fd(1)
+                    .unwrap_or_else(|| std::io::stdout().into());
+                let err = context
+                    .try_fd(2)
+                    .unwrap_or_else(|| std::io::stderr().into());
                 let inp = context.try_fd(0).unwrap_or_else(|| std::io::stdin().into());
 
-                let code = run_coreutil_localized($thread, context.shell.umask(), envv.clone(), move || {
-                    use std::io::Write;
-                    let mut out = out;
-                    let mut err = err;
-                    let mut inp = inp;
-                    let r = match $entry(argv.into_iter(), &cwd, &envv, &mut out, &mut err, &mut inp) {
-                        Ok(()) => 0,
-                        Err(e) => finish_uutil_error(&*e, &name, &mut out, &mut err),
-                    };
-                    let _ = out.flush();
-                    let _ = err.flush();
-                    r
-                });
-                Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8))
+                let code = run_coreutil_localized(
+                    $thread,
+                    context.shell.umask(),
+                    envv.clone(),
+                    move || {
+                        use std::io::Write;
+                        let mut out = out;
+                        let mut err = err;
+                        let mut inp = inp;
+                        let r = match $entry(
+                            argv.into_iter(),
+                            &cwd,
+                            &envv,
+                            &mut out,
+                            &mut err,
+                            &mut inp,
+                        ) {
+                            Ok(()) => 0,
+                            Err(e) => finish_uutil_error(&*e, &name, &mut out, &mut err),
+                        };
+                        let _ = out.flush();
+                        let _ = err.flush();
+                        r
+                    },
+                );
+                Ok(brush_core::results::ExecutionResult::new(
+                    (code & 0xff) as u8,
+                ))
             }
         }
     };
@@ -757,45 +962,76 @@ impl brush_core::builtins::SimpleCommand for TrBuiltin {
         Ok(format!("{name}: native injected-I/O tr builtin\n"))
     }
 
-    fn execute<SE: brush_core::extensions::ShellExtensions,
-               I: Iterator<Item = S>, S: AsRef<str>>(
+    fn execute<
+        SE: brush_core::extensions::ShellExtensions,
+        I: Iterator<Item = S>,
+        S: AsRef<str>,
+    >(
         context: brush_core::commands::ExecutionContext<'_, SE>,
         args: I,
     ) -> Result<brush_core::results::ExecutionResult, brush_core::error::Error> {
         let name = context.command_name.clone();
         let mut argv: Vec<OsString> = args.map(|a| OsString::from(a.as_ref())).collect();
-        if argv.is_empty() { argv.push(OsString::from(&name)); }
+        if argv.is_empty() {
+            argv.push(OsString::from(&name));
+        }
 
-        let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
-        let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
+        let out = context
+            .try_fd(1)
+            .unwrap_or_else(|| std::io::stdout().into());
+        let err = context
+            .try_fd(2)
+            .unwrap_or_else(|| std::io::stderr().into());
         let inp = context.try_fd(0).unwrap_or_else(|| std::io::stdin().into());
 
-        let code = run_coreutil_localized("uu_tr", context.shell.umask(), exported_env_snapshot(&context), move || {
-            use std::io::Write;
-            let mut out = out;
-            let mut err = err;
-            let mut inp = inp;
-            let r = match uu_tr::tr(argv.into_iter(), &mut out, &mut err, &mut inp) {
-                Ok(()) => 0,
-                        Err(e) => finish_uutil_error(&*e, &name, &mut out, &mut err),
-            };
-            let _ = out.flush();
-            let _ = err.flush();
-            r
-        });
-        Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8))
+        let code = run_coreutil_localized(
+            "uu_tr",
+            context.shell.umask(),
+            exported_env_snapshot(&context),
+            move || {
+                use std::io::Write;
+                let mut out = out;
+                let mut err = err;
+                let mut inp = inp;
+                let r = match uu_tr::tr(argv.into_iter(), &mut out, &mut err, &mut inp) {
+                    Ok(()) => 0,
+                    Err(e) => finish_uutil_error(&*e, &name, &mut out, &mut err),
+                };
+                let _ = out.flush();
+                let _ = err.flush();
+                r
+            },
+        );
+        Ok(brush_core::results::ExecutionResult::new(
+            (code & 0xff) as u8,
+        ))
     }
 }
 
 // FILESYSTEM builtins.
 fs_builtin!(MkdirBuiltin, "mkdir", uu_mkdir::mkdir_main, "uu_mkdir");
 fs_builtin!(RmdirBuiltin, "rmdir", uu_rmdir::rmdir_main, "uu_rmdir");
-fs_builtin!(RealpathBuiltin, "realpath", uu_realpath::realpath, "uu_realpath");
+fs_builtin!(
+    RealpathBuiltin,
+    "realpath",
+    uu_realpath::realpath,
+    "uu_realpath"
+);
 fs_builtin!(ChmodBuiltin, "chmod", uu_chmod::chmod_main, "uu_chmod");
 fs_builtin!(ChownBuiltin, "chown", uu_chown::chown_main, "uu_chown");
-fs_builtin!(InstallBuiltin, "install", uu_install::install_main, "uu_install");
+fs_builtin!(
+    InstallBuiltin,
+    "install",
+    uu_install::install_main,
+    "uu_install"
+);
 fs_env_builtin!(CpBuiltin, "cp", uu_cp::cp, "uu_cp");
-fs_env_builtin!(ReadlinkBuiltin, "readlink", uu_readlink::readlink, "uu_readlink");
+fs_env_builtin!(
+    ReadlinkBuiltin,
+    "readlink",
+    uu_readlink::readlink,
+    "uu_readlink"
+);
 fs_env_builtin!(MktempBuiltin, "mktemp", uu_mktemp::mktemp_main, "uu_mktemp");
 fs_builtin_stdin!(RmBuiltin, "rm", uu_rm::rm_main, "uu_rm");
 fs_builtin_stdin!(MvBuiltin, "mv", uu_mv::mv_main, "uu_mv");
@@ -816,41 +1052,59 @@ impl brush_core::builtins::SimpleCommand for TouchBuiltin {
         Ok(format!("{name}: native injected-I/O touch builtin\n"))
     }
 
-    fn execute<SE: brush_core::extensions::ShellExtensions,
-               I: Iterator<Item = S>, S: AsRef<str>>(
+    fn execute<
+        SE: brush_core::extensions::ShellExtensions,
+        I: Iterator<Item = S>,
+        S: AsRef<str>,
+    >(
         context: brush_core::commands::ExecutionContext<'_, SE>,
         args: I,
     ) -> Result<brush_core::results::ExecutionResult, brush_core::error::Error> {
         let name = context.command_name.clone();
         let mut argv: Vec<OsString> = args.map(|a| OsString::from(a.as_ref())).collect();
-        if argv.is_empty() { argv.push(OsString::from(&name)); }
+        if argv.is_empty() {
+            argv.push(OsString::from(&name));
+        }
 
         let cwd = context.shell.working_dir().to_path_buf();
         let envv = exported_env_snapshot(&context);
-        let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
-        let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
+        let out = context
+            .try_fd(1)
+            .unwrap_or_else(|| std::io::stdout().into());
+        let err = context
+            .try_fd(2)
+            .unwrap_or_else(|| std::io::stderr().into());
 
-        let code = run_coreutil_localized("uu_touch", context.shell.umask(), envv.clone(), move || {
-            use std::io::Write;
-            use std::os::fd::AsRawFd;
-            let mut out = out;
-            let mut err = err;
-            // Raw fd for the logical stdout, for the `-` operand only;
-            // borrowed for the call's duration (the OpenFile outlives it).
-            let out_fd = out.try_borrow_as_fd().ok().map(|b| b.as_raw_fd());
-            let r = match uu_touch::touch_main(argv.into_iter(), &cwd, &envv, out_fd, &mut err) {
-                Ok(()) => 0,
-                Err(e) => finish_uutil_error(&*e, &name, &mut out, &mut err),
-            };
-            let _ = err.flush();
-            r
-        });
-        Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8))
+        let code =
+            run_coreutil_localized("uu_touch", context.shell.umask(), envv.clone(), move || {
+                use std::io::Write;
+                use std::os::fd::AsRawFd;
+                let mut out = out;
+                let mut err = err;
+                // Raw fd for the logical stdout, for the `-` operand only;
+                // borrowed for the call's duration (the OpenFile outlives it).
+                let out_fd = out.try_borrow_as_fd().ok().map(|b| b.as_raw_fd());
+                let r = match uu_touch::touch_main(argv.into_iter(), &cwd, &envv, out_fd, &mut err)
+                {
+                    Ok(()) => 0,
+                    Err(e) => finish_uutil_error(&*e, &name, &mut out, &mut err),
+                };
+                let _ = err.flush();
+                r
+            });
+        Ok(brush_core::results::ExecutionResult::new(
+            (code & 0xff) as u8,
+        ))
     }
 }
 
 // INFO builtins.
-info_builtin!(BasenameBuiltin, "basename", uu_basename::basename, "uu_basename");
+info_builtin!(
+    BasenameBuiltin,
+    "basename",
+    uu_basename::basename,
+    "uu_basename"
+);
 info_builtin!(DirnameBuiltin, "dirname", uu_dirname::dirname, "uu_dirname");
 info_builtin!(SeqBuiltin, "seq", uu_seq::seq, "uu_seq");
 info_builtin!(ExprBuiltin, "expr", uu_expr::expr, "uu_expr");
@@ -873,7 +1127,9 @@ impl EngineSelfCommand {
         let of = of.as_ref()?;
         let bf = of.try_borrow_as_fd().ok()?;
         let dup = unsafe { libc::dup(bf.as_raw_fd()) };
-        if dup < 0 { return None; }
+        if dup < 0 {
+            return None;
+        }
         Some(unsafe { std::process::Stdio::from(OwnedFd::from_raw_fd(dup)) })
     }
 }
@@ -887,33 +1143,53 @@ impl brush_core::builtins::SimpleCommand for EngineSelfCommand {
         Ok(format!("{name}: sarun in-box engine builtin\n"))
     }
 
-    fn execute<SE: brush_core::extensions::ShellExtensions,
-               I: Iterator<Item = S>, S: AsRef<str>>(
+    fn execute<
+        SE: brush_core::extensions::ShellExtensions,
+        I: Iterator<Item = S>,
+        S: AsRef<str>,
+    >(
         context: brush_core::commands::ExecutionContext<'_, SE>,
         args: I,
     ) -> Result<brush_core::results::ExecutionResult, brush_core::error::Error> {
         let name = context.command_name.clone();
         // args includes argv[0]; drop it, prepend "oaita" for the oaita subcommand.
         let mut argv: Vec<OsString> = args.map(|a| OsString::from(a.as_ref())).collect();
-        let rest = if argv.is_empty() { vec![] } else { argv.split_off(1) };
+        let rest = if argv.is_empty() {
+            vec![]
+        } else {
+            argv.split_off(1)
+        };
         let mut eargs: Vec<OsString> = Vec::new();
-        if name == "oaita" { eargs.push(OsString::from("oaita")); }
+        if name == "oaita" {
+            eargs.push(OsString::from("oaita"));
+        }
         eargs.extend(rest);
 
         // Re-exec the engine via the ferried fd (SARUN_EXE) so `sarun`/`oaita`
         // work inside a closed rootfs where `/proc/self/exe`'s path is absent.
         let mut cmd = std::process::Command::new(crate::runner::in_box_self_exe());
         cmd.args(&eargs);
-        if let Some(s) = Self::stdio_from(&context.try_fd(0)) { cmd.stdin(s); }
-        if let Some(s) = Self::stdio_from(&context.try_fd(1)) { cmd.stdout(s); }
-        if let Some(s) = Self::stdio_from(&context.try_fd(2)) { cmd.stderr(s); }
+        if let Some(s) = Self::stdio_from(&context.try_fd(0)) {
+            cmd.stdin(s);
+        }
+        if let Some(s) = Self::stdio_from(&context.try_fd(1)) {
+            cmd.stdout(s);
+        }
+        if let Some(s) = Self::stdio_from(&context.try_fd(2)) {
+            cmd.stderr(s);
+        }
         let code = match cmd.status() {
             // T1: a signal death of the re-exec'd engine reports 128 + signo,
             // not a bogus "exited 1".
             Ok(s) => child_exit_code(s),
-            Err(e) => { eprintln!("{name}: cannot exec engine: {e}"); 127 }
+            Err(e) => {
+                eprintln!("{name}: cannot exec engine: {e}");
+                127
+            }
         };
-        Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8))
+        Ok(brush_core::results::ExecutionResult::new(
+            (code & 0xff) as u8,
+        ))
     }
 }
 
@@ -934,8 +1210,11 @@ impl brush_core::builtins::SimpleCommand for MakeBuiltin {
         Ok(format!("{name}: embedded GNU make (in-process kati)\n"))
     }
 
-    fn execute<SE: brush_core::extensions::ShellExtensions,
-               I: Iterator<Item = S>, S: AsRef<str>>(
+    fn execute<
+        SE: brush_core::extensions::ShellExtensions,
+        I: Iterator<Item = S>,
+        S: AsRef<str>,
+    >(
         context: brush_core::commands::ExecutionContext<'_, SE>,
         args: I,
     ) -> Result<brush_core::results::ExecutionResult, brush_core::error::Error> {
@@ -966,16 +1245,32 @@ impl brush_core::builtins::SimpleCommand for MakeBuiltin {
             .collect();
         // fd 1/2 twice each: one handle for make's own messages, one as the
         // recipe/diagnostic sink kati writes through (set_recipe_out/err).
-        let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
-        let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
-        let recipe_out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
-        let recipe_err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
+        let out = context
+            .try_fd(1)
+            .unwrap_or_else(|| std::io::stdout().into());
+        let err = context
+            .try_fd(2)
+            .unwrap_or_else(|| std::io::stderr().into());
+        let recipe_out = context
+            .try_fd(1)
+            .unwrap_or_else(|| std::io::stdout().into());
+        let recipe_err = context
+            .try_fd(2)
+            .unwrap_or_else(|| std::io::stderr().into());
         let stdin = context.try_fd(0);
         let code = crate::katirun::make_builtin(
-            &argv, &cwd, &seed_env, out, err, Box::new(recipe_out), Box::new(recipe_err),
+            &argv,
+            &cwd,
+            &seed_env,
+            out,
+            err,
+            Box::new(recipe_out),
+            Box::new(recipe_err),
             stdin,
         );
-        Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8))
+        Ok(brush_core::results::ExecutionResult::new(
+            (code & 0xff) as u8,
+        ))
     }
 }
 
@@ -993,8 +1288,11 @@ impl brush_core::builtins::SimpleCommand for NinjaBuiltin {
         Ok(format!("{name}: embedded ninja (in-process n2)\n"))
     }
 
-    fn execute<SE: brush_core::extensions::ShellExtensions,
-               I: Iterator<Item = S>, S: AsRef<str>>(
+    fn execute<
+        SE: brush_core::extensions::ShellExtensions,
+        I: Iterator<Item = S>,
+        S: AsRef<str>,
+    >(
         context: brush_core::commands::ExecutionContext<'_, SE>,
         args: I,
     ) -> Result<brush_core::results::ExecutionResult, brush_core::error::Error> {
@@ -1004,10 +1302,16 @@ impl brush_core::builtins::SimpleCommand for NinjaBuiltin {
             argv.push(name);
         }
         let cwd = context.shell.working_dir().to_path_buf();
-        let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
-        let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
+        let out = context
+            .try_fd(1)
+            .unwrap_or_else(|| std::io::stdout().into());
+        let err = context
+            .try_fd(2)
+            .unwrap_or_else(|| std::io::stderr().into());
         let code = crate::n2run::ninja_builtin(&argv, &cwd, out, err);
-        Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8))
+        Ok(brush_core::results::ExecutionResult::new(
+            (code & 0xff) as u8,
+        ))
     }
 }
 
@@ -1046,7 +1350,10 @@ impl brush_core::builtins::Command for EditBuiltin {
             ));
         }
         let pipeline_io = |file: Option<OpenFile>| {
-            matches!(file, Some(OpenFile::PipeReader(_) | OpenFile::PipeWriter(_)))
+            matches!(
+                file,
+                Some(OpenFile::PipeReader(_) | OpenFile::PipeWriter(_))
+            )
         };
         if context.spawned_pipeline_stage
             || pipeline_io(context.try_fd(0))
@@ -1089,11 +1396,11 @@ impl brush_core::builtins::Command for EditBuiltin {
 /// other's localization. (Vendored uucore made `LOCALIZER` and its resource
 /// caches thread-local; the old process-global `OnceLock` that once forced a
 /// fork+exec gate for make recipes is gone.)
-fn box_builtins<SE: brush_core::extensions::ShellExtensions>(
-) -> std::collections::HashMap<String, brush_core::builtins::Registration<SE>> {
+fn box_builtins<SE: brush_core::extensions::ShellExtensions>()
+-> std::collections::HashMap<String, brush_core::builtins::Registration<SE>> {
     use brush_core::builtins::{builtin, simple_builtin};
-    let mut m: std::collections::HashMap<String, brush_core::builtins::Registration<SE>>
-        = std::collections::HashMap::new();
+    let mut m: std::collections::HashMap<String, brush_core::builtins::Registration<SE>> =
+        std::collections::HashMap::new();
     // Stream/filter + info coreutils (see the macro block above for their shapes).
     m.insert("cat".to_string(), simple_builtin::<CatBuiltin, SE>());
     m.insert("head".to_string(), simple_builtin::<HeadBuiltin, SE>());
@@ -1101,8 +1408,14 @@ fn box_builtins<SE: brush_core::extensions::ShellExtensions>(
     m.insert("wc".to_string(), simple_builtin::<WcBuiltin, SE>());
     m.insert("nl".to_string(), simple_builtin::<NlBuiltin, SE>());
     m.insert("tac".to_string(), simple_builtin::<TacBuiltin, SE>());
-    m.insert("basename".to_string(), simple_builtin::<BasenameBuiltin, SE>());
-    m.insert("dirname".to_string(), simple_builtin::<DirnameBuiltin, SE>());
+    m.insert(
+        "basename".to_string(),
+        simple_builtin::<BasenameBuiltin, SE>(),
+    );
+    m.insert(
+        "dirname".to_string(),
+        simple_builtin::<DirnameBuiltin, SE>(),
+    );
     m.insert("seq".to_string(), simple_builtin::<SeqBuiltin, SE>());
     m.insert("expr".to_string(), simple_builtin::<ExprBuiltin, SE>());
     m.insert("tr".to_string(), simple_builtin::<TrBuiltin, SE>());
@@ -1121,24 +1434,41 @@ fn box_builtins<SE: brush_core::extensions::ShellExtensions>(
     m.insert("mv".to_string(), simple_builtin::<MvBuiltin, SE>());
     m.insert("ln".to_string(), simple_builtin::<LnBuiltin, SE>());
     m.insert("touch".to_string(), simple_builtin::<TouchBuiltin, SE>());
-    m.insert("readlink".to_string(), simple_builtin::<ReadlinkBuiltin, SE>());
-    m.insert("realpath".to_string(), simple_builtin::<RealpathBuiltin, SE>());
+    m.insert(
+        "readlink".to_string(),
+        simple_builtin::<ReadlinkBuiltin, SE>(),
+    );
+    m.insert(
+        "realpath".to_string(),
+        simple_builtin::<RealpathBuiltin, SE>(),
+    );
     m.insert("mktemp".to_string(), simple_builtin::<MktempBuiltin, SE>());
     m.insert("tee".to_string(), simple_builtin::<TeeBuiltin, SE>());
     m.insert("chmod".to_string(), simple_builtin::<ChmodBuiltin, SE>());
     m.insert("chown".to_string(), simple_builtin::<ChownBuiltin, SE>());
-    m.insert("install".to_string(), simple_builtin::<InstallBuiltin, SE>());
+    m.insert(
+        "install".to_string(),
+        simple_builtin::<InstallBuiltin, SE>(),
+    );
     // Embedded GNU make: keeps recursive `$(MAKE)` and configure/cmake-invoked
     // make IN-PROCESS (see MakeBuiltin) instead of re-exec'ing the engine.
     m.insert("make".to_string(), simple_builtin::<MakeBuiltin, SE>());
     m.insert("gmake".to_string(), simple_builtin::<MakeBuiltin, SE>());
     m.insert("ninja".to_string(), simple_builtin::<NinjaBuiltin, SE>());
     // BashMode shell builtins overwrite any overlapping coreutil names (highest priority).
-    m.extend(brush_builtins::default_builtins(brush_builtins::BuiltinSet::BashMode));
+    m.extend(brush_builtins::default_builtins(
+        brush_builtins::BuiltinSet::BashMode,
+    ));
     m.insert("edit".to_string(), builtin::<EditBuiltin, SE>());
     // In-box engine entry points via /proc/self/exe (no PATH shadow needed).
-    m.insert("sarun".to_string(), simple_builtin::<EngineSelfCommand, SE>());
-    m.insert("oaita".to_string(), simple_builtin::<EngineSelfCommand, SE>());
+    m.insert(
+        "sarun".to_string(),
+        simple_builtin::<EngineSelfCommand, SE>(),
+    );
+    m.insert(
+        "oaita".to_string(),
+        simple_builtin::<EngineSelfCommand, SE>(),
+    );
     // find/xargs: vendored findutils fork; always present (see find_builtin/xargs_builtin).
     let mut find = builtin::<crate::find_builtin::FindBuiltin, SE>();
     find.parser_func = Some(crate::find_builtin::parser);
@@ -1176,11 +1506,10 @@ fn box_builtins<SE: brush_core::extensions::ShellExtensions>(
     // `command -v`/`type` must return the executable from PATH (and therefore
     // an `-x`-testable path), not a bare shell-builtin name.
     for name in [
-        "cat", "head", "tail", "wc", "nl", "tac", "basename", "dirname",
-        "seq", "expr", "tr", "cut", "uniq", "sort", "uname", "nproc", "id",
-        "whoami", "cp", "mkdir", "rmdir", "rm", "mv", "ln", "touch", "readlink",
-        "realpath", "mktemp", "tee", "chmod", "chown", "install", "make", "gmake",
-        "ninja", "find", "xargs", "env", "printenv", "nice", "setsid", "nohup",
+        "cat", "head", "tail", "wc", "nl", "tac", "basename", "dirname", "seq", "expr", "tr",
+        "cut", "uniq", "sort", "uname", "nproc", "id", "whoami", "cp", "mkdir", "rmdir", "rm",
+        "mv", "ln", "touch", "readlink", "realpath", "mktemp", "tee", "chmod", "chown", "install",
+        "make", "gmake", "ninja", "find", "xargs", "env", "printenv", "nice", "setsid", "nohup",
         "sarun", "oaita",
     ] {
         if let Some(registration) = m.get_mut(name) {
@@ -1217,8 +1546,7 @@ pub(crate) fn builtin_parser(
 /// parsers used at execution time. Shell syntax supplies resolved symbolic
 /// argv; the adapter supplies ordinary relation projections.
 pub(crate) fn builtin_command_grammar() -> Result<&'static crate::prolog::RelationValue, String> {
-    static GRAMMAR: std::sync::OnceLock<crate::prolog::RelationValue> =
-        std::sync::OnceLock::new();
+    static GRAMMAR: std::sync::OnceLock<crate::prolog::RelationValue> = std::sync::OnceLock::new();
     Ok(GRAMMAR.get_or_init(|| {
         crate::prolog::RelationValue::Compound(
             "registered_relation".into(),
@@ -1271,14 +1599,22 @@ async fn build_box_shell_full(
     let cwd = cwd.unwrap_or_else(|| {
         std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"))
     });
-    let mut shell = brush_core::Shell::builder()
+    let builder = brush_core::Shell::builder()
         .sh_mode(sh_mode)
         .interactive(interactive)
         .builtins(box_builtins())
         .shell_name(shell_name.unwrap_or_default())
         .shell_args(positional.unwrap_or_default())
-        .working_dir(cwd)
-        .build().await?;
+        .working_dir(cwd);
+    // Only the trusted FUSE `inner` process adopts this process-local
+    // capability. Install it before build() can load any profile or rc file;
+    // plain Brush and re-exec'd shell shims keep NativeBoxVfs.
+    let mut shell = if let Some(box_vfs) = crate::direct_fs::current() {
+        let box_vfs: std::sync::Arc<dyn brush_core::vfs::BoxVfs> = box_vfs;
+        builder.box_vfs(box_vfs).build().await?
+    } else {
+        builder.build().await?
+    };
     // sarun: snoop self-shadowed /bin/sh scripts in-process instead of forking
     // ourselves. Inherited by every subshell clone (recipes, nested, -exec).
     shell.set_exec_interposer(std::sync::Arc::new(SnoopInterposer));
@@ -1288,8 +1624,12 @@ async fn build_box_shell_full(
 /// dup2 the box's FUSE stdout/stderr sinks onto fd 1/2 so brush and every forked
 /// binary write to the overlay. Returns false if the sinks can't be opened.
 fn redirect_stdio_to_sinks() -> bool {
-    let out = std::fs::OpenOptions::new().write(true).open("/.slopbox-stdout");
-    let err = std::fs::OpenOptions::new().write(true).open("/.slopbox-stderr");
+    let out = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/.slopbox-stdout");
+    let err = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/.slopbox-stderr");
     let (out, err) = match (out, err) {
         (Ok(o), Ok(e)) => (o, e),
         _ => {
@@ -1298,8 +1638,12 @@ fn redirect_stdio_to_sinks() -> bool {
         }
     };
     unsafe {
-        if libc::dup2(out.as_raw_fd(), 1) < 0 { return false; }
-        if libc::dup2(err.as_raw_fd(), 2) < 0 { return false; }
+        if libc::dup2(out.as_raw_fd(), 1) < 0 {
+            return false;
+        }
+        if libc::dup2(err.as_raw_fd(), 2) < 0 {
+            return false;
+        }
     }
     // out/err drop here; dup'd fd 1/2 keep the sinks open.
     true
@@ -1315,13 +1659,17 @@ fn redirect_stdio_to_sinks() -> bool {
 /// was unwrapped by script_from_argv and the bash-ness dropped.
 pub(crate) fn shell_name_from_argv(cmd: &[String]) -> &'static str {
     let base = std::path::Path::new(&cmd[0])
-        .file_name().and_then(|s| s.to_str()).unwrap_or(&cmd[0]);
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(&cmd[0]);
     if base == "bash" { "bash" } else { "sh" }
 }
 
 pub(crate) fn script_from_argv(cmd: &[String]) -> String {
     let base = std::path::Path::new(&cmd[0])
-        .file_name().and_then(|s| s.to_str()).unwrap_or(&cmd[0]);
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(&cmd[0]);
     if matches!(base, "sh" | "bash" | "dash" | "brush") {
         if let Some(pos) = cmd.iter().position(|a| a == "-c") {
             if let Some(script) = cmd.get(pos + 1) {
@@ -1330,18 +1678,29 @@ pub(crate) fn script_from_argv(cmd: &[String]) -> String {
         }
     }
     // Not a `sh -c` form: reconstruct with quoting so brush sees the same words.
-    cmd.iter().map(|w| shell_quote(w)).collect::<Vec<_>>().join(" ")
+    cmd.iter()
+        .map(|w| shell_quote(w))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// POSIX single-quote escaping: wrap in `'…'`, escaping `'` as `'\''`.
 /// Safe alnum/punct words pass through unquoted.
 fn shell_quote(w: &str) -> String {
-    let safe = !w.is_empty() && w.chars().all(|c|
-        c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | '=' | ':' | '+'));
-    if safe { return w.to_string(); }
+    let safe = !w.is_empty()
+        && w.chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | '=' | ':' | '+')
+        });
+    if safe {
+        return w.to_string();
+    }
     let mut s = String::from("'");
     for c in w.chars() {
-        if c == '\'' { s.push_str("'\\''"); } else { s.push(c); }
+        if c == '\'' {
+            s.push_str("'\\''");
+        } else {
+            s.push(c);
+        }
     }
     s.push('\'');
     s
@@ -1387,27 +1746,37 @@ fn pipeline_out_targets(pl: &brush_parser::ast::Pipeline) -> Vec<String> {
     let mut out = vec![];
     for cmd in &pl.seq {
         if let Command::Simple(s) = cmd {
-            if let Some(p) = &s.prefix { collect_out_targets(&p.0, &mut out); }
-            if let Some(suf) = &s.suffix { collect_out_targets(&suf.0, &mut out); }
+            if let Some(p) = &s.prefix {
+                collect_out_targets(&p.0, &mut out);
+            }
+            if let Some(suf) = &s.suffix {
+                collect_out_targets(&suf.0, &mut out);
+            }
         }
     }
     out
 }
 
-fn collect_out_targets(items: &[brush_parser::ast::CommandPrefixOrSuffixItem],
-                       out: &mut Vec<String>) {
+fn collect_out_targets(
+    items: &[brush_parser::ast::CommandPrefixOrSuffixItem],
+    out: &mut Vec<String>,
+) {
     use brush_parser::ast::CommandPrefixOrSuffixItem as It;
-    use brush_parser::ast::{IoRedirect, IoFileRedirectKind as K, IoFileRedirectTarget as T};
+    use brush_parser::ast::{IoFileRedirectKind as K, IoFileRedirectTarget as T, IoRedirect};
     for it in items {
         let It::IoRedirect(io) = it else { continue };
         match io {
             IoRedirect::File(_, kind, T::Filename(w)) => {
                 if matches!(kind, K::Write | K::Append | K::Clobber | K::ReadAndWrite) {
-                    if let Some(p) = literal_word(w) { out.push(p); }
+                    if let Some(p) = literal_word(w) {
+                        out.push(p);
+                    }
                 }
             }
             IoRedirect::OutputAndError(w, _) => {
-                if let Some(p) = literal_word(w) { out.push(p); }
+                if let Some(p) = literal_word(w) {
+                    out.push(p);
+                }
             }
             _ => {}
         }
@@ -1417,14 +1786,20 @@ fn collect_out_targets(items: &[brush_parser::ast::CommandPrefixOrSuffixItem],
 /// Return the word as a literal path string if it needs no expansion; else `None`.
 fn literal_word(w: &brush_parser::ast::Word) -> Option<String> {
     let s = w.to_string();
-    if s.is_empty() || s.chars().any(|c| matches!(c, '$' | '`' | '*' | '?' | '[' | '~')) {
+    if s.is_empty()
+        || s.chars()
+            .any(|c| matches!(c, '$' | '`' | '*' | '?' | '[' | '~'))
+    {
         return None;
     }
     Some(s)
 }
 
-fn scan_items(items: &[brush_parser::ast::CommandPrefixOrSuffixItem],
-              words: &mut Vec<String>, redirects: &mut usize) {
+fn scan_items(
+    items: &[brush_parser::ast::CommandPrefixOrSuffixItem],
+    words: &mut Vec<String>,
+    redirects: &mut usize,
+) {
     use brush_parser::ast::CommandPrefixOrSuffixItem as It;
     for it in items {
         match it {
@@ -1443,9 +1818,15 @@ fn stage_record(cmd: &brush_parser::ast::Command) -> Value {
         ast::Command::Simple(s) => {
             let mut words: Vec<String> = vec![];
             let mut redirects = 0usize;
-            if let Some(p) = &s.prefix { scan_items(&p.0, &mut words, &mut redirects); }
-            if let Some(w) = &s.word_or_name { words.push(w.to_string()); }
-            if let Some(suf) = &s.suffix { scan_items(&suf.0, &mut words, &mut redirects); }
+            if let Some(p) = &s.prefix {
+                scan_items(&p.0, &mut words, &mut redirects);
+            }
+            if let Some(w) = &s.word_or_name {
+                words.push(w.to_string());
+            }
+            if let Some(suf) = &s.suffix {
+                scan_items(&suf.0, &mut words, &mut redirects);
+            }
             json!({"kind": "simple", "words": words, "redirects": redirects})
         }
         ast::Command::Compound(_, redirs) => json!({
@@ -1467,13 +1848,17 @@ fn send_prov(conn_fd: i32, rec: &Value) {
     let payload = match serde_json::to_vec(rec) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("sarun-engine brush: dropping provenance frame, \
-                       JSON serialize failed: {e}");
+            eprintln!(
+                "sarun-engine brush: dropping provenance frame, \
+                       JSON serialize failed: {e}"
+            );
             return;
         }
     };
     let frame = crate::frames::encode(crate::frames::FRAME_PROV, &payload);
-    unsafe { libc::write(conn_fd, frame.as_ptr().cast(), frame.len()); }
+    unsafe {
+        libc::write(conn_fd, frame.as_ptr().cast(), frame.len());
+    }
 }
 
 /// Box body for `-b` brush shells. Returns the exit code. Errors are visible on
@@ -1491,8 +1876,13 @@ pub fn inner_brush(conn_fd: i32, cmd: Vec<String>) -> i32 {
     let pidfd = crate::runner::pidfd_open_pub(std::process::id() as i32);
     if pidfd >= 0 {
         crate::runner::send_frame_pub(
-            conn_fd, &crate::frames::encode(crate::frames::FRAME_MUTE, &[]), Some(pidfd));
-        unsafe { libc::close(pidfd); }
+            conn_fd,
+            &crate::frames::encode(crate::frames::FRAME_MUTE, &[]),
+            Some(pidfd),
+        );
+        unsafe {
+            libc::close(pidfd);
+        }
     }
     // ECHO reader: replays captured bytes to saved real fd 1/2 (live output).
     // Stops on ECHO_DONE or channel close.
@@ -1506,9 +1896,10 @@ pub fn inner_brush(conn_fd: i32, cmd: Vec<String>) -> i32 {
             // recvmsg (not read) so SCM_RIGHTS fds from FRAME_CONN reach the broker;
             // one fd per recvmsg, associated with the first FRAME_CONN in the batch.
             let mut got_fd: Option<i32> = None;
-            let n = crate::runner::recv_box_frame_bytes_pub(
-                rfd, &mut tmp, &mut got_fd);
-            if n <= 0 { break; }
+            let n = crate::runner::recv_box_frame_bytes_pub(rfd, &mut tmp, &mut got_fd);
+            if n <= 0 {
+                break;
+            }
             buf.extend_from_slice(&tmp[..n as usize]);
             let (frames, used) = crate::frames::decode(&buf);
             buf.drain(..used);
@@ -1521,14 +1912,19 @@ pub fn inner_brush(conn_fd: i32, cmd: Vec<String>) -> i32 {
                 }
                 if ft == crate::frames::FRAME_ECHO && !payload.is_empty() {
                     let realfd = if payload[0] == 1 { real_err } else { real_out };
-                    unsafe { libc::write(realfd, payload[1..].as_ptr().cast(),
-                                         payload.len() - 1); }
+                    unsafe {
+                        libc::write(realfd, payload[1..].as_ptr().cast(), payload.len() - 1);
+                    }
                 } else if ft == crate::frames::FRAME_ECHO_DONE {
                     done2.store(true, std::sync::atomic::Ordering::SeqCst);
                     return;
                 }
             }
-            if let Some(fd) = got_fd { unsafe { libc::close(fd); } }
+            if let Some(fd) = got_fd {
+                unsafe {
+                    libc::close(fd);
+                }
+            }
         }
     });
 
@@ -1541,22 +1937,31 @@ pub fn inner_brush(conn_fd: i32, cmd: Vec<String>) -> i32 {
     // the default 2 MiB tokio worker stack.
     let rt = tokio::runtime::Builder::new_multi_thread()
         .thread_stack_size(64 * 1024 * 1024)
-        .enable_all().build();
+        .enable_all()
+        .build();
     let code = match rt {
         Ok(rt) => rt.block_on(run_brush(conn_fd, script, sh_mode)),
-        Err(e) => { eprintln!("sarun-engine inner: -b runtime: {e}"); 127 }
+        Err(e) => {
+            eprintln!("sarun-engine inner: -b runtime: {e}");
+            127
+        }
     };
 
     // 3. Teardown: restore fd 1/2 to the saved terminal so late eprints surface;
     //    wait for the ECHO reader to drain (triggers ECHO_DONE), then UNMUTE.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    unsafe { libc::dup2(real_out, 1); libc::dup2(real_err, 2); }
-    while !done.load(std::sync::atomic::Ordering::SeqCst)
-        && std::time::Instant::now() < deadline {
+    unsafe {
+        libc::dup2(real_out, 1);
+        libc::dup2(real_err, 2);
+    }
+    while !done.load(std::sync::atomic::Ordering::SeqCst) && std::time::Instant::now() < deadline {
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
     crate::runner::send_frame_pub(
-        conn_fd, &crate::frames::encode(crate::frames::FRAME_UNMUTE, &[]), None);
+        conn_fd,
+        &crate::frames::encode(crate::frames::FRAME_UNMUTE, &[]),
+        None,
+    );
     let _ = reader;
     code
 }
@@ -1573,7 +1978,9 @@ pub fn inner_brush(conn_fd: i32, cmd: Vec<String>) -> i32 {
 pub fn is_brush_sh_invocation() -> bool {
     let arg0 = std::env::args().next().unwrap_or_default();
     let base = std::path::Path::new(&arg0)
-        .file_name().and_then(|s| s.to_str()).unwrap_or("");
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
     matches!(base, "sh" | "bash" | "dash")
 }
 
@@ -1589,7 +1996,10 @@ pub fn cli(arguments: &[String]) -> i32 {
     let invocation = match crate::parser::parse_argv(&source, &crate::parser::EmptyContext) {
         crate::parser::ParseResult::Invocation(invocation)
             if invocation.action == "brush"
-                && invocation.target == crate::parser::ActionTarget::CliLocal => invocation,
+                && invocation.target == crate::parser::ActionTarget::CliLocal =>
+        {
+            invocation
+        }
         crate::parser::ParseResult::BackendError(error) => {
             eprintln!("sarun brush: parser: {error}");
             return 2;
@@ -1635,7 +2045,10 @@ pub fn brush_sh(argv: &[String]) -> i32 {
     crate::selfbt::install();
     let arg0 = &argv[0];
     let base = std::path::Path::new(arg0)
-        .file_name().and_then(|s| s.to_str()).unwrap_or("sh").to_string();
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("sh")
+        .to_string();
     // Do NOT touch fd 1/2: the shim inherits them from its caller (typically
     // make/system()), which already point at the top-level inner_brush's FUSE
     // sinks. Re-redirecting would double-record and stamp writes to the wrong
@@ -1656,42 +2069,59 @@ pub fn brush_sh(argv: &[String]) -> i32 {
     // Parse leading flags. brush-core honors -e/-u/-x/-o NAME (applied via `set`).
     // -l/--login is not supported inside a box — error visibly.
     let mut idx = 1;
-    let mut set_flags: Vec<String> = vec![];   // e.g. ["-e","-u","-x"]
-    let mut set_o: Vec<String> = vec![];       // names from `-o NAME`
-    let mut unset_o: Vec<String> = vec![];     // names from `+o NAME`
+    let mut set_flags: Vec<String> = vec![]; // e.g. ["-e","-u","-x"]
+    let mut set_o: Vec<String> = vec![]; // names from `-o NAME`
+    let mut unset_o: Vec<String> = vec![]; // names from `+o NAME`
     let mut have_c = false;
     let mut interactive = false;
     while idx < argv.len() {
         let a = &argv[idx];
-        if a == "--" { idx += 1; break; }
-        if a == "-c" { have_c = true; idx += 1; break; }
+        if a == "--" {
+            idx += 1;
+            break;
+        }
+        if a == "-c" {
+            have_c = true;
+            idx += 1;
+            break;
+        }
         if a == "-o" || a == "+o" {
             let Some(name) = argv.get(idx + 1) else {
                 eprintln!("sarun-engine brush-sh: {a} requires an option name");
                 return 2;
             };
-            if a == "-o" { set_o.push(name.clone()); }
-            else { unset_o.push(name.clone()); }
-            idx += 2; continue;
+            if a == "-o" {
+                set_o.push(name.clone());
+            } else {
+                unset_o.push(name.clone());
+            }
+            idx += 2;
+            continue;
         }
         // -i/--interactive: enter the brush-interactive reedline REPL.
         if a == "-i" || a == "--interactive" {
             interactive = true;
-            idx += 1; continue;
+            idx += 1;
+            continue;
         }
         if a == "-l" || a == "--login" {
             eprintln!("sarun-engine brush-sh: {a} not supported inside a brush box");
             return 2;
         }
         // Grouped flags like `-eux`; `-` alone is the stdin marker, ends flags.
-        if a == "-" { break; }
+        if a == "-" {
+            break;
+        }
         if let Some(rest) = a.strip_prefix('-') {
             // Each char must be a known POSIX-ish flag.
             for c in rest.chars() {
                 match c {
-                    'e' | 'u' | 'x' | 'v' | 'f' | 'n' | 'h' | 'm' | 'b' | 'C' | 'a' =>
-                        set_flags.push(format!("-{c}")),
-                    'c' => { have_c = true; }
+                    'e' | 'u' | 'x' | 'v' | 'f' | 'n' | 'h' | 'm' | 'b' | 'C' | 'a' => {
+                        set_flags.push(format!("-{c}"))
+                    }
+                    'c' => {
+                        have_c = true;
+                    }
                     _ => {
                         eprintln!("sarun-engine brush-sh: unsupported flag -{c}");
                         return 2;
@@ -1699,32 +2129,38 @@ pub fn brush_sh(argv: &[String]) -> i32 {
                 }
             }
             idx += 1;
-            if have_c { break; }  // -c terminates flag parse
+            if have_c {
+                break;
+            } // -c terminates flag parse
             continue;
         }
         if let Some(rest) = a.strip_prefix('+') {
             for c in rest.chars() {
                 match c {
-                    'e' | 'u' | 'x' | 'v' | 'f' | 'n' | 'h' | 'm' | 'b' | 'C' | 'a' =>
-                        set_flags.push(format!("+{c}")),
+                    'e' | 'u' | 'x' | 'v' | 'f' | 'n' | 'h' | 'm' | 'b' | 'C' | 'a' => {
+                        set_flags.push(format!("+{c}"))
+                    }
                     _ => {
                         eprintln!("sarun-engine brush-sh: unsupported flag +{c}");
                         return 2;
                     }
                 }
             }
-            idx += 1; continue;
+            idx += 1;
+            continue;
         }
         // First non-flag operand: stop flag parsing here.
         break;
     }
 
     // Interactive REPL form: `sh -i` (no -c, no script path).
-    if interactive && have_c == false
-        && idx >= argv.len()  // no script path follows the flags
+    if interactive && have_c == false && idx >= argv.len()
+    // no script path follows the flags
     {
         let rt = match tokio::runtime::Builder::new_multi_thread()
-            .enable_all().build() {
+            .enable_all()
+            .build()
+        {
             Ok(rt) => rt,
             Err(e) => {
                 eprintln!("sarun-engine brush-sh: runtime: {e}");
@@ -1733,7 +2169,12 @@ pub fn brush_sh(argv: &[String]) -> i32 {
         };
         let bash_mode = base == "bash";
         return rt.block_on(run_brush_interactive(
-            base.clone(), set_flags, set_o, unset_o, bash_mode));
+            base.clone(),
+            set_flags,
+            set_o,
+            unset_o,
+            bash_mode,
+        ));
     }
 
     // Discriminate `-c SCRIPT` vs. script-file forms.
@@ -1755,7 +2196,11 @@ pub fn brush_sh(argv: &[String]) -> i32 {
         };
         idx += 1;
         let name = argv.get(idx).cloned().unwrap_or(base.clone());
-        let args = if idx < argv.len() { argv[idx + 1..].to_vec() } else { vec![] };
+        let args = if idx < argv.len() {
+            argv[idx + 1..].to_vec()
+        } else {
+            vec![]
+        };
         script_src = s;
         dollar0 = name;
         positional = args;
@@ -1774,11 +2219,15 @@ pub fn brush_sh(argv: &[String]) -> i32 {
     } else {
         // No -c and no script-file. We refuse to enter an interactive REPL
         // inside a box (out of scope here).
-        eprintln!("sarun-engine brush-sh: requires -c SCRIPT or a script path \
-                   (interactive nested shell is out of scope inside a brush box)");
-        eprintln!("hint: for an interactive shell in a fresh box, start it from \
+        eprintln!(
+            "sarun-engine brush-sh: requires -c SCRIPT or a script path \
+                   (interactive nested shell is out of scope inside a brush box)"
+        );
+        eprintln!(
+            "hint: for an interactive shell in a fresh box, start it from \
                    the HOST instead: `sarun run -b --` (in the UI: Pty+ → \
-                   \"Shell in a new box\")");
+                   \"Shell in a new box\")"
+        );
         return 2;
     }
 
@@ -1794,22 +2243,29 @@ pub fn brush_sh(argv: &[String]) -> i32 {
     // same reason as run_brush (kati recursion on huge Makefiles).
     let rt = tokio::runtime::Builder::new_multi_thread()
         .thread_stack_size(64 * 1024 * 1024)
-        .enable_all().build();
+        .enable_all()
+        .build();
     let rt = match rt {
         Ok(rt) => rt,
-        Err(e) => { eprintln!("sarun-engine brush-sh: runtime: {e}"); return 127; }
+        Err(e) => {
+            eprintln!("sarun-engine brush-sh: runtime: {e}");
+            return 127;
+        }
     };
     // Invoked as `bash` → BASH mode; `sh`/`dash` → POSIX sh_mode (B).
     let bash_mode = base == "bash";
-    rt.block_on(run_brush_script(script_src, dollar0, positional,
-                                  set_flags, set_o, unset_o, bash_mode))
+    rt.block_on(run_brush_script(
+        script_src, dollar0, positional, set_flags, set_o, unset_o, bash_mode,
+    ))
 }
 
 /// Send one `brush_prov_nested` message per pipeline (with `nested:true`);
 /// called per-pipeline by run_brush_script so the engine sees provenance in
 /// execution order even for multi-command recipes.
 fn send_nested_pipeline_records(records: Vec<Value>) {
-    if records.is_empty() { return; }
+    if records.is_empty() {
+        return;
+    }
     let msg = json!({"type": "brush_prov_nested", "records": records});
     crate::runner::send_nested_prov(format!("{msg}\n").as_bytes());
 }
@@ -1818,7 +2274,9 @@ fn send_nested_pipeline_records(records: Vec<Value>) {
 /// stamps done_ts + exit_code on the pipelines with these uids, so a reader can
 /// show per-pipeline wall time and tell running from finished.
 fn send_pipeline_done(uids: &[u64], code: i32, done_ts: f64) {
-    if uids.is_empty() { return; }
+    if uids.is_empty() {
+        return;
+    }
     let msg = json!({"type": "brush_prov_done", "uids": uids, "code": code, "done_ts": done_ts});
     crate::runner::send_nested_prov(format!("{msg}\n").as_bytes());
 }
@@ -1828,7 +2286,9 @@ fn send_pipeline_done(uids: &[u64], code: i32, done_ts: f64) {
 /// flowed through fd 2 → FUSE normally for live backread; this message tells
 /// the engine to UPDATE those rows' brush_pipeline_id to the correct value.
 fn send_recipe_fixup(uids: &[u64], start_ts: f64) {
-    if uids.is_empty() { return; }
+    if uids.is_empty() {
+        return;
+    }
     let msg = json!({
         "type": "recipe_fixup",
         "uids": uids,
@@ -1844,28 +2304,51 @@ fn send_recipe_fixup(uids: &[u64], start_ts: f64) {
 /// exact recipe cmdline == the stored cmd). `phase` is "start" or "done";
 /// `code` is only meaningful for "done". Best-effort (same broker path as the
 /// per-pipeline provenance); a failure leaves the recipe running unchanged.
-pub fn send_build_edge_state(out: Option<&str>, cmd: Option<&str>, phase: &str, code: i32,
-                             excerpt: Option<&str>) {
+pub fn send_build_edge_state(
+    out: Option<&str>,
+    cmd: Option<&str>,
+    phase: &str,
+    code: i32,
+    excerpt: Option<&str>,
+) {
     let mut m = json!({"type": "build_edge_state", "state": phase, "ts": now_secs()});
-    if let Some(o) = out { m["out"] = json!(o); }
-    if let Some(c) = cmd { m["cmd"] = json!(c); }
-    if phase == "done" { m["code"] = json!(code); }
-    if let Some(x) = excerpt { m["excerpt"] = json!(x); }
+    if let Some(o) = out {
+        m["out"] = json!(o);
+    }
+    if let Some(c) = cmd {
+        m["cmd"] = json!(c);
+    }
+    if phase == "done" {
+        m["code"] = json!(code);
+    }
+    if let Some(x) = excerpt {
+        m["excerpt"] = json!(x);
+    }
     crate::runner::send_nested_prov(format!("{m}\n").as_bytes());
 }
 
 /// Build the brush shell, apply set-flags, parse, and execute the script.
 /// Mirrors run_brush: same parse/execute discipline and visible-failure rule.
-async fn run_brush_script(script: String, shell_name: String,
-                          positional: Vec<String>,
-                          set_flags: Vec<String>, set_o: Vec<String>,
-                          unset_o: Vec<String>, bash_mode: bool) -> i32 {
+async fn run_brush_script(
+    script: String,
+    shell_name: String,
+    positional: Vec<String>,
+    set_flags: Vec<String>,
+    set_o: Vec<String>,
+    unset_o: Vec<String>,
+    bash_mode: bool,
+) -> i32 {
     // Shim inherits cwd from execve; pass it explicitly in case the builder
     // default ever changes.
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
     // sh_mode=!bash_mode: sh/dash → POSIX; bash → bashisms (B).
-    let shell_res = build_box_shell(!bash_mode, Some(shell_name.clone()),
-                                    Some(positional.clone()), Some(cwd)).await;
+    let shell_res = build_box_shell(
+        !bash_mode,
+        Some(shell_name.clone()),
+        Some(positional.clone()),
+        Some(cwd),
+    )
+    .await;
     let mut shell = match shell_res {
         Ok(s) => s,
         Err(e) => {
@@ -1876,9 +2359,18 @@ async fn run_brush_script(script: String, shell_name: String,
     // Apply flags via explicit `set`; failures are visible (never silently dropped).
     if !set_flags.is_empty() || !set_o.is_empty() || !unset_o.is_empty() {
         let mut set_cmd = String::from("set");
-        for f in &set_flags { set_cmd.push(' '); set_cmd.push_str(f); }
-        for n in &set_o    { set_cmd.push_str(" -o "); set_cmd.push_str(n); }
-        for n in &unset_o  { set_cmd.push_str(" +o "); set_cmd.push_str(n); }
+        for f in &set_flags {
+            set_cmd.push(' ');
+            set_cmd.push_str(f);
+        }
+        for n in &set_o {
+            set_cmd.push_str(" -o ");
+            set_cmd.push_str(n);
+        }
+        for n in &unset_o {
+            set_cmd.push_str(" +o ");
+            set_cmd.push_str(n);
+        }
         let src = brush_core::SourceInfo {
             source: "<brush-sh flags>".into(),
             start: None,
@@ -1893,8 +2385,10 @@ async fn run_brush_script(script: String, shell_name: String,
     let prog = match shell.parse_string(script.clone()) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("sarun-engine brush-sh: cannot parse this script \
-                       (NO /bin/sh fallback): {e}");
+            eprintln!(
+                "sarun-engine brush-sh: cannot parse this script \
+                       (NO /bin/sh fallback): {e}"
+            );
             return 2;
         }
     };
@@ -2004,7 +2498,9 @@ fn activity_desc(complete: &brush_parser::ast::CompoundList) -> String {
     s = s.split_whitespace().collect::<Vec<_>>().join(" ");
     if s.len() > 120 {
         let mut cut = 120;
-        while !s.is_char_boundary(cut) { cut -= 1; }
+        while !s.is_char_boundary(cut) {
+            cut -= 1;
+        }
         s.truncate(cut);
         s.push('…');
     }
@@ -2022,12 +2518,15 @@ async fn run_nested_pipelines(
     for complete in prog.complete_commands {
         let spawn_ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs_f64()).unwrap_or(0.0);
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
         let (recs, frame_uid, uids) = stamp_pipeline_records(&complete, &mut seq, spawn_ts, true);
         all_uids.extend_from_slice(&uids);
         send_nested_pipeline_records(recs);
         let _act = kati::fileutil::ActivityGuard::new(activity_desc(&complete));
-        let one = brush_parser::ast::Program { complete_commands: vec![complete] };
+        let one = brush_parser::ast::Program {
+            complete_commands: vec![complete],
+        };
         let prev_uid = set_current_pipeline_uid(frame_uid);
         let r = shell.run_program(one, params).await;
         set_current_pipeline_uid(prev_uid);
@@ -2040,8 +2539,10 @@ async fn run_nested_pipelines(
                 }
             }
             Err(e) => {
-                eprintln!("sarun-engine brush-sh: execution error \
-                           (NO /bin/sh fallback): {e}");
+                eprintln!(
+                    "sarun-engine brush-sh: execution error \
+                           (NO /bin/sh fallback): {e}"
+                );
                 return (1, all_uids);
             }
         }
@@ -2144,7 +2645,9 @@ fn shebang_interp(path: &std::path::Path) -> Option<std::path::PathBuf> {
     if token.is_empty() {
         return None;
     }
-    Some(std::path::PathBuf::from(std::ffi::OsStr::from_bytes(&token)))
+    Some(std::path::PathBuf::from(std::ffi::OsStr::from_bytes(
+        &token,
+    )))
 }
 
 /// A snoopable shell invocation extracted from a self-exe shell argv.
@@ -2175,16 +2678,27 @@ fn parse_snoop(resolved: &std::path::Path, argv: &[String]) -> Option<Snoop> {
     let direct = is_self_exe(resolved);
     if direct {
         let base = std::path::Path::new(arg0)
-            .file_name().and_then(|s| s.to_str()).unwrap_or("");
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
         let bash_mode = base == "bash";
         let mut i = 1usize;
         let mut set_flags = vec![];
         let mut have_c = false;
         while i < argv.len() {
             let a = &argv[i];
-            if a == "--" { i += 1; break; }
-            if a == "-" { break; } // stdin marker: ends flags, operand follows
-            if a == "-c" { have_c = true; i += 1; break; }
+            if a == "--" {
+                i += 1;
+                break;
+            }
+            if a == "-" {
+                break;
+            } // stdin marker: ends flags, operand follows
+            if a == "-c" {
+                have_c = true;
+                i += 1;
+                break;
+            }
             // `-o NAME` / `+o NAME`: a named option (pipefail, errexit, …). Take
             // the name and replay it verbatim via `set` (the two tokens become
             // `set … -o pipefail`). Missing name → decline (fork; brush_sh errors).
@@ -2197,15 +2711,23 @@ fn parse_snoop(resolved: &std::path::Path, argv: &[String]) -> Option<Snoop> {
             }
             if let Some(rest) = a.strip_prefix('-') {
                 if rest.is_empty()
-                    || !rest.chars().all(|c| c == 'c' || SNOOP_SET_FLAGS.contains(c))
+                    || !rest
+                        .chars()
+                        .all(|c| c == 'c' || SNOOP_SET_FLAGS.contains(c))
                 {
                     return None; // an option we don't model precisely → fork
                 }
                 for c in rest.chars() {
-                    if c == 'c' { have_c = true; } else { set_flags.push(format!("-{c}")); }
+                    if c == 'c' {
+                        have_c = true;
+                    } else {
+                        set_flags.push(format!("-{c}"));
+                    }
                 }
                 i += 1;
-                if have_c { break; }
+                if have_c {
+                    break;
+                }
                 continue;
             }
             // `+`-prefixed bundle (`+e`, `+x`, …): turn options OFF via `set +X`.
@@ -2213,7 +2735,9 @@ fn parse_snoop(resolved: &std::path::Path, argv: &[String]) -> Option<Snoop> {
                 if rest.is_empty() || !rest.chars().all(|c| SNOOP_SET_FLAGS.contains(c)) {
                     return None;
                 }
-                for c in rest.chars() { set_flags.push(format!("+{c}")); }
+                for c in rest.chars() {
+                    set_flags.push(format!("+{c}"));
+                }
                 i += 1;
                 continue;
             }
@@ -2221,12 +2745,24 @@ fn parse_snoop(resolved: &std::path::Path, argv: &[String]) -> Option<Snoop> {
         }
         if have_c {
             // popen / `sh -c -- CMD` insert a `--` terminator before SCRIPT.
-            if argv.get(i).map(String::as_str) == Some("--") { i += 1; }
+            if argv.get(i).map(String::as_str) == Some("--") {
+                i += 1;
+            }
             let script = argv.get(i)?.clone();
             i += 1;
             let dollar0 = argv.get(i).cloned().unwrap_or_else(|| arg0.clone());
-            let positional = if i < argv.len() { argv[i + 1..].to_vec() } else { vec![] };
-            return Some(Snoop { script, dollar0, positional, set_flags, bash_mode });
+            let positional = if i < argv.len() {
+                argv[i + 1..].to_vec()
+            } else {
+                vec![]
+            };
+            return Some(Snoop {
+                script,
+                dollar0,
+                positional,
+                set_flags,
+                bash_mode,
+            });
         }
         // `sh [-flags] SCRIPT [args]` — read SCRIPT from disk.
         let path = argv.get(i)?;
@@ -2336,12 +2872,7 @@ impl brush_core::commands::ExecInterposer<brush_core::extensions::DefaultShellEx
                 sub.options_mut().sh_mode = false;
             }
 
-            sub.set_snoop_identity(
-                snoop.dollar0,
-                snoop.positional,
-                synth,
-                snoop.bash_mode,
-            );
+            sub.set_snoop_identity(snoop.dollar0, snoop.positional, synth, snoop.bash_mode);
 
             // Replay simple set-flags (-e/-u/-x…) via `set`, like run_brush_script.
             if !snoop.set_flags.is_empty() {
@@ -2350,7 +2881,10 @@ impl brush_core::commands::ExecInterposer<brush_core::extensions::DefaultShellEx
                     cmd.push(' ');
                     cmd.push_str(f);
                 }
-                let src = brush_core::SourceInfo { source: "<snoop flags>".into(), start: None };
+                let src = brush_core::SourceInfo {
+                    source: "<snoop flags>".into(),
+                    start: None,
+                };
                 if sub.run_string(cmd, &src, &params).await.is_err() {
                     return Some(brush_core::ExecutionResult::new(2));
                 }
@@ -2431,16 +2965,25 @@ impl brush_interactive::SemanticCompletionProvider for BrushRelationCompletionPr
     }
 }
 
-async fn run_brush_interactive(shell_name: String,
-                               set_flags: Vec<String>, set_o: Vec<String>,
-                               unset_o: Vec<String>, bash_mode: bool) -> i32 {
+async fn run_brush_interactive(
+    shell_name: String,
+    set_flags: Vec<String>,
+    set_o: Vec<String>,
+    unset_o: Vec<String>,
+    bash_mode: bool,
+) -> i32 {
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
     // Must be built as interactive from the start — builder wires up
     // Option<History> and job-control in build(); setting it afterwards
     // leaves history=None, causing reedline DefaultHinter to panic.
-    let shell_res = build_box_shell_opt(!bash_mode, Some(shell_name.clone()),
-                                        Some(vec![]), Some(cwd),
-                                        /*interactive=*/ true).await;
+    let shell_res = build_box_shell_opt(
+        !bash_mode,
+        Some(shell_name.clone()),
+        Some(vec![]),
+        Some(cwd),
+        /*interactive=*/ true,
+    )
+    .await;
     let mut shell = match shell_res {
         Ok(s) => s,
         Err(e) => {
@@ -2451,11 +2994,21 @@ async fn run_brush_interactive(shell_name: String,
     // Apply set-flags as in run_brush_script.
     if !set_flags.is_empty() || !set_o.is_empty() || !unset_o.is_empty() {
         let mut set_cmd = String::from("set");
-        for f in &set_flags { set_cmd.push(' '); set_cmd.push_str(f); }
-        for n in &set_o    { set_cmd.push_str(" -o "); set_cmd.push_str(n); }
-        for n in &unset_o  { set_cmd.push_str(" +o "); set_cmd.push_str(n); }
+        for f in &set_flags {
+            set_cmd.push(' ');
+            set_cmd.push_str(f);
+        }
+        for n in &set_o {
+            set_cmd.push_str(" -o ");
+            set_cmd.push_str(n);
+        }
+        for n in &unset_o {
+            set_cmd.push_str(" +o ");
+            set_cmd.push_str(n);
+        }
         let src = brush_core::SourceInfo {
-            source: "<brush-sh flags>".into(), start: None,
+            source: "<brush-sh flags>".into(),
+            start: None,
         };
         let params0 = shell.default_exec_params();
         if let Err(e) = shell.run_string(set_cmd.clone(), &src, &params0).await {
@@ -2465,8 +3018,8 @@ async fn run_brush_interactive(shell_name: String,
     }
     // brush-interactive requires Arc<tokio::Mutex<>> (ShellRef) so reedline
     // helpers (completer/validator/highlighter) can clone and query the shell.
-    let shell_ref: brush_interactive::ShellRef = std::sync::Arc::new(
-        tokio::sync::Mutex::new(shell));
+    let shell_ref: brush_interactive::ShellRef =
+        std::sync::Arc::new(tokio::sync::Mutex::new(shell));
     let ui_opts = brush_interactive::UIOptions::builder().build();
     let mut backend = match brush_interactive::ReedlineInputBackend::new(
         &ui_opts,
@@ -2482,8 +3035,7 @@ async fn run_brush_interactive(shell_name: String,
         }
     };
     let opts: brush_interactive::InteractiveOptions = (&ui_opts).into();
-    let mut iash = match brush_interactive::InteractiveShell::new(
-        &shell_ref, &mut backend, &opts) {
+    let mut iash = match brush_interactive::InteractiveShell::new(&shell_ref, &mut backend, &opts) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("sarun-engine brush-sh: interactive shell init failed: {e}");
@@ -2509,15 +3061,20 @@ async fn run_brush(conn_fd: i32, script: String, sh_mode: bool) -> i32 {
     let shell_res = build_box_shell(sh_mode, None, None, None).await;
     let mut shell = match shell_res {
         Ok(s) => s,
-        Err(e) => { eprintln!("sarun-engine inner: -b brush init failed: {e}"); return 127; }
+        Err(e) => {
+            eprintln!("sarun-engine inner: -b brush init failed: {e}");
+            return 127;
+        }
     };
 
     // Parse first: enables provenance emission and surfaces parse errors visibly.
     let prog = match shell.parse_string(script.clone()) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("sarun-engine inner: -b brush cannot parse this command \
-                       (NO /bin/sh fallback): {e}");
+            eprintln!(
+                "sarun-engine inner: -b brush cannot parse this command \
+                       (NO /bin/sh fallback): {e}"
+            );
             return 2;
         }
     };
@@ -2531,12 +3088,15 @@ async fn run_brush(conn_fd: i32, script: String, sh_mode: bool) -> i32 {
     for complete in prog.complete_commands {
         let spawn_ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs_f64()).unwrap_or(0.0);
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
         let (recs, frame_uid, uids) = stamp_pipeline_records(&complete, &mut seq, spawn_ts, false);
         for rec in &recs {
             send_prov(conn_fd, rec);
         }
-        let one = brush_parser::ast::Program { complete_commands: vec![complete] };
+        let one = brush_parser::ast::Program {
+            complete_commands: vec![complete],
+        };
         let prev_uid = set_current_pipeline_uid(frame_uid);
         let r = shell.run_program(one, &params).await;
         set_current_pipeline_uid(prev_uid);
@@ -2554,8 +3114,10 @@ async fn run_brush(conn_fd: i32, script: String, sh_mode: bool) -> i32 {
                 }
             }
             Err(e) => {
-                eprintln!("sarun-engine inner: -b brush execution error \
-                           (NO /bin/sh fallback): {e}");
+                eprintln!(
+                    "sarun-engine inner: -b brush execution error \
+                           (NO /bin/sh fallback): {e}"
+                );
                 return 1;
             }
         }
@@ -2581,7 +3143,8 @@ fn n2_runtime() -> Option<&'static tokio::runtime::Runtime> {
         // kati parse recurses deeply; the default 2 MiB tokio stack overflows.
         tokio::runtime::Builder::new_multi_thread()
             .thread_stack_size(64 * 1024 * 1024)
-            .enable_all().build()
+            .enable_all()
+            .build()
             .expect("sarun-engine n2: tokio runtime")
     });
     N2_RT.get()
@@ -2609,7 +3172,9 @@ fn unwrap_sh_c(cmdline: &str) -> String {
     let words = split_words(cmdline);
     if words.len() >= 3 {
         let base = std::path::Path::new(&words[0])
-            .file_name().and_then(|s| s.to_str()).unwrap_or("");
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
         if matches!(base, "sh" | "bash" | "dash" | "brush") && words[1] == "-c" {
             return words[2].clone();
         }
@@ -2628,28 +3193,51 @@ fn split_words(s: &str) -> Vec<String> {
     while let Some(c) = chars.next() {
         match c {
             ' ' | '\t' | '\n' if !in_word => {}
-            ' ' | '\t' | '\n' => { words.push(std::mem::take(&mut cur)); in_word = false; }
+            ' ' | '\t' | '\n' => {
+                words.push(std::mem::take(&mut cur));
+                in_word = false;
+            }
             '\'' => {
                 in_word = true;
-                for q in chars.by_ref() { if q == '\'' { break; } cur.push(q); }
+                for q in chars.by_ref() {
+                    if q == '\'' {
+                        break;
+                    }
+                    cur.push(q);
+                }
             }
             '"' => {
                 in_word = true;
                 while let Some(q) = chars.next() {
-                    if q == '"' { break; }
+                    if q == '"' {
+                        break;
+                    }
                     if q == '\\' {
                         if let Some(&n) = chars.peek() {
-                            if matches!(n, '"' | '\\' | '$' | '`') { cur.push(chars.next().unwrap()); continue; }
+                            if matches!(n, '"' | '\\' | '$' | '`') {
+                                cur.push(chars.next().unwrap());
+                                continue;
+                            }
                         }
                     }
                     cur.push(q);
                 }
             }
-            '\\' => { in_word = true; if let Some(n) = chars.next() { cur.push(n); } }
-            _ => { in_word = true; cur.push(c); }
+            '\\' => {
+                in_word = true;
+                if let Some(n) = chars.next() {
+                    cur.push(n);
+                }
+            }
+            _ => {
+                in_word = true;
+                cur.push(c);
+            }
         }
     }
-    if in_word { words.push(cur); }
+    if in_word {
+        words.push(cur);
+    }
     words
 }
 
@@ -2735,9 +3323,7 @@ pub(crate) fn install_shell_var_recorder() {
     ONCE.call_once(|| {
         brush_core::interp::install_assign_observer(std::sync::Arc::new(
             |name, value, exported, rhs| {
-                if !crate::katirun::vartrace_enabled()
-                    || SUPPRESS_VAR_RECORD.with(|c| c.get())
-                {
+                if !crate::katirun::vartrace_enabled() || SUPPRESS_VAR_RECORD.with(|c| c.get()) {
                     return;
                 }
                 let uid = current_pipeline_uid();
@@ -2833,7 +3419,10 @@ pub fn run_recipe_in_process_prefixed(
     // Merged stdout+stderr pipe (n2's posix contract: one pipe, both fds on it).
     let (mut reader, writer) = match std::io::pipe() {
         Ok(p) => p,
-        Err(e) => { output_cb(format!("sarun-engine n2: pipe: {e}\n").as_bytes()); return 127; }
+        Err(e) => {
+            output_cb(format!("sarun-engine n2: pipe: {e}\n").as_bytes());
+            return 127;
+        }
     };
     let recipe_start_ts = now_secs();
     let is_inherit = matches!(stderr, RecipeStderr::Inherit);
@@ -2855,91 +3444,105 @@ pub fn run_recipe_in_process_prefixed(
     let exec = std::thread::Builder::new()
         .stack_size(64 * 1024 * 1024)
         .spawn(move || {
-        rt.block_on(async move {
-            // Seed this worker thread's current pipeline from the captured parent.
-            set_current_pipeline_uid(parent_uid);
-            set_box_recipe_edge(recipe_edge);
-            let mut shell = match build_box_shell_full(
-                true, None, None, Some(cwd), false,
-            ).await {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("sarun-engine n2: brush init failed: {e}");
-                    return (127, vec![]);
+            rt.block_on(async move {
+                // Seed this worker thread's current pipeline from the captured parent.
+                set_current_pipeline_uid(parent_uid);
+                set_box_recipe_edge(recipe_edge);
+                let mut shell = match build_box_shell_full(true, None, None, Some(cwd), false).await
+                {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("sarun-engine n2: brush init failed: {e}");
+                        return (127, vec![]);
+                    }
+                };
+                // A make/ninja recipe is a fresh logical `/bin/sh` process even
+                // though Sarun executes it inside the engine. In particular,
+                // `exec cmd` must terminate this recipe shell after `cmd`; it must
+                // never execve over the engine and abandon the enclosing graph.
+                shell.mark_as_embedded_subshell();
+                // A recipe inherits the stdin of the make invocation which owns
+                // it. For an embedded make in `producer | make`, that is Brush's
+                // logical pipe reader, not the engine process's terminal fd 0.
+                if let Some(fd) = stdin {
+                    shell.open_files_mut().set_fd(
+                        0,
+                        brush_core::openfiles::OpenFile::from(std::fs::File::from(fd)),
+                    );
                 }
-            };
-            // A make/ninja recipe is a fresh logical `/bin/sh` process even
-            // though Sarun executes it inside the engine. In particular,
-            // `exec cmd` must terminate this recipe shell after `cmd`; it must
-            // never execve over the engine and abandon the enclosing graph.
-            shell.mark_as_embedded_subshell();
-            // A recipe inherits the stdin of the make invocation which owns
-            // it. For an embedded make in `producer | make`, that is Brush's
-            // logical pipe reader, not the engine process's terminal fd 0.
-            if let Some(fd) = stdin {
-                shell.open_files_mut().set_fd(
-                    0,
-                    brush_core::openfiles::OpenFile::from(std::fs::File::from(fd)),
-                );
-            }
-            match stderr {
-                RecipeStderr::Merge => {
-                    let w2 = match writer.try_clone() {
-                        Ok(w) => w,
-                        Err(e) => { eprintln!("sarun-engine n2: pipe clone: {e}"); return (127, vec![]); }
-                    };
-                    shell.open_files_mut().set_fd(2, brush_core::openfiles::OpenFile::from(w2));
-                }
-                RecipeStderr::Inherit => {
-                    // Leave fd 2 on the shell default (box's real fd 2 = FUSE
-                    // stderr sink). Stderr flows through the existing capture
-                    // path for live backread. Attribution is fixed retroactively
-                    // after the recipe finishes (send_recipe_fixup).
-                }
-                RecipeStderr::Null => {
-                    if let Ok(devnull) = std::fs::OpenOptions::new().write(true).open("/dev/null") {
-                        shell.open_files_mut()
-                            .set_fd(2, brush_core::openfiles::OpenFile::from(devnull));
+                match stderr {
+                    RecipeStderr::Merge => {
+                        let w2 = match writer.try_clone() {
+                            Ok(w) => w,
+                            Err(e) => {
+                                eprintln!("sarun-engine n2: pipe clone: {e}");
+                                return (127, vec![]);
+                            }
+                        };
+                        shell
+                            .open_files_mut()
+                            .set_fd(2, brush_core::openfiles::OpenFile::from(w2));
+                    }
+                    RecipeStderr::Inherit => {
+                        // Leave fd 2 on the shell default (box's real fd 2 = FUSE
+                        // stderr sink). Stderr flows through the existing capture
+                        // path for live backread. Attribution is fixed retroactively
+                        // after the recipe finishes (send_recipe_fixup).
+                    }
+                    RecipeStderr::Null => {
+                        if let Ok(devnull) =
+                            std::fs::OpenOptions::new().write(true).open("/dev/null")
+                        {
+                            shell
+                                .open_files_mut()
+                                .set_fd(2, brush_core::openfiles::OpenFile::from(devnull));
+                        }
                     }
                 }
-            }
-            shell.open_files_mut().set_fd(1, brush_core::openfiles::OpenFile::from(writer));
-            // Apply the make's export prefix to THIS shell, provenance-free:
-            // run_string sets the vars/exports without emitting pipeline
-            // records (only run_nested_pipelines below records).
-            if !prefix_owned.is_empty() {
-                let src = brush_core::SourceInfo {
-                    source: "<make exports>".into(), start: None };
+                shell
+                    .open_files_mut()
+                    .set_fd(1, brush_core::openfiles::OpenFile::from(writer));
+                // Apply the make's export prefix to THIS shell, provenance-free:
+                // run_string sets the vars/exports without emitting pipeline
+                // records (only run_nested_pipelines below records).
+                if !prefix_owned.is_empty() {
+                    let src = brush_core::SourceInfo {
+                        source: "<make exports>".into(),
+                        start: None,
+                    };
+                    let params = shell.default_exec_params();
+                    SUPPRESS_VAR_RECORD.with(|c| c.set(true));
+                    let r = shell.run_string(prefix_owned.clone(), &src, &params).await;
+                    SUPPRESS_VAR_RECORD.with(|c| c.set(false));
+                    if r.is_err() {
+                        eprintln!("sarun-engine make: export prefix failed to apply");
+                    }
+                }
+                let prog = match shell.parse_string(recipe_owned.clone()) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!(
+                            "sarun-engine n2: cannot parse recipe \
+                               (NO /bin/sh fallback): {e}"
+                        );
+                        return (2, vec![]);
+                    }
+                };
                 let params = shell.default_exec_params();
-                SUPPRESS_VAR_RECORD.with(|c| c.set(true));
-                let r = shell.run_string(prefix_owned.clone(), &src, &params).await;
-                SUPPRESS_VAR_RECORD.with(|c| c.set(false));
-                if r.is_err() {
-                    eprintln!("sarun-engine make: export prefix failed to apply");
-                }
-            }
-            let prog = match shell.parse_string(recipe_owned.clone()) {
-                Ok(p) => p,
-                Err(e) => {
-                    eprintln!("sarun-engine n2: cannot parse recipe \
-                               (NO /bin/sh fallback): {e}");
-                    return (2, vec![]);
-                }
-            };
-            let params = shell.default_exec_params();
-            // Route through run_nested_pipelines so the recipe's own pipelines are
-            // logged (as nested prov rows) and become tree nodes — the recipe's
-            // `sh -c …` then nests under it — and so `set -e`/`exit` between the
-            // recipe's statements is honored. Each pipeline records parent_uid =
-            // the enclosing pipeline (the make/recipe that spawned this one).
-            let r = run_nested_pipelines(&mut shell, prog, &params).await;
-            // A recipe line is its own shell: fire its EXIT trap (into the
-            // recipe's captured output), as bash-per-recipe-line would.
-            let _ = shell.on_exit_with_params(&params).await;
-            r
-            // shell and PipeWriter clones drop here → write end closed → drain sees EOF.
+                // Route through run_nested_pipelines so the recipe's own pipelines are
+                // logged (as nested prov rows) and become tree nodes — the recipe's
+                // `sh -c …` then nests under it — and so `set -e`/`exit` between the
+                // recipe's statements is honored. Each pipeline records parent_uid =
+                // the enclosing pipeline (the make/recipe that spawned this one).
+                let r = run_nested_pipelines(&mut shell, prog, &params).await;
+                // A recipe line is its own shell: fire its EXIT trap (into the
+                // recipe's captured output), as bash-per-recipe-line would.
+                let _ = shell.on_exit_with_params(&params).await;
+                r
+                // shell and PipeWriter clones drop here → write end closed → drain sees EOF.
+            })
         })
-    }).expect("spawn brush recipe thread");
+        .expect("spawn brush recipe thread");
 
     // Drain the merged pipe into n2's output_cb. n2 writes to the terminal;
     // we previously also teed to the FUSE sink, causing double output — removed.
@@ -3085,7 +3688,10 @@ mod builtin_boundary_tests {
         shell
             .open_files_mut()
             .set_fd(2, brush_core::openfiles::OpenFile::from(err));
-        let src = brush_core::SourceInfo { source: "<boundary-test>".into(), start: None };
+        let src = brush_core::SourceInfo {
+            source: "<boundary-test>".into(),
+            start: None,
+        };
         let params = shell.default_exec_params();
         shell
             .run_string(script.to_string(), &src, &params)
@@ -3396,12 +4002,8 @@ mod builtin_boundary_tests {
         let noninteractive = run_capture("edit file.sh; printf '%s' \"$?\"", &dir).await;
         assert_eq!(noninteractive, "1");
 
-        let pipeline = run_capture_mode(
-            "printf x | edit file.sh; printf '%s' \"$?\"",
-            &dir,
-            true,
-        )
-        .await;
+        let pipeline =
+            run_capture_mode("printf x | edit file.sh; printf '%s' \"$?\"", &dir, true).await;
         assert_eq!(pipeline, "1");
     }
 

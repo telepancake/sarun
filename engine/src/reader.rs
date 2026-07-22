@@ -104,7 +104,11 @@ fn build_doc(tagged: Vec<TaggedLine<Vec<RichAnnotation>>>, width: usize) -> Doc 
                 (Some((_, ru)), Some(u)) if ru == u => {} // run continues
                 _ => {
                     if let Some((start, u)) = run.take() {
-                        links.push(LinkRef { line: li, span_range: (start, spans.len()), url: u });
+                        links.push(LinkRef {
+                            line: li,
+                            span_range: (start, spans.len()),
+                            url: u,
+                        });
                     }
                     if let Some(u) = url {
                         run = Some((spans.len(), u.to_string()));
@@ -115,7 +119,11 @@ fn build_doc(tagged: Vec<TaggedLine<Vec<RichAnnotation>>>, width: usize) -> Doc 
             text.push_str(&ts.s);
         }
         if let Some((start, u)) = run.take() {
-            links.push(LinkRef { line: li, span_range: (start, spans.len()), url: u });
+            links.push(LinkRef {
+                line: li,
+                span_range: (start, spans.len()),
+                url: u,
+            });
         }
         // Heading detection: the rich decorator prefixes `#`*level + ' ', and
         // heading lines are never Preformat-tagged (a leading # inside a code
@@ -123,9 +131,15 @@ fn build_doc(tagged: Vec<TaggedLine<Vec<RichAnnotation>>>, width: usize) -> Doc 
         let hashes = text.chars().take_while(|c| *c == '#').count();
         if (1..=6).contains(&hashes)
             && text.as_bytes().get(hashes) == Some(&b' ')
-            && !spans.first().is_some_and(|s| s.style.fg == Some(Color::Cyan))
+            && !spans
+                .first()
+                .is_some_and(|s| s.style.fg == Some(Color::Cyan))
         {
-            headings.push(Heading { line: li, level: hashes, text: text[hashes + 1..].to_string() });
+            headings.push(Heading {
+                line: li,
+                level: hashes,
+                text: text[hashes + 1..].to_string(),
+            });
             let color = HEADING_COLORS[hashes.min(HEADING_COLORS.len()) - 1];
             for s in &mut spans {
                 s.style = s.style.fg(color).add_modifier(Modifier::BOLD);
@@ -134,7 +148,14 @@ fn build_doc(tagged: Vec<TaggedLine<Vec<RichAnnotation>>>, width: usize) -> Doc 
         plain.push(text);
         lines.push(Line::from(spans));
     }
-    Doc { lines, links, headings, fragments, plain, width }
+    Doc {
+        lines,
+        links,
+        headings,
+        fragments,
+        plain,
+        width,
+    }
 }
 
 impl Doc {
@@ -200,8 +221,12 @@ impl Doc {
     /// Toggle the REVERSED (focus) modifier on one link's spans — O(spans of
     /// that link), never a document rebuild.
     fn set_link_focused(&mut self, link: usize, on: bool) {
-        let Some(l) = self.links.get(link) else { return };
-        let Some(line) = self.lines.get_mut(l.line) else { return };
+        let Some(l) = self.links.get(link) else {
+            return;
+        };
+        let Some(line) = self.lines.get_mut(l.line) else {
+            return;
+        };
         for si in l.span_range.0..l.span_range.1 {
             if let Some(sp) = line.spans.get_mut(si) {
                 sp.style = if on {
@@ -229,9 +254,18 @@ const MAX_DOC_BYTES: u64 = 16 << 20;
 #[derive(Clone, Debug, PartialEq)]
 pub enum Source {
     File(PathBuf),
-    Wiki { root: PathBuf, title: String },
-    Ietf { root: PathBuf, draft: Option<String>, filter: Option<String> },
-    Bytes { name: String },
+    Wiki {
+        root: PathBuf,
+        title: String,
+    },
+    Ietf {
+        root: PathBuf,
+        draft: Option<String>,
+        filter: Option<String>,
+    },
+    Bytes {
+        name: String,
+    },
 }
 
 impl Source {
@@ -239,8 +273,16 @@ impl Source {
         match self {
             Source::File(p) => p.display().to_string(),
             Source::Wiki { title, .. } => format!("wiki:{title}"),
-            Source::Ietf { draft: None, filter: None, .. } => "ietf:drafts".into(),
-            Source::Ietf { draft: None, filter: Some(f), .. } => format!("ietf:drafts:{f}"),
+            Source::Ietf {
+                draft: None,
+                filter: None,
+                ..
+            } => "ietf:drafts".into(),
+            Source::Ietf {
+                draft: None,
+                filter: Some(f),
+                ..
+            } => format!("ietf:drafts:{f}"),
             Source::Ietf { draft: Some(d), .. } => format!("ietf:{d}"),
             Source::Bytes { name } => name.clone(),
         }
@@ -334,10 +376,9 @@ fn resolve_wiki_page(
 /// targets. Returns (html, resolved display title).
 fn wiki_page_html(root: &Path, title: &str) -> anyhow::Result<(String, String)> {
     use wikimak_wikitext::PageStore;
-    let inst = wikimak_wikipedia::Instance::open_read(wikimak_wikipedia::read_config(
-        root.to_path_buf(),
-    ))
-    .map_err(|e| anyhow::anyhow!("wiki open {}: {e}", root.display()))?;
+    let inst =
+        wikimak_wikipedia::Instance::open_read(wikimak_wikipedia::read_config(root.to_path_buf()))
+            .map_err(|e| anyhow::anyhow!("wiki open {}: {e}", root.display()))?;
     let view = wikimak_wikipedia::asof::AsOfView::new(&inst, None)
         .map_err(|e| anyhow::anyhow!("wiki site config: {e}"))?;
     let (pid, resolved) = resolve_wiki_page(&inst, title)?;
@@ -370,10 +411,9 @@ fn wiki_page_html(root: &Path, title: &str) -> anyhow::Result<(String, String)> 
 /// Pick a page to land on when a wiki mirror is opened without a title:
 /// "Main Page" when the store has one, else the first page in title order.
 pub fn wiki_default_title(root: &Path) -> anyhow::Result<String> {
-    let inst = wikimak_wikipedia::Instance::open_read(wikimak_wikipedia::read_config(
-        root.to_path_buf(),
-    ))
-    .map_err(|e| anyhow::anyhow!("wiki open {}: {e}", root.display()))?;
+    let inst =
+        wikimak_wikipedia::Instance::open_read(wikimak_wikipedia::read_config(root.to_path_buf()))
+            .map_err(|e| anyhow::anyhow!("wiki open {}: {e}", root.display()))?;
     if inst
         .page_id_by_title_at("Main Page", None)
         .map_err(|e| anyhow::anyhow!("wiki lookup: {e}"))?
@@ -395,12 +435,14 @@ fn ietf_draft_list_html(root: &Path, filter: &str) -> anyhow::Result<(String, St
     let cfg = ietf_mirror::MirrorConfig::new(root.to_path_buf());
     let m = ietf_mirror::Mirror::open_read(cfg)
         .map_err(|e| anyhow::anyhow!("ietf open {}: {e}", root.display()))?;
-    let all_drafts = m.drafts()
+    let all_drafts = m
+        .drafts()
         .map_err(|e| anyhow::anyhow!("ietf drafts: {e}"))?;
     let drafts: Vec<String> = if filter.is_empty() {
         all_drafts
     } else {
-        all_drafts.into_iter()
+        all_drafts
+            .into_iter()
             .filter(|d| d.to_lowercase().contains(&filter.to_lowercase()))
             .collect()
     };
@@ -418,23 +460,19 @@ fn ietf_draft_list_html(root: &Path, filter: &str) -> anyhow::Result<(String, St
         let wg = ietf_wg_of(name);
         groups.entry(wg.to_string()).or_default().push(name);
     }
-    let mut html = String::from(
-        &format!("<h1>IETF Drafts</h1>\n<p>{} drafts", drafts.len()));
+    let mut html = String::from(&format!("<h1>IETF Drafts</h1>\n<p>{} drafts", drafts.len()));
     if !filter.is_empty() {
         html.push_str(&format!(" matching '{}'", filter));
     }
     html.push_str(&format!(" in {} groups</p>\n", groups.len()));
     for (wg, names) in &groups {
-        html.push_str(&format!(
-            "<h2>{wg} ({})</h2>\n<ul>\n", names.len()));
+        html.push_str(&format!("<h2>{wg} ({})</h2>\n<ul>\n", names.len()));
         // Show first 50 drafts per group, with a note if truncated.
         for name in names.iter().take(50) {
-            html.push_str(&format!(
-                "<li><a href=\"/ietf/{name}\">{name}</a></li>\n"));
+            html.push_str(&format!("<li><a href=\"/ietf/{name}\">{name}</a></li>\n"));
         }
         if names.len() > 50 {
-            html.push_str(&format!(
-                "<li>... and {} more</li>\n", names.len() - 50));
+            html.push_str(&format!("<li>... and {} more</li>\n", names.len() - 50));
         }
         html.push_str("</ul>\n");
     }
@@ -461,11 +499,16 @@ fn ietf_draft_text(root: &Path, draft: &str) -> anyhow::Result<(Vec<u8>, String)
     let cfg = ietf_mirror::MirrorConfig::new(root.to_path_buf());
     let m = ietf_mirror::Mirror::open_read(cfg)
         .map_err(|e| anyhow::anyhow!("ietf open {}: {e}", root.display()))?;
-    let entry = m.head(draft)
+    let entry = m
+        .head(draft)
         .map_err(|e| anyhow::anyhow!("ietf head {draft}: {e}"))?
         .ok_or_else(|| anyhow::anyhow!("no draft {draft}"))?;
-    let display = format!("{} rev {} {}", draft, entry.rev,
-        entry.date.as_deref().unwrap_or("-"));
+    let display = format!(
+        "{} rev {} {}",
+        draft,
+        entry.rev,
+        entry.date.as_deref().unwrap_or("-")
+    );
     Ok((entry.text, display))
 }
 
@@ -490,19 +533,21 @@ fn load_source(source: &Source) -> anyhow::Result<(Vec<u8>, Kind, String)> {
             let (html, display) = wiki_page_html(root, title)?;
             Ok((html.into_bytes(), Kind::Html, display))
         }
-        Source::Ietf { root, draft, filter } => {
-            match draft {
-                None => {
-                    let f = filter.as_deref().unwrap_or("");
-                    let (html, display) = ietf_draft_list_html(root, f)?;
-                    Ok((html.into_bytes(), Kind::Html, display))
-                }
-                Some(name) => {
-                    let (text, display) = ietf_draft_text(root, name)?;
-                    Ok((text, Kind::Text, display))
-                }
+        Source::Ietf {
+            root,
+            draft,
+            filter,
+        } => match draft {
+            None => {
+                let f = filter.as_deref().unwrap_or("");
+                let (html, display) = ietf_draft_list_html(root, f)?;
+                Ok((html.into_bytes(), Kind::Html, display))
             }
-        }
+            Some(name) => {
+                let (text, display) = ietf_draft_text(root, name)?;
+                Ok((text, Kind::Text, display))
+            }
+        },
         Source::Bytes { .. } => {
             anyhow::bail!("reader: byte sources are loaded by the caller")
         }
@@ -585,7 +630,11 @@ impl Reader {
     /// Open an IETF mirror: `draft: None` lands on the draft list,
     /// `Some(name)` opens that draft's latest revision as text.
     pub fn open_ietf(root: PathBuf, draft: Option<String>) -> anyhow::Result<Reader> {
-        let source = Source::Ietf { root, draft, filter: None };
+        let source = Source::Ietf {
+            root,
+            draft,
+            filter: None,
+        };
         let (raw, kind, display) = load_source(&source)?;
         Reader::new(source, raw, kind, display)
     }
@@ -594,11 +643,18 @@ impl Reader {
     /// the source is an IETF draft list (draft: None).
     #[allow(dead_code)]
     pub fn set_ietf_filter(&mut self, filter: &str) -> anyhow::Result<()> {
-        if let Source::Ietf { root, draft: None, .. } = &self.source {
+        if let Source::Ietf {
+            root, draft: None, ..
+        } = &self.source
+        {
             let source = Source::Ietf {
                 root: root.clone(),
                 draft: None,
-                filter: if filter.is_empty() { None } else { Some(filter.to_string()) },
+                filter: if filter.is_empty() {
+                    None
+                } else {
+                    Some(filter.to_string())
+                },
             };
             self.load_into(source)?;
         }
@@ -609,7 +665,10 @@ impl Reader {
     /// socket); `name` decides html/md/text dispatch and titles the pane.
     pub fn open_bytes(name: String, raw: Vec<u8>) -> anyhow::Result<Reader> {
         if raw.len() as u64 > MAX_DOC_BYTES {
-            anyhow::bail!("reader: {name} is {} bytes (cap {MAX_DOC_BYTES})", raw.len());
+            anyhow::bail!(
+                "reader: {name} is {} bytes (cap {MAX_DOC_BYTES})",
+                raw.len()
+            );
         }
         let kind = kind_for_name(&name);
         Reader::new(Source::Bytes { name: name.clone() }, raw, kind, name)
@@ -723,7 +782,11 @@ impl Reader {
         let target = if dir > 0 {
             self.doc.headings.iter().find(|h| h.line > self.scroll + 2)
         } else {
-            self.doc.headings.iter().rev().find(|h| h.line < self.scroll)
+            self.doc
+                .headings
+                .iter()
+                .rev()
+                .find(|h| h.line < self.scroll)
         };
         match target {
             Some(h) => {
@@ -793,7 +856,10 @@ impl Reader {
             Source::Wiki { root, .. } => match path_part.strip_prefix("/wiki/") {
                 Some(t) => {
                     let title = percent_decode(t).replace('_', " ");
-                    Some(Source::Wiki { root: root.clone(), title })
+                    Some(Source::Wiki {
+                        root: root.clone(),
+                        title,
+                    })
                 }
                 None => None,
             },
@@ -808,7 +874,11 @@ impl Reader {
             Source::Ietf { root, .. } => match path_part.strip_prefix("/ietf/") {
                 Some(d) => {
                     let draft = percent_decode(d);
-                    Some(Source::Ietf { root: root.clone(), draft: Some(draft), filter: None })
+                    Some(Source::Ietf {
+                        root: root.clone(),
+                        draft: Some(draft),
+                        filter: None,
+                    })
                 }
                 None => None,
             },
@@ -928,9 +998,8 @@ impl Reader {
             .iter()
             .map(|h| {
                 let pad = "  ".repeat(h.level.saturating_sub(1));
-                let mut st = Style::default().fg(
-                    HEADING_COLORS[h.level.min(HEADING_COLORS.len()) - 1],
-                );
+                let mut st =
+                    Style::default().fg(HEADING_COLORS[h.level.min(HEADING_COLORS.len()) - 1]);
                 if Some(h.line) == here {
                     st = st.add_modifier(Modifier::REVERSED);
                 }
@@ -964,7 +1033,9 @@ impl Reader {
         };
         let (bstyle, btype) = if focused {
             (
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
                 BorderType::Double,
             )
         } else {
@@ -1000,8 +1071,8 @@ fn find_matches(plain: &[String], query: &str) -> Vec<usize> {
 mod tests {
     use super::*;
     use crossterm::event::KeyCode;
-    use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
 
     const HTML: &str = r##"
         <h1>Alpha</h1>
@@ -1055,7 +1126,10 @@ mod tests {
         let r = html_reader();
         let urls: Vec<&str> = r.doc.links.iter().map(|l| l.url.as_str()).collect();
         assert!(urls.contains(&"#sec2"), "anchor link indexed: {urls:?}");
-        assert!(urls.contains(&"https://example.com/x"), "external link indexed: {urls:?}");
+        assert!(
+            urls.contains(&"https://example.com/x"),
+            "external link indexed: {urls:?}"
+        );
         let names: Vec<&str> = r.doc.headings.iter().map(|h| h.text.as_str()).collect();
         assert_eq!(names, ["Alpha", "Beta section"], "heading index");
         assert_eq!(r.doc.headings[0].level, 1);
@@ -1069,7 +1143,10 @@ mod tests {
             sec2 <= hline && hline - sec2 <= 3,
             "fragment ({sec2}) points at its heading line ({hline})"
         );
-        assert!(r.doc.fragments.contains_key("deep"), "non-heading id indexed");
+        assert!(
+            r.doc.fragments.contains_key("deep"),
+            "non-heading id indexed"
+        );
     }
 
     #[test]
@@ -1079,9 +1156,15 @@ mod tests {
         let links = styled_text(&buf, |s| {
             s.fg == Some(Color::Blue) && s.add_modifier.contains(Modifier::UNDERLINED)
         });
-        assert!(links.contains("jump link"), "link styled blue+underline: {links:?}");
+        assert!(
+            links.contains("jump link"),
+            "link styled blue+underline: {links:?}"
+        );
         // No REVERSED cells before any focus.
-        assert_eq!(styled_text(&buf, |s| s.add_modifier.contains(Modifier::REVERSED)), "");
+        assert_eq!(
+            styled_text(&buf, |s| s.add_modifier.contains(Modifier::REVERSED)),
+            ""
+        );
         // Tab focuses link 0: exactly its text goes REVERSED (span patch).
         assert_eq!(r.handle_key(KeyCode::Tab), KeyResult::Consumed);
         let buf = frame(&mut r, 60, 20);
@@ -1104,7 +1187,10 @@ mod tests {
         let mut r = html_reader();
         assert_eq!(r.scroll, 0);
         r.handle_key(KeyCode::Char('n'));
-        assert_eq!(r.scroll, r.doc.headings[1].line, "n jumps to the next heading line");
+        assert_eq!(
+            r.scroll, r.doc.headings[1].line,
+            "n jumps to the next heading line"
+        );
         r.handle_key(KeyCode::Char('p'));
         assert_eq!(r.scroll, r.doc.headings[0].line, "p jumps back");
     }
@@ -1135,7 +1221,11 @@ mod tests {
         assert_eq!(r.matches.len(), 2, "two matching lines");
         let first = r.matches[0];
         let second = r.matches[1];
-        assert_eq!(r.scroll, first.saturating_sub(2), "committed search lands on match 1");
+        assert_eq!(
+            r.scroll,
+            first.saturating_sub(2),
+            "committed search lands on match 1"
+        );
         r.handle_key(KeyCode::Char('n'));
         assert_eq!(r.scroll, second.saturating_sub(2), "n advances to match 2");
         r.handle_key(KeyCode::Char('p'));
@@ -1160,7 +1250,11 @@ mod tests {
         assert!(r.status.contains("external link"), "{}", r.status);
         assert!(r.status.contains("https://example.com/x"));
         assert_eq!(r.history_len(), 0);
-        assert_eq!(r.source_label(), "fixture.html", "still on the same document");
+        assert_eq!(
+            r.source_label(),
+            "fixture.html",
+            "still on the same document"
+        );
     }
 
     #[test]
@@ -1179,7 +1273,11 @@ mod tests {
         r.handle_key(KeyCode::Tab);
         r.handle_key(KeyCode::Enter);
         assert_eq!(r.history_len(), 1, "follow pushed history: {}", r.status);
-        assert!(matches!(&r.source, Source::File(p) if p.ends_with("b.md")), "{}", r.status);
+        assert!(
+            matches!(&r.source, Source::File(p) if p.ends_with("b.md")),
+            "{}",
+            r.status
+        );
         let buf = frame(&mut r, 40, 10);
         assert!(buffer_text(&buf).contains("# B"), "target doc rendered");
         r.handle_key(KeyCode::Backspace);
@@ -1218,7 +1316,10 @@ mod tests {
         let r = Reader::open_bytes("notes.txt".into(), long.into_bytes()).unwrap();
         assert_eq!(r.kind, Kind::Text);
         assert!(r.doc.links.is_empty());
-        assert!(r.doc.lines.len() >= 3, "long line hard-wrapped at doc width");
+        assert!(
+            r.doc.lines.len() >= 3,
+            "long line hard-wrapped at doc width"
+        );
     }
 
     // ── wiki store ──────────────────────────────────────────────────────────
@@ -1287,16 +1388,28 @@ Alpha body linking [[Beta Article]] and [https://example.org outside].</text><sh
         // No title → the default-page pick (no Main Page here: first title).
         let picked = wiki_default_title(tmp.path()).unwrap();
         assert_eq!(picked, "Alpha Article");
-        let mut r = Reader::open_wiki(tmp.path().to_path_buf(), Some("Alpha Article".into()))
-            .unwrap();
+        let mut r =
+            Reader::open_wiki(tmp.path().to_path_buf(), Some("Alpha Article".into())).unwrap();
         let buf = frame(&mut r, 70, 16);
         let text = buffer_text(&buf);
-        assert!(text.contains("Alpha Article"), "page title displayed:\n{text}");
-        assert!(text.contains("Alpha body"), "wikitext body rendered:\n{text}");
-        assert!(text.contains("Overview"), "section heading rendered:\n{text}");
+        assert!(
+            text.contains("Alpha Article"),
+            "page title displayed:\n{text}"
+        );
+        assert!(
+            text.contains("Alpha body"),
+            "wikitext body rendered:\n{text}"
+        );
+        assert!(
+            text.contains("Overview"),
+            "section heading rendered:\n{text}"
+        );
         // The [[Beta Article]] link is indexed with a /wiki/ href.
         assert!(
-            r.doc.links.iter().any(|l| l.url.starts_with("/wiki/") && l.url.contains("Beta")),
+            r.doc
+                .links
+                .iter()
+                .any(|l| l.url.starts_with("/wiki/") && l.url.contains("Beta")),
             "internal link indexed: {:?}",
             r.doc.links.iter().map(|l| &l.url).collect::<Vec<_>>()
         );
@@ -1309,7 +1422,12 @@ Alpha body linking [[Beta Article]] and [https://example.org outside].</text><sh
             }
         }
         r.handle_key(KeyCode::Enter);
-        assert_eq!(r.history_len(), 1, "wiki follow pushed history: {}", r.status);
+        assert_eq!(
+            r.history_len(),
+            1,
+            "wiki follow pushed history: {}",
+            r.status
+        );
         assert!(
             matches!(&r.source, Source::Wiki { title, .. } if title == "Beta Article"),
             "landed on Beta: {} / {:?}",

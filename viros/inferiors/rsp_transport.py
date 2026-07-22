@@ -5,8 +5,7 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass
 import select
-import socket
-from typing import Deque
+from typing import Deque, Protocol
 
 from .rsp_codec import Ack, Event, Interrupt, InvalidPacket, Packet, RspCodec, frame_packet
 
@@ -20,6 +19,22 @@ class RspDisconnected(ConnectionError):
     pass
 
 
+class DuplexByteStream(Protocol):
+    """The byte-stream operations RSP needs.
+
+    A socket implements this directly. Sarun's generic service relay instead
+    presents the two directions as child stdout and child stdin.
+    """
+
+    def fileno(self) -> int: ...
+
+    def recv(self, size: int) -> bytes: ...
+
+    def sendall(self, data: bytes) -> None: ...
+
+    def close(self) -> None: ...
+
+
 class RspStream:
     """An ACK-mode RSP stream over an already connected socket.
 
@@ -27,7 +42,7 @@ class RspStream:
     for an acknowledgement of a packet sent by this endpoint.
     """
 
-    def __init__(self, sock: socket.socket) -> None:
+    def __init__(self, sock: DuplexByteStream) -> None:
         self.socket = sock
         self.codec = RspCodec()
         self._events: Deque[Event | _AcknowledgedPacket] = deque()

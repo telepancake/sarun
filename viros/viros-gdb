@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if (($# != 2)); then
+    printf 'usage: %s KERNEL-BUNDLE GDB-SOCKET\n' "$0" >&2
+    exit 2
+fi
+root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+bundle=$(CDPATH= cd -- "$1" && pwd -P)
+socket=$2
+manifest="$bundle/callgate.json"
+vmlinux="$bundle/vmlinux"
+gdb="$root/tools/gdb/bin/gdb"
+for path in "$manifest" "$vmlinux" "$gdb"; do
+    if [[ ! -f $path ]]; then
+        printf 'viros-gdb: required file is missing: %s\n' "$path" >&2
+        exit 2
+    fi
+done
+if [[ ! -S $socket ]]; then
+    printf 'viros-gdb: facade socket is missing: %s\n' "$socket" >&2
+    exit 2
+fi
+
+exec "$gdb" -nx -q \
+    -iex "set auto-load safe-path $bundle" \
+    "$vmlinux" \
+    -ex 'set pagination off' \
+    -ex 'set python print-stack full' \
+    -ex 'set remotetimeout 10' \
+    -ex "target remote $socket" \
+    -ex 'info inferiors'

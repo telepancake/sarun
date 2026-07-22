@@ -31,7 +31,9 @@ impl Config {
     }
 
     pub fn load_from(path: &PathBuf) -> Self {
-        let Ok(text) = fs::read_to_string(path) else { return Self::default(); };
+        let Ok(text) = fs::read_to_string(path) else {
+            return Self::default();
+        };
         toml::from_str(&text).unwrap_or_else(|e| {
             eprintln!("oaita: ignoring malformed {}: {e}", path.display());
             Self::default()
@@ -41,9 +43,13 @@ impl Config {
     /// Resolve (model, base_url, api_key) from the toml. Errors only if
     /// `model` is unset (the only required field).
     pub fn resolve(&self) -> Result<(String, String, String), String> {
-        let model = self.model.clone()
+        let model = self
+            .model
+            .clone()
             .ok_or_else(|| "no model set — put model = \"…\" in oaita.toml".to_string())?;
-        let base_url = self.base_url.clone()
+        let base_url = self
+            .base_url
+            .clone()
             .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
         let api_key = self.api_key.clone().unwrap_or_default();
         Ok((model, base_url, api_key))

@@ -7,10 +7,10 @@
 use std::io::{self, Read, Write};
 
 use crate::generated_wire::{
-    ActionSuccess, ConnectionMode, RequestEnvelope, SubscriptionEvent, TransportResponse,
-    LIMIT_FRAME_BYTES, WIRE_PROTOCOL_VERSION,
+    ActionSuccess, ConnectionMode, LIMIT_FRAME_BYTES, RequestEnvelope, SubscriptionEvent,
+    TransportResponse, WIRE_PROTOCOL_VERSION,
 };
-use crate::wire::{put_u64, DecodeError, WireValue};
+use crate::wire::{DecodeError, WireValue, put_u64};
 
 fn invalid_data(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())

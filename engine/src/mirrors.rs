@@ -29,16 +29,20 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 
 fn now() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 fn db() -> Result<Connection, String> {
     let path = crate::paths::state_home().join("mirrors.db");
     let conn = Connection::open(&path).map_err(|e| e.to_string())?;
-    conn.pragma_update(None, "journal_mode", "WAL").map_err(|e| e.to_string())?;
+    conn.pragma_update(None, "journal_mode", "WAL")
+        .map_err(|e| e.to_string())?;
     conn.execute(
         "CREATE TABLE IF NOT EXISTS jobs (
             id INTEGER PRIMARY KEY,
@@ -53,7 +57,8 @@ fn db() -> Result<Connection, String> {
             last_detail TEXT NOT NULL DEFAULT ''
         )",
         [],
-    ).map_err(|e| e.to_string())?;
+    )
+    .map_err(|e| e.to_string())?;
     Ok(conn)
 }
 
@@ -107,7 +112,11 @@ fn derive(mut j: Job) -> Job {
     } else {
         "scheduled".into()
     };
-    j.next_due = if j.paused || live { None } else { due_at.or(Some(now())) };
+    j.next_due = if j.paused || live {
+        None
+    } else {
+        due_at.or(Some(now()))
+    };
     j
 }
 
@@ -140,41 +149,44 @@ pub fn jobs_list() -> Result<Vec<Job>, String> {
 
 pub fn jobs_list_typed() -> Result<Vec<crate::generated_wire::MirrorJob>, String> {
     use crate::generated_wire::{MirrorJob, MirrorState};
-    jobs_list()?.into_iter().map(|job| {
-        let state = match job.state.as_str() {
-            "running" => MirrorState::Running,
-            "paused" => MirrorState::Paused,
-            "pending" => MirrorState::Pending,
-            "stopped" => MirrorState::Stopped,
-            "error" => MirrorState::Error,
-            "completed" => MirrorState::Completed,
-            "scheduled" => MirrorState::Scheduled,
-            state => return Err(format!("unknown derived mirror state {state:?}")),
-        };
-        Ok(MirrorJob {
-            id: u64::try_from(job.id).map_err(|_| "negative mirror job id")?,
-            kind: crate::wire::BoundedText::new(job.kind)
-                .map_err(|error| format!("mirror kind exceeds relation bound: {error:?}"))?,
-            source: crate::wire::BoundedText::new(job.src)
-                .map_err(|error| format!("mirror source exceeds relation bound: {error:?}"))?,
-            destination: crate::wire::BoundedBytes::new(job.dest.into_bytes())
-                .map_err(|error| format!(
-                    "mirror destination exceeds relation bound: {error:?}"))?,
-            interval_seconds: u64::try_from(job.interval_secs)
-                .map_err(|_| "negative mirror interval")?,
-            paused: job.paused,
-            last_start: job.last_start,
-            last_end: job.last_end,
-            last_exit: job.last_exit
-                .map(|exit| i32::try_from(exit).map_err(|_| "mirror exit code exceeds i32"))
-                .transpose()?,
-            last_detail: crate::wire::BoundedText::new(job.last_detail)
-                .map_err(|error| format!(
-                    "mirror detail exceeds relation bound: {error:?}"))?,
-            state,
-            next_due: job.next_due,
+    jobs_list()?
+        .into_iter()
+        .map(|job| {
+            let state = match job.state.as_str() {
+                "running" => MirrorState::Running,
+                "paused" => MirrorState::Paused,
+                "pending" => MirrorState::Pending,
+                "stopped" => MirrorState::Stopped,
+                "error" => MirrorState::Error,
+                "completed" => MirrorState::Completed,
+                "scheduled" => MirrorState::Scheduled,
+                state => return Err(format!("unknown derived mirror state {state:?}")),
+            };
+            Ok(MirrorJob {
+                id: u64::try_from(job.id).map_err(|_| "negative mirror job id")?,
+                kind: crate::wire::BoundedText::new(job.kind)
+                    .map_err(|error| format!("mirror kind exceeds relation bound: {error:?}"))?,
+                source: crate::wire::BoundedText::new(job.src)
+                    .map_err(|error| format!("mirror source exceeds relation bound: {error:?}"))?,
+                destination: crate::wire::BoundedBytes::new(job.dest.into_bytes()).map_err(
+                    |error| format!("mirror destination exceeds relation bound: {error:?}"),
+                )?,
+                interval_seconds: u64::try_from(job.interval_secs)
+                    .map_err(|_| "negative mirror interval")?,
+                paused: job.paused,
+                last_start: job.last_start,
+                last_end: job.last_end,
+                last_exit: job
+                    .last_exit
+                    .map(|exit| i32::try_from(exit).map_err(|_| "mirror exit code exceeds i32"))
+                    .transpose()?,
+                last_detail: crate::wire::BoundedText::new(job.last_detail)
+                    .map_err(|error| format!("mirror detail exceeds relation bound: {error:?}"))?,
+                state,
+                next_due: job.next_due,
+            })
         })
-    }).collect()
+        .collect()
 }
 
 pub fn job_add(kind: &str, src: &str, dest: &str, interval_secs: i64) -> Result<i64, String> {
@@ -185,7 +197,8 @@ pub fn job_add(kind: &str, src: &str, dest: &str, interval_secs: i64) -> Result<
     conn.execute(
         "INSERT INTO jobs(kind, src, dest, interval_secs) VALUES(?1,?2,?3,?4)",
         params![kind, src, dest, interval_secs.max(60)],
-    ).map_err(|e| e.to_string())?;
+    )
+    .map_err(|e| e.to_string())?;
     Ok(conn.last_insert_rowid())
 }
 
@@ -204,14 +217,19 @@ pub fn job_remove(id: i64) -> Result<String, String> {
     }
     let conn = db()?;
     let row: Option<(String, String)> = conn
-        .query_row("SELECT kind, dest FROM jobs WHERE id = ?1", [id],
-                   |r| Ok((r.get(0)?, r.get(1)?)))
+        .query_row("SELECT kind, dest FROM jobs WHERE id = ?1", [id], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
         .ok();
-    let n = conn.execute("DELETE FROM jobs WHERE id = ?1", [id]).map_err(|e| e.to_string())?;
+    let n = conn
+        .execute("DELETE FROM jobs WHERE id = ?1", [id])
+        .map_err(|e| e.to_string())?;
     if n == 0 {
         return Err("no such job".into());
     }
-    let Some((kind, dest)) = row else { return Ok(String::new()) };
+    let Some((kind, dest)) = row else {
+        return Ok(String::new());
+    };
     if kind != "git" {
         // wiki/ietf/cmd keep no separate fetch buffer.
         return Ok(String::new());
@@ -230,9 +248,16 @@ pub fn job_remove(id: i64) -> Result<String, String> {
 
 pub fn job_set_paused(id: i64, paused: bool) -> Result<(), String> {
     let n = db()?
-        .execute("UPDATE jobs SET paused = ?2 WHERE id = ?1", params![id, paused as i64])
+        .execute(
+            "UPDATE jobs SET paused = ?2 WHERE id = ?1",
+            params![id, paused as i64],
+        )
         .map_err(|e| e.to_string())?;
-    if n == 0 { Err("no such job".into()) } else { Ok(()) }
+    if n == 0 {
+        Err("no such job".into())
+    } else {
+        Ok(())
+    }
 }
 
 /// Force-run one job NOW (also works on paused jobs — force is force).
@@ -275,17 +300,33 @@ fn driver_argv(name: &str, self_exe: Option<std::path::PathBuf>) -> Vec<String> 
 fn spawn_run(job: Job) {
     let driver = |name: &str| driver_argv(name, std::env::current_exe().ok());
     let argv: Vec<String> = match job.kind.as_str() {
-        "git" => [driver("gitdepot"),
-                  vec!["mirror".into(), job.src.clone(), job.dest.clone()]].concat(),
-        "wiki" => [driver("wikimak"),
-                   vec!["fetch".into(), job.src.clone(), job.dest.clone()]].concat(),
-        "cmd" => vec!["/bin/sh".into(), "-c".into(), job.src.clone(),
-                      "mirror-job".into(), job.dest.clone()],
+        "git" => [
+            driver("gitdepot"),
+            vec!["mirror".into(), job.src.clone(), job.dest.clone()],
+        ]
+        .concat(),
+        "wiki" => [
+            driver("wikimak"),
+            vec!["fetch".into(), job.src.clone(), job.dest.clone()],
+        ]
+        .concat(),
+        "cmd" => vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            job.src.clone(),
+            "mirror-job".into(),
+            job.dest.clone(),
+        ],
         _ => [driver("ietfmak"), vec!["update".into(), job.dest.clone()]].concat(),
     };
     let id = job.id;
     if !running_map(|m| {
-        if m.contains_key(&id) { false } else { m.insert(id, 0); true }
+        if m.contains_key(&id) {
+            false
+        } else {
+            m.insert(id, 0);
+            true
+        }
     }) {
         return;
     }
@@ -317,7 +358,9 @@ fn spawn_run(job: Job) {
         let child = cmd.spawn();
         let (exit, detail) = match child {
             Ok(mut c) => {
-                running_map(|m| { m.insert(id, c.id()); });
+                running_map(|m| {
+                    m.insert(id, c.id());
+                });
                 let stderr = c.stderr.take().expect("piped stderr");
                 let (exit, tail) = stream_stderr(id, stderr, &mut c);
                 match exit {
@@ -328,19 +371,35 @@ fn spawn_run(job: Job) {
                             None => {
                                 let sig = status.signal().unwrap_or(0);
                                 let hint = if sig == libc::SIGKILL { " (OOM?)" } else { "" };
-                                (-1, format!("killed by signal {sig}{hint}{}{tail}",
-                                             if tail.is_empty() { "" } else { "; stderr: " }))
+                                (
+                                    -1,
+                                    format!(
+                                        "killed by signal {sig}{hint}{}{tail}",
+                                        if tail.is_empty() { "" } else { "; stderr: " }
+                                    ),
+                                )
                             }
                         }
                     }
                     Err(e) => (-1, e.to_string()),
                 }
             }
-            Err(e) => (-1, format!(
-                "spawn {} ({}): {e}", argv[0],
-                if argv[0].starts_with('/') { "self-exec" } else { "via PATH" })),
+            Err(e) => (
+                -1,
+                format!(
+                    "spawn {} ({}): {e}",
+                    argv[0],
+                    if argv[0].starts_with('/') {
+                        "self-exec"
+                    } else {
+                        "via PATH"
+                    }
+                ),
+            ),
         };
-        running_map(|m| { m.remove(&id); });
+        running_map(|m| {
+            m.remove(&id);
+        });
         if let Ok(conn) = db() {
             let _ = conn.execute(
                 "UPDATE jobs SET last_end = ?2, last_exit = ?3, last_detail = ?4 WHERE id = ?1",
@@ -357,7 +416,10 @@ fn stream_stderr(
     id: i64,
     stderr: std::process::ChildStderr,
     child: &mut std::process::Child,
-) -> (std::result::Result<std::process::ExitStatus, std::io::Error>, String) {
+) -> (
+    std::result::Result<std::process::ExitStatus, std::io::Error>,
+    String,
+) {
     use std::io::{BufRead, BufReader};
     use std::time::{Duration, Instant};
     let reader = BufReader::new(stderr);
@@ -365,7 +427,10 @@ fn stream_stderr(
     let mut last_flush = Instant::now();
     let mut pending = String::new();
     for line in reader.lines() {
-        let line = match line { Ok(l) => l, Err(_) => break };
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => break,
+        };
         pending.push_str(&line);
         pending.push('\n');
         if last_flush.elapsed() >= Duration::from_secs(2) {
@@ -401,9 +466,11 @@ fn tail_2k(s: &str) -> String {
 /// The scheduler tick loop: every minute, start whatever is due. Runs
 /// for the life of the engine; jobs only exist if the user added them.
 pub fn scheduler_thread() {
-    std::thread::spawn(|| loop {
-        let _ = run_pending();
-        std::thread::sleep(std::time::Duration::from_secs(60));
+    std::thread::spawn(|| {
+        loop {
+            let _ = run_pending();
+            std::thread::sleep(std::time::Duration::from_secs(60));
+        }
     });
 }
 
@@ -418,8 +485,10 @@ mod tests {
     #[test]
     fn driver_argv_self_execs_the_engine_binary() {
         let exe = std::path::PathBuf::from("/opt/sarun/bin/sarun");
-        assert_eq!(driver_argv("gitdepot", Some(exe)),
-                   vec!["/opt/sarun/bin/sarun".to_string(), "gitdepot".to_string()]);
+        assert_eq!(
+            driver_argv("gitdepot", Some(exe)),
+            vec!["/opt/sarun/bin/sarun".to_string(), "gitdepot".to_string()]
+        );
         assert_eq!(driver_argv("ietfmak", None), vec!["ietfmak".to_string()]);
     }
 
@@ -427,10 +496,17 @@ mod tests {
     /// spawn_run builds it: [exe, driver, verb, args...].
     #[test]
     fn driver_argv_composes_with_the_subcommand_tail() {
-        let argv = [driver_argv("wikimak", Some("/x/sarun".into())),
-                    vec!["fetch".into(), "enwiki".into(), "/depot/w".into()]].concat();
-        assert_eq!(argv, ["/x/sarun", "wikimak", "fetch", "enwiki", "/depot/w"]
-                   .map(String::from).to_vec());
+        let argv = [
+            driver_argv("wikimak", Some("/x/sarun".into())),
+            vec!["fetch".into(), "enwiki".into(), "/depot/w".into()],
+        ]
+        .concat();
+        assert_eq!(
+            argv,
+            ["/x/sarun", "wikimak", "fetch", "enwiki", "/depot/w"]
+                .map(String::from)
+                .to_vec()
+        );
     }
 
     /// A signal death must name the signal in the detail — the live
@@ -439,7 +515,9 @@ mod tests {
     #[test]
     fn signal_death_names_the_killing_signal() {
         let out = std::process::Command::new("/bin/sh")
-            .args(["-c", "kill -9 $$"]).output().unwrap();
+            .args(["-c", "kill -9 $$"])
+            .output()
+            .unwrap();
         use std::os::unix::process::ExitStatusExt;
         assert!(out.status.code().is_none(), "signal death has no code");
         let sig = out.status.signal().unwrap_or(0);
@@ -450,12 +528,20 @@ mod tests {
 
     fn sh_git(repo: &std::path::Path, args: &[&str]) {
         let out = std::process::Command::new("git")
-            .arg("-C").arg(repo).args(args)
-            .env("GIT_AUTHOR_NAME", "T").env("GIT_AUTHOR_EMAIL", "t@x")
-            .env("GIT_COMMITTER_NAME", "T").env("GIT_COMMITTER_EMAIL", "t@x")
-            .output().expect("run git");
-        assert!(out.status.success(), "git {args:?}: {}",
-                String::from_utf8_lossy(&out.stderr));
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "T")
+            .env("GIT_AUTHOR_EMAIL", "t@x")
+            .env("GIT_COMMITTER_NAME", "T")
+            .env("GIT_COMMITTER_EMAIL", "t@x")
+            .output()
+            .expect("run git");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     /// `rm` on a git job drops the derived fetch buffer (repo.git +
@@ -464,13 +550,14 @@ mod tests {
     #[test]
     fn job_remove_drops_git_fetch_buffer_keeps_store() {
         let _g = crate::depot::TEST_STATE_HOME_LOCK.lock().unwrap();
-        let tmp = std::env::temp_dir()
-            .join(format!("sarun-mirrorrm-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("sarun-mirrorrm-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
         // SAFETY: serialized by TEST_STATE_HOME_LOCK with the other
         // state-home-dependent tests.
-        unsafe { std::env::set_var("XDG_STATE_HOME", &tmp); }
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", &tmp);
+        }
         std::fs::create_dir_all(crate::paths::state_home()).unwrap();
 
         let origin = tmp.join("origin");
@@ -488,17 +575,30 @@ mod tests {
         assert!(dest.join("repo.git/HEAD").exists());
         std::fs::create_dir_all(dest.join("repo.git.new")).unwrap();
 
-        let id = job_add("git", origin.to_str().unwrap(),
-                         dest.to_str().unwrap(), 3600).unwrap();
+        let id = job_add(
+            "git",
+            origin.to_str().unwrap(),
+            dest.to_str().unwrap(),
+            3600,
+        )
+        .unwrap();
         let note = job_remove(id).unwrap();
         assert!(note.contains("fetch buffer dropped"), "{note}");
         assert!(note.contains("store kept"), "{note}");
         assert!(!dest.join("repo.git").exists(), "buffer must be dropped");
-        assert!(!dest.join("repo.git.new").exists(), "scratch must be dropped");
+        assert!(
+            !dest.join("repo.git.new").exists(),
+            "scratch must be dropped"
+        );
         let store = dest.join("store");
-        assert!(gitdepot::store::store_exists(&store), "store must survive rm");
-        assert!(gitdepot::resolve_ref(&store, "main").unwrap().is_some(),
-                "store must stay readable after rm");
+        assert!(
+            gitdepot::store::store_exists(&store),
+            "store must survive rm"
+        );
+        assert!(
+            gitdepot::resolve_ref(&store, "main").unwrap().is_some(),
+            "store must stay readable after rm"
+        );
 
         let cid = job_add("cmd", "true", dest.to_str().unwrap(), 3600).unwrap();
         assert_eq!(job_remove(cid).unwrap(), "", "cmd rm is row-only");

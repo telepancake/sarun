@@ -125,9 +125,9 @@ fn run_brush_completion(cwd: &std::path::Path, input: &[u8], expected: &[&[u8]])
             send(&mut master, b"\x03");
             interrupted_at = Some(now);
         }
-        if interrupted_at.is_some_and(|interrupted| {
-            now.duration_since(interrupted) > Duration::from_millis(700)
-        }) && !exit_sent
+        if interrupted_at
+            .is_some_and(|interrupted| now.duration_since(interrupted) > Duration::from_millis(700))
+            && !exit_sent
         {
             send(&mut master, b"exit 0\r");
             exit_sent = true;
@@ -191,8 +191,7 @@ fn standalone_brush_completes_find_reference_from_actual_parser_arm() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("reference-dir"))
         .expect("create reference completion fixture directory");
-    std::fs::write(dir.join("reference-file"), b"")
-        .expect("write reference completion fixture");
+    std::fs::write(dir.join("reference-file"), b"").expect("write reference completion fixture");
     run_brush_completion(
         &dir,
         b"find . -newer ./r\t",
@@ -203,19 +202,13 @@ fn standalone_brush_completes_find_reference_from_actual_parser_arm() {
 
 #[test]
 fn standalone_brush_completes_builtin_flag_through_relation() {
-    run_brush_completion(
-        &std::env::current_dir().unwrap(),
-        b"bind\t",
-        &[b"-P"],
-    );
+    run_brush_completion(&std::env::current_dir().unwrap(), b"bind\t", &[b"-P"]);
 }
 
 #[test]
 fn standalone_brush_completes_contextual_path_through_relation() {
-    let dir = std::env::temp_dir().join(format!(
-        "sarun-brush-relation-path-{}",
-        std::process::id()
-    ));
+    let dir =
+        std::env::temp_dir().join(format!("sarun-brush-relation-path-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("create path fixture directory");
     std::fs::write(dir.join("test1.sh"), "#!/bin/sh\n").expect("write path fixture");

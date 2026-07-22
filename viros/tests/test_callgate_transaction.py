@@ -11,6 +11,7 @@ from callgate.architectures import (
     AARCH64,
     ARCHITECTURES,
     MIPS32EL_MMIPS,
+    MIPS_CAUSE_RESTORATION_AUDIT_MASK,
     MIPS_GATE_STATUS_CLEAR,
     MIPS_STATUS_EXL,
     architecture_by_name,
@@ -333,7 +334,8 @@ class TransactionTests(unittest.TestCase):
                 "resume only CPU 0 synchronously to 0xffff800080100004; "
                 "host timeout is not yet enforceable through the stock QEMU packet set",
                 "read and validate the mailbox result",
-                "restore pages, registers, and breakpoint in finally; then byte-audit state",
+                "restore pages, registers, and breakpoint in finally; then audit restored "
+                "state using architecture register policies",
             ),
         )
 
@@ -473,8 +475,78 @@ class MipsTransactionPolicyTests(unittest.TestCase):
                 (0, "pc", self.manifest.entry_address),
             ],
         )
-        self.assertIn("76 register values: restored", result.audit)
+        self.assertIn(
+            "76 register values: restoration audited "
+            "(74 exact, 2 writable-field masked)",
+            result.audit,
+        )
+        self.assertIn(
+            "CPU 0 register cause: writable fields restored "
+            "(mask 0x8c00300; volatile/read-only fields excluded)",
+            result.audit,
+        )
         self.assert_restored()
+
+    def test_cause_audit_accepts_only_live_read_only_field_changes(self):
+        original_write_register = self.target.write_register
+
+        def architectural_write(cpu, name, value):
+            if name != "cause":
+                original_write_register(cpu, name, value)
+                return
+            before = self.target.registers[(cpu, name)]
+            mask = MIPS_CAUSE_RESTORATION_AUDIT_MASK
+            self.target.register_writes.append((cpu, name, value))
+            self.target.registers[(cpu, name)] = (before & ~mask) | (value & mask)
+
+        original_run = self.target.run_cpu_until
+
+        def run_with_live_cause_change(cpu, address, timeout_seconds):
+            original_run(cpu, address, timeout_seconds)
+            # Timer pending, one hardware-pending input, and ExcCode are not
+            # writable through CP0 Cause and can change while the CPU runs.
+            self.target.registers[(cpu, "cause")] ^= 0x4000807C
+
+        self.target.write_register = architectural_write
+        self.target.run_cpu_until = run_with_live_cause_change
+
+        result = CallGateTransaction(self.target, self.manifest).execute()
+
+        before = self.before_registers[(0, "cause")]
+        after = self.target.registers[(0, "cause")]
+        self.assertEqual(
+            after & MIPS_CAUSE_RESTORATION_AUDIT_MASK,
+            before & MIPS_CAUSE_RESTORATION_AUDIT_MASK,
+        )
+        self.assertNotEqual(after, before)
+        self.assertTrue(any("volatile/read-only fields excluded" in item for item in result.audit))
+
+    def test_cause_audit_still_rejects_writable_field_mismatch(self):
+        original_write_register = self.target.write_register
+        restore_writes = 0
+
+        def lose_cause_restore(cpu, name, value):
+            nonlocal restore_writes
+            if name == "cause":
+                restore_writes += 1
+                if restore_writes >= 1:
+                    return
+            original_write_register(cpu, name, value)
+
+        original_run = self.target.run_cpu_until
+
+        def run_with_software_interrupt_change(cpu, address, timeout_seconds):
+            original_run(cpu, address, timeout_seconds)
+            self.target.registers[(cpu, "cause")] ^= 1 << 8
+
+        self.target.write_register = lose_cause_restore
+        self.target.run_cpu_until = run_with_software_interrupt_change
+
+        with self.assertRaisesRegex(
+            CallGateError,
+            r"register cause: expected .* audit mask 0x8c00300",
+        ):
+            CallGateTransaction(self.target, self.manifest).execute()
 
     def test_status_formula_preserves_unrelated_original_bits(self):
         for original_status in (0, 0x1D, 0x1040FF1D, 0xFFFFFFFF):

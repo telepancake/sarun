@@ -34,11 +34,19 @@ pub const FILE_KINDS: &[&str] = &["path", "box", "exe", "cwd", "arg"];
 /// file may freely mix file and net kinds in a single clause (e.g.
 /// `discard box:* and host:bad.com` to deny bad.com for every box).
 pub const NET_KINDS: &[&str] = &[
-    "host", "port", "scheme", "sni",
-    "http_path", "http_method", "http_status",
-    "proto", "box", "exe", "cwd", "arg",
+    "host",
+    "port",
+    "scheme",
+    "sni",
+    "http_path",
+    "http_method",
+    "http_status",
+    "proto",
+    "box",
+    "exe",
+    "cwd",
+    "arg",
 ];
-
 
 #[cfg(test)]
 mod parse_net_rules {
@@ -56,8 +64,7 @@ mod parse_net_rules {
     }
     #[test]
     fn mixed_file_and_net_kinds_in_one_rule() {
-        let r = FileRule::parse(
-            "discard host:tracker.example and box:BAD").unwrap();
+        let r = FileRule::parse("discard host:tracker.example and box:BAD").unwrap();
         assert_eq!(r.clauses.len(), 2);
         assert_eq!(r.clauses[0].m.kind, "host");
         assert_eq!(r.clauses[1].m.kind, "box");
@@ -71,15 +78,19 @@ mod parse_net_rules {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Action { Apply, Discard, Passthrough,
-                  /// Net-only: a matching `ask` rule prompts the user via
-                  /// the banner-queue when the TUI is up, denies if not.
-                  /// The user's chosen YesOnce/NoOnce verdict drives the
-                  /// per-conn outcome; AllowSave/DenySave additionally
-                  /// appends a new `apply host:H` / `discard host:H` line
-                  /// to the filerules file so the next conn skips the
-                  /// banner. File-rule paths ignore Ask (treated as Apply).
-                  Ask }
+pub enum Action {
+    Apply,
+    Discard,
+    Passthrough,
+    /// Net-only: a matching `ask` rule prompts the user via
+    /// the banner-queue when the TUI is up, denies if not.
+    /// The user's chosen YesOnce/NoOnce verdict drives the
+    /// per-conn outcome; AllowSave/DenySave additionally
+    /// appends a new `apply host:H` / `discard host:H` line
+    /// to the filerules file so the next conn skips the
+    /// banner. File-rule paths ignore Ask (treated as Apply).
+    Ask,
+}
 
 impl Action {
     pub fn parse(s: &str) -> Option<Action> {
@@ -93,17 +104,26 @@ impl Action {
     }
     #[allow(dead_code)]
     pub fn as_str(self) -> &'static str {
-        match self { Action::Apply => "apply", Action::Discard => "discard",
-                     Action::Passthrough => "passthrough",
-                     Action::Ask => "ask" }
+        match self {
+            Action::Apply => "apply",
+            Action::Discard => "discard",
+            Action::Passthrough => "passthrough",
+            Action::Ask => "ask",
+        }
     }
 }
 
 #[derive(Clone, Debug)]
-pub struct Match { pub kind: String, pub pattern: String }
+pub struct Match {
+    pub kind: String,
+    pub pattern: String,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Join { And, Or }
+pub enum Join {
+    And,
+    Or,
+}
 
 #[derive(Clone, Debug)]
 pub struct Clause {
@@ -125,7 +145,9 @@ pub struct FileRule {
 /// DOTGLOB). Empty pattern → false. Mirrors Python `_glob_match`.
 pub fn glob_match(pat: &str, s: &str) -> bool {
     let pat = pat.trim();
-    if pat.is_empty() { return false; }
+    if pat.is_empty() {
+        return false;
+    }
     glob::globmatch(pat, s)
 }
 
@@ -160,7 +182,9 @@ pub fn wrap_bare_as_substring(pat: &str) -> String {
 /// and a cmd filter silently misses almost every real command line.
 pub fn cmd_match(pat: &str, s: &str) -> bool {
     let pat = pat.trim();
-    if pat.is_empty() { return false; }
+    if pat.is_empty() {
+        return false;
+    }
     glob::textmatch(&wrap_bare_as_substring(pat), s)
 }
 
@@ -168,10 +192,12 @@ pub fn cmd_match(pat: &str, s: &str) -> bool {
 /// (`**/` prefix); a leading `/` anchors at the root. Mirrors `_path_match`.
 pub fn path_match(pat: &str, rel: &str) -> bool {
     let pat = pat.trim();
-    if pat.is_empty() { return false; }
+    if pat.is_empty() {
+        return false;
+    }
     let s = format!("/{}", rel.trim_start_matches('/')); // absolute path
     let p = if !pat.contains('/') || !pat.starts_with('/') {
-        format!("**/{pat}")                              // bare/relative → any depth
+        format!("**/{pat}") // bare/relative → any depth
     } else {
         pat.to_string()
     };
@@ -206,7 +232,10 @@ impl Subject {
 
 /// Parse the internal "ids" pattern — comma-separated row ids — into a set.
 fn ids_of(pattern: &str) -> std::collections::HashSet<i64> {
-    pattern.split(',').filter_map(|t| t.trim().parse::<i64>().ok()).collect()
+    pattern
+        .split(',')
+        .filter_map(|t| t.trim().parse::<i64>().ok())
+        .collect()
 }
 
 /// A changed path under evaluation (file-domain target, mirrors PathTarget).
@@ -296,12 +325,19 @@ impl Target for EdgeFilterTarget {
 pub fn eval_clauses<T: Target>(target: &T, clauses: &[Clause]) -> bool {
     let mut acc: Option<bool> = None;
     for c in clauses {
-        if !c.enabled { continue; }
+        if !c.enabled {
+            continue;
+        }
         let mut v = target.match_one(&c.m);
-        if c.negate { v = !v; }
+        if c.negate {
+            v = !v;
+        }
         acc = Some(match acc {
             None => v,
-            Some(a) => match c.join { Join::Or => a || v, Join::And => a && v },
+            Some(a) => match c.join {
+                Join::Or => a || v,
+                Join::And => a && v,
+            },
         });
     }
     acc.unwrap_or(false)
@@ -319,11 +355,23 @@ impl FileRule {
         let mut out = vec![self.action.as_str().to_string()];
         for (n, c) in self.clauses.iter().enumerate() {
             let mut seg = vec![];
-            if n > 0 { seg.push(match c.join { Join::Or => "or", Join::And => "and" }.to_string()); }
-            if !c.enabled { seg.push("off".to_string()); }
-            if c.negate { seg.push("not".to_string()); }
+            if n > 0 {
+                seg.push(
+                    match c.join {
+                        Join::Or => "or",
+                        Join::And => "and",
+                    }
+                    .to_string(),
+                );
+            }
+            if !c.enabled {
+                seg.push("off".to_string());
+            }
+            if c.negate {
+                seg.push("not".to_string());
+            }
             if c.m.kind == "path" {
-                seg.push(c.m.pattern.clone());          // path renders bare
+                seg.push(c.m.pattern.clone()); // path renders bare
             } else {
                 seg.push(format!("{}:{}", c.m.kind, c.m.pattern));
             }
@@ -348,20 +396,33 @@ impl FileRule {
             let (mut off, mut neg) = (false, false);
             while i < toks.len() {
                 let lc = toks[i].to_ascii_lowercase();
-                if lc == "off" { off = true; i += 1; }
-                else if lc == "not" { neg = true; i += 1; }
-                else { break; }
+                if lc == "off" {
+                    off = true;
+                    i += 1;
+                } else if lc == "not" {
+                    neg = true;
+                    i += 1;
+                } else {
+                    break;
+                }
             }
-            if i >= toks.len() { break; }
+            if i >= toks.len() {
+                break;
+            }
             let pred = toks[i];
             i += 1;
             let (kind, pat) = match pred.split_once(':') {
-                Some((k, p)) if FILE_KINDS.contains(&k.to_ascii_lowercase().as_str())
-                             || NET_KINDS.contains(&k.to_ascii_lowercase().as_str()) =>
-                    (k.to_ascii_lowercase(), p.to_string()),
+                Some((k, p))
+                    if FILE_KINDS.contains(&k.to_ascii_lowercase().as_str())
+                        || NET_KINDS.contains(&k.to_ascii_lowercase().as_str()) =>
+                {
+                    (k.to_ascii_lowercase(), p.to_string())
+                }
                 _ => ("path".to_string(), pred.to_string()), // bare → path kind
             };
-            if pat.is_empty() { continue; }
+            if pat.is_empty() {
+                continue;
+            }
             clauses.push(Clause {
                 m: Match { kind, pattern: pat },
                 join: if clauses.is_empty() { Join::And } else { join },
@@ -377,14 +438,18 @@ impl FileRule {
     /// action (an explicit action is always required), or no clauses.
     pub fn parse(line: &str) -> Option<FileRule> {
         let s = line.trim();
-        if s.is_empty() || s.starts_with('#') { return None; }
+        if s.is_empty() || s.starts_with('#') {
+            return None;
+        }
         let (verb, rest) = match s.split_once(' ') {
             Some((v, r)) => (v, r),
             None => (s, ""),
         };
         let action = Action::parse(&verb.to_ascii_lowercase())?;
         let clauses = Self::parse_clauses(rest.trim());
-        if clauses.is_empty() { return None; }
+        if clauses.is_empty() {
+            return None;
+        }
         Some(FileRule { action, clauses })
     }
 
@@ -397,12 +462,14 @@ impl FileRule {
 
 // ── FileRules (mirrors Python FileRules) ─────────────────────────────────────
 
-pub struct Rules { pub rules: Vec<FileRule> }
+pub struct Rules {
+    pub rules: Vec<FileRule>,
+}
 
 impl Rules {
     pub fn load() -> Rules {
-        let text = std::fs::read_to_string(paths::config_home().join("filerules"))
-            .unwrap_or_default();
+        let text =
+            std::fs::read_to_string(paths::config_home().join("filerules")).unwrap_or_default();
         Rules::parse(&text)
     }
 
@@ -414,8 +481,15 @@ impl Rules {
     /// First-match FULL-grammar decision for a path, given the box display name
     /// and the writer's provenance (exe/cwd/argv). Mirrors `FileRules.decide`.
     pub fn decide(&self, rel: &str, subject: &Subject) -> Option<Action> {
-        let target = PathTarget { rel, subject: subject.clone(), ids: vec![] };
-        self.rules.iter().find(|r| r.matches(&target)).map(|r| r.action)
+        let target = PathTarget {
+            rel,
+            subject: subject.clone(),
+            ids: vec![],
+        };
+        self.rules
+            .iter()
+            .find(|r| r.matches(&target))
+            .map(|r| r.action)
     }
 
     /// PATH-ONLY passthrough decision for the D5 kernel-read-passthrough gate.
@@ -424,9 +498,15 @@ impl Rules {
     /// First matching path-only rule wins (so a higher path-only apply/discard
     /// still shadows a lower passthrough).
     pub fn passthrough_path_only(&self, rel: &str) -> bool {
-        let target = PathTarget { rel, subject: Subject::default(), ids: vec![] };
+        let target = PathTarget {
+            rel,
+            subject: Subject::default(),
+            ids: vec![],
+        };
         for r in &self.rules {
-            if !r.path_only() { continue; }
+            if !r.path_only() {
+                continue;
+            }
             if r.matches(&target) {
                 return r.action == Action::Passthrough;
             }
@@ -437,13 +517,17 @@ impl Rules {
     /// True if any rule tests a process facet (lets a hot caller skip resolving
     /// the writer's provenance when no rule would use it). Mirrors needs_proc.
     pub fn needs_proc(&self) -> bool {
-        self.rules.iter().flat_map(|r| &r.clauses)
+        self.rules
+            .iter()
+            .flat_map(|r| &r.clauses)
             .any(|c| matches!(c.m.kind.as_str(), "exe" | "cwd" | "arg"))
     }
 
     /// True if any rule tests the box facet.
     pub fn needs_box(&self) -> bool {
-        self.rules.iter().flat_map(|r| &r.clauses)
+        self.rules
+            .iter()
+            .flat_map(|r| &r.clauses)
             .any(|c| c.m.kind == "box")
     }
 }

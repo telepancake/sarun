@@ -91,6 +91,87 @@ wire_enum(run_backend, qemu, 3).
 wire_type(qemu_architecture, enum).
 wire_enum(qemu_architecture, aarch64, 1).
 wire_enum(qemu_architecture, x86_64, 2).
+wire_enum(qemu_architecture, arm,     3).
+wire_enum(qemu_architecture, mmips,   4).
+
+wire_type(debug_mode, enum).
+wire_enum(debug_mode, off,                   1).
+wire_enum(debug_mode, attach_before_command, 2).
+
+% Fixed QEMU machine/console contracts for opaque initramfs images.  This is
+% deliberately an enum rather than an argument list: a box can select one
+% reviewed profile, but cannot inject QEMU command-line options.
+wire_type(debug_image_profile, enum).
+wire_enum(debug_image_profile, virt_initramfs_aarch64_v1,   1).
+wire_enum(debug_image_profile, microvm_initramfs_x86_64_v1, 2).
+wire_enum(debug_image_profile, virt_initramfs_arm_v1,       3).
+wire_enum(debug_image_profile, malta_initramfs_mipsel_v1,   4).
+
+wire_type(debug_source_view, enum).
+wire_enum(debug_source_view, provider_root, 1).
+
+% One exact boot artifact selected from a captured box. No host or derived
+% artifact paths cross this boundary.
+wire_type(selected_artifact, record([
+    field(box, box_selector),
+    field(path, path)
+])).
+
+% The user selects either one combined firmware image or the two payloads
+% accepted by QEMU's -kernel/-initrd boot form. Keeping this a closed sum
+% prevents partial pairs and ambiguous combinations at the transport layer.
+wire_type(selected_boot, choice).
+wire_variant(selected_boot, image, 1, [
+    field(image, selected_artifact)
+]).
+wire_variant(selected_boot, kernel_initramfs, 2, [
+    field(kernel, selected_artifact),
+    field(initramfs, selected_artifact)
+]).
+
+% Exact userspace symbol identity delivered to the provider after the engine
+% has validated the named image bundle.  Paths remain provider-root-relative;
+% no host pathname crosses this boundary.
+wire_type(debug_executable, record([
+    field(guest_path, path),
+    field(build_id, bytes(short_bytes)),
+    field(runtime_sha256, fixed_bytes(32)),
+    field(runtime_size, u64),
+    field(debug_elf, path),
+    field(debug_sha256, fixed_bytes(32)),
+    field(debug_size, u64),
+    field(elf_class, u16),
+    field(elf_machine, u16),
+    field(source_view, debug_source_view)
+])).
+
+wire_type(debug_image_catalog, record([
+    field(manifest, path),
+    field(profile, debug_image_profile),
+    field(init, path),
+    field(executables, list(debug_executable, collection_items))
+])).
+
+wire_type(debug_guest_image_start, record([
+    field(profile, debug_image_profile),
+    field(init, path)
+])).
+
+% Prelude consumed by the declared viros-debug provider before the same
+% inherited duplex stream becomes QEMU's raw RSP lane.  Both paths are names
+% inside the composed Sarun resource view; neither can designate a host file
+% or socket.
+wire_type(debug_provider_start, record([
+    field(manifest, path),
+    field(service, service_name),
+    field(image, option(debug_image_catalog))
+])).
+
+wire_type(debug_client_start, record([
+    field(manifest, path),
+    field(image, option(debug_image_catalog)),
+    field(service, service_name)
+])).
 
 wire_type(error_category, enum).
 wire_enum(error_category, invalid_request, 1).
@@ -172,7 +253,8 @@ wire_type(register_reply, record([
     field(api, bool),
     field(no_host, bool),
     field(oci, option(oci_runtime)),
-    field(virtiofs_socket, option(path))
+    field(virtiofs_socket, option(path)),
+    field(debug_image, option(debug_guest_image_start))
 ])).
 
 % Host runner <-> target /init over the named virtio-serial port.  This is a
@@ -182,7 +264,8 @@ wire_type(appliance_command, record([
     field(command, list(os_string, 1, command_items)),
     field(cwd, option(path)),
     field(environment, environment),
-    field(net_mode, net_mode)
+    field(net_mode, net_mode),
+    field(debug_mode, debug_mode)
 ])).
 % A nested `run --qemu` does not start QEMU in the guest.  The guest sends this
 % semantic request to its still-live host runner, which launches a second flat
@@ -919,6 +1002,8 @@ wire_request(register,              257, mode(box), [
     field(name, registration_name),
     field(backend, run_backend),
     field(architecture, option(qemu_architecture)),
+    field(debug_mode, debug_mode),
+    field(selected_boot, option(selected_boot)),
     field(net_mode, net_mode),
     field(capture, bool),
     field(direct, bool),
@@ -970,6 +1055,7 @@ wire_request(api_proxy,             266, mode(raw_http), [], [], broker_box).
 wire_request(service_declare,       267, reply(empty), [
     field(name, service_name),
     field(argv, list(os_string, 1, command_items)),
+    field(client_argv, list(os_string, command_items)),
     field(net_mode, option(net_mode))
 ], [], broker_box).
 wire_request(service_accept,        268, mode(service_accept), [
@@ -1045,6 +1131,10 @@ wire_event(build_graph_changed,      7, [
 wire_event(api_log_added,            8, [field(box, box_id)]).
 wire_event(web_capture_added,        9, [field(box, box_id)]).
 wire_event(pong,                    10, []).
+wire_event(debug_console_ready,     11, [
+    field(box, box_id),
+    field(service, service_name)
+]).
 
 % wire_frame(Stream, Name, Code, Direction, Fields, Fds, Transition).
 % Codes preserve the already-deployed tv-atom mux identities. Retired 10..12
@@ -1068,6 +1158,12 @@ wire_frame(box, open_connection, 13, runner_to_engine, [], [], stay).
 wire_frame(box, connection,      14, engine_to_runner, [], [
     fd(connected_socket, required, always)
 ], stay).
+% The runner forwards the guest's attach-before-command barrier to the engine.
+% Only after the provider has parked the engine-issued session service does the
+% engine return debug_start.  QEMU is then still stopped by the provider; the
+% queued guest reply becomes visible when managed GDB continues the machine.
+wire_frame(box, debug_prepared,  18, runner_to_engine, [], [], stay).
+wire_frame(box, debug_start,     19, engine_to_runner, [], [], stay).
 
 % Flat nested-QEMU operation channel.  `stream` identifies one guest caller;
 % it never names an engine socket or a host descriptor.  The host runner owns
@@ -1105,6 +1201,12 @@ wire_frame(appliance, ready, 8, guest_to_host, [], [], stay).
 wire_frame(appliance, process, 9, guest_to_host, [
     field(event, guest_process_event)
 ], [], stay).
+% In attach-before-command mode PID 1 reaches this barrier after mounts,
+% networking, and control setup, but before spawning the requested command.
+% The host starts the debugger facade and replies only when its endpoint is
+% ready. The queued reply reaches PID 1 when GDB resumes the stopped machine.
+wire_frame(appliance, debug_prepared, 10, guest_to_host, [], [], stay).
+wire_frame(appliance, debug_start,    11, host_to_guest, [], [], stay).
 
 wire_frame(pty, data,             7, bidirectional, [
     field(data, bytes(stream_chunk_bytes))

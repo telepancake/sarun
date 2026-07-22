@@ -14,11 +14,10 @@
 //   reject    — discard a sub-agent's staged changes
 //   backtrack — rewind this conversation; waypoint OR finished answer
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 pub const META_TOOL_NAME: &str = "ask";
-pub const DEFAULT_CAPABILITIES: &str =
-    "general assistance (shell, inspect, delegation)";
+pub const DEFAULT_CAPABILITIES: &str = "general assistance (shell, inspect, delegation)";
 
 /// Delegation depth cap — a top-level conversation is depth 0; each `ask`
 /// sub-agent is one deeper. Past it `ask` stays VISIBLE in the schema but
@@ -26,7 +25,9 @@ pub const DEFAULT_CAPABILITIES: &str =
 /// exhausted, and does the work itself instead of spinning.
 pub const MAX_DEPTH: u32 = 3;
 
-pub fn max_depth() -> u32 { MAX_DEPTH }
+pub fn max_depth() -> u32 {
+    MAX_DEPTH
+}
 
 /// Hard ceiling on a tool RESULT turn's size, in bytes. Rendering ladders
 /// fall back to terser forms until one fits; the FULL stream/diff stays in
@@ -39,7 +40,10 @@ pub const RESULT_BUDGET: usize = 8 * 1024;
 pub const CHANGES_BUDGET: usize = 2 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RunLocation { InBox, Manager }
+pub enum RunLocation {
+    InBox,
+    Manager,
+}
 
 #[derive(Debug, Clone)]
 pub struct ToolSpec {
@@ -65,7 +69,8 @@ impl ToolSpec {
 fn act_spec(capabilities: &str, exhausted: bool) -> ToolSpec {
     let description = if exhausted {
         "Delegation depth is exhausted here. You can still call this, but it \
-         will return 'too deep' — so just do the task yourself.".to_string()
+         will return 'too deep' — so just do the task yourself."
+            .to_string()
     } else {
         format!(
             "ASK A SUB-AGENT to do something for you. Your context is \
@@ -107,7 +112,8 @@ fn act_spec(capabilities: &str, exhausted: bool) -> ToolSpec {
              pool by N more turns. \
              \
              Put the natural-language request in `request` and any \
-             input data in `data`. Your capabilities are: {capabilities}.")
+             input data in `data`. Your capabilities are: {capabilities}."
+        )
     };
     ToolSpec {
         name: META_TOOL_NAME,
@@ -133,8 +139,7 @@ fn act_spec(capabilities: &str, exhausted: bool) -> ToolSpec {
 fn shell_spec() -> ToolSpec {
     ToolSpec {
         name: "shell",
-        description:
-            "Run a shell script for ACTIONS and RUNTIME work — building, \
+        description: "Run a shell script for ACTIONS and RUNTIME work — building, \
              compiling, installing packages, running tests, invoking other \
              binaries, anything that changes state or needs a real process. \
              For READING files or BROWSING the filesystem, use `inspect` \
@@ -153,7 +158,8 @@ fn shell_spec() -> ToolSpec {
              IMPORTANT: /tmp is a FRESH tmpfs per shell call (not part of \
              the overlay) — files written to /tmp in one call are GONE by \
              the next. To persist state across calls, write to /root, \
-             $HOME, /var, or any other path under the overlay.".to_string(),
+             $HOME, /var, or any other path under the overlay."
+            .to_string(),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -169,8 +175,7 @@ fn shell_spec() -> ToolSpec {
 fn inspect_spec() -> ToolSpec {
     ToolSpec {
         name: "inspect",
-        description:
-            "Use this for FILESYSTEM NAVIGATION and STRUCTURE — anything \
+        description: "Use this for FILESYSTEM NAVIGATION and STRUCTURE — anything \
              you'd normally do with `ls`, `find`, `head`, line-numbered \
              `cat`, or `grep -n`. inspect is PAGED so you won't get an \
              8KB blob back, KEYED so you can ask for `next` page instead \
@@ -192,7 +197,8 @@ fn inspect_spec() -> ToolSpec {
              turns). The cursor footer says either END (you've seen \
              everything) or shows the available page keys — read it \
              and decide whether you have what you need before paginating \
-             further.".to_string(),
+             further."
+            .to_string(),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -208,8 +214,7 @@ fn inspect_spec() -> ToolSpec {
 fn read_spec() -> ToolSpec {
     ToolSpec {
         name: "read",
-        description:
-            "Use this when you need to QUOTE FILE CONTENT VERBATIM — the \
+        description: "Use this when you need to QUOTE FILE CONTENT VERBATIM — the \
              raw bytes, no line numbers, no framing. inspect shows you \
              structure and numbered lines (use it first to find WHERE in \
              the file you want); read gives you the exact text from there \
@@ -221,7 +226,8 @@ fn read_spec() -> ToolSpec {
              .sh/.bash), or a page key (next/previous/first/last) \
              returning the last paged window raw. Use this instead of \
              `shell` + `cat`/`sed -n`/`awk` — those add line numbers, \
-             framing, or formatting noise.".to_string(),
+             framing, or formatting noise."
+            .to_string(),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -236,8 +242,7 @@ fn read_spec() -> ToolSpec {
 fn write_spec() -> ToolSpec {
     ToolSpec {
         name: "write",
-        description:
-            "Use this to MODIFY a file by NAMING THE THING TO REPLACE — the \
+        description: "Use this to MODIFY a file by NAMING THE THING TO REPLACE — the \
              same locator grammar `inspect` uses to ENUMERATE things, `write` \
              uses to REPLACE them. inspect says \"here are the lines / \
              entries / sections of this thing\"; read quotes one of them \
@@ -271,7 +276,8 @@ fn write_spec() -> ToolSpec {
              \
              box: locators are inspect-only (staged change sets are \
              read-only here). Sequence-insertion locators (before/after a \
-             named symbol) are a planned extension.".to_string(),
+             named symbol) are a planned extension."
+            .to_string(),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -291,8 +297,7 @@ fn write_spec() -> ToolSpec {
 fn apply_spec() -> ToolSpec {
     ToolSpec {
         name: "apply",
-        description:
-            "Call this AFTER a successful `ask` to commit the sub-agent's \
+        description: "Call this AFTER a successful `ask` to commit the sub-agent's \
              work. The sub-agent ran in its own sandbox box; its file \
              writes are STAGED there, not yet folded into your plane. \
              apply takes the change summary you saw in the ask result \
@@ -306,7 +311,8 @@ fn apply_spec() -> ToolSpec {
              \
              `target` is the sub-agent's session id — find it as the \
              `from` field on the ask result turn (`{\"turn-id\":\"...\", \
-             \"from\":\"<target>\"}` header).".to_string(),
+             \"from\":\"<target>\"}` header)."
+            .to_string(),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -321,8 +327,7 @@ fn apply_spec() -> ToolSpec {
 fn reject_spec() -> ToolSpec {
     ToolSpec {
         name: "reject",
-        description:
-            "Call this when a sub-agent's STAGED FILE CHANGES are wrong \
+        description: "Call this when a sub-agent's STAGED FILE CHANGES are wrong \
              or unwanted, but its RESULT TEXT is still useful. Discards \
              everything the sub-agent's sandbox box accumulated and \
              removes the box — but the ask tool result stays in your \
@@ -335,7 +340,8 @@ fn reject_spec() -> ToolSpec {
              instead. \
              \
              `target` is the sub-agent's session id — find it as the \
-             `from` field on the ask result turn.".to_string(),
+             `from` field on the ask result turn."
+            .to_string(),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -350,8 +356,7 @@ fn reject_spec() -> ToolSpec {
 fn backtrack_spec() -> ToolSpec {
     ToolSpec {
         name: "backtrack",
-        description:
-            "USE THIS TO SHIP YOUR FINAL ANSWER cleanly. When you've \
+        description: "USE THIS TO SHIP YOUR FINAL ANSWER cleanly. When you've \
              worked through tool calls, dead ends, retries, and now know \
              the answer — DO NOT just emit prose. Call backtrack with \
              final=true and your answer as the summary. The harness will \
@@ -377,7 +382,8 @@ fn backtrack_spec() -> ToolSpec {
              You cannot use this to edit your CALLER's context — only \
              your own. Sub-agents must call backtrack(final=true) to \
              cleanly ship a result, otherwise the messy derivation \
-             flows back to the caller.".to_string(),
+             flows back to the caller."
+            .to_string(),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -395,8 +401,7 @@ fn backtrack_spec() -> ToolSpec {
 fn delete_spec() -> ToolSpec {
     ToolSpec {
         name: "delete",
-        description:
-            "Call this when a sub-agent's WORK was a dead end — you've \
+        description: "Call this when a sub-agent's WORK was a dead end — you've \
              already incorporated whatever signal you got into your own \
              reasoning (or there was no useful signal), and now you want \
              to free the harness from tracking that sub-agent at all. \
@@ -411,7 +416,8 @@ fn delete_spec() -> ToolSpec {
              \
              For rewinding your OWN context — collapsing your derivation \
              into a clean answer — use `backtrack(final=true)`, NOT \
-             delete.".to_string(),
+             delete."
+            .to_string(),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -427,9 +433,10 @@ fn delete_spec() -> ToolSpec {
 /// `depth` (this context's delegation depth) flattens `ask` to its exhausted
 /// form at `MAX_DEPTH` — the row stays so the model sees the capability, but
 /// a call returns "too deep".
-pub fn tool_registry(capabilities: Option<&str>, depth: u32)
-    -> std::collections::BTreeMap<&'static str, ToolSpec>
-{
+pub fn tool_registry(
+    capabilities: Option<&str>,
+    depth: u32,
+) -> std::collections::BTreeMap<&'static str, ToolSpec> {
     let caps = capabilities.unwrap_or(DEFAULT_CAPABILITIES);
     let mut r = std::collections::BTreeMap::new();
     r.insert(META_TOOL_NAME, act_spec(caps, depth >= max_depth()));
@@ -464,7 +471,9 @@ pub struct ExecResult {
 //    by trying them in order until one fits. ───────────────────────────────
 pub fn fit_to_budget(renderings: &[String], budget: usize) -> String {
     for r in renderings {
-        if r.len() <= budget { return r.clone(); }
+        if r.len() <= budget {
+            return r.clone();
+        }
     }
     // None fit — clamp the LAST (presumed terse-most) rendering to the budget.
     let last = renderings.last().cloned().unwrap_or_default();
@@ -476,19 +485,31 @@ pub fn fit_to_budget(renderings: &[String], budget: usize) -> String {
 /// ladder. The shell `text` is `output\n\n=== changes ===\n<changes>` —
 /// callers concat afterwards.
 pub fn fit_output(output: &str, budget: usize) -> String {
-    if output.len() <= budget { return output.to_string(); }
+    if output.len() <= budget {
+        return output.to_string();
+    }
     let head_n = budget / 2;
     let tail_n = budget / 2 - 80; // room for the elision marker
     let head: String = output.chars().take(head_n).collect();
-    let tail: String = output.chars().rev().take(tail_n).collect::<String>()
-        .chars().rev().collect();
-    format!("{head}\n…[{} bytes elided]…\n{tail}",
-            output.len().saturating_sub(head.len() + tail.len()))
+    let tail: String = output
+        .chars()
+        .rev()
+        .take(tail_n)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    format!(
+        "{head}\n…[{} bytes elided]…\n{tail}",
+        output.len().saturating_sub(head.len() + tail.len())
+    )
 }
 
 /// Summarise a unified diff into per-file then per-dir then totals lines.
 pub fn summarize_patch(patch: &str, budget: usize) -> String {
-    if patch.len() <= budget { return patch.to_string(); }
+    if patch.len() <= budget {
+        return patch.to_string();
+    }
     // Per-file +/- summary.
     let mut files: Vec<(String, usize, usize)> = Vec::new(); // (path, +, -)
     let mut cur_path: Option<String> = None;
@@ -497,10 +518,13 @@ pub fn summarize_patch(patch: &str, budget: usize) -> String {
     let mut total_adds = 0usize;
     let mut total_dels = 0usize;
     let push_cur = |files: &mut Vec<(String, usize, usize)>,
-                    cur: &mut Option<String>, a: &mut usize, d: &mut usize| {
+                    cur: &mut Option<String>,
+                    a: &mut usize,
+                    d: &mut usize| {
         if let Some(p) = cur.take() {
             files.push((p, *a, *d));
-            *a = 0; *d = 0;
+            *a = 0;
+            *d = 0;
         }
     };
     for line in patch.lines() {
@@ -508,31 +532,43 @@ pub fn summarize_patch(patch: &str, budget: usize) -> String {
             push_cur(&mut files, &mut cur_path, &mut adds, &mut dels);
             cur_path = Some(rest.to_string());
         } else if line.starts_with("+") && !line.starts_with("+++") {
-            adds += 1; total_adds += 1;
+            adds += 1;
+            total_adds += 1;
         } else if line.starts_with("-") && !line.starts_with("---") {
-            dels += 1; total_dels += 1;
+            dels += 1;
+            total_dels += 1;
         }
     }
     push_cur(&mut files, &mut cur_path, &mut adds, &mut dels);
     // Try the per-file rendering first.
-    let mut per_file: Vec<String> = files.iter()
+    let mut per_file: Vec<String> = files
+        .iter()
         .map(|(p, a, d)| format!("{p}: +{a} -{d}"))
         .collect();
     per_file.sort();
     let per_file_text = per_file.join("\n");
-    if per_file_text.len() <= budget { return per_file_text; }
-    // Per-directory rollup.
-    let mut by_dir: std::collections::BTreeMap<String, (usize, usize, usize)> =
-        Default::default();
-    for (p, a, d) in &files {
-        let dir = std::path::Path::new(p).parent()
-            .map(|x| x.display().to_string()).unwrap_or_else(|| ".".into());
-        let e = by_dir.entry(dir).or_insert((0, 0, 0));
-        e.0 += 1; e.1 += a; e.2 += d;
+    if per_file_text.len() <= budget {
+        return per_file_text;
     }
-    let per_dir_text = by_dir.iter()
+    // Per-directory rollup.
+    let mut by_dir: std::collections::BTreeMap<String, (usize, usize, usize)> = Default::default();
+    for (p, a, d) in &files {
+        let dir = std::path::Path::new(p)
+            .parent()
+            .map(|x| x.display().to_string())
+            .unwrap_or_else(|| ".".into());
+        let e = by_dir.entry(dir).or_insert((0, 0, 0));
+        e.0 += 1;
+        e.1 += a;
+        e.2 += d;
+    }
+    let per_dir_text = by_dir
+        .iter()
         .map(|(d, (n, a, m))| format!("{d}/: {n} files +{a} -{m}"))
-        .collect::<Vec<_>>().join("\n");
-    if per_dir_text.len() <= budget { return per_dir_text; }
+        .collect::<Vec<_>>()
+        .join("\n");
+    if per_dir_text.len() <= budget {
+        return per_dir_text;
+    }
     format!("{} files +{total_adds} -{total_dels}", files.len())
 }

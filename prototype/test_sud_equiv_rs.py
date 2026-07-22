@@ -26,7 +26,7 @@ Skips (passes vacuously) if cargo / the engine / bwrap / the sud64 wrapper / a
 C toolchain is unavailable. Host fixtures use /var/tmp so they do not collide
 with paths deliberately created inside the test boxes.
 """
-import os, shutil, socket, sqlite3, stat as stat_mod, subprocess, sys, \
+import os, shlex, shutil, socket, sqlite3, stat as stat_mod, subprocess, sys, \
        tempfile, time
 from pathlib import Path
 from sarun_test_paths import ENGINE_BIN
@@ -233,15 +233,18 @@ class Engine:
 
 def equivalence_workload(mode, sudtool):
     """Run the shared workload under one backend; return observations."""
+    fixture = Path(tempfile.mkdtemp(prefix=f"sudeq-{mode}-", dir=TMPBASE))
     # Host binary the box will exec (lives on the real host = lower layer).
-    host_bin = Path(TMPBASE) / "sudeq_hostbin"
+    host_bin = fixture / "sudeq_hostbin"
     shutil.copy(sudtool, host_bin); host_bin.chmod(0o755)
-    victim = Path("/root/sudeq_victim.txt")
+    victim = fixture / "sudeq_victim.txt"
     victim.write_bytes(b"v\n")
     # Host files the box MODIFIES (append / chmod): copy-up territory —
     # the captured box copy carries the change, the host copy must not.
-    modf = Path("/root/sudeq_mod.txt")
+    modf = fixture / "sudeq_mod.txt"
     modf.write_bytes(b"orig\n"); modf.chmod(0o644)
+    victim_rel = victim.as_posix().removeprefix("/")
+    mod_rel = modf.as_posix().removeprefix("/")
     eng = Engine(mode)
     try:
         script = (
@@ -258,9 +261,10 @@ def equivalence_workload(mode, sudtool):
             f"{host_bin} streams; "
             # in-place modification of a HOST file (append) + chmod of it:
             # copy-up semantics — box copy changes, host copy must not
-            "echo add >> /root/sudeq_mod.txt && chmod 0741 /root/sudeq_mod.txt && "
+            f"echo add >> {shlex.quote(str(modf))} && "
+            f"chmod 0741 {shlex.quote(str(modf))} && "
             # deletion of a host file -> tombstone / whiteout
-            "rm /root/sudeq_victim.txt")
+            f"rm {shlex.quote(str(victim))}")
         # --net off keeps this (filesystem-equivalence) workload deterministic
         # and independent of tap availability; networking has its own test.
         r = eng.run("SUDEQBOX", script, extra_argv=["--net", "off"])
@@ -273,7 +277,8 @@ def equivalence_workload(mode, sudtool):
         # SUD trace EOF finalization folds live/<id>/sud.trace into the box's
         # sqlar `sudtrace` row and removes the redundant file. Verify the blob
         # is present + the `sudtrace` control verb decodes ≥1 EXEC event + the
-        # live file is gone. (FUSE boxes never populate it — trace stays None.)
+        # live file is gone. This test inspects SUD's syscall producer here;
+        # FUSE TRACE v3 generation has its focused CLI regression.
         trace = None
         if mode == "sud":
             bid = sp.stem
@@ -301,9 +306,9 @@ def equivalence_workload(mode, sudtool):
             "xattr": sqlar_xattr(sp, "root/sudeq_xf.txt", "user.sudeq"),
             "nested_content": m.sqlar_content(sp, "root/sudeq_d/inner.txt"),
             "victim_is_tombstone": stat_mod.S_ISCHR(
-                rows.get("root/sudeq_victim.txt", 0)),
-            "mod_content": m.sqlar_content(sp, "root/sudeq_mod.txt"),
-            "mod_perm": stat_mod.S_IMODE(rows.get("root/sudeq_mod.txt", 0)),
+                rows.get(victim_rel, 0)),
+            "mod_content": m.sqlar_content(sp, mod_rel),
+            "mod_perm": stat_mod.S_IMODE(rows.get(mod_rel, 0)),
             "host_mod_untouched": modf.read_bytes() == b"orig\n"
                 and stat_mod.S_IMODE(modf.stat().st_mode) == 0o644,
             # An overlay deletion must leave the HOST file untouched (the
@@ -315,10 +320,7 @@ def equivalence_workload(mode, sudtool):
             "cap_stderr": b"STDERR-STREAM\n" in outs[1],
         }
     finally:
-        victim.unlink(missing_ok=True)
-        modf.unlink(missing_ok=True)
-        Path("/root/sudeq_out.txt").unlink(missing_ok=True)
-        host_bin.unlink(missing_ok=True)
+        shutil.rmtree(fixture, ignore_errors=True)
         eng.close()
 
 

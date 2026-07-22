@@ -67,7 +67,7 @@ UV_X86_64_SHA256=${UV_X86_64_SHA256:-8c88519b0ef0af9801fcdee419bbb12116bd9e6b18e
 JOBS=${JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || printf '2')}
 DISK_SIZE=${DISK_SIZE:-64M}
 DEBUG_BOOT_TIMEOUT=${DEBUG_BOOT_TIMEOUT:-30}
-DEBUG_KERNEL_CONFIG_REVISION=1
+DEBUG_KERNEL_CONFIG_REVISION=2
 
 ARCHES=(x86 arm arm64 mipsbe mmips smips ppc tile)
 RUN_TARGETS=(x86 arm arm64 mipsbe mmips smips ppc-e500-smp ppc-e500 ppc-440 ppc-83xx tile openwrt-malta-le openwrt-arm openwrt-arm64)
@@ -198,6 +198,14 @@ Stages:
   download              Download pinned tools, current RouterOS, and OpenWrt
   build                 Build emulators, Python GDB, and debug kernel(s)
   kernel-debug <target> Build a MikroTik-configured vmlinux with GDB scripts
+  kernel-support LINUX_SOURCE [CONFIG]
+                        Install debugger support into an external Linux tree;
+                        optionally update an existing kernel .config
+  kernel-bundle OPTIONS Build a portable debugger bundle from one exact
+                        external Kbuild output; use kernel-bundle --help
+  image-bundle OPTIONS  Publish a bootable initramfs and build-ID-indexed
+                        userspace symbols; use image-bundle --help
+  sarun-install         Publish/update the named VIROS-DEBUG provider box
   kernel-workspace TARGET WRITABLE-DIR -- COMMAND [ARG...]
                         Run a foreground Kbuild command with matching source
   extract [arch|all]    Extract Linux images/initramfs from RouterOS NPKs
@@ -205,7 +213,8 @@ Stages:
   run <target> [-- ...] Prepare and run one target; extra args go to QEMU
   gdb <target> [remote] Launch debug workflow, or attach to explicit remote
   debug <target>        Boot matching debug kernel, stop after init, open GDB
-  inferiors mmips       Boot the matching MMIPS kernel to /init and expose its
+  inferiors x86|arm|arm64|mmips
+                        Boot the matching kernel to /init and expose its
                         live task snapshot through the GDB RSP facade
   inferiors openwrt-arm64 MANIFEST BOOTABLE_KERNEL
                         Do the same for an exact local OpenWrt AArch64 build
@@ -456,7 +465,7 @@ build_expat() {
 
 build_gdb() {
     local src="$SOURCES/gdb-${GDB_VERSION}"
-    local out="$BUILD/gdb-${GDB_VERSION}-python-${UV_PYTHON_VERSION}-localdeps-expat" python python_prefix
+    local out="$BUILD/gdb-${GDB_VERSION}-python-${UV_PYTHON_VERSION}-localdeps-expat-portable" python python_prefix python_root portable_ldflags
     local gmp_prefix="$TOOLS/gmp-${GMP_VERSION}" mpfr_prefix="$TOOLS/mpfr-${MPFR_VERSION}"
     local expat_prefix="$TOOLS/expat-${EXPAT_VERSION}"
     build_mpfr
@@ -465,6 +474,13 @@ build_gdb() {
     mkdir -p "$out" "$TOOLS/gdb"
     python=$(managed_python)
     python_prefix=$("$python" -c 'import sys; print(sys.prefix)')
+    python_root=$(dirname -- "$(dirname -- "$python")")
+    ln -sfn -- "$(basename -- "$python_root")" "$TOOLS/python/managed"
+    # Only the final GDB executable needs a relocatable libpython lookup. Keep
+    # the ordinary absolute build-time path for recursive configure checks;
+    # the make command-line override reaches the final link without losing
+    # the escaped token through another generated Makefile.
+    portable_ldflags="-L$python_prefix/lib -Wl,-rpath,"'\$$ORIGIN/../../python/managed/lib'
     say "Configuring Python-enabled multi-target GDB $GDB_VERSION"
     (cd "$out" && LDFLAGS="-L$python_prefix/lib -Wl,-rpath,$python_prefix/lib${LDFLAGS:+ $LDFLAGS}" "$src/configure" \
         --prefix="$TOOLS/gdb" --enable-targets=all --with-python="$python" \
@@ -473,7 +489,7 @@ build_gdb() {
         --disable-binutils --disable-gas --disable-gold --disable-gprof \
         --disable-ld --disable-sim)
     say "Building GDB"
-    make -C "$out" -j "$JOBS" all-gdb
+    make -C "$out" -j "$JOBS" all-gdb LDFLAGS="$portable_ldflags"
     make -C "$out" install-gdb
 }
 
@@ -516,12 +532,16 @@ setup_uv() {
 }
 
 download_managed_python() {
+    local python python_root
     setup_uv
     say "Installing pinned managed CPython $UV_PYTHON_VERSION below VIROS_WORKDIR"
     UV_CACHE_DIR="$TOOLS/uv-cache" \
     UV_PYTHON_INSTALL_DIR="$TOOLS/python" \
     UV_PYTHON_INSTALL_BIN=0 \
         "$UV" python install --managed-python --no-bin --no-progress "$UV_PYTHON_VERSION"
+    python=$(managed_python)
+    python_root=$(dirname -- "$(dirname -- "$python")")
+    ln -sfn -- "$(basename -- "$python_root")" "$TOOLS/python/managed"
 }
 
 managed_python() {
@@ -671,9 +691,13 @@ setup_mipsbe_cross() { setup_downloaded_cross "$MIPSBE_TOOLCHAIN_NAME" "$MIPSBE_
 setup_ppc_cross() { setup_downloaded_cross "$PPC_TOOLCHAIN_NAME" "$PPC_TOOLCHAIN_SHA256" powerpc powerpc-linux PPC_CROSS_PREFIX 10.2.0 PowerPC; }
 setup_mmips_cross() { setup_downloaded_cross "$MMIPS_TOOLCHAIN_NAME" "$MMIPS_TOOLCHAIN_SHA256" mmips mipsel-buildroot-linux-musl MMIPS_CROSS_PREFIX 9.3.0 MMIPS; }
 
-kernel_scratch_source_hash() {
-    (CDPATH= cd -- "$SCRIPT_DIR/probe/scratch/kernel" &&
-        sha256sum Kbuild viros_scratch.S | sha256sum | awk '{print $1}')
+kernel_debug_source_hash() {
+    sha256sum \
+        "$SCRIPT_DIR/probe/debug/kernel/Kbuild" \
+        "$SCRIPT_DIR/probe/scratch/kernel/viros_scratch.S" \
+        "$SCRIPT_DIR/probe/events/kernel/viros_event.c" \
+        "$SCRIPT_DIR/probe/events/include/viros_event_abi.h" |
+        sha256sum | awk '{print $1}'
 }
 
 install_kernel_scratch_source() {
@@ -682,15 +706,24 @@ install_kernel_scratch_source() {
     local marker='# viros built-in debugger workspace'
     local link_marker='# viros debugger workspace link anchor'
     mkdir -p -- "$destination"
-    cp -f -- "$SCRIPT_DIR/probe/scratch/kernel/Kbuild" "$destination/Kbuild"
+    cp -f -- "$SCRIPT_DIR/probe/debug/kernel/Kbuild" "$destination/Kbuild"
     cp -f -- "$SCRIPT_DIR/probe/scratch/kernel/viros_scratch.S" \
         "$destination/viros_scratch.S"
+    cp -f -- "$SCRIPT_DIR/probe/events/kernel/viros_event.c" \
+        "$destination/viros_event.c"
+    cp -f -- "$SCRIPT_DIR/probe/events/include/viros_event_abi.h" \
+        "$destination/viros_event_abi.h"
     if ! grep -qxF "$marker" "$makefile"; then
         {
             printf '\n%s\n' "$marker"
-            printf 'obj-$(CONFIG_ARM64) += viros/\n'
-            printf 'obj-$(CONFIG_MIPS) += viros/\n'
+            printf 'obj-y += viros/\n'
         } >> "$makefile"
+    elif ! grep -qxF 'obj-y += viros/' "$makefile"; then
+        sed -i \
+            -e '/^obj-$(CONFIG_ARM64) += viros\/$/d' \
+            -e '/^obj-$(CONFIG_MIPS) += viros\/$/d' \
+            -e "/^# viros built-in debugger workspace$/a\\
+obj-y += viros/" "$makefile"
     fi
     if grep -qxF "$link_marker" "$src/Makefile" &&
         ! grep -qxF 'ifeq ($(VIROS_SCRATCH),1)' "$src/Makefile"; then
@@ -710,6 +743,61 @@ endif' "$src/Makefile"
         sed -i 's/^KBUILD_LDFLAGS += --undefined=__viros_scratch_code_start$/KBUILD_LDFLAGS += --undefined=__viros_scratch_code_start --undefined=__viros_scratch_data_start --undefined=__viros_scratch_stack_start/' \
             "$src/Makefile"
     fi
+}
+
+kernel_support_stage() {
+    if [[ ${1:-} == -h || ${1:-} == --help ]]; then
+        cat <<'EOF'
+usage: ./viros.sh kernel-support LINUX_SOURCE [CONFIG]
+
+Install the built-in ViroS debugger support in a prepared Linux source tree.
+When CONFIG is supplied, enable the required debug and tracepoint settings in
+that file. Build the resulting tree with VIROS_SCRATCH=1 VIROS_EVENTS=1 and
+retain its unstripped vmlinux, boot image, Kbuild output, and scripts_gdb files.
+EOF
+        return 0
+    fi
+    (($# == 1 || $# == 2)) ||
+        die "usage: ./viros.sh kernel-support LINUX_SOURCE [CONFIG]"
+    local src=$1 config=${2:-}
+    [[ -d "$src" && -f "$src/Makefile" && -f "$src/Kconfig" &&
+       -f "$src/kernel/Makefile" ]] ||
+        die "LINUX_SOURCE is not a prepared Linux source tree: $src"
+    src=$(CDPATH= cd -- "$src" && pwd -P)
+    install_kernel_scratch_source "$src"
+    if [[ -n "$config" ]]; then
+        [[ -f "$config" ]] || die "kernel config is not a regular file: $config"
+        [[ -x "$src/scripts/config" ]] ||
+            die "Linux scripts/config is missing or not executable"
+        config=$(CDPATH= cd -- "$(dirname -- "$config")" && pwd -P)/$(basename -- "$config")
+        "$src/scripts/config" --file "$config" \
+            --enable DEBUG_INFO --enable GDB_SCRIPTS --enable TRACEPOINTS \
+            --disable DEBUG_INFO_REDUCED --disable DEBUG_INFO_SPLIT
+        say "Updated debugger configuration: $config"
+    fi
+    say "Installed viros kernel support: $src/kernel/viros"
+    printf '%s\n' \
+        'Build with VIROS_SCRATCH=1 VIROS_EVENTS=1 and keep the resulting unstripped vmlinux.' \
+        'Example: make O=build ARCH=<arch> CROSS_COMPILE=<prefix> VIROS_SCRATCH=1 VIROS_EVENTS=1 olddefconfig vmlinux scripts_gdb'
+}
+
+kernel_bundle_stage() {
+    local python
+    python=$(managed_python) ||
+        die "managed Python is missing; run ./viros.sh download first"
+    [[ -x "$python" ]] ||
+        die "managed Python is missing; run ./viros.sh download first"
+    env PYTHONPATH="$SCRIPT_DIR" PYTHONNOUSERSITE=1 "$python" \
+        "$SCRIPT_DIR/probe/kernel_bundle.py" "$@"
+}
+
+image_bundle_stage() {
+    local python
+    python=$(managed_python) ||
+        die "managed Python is missing; run ./viros.sh download first"
+    [[ -x "$python" ]] ||
+        die "managed Python is missing; run ./viros.sh download first"
+    PYTHONNOUSERSITE=1 "$python" "$SCRIPT_DIR/probe/image_bundle.py" "$@"
 }
 
 normalize_case_kbuild_source_times() {
@@ -750,9 +838,126 @@ normalize_mips32_symbol_address() {
     fi
 }
 
-build_mmips_inferiors_artifacts() {
-    local out=$1 prefix=$2 destination="$ARTIFACTS/mmips/inferiors"
-    local python code_gva init_task init_task_raw
+write_managed_scratch_gpa_arguments() {
+    local target=$1 vmlinux=$2 scratch=$3 output=$4 python=$5
+    env PYTHONPATH="$SCRIPT_DIR" PYTHONNOUSERSITE=1 "$python" -c '
+import json
+from pathlib import Path
+import struct
+import sys
+
+from probe.probe_tool import ElfObject, EM_ARM, EM_AARCH64, EM_X86_64
+
+target, vmlinux_path, scratch_path = sys.argv[1:]
+vmlinux = Path(vmlinux_path)
+document = json.loads(Path(scratch_path).read_text(encoding="utf-8"))
+expected_arch = {"x86": "x86_64", "arm": "arm", "arm64": "aarch64"}.get(target)
+if expected_arch is None or document.get("arch") != expected_arch:
+    raise SystemExit(f"unsupported or mismatched managed scratch target: {target}")
+page_size = document.get("page_size")
+if not isinstance(page_size, int) or page_size <= 0:
+    raise SystemExit("scratch document has an invalid page size")
+regions = document.get("regions")
+if not isinstance(regions, dict):
+    raise SystemExit("scratch document has no regions object")
+
+def bounds(name):
+    region = regions.get(name)
+    if not isinstance(region, dict):
+        raise SystemExit(f"scratch document has no {name} region")
+    gva, size = region.get("gva"), region.get("size")
+    if not isinstance(gva, int) or not isinstance(size, int) or gva < 0 or size <= 0:
+        raise SystemExit(f"scratch {name} region has invalid bounds")
+    if gva % page_size or size != page_size:
+        raise SystemExit(f"scratch {name} region does not occupy one aligned page")
+    return gva, size
+
+elf = ElfObject(vmlinux)
+mapped = {}
+if target == "x86":
+    if elf.machine != EM_X86_64 or elf.elf_class != 64 or elf.endian != "<":
+        raise SystemExit("managed x86 mapping requires ELF64 little-endian x86-64 vmlinux")
+    if len(elf.data) < 64:
+        raise SystemExit("managed x86 vmlinux has a truncated ELF header")
+    phoff = struct.unpack_from("<Q", elf.data, 32)[0]
+    phentsize, phnum = struct.unpack_from("<HH", elf.data, 54)
+    phsize = struct.calcsize("<IIQQQQQQ")
+    if phentsize < phsize or phnum == 0 or phoff + phentsize * phnum > len(elf.data):
+        raise SystemExit("managed x86 vmlinux has an invalid program-header table")
+    loads = []
+    for index in range(phnum):
+        item = struct.unpack_from("<IIQQQQQQ", elf.data, phoff + index * phentsize)
+        if item[0] == 1 and item[6] > 0:
+            loads.append((item[3], item[4], item[6]))
+    for name in ("code", "data", "stack"):
+        gva, size = bounds(name)
+        matches = [
+            (paddr + gva - vaddr, memsz)
+            for vaddr, paddr, memsz in loads
+            if vaddr <= gva and gva + size <= vaddr + memsz
+        ]
+        if len(matches) != 1:
+            raise SystemExit(
+                f"scratch {name} region is not covered by exactly one x86 PT_LOAD segment"
+            )
+        gpa = matches[0][0]
+        if gpa + size > 0x20000000:
+            raise SystemExit(f"scratch {name} region is outside the managed x86 512 MiB RAM")
+        mapped[name] = gpa
+else:
+    expected_machine = EM_ARM if target == "arm" else EM_AARCH64
+    expected_class = 32 if target == "arm" else 64
+    if elf.machine != expected_machine or elf.elf_class != expected_class or elf.endian != "<":
+        raise SystemExit(f"managed {target} mapping has a mismatched vmlinux ELF identity")
+    text_symbols = {
+        (record["value"], record["shndx"])
+        for record in elf.symbol_records()
+        if record["name"] == "_text" and record["shndx"] != 0
+    }
+    if len(text_symbols) != 1:
+        raise SystemExit("managed ARM vmlinux does not define exactly one _text address")
+    text_gva = next(iter(text_symbols))[0]
+    # The project-managed QEMU virt machine starts RAM at 0x40000000.  The
+    # published Linux 5.6 ARM image begins at TEXT_OFFSET 0x8000.  Its AArch64
+    # KIMAGE_VADDR is 0xffff800010000000 and TEXT_OFFSET is 0x80000.
+    expected_text_gva = 0x80008000 if target == "arm" else 0xffff800010080000
+    text_gpa = 0x40008000 if target == "arm" else 0x40080000
+    if text_gva != expected_text_gva:
+        raise SystemExit(
+            f"managed {target} vmlinux _text is {text_gva:#x}, expected "
+            f"the published configuration address {expected_text_gva:#x}"
+        )
+    image_offset = text_gva - text_gpa
+    for name in ("code", "data", "stack"):
+        gva, size = bounds(name)
+        if gva < image_offset:
+            raise SystemExit(f"scratch {name} address is below the managed ARM image mapping")
+        gpa = gva - image_offset
+        if gpa < 0x40000000 or gpa + size > 0x60000000:
+            raise SystemExit(f"scratch {name} region is outside the managed ARM virt 512 MiB RAM")
+        mapped[name] = gpa
+
+for name in ("code", "data", "stack"):
+    gpa = mapped[name]
+    if gpa % page_size:
+        raise SystemExit(f"scratch {name} physical address is not page aligned")
+    print(f"--{name}-gpa")
+    print(hex(gpa))
+' "$target" "$vmlinux" "$scratch" > "$output" ||
+        die "cannot derive $target scratch physical mappings for the project-managed QEMU machine"
+}
+
+build_inferiors_artifacts() {
+    local target=$1 out=$2 prefix=$3 probe_arch destination="$ARTIFACTS/$1/inferiors"
+    local python code_gva init_task init_task_raw scratch_gpa_file
+    local -a scratch_gpa_args=()
+    case "$target" in
+        x86) probe_arch=x86_64 ;;
+        arm) probe_arch=arm ;;
+        arm64) probe_arch=aarch64 ;;
+        mmips) probe_arch=mmips ;;
+        *) die "no task-snapshot probe packaging for $target" ;;
+    esac
     python=$(managed_python)
     [[ -x "$python" ]] || die "managed Python is missing; run download"
     rm -rf -- "$destination"
@@ -762,19 +967,31 @@ build_mmips_inferiors_artifacts() {
         "$SCRIPT_DIR/probe/scratch/scratch_tool.py" "$out/vmlinux" \
         --output "$destination/scratch.json" \
         > "$destination/scratch-build.log"
+    if [[ "$target" != mmips ]]; then
+        scratch_gpa_file="$destination/scratch-gpas.args"
+        write_managed_scratch_gpa_arguments \
+            "$target" "$out/vmlinux" "$destination/scratch.json" \
+            "$scratch_gpa_file" "$python"
+        mapfile -t scratch_gpa_args < "$scratch_gpa_file"
+        ((${#scratch_gpa_args[@]} == 6)) ||
+            die "invalid $target managed scratch physical mapping arguments"
+    fi
     code_gva=$(env PYTHONNOUSERSITE=1 "$python" -c \
         'import json,sys; print(hex(json.load(open(sys.argv[1]))["regions"]["code"]["gva"]))' \
         "$destination/scratch.json")
     init_task_raw=$("${prefix}nm" -n "$out/vmlinux" | awk '
         $3 == "init_task" { count++; value = $1 }
         END { if (count != 1) exit 1; print value }
-    ') || die "matching MMIPS vmlinux does not define exactly one init_task"
-    init_task=$(normalize_mips32_symbol_address "$init_task_raw")
+    ') || die "matching $target vmlinux does not define exactly one init_task"
+    case "$target" in
+        arm|mmips) init_task=$(normalize_mips32_symbol_address "$init_task_raw") ;;
+        *) init_task="0x$init_task_raw" ;;
+    esac
 
     env PYTHONPATH="$SCRIPT_DIR" PYTHONNOUSERSITE=1 "$python" \
         "$SCRIPT_DIR/probe/probe_tool.py" build \
         --linux-dir "$out" --output-dir "$destination/probe-build" \
-        --arch mmips --cross-compile "$prefix" --vmlinux "$out/vmlinux" \
+        --arch "$probe_arch" --cross-compile "$prefix" --vmlinux "$out/vmlinux" \
         > "$destination/probe-build.log"
     env PYTHONPATH="$SCRIPT_DIR" PYTHONNOUSERSITE=1 "$python" \
         "$SCRIPT_DIR/probe/probe_tool.py" package \
@@ -785,10 +1002,10 @@ build_mmips_inferiors_artifacts() {
     env PYTHONPATH="$SCRIPT_DIR" PYTHONNOUSERSITE=1 "$python" \
         "$SCRIPT_DIR/probe/probe_tool.py" callgate-manifest \
         "$destination/probe-package/package.json" --vmlinux "$out/vmlinux" \
-        --scratch-regions "$destination/scratch.json" --cpu 0 \
+        --scratch-regions "$destination/scratch.json" "${scratch_gpa_args[@]}" --cpu 0 \
         --init-task "$init_task" --output "$destination/callgate.json" \
         > "$destination/callgate-build.log"
-    say "Built matching MMIPS task snapshot artifacts: $destination"
+    say "Built matching $target task snapshot artifacts: $destination"
 }
 
 find_kernel_config() {
@@ -925,9 +1142,11 @@ retain_case_kbuild_workspace() {
         printf 'linux_update_sha256 %s\n' "$update_hash"
         printf 'config_sha256 %s\n' "$config_hash"
         printf 'vmlinux_sha256 %s\n' "$vmlinux_hash"
-        if [[ "$target" == mmips ]]; then
-            printf 'scratch_source_sha256 %s\n' "$(kernel_scratch_source_hash)"
-        fi
+        case "$target" in
+        x86|arm|arm64|mipsbe|mmips|smips)
+            printf 'debug_source_sha256 %s\n' "$(kernel_debug_source_hash)"
+            ;;
+        esac
     } > "$out/.viros-case-kbuild"
     mkdir -p "$destination/kernel-$target" "$destination/artifacts/$target"
     cp -a -- "$out/." "$destination/kernel-$target/"
@@ -998,12 +1217,14 @@ rehydrate_case_kbuild_worker() {
     verify_file "$expected" "$DOWNLOADS/linux-${LINUX_VERSION}.tar.xz"
     prepare_mikrotik_kernel_source
     src=$(mikrotik_kernel_source)
-    if [[ "$target" == mmips ]]; then
-        expected=$(case_kbuild_identity_value "$identity" scratch_source_sha256)
-        [[ "$expected" == "$(kernel_scratch_source_hash)" ]] ||
-            die "retained MMIPS workspace source does not match this checkout"
+    case "$target" in
+    x86|arm|arm64|mipsbe|mmips|smips)
+        expected=$(case_kbuild_identity_value "$identity" debug_source_sha256)
+        [[ "$expected" == "$(kernel_debug_source_hash)" ]] ||
+            die "retained $target workspace debugger source does not match this checkout"
         install_kernel_scratch_source "$src"
-    fi
+        ;;
+    esac
     expected=$(case_kbuild_identity_value "$identity" linux_update_sha256)
     verify_file "$expected" "$SOURCES/mikrotik-gpl/2025-03-19/linux-${LINUX_VERSION}.patch"
     out="$BUILD/kernel-$target"
@@ -1092,14 +1313,20 @@ case_kbuild_worker() {
 }
 
 build_debug_kernel_casefold() {
-    local target=$1 export_directory status retained=
+    local target=$1 export_directory status retained= identity= retained_revision=
     case_kbuild_preflight
     export_directory=$(mktemp -d "$BUILD/.case-kbuild-export-$target.XXXXXX") ||
         die "cannot create case-sensitive Kbuild export directory"
     say "Using a project-local case-sensitive tmpfs for Linux Kbuild"
-    if [[ -s "$BUILD/kernel-$target/.viros-case-kbuild" ]]; then
-        retained="$BUILD/kernel-$target"
-        say "Seeding the case-sensitive workspace from retained matching Kbuild output"
+    identity="$BUILD/kernel-$target/.viros-case-kbuild"
+    if [[ -s "$identity" ]]; then
+        retained_revision=$(awk '$1 == "config_revision" { print $2 }' "$identity")
+        if [[ "$retained_revision" == "$DEBUG_KERNEL_CONFIG_REVISION" ]]; then
+            retained="$BUILD/kernel-$target"
+            say "Seeding the case-sensitive workspace from retained matching Kbuild output"
+        else
+            say "Ignoring retained Kbuild output that does not match the current debugger build inputs"
+        fi
     fi
     if VIROS_KBUILD_RETAINED_BIND="$retained" \
         run_case_sensitive_workspace "kernel-$target-$$" "$export_directory" \
@@ -1132,7 +1359,7 @@ build_debug_kernel_casefold() {
 
 build_debug_kernel() {
     local target=${1:-} src out config arch prefix= image= obj raw compiler_version identity expected
-    local scratch=0 retained_config=0 retained_vmlinux=0
+    local scratch=0 events=0 retained_config=0 retained_vmlinux=0 debug_source_changed=0
     local -a targets
     host_is_supported || die "debug-kernel build requires x86-64 or AArch64 Linux"
     case "$target" in
@@ -1173,11 +1400,15 @@ build_debug_kernel() {
             verify_file "$expected" "$out/vmlinux"
             retained_vmlinux=1
         fi
-        if [[ "$target" == mmips ]]; then
-            [[ $(case_kbuild_identity_value "$identity" scratch_source_sha256) == \
-               "$(kernel_scratch_source_hash)" ]] ||
-                die "retained MMIPS Kbuild seed source does not match this checkout"
-        fi
+        case "$target" in
+        x86|arm|arm64|mipsbe|mmips|smips)
+            if [[ $(case_kbuild_identity_value "$identity" debug_source_sha256) != \
+                  "$(kernel_debug_source_hash)" ]]; then
+                debug_source_changed=1
+                retained_vmlinux=0
+            fi
+            ;;
+        esac
         reconnect_retained_kbuild_output "$out" "$src"
         retained_config=1
     fi
@@ -1229,9 +1460,17 @@ build_debug_kernel() {
             ;;
     esac
     mkdir -p "$out" "$ARTIFACTS/$target"
-    if [[ "$target" == mmips ]]; then
+    case "$target" in
+    x86|arm|arm64|mipsbe|mmips|smips)
         install_kernel_scratch_source "$src"
-    fi
+        events=1
+        if ((debug_source_changed)); then
+            rm -f -- "$out/kernel/viros/viros_event.o" \
+                "$out/kernel/viros/viros_scratch.o" \
+                "$out/kernel/viros/built-in.a"
+        fi
+        ;;
+    esac
     normalize_case_kbuild_source_times "$src"
     if ((retained_config)); then
         say "Reusing the hash-verified retained kernel configuration"
@@ -1239,6 +1478,7 @@ build_debug_kernel() {
         cp -f -- "$config" "$out/.config"
         "$src/scripts/config" --file "$out/.config" \
             --enable GDB_SCRIPTS --enable DEBUG_INFO \
+            --enable TRACEPOINTS \
             --disable DEBUG_INFO_REDUCED --disable DEBUG_INFO_SPLIT --disable DEBUG_INFO_DWARF4
         if [[ "$target" == x86 ]]; then
             # The published path names an out-of-tree build input.  The extractor
@@ -1251,9 +1491,11 @@ build_debug_kernel() {
         fi
     fi
     VIROS_CASE_KBUILD_RETAIN_READY=1
-    [[ "$target" == mmips ]] && scratch=1
+    case "$target" in
+        x86|arm|arm64|mmips) scratch=1 ;;
+    esac
     local make_args=( -C "$src" O="$out" ARCH="$arch" CROSS_COMPILE="$prefix"
-        "VIROS_SCRATCH=$scratch" )
+        "VIROS_SCRATCH=$scratch" "VIROS_EVENTS=$events" )
     if ((retained_vmlinux)); then
         say "Reusing the hash-verified retained vmlinux"
     else
@@ -1263,9 +1505,14 @@ build_debug_kernel() {
         [[ -n "$image" ]] && targets+=("$image")
         make "${make_args[@]}" -j "$JOBS" "${targets[@]}"
     fi
-    if [[ "$target" == mmips ]]; then
+    if ((scratch)); then
         verify_kernel_scratch_symbols "$out" "$prefix"
-        build_mmips_inferiors_artifacts "$out" "$prefix"
+        build_inferiors_artifacts "$target" "$out" "$prefix"
+    fi
+    if ((events)); then
+        "$prefix"nm -g --defined-only "$out/vmlinux" |
+            grep -Eq '[[:space:]]viros_event_stop$' ||
+            die "kernel build did not retain viros_event_stop"
     fi
     cp -f -- "$out/vmlinux" "$ARTIFACTS/$target/vmlinux.debug"
     [[ -s "$out/vmlinux-gdb.py" ]] || die "kernel build did not create vmlinux-gdb.py"
@@ -1919,33 +2166,42 @@ inferiors_stage() {
         openwrt-arm64)
             (($# == 3)) || die "usage: ./viros.sh inferiors openwrt-arm64 MANIFEST BOOTABLE_KERNEL"
             ;;
-        mmips)
-            (($# == 1)) || die "usage: ./viros.sh inferiors mmips"
-            prepare_one mmips
-            manifest="$ARTIFACTS/mmips/inferiors/callgate.json"
-            boot_kernel="$ARTIFACTS/mmips/kernel.debug.qemu.elf"
-            initrd="$ARTIFACTS/mmips/initramfs.cpio"
-            [[ -s "$ARTIFACTS/mmips/init.entry" ]] ||
-                die "MMIPS init entry is missing; re-extract mmips"
-            init_entry=$(head -n 1 "$ARTIFACTS/mmips/init.entry")
+        x86|arm|arm64|mmips)
+            (($# == 1)) || die "usage: ./viros.sh inferiors x86|arm|arm64|mmips"
+            prepare_one "$target"
+            manifest="$ARTIFACTS/$target/inferiors/callgate.json"
+            initrd="$ARTIFACTS/$target/initramfs.cpio"
+            case "$target" in
+                x86) boot_kernel="$ARTIFACTS/x86/kernel.debug.bzImage" ;;
+                arm) boot_kernel="$ARTIFACTS/arm/kernel.debug.zImage" ;;
+                arm64) boot_kernel="$ARTIFACTS/arm64/kernel.debug.Image" ;;
+                mmips) boot_kernel="$ARTIFACTS/mmips/kernel.debug.qemu.elf" ;;
+            esac
+            [[ -s "$ARTIFACTS/$target/init.entry" ]] ||
+                die "$target init entry is missing; re-extract $target"
+            init_entry=$(head -n 1 "$ARTIFACTS/$target/init.entry")
             [[ "$init_entry" =~ ^0x[0-9a-fA-F]+$ ]] ||
-                die "invalid MMIPS init entry: $init_entry"
+                die "invalid $target init entry: $init_entry"
             ;;
         *)
-            die "inferiors requires mmips, or openwrt-arm64 MANIFEST BOOTABLE_KERNEL"
+            die "inferiors requires x86, arm, arm64, mmips, or openwrt-arm64 MANIFEST BOOTABLE_KERNEL"
             ;;
     esac
     [[ -f "$manifest" ]] || die "call-gate manifest is not a regular file: $manifest"
     [[ -s "$boot_kernel" ]] || die "bootable kernel is missing or empty: $boot_kernel"
 
-    if [[ "$target" == mmips ]]; then
-        qemu="$TOOLS/qemu/bin/qemu-system-mipsel"
-        [[ -x "$qemu" ]] ||
-            die "MMIPS requires viros's MT7621-compatible patched QEMU; run build"
-        [[ -s "$initrd" ]] || die "MMIPS initramfs is missing; re-extract mmips"
-    else
-        qemu=$(qemu_binary qemu-system-aarch64)
-    fi
+    case "$target" in
+        mmips)
+            qemu="$TOOLS/qemu/bin/qemu-system-mipsel"
+            [[ -x "$qemu" ]] ||
+                die "MMIPS requires viros's MT7621-compatible patched QEMU; run build"
+            ;;
+        x86) qemu=$(qemu_binary qemu-system-x86_64) ;;
+        arm) qemu=$(qemu_binary qemu-system-arm) ;;
+        arm64|openwrt-arm64) qemu=$(qemu_binary qemu-system-aarch64) ;;
+    esac
+    [[ -z "$initrd" || -s "$initrd" ]] ||
+        die "$target initramfs is missing; re-extract $target"
     gdb="$TOOLS/gdb/bin/gdb"
     [[ -x "$gdb" ]] || die "Python-enabled GDB is missing; run download and build"
     python=$(managed_python)
@@ -1997,6 +2253,34 @@ inferiors_stage() {
             -append 'board=750g-mt mem=256M HZ=100000000 console=ttyS0,115200 loglevel=8 ignore_loglevel init=/init panic=-1'
             -chardev "socket,id=$console_chardev,path=$INFERIORS_CONSOLE_SOCKET,server=on,wait=off,logfile=$console_log,logappend=on"
             -gdb "unix:path=$INFERIORS_QEMU_SOCKET,server=on,wait=off" )
+    elif [[ "$target" == x86 ]]; then
+        local version chr
+        version=$(routeros_version); chr="$IMAGES/chr-${version}.img"
+        [[ -s "$chr" ]] || die "CHR image missing; run download then prepare x86"
+        qemu_args=( -machine pc,accel=tcg -cpu qemu64 -smp 1 -m 512M
+            -display none -monitor none -nic none -nodefaults
+            -no-reboot -no-shutdown -S -kernel "$boot_kernel" -initrd "$initrd"
+            -append 'console=ttyS0,115200 loglevel=8 ignore_loglevel rdinit=/init init=/init panic=-1 nokaslr'
+            -drive "file=$chr,format=raw,if=ide"
+            -chardev "socket,id=viros-console,path=$INFERIORS_CONSOLE_SOCKET,server=on,wait=off,logfile=$console_log,logappend=on"
+            -serial chardev:viros-console
+            -gdb "unix:path=$INFERIORS_QEMU_SOCKET,server=on,wait=off" )
+    elif [[ "$target" == arm ]]; then
+        qemu_args=( -M virt,gic-version=2 -cpu cortex-a15 -smp 1 -m 512M
+            -display none -monitor none -nic none -nodefaults
+            -no-reboot -no-shutdown -S -kernel "$boot_kernel" -initrd "$initrd"
+            -append 'console=ttyAMA0,115200 earlycon=pl011,0x09000000 loglevel=8 ignore_loglevel init=/init panic=-1 nokaslr'
+            -chardev "socket,id=viros-console,path=$INFERIORS_CONSOLE_SOCKET,server=on,wait=off,logfile=$console_log,logappend=on"
+            -serial chardev:viros-console
+            -gdb "unix:path=$INFERIORS_QEMU_SOCKET,server=on,wait=off" )
+    elif [[ "$target" == arm64 ]]; then
+        qemu_args=( -M virt -cpu cortex-a57 -smp 2 -m 512M
+            -display none -monitor none -nic none -nodefaults
+            -no-reboot -no-shutdown -S -kernel "$boot_kernel" -initrd "$initrd"
+            -append 'console=ttyAMA0,115200 earlycon=pl011,0x09000000 loglevel=8 ignore_loglevel init=/init panic=-1 nokaslr'
+            -chardev "socket,id=viros-console,path=$INFERIORS_CONSOLE_SOCKET,server=on,wait=off,logfile=$console_log,logappend=on"
+            -serial chardev:viros-console
+            -gdb "unix:path=$INFERIORS_QEMU_SOCKET,server=on,wait=off" )
     else
         qemu_args=( -M virt -cpu cortex-a57 -smp 2 -m 512M
             -display none -monitor none -nic none -nodefaults
@@ -2037,12 +2321,29 @@ inferiors_stage() {
             -ex "python assert int(gdb.parse_and_eval('\$pc')) == $init_entry, 'unexpected MMIPS init stop'"
             -ex 'printf "viros-bootstrap: stopped at MMIPS init entry\\n"'
             -ex 'delete breakpoints' -ex disconnect )
+    elif [[ "$target" == x86 ]]; then
+        bootstrap_args=( -nx -q -batch -iex 'set auto-load safe-path /' "$vmlinux"
+            -ex 'set pagination off' -ex 'set confirm off' -ex 'set remotetimeout 10'
+            -ex 'set architecture i386:x86-64' -ex "target remote $INFERIORS_QEMU_SOCKET"
+            -ex 'tbreak compat_start_thread' -ex continue -ex 'delete breakpoints'
+            -ex "tbreak *$init_entry" -ex continue
+            -ex "python assert int(gdb.parse_and_eval('\$pc')) == $init_entry, 'unexpected x86 init stop'"
+            -ex 'printf "viros-bootstrap: stopped at x86 init entry\\n"'
+            -ex 'delete breakpoints' -ex disconnect )
+    elif [[ "$target" == arm || "$target" == arm64 ]]; then
+        bootstrap_args=( -nx -q -batch -iex 'set auto-load safe-path /' "$vmlinux"
+            -ex 'set pagination off' -ex 'set confirm off' -ex 'set remotetimeout 10'
+            -ex "target remote $INFERIORS_QEMU_SOCKET"
+            -ex 'thbreak ret_to_user' -ex continue -ex 'delete breakpoints'
+            -ex "thbreak *$init_entry" -ex continue
+            -ex "python assert int(gdb.parse_and_eval('\$pc')) == $init_entry, 'unexpected ARM init stop'"
+            -ex 'printf "viros-bootstrap: stopped at ARM init entry\\n"'
+            -ex 'delete breakpoints' -ex disconnect )
     else
         bootstrap_args=( -nx -q -batch -iex 'set auto-load safe-path /' "$vmlinux"
             -ex 'set pagination off' -ex 'set confirm off' -ex 'set remotetimeout 10'
             -ex "target remote $INFERIORS_QEMU_SOCKET"
             -ex 'thbreak ret_to_user' -ex continue
-            -ex 'python assert int(gdb.parse_and_eval("$pc")) == int(gdb.parse_and_eval("&ret_to_user")), "unexpected bootstrap stop"'
             -ex 'printf "viros-bootstrap: stopped at ret_to_user\\n"'
             -ex 'delete breakpoints' -ex disconnect )
     fi
@@ -2093,6 +2394,11 @@ inferiors_stage() {
         gdb_args=( -nx -q -iex 'set auto-load safe-path /' "$vmlinux"
             -ex 'set pagination off' -ex 'set confirm off' -ex 'set python print-stack full' -ex 'set remotetimeout 10'
             -ex 'set architecture mips' -ex "source $SCRIPT_DIR/gdb_console.py"
+            -ex "target remote $INFERIORS_GDB_SOCKET" -ex 'info inferiors' )
+    elif [[ "$target" == x86 ]]; then
+        gdb_args=( -nx -q -iex 'set auto-load safe-path /' "$vmlinux"
+            -ex 'set pagination off' -ex 'set confirm off' -ex 'set python print-stack full' -ex 'set remotetimeout 10'
+            -ex 'set architecture i386:x86-64' -ex "source $SCRIPT_DIR/gdb_console.py"
             -ex "target remote $INFERIORS_GDB_SOCKET" -ex 'info inferiors' )
     fi
     set +e
@@ -2505,6 +2811,36 @@ doctor_stage() {
     return "$failed"
 }
 
+sarun_install_worker() {
+    local destination=/opt/viros python python_root
+    [[ $# == 0 ]] || die "internal Sarun provider installer accepts no arguments"
+    [[ -x "$TOOLS/gdb/bin/gdb" ]] || die "managed GDB is missing; run ./viros.sh build first"
+    python=$(managed_python)
+    python_root=$(dirname -- "$(dirname -- "$python")")
+    rm -rf -- "$destination"
+    install -d "$destination" "$destination/sysroot" \
+        "$destination/tools" "$destination/tools/python"
+    cp -a -- "$SCRIPT_DIR/callgate" "$SCRIPT_DIR/inferiors" "$SCRIPT_DIR/probe" "$destination/"
+    cp -a -- "$SCRIPT_DIR/viros-facade" "$SCRIPT_DIR/viros-gdb-managed" "$destination/"
+    cp -a -- "$TOOLS/gdb" "$destination/tools/gdb"
+    cp -aL -- "$python_root" "$destination/tools/python/managed"
+    find "$destination" -type d -name __pycache__ -prune -exec rm -rf -- {} +
+    PYTHONHOME="$destination/tools/python/managed" \
+        "$destination/tools/gdb/bin/gdb" -nx -batch \
+        -ex 'python import json; import gdb'
+    sarun service declare viros-debug \
+        /opt/viros/viros-facade /opt/viros/viros-gdb-managed
+    say "Published named Sarun debugger provider VIROS-DEBUG"
+}
+
+sarun_install_stage() {
+    [[ $# == 0 ]] || die "usage: ./viros.sh sarun-install"
+    need sarun
+    [[ -x "$SCRIPT_DIR/viros-gdb-managed" ]] ||
+        die "managed GDB client entry point is missing from this source tree"
+    sarun run --net off VIROS-DEBUG -- "$SCRIPT_DIR/viros.sh" _sarun-install
+}
+
 main() {
     local command=${1:-help}
     shift || true
@@ -2512,6 +2848,10 @@ main() {
         download) download_stage "$@" ;;
         build) build_stage "$@" ;;
         kernel-debug) build_debug_kernel "$@" ;;
+        kernel-support) kernel_support_stage "$@" ;;
+        kernel-bundle) kernel_bundle_stage "$@" ;;
+        image-bundle) image_bundle_stage "$@" ;;
+        sarun-install) sarun_install_stage "$@" ;;
         kernel-workspace) run_retained_kernel_workspace "$@" ;;
         extract) extract_stage "$@" ;;
         prepare) prepare_stage "$@" ;;
@@ -2521,6 +2861,7 @@ main() {
         inferiors) inferiors_stage "$@" ;;
         _case-kbuild-worker) case_kbuild_worker "$@" ;;
         _case-kbuild-command) rehydrate_case_kbuild_worker "$@" ;;
+        _sarun-install) sarun_install_worker "$@" ;;
         list) list_stage ;;
         doctor) doctor_stage ;;
         help|-h|--help) usage ;;

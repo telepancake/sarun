@@ -1216,11 +1216,7 @@ impl Runtime {
                 PL_reset_term_refs(terms);
                 return Err("failed to construct installed grammar terms".into());
             }
-            let predicate = PL_predicate(
-                c"install_grammar".as_ptr(),
-                2,
-                c"grammar_store".as_ptr(),
-            );
+            let predicate = PL_predicate(c"install_grammar".as_ptr(), 2, c"grammar_store".as_ptr());
             if predicate.is_null() {
                 PL_reset_term_refs(terms);
                 return Err("FLI grammar installer predicate allocation failed".into());
@@ -2791,7 +2787,10 @@ pub(crate) fn ensure_linked() {
 mod tests {
     use super::*;
 
-    fn find_file_type_completions(source: &str, assist: Span) -> std::collections::BTreeSet<String> {
+    fn find_file_type_completions(
+        source: &str,
+        assist: Span,
+    ) -> std::collections::BTreeSet<String> {
         crate::parser::analyze_brush_document_resolved(
             &BrushDocumentRequest {
                 source: source.into(),
@@ -2807,14 +2806,11 @@ mod tests {
         .flat_map(|candidate| &candidate.completions)
         .filter(|completion| {
             completion.replace == assist
-                && completion
-                    .alternatives
-                    .iter()
-                    .any(|alternative| {
-                        alternative.syntax == "builtin_argument"
-                            && alternative.provider == "builtin_parser"
-                            && alternative.semantic.contains("type_value")
-                    })
+                && completion.alternatives.iter().any(|alternative| {
+                    alternative.syntax == "builtin_argument"
+                        && alternative.provider == "builtin_parser"
+                        && alternative.semantic.contains("type_value")
+                })
         })
         .map(|completion| completion.insert.clone())
         .collect()
@@ -3004,20 +3000,14 @@ mod tests {
         let terminal = rv_compound(
             "terminal",
             vec![
-                rv_compound(
-                    "text",
-                    vec![rv_compound("codepoint", vec![rv_atom("any")])],
-                ),
+                rv_compound("text", vec![rv_compound("codepoint", vec![rv_atom("any")])]),
                 metadata,
             ],
         );
         let grammar = rv_compound(
             "grammar",
             vec![
-                rv_compound(
-                    "source",
-                    vec![rv_compound("text", vec![rv_atom("utf8")])],
-                ),
+                rv_compound("source", vec![rv_compound("text", vec![rv_atom("utf8")])]),
                 rv_atom("root"),
                 rv_list(vec![rv_compound(
                     "rule",
@@ -3090,10 +3080,7 @@ mod tests {
         let grammar = rv_compound(
             "grammar",
             vec![
-                rv_compound(
-                    "source",
-                    vec![rv_compound("text", vec![rv_atom("utf8")])],
-                ),
+                rv_compound("source", vec![rv_compound("text", vec![rv_atom("utf8")])]),
                 rv_atom("root"),
                 rv_list(vec![rv_compound(
                     "rule",
@@ -3112,11 +3099,11 @@ mod tests {
                                 ),
                                 rv_compound(
                                     "repeat",
-                                    vec![rv_integer(0), rv_atom("unbounded"),
-                                         rv_compound(
-                                             "terminal",
-                                             vec![codec.clone(), presentation],
-                                         )],
+                                    vec![
+                                        rv_integer(0),
+                                        rv_atom("unbounded"),
+                                        rv_compound("terminal", vec![codec.clone(), presentation]),
+                                    ],
                                 ),
                                 rv_compound(
                                     "literal",
@@ -3147,10 +3134,7 @@ mod tests {
                                 "assist",
                                 vec![
                                     rv_atom("edit"),
-                                    rv_compound(
-                                        "span",
-                                        vec![rv_integer(1), rv_integer(1)],
-                                    ),
+                                    rv_compound("span", vec![rv_integer(1), rv_integer(1)]),
                                 ],
                             ),
                             rv_atom("rust_test"),
@@ -3166,7 +3150,10 @@ mod tests {
         assert_eq!(reply.solutions.len(), 1);
         assert_eq!(
             reply.solutions[0].bindings[1].value,
-            rv_compound("incomplete", vec![rv_compound("edit", vec![rv_atom("edit")])])
+            rv_compound(
+                "incomplete",
+                vec![rv_compound("edit", vec![rv_atom("edit")])]
+            )
         );
         assert!(contains_relation_value(
             &reply.solutions[0].bindings[0].value,
@@ -3239,10 +3226,7 @@ mod tests {
                                 "assist",
                                 vec![
                                     rv_atom("edit"),
-                                    rv_compound(
-                                        "span",
-                                        vec![rv_integer(0), rv_integer(0)],
-                                    ),
+                                    rv_compound("span", vec![rv_integer(0), rv_integer(0)]),
                                 ],
                             ),
                             rv_atom("rust_test"),
@@ -3256,14 +3240,16 @@ mod tests {
             .unwrap();
         assert!(assist.diagnostics.is_empty());
         assert_eq!(assist.solutions.len(), 1);
-        let completions =
-            decode_completions_value(&assist.solutions[0].bindings[0].value).unwrap();
+        let completions = decode_completions_value(&assist.solutions[0].bindings[0].value).unwrap();
         assert_eq!(completions.len(), 1);
         assert_eq!(completions[0].replace, Span { start: 0, end: 0 });
         assert_eq!(completions[0].insert, "$(");
         assert_eq!(
             assist.solutions[0].bindings[1].value,
-            rv_compound("incomplete", vec![rv_compound("edit", vec![rv_atom("edit")])])
+            rv_compound(
+                "incomplete",
+                vec![rv_compound("edit", vec![rv_atom("edit")])]
+            )
         );
     }
 
@@ -3344,8 +3330,7 @@ mod tests {
         assert_eq!(candidate.status, ParseStatus::Complete);
         assert!(candidate.completions.is_empty());
         assert!(candidate.highlights.iter().any(|highlight| {
-            highlight.span == Span { start: 12, end: 13 }
-                && highlight.syntax == "variable"
+            highlight.span == Span { start: 12, end: 13 } && highlight.syntax == "variable"
         }));
         assert_eq!(
             candidate.state_changes,
@@ -3373,10 +3358,12 @@ mod tests {
                 edit_id: "document_edit".into(),
             }
         );
-        assert!(assist.candidates[0]
-            .completions
-            .iter()
-            .any(|completion| completion.insert == "$("));
+        assert!(
+            assist.candidates[0]
+                .completions
+                .iter()
+                .any(|completion| completion.insert == "$(")
+        );
     }
 
     #[test]
@@ -3569,10 +3556,7 @@ mod tests {
                                 "hole",
                                 vec![
                                     rv_atom("document_edit"),
-                                    rv_compound(
-                                        "span",
-                                        vec![rv_integer(3), rv_integer(3)],
-                                    ),
+                                    rv_compound("span", vec![rv_integer(3), rv_integer(3)]),
                                     rv_string(""),
                                     rv_compound(
                                         "terminal",
@@ -3598,22 +3582,17 @@ mod tests {
             .iter()
             .filter(|completion| {
                 completion.replace == Span { start: 3, end: 3 }
-                    && completion
-                        .alternatives
-                        .iter()
-                        .any(|alternative| {
-                            alternative.syntax == "builtin_argument"
-                                && alternative.provider == "builtin_parser"
-                                && alternative.semantic.contains("type_value")
-                        })
+                    && completion.alternatives.iter().any(|alternative| {
+                        alternative.syntax == "builtin_argument"
+                            && alternative.provider == "builtin_parser"
+                            && alternative.semantic.contains("type_value")
+                    })
             })
             .map(|completion| completion.insert.as_str())
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(
             completions,
-            ["b", "c", "d", "f", "l", "p", "s"]
-                .into_iter()
-                .collect()
+            ["b", "c", "d", "f", "l", "p", "s"].into_iter().collect()
         );
     }
 
@@ -3647,8 +3626,7 @@ mod tests {
         assert!(analysis.context_queries.iter().any(|node| {
             node.query.cardinality == ContextCardinality::All
                 && node.query.domain == rv_atom("shell_variable")
-                && node.query.selector
-                    == rv_compound("prefix", vec![rv_string("")])
+                && node.query.selector == rv_compound("prefix", vec![rv_string("")])
         }));
         assert!(analysis.context_queries.iter().all(|node| {
             !(node.query.cardinality == ContextCardinality::One
@@ -3783,19 +3761,13 @@ mod tests {
                 rv_list(vec![]),
             ],
         );
-        let outcome = rv_compound(
-            "some",
-            vec![rv_compound("one", vec![entry.clone()])],
-        );
+        let outcome = rv_compound("some", vec![rv_compound("one", vec![entry.clone()])]);
         let observation = rv_compound(
             "observed",
             vec![
                 id.clone(),
                 query.clone(),
-                rv_compound(
-                    "source",
-                    vec![rv_atom("brush_variables"), rv_integer(7)],
-                ),
+                rv_compound("source", vec![rv_atom("brush_variables"), rv_integer(7)]),
                 outcome.clone(),
             ],
         );
@@ -3808,11 +3780,7 @@ mod tests {
                         name: "source".into(),
                         value: rv_compound(
                             "text_source",
-                            vec![
-                                rv_string("echo $z"),
-                                rv_atom("exact"),
-                                rv_atom("rust_test"),
-                            ],
+                            vec![rv_string("echo $z"), rv_atom("exact"), rv_atom("rust_test")],
                         ),
                     },
                     RelationBinding {
@@ -3838,10 +3806,7 @@ mod tests {
         assert!(reply.context_queries.is_empty());
         assert_eq!(
             reply.dependency_keys,
-            vec![rv_compound(
-                "dependency",
-                vec![id.clone(), query, outcome],
-            )]
+            vec![rv_compound("dependency", vec![id.clone(), query, outcome],)]
         );
         assert_eq!(
             reply.solutions[0].bindings[0].value,
@@ -3849,10 +3814,7 @@ mod tests {
                 "resolved",
                 vec![
                     inner_id,
-                    rv_compound(
-                        "external",
-                        vec![rv_compound("one", vec![entry])],
-                    ),
+                    rv_compound("external", vec![rv_compound("one", vec![entry])],),
                 ],
             )])
         );
@@ -3872,7 +3834,11 @@ mod tests {
         );
         let use_x = rv_compound(
             "use",
-            vec![rv_atom("local_x"), rv_atom("shell_variable"), rv_string("x")],
+            vec![
+                rv_atom("local_x"),
+                rv_atom("shell_variable"),
+                rv_string("x"),
+            ],
         );
         let use_z = rv_compound(
             "use",
@@ -4068,10 +4034,7 @@ mod tests {
                 rv_atom("edit"),
                 rv_compound("span", vec![rv_integer(3), rv_integer(3)]),
                 rv_string(""),
-                rv_compound(
-                    "text",
-                    vec![rv_compound("codepoint", vec![rv_atom("any")])],
-                ),
+                rv_compound("text", vec![rv_compound("codepoint", vec![rv_atom("any")])]),
             ],
         );
         let state = rv_compound(
@@ -4095,24 +4058,20 @@ mod tests {
                 rv_list(vec![]),
             ],
         );
-        let values = [
-            ("f", "file"),
-            ("d", "directory"),
-            ("l", "symlink"),
-        ]
-        .into_iter()
-        .map(|(text, semantic)| {
-            rv_compound(
-                "value",
-                vec![
-                    rv_string(text),
-                    rv_atom(semantic),
-                    rv_atom("find_type"),
-                    rv_integer(30),
-                ],
-            )
-        })
-        .collect::<Vec<_>>();
+        let values = [("f", "file"), ("d", "directory"), ("l", "symlink")]
+            .into_iter()
+            .map(|(text, semantic)| {
+                rv_compound(
+                    "value",
+                    vec![
+                        rv_string(text),
+                        rv_atom(semantic),
+                        rv_atom("find_type"),
+                        rv_integer(30),
+                    ],
+                )
+            })
+            .collect::<Vec<_>>();
         let constraints = rv_list(vec![rv_compound(
             "text_constraint",
             vec![
@@ -4148,8 +4107,7 @@ mod tests {
             .unwrap();
         assert!(reply.diagnostics.is_empty());
         assert_eq!(reply.solutions.len(), 1);
-        let completions = decode_completions_value(&reply.solutions[0].bindings[0].value)
-            .unwrap();
+        let completions = decode_completions_value(&reply.solutions[0].bindings[0].value).unwrap();
         assert_eq!(
             completions
                 .iter()
@@ -4157,9 +4115,11 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["d", "f", "l"],
         );
-        assert!(completions
-            .iter()
-            .all(|completion| completion.replace == Span { start: 3, end: 3 }));
+        assert!(
+            completions
+                .iter()
+                .all(|completion| completion.replace == Span { start: 3, end: 3 })
+        );
     }
 
     #[test]

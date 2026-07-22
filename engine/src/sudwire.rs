@@ -54,10 +54,19 @@ impl EvState {
     /// Header = stream_id + seven delta-encoded base scalars + verbatim
     /// extras. Commits the new scalar values into self.
     #[allow(clippy::too_many_arguments)]
-    pub fn build_event(&mut self, stream_id: u32, ty: i64, ts_ns: i64,
-                       pid: i64, tgid: i64, ppid: i64,
-                       nspid: i64, nstgid: i64,
-                       extras: &[i64], blob: &[u8]) -> Vec<u8> {
+    pub fn build_event(
+        &mut self,
+        stream_id: u32,
+        ty: i64,
+        ts_ns: i64,
+        pid: i64,
+        tgid: i64,
+        ppid: i64,
+        nspid: i64,
+        nstgid: i64,
+        extras: &[i64],
+        blob: &[u8],
+    ) -> Vec<u8> {
         let mut hdr = Vec::with_capacity(96);
         put_u64(&mut hdr, stream_id as u64);
         put_i64(&mut hdr, ty - self.ty);
@@ -79,28 +88,51 @@ impl EvState {
         self.nstgid = nstgid;
         // outer { hdr_atom || blob_atom }
         let mut out = Vec::with_capacity(hdr.len() + blob.len() + 12);
-        crate::wire::put_many(&mut out, &[&hdr, blob])
-            .expect("an in-memory trace event fits");
+        crate::wire::put_many(&mut out, &[&hdr, blob]).expect("an in-memory trace event fits");
         out
     }
 
     /// EV_EXIT with sudtrace's launcher semantics: extras =
     /// {status, code_or_signal, core_dumped, raw wstatus}, empty blob,
     /// nspid/nstgid mirroring pid/tgid (the launcher has no pidns view).
-    pub fn build_exit(&mut self, stream_id: u32, ts_ns: i64,
-                      pid: i64, tgid: i64, ppid: i64,
-                      wstatus: i32) -> Vec<u8> {
+    pub fn build_exit(
+        &mut self,
+        stream_id: u32,
+        ts_ns: i64,
+        pid: i64,
+        tgid: i64,
+        ppid: i64,
+        wstatus: i32,
+    ) -> Vec<u8> {
         let extras = if libc::WIFEXITED(wstatus) {
-            [EV_EXIT_EXITED, libc::WEXITSTATUS(wstatus) as i64, 0,
-             wstatus as i64]
+            [
+                EV_EXIT_EXITED,
+                libc::WEXITSTATUS(wstatus) as i64,
+                0,
+                wstatus as i64,
+            ]
         } else if libc::WIFSIGNALED(wstatus) {
-            [EV_EXIT_SIGNALED, libc::WTERMSIG(wstatus) as i64,
-             libc::WCOREDUMP(wstatus) as i64, wstatus as i64]
+            [
+                EV_EXIT_SIGNALED,
+                libc::WTERMSIG(wstatus) as i64,
+                libc::WCOREDUMP(wstatus) as i64,
+                wstatus as i64,
+            ]
         } else {
             [EV_EXIT_EXITED, 0, 0, wstatus as i64]
         };
-        self.build_event(stream_id, EV_EXIT, ts_ns, pid, tgid, ppid,
-                         pid, tgid, &extras, &[])
+        self.build_event(
+            stream_id,
+            EV_EXIT,
+            ts_ns,
+            pid,
+            tgid,
+            ppid,
+            pid,
+            tgid,
+            &extras,
+            &[],
+        )
     }
 }
 
@@ -123,8 +155,10 @@ pub struct Event {
 
 /// OPEN extras layout: {flags, fd, ino, dev_major, dev_minor, err, inh}.
 pub const EV_EXEC: i64 = 0;
-#[allow(dead_code)] pub const EV_ARGV: i64 = 1; // wire ids kept complete
-#[allow(dead_code)] pub const EV_ENV: i64 = 2;
+#[allow(dead_code)]
+pub const EV_ARGV: i64 = 1; // wire ids kept complete
+#[allow(dead_code)]
+pub const EV_ENV: i64 = 2;
 pub const EV_CWD: i64 = 6;
 pub const EV_OPEN: i64 = 5;
 pub const EV_STDOUT: i64 = 7;
@@ -155,8 +189,10 @@ impl Decoder {
     /// is undebuggable if the poisoning itself is silent: SAY SO.
     fn poison(&mut self, why: &str) {
         if !self.poisoned {
-            eprintln!("sarun-engine: sud trace stream POISONED ({why}); \
-process/output capture stops here for this box");
+            eprintln!(
+                "sarun-engine: sud trace stream POISONED ({why}); \
+process/output capture stops here for this box"
+            );
         }
         self.poisoned = true;
     }
@@ -179,7 +215,9 @@ fn take_i64(src: &mut &[u8]) -> Option<i64> {
 impl Decoder {
     /// Consume `bytes`, return every event that completed.
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<Event> {
-        if self.poisoned { return vec![]; }
+        if self.poisoned {
+            return vec![];
+        }
         self.buf.extend_from_slice(bytes);
         let mut out = vec![];
         let mut off = 0usize;
@@ -192,23 +230,24 @@ impl Decoder {
                     if !self.versioned {
                         // first atom = wire_put_u64(TRACE_VERSION); its
                         // payload IS the LE version bytes
-                        let v = crate::wire::u64_from_payload(payload)
-                            .unwrap_or(u64::MAX);
+                        let v = crate::wire::u64_from_payload(payload).unwrap_or(u64::MAX);
                         if v != TRACE_VERSION {
                             self.poison(&format!(
                                 "version atom {v} != {TRACE_VERSION} \
-(wrapper/engine build skew?)"));
+(wrapper/engine build skew?)"
+                            ));
                             return out;
                         }
                         self.versioned = true;
-                    } else if let Some(ev) =
-                        Self::decode_event(&mut self.states, payload) {
+                    } else if let Some(ev) = Self::decode_event(&mut self.states, payload) {
                         out.push(ev);
                     } else {
                         self.poison(&format!(
                             "undecodable event atom ({} bytes) after {} \
 good event(s) — framing corrupted (interleaved writer?)",
-                            payload.len(), out.len()));
+                            payload.len(),
+                            out.len()
+                        ));
                         self.buf.clear();
                         return out;
                     }
@@ -226,8 +265,10 @@ good event(s) — framing corrupted (interleaved writer?)",
         out
     }
 
-    fn decode_event(states: &mut std::collections::HashMap<u32, EvState>,
-                    payload: &[u8]) -> Option<Event> {
+    fn decode_event(
+        states: &mut std::collections::HashMap<u32, EvState>,
+        payload: &[u8],
+    ) -> Option<Event> {
         let mut p = payload;
         let mut hdr = take_atom(&mut p)?;
         let blob = take_atom(&mut p)?.to_vec();
@@ -312,16 +353,23 @@ mod tests {
     fn decoder_streams_incrementally() {
         let mut enc = EvState::default();
         let mut stream = version_atom();
-        stream.extend(enc.build_event(3, EV_EXEC, 100, 10, 10, 5, 10, 10,
-                                      &[], b"/bin/sh"));
-        stream.extend(enc.build_event(3, EV_OPEN, 200, 10, 10, 5, 10, 10,
-                                      &[0o101, 3, 99, 1, 2, 0, 0],
-                                      b"out.txt"));
+        stream.extend(enc.build_event(3, EV_EXEC, 100, 10, 10, 5, 10, 10, &[], b"/bin/sh"));
+        stream.extend(enc.build_event(
+            3,
+            EV_OPEN,
+            200,
+            10,
+            10,
+            5,
+            10,
+            10,
+            &[0o101, 3, 99, 1, 2, 0, 0],
+            b"out.txt",
+        ));
         stream.extend(enc.build_exit(3, 300, 10, 10, 5, 0));
         // interleave a second stream to prove per-stream delta state
         let mut enc2 = EvState::default();
-        stream.extend(enc2.build_event(4, EV_STDOUT, 150, 11, 11, 10,
-                                       11, 11, &[], b"hi\n"));
+        stream.extend(enc2.build_event(4, EV_STDOUT, 150, 11, 11, 10, 11, 11, &[], b"hi\n"));
         let mut dec = Decoder::default();
         let mut evs = vec![];
         for b in &stream {
@@ -345,13 +393,12 @@ mod tests {
     #[test]
     fn exit_event_roundtrips_with_delta_state() {
         let mut enc = EvState::default();
-        let e1 = enc.build_exit(1, 1_000, 42, 42, 7, 0);        // exit 0
-        let e2 = enc.build_exit(1, 2_500, 43, 43, 7, 9 << 8);   // exit 9
+        let e1 = enc.build_exit(1, 1_000, 42, 42, 7, 0); // exit 0
+        let e2 = enc.build_exit(1, 2_500, 43, 43, 7, 9 << 8); // exit 9
         // decode both against a fresh state, applying the same deltas
         let mut st = EvState::default();
         let mut expect = [(1_000i64, 42i64, 0i64, 0i64), (2_500, 43, 0, 9)];
-        for (buf, (ts, pid, status, code)) in
-            [e1, e2].iter().zip(expect.iter_mut()) {
+        for (buf, (ts, pid, status, code)) in [e1, e2].iter().zip(expect.iter_mut()) {
             let mut s: &[u8] = buf;
             let outer = get(&mut s);
             assert!(s.is_empty());

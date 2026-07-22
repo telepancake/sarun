@@ -101,8 +101,10 @@ mod tests {
 
     #[test]
     fn font_asset_is_present_and_small() {
-        assert!(FONT_TTF.starts_with(&[0x00, 0x01, 0x00, 0x00]) // TrueType
-            || FONT_TTF.starts_with(b"OTTO"));
+        assert!(
+            FONT_TTF.starts_with(&[0x00, 0x01, 0x00, 0x00]) // TrueType
+            || FONT_TTF.starts_with(b"OTTO")
+        );
         assert!(FONT_TTF.len() < 100_000);
     }
 

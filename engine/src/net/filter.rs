@@ -56,12 +56,16 @@ impl Filter {
         let mut rules = Vec::new();
         for line in text.lines() {
             let line = line.trim();
-            if line.is_empty() || line.starts_with('#') { continue; }
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
             let (kind, arg) = match line.split_once(char::is_whitespace) {
                 Some((k, a)) => (k, a.trim()),
                 None => continue, // a bare directive with no argument is inert
             };
-            if arg.is_empty() { continue; }
+            if arg.is_empty() {
+                continue;
+            }
             match kind {
                 "block" => rules.push(Rule::BlockUrl(Glob::new(arg))),
                 "block-host" => rules.push(Rule::BlockHost(Glob::new(arg))),
@@ -75,8 +79,9 @@ impl Filter {
     /// Test-only: whether any rules parsed (the prod paths gate on
     /// `ProxyHooks.filter` being present at all).
     #[cfg(test)]
-    pub fn is_empty(&self) -> bool { self.rules.is_empty() }
-
+    pub fn is_empty(&self) -> bool {
+        self.rules.is_empty()
+    }
 
     /// Request-time verdict for a URL + host. Block wins on the first match.
     pub fn decide(&self, url: &str, host: &str) -> Decision {
@@ -98,7 +103,9 @@ impl Filter {
             if let Rule::StripHeader(name) = r {
                 // HeaderMap::remove takes a header name; remove all values.
                 if let Ok(hn) = hyper::header::HeaderName::from_bytes(name.as_bytes()) {
-                    while headers.remove(&hn).is_some() { removed += 1; }
+                    while headers.remove(&hn).is_some() {
+                        removed += 1;
+                    }
                 }
             }
         }
@@ -125,17 +132,24 @@ impl Glob {
         let low = pat.to_ascii_lowercase();
         let anchor_start = !low.starts_with('*');
         let anchor_end = !low.ends_with('*');
-        let segs: Vec<String> = low.split('*')
+        let segs: Vec<String> = low
+            .split('*')
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string())
             .collect();
-        Self { segs, anchor_start, anchor_end }
+        Self {
+            segs,
+            anchor_start,
+            anchor_end,
+        }
     }
 
     fn matches(&self, hay: &str) -> bool {
         let hay = hay.to_ascii_lowercase();
         // A pattern of pure `*` (no segments) matches anything.
-        if self.segs.is_empty() { return true; }
+        if self.segs.is_empty() {
+            return true;
+        }
         let mut pos = 0usize;
         for (i, seg) in self.segs.iter().enumerate() {
             let from = &hay[pos..];
@@ -143,7 +157,9 @@ impl Glob {
                 None => return false,
                 Some(idx) => {
                     // First segment must sit at the very start when anchored.
-                    if i == 0 && self.anchor_start && idx != 0 { return false; }
+                    if i == 0 && self.anchor_start && idx != 0 {
+                        return false;
+                    }
                     pos += idx + seg.len();
                 }
             }
@@ -178,20 +194,29 @@ mod tests {
 
     #[test]
     fn decide_blocks_by_url_and_host() {
-        let f = Filter::parse(
-            "# comment\nblock *doubleclick.net*\nblock-host *.tracker.io\n");
-        assert_eq!(f.decide("https://ad.doubleclick.net/pixel", "ad.doubleclick.net"),
-                   Decision::Block);
-        assert_eq!(f.decide("https://x.com/", "evil.tracker.io"), Decision::Block);
-        assert_eq!(f.decide("https://example.com/", "example.com"), Decision::Pass);
+        let f = Filter::parse("# comment\nblock *doubleclick.net*\nblock-host *.tracker.io\n");
+        assert_eq!(
+            f.decide("https://ad.doubleclick.net/pixel", "ad.doubleclick.net"),
+            Decision::Block
+        );
+        assert_eq!(
+            f.decide("https://x.com/", "evil.tracker.io"),
+            Decision::Block
+        );
+        assert_eq!(
+            f.decide("https://example.com/", "example.com"),
+            Decision::Pass
+        );
     }
 
     #[test]
     fn strip_header_removes_all_matches() {
         let f = Filter::parse("strip-header Content-Security-Policy\n");
         let mut h = HeaderMap::new();
-        h.append(hyper::header::CONTENT_SECURITY_POLICY,
-                 "default-src 'self'".parse().unwrap());
+        h.append(
+            hyper::header::CONTENT_SECURITY_POLICY,
+            "default-src 'self'".parse().unwrap(),
+        );
         h.insert(hyper::header::CONTENT_TYPE, "text/html".parse().unwrap());
         assert_eq!(f.rewrite_response_headers(&mut h), 1);
         assert!(!h.contains_key(hyper::header::CONTENT_SECURITY_POLICY));

@@ -718,6 +718,19 @@ enum Action {
     /// Selected sessions row is a loaded image: prompt a PTY running
     /// `<exe> oci run <name>` (a container shell on that image).
     RunSelectedImage,
+    /// Debug the selected captured file as firmware in a fresh QEMU child.
+    DebugSelectedFirmware,
+    DebugSelectedFirmwareX8664,
+    DebugSelectedFirmwareAarch64,
+    DebugSelectedFirmwareArm,
+    DebugSelectedFirmwareMmips,
+    /// Boot the one marked captured file as kernel and the selected file as
+    /// initramfs in a fresh debugger-owned QEMU child.
+    DebugSelectedKernelInitramfs,
+    DebugSelectedKernelInitramfsX8664,
+    DebugSelectedKernelInitramfsAarch64,
+    DebugSelectedKernelInitramfsArm,
+    DebugSelectedKernelInitramfsMmips,
     /// Launcher: carbonyl (Chromium in the terminal) in the persistent
     /// BROWSER box (DESIGN-web.md W3). Opens a real URL field (Modal::
     /// BrowserUrl); Enter assembles the launch via build_launch as
@@ -5397,6 +5410,26 @@ impl App {
         }
     }
 
+    fn open_debug_console(&mut self, service: &str, sid: &str) {
+        let (cols, rows) = match crossterm::terminal::size() {
+            Ok((columns, rows)) => (columns.max(20), rows.saturating_sub(5).max(2)),
+            Err(_) => (80, 24),
+        };
+        match PtyPane::open_debug_console(&self.sock, service, rows, cols) {
+            Ok(pane) => {
+                self.ptys.push(pane);
+                self.sel_pty = self.ptys.len() - 1;
+                self.focus = Pane::Pty;
+                self.status = format!(
+                    "debugger for box {sid} · PTY {}/{} · F11 embeds in detail pane",
+                    self.sel_pty + 1,
+                    self.ptys.len()
+                );
+            }
+            Err(error) => self.status = format!("debugger for box {sid}: {error}"),
+        }
+    }
+
     /// Compute the (rows, cols) the currently-VISIBLE PTY should
     /// occupy given the terminal size, and resize it if it differs
     /// from what the child currently thinks. Called from the main
@@ -6082,6 +6115,14 @@ impl App {
             Some("consolidate_failed") => {
                 let err = ev.get("error").and_then(Value::as_str).unwrap_or("?");
                 self.status = format!("consolidate failed: {err}");
+            }
+            Some("debug_console_ready") => {
+                let service = ev.get("service").and_then(Value::as_str);
+                let sid = ev.get("sid").and_then(Value::as_str).unwrap_or("?");
+                match service {
+                    Some(service) => self.open_debug_console(service, sid),
+                    None => self.status = "debug console event omitted its service identity".into(),
+                }
             }
             Some("pong") => self.status = "pong".into(),
             _ => {}
@@ -13905,7 +13946,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                 let lines = trace_index_lines(app);
                 let scroll = scroll_for_cursor(app.sel_trace + 1, lines.len(), left.height);
                 let p = Paragraph::new(Text::from(lines))
-                    .block(block(title("TRACE · sud wire events", lf), lf))
+                    .block(block(title("TRACE · process and file events", lf), lf))
                     .scroll((scroll, 0));
                 f.render_widget(p, left);
                 let dl = trace_detail_lines(app);
@@ -15306,6 +15347,90 @@ fn self_exe() -> String {
         .unwrap_or_else(|| "sarun".to_string())
 }
 
+fn launch_selected_firmware(app: &mut App, architecture: &str) {
+    let source_box = app
+        .sessions
+        .get(app.sel_session)
+        .and_then(|row| row.get("path"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let selected_path = app.cur_change_path();
+    let (Some(source_box), Some(selected_path)) = (source_box, selected_path) else {
+        app.status = "select a captured firmware file in Changes first".into();
+        return;
+    };
+    if app
+        .changes
+        .get(app.sel_change)
+        .and_then(|row| row.get("connector"))
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        app.status = "select a file, not a directory row".into();
+        return;
+    }
+    app.open_pty(vec![
+        "sarun".into(),
+        "run".into(),
+        "--net".into(),
+        "off".into(),
+        "--qemu".into(),
+        architecture.into(),
+        "--debug".into(),
+        "--image".into(),
+        source_box,
+        selected_path,
+    ]);
+}
+
+fn launch_selected_kernel_initramfs(app: &mut App, architecture: &str) {
+    let source_box = app
+        .sessions
+        .get(app.sel_session)
+        .and_then(|row| row.get("path"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let initramfs = app.cur_change_path();
+    let marked = app.marked_here();
+    let (Some(source_box), Some(initramfs)) = (source_box, initramfs) else {
+        app.status = "select an initramfs file in Changes first".into();
+        return;
+    };
+    let [kernel] = marked.as_slice() else {
+        app.status = "mark exactly one kernel file, then select the initramfs".into();
+        return;
+    };
+    let is_connector = |path: &str| {
+        app.changes.iter().any(|row| {
+            row.get("path").and_then(Value::as_str) == Some(path)
+                && row.get("connector").and_then(Value::as_bool) == Some(true)
+        })
+    };
+    if is_connector(kernel) || is_connector(&initramfs) {
+        app.status = "select captured files, not directory rows".into();
+        return;
+    }
+    if kernel == &initramfs {
+        app.status = "the marked kernel and selected initramfs must be different files".into();
+        return;
+    }
+    app.open_pty(vec![
+        "sarun".into(),
+        "run".into(),
+        "--net".into(),
+        "off".into(),
+        "--qemu".into(),
+        architecture.into(),
+        "--debug".into(),
+        "--kernel".into(),
+        source_box.clone(),
+        kernel.clone(),
+        "--initramfs".into(),
+        source_box,
+        initramfs,
+    ]);
+}
+
 /// The Pty+ chooser: each destination spelled out instead of one raw command
 /// prompt. (Previously Pty+ opened a prompt pre-filled with the full sarun
 /// path; typing `bash` over it ran on the HOST — or, appended, tripped the
@@ -15988,6 +16113,45 @@ impl PtyPane {
                 .unwrap_or("pty_spawn refused")
                 .to_string());
         }
+        let browser =
+            argv.iter().any(|a| a == "/proc/self/exe") && argv.iter().any(|a| a == "browser");
+        Self::from_stream(s, rows, cols, browser)
+    }
+
+    /// Attach to an engine-owned debugger PTY which is already running.  The
+    /// readiness event carries only the engine-issued service identity; the
+    /// UI uses the generated service-dial request and then the ordinary PTY
+    /// frame protocol, with no filesystem endpoint or process argv.
+    fn open_debug_console(
+        sock: &str,
+        service: &str,
+        rows: u16,
+        cols: u16,
+    ) -> Result<PtyPane, String> {
+        let mut s = UnixStream::connect(sock).map_err(|e| format!("connect: {e}"))?;
+        let name = crate::wire::BoundedText::new(service.to_owned())
+            .map_err(|_| "debug console service identity is invalid".to_string())?;
+        crate::socket_wire::write_request(
+            &mut s,
+            &crate::generated_wire::RequestEnvelope::Transport(
+                crate::generated_wire::TransportRequest::ServiceDial { name },
+            ),
+        )
+        .map_err(|error| format!("request debug console: {error}"))?;
+        match crate::socket_wire::read_mode(&mut s)
+            .map_err(|error| format!("open debug console: {error}"))?
+        {
+            crate::generated_wire::ConnectionMode::RawService => {
+                Self::from_stream(s, rows, cols, false)
+            }
+            crate::generated_wire::ConnectionMode::Reply { response } => {
+                Err(format!("debug console refused: {response:?}"))
+            }
+            mode => Err(format!("debug console returned unexpected mode {mode:?}")),
+        }
+    }
+
+    fn from_stream(s: UnixStream, rows: u16, cols: u16, browser: bool) -> Result<PtyPane, String> {
         // Share the UnixStream between three roles:
         //   * READER thread reads the byte stream → FRAME_PTY_DATA / EOF.
         //   * send_input / resize write FRAME_PTY_DATA / FRAME_PTY_RESIZE.
@@ -16045,10 +16209,6 @@ impl PtyPane {
             env!("CARGO_PKG_VERSION"),
             response_writer,
         );
-        // Browser detection: the cellulose launch runs the ferried engine
-        // binary as `… browser …` in the box (see LaunchTarget::Browser).
-        let browser =
-            argv.iter().any(|a| a == "/proc/self/exe") && argv.iter().any(|a| a == "browser");
         Ok(PtyPane {
             terminal: term,
             writer,
@@ -16562,6 +16722,16 @@ fn pane_action_menu(app: &App) -> Option<(String, Vec<ActionItem>)> {
                 title("Change", &path),
                 vec![
                     mk("Open diff", "Enter", Action::OpenSelection),
+                    mk(
+                        "Debug this captured firmware image…",
+                        "",
+                        Action::DebugSelectedFirmware,
+                    ),
+                    mk(
+                        "Boot marked kernel + selected initramfs…",
+                        "",
+                        Action::DebugSelectedKernelInitramfs,
+                    ),
                     mk("Apply this file", "a", Action::ApplyFile),
                     mk("Discard this file", "x/F8", Action::DiscardFile),
                 ],
@@ -16755,6 +16925,72 @@ fn run_action(app: &mut App, a: Action) {
                 None => app.status = "selected box is not a loaded image".into(),
             }
         }
+        Action::DebugSelectedFirmware => {
+            app.modal = Some(Modal::Launcher {
+                items: vec![
+                    ActionItem {
+                        label: "x86_64".into(),
+                        hint: "",
+                        action: Action::DebugSelectedFirmwareX8664,
+                    },
+                    ActionItem {
+                        label: "AArch64".into(),
+                        hint: "",
+                        action: Action::DebugSelectedFirmwareAarch64,
+                    },
+                    ActionItem {
+                        label: "ARMv7".into(),
+                        hint: "",
+                        action: Action::DebugSelectedFirmwareArm,
+                    },
+                    ActionItem {
+                        label: "MIPS32 little-endian".into(),
+                        hint: "",
+                        action: Action::DebugSelectedFirmwareMmips,
+                    },
+                ],
+                sel: 0,
+            });
+        }
+        Action::DebugSelectedFirmwareX8664 => launch_selected_firmware(app, "x86_64"),
+        Action::DebugSelectedFirmwareAarch64 => launch_selected_firmware(app, "aarch64"),
+        Action::DebugSelectedFirmwareArm => launch_selected_firmware(app, "arm"),
+        Action::DebugSelectedFirmwareMmips => launch_selected_firmware(app, "mmips"),
+        Action::DebugSelectedKernelInitramfs => {
+            app.modal = Some(Modal::Launcher {
+                items: vec![
+                    ActionItem {
+                        label: "x86_64".into(),
+                        hint: "",
+                        action: Action::DebugSelectedKernelInitramfsX8664,
+                    },
+                    ActionItem {
+                        label: "AArch64".into(),
+                        hint: "",
+                        action: Action::DebugSelectedKernelInitramfsAarch64,
+                    },
+                    ActionItem {
+                        label: "ARMv7".into(),
+                        hint: "",
+                        action: Action::DebugSelectedKernelInitramfsArm,
+                    },
+                    ActionItem {
+                        label: "MIPS32 little-endian".into(),
+                        hint: "",
+                        action: Action::DebugSelectedKernelInitramfsMmips,
+                    },
+                ],
+                sel: 0,
+            });
+        }
+        Action::DebugSelectedKernelInitramfsX8664 => {
+            launch_selected_kernel_initramfs(app, "x86_64")
+        }
+        Action::DebugSelectedKernelInitramfsAarch64 => {
+            launch_selected_kernel_initramfs(app, "aarch64")
+        }
+        Action::DebugSelectedKernelInitramfsArm => launch_selected_kernel_initramfs(app, "arm"),
+        Action::DebugSelectedKernelInitramfsMmips => launch_selected_kernel_initramfs(app, "mmips"),
         Action::Browser => {
             // Open a real URL field (DESIGN-web.md W3). The MITM SPKI is
             // required — Chromium ignores the overlay CA bundle and pin-trusts
@@ -18513,7 +18749,8 @@ mod tests {
         })];
         let input = "kill ";
         let completion = super::command_completions(&mut app, input, input.len())
-            .into_iter().find(|entry| entry.insert == "C1")
+            .into_iter()
+            .find(|entry| entry.insert == "C1")
             .expect("C1 offered for kill SID");
         let completed = crate::parser::apply_completion(input, &completion);
         assert_eq!(completed, "kill C1");
@@ -18525,8 +18762,9 @@ mod tests {
         };
         assert_eq!(
             invocation.payload,
-            crate::parser::InvocationPayload::Wire(
-                crate::generated_wire::ActionRequest::Kill { sid: 1 }),
+            crate::parser::InvocationPayload::Wire(crate::generated_wire::ActionRequest::Kill {
+                sid: 1
+            }),
         );
         assert_eq!(crate::parser::render(&invocation).unwrap(), "kill 1");
     }
@@ -18543,11 +18781,7 @@ mod tests {
 
         dispatch_char_key(&mut app, ':');
         for character in "kill ".chars() {
-            handle_modal_key(
-                &mut app,
-                KeyCode::Char(character),
-                KeyModifiers::empty(),
-            );
+            handle_modal_key(&mut app, KeyCode::Char(character), KeyModifiers::empty());
         }
         let (selected, target, count) = match app.modal.as_ref() {
             Some(Modal::Command {
@@ -18604,11 +18838,7 @@ mod tests {
         let mut app = App::bare(path.to_string_lossy().into_owned());
         dispatch_char_key(&mut app, ':');
         for character in "quit".chars() {
-            handle_modal_key(
-                &mut app,
-                KeyCode::Char(character),
-                KeyModifiers::empty(),
-            );
+            handle_modal_key(&mut app, KeyCode::Char(character), KeyModifiers::empty());
         }
         handle_modal_key(&mut app, KeyCode::Enter, KeyModifiers::empty());
         server.join().unwrap();

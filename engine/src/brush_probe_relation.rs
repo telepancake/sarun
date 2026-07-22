@@ -411,10 +411,7 @@ fn probe_from_symbolic_tear(
         return Err("typed builtin tear has an invalid cooked offset".into());
     }
     Ok(ProbeAtTear {
-        input: if word_index == 0
-            && tear.offset == word.text.len()
-            && tear.surface_len == 0
-        {
+        input: if word_index == 0 && tear.offset == word.text.len() && tear.surface_len == 0 {
             BuiltinParserInput {
                 tear: true,
                 before: vec![word.text.clone()],
@@ -440,9 +437,7 @@ fn probe_from_symbolic_tear(
         replace: tear.replace,
         edit_id: tear.edit_id.clone(),
         tear_surface_len: tear.surface_len,
-        command_gap: word_index == 0
-            && tear.offset == word.text.len()
-            && tear.surface_len == 0,
+        command_gap: word_index == 0 && tear.offset == word.text.len() && tear.surface_len == 0,
     })
 }
 
@@ -1196,10 +1191,7 @@ mod tests {
         );
         assert_eq!(
             graph[0].query.selector,
-            RelationValue::Compound(
-                "prefix".into(),
-                vec![RelationValue::String("./r".into())],
-            )
+            RelationValue::Compound("prefix".into(), vec![RelationValue::String("./r".into())],)
         );
     }
 

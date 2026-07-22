@@ -31,11 +31,11 @@ use parking_lot::Mutex;
 use tokio::net::TcpStream;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
+use super::ProxyHooks;
 use super::bridge::SmoltcpStream;
 use super::ca::Ca;
 use super::filter::Decision;
 use super::webcap::{self, ReqCap};
-use super::ProxyHooks;
 
 /// Hyper body type the proxy emits — boxed dyn so HTTP and HTTPS paths
 /// share the same Response signature regardless of the upstream body.
@@ -60,7 +60,8 @@ fn err_response(status: hyper::StatusCode, msg: &str) -> Response<ProxyBody> {
     *r.status_mut() = status;
     r.headers_mut().insert(
         hyper::header::CONTENT_TYPE,
-        hyper::header::HeaderValue::from_static("text/plain; charset=utf-8"));
+        hyper::header::HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
     r
 }
 
@@ -77,21 +78,31 @@ fn replay_response(hit: crate::discover::ReplayHit) -> Response<ProxyBody> {
         .boxed();
     let mut headers = hyper::HeaderMap::new();
     for line in hit.resp_headers.lines() {
-        let Some((k, v)) = line.split_once(':') else { continue };
+        let Some((k, v)) = line.split_once(':') else {
+            continue;
+        };
         let (k, v) = (k.trim(), v.trim());
-        if matches!(k.to_ascii_lowercase().as_str(),
-                    "content-length" | "transfer-encoding" | "connection"
-                    | "keep-alive" | "proxy-connection") {
+        if matches!(
+            k.to_ascii_lowercase().as_str(),
+            "content-length"
+                | "transfer-encoding"
+                | "connection"
+                | "keep-alive"
+                | "proxy-connection"
+        ) {
             continue;
         }
         if let (Ok(name), Ok(val)) = (
             hyper::header::HeaderName::from_bytes(k.as_bytes()),
-            hyper::header::HeaderValue::from_str(v)) {
+            hyper::header::HeaderValue::from_str(v),
+        ) {
             headers.append(name, val);
         }
     }
-    headers.insert("x-sarun-replay",
-                   hyper::header::HeaderValue::from_static("1"));
+    headers.insert(
+        "x-sarun-replay",
+        hyper::header::HeaderValue::from_static("1"),
+    );
     let mut r = Response::new(body);
     *r.status_mut() = hyper::StatusCode::from_u16(hit.status.clamp(100, 599) as u16)
         .unwrap_or(hyper::StatusCode::OK);
@@ -106,18 +117,21 @@ fn replay_response(hit: crate::discover::ReplayHit) -> Response<ProxyBody> {
 /// cost; otherwise the filter can block the request (synthetic 204) or rewrite
 /// response headers, and the capture sink tees the exchange into a `webcap`
 /// row while streaming the body to the box unchanged.
-async fn proxy_request(scheme: &'static str, default_port: u16,
-                       req: Request<Incoming>,
-                       rustls_client_config: Option<Arc<rustls::ClientConfig>>,
-                       hooks: Option<Arc<ProxyHooks>>)
-                       -> Result<Response<ProxyBody>>
-{
+async fn proxy_request(
+    scheme: &'static str,
+    default_port: u16,
+    req: Request<Incoming>,
+    rustls_client_config: Option<Arc<rustls::ClientConfig>>,
+    hooks: Option<Arc<ProxyHooks>>,
+) -> Result<Response<ProxyBody>> {
     let sink = hooks.as_ref().and_then(|h| h.capture.clone());
     let filter = hooks.as_ref().and_then(|h| h.filter.clone());
     let replay = hooks.as_ref().and_then(|h| h.replay);
     // Recover the target authority from the Host header (HTTP) or the
     // request URI's authority (HTTP/2-style absolute URI).
-    let host = req.headers().get(hyper::header::HOST)
+    let host = req
+        .headers()
+        .get(hyper::header::HOST)
         .and_then(|h| h.to_str().ok())
         .map(|s| s.to_string())
         .or_else(|| req.uri().authority().map(|a| a.as_str().to_string()))
@@ -134,7 +148,11 @@ async fn proxy_request(scheme: &'static str, default_port: u16,
     // outgoing body is boxed to a uniform type so both the streamed
     // (capture-off) and buffered (capture-on) shapes drive the same sender.
     let (parts, in_body) = req.into_parts();
-    let pq = parts.uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
+    let pq = parts
+        .uri
+        .path_and_query()
+        .map(|p| p.as_str())
+        .unwrap_or("/");
     let url = format!("{scheme}://{host}{pq}");
 
     // ── W7 request-block (adblock) ────────────────────────────────────────
@@ -144,10 +162,13 @@ async fn proxy_request(scheme: &'static str, default_port: u16,
     if let Some(f) = &filter {
         if f.decide(&url, &host) == Decision::Block {
             if let Some(sink) = &sink {
-                let ts = SystemTime::now().duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_secs_f64()).unwrap_or(0.0);
+                let ts = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs_f64())
+                    .unwrap_or(0.0);
                 let rc = ReqCap {
-                    method: parts.method.to_string(), url: url.clone(),
+                    method: parts.method.to_string(),
+                    url: url.clone(),
                     host: host.clone(),
                     headers: webcap::format_headers(&parts.headers),
                     body: Vec::new(),
@@ -157,7 +178,8 @@ async fn proxy_request(scheme: &'static str, default_port: u16,
             return Ok(Response::builder()
                 .status(hyper::StatusCode::NO_CONTENT)
                 .header("x-sarun-filter", "blocked")
-                .body(empty_body()).unwrap());
+                .body(empty_body())
+                .unwrap());
         }
     }
 
@@ -169,13 +191,15 @@ async fn proxy_request(scheme: &'static str, default_port: u16,
     // 404 (sealed: replay never silently falls back to a live fetch).
     if let Some(rp) = replay {
         let method = parts.method.to_string();
-        return Ok(match crate::discover::webcap_replay(
-            rp.source_box, &url, &method, rp.asof)
-        {
-            Some(hit) => replay_response(hit),
-            None => err_response(hyper::StatusCode::NOT_FOUND,
-                                 &format!("not in archive: {url}")),
-        });
+        return Ok(
+            match crate::discover::webcap_replay(rp.source_box, &url, &method, rp.asof) {
+                Some(hit) => replay_response(hit),
+                None => err_response(
+                    hyper::StatusCode::NOT_FOUND,
+                    &format!("not in archive: {url}"),
+                ),
+            },
+        );
     }
 
     let (out_body, reqcap): (ProxyBody, Option<ReqCap>) = if sink.is_some() {
@@ -194,13 +218,18 @@ async fn proxy_request(scheme: &'static str, default_port: u16,
             // with a 502 instead.
             let collected = match in_body.collect().await {
                 Ok(c) => c.to_bytes(),
-                Err(e) => return Ok(err_response(
-                    hyper::StatusCode::BAD_GATEWAY,
-                    &format!("read request body for {url}: {e}"))),
+                Err(e) => {
+                    return Ok(err_response(
+                        hyper::StatusCode::BAD_GATEWAY,
+                        &format!("read request body for {url}: {e}"),
+                    ));
+                }
             };
             let bytes = if collected.len() > webcap::WEBCAP_BODY_MAX {
                 collected.slice(0..webcap::WEBCAP_BODY_MAX)
-            } else { collected };
+            } else {
+                collected
+            };
             rc.body = bytes.to_vec();
             (Full::new(bytes).map_err(|n| match n {}).boxed(), Some(rc))
         } else {
@@ -213,7 +242,8 @@ async fn proxy_request(scheme: &'static str, default_port: u16,
     };
     let out_req = Request::from_parts(parts, out_body);
 
-    let tcp = TcpStream::connect((host_only.as_str(), port)).await
+    let tcp = TcpStream::connect((host_only.as_str(), port))
+        .await
         .with_context(|| format!("dial {host_only}:{port}"))?;
 
     let resp: Response<ProxyBody> = if scheme == "https" {
@@ -221,7 +251,9 @@ async fn proxy_request(scheme: &'static str, default_port: u16,
         let connector = tokio_rustls::TlsConnector::from(cfg);
         let dnsname = rustls::pki_types::ServerName::try_from(host_only.clone())
             .map_err(|e| anyhow!("bad dns name: {e}"))?;
-        let tls = connector.connect(dnsname, tcp).await
+        let tls = connector
+            .connect(dnsname, tcp)
+            .await
             .with_context(|| format!("tls handshake {host_only}"))?;
         let io = TokioIo::new(tls);
         let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await?;
@@ -269,8 +301,11 @@ async fn proxy_request(scheme: &'static str, default_port: u16,
 /// completed exchange is recorded as one `webcap` row (DESIGN-web.md W2). The
 /// forward is byte-for-byte — the box sees exactly what upstream sent — so
 /// this never changes what the box receives, only records a copy.
-fn tee_response(sink: Arc<webcap::WebCapSink>, req: ReqCap,
-                resp: Response<ProxyBody>) -> Response<ProxyBody> {
+fn tee_response(
+    sink: Arc<webcap::WebCapSink>,
+    req: ReqCap,
+    resp: Response<ProxyBody>,
+) -> Response<ProxyBody> {
     let (parts, mut body) = resp.into_parts();
     let status = parts.status.as_u16() as i32;
     let resp_headers = webcap::format_headers(&parts.headers);
@@ -281,7 +316,8 @@ fn tee_response(sink: Arc<webcap::WebCapSink>, req: ReqCap,
     let over_cap_declared = !capturing;
 
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<
-        Result<Frame<Bytes>, Box<dyn std::error::Error + Send + Sync>>>();
+        Result<Frame<Bytes>, Box<dyn std::error::Error + Send + Sync>>,
+    >();
     tokio::spawn(async move {
         let mut acc: Vec<u8> = Vec::new();
         let mut truncated = over_cap_declared;
@@ -302,14 +338,21 @@ fn tee_response(sink: Arc<webcap::WebCapSink>, req: ReqCap,
                             truncated = true;
                         }
                     }
-                    if tx.send(Ok(frame)).is_err() { break; }
+                    if tx.send(Ok(frame)).is_err() {
+                        break;
+                    }
                 }
-                Some(Err(e)) => { let _ = tx.send(Err(e)); break; }
+                Some(Err(e)) => {
+                    let _ = tx.send(Err(e));
+                    break;
+                }
                 None => break,
             }
         }
-        let ts = SystemTime::now().duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs_f64()).unwrap_or(0.0);
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
         sink.record(ts, &req, status, &mime, &resp_headers, &acc, truncated);
     });
     let stream = UnboundedReceiverStream::new(rx);
@@ -318,8 +361,12 @@ fn tee_response(sink: Arc<webcap::WebCapSink>, req: ReqCap,
     Response::from_parts(parts, new_body)
 }
 
-pub async fn serve_http(box_side: SmoltcpStream, _host_hint: &str,
-                        port: u16, hooks: Option<Arc<ProxyHooks>>) -> Result<()> {
+pub async fn serve_http(
+    box_side: SmoltcpStream,
+    _host_hint: &str,
+    port: u16,
+    hooks: Option<Arc<ProxyHooks>>,
+) -> Result<()> {
     let io = TokioIo::new(box_side);
     let svc = hyper::service::service_fn(move |req: Request<Incoming>| {
         let hooks = hooks.clone();
@@ -333,8 +380,7 @@ pub async fn serve_http(box_side: SmoltcpStream, _host_hint: &str,
             }
         }
     });
-    let conn = hyper::server::conn::http1::Builder::new()
-        .serve_connection(io, svc);
+    let conn = hyper::server::conn::http1::Builder::new().serve_connection(io, svc);
     // A box-side connection error (client hangup mid-request, framing error)
     // is surfaced rather than swallowed so a broken proxy session is visible.
     if let Err(e) = conn.await {
@@ -343,10 +389,14 @@ pub async fn serve_http(box_side: SmoltcpStream, _host_hint: &str,
     Ok(())
 }
 
-pub async fn serve_https(box_side: SmoltcpStream, host: &str,
-                         ca: Arc<Ca>, keylog: Arc<KeyLogFile>,
-                         upstream: Arc<rustls::ClientConfig>,
-                         hooks: Option<Arc<ProxyHooks>>) -> Result<()> {
+pub async fn serve_https(
+    box_side: SmoltcpStream,
+    host: &str,
+    ca: Arc<Ca>,
+    keylog: Arc<KeyLogFile>,
+    upstream: Arc<rustls::ClientConfig>,
+    hooks: Option<Arc<ProxyHooks>>,
+) -> Result<()> {
     let leaf = ca.leaf_for(host).context("mint leaf")?;
     let cert_chain: Vec<rustls::pki_types::CertificateDer> = vec![
         rustls::pki_types::CertificateDer::from(leaf.cert_der.clone()),
@@ -377,8 +427,7 @@ pub async fn serve_https(box_side: SmoltcpStream, host: &str,
             }
         }
     });
-    let conn = hyper::server::conn::http1::Builder::new()
-        .serve_connection(io, svc);
+    let conn = hyper::server::conn::http1::Builder::new().serve_connection(io, svc);
     // Same as serve_http: surface a box-side TLS/HTTP connection error.
     if let Err(e) = conn.await {
         eprintln!("sarun-engine: net: mitm box-side https conn: {e}");
@@ -407,20 +456,28 @@ pub fn build_upstream_client_config() -> Arc<rustls::ClientConfig> {
                 // A single malformed cert in the bundle shouldn't abort the
                 // load, but tally rejects so a silently-thinned trust store
                 // (→ UnknownIssuer for some upstreams) is diagnosable.
-                if roots.add(c).is_ok() { added += 1; } else { rejected += 1; }
+                if roots.add(c).is_ok() {
+                    added += 1;
+                } else {
+                    rejected += 1;
+                }
             }
             break;
         }
     }
     if rejected > 0 {
-        eprintln!("sarun-engine: net: {rejected} upstream CA cert(s) rejected \
-                   while loading trust store");
+        eprintln!(
+            "sarun-engine: net: {rejected} upstream CA cert(s) rejected \
+                   while loading trust store"
+        );
     }
     if added == 0 {
         // No roots → every HTTPS upstream dial fails UnknownIssuer. This is a
         // serious, otherwise-mysterious condition; make it loud.
-        eprintln!("sarun-engine: net: WARNING no upstream CA roots loaded — \
-                   HTTPS MITM upstream dials will fail to verify");
+        eprintln!(
+            "sarun-engine: net: WARNING no upstream CA roots loaded — \
+                   HTTPS MITM upstream dials will fail to verify"
+        );
     }
     let cfg = rustls::ClientConfig::builder()
         .with_root_certificates(roots)
@@ -430,9 +487,7 @@ pub fn build_upstream_client_config() -> Arc<rustls::ClientConfig> {
 
 /// Minimal PEM cert iterator (no extra crate). Parses every BEGIN/END CERT
 /// block; ignores anything else.
-fn rustls_pemfile_certs(input: &mut &[u8])
-    -> Vec<rustls::pki_types::CertificateDer<'static>>
-{
+fn rustls_pemfile_certs(input: &mut &[u8]) -> Vec<rustls::pki_types::CertificateDer<'static>> {
     // PEM is ASCII; a non-UTF8 bundle is malformed and yields no certs. The
     // caller (build_upstream_client_config) already warns loudly when zero
     // roots end up loaded, so the empty fallback here is safe.
@@ -442,18 +497,21 @@ fn rustls_pemfile_certs(input: &mut &[u8])
     let mut in_block = false;
     for line in s.lines() {
         if line.starts_with("-----BEGIN CERTIFICATE") {
-            in_block = true; acc.clear(); continue;
+            in_block = true;
+            acc.clear();
+            continue;
         }
         if line.starts_with("-----END CERTIFICATE") {
             in_block = false;
             use base64::Engine;
-            if let Ok(der) = base64::engine::general_purpose::STANDARD
-                .decode(acc.as_bytes()) {
+            if let Ok(der) = base64::engine::general_purpose::STANDARD.decode(acc.as_bytes()) {
                 out.push(rustls::pki_types::CertificateDer::from(der));
             }
             continue;
         }
-        if in_block { acc.push_str(line.trim()); }
+        if in_block {
+            acc.push_str(line.trim());
+        }
     }
     out
 }
@@ -466,8 +524,12 @@ pub struct KeyLogFile {
 impl KeyLogFile {
     pub fn new(path: &std::path::Path) -> std::io::Result<Arc<Self>> {
         let f = std::fs::OpenOptions::new()
-            .create(true).append(true).open(path)?;
-        Ok(Arc::new(Self { file: Mutex::new(f) }))
+            .create(true)
+            .append(true)
+            .open(path)?;
+        Ok(Arc::new(Self {
+            file: Mutex::new(f),
+        }))
     }
 }
 

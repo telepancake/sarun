@@ -30,7 +30,14 @@ const SLOT_CANCELLED: u32 = 5;
 const FD_MAGIC: u32 = 0x5346_4644;
 const FD_VERSION: u16 = 1;
 const FD_EXPORT: u16 = 1;
+const FD_IDENTIFY: u16 = 2;
 const FD_EXPORT_WRITE: u32 = 1;
+
+/// `CMSG_FIRSTHDR` returns a `cmsghdr` pointer into this storage. A byte array
+/// alone has alignment one and faults on architectures that enforce aligned
+/// accesses (including aarch64), even though x86 happens to accept it.
+#[repr(align(16))]
+struct ControlMessageBuffer([u8; 64]);
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -101,7 +108,7 @@ const _: () = assert!(size_of::<Ring>() == 2_099_264);
 /// One mapping of the shared ring. Duplicating it maps the same memfd again;
 /// this mirrors the engine/tracee process boundary in unit tests.
 pub(crate) struct RingMapping {
-    fd: OwnedFd,
+    fd: Option<OwnedFd>,
     base: NonNull<Ring>,
 }
 
@@ -163,9 +170,8 @@ impl RingMapping {
         Self::from_fd(self.duplicate_fd()?)
     }
 
-    #[cfg(test)]
     pub(crate) fn duplicate_fd(&self) -> io::Result<OwnedFd> {
-        let raw = unsafe { libc::fcntl(self.fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+        let raw = unsafe { libc::fcntl(self.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
         if raw < 0 {
             Err(io::Error::last_os_error())
         } else {
@@ -182,7 +188,11 @@ impl RingMapping {
         if stat.st_size != size_of::<Ring>() as libc::off_t {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("SUD filesystem ring size {} != {}", stat.st_size, size_of::<Ring>()),
+                format!(
+                    "SUD filesystem ring size {} != {}",
+                    stat.st_size,
+                    size_of::<Ring>()
+                ),
             ));
         }
         let mapping = Self::map(fd)?;
@@ -218,13 +228,23 @@ impl RingMapping {
             return Err(io::Error::last_os_error());
         }
         Ok(Self {
-            fd,
+            fd: Some(fd),
             base: NonNull::new(address.cast()).expect("mmap never returns null on success"),
         })
     }
 
     pub(crate) fn as_raw_fd(&self) -> RawFd {
-        self.fd.as_raw_fd()
+        self.fd
+            .as_ref()
+            .expect("ring backing descriptor was discarded")
+            .as_raw_fd()
+    }
+
+    /// Close the backing memfd after a trusted client has mapped the ring.
+    /// The shared mapping remains fully usable, but descendants can no longer
+    /// recover the transport capability through `/proc/self/fd`.
+    pub(crate) fn discard_descriptor(&mut self) {
+        self.fd.take();
     }
 
     fn slot(&self, index: usize) -> *mut Slot {
@@ -263,13 +283,11 @@ impl Drop for RingMapping {
     }
 }
 
-#[cfg(test)]
 pub(crate) struct RingClient {
     mapping: Arc<RingMapping>,
     cursor: AtomicU32,
 }
 
-#[cfg(test)]
 impl RingClient {
     pub(crate) fn new(mapping: Arc<RingMapping>) -> Self {
         Self {
@@ -292,12 +310,18 @@ impl RingClient {
                 .wrapping_add(1)
         };
         unsafe {
-            std::ptr::write(std::ptr::addr_of_mut!((*slot).request_len), request.len() as u32);
+            std::ptr::write(
+                std::ptr::addr_of_mut!((*slot).request_len),
+                request.len() as u32,
+            );
             std::ptr::write(std::ptr::addr_of_mut!((*slot).response_len), 0);
             std::ptr::write(std::ptr::addr_of_mut!((*slot).flags), 0);
             std::ptr::write(std::ptr::addr_of_mut!((*slot).request_id), u64::from(id));
             std::ptr::write(std::ptr::addr_of_mut!((*slot).owner_tgid), libc::getpid());
-            std::ptr::write(std::ptr::addr_of_mut!((*slot).owner_tid), libc::syscall(libc::SYS_gettid) as i32);
+            std::ptr::write(
+                std::ptr::addr_of_mut!((*slot).owner_tid),
+                libc::syscall(libc::SYS_gettid) as i32,
+            );
             std::ptr::copy_nonoverlapping(
                 request.as_ptr(),
                 std::ptr::addr_of_mut!((*slot).request).cast::<u8>(),
@@ -397,6 +421,69 @@ impl RingClient {
     }
 }
 
+/// Engine-authenticated process identity for a direct userspace filesystem
+/// session. The raw request producer cannot choose its host pid: the session
+/// overwrites `InHeader.pid` immediately before the canonical decoder sees it.
+#[derive(Clone)]
+pub(crate) struct TrustedCaller {
+    host_pid: Arc<AtomicU32>,
+}
+
+impl TrustedCaller {
+    pub(crate) fn new(host_pid: u32) -> Self {
+        Self {
+            host_pid: Arc::new(AtomicU32::new(host_pid)),
+        }
+    }
+
+    /// Install the `inner` host pid exactly once. The identity lane invokes
+    /// this before acknowledging its handshake, so request workers either see
+    /// this immutable identity or reject an early request without attribution.
+    fn identify(&self, host_pid: u32) -> io::Result<()> {
+        if host_pid == 0 {
+            return Err(io::Error::from_raw_os_error(libc::ESRCH));
+        }
+        self.host_pid
+            .compare_exchange(0, host_pid, Ordering::AcqRel, Ordering::Acquire)
+            .map(|_| ())
+            .map_err(|_| io::Error::from_raw_os_error(libc::EALREADY))
+    }
+
+    pub(crate) fn host_pid(&self) -> u32 {
+        self.host_pid.load(Ordering::Acquire)
+    }
+
+    fn stamp(&self, request: &mut [u8]) -> io::Result<()> {
+        use virtiofsd::fuse::InHeader;
+
+        if request.len() < size_of::<InHeader>() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "direct filesystem request has no complete FUSE header",
+            ));
+        }
+        let mut header = unsafe { std::ptr::read_unaligned(request.as_ptr().cast::<InHeader>()) };
+        if header.len as usize != request.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "direct filesystem request length does not match its FUSE header",
+            ));
+        }
+        let host_pid = self.host_pid();
+        if host_pid == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "direct filesystem caller identity is not ready",
+            ));
+        }
+        header.pid = host_pid;
+        unsafe {
+            std::ptr::write_unaligned(request.as_mut_ptr().cast::<InHeader>(), header);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct PendingRequest {
     index: usize,
@@ -416,6 +503,39 @@ pub(crate) struct SudFsSession {
     lane_shutdown: Option<OwnedFd>,
 }
 
+/// A trusted userspace session for an in-process FUSE-box consumer. Transport
+/// lifetime is shared with SUD. Its identity starts unavailable and is fixed by
+/// the private descriptor-lane handshake before the client sends FUSE INIT.
+pub(crate) struct DirectFsSession {
+    session: SudFsSession,
+}
+
+impl DirectFsSession {
+    pub(crate) fn start(
+        filesystem: crate::sarunfs::SarunFs,
+        fd: OwnedFd,
+        lane_fd: OwnedFd,
+        worker_count: usize,
+    ) -> io::Result<Self> {
+        let caller = TrustedCaller::new(0);
+        enable_passcred(&lane_fd)?;
+        let lane_shutdown = duplicate_fd(&lane_fd)?;
+        let lane_filesystem = filesystem.clone();
+        let lane_caller = caller.clone();
+        let mut session =
+            SudFsSession::start_with(filesystem, fd, worker_count, Some(caller.clone()))?;
+        session.workers.push(std::thread::spawn(move || {
+            serve_fd_lane(lane_filesystem, lane_fd, Some(lane_caller))
+        }));
+        session.lane_shutdown = Some(lane_shutdown);
+        Ok(Self { session })
+    }
+
+    pub(crate) fn stop(self) -> io::Result<()> {
+        self.session.stop()
+    }
+}
+
 impl SudFsSession {
     pub(crate) fn start(
         filesystem: crate::sarunfs::SarunFs,
@@ -425,9 +545,9 @@ impl SudFsSession {
     ) -> io::Result<Self> {
         let lane_shutdown = duplicate_fd(&lane_fd)?;
         let lane_filesystem = filesystem.clone();
-        let mut session = Self::start_with(filesystem, fd, worker_count)?;
+        let mut session = Self::start_with(filesystem, fd, worker_count, None)?;
         session.workers.push(std::thread::spawn(move || {
-            serve_fd_lane(lane_filesystem, lane_fd)
+            serve_fd_lane(lane_filesystem, lane_fd, None)
         }));
         session.lane_shutdown = Some(lane_shutdown);
         Ok(session)
@@ -438,10 +558,28 @@ impl SudFsSession {
     where
         F: virtiofsd::filesystem::FileSystem + Send + Sync + 'static,
     {
-        Self::start_with(filesystem, fd, worker_count)
+        Self::start_with(filesystem, fd, worker_count, None)
     }
 
-    fn start_with<F>(filesystem: F, fd: OwnedFd, worker_count: usize) -> io::Result<Self>
+    #[cfg(test)]
+    fn start_for_test_with_caller<F>(
+        filesystem: F,
+        fd: OwnedFd,
+        worker_count: usize,
+        caller: TrustedCaller,
+    ) -> io::Result<Self>
+    where
+        F: virtiofsd::filesystem::FileSystem + Send + Sync + 'static,
+    {
+        Self::start_with(filesystem, fd, worker_count, Some(caller))
+    }
+
+    fn start_with<F>(
+        filesystem: F,
+        fd: OwnedFd,
+        worker_count: usize,
+        caller: Option<TrustedCaller>,
+    ) -> io::Result<Self>
     where
         F: virtiofsd::filesystem::FileSystem + Send + Sync + 'static,
     {
@@ -452,9 +590,19 @@ impl SudFsSession {
         for _ in 0..worker_count.max(1) {
             let ring = ring.clone();
             let decoder = decoder.clone();
+            let caller = caller.clone();
             workers.push(std::thread::spawn(move || {
                 let mut response = vec![0; SLOT_DATA];
-                while let Some(request) = ring.wait()? {
+                while let Some(mut request) = ring.wait()? {
+                    if let Some(caller) = &caller
+                        && caller.stamp(&mut request.bytes).is_err()
+                    {
+                        match crate::sarunfs::malformed_fuse_reply(&request.bytes, &mut response) {
+                            Some(length) => ring.complete(request, &response[..length])?,
+                            None => ring.cancel(request),
+                        }
+                        continue;
+                    }
                     match decoder.handle_fuse_message(&request.bytes, &mut response) {
                         Ok(length) => ring.complete(request, &response[..length])?,
                         Err(_) => match crate::sarunfs::malformed_fuse_reply(
@@ -469,7 +617,7 @@ impl SudFsSession {
                 Ok(())
             }));
         }
-        {
+        if caller.is_none() {
             let ring = ring.clone();
             let mapping = mapping.clone();
             workers.push(std::thread::spawn(move || {
@@ -480,7 +628,11 @@ impl SudFsSession {
                 Ok(())
             }));
         }
-        Ok(Self { mapping, workers, lane_shutdown: None })
+        Ok(Self {
+            mapping,
+            workers,
+            lane_shutdown: None,
+        })
     }
 
     pub(crate) fn stop(mut self) -> io::Result<()> {
@@ -514,7 +666,9 @@ impl Drop for SudFsSession {
 impl SudFsSession {
     fn shutdown_lane(&mut self) {
         if let Some(fd) = self.lane_shutdown.take() {
-            unsafe { libc::shutdown(fd.as_raw_fd(), libc::SHUT_RDWR); }
+            unsafe {
+                libc::shutdown(fd.as_raw_fd(), libc::SHUT_RDWR);
+            }
         }
     }
 }
@@ -529,53 +683,299 @@ fn duplicate_fd(fd: &OwnedFd) -> io::Result<OwnedFd> {
     }
 }
 
-fn serve_fd_lane(filesystem: crate::sarunfs::SarunFs, fd: OwnedFd) -> io::Result<()> {
-    loop {
-        let mut request = FdRequest::default();
-        let received = loop {
-            let result = unsafe {
-                libc::recv(fd.as_raw_fd(), std::ptr::addr_of_mut!(request).cast(),
-                           size_of::<FdRequest>(), 0)
-            };
-            if result < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            break result;
-        };
-        if received == 0 { return Ok(()); }
-        if received < 0 {
-            let error = io::Error::last_os_error();
-            if matches!(error.raw_os_error(), Some(libc::ECONNRESET) | Some(libc::ENOTCONN)) {
-                return Ok(());
-            }
-            return Err(error);
-        }
+fn enable_passcred(fd: &OwnedFd) -> io::Result<()> {
+    let enabled: libc::c_int = 1;
+    let result = unsafe {
+        libc::setsockopt(
+            fd.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PASSCRED,
+            std::ptr::from_ref(&enabled).cast(),
+            size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if result < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
 
-        let valid = received as usize == size_of::<FdRequest>()
-            && request.magic == FD_MAGIC
-            && request.version == FD_VERSION
-            && request.operation == FD_EXPORT
-            && request.flags & !FD_EXPORT_WRITE == 0;
-        let exported = if valid {
-            filesystem.export_handle(
-                request.handle,
-                request.flags & FD_EXPORT_WRITE != 0,
-                request.caller_pid,
+/// Establish the direct client's host identity synchronously, then close its
+/// private lane endpoint. A pidfd makes the translation wrap-safe across PID
+/// namespaces and PID reuse; the engine acknowledges only after publishing
+/// the resulting immutable host PID to all request workers.
+pub(crate) fn identify_direct_caller(lane_fd: OwnedFd) -> io::Result<()> {
+    let raw_pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, libc::getpid(), 0) as RawFd };
+    if raw_pidfd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: pidfd_open returned a fresh descriptor.
+    let pidfd = unsafe { OwnedFd::from_raw_fd(raw_pidfd) };
+    let request_id = (u64::from(std::process::id()) << 32)
+        | u64::from(unsafe { libc::syscall(libc::SYS_gettid) as u32 });
+    let request = FdRequest {
+        magic: FD_MAGIC,
+        version: FD_VERSION,
+        operation: FD_IDENTIFY,
+        request_id,
+        ..Default::default()
+    };
+    send_fd_request(lane_fd.as_raw_fd(), &request, &[pidfd.as_raw_fd()])?;
+
+    let mut response = FdResponse::default();
+    let received = loop {
+        let result = unsafe {
+            libc::recv(
+                lane_fd.as_raw_fd(),
+                std::ptr::addr_of_mut!(response).cast(),
+                size_of::<FdResponse>(),
+                0,
             )
-        } else {
-            Err(io::Error::from_raw_os_error(libc::EPROTO))
+        };
+        if result < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        break result;
+    };
+    if received == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "direct filesystem identity lane closed before acknowledgement",
+        ));
+    }
+    if received < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if received as usize != size_of::<FdResponse>()
+        || response.magic != FD_MAGIC
+        || response.version != FD_VERSION
+        || response.operation != FD_IDENTIFY
+        || response.request_id != request_id
+        || response.reserved != 0
+        || response.error > 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "direct filesystem identity response mismatch",
+        ));
+    }
+    if response.error < 0 {
+        let errno = response.error.checked_neg().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid direct filesystem identity errno",
+            )
+        })?;
+        return Err(io::Error::from_raw_os_error(errno));
+    }
+    Ok(())
+}
+
+fn send_fd_request(fd: RawFd, request: &FdRequest, passed_fds: &[RawFd]) -> io::Result<()> {
+    let mut iov = libc::iovec {
+        iov_base: std::ptr::from_ref(request).cast_mut().cast(),
+        iov_len: size_of::<FdRequest>(),
+    };
+    let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+    message.msg_iov = &mut iov;
+    message.msg_iovlen = 1;
+    let mut control = ControlMessageBuffer([0u8; 64]);
+    if !passed_fds.is_empty() {
+        let control_length =
+            unsafe { libc::CMSG_SPACE((passed_fds.len() * size_of::<RawFd>()) as u32) } as usize;
+        if control_length > control.0.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "too many direct filesystem lane descriptors",
+            ));
+        }
+        message.msg_control = control.0.as_mut_ptr().cast();
+        message.msg_controllen = control_length as _;
+        unsafe {
+            let header = libc::CMSG_FIRSTHDR(&message);
+            (*header).cmsg_level = libc::SOL_SOCKET;
+            (*header).cmsg_type = libc::SCM_RIGHTS;
+            (*header).cmsg_len =
+                libc::CMSG_LEN((passed_fds.len() * size_of::<RawFd>()) as u32) as _;
+            std::ptr::copy_nonoverlapping(
+                passed_fds.as_ptr(),
+                libc::CMSG_DATA(header).cast::<RawFd>(),
+                passed_fds.len(),
+            );
+        }
+    }
+    let sent = loop {
+        let result = unsafe { libc::sendmsg(fd, &message, libc::MSG_NOSIGNAL) };
+        if result < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        break result;
+    };
+    if sent == size_of::<FdRequest>() as isize {
+        Ok(())
+    } else if sent < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::WriteZero,
+            "short direct filesystem lane request",
+        ))
+    }
+}
+
+fn receive_fd_request(
+    fd: RawFd,
+) -> io::Result<Option<(FdRequest, Vec<OwnedFd>, Option<libc::ucred>)>> {
+    let mut request = FdRequest::default();
+    let mut iov = libc::iovec {
+        iov_base: std::ptr::addr_of_mut!(request).cast(),
+        iov_len: size_of::<FdRequest>(),
+    };
+    let mut control = ControlMessageBuffer([0u8; 64]);
+    let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+    message.msg_iov = &mut iov;
+    message.msg_iovlen = 1;
+    message.msg_control = control.0.as_mut_ptr().cast();
+    message.msg_controllen = control.0.len() as _;
+    let received = loop {
+        let result = unsafe { libc::recvmsg(fd, &mut message, libc::MSG_CMSG_CLOEXEC) };
+        if result < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        break result;
+    };
+    if received == 0 {
+        return Ok(None);
+    }
+    if received < 0 {
+        let error = io::Error::last_os_error();
+        if matches!(
+            error.raw_os_error(),
+            Some(libc::ECONNRESET) | Some(libc::ENOTCONN)
+        ) {
+            return Ok(None);
+        }
+        return Err(error);
+    }
+
+    let mut passed_fds = Vec::new();
+    let mut credentials = None;
+    let mut malformed_control = false;
+    unsafe {
+        let mut header = libc::CMSG_FIRSTHDR(&message);
+        while !header.is_null() {
+            let data_offset = libc::CMSG_DATA(header) as usize - header as usize;
+            if ((*header).cmsg_len as usize) < data_offset {
+                malformed_control = true;
+            } else {
+                let bytes = (*header).cmsg_len as usize - data_offset;
+                match ((*header).cmsg_level, (*header).cmsg_type) {
+                    (libc::SOL_SOCKET, libc::SCM_RIGHTS)
+                        if bytes != 0 && bytes % size_of::<RawFd>() == 0 =>
+                    {
+                        for index in 0..bytes / size_of::<RawFd>() {
+                            let raw = std::ptr::read_unaligned(
+                                libc::CMSG_DATA(header)
+                                    .add(index * size_of::<RawFd>())
+                                    .cast::<RawFd>(),
+                            );
+                            passed_fds.push(OwnedFd::from_raw_fd(raw));
+                        }
+                    }
+                    (libc::SOL_SOCKET, libc::SCM_CREDENTIALS)
+                        if bytes == size_of::<libc::ucred>() && credentials.is_none() =>
+                    {
+                        credentials = Some(std::ptr::read_unaligned(
+                            libc::CMSG_DATA(header).cast::<libc::ucred>(),
+                        ));
+                    }
+                    _ => malformed_control = true,
+                }
+            }
+            header = libc::CMSG_NXTHDR(&message, header);
+        }
+    }
+    if received as usize != size_of::<FdRequest>()
+        || message.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) != 0
+        || malformed_control
+    {
+        return Err(io::Error::from_raw_os_error(libc::EPROTO));
+    }
+    Ok(Some((request, passed_fds, credentials)))
+}
+
+fn serve_fd_lane(
+    filesystem: crate::sarunfs::SarunFs,
+    fd: OwnedFd,
+    caller: Option<TrustedCaller>,
+) -> io::Result<()> {
+    loop {
+        let Some((request, passed_fds, credentials)) = receive_fd_request(fd.as_raw_fd())? else {
+            return Ok(());
+        };
+        let common_valid = request.magic == FD_MAGIC && request.version == FD_VERSION;
+        let mut exported = None;
+        let result = match request.operation {
+            FD_IDENTIFY
+                if common_valid
+                    && request.flags == 0
+                    && request.handle == 0
+                    && request.caller_pid == 0
+                    && passed_fds.len() == 1
+                    && credentials.is_some() =>
+            {
+                match (caller.as_ref(), credentials) {
+                    (Some(caller), Some(credentials)) => {
+                        let host_pid =
+                            crate::control::host_pid_from_pidfd(passed_fds[0].as_raw_fd());
+                        if host_pid <= 0 || host_pid != credentials.pid {
+                            Err(io::Error::from_raw_os_error(libc::EPERM))
+                        } else {
+                            u32::try_from(host_pid)
+                                .map_err(|_| io::Error::from_raw_os_error(libc::ESRCH))
+                                .and_then(|host_pid| caller.identify(host_pid))
+                        }
+                    }
+                    _ => Err(io::Error::from_raw_os_error(libc::EPROTO)),
+                }
+            }
+            FD_EXPORT
+                if common_valid
+                    && passed_fds.is_empty()
+                    && request.flags & !FD_EXPORT_WRITE == 0 =>
+            {
+                let caller_pid = caller
+                    .as_ref()
+                    .map(TrustedCaller::host_pid)
+                    .unwrap_or(request.caller_pid);
+                if caller_pid == 0 {
+                    Err(io::Error::from_raw_os_error(libc::EAGAIN))
+                } else {
+                    filesystem
+                        .export_handle(
+                            request.handle,
+                            request.flags & FD_EXPORT_WRITE != 0,
+                            caller_pid,
+                        )
+                        .map(|file| exported = Some(file))
+                }
+            }
+            _ => Err(io::Error::from_raw_os_error(libc::EPROTO)),
         };
         let response = FdResponse {
             magic: FD_MAGIC,
             version: FD_VERSION,
-            operation: FD_EXPORT,
+            operation: request.operation,
             request_id: request.request_id,
-            error: exported.as_ref().err()
+            error: result
+                .as_ref()
+                .err()
                 .map(|error| -error.raw_os_error().unwrap_or(libc::EIO).abs())
                 .unwrap_or(0),
             reserved: 0,
         };
-        send_fd_response(fd.as_raw_fd(), &response, exported.as_ref().ok())?;
+        send_fd_response(fd.as_raw_fd(), &response, exported.as_ref())?;
     }
 }
 
@@ -596,8 +996,10 @@ fn send_fd_response(fd: RawFd, response: &FdResponse, exported: Option<&File>) -
             (*header).cmsg_level = libc::SOL_SOCKET;
             (*header).cmsg_type = libc::SCM_RIGHTS;
             (*header).cmsg_len = libc::CMSG_LEN(size_of::<RawFd>() as u32) as _;
-            std::ptr::write_unaligned(libc::CMSG_DATA(header).cast::<RawFd>(),
-                                      exported.as_raw_fd());
+            std::ptr::write_unaligned(
+                libc::CMSG_DATA(header).cast::<RawFd>(),
+                exported.as_raw_fd(),
+            );
         }
     }
     let sent = unsafe { libc::sendmsg(fd, &message, libc::MSG_NOSIGNAL) };
@@ -605,14 +1007,19 @@ fn send_fd_response(fd: RawFd, response: &FdResponse, exported: Option<&File>) -
         Ok(())
     } else if sent < 0 {
         let error = io::Error::last_os_error();
-        if matches!(error.raw_os_error(), Some(libc::EPIPE) | Some(libc::ECONNRESET)) {
+        if matches!(
+            error.raw_os_error(),
+            Some(libc::EPIPE) | Some(libc::ECONNRESET)
+        ) {
             Ok(())
         } else {
             Err(error)
         }
     } else {
-        Err(io::Error::new(io::ErrorKind::WriteZero,
-                           "short SUD fd-lane response"))
+        Err(io::Error::new(
+            io::ErrorKind::WriteZero,
+            "short SUD fd-lane response",
+        ))
     }
 }
 
@@ -644,8 +1051,8 @@ impl RingServer {
             {
                 continue;
             }
-            let length = unsafe { std::ptr::read(std::ptr::addr_of!((*slot).request_len)) }
-                as usize;
+            let length =
+                unsafe { std::ptr::read(std::ptr::addr_of!((*slot).request_len)) } as usize;
             if length > SLOT_DATA {
                 state.store(SLOT_CANCELLED, Ordering::Release);
                 futex_wake(state, 1);
@@ -659,10 +1066,7 @@ impl RingServer {
                     length,
                 );
             }
-            return Ok(Some(PendingRequest {
-                index,
-                bytes,
-            }));
+            return Ok(Some(PendingRequest { index, bytes }));
         }
         Ok(None)
     }
@@ -700,7 +1104,10 @@ impl RingServer {
                 std::ptr::addr_of_mut!((*slot).response).cast::<u8>(),
                 response.len(),
             );
-            std::ptr::write(std::ptr::addr_of_mut!((*slot).response_len), response.len() as u32);
+            std::ptr::write(
+                std::ptr::addr_of_mut!((*slot).response_len),
+                response.len() as u32,
+            );
         }
         if state
             .compare_exchange(
@@ -744,15 +1151,12 @@ impl RingServer {
             }
             let state = unsafe { slot_state(slot) };
             let current = state.load(Ordering::Acquire);
-            if matches!(current, SLOT_WRITING | SLOT_REQUEST | SLOT_RESPONSE | SLOT_CANCELLED)
-                && state
-                    .compare_exchange(
-                        current,
-                        SLOT_FREE,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    )
-                    .is_ok()
+            if matches!(
+                current,
+                SLOT_WRITING | SLOT_REQUEST | SLOT_RESPONSE | SLOT_CANCELLED
+            ) && state
+                .compare_exchange(current, SLOT_FREE, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
             {
                 reaped += 1;
             }
@@ -770,7 +1174,10 @@ impl RingServer {
         for index in 0..SLOT_COUNT {
             let slot = self.mapping.slot(index);
             let state = unsafe { slot_state(slot) }.load(Ordering::Acquire);
-            if !matches!(state, SLOT_WRITING | SLOT_REQUEST | SLOT_RESPONSE | SLOT_CANCELLED) {
+            if !matches!(
+                state,
+                SLOT_WRITING | SLOT_REQUEST | SLOT_RESPONSE | SLOT_CANCELLED
+            ) {
                 continue;
             }
             let owner = unsafe { std::ptr::read(std::ptr::addr_of!((*slot).owner_tgid)) };
@@ -855,7 +1262,10 @@ mod tests {
             })
         };
         let client = RingClient::new(owner);
-        assert_eq!(client.request(b"canonical fuse bytes").unwrap(), b"one decoder reply");
+        assert_eq!(
+            client.request(b"canonical fuse bytes").unwrap(),
+            b"one decoder reply"
+        );
         worker.join().unwrap();
     }
 
@@ -908,7 +1318,10 @@ mod tests {
         mapping.shutdown();
         waiter.join().unwrap();
         let client = RingClient::new(mapping);
-        assert_eq!(client.request(b"late").unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(
+            client.request(b"late").unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
     }
 
     #[test]
@@ -921,7 +1334,52 @@ mod tests {
         }
         let server = RingServer::new(mapping);
         assert_eq!(server.reap_tgid(444), 1);
-        assert_eq!(unsafe { slot_state(slot) }.load(Ordering::Acquire), SLOT_FREE);
+        assert_eq!(
+            unsafe { slot_state(slot) }.load(Ordering::Acquire),
+            SLOT_FREE
+        );
+    }
+
+    #[test]
+    fn trusted_caller_stamps_only_the_fuse_pid() {
+        let caller = TrustedCaller::new(0);
+        let header = InHeader {
+            len: (size_of::<InHeader>() + 4) as u32,
+            opcode: 1,
+            unique: 92,
+            nodeid: ROOT_ID,
+            uid: 123.into(),
+            gid: 456.into(),
+            pid: 7,
+            ..Default::default()
+        };
+        let mut request = unsafe {
+            std::slice::from_raw_parts(
+                (&header as *const InHeader).cast::<u8>(),
+                size_of::<InHeader>(),
+            )
+            .to_vec()
+        };
+        request.extend_from_slice(b"x\0\0\0");
+        assert_eq!(
+            caller.stamp(&mut request).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        caller.identify(456_789).unwrap();
+        caller.stamp(&mut request).unwrap();
+        let stamped = unsafe { std::ptr::read_unaligned(request.as_ptr().cast::<InHeader>()) };
+        assert_eq!(stamped.pid, 456_789);
+        assert_eq!(stamped.uid, 123.into());
+        assert_eq!(stamped.gid, 456.into());
+        assert_eq!(&request[size_of::<InHeader>()..], b"x\0\0\0");
+
+        assert_eq!(
+            caller.identify(876_543).unwrap_err().raw_os_error(),
+            Some(libc::EALREADY)
+        );
+        caller.stamp(&mut request).unwrap();
+        let stamped = unsafe { std::ptr::read_unaligned(request.as_ptr().cast::<InHeader>()) };
+        assert_eq!(stamped.pid, 456_789);
     }
 
     struct NoDirectory;
@@ -955,6 +1413,21 @@ mod tests {
                 attr_timeout: Duration::ZERO,
                 entry_timeout: Duration::ZERO,
             })
+        }
+    }
+
+    struct IdentityLookupFs {
+        seen_pid: Arc<AtomicU32>,
+    }
+
+    impl FileSystem for IdentityLookupFs {
+        type Inode = u64;
+        type Handle = u64;
+        type DirIter = NoDirectory;
+
+        fn lookup(&self, ctx: Context, parent: u64, name: &CStr) -> io::Result<Entry> {
+            self.seen_pid.store(ctx.pid as u32, Ordering::Release);
+            LookupFs.lookup(ctx, parent, name)
         }
     }
 
@@ -1007,24 +1480,86 @@ mod tests {
     }
 
     #[test]
+    fn trusted_session_replaces_client_pid_before_decode() {
+        let client_mapping = Arc::new(RingMapping::create().unwrap());
+        let server_fd = client_mapping.duplicate_fd().unwrap();
+        let seen_pid = Arc::new(AtomicU32::new(0));
+        let caller = TrustedCaller::new(0);
+        let session = SudFsSession::start_for_test_with_caller(
+            IdentityLookupFs {
+                seen_pid: seen_pid.clone(),
+            },
+            server_fd,
+            1,
+            caller.clone(),
+        )
+        .unwrap();
+        let header = InHeader {
+            len: (size_of::<InHeader>() + 6) as u32,
+            opcode: 1,
+            unique: 93,
+            nodeid: ROOT_ID,
+            pid: 11,
+            ..Default::default()
+        };
+        let mut request = unsafe {
+            std::slice::from_raw_parts(
+                (&header as *const InHeader).cast::<u8>(),
+                size_of::<InHeader>(),
+            )
+            .to_vec()
+        };
+        request.extend_from_slice(b"hello\0");
+        let client = RingClient::new(client_mapping);
+        let response = client.request(&request).unwrap();
+        let output = unsafe { std::ptr::read_unaligned(response.as_ptr().cast::<OutHeader>()) };
+        assert_eq!(output.error, -libc::EIO);
+        assert_eq!(seen_pid.load(Ordering::Acquire), 0);
+
+        caller.identify(765_432).unwrap();
+        let response = client.request(&request).unwrap();
+        let output = unsafe { std::ptr::read_unaligned(response.as_ptr().cast::<OutHeader>()) };
+        assert_eq!(output.error, 0);
+        assert_eq!(seen_pid.load(Ordering::Acquire), 765_432);
+
+        assert_eq!(
+            caller.identify(876_543).unwrap_err().raw_os_error(),
+            Some(libc::EALREADY)
+        );
+        let _ = client.request(&request).unwrap();
+        assert_eq!(seen_pid.load(Ordering::Acquire), 765_432);
+        session.stop().unwrap();
+    }
+
+    #[test]
     fn descriptor_lane_validates_and_correlates_requests() {
         let _guard = crate::depot::TEST_STATE_HOME_LOCK.lock().unwrap();
         let root = std::env::temp_dir().join(format!(
-            "sarun-fd-lane-{}-{:?}", std::process::id(),
-            std::thread::current().id()));
+            "sarun-fd-lane-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         std::fs::create_dir_all(&root).unwrap();
-        unsafe { std::env::set_var("XDG_STATE_HOME", &root); }
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", &root);
+        }
         std::fs::create_dir_all(crate::paths::state_home()).unwrap();
         let filesystem = crate::sarunfs::SarunFs::new(root.clone());
         let mut sockets = [-1; 2];
-        assert_eq!(unsafe {
-            libc::socketpair(libc::AF_UNIX,
-                             libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
-                             0, sockets.as_mut_ptr())
-        }, 0);
+        assert_eq!(
+            unsafe {
+                libc::socketpair(
+                    libc::AF_UNIX,
+                    libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+                    0,
+                    sockets.as_mut_ptr(),
+                )
+            },
+            0
+        );
         let server = unsafe { OwnedFd::from_raw_fd(sockets[0]) };
         let client = unsafe { OwnedFd::from_raw_fd(sockets[1]) };
-        let worker = std::thread::spawn(move || serve_fd_lane(filesystem, server));
+        let worker = std::thread::spawn(move || serve_fd_lane(filesystem, server, None));
         let request = FdRequest {
             magic: FD_MAGIC,
             version: FD_VERSION,
@@ -1034,19 +1569,84 @@ mod tests {
             flags: 0,
             caller_pid: std::process::id(),
         };
-        assert_eq!(unsafe {
-            libc::send(client.as_raw_fd(), std::ptr::from_ref(&request).cast(),
-                       size_of::<FdRequest>(), 0)
-        }, size_of::<FdRequest>() as isize);
+        assert_eq!(
+            unsafe {
+                libc::send(
+                    client.as_raw_fd(),
+                    std::ptr::from_ref(&request).cast(),
+                    size_of::<FdRequest>(),
+                    0,
+                )
+            },
+            size_of::<FdRequest>() as isize
+        );
         let mut response = FdResponse::default();
-        assert_eq!(unsafe {
-            libc::recv(client.as_raw_fd(), std::ptr::addr_of_mut!(response).cast(),
-                       size_of::<FdResponse>(), 0)
-        }, size_of::<FdResponse>() as isize);
+        assert_eq!(
+            unsafe {
+                libc::recv(
+                    client.as_raw_fd(),
+                    std::ptr::addr_of_mut!(response).cast(),
+                    size_of::<FdResponse>(),
+                    0,
+                )
+            },
+            size_of::<FdResponse>() as isize
+        );
         assert_eq!(response.request_id, 44);
         assert_eq!(response.error, -libc::EBADF);
         drop(client);
         worker.join().unwrap().unwrap();
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn direct_identity_is_published_before_ack_and_then_lane_closes() {
+        let _guard = crate::depot::TEST_STATE_HOME_LOCK.lock().unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "sarun-direct-identity-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", &root);
+        }
+        std::fs::create_dir_all(crate::paths::state_home()).unwrap();
+        let filesystem = crate::sarunfs::SarunFs::new(root.clone());
+        let mut sockets = [-1; 2];
+        assert_eq!(
+            unsafe {
+                libc::socketpair(
+                    libc::AF_UNIX,
+                    libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+                    0,
+                    sockets.as_mut_ptr(),
+                )
+            },
+            0
+        );
+        let server = unsafe { OwnedFd::from_raw_fd(sockets[0]) };
+        let client = unsafe { OwnedFd::from_raw_fd(sockets[1]) };
+        enable_passcred(&server).unwrap();
+        let caller = TrustedCaller::new(0);
+        let server_caller = caller.clone();
+        let worker =
+            std::thread::spawn(move || serve_fd_lane(filesystem, server, Some(server_caller)));
+
+        identify_direct_caller(client).unwrap();
+        assert_eq!(caller.host_pid(), std::process::id());
+        worker.join().unwrap().unwrap();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn mapped_ring_remains_live_after_backing_descriptor_is_discarded() {
+        let mut mapping = RingMapping::create().unwrap();
+        let raw = mapping.as_raw_fd();
+        mapping.discard_descriptor();
+        assert_eq!(unsafe { libc::fcntl(raw, libc::F_GETFD) }, -1);
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+        mapping.shutdown();
+        assert_eq!(mapping.shutdown_word().load(Ordering::Acquire), 1);
     }
 }

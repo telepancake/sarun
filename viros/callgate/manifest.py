@@ -9,7 +9,12 @@ from pathlib import Path
 import re
 from typing import Any
 
-from .architectures import AARCH64, ArchitectureDescriptor, architecture_by_name
+from .architectures import (
+    AARCH64,
+    ARCHITECTURES,
+    ArchitectureDescriptor,
+    architecture_by_name,
+)
 
 
 FORMAT = "viros-callgate-v1"
@@ -219,7 +224,7 @@ def load_and_validate_manifest(path: str | Path) -> ValidatedManifest:
     try:
         architecture = architecture_by_name(root.get("architecture"))
     except LookupError:
-        supported = ", ".join(sorted(("aarch64", "mmips")))
+        supported = ", ".join(sorted(ARCHITECTURES))
         raise ManifestError(
             f"architecture must name a supported call gate: {supported}"
         )

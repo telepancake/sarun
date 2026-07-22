@@ -78,6 +78,20 @@ pub const FRAME_CONN: u8 = 14;
 // boundary as every other nested runner.
 pub const FRAME_APPLIANCE_FS: u8 = 15;
 
+// Debug registration descriptors.  The engine sends these only after it has
+// resolved and validated the named viros-debug service and kernel bundle.
+// Their bodies are empty; identity and lifetime are carried by SCM_RIGHTS.
+pub const FRAME_DEBUG_KERNEL: u8 = 16;
+pub const FRAME_DEBUG_RSP: u8 = 17;
+// Attach-before-command barrier forwarded across the runner/engine box lane.
+// The engine returns START only after the provider has published the unique
+// session service, so PID 1 can never outrun debugger readiness.
+pub const FRAME_DEBUG_PREPARED: u8 = 18;
+pub const FRAME_DEBUG_START: u8 = 19;
+// Optional opaque initramfs descriptor.  The payload is the generated
+// DebugGuestImageStart record and the sealed initramfs arrives via SCM_RIGHTS.
+pub const FRAME_DEBUG_IMAGE: u8 = 20;
+
 /// Body of a FRAME_PTY_RESIZE frame: [rows:u16 BE][cols:u16 BE].
 #[allow(dead_code)]
 pub fn pty_resize_payload(rows: u16, cols: u16) -> Vec<u8> {
@@ -102,7 +116,11 @@ pub fn pty_resize_parse(payload: &[u8]) -> Option<(u16, u16)> {
 pub fn encode(ftype: u8, payload: &[u8]) -> Vec<u8> {
     assert!(payload.len().saturating_add(1) <= MAX_FRAME_LEN);
     let type_storage = [ftype];
-    let type_payload = if ftype == 0 { &[][..] } else { &type_storage[..] };
+    let type_payload = if ftype == 0 {
+        &[][..]
+    } else {
+        &type_storage[..]
+    };
     let mut out = Vec::new();
     crate::wire::put_many(&mut out, &[type_payload, payload])
         .expect("a bounded in-memory frame always fits the atom format");
@@ -176,7 +194,10 @@ mod tests {
         let first = encode(FRAME_MUTE, &[]);
         let mut joined = first.clone();
         joined.extend_from_slice(&encoded[..3]);
-        assert_eq!(decode(&joined), (vec![(FRAME_MUTE, Vec::new())], first.len()));
+        assert_eq!(
+            decode(&joined),
+            (vec![(FRAME_MUTE, Vec::new())], first.len())
+        );
     }
 
     #[test]
@@ -194,8 +215,7 @@ mod tests {
         assert_eq!(decode(&hostile), (Vec::new(), hostile.len()));
 
         let mut malformed = Vec::new();
-        crate::wire::put_many(&mut malformed, &[b"not-an-integer-width-xxxxxxxx", b""])
-            .unwrap();
+        crate::wire::put_many(&mut malformed, &[b"not-an-integer-width-xxxxxxxx", b""]).unwrap();
         assert_eq!(decode(&malformed), (Vec::new(), malformed.len()));
     }
 }

@@ -46,10 +46,15 @@ pub type Sink = Arc<Mutex<dyn Write + Send>>;
 /// when it sent pty_spawn). `env` is a list of (KEY, VAL) pairs piled on
 /// top of the engine's own environment, so the child sees the UI user's
 /// SHELL / HOME / PATH instead of the daemon's minimal env.
-pub fn serve_pty<C>(argv: &[String], rows: u16, cols: u16,
-                    mut client: C, sink: Option<Sink>,
-                    cwd: Option<&std::path::Path>,
-                    env: &[(String, String)]) -> i32
+pub fn serve_pty<C>(
+    argv: &[String],
+    rows: u16,
+    cols: u16,
+    mut client: C,
+    sink: Option<Sink>,
+    cwd: Option<&std::path::Path>,
+    env: &[(String, String)],
+) -> i32
 where
     C: Read + Write + Send + 'static + CloneStream,
 {
@@ -58,7 +63,10 @@ where
     }
     let pty = native_pty_system();
     let pair = match pty.openpty(PtySize {
-        rows, cols, pixel_width: 0, pixel_height: 0,
+        rows,
+        cols,
+        pixel_width: 0,
+        pixel_height: 0,
     }) {
         Ok(p) => p,
         Err(_) => return 1,
@@ -67,8 +75,12 @@ where
     for a in &argv[1..] {
         cmd.arg(a);
     }
-    if let Some(d) = cwd { cmd.cwd(d); }
-    for (k, v) in env { cmd.env(k, v); }
+    if let Some(d) = cwd {
+        cmd.cwd(d);
+    }
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
     let mut child = match pair.slave.spawn_command(cmd) {
         Ok(c) => c,
         Err(e) => {
@@ -78,8 +90,7 @@ where
             // on an empty pane and can't tell whether it was a missing
             // binary, a permission error, or anything else.
             let msg = format!("pty: spawn {:?} failed: {}\r\n", argv[0], e);
-            let _ = client.write_all(&frames::encode(
-                frames::FRAME_PTY_DATA, msg.as_bytes()));
+            let _ = client.write_all(&frames::encode(frames::FRAME_PTY_DATA, msg.as_bytes()));
             let _ = client.write_all(&frames::encode(frames::FRAME_PTY_EOF, &[]));
             let _ = client.flush();
             return 127;
@@ -147,6 +158,7 @@ where
     // client closes, applying DATA (write to master) and RESIZE (resize PTY).
     let mut acc: Vec<u8> = vec![];
     let mut rbuf = [0u8; 8192];
+    let mut client_closed = false;
     loop {
         if done.load(Ordering::SeqCst) {
             // The child has exited; drain anything already buffered, then stop —
@@ -157,7 +169,10 @@ where
             break;
         }
         let n = match client.read(&mut rbuf) {
-            Ok(0) | Err(_) => break,
+            Ok(0) | Err(_) => {
+                client_closed = true;
+                break;
+            }
             Ok(n) => n,
         };
         acc.extend_from_slice(&rbuf[..n]);
@@ -166,6 +181,13 @@ where
         apply_input(&frames_v, &master_writer, &master);
     }
 
+    // The client connection owns this terminal session.  Closing it while the
+    // child is still alive is cancellation, not a reason to wait forever in
+    // child.wait().  This also gives managed debug sessions deterministic
+    // teardown when their QEMU registration is dropped.
+    if client_closed && !done.load(Ordering::SeqCst) {
+        let _ = child.kill();
+    }
     let code = child.wait().map(|s| s.exit_code() as i32).unwrap_or(0);
     // Drop the master write side; the read side closed when the child closed its
     // slave (that EOF is what ended the output thread). Join it to be tidy.
@@ -176,9 +198,11 @@ where
 }
 
 /// Apply a batch of client→engine input frames to the PTY master.
-fn apply_input(frames_v: &[(u8, Vec<u8>)],
-               master_writer: &Arc<Mutex<Box<dyn Write + Send>>>,
-               master: &Arc<Mutex<Box<dyn portable_pty::MasterPty + Send>>>) {
+fn apply_input(
+    frames_v: &[(u8, Vec<u8>)],
+    master_writer: &Arc<Mutex<Box<dyn Write + Send>>>,
+    master: &Arc<Mutex<Box<dyn portable_pty::MasterPty + Send>>>,
+) {
     for (ft, payload) in frames_v {
         match *ft {
             x if x == frames::FRAME_PTY_DATA => {
@@ -191,7 +215,10 @@ fn apply_input(frames_v: &[(u8, Vec<u8>)],
                 if let Some((rows, cols)) = frames::pty_resize_parse(payload) {
                     if let Ok(m) = master.lock() {
                         let _ = m.resize(PtySize {
-                            rows, cols, pixel_width: 0, pixel_height: 0,
+                            rows,
+                            cols,
+                            pixel_width: 0,
+                            pixel_height: 0,
                         });
                     }
                 }
@@ -229,30 +256,43 @@ mod tests {
     /// visible screen into a single string (rows joined by newlines).
     /// This is conceptually the same as what the UI pane renders.
     fn render(bytes: &[u8], rows: u16, cols: u16) -> String {
-        use tattoy_wezterm_term::{Terminal, TerminalConfiguration, TerminalSize};
         use tattoy_wezterm_term::color::ColorPalette;
-        #[derive(Debug)] struct C;
+        use tattoy_wezterm_term::{Terminal, TerminalConfiguration, TerminalSize};
+        #[derive(Debug)]
+        struct C;
         impl TerminalConfiguration for C {
-            fn color_palette(&self) -> ColorPalette { ColorPalette::default() }
+            fn color_palette(&self) -> ColorPalette {
+                ColorPalette::default()
+            }
         }
         // Discard the emulator's reply traffic — the test only checks
         // what landed on the visible screen.
         let mut term = Terminal::new(
-            TerminalSize { rows: rows as usize, cols: cols as usize,
-                pixel_width: 0, pixel_height: 0, dpi: 0 },
+            TerminalSize {
+                rows: rows as usize,
+                cols: cols as usize,
+                pixel_width: 0,
+                pixel_height: 0,
+                dpi: 0,
+            },
             std::sync::Arc::new(C),
-            "sarun-test", "0",
+            "sarun-test",
+            "0",
             Box::new(std::io::sink()),
         );
         term.advance_bytes(bytes);
         let screen = term.screen();
         let phys = screen.physical_rows;
         let mut total = 0usize;
-        screen.for_each_phys_line(|_, _| { total += 1; });
+        screen.for_each_phys_line(|_, _| {
+            total += 1;
+        });
         let start = total.saturating_sub(phys);
         let mut out = String::new();
         screen.for_each_phys_line(|idx, line| {
-            if idx < start { return; }
+            if idx < start {
+                return;
+            }
             for cell in line.visible_cells() {
                 out.push_str(cell.str());
             }
@@ -291,19 +331,32 @@ mod tests {
         let (engine_end, client_end) = UnixStream::pair().expect("socketpair");
         let h = std::thread::spawn(move || {
             serve_pty(
-                &["sh".into(), "-c".into(),
-                  "echo MARKER-ENGINE-PTY; echo second-row".into()],
-                24, 80, engine_end, None, None, &[])
+                &[
+                    "sh".into(),
+                    "-c".into(),
+                    "echo MARKER-ENGINE-PTY; echo second-row".into(),
+                ],
+                24,
+                80,
+                engine_end,
+                None,
+                None,
+                &[],
+            )
         });
         let stream = drain_to_eof(client_end);
         let _ = h.join();
         let (data, eof) = collect_pty_data(&stream);
         assert!(eof, "engine sent FRAME_PTY_EOF on child exit");
         let screen = render(&data, 24, 80);
-        assert!(screen.contains("MARKER-ENGINE-PTY"),
-                "rendered pane missing child stdout marker; screen=\n{screen}");
-        assert!(screen.contains("second-row"),
-                "rendered pane missing second line; screen=\n{screen}");
+        assert!(
+            screen.contains("MARKER-ENGINE-PTY"),
+            "rendered pane missing child stdout marker; screen=\n{screen}"
+        );
+        assert!(
+            screen.contains("second-row"),
+            "rendered pane missing second line; screen=\n{screen}"
+        );
     }
 
     // CONTROL SEQUENCES: vt100 truly emulates (no raw escape codes on the grid).
@@ -312,16 +365,27 @@ mod tests {
         let (engine_end, client_end) = UnixStream::pair().expect("socketpair");
         let h = std::thread::spawn(move || {
             serve_pty(
-                &["printf".into(),
-                  "\\033[2J\\033[H\\033[1mBOLD-ENGINE\\033[0m end".into()],
-                24, 80, engine_end, None, None, &[])
+                &[
+                    "printf".into(),
+                    "\\033[2J\\033[H\\033[1mBOLD-ENGINE\\033[0m end".into(),
+                ],
+                24,
+                80,
+                engine_end,
+                None,
+                None,
+                &[],
+            )
         });
         let stream = drain_to_eof(client_end);
         let _ = h.join();
         let (data, _) = collect_pty_data(&stream);
         let screen = render(&data, 24, 80);
         assert!(screen.contains("BOLD-ENGINE"), "screen=\n{screen}");
-        assert!(!screen.contains("\u{1b}["), "raw escape leaked: screen=\n{screen}");
+        assert!(
+            !screen.contains("\u{1b}["),
+            "raw escape leaked: screen=\n{screen}"
+        );
     }
 
     // INPUT: a FRAME_PTY_DATA keystroke frame written to the engine reaches the
@@ -331,9 +395,14 @@ mod tests {
         let (engine_end, mut client_end) = UnixStream::pair().expect("socketpair");
         let h = std::thread::spawn(move || {
             serve_pty(
-                &["sh".into(), "-c".into(),
-                  "read line; echo GOT:$line".into()],
-                24, 80, engine_end, None, None, &[])
+                &["sh".into(), "-c".into(), "read line; echo GOT:$line".into()],
+                24,
+                80,
+                engine_end,
+                None,
+                None,
+                &[],
+            )
         });
         // Drive a keystroke as the client would: a FRAME_PTY_DATA frame.
         let key = frames::encode(frames::FRAME_PTY_DATA, b"ping-from-ui\n");
@@ -343,8 +412,32 @@ mod tests {
         let _ = h.join();
         let (data, _) = collect_pty_data(&stream);
         let screen = render(&data, 24, 80);
-        assert!(screen.contains("GOT:ping-from-ui"),
-                "child never received the keystroke; screen=\n{screen}");
+        assert!(
+            screen.contains("GOT:ping-from-ui"),
+            "child never received the keystroke; screen=\n{screen}"
+        );
+    }
+
+    #[test]
+    fn closing_client_terminates_owned_pty_child() {
+        let (engine_end, client_end) = UnixStream::pair().expect("socketpair");
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let code = serve_pty(
+                &["sh".into(), "-c".into(), "sleep 60".into()],
+                24,
+                80,
+                engine_end,
+                None,
+                None,
+                &[],
+            );
+            let _ = finished_tx.send(code);
+        });
+        drop(client_end);
+        finished_rx
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .expect("closed PTY client must terminate its child");
     }
 
     // RESIZE: a FRAME_PTY_RESIZE frame changes the child's tty size — the child
@@ -355,21 +448,34 @@ mod tests {
         let h = std::thread::spawn(move || {
             // Start at 24 rows, then we resize to 40 before stty reads it.
             serve_pty(
-                &["sh".into(), "-c".into(),
-                  // small sleep so the resize frame is applied before stty runs
-                  "sleep 0.3; stty size".into()],
-                24, 80, engine_end, None, None, &[])
+                &[
+                    "sh".into(),
+                    "-c".into(),
+                    // small sleep so the resize frame is applied before stty runs
+                    "sleep 0.3; stty size".into(),
+                ],
+                24,
+                80,
+                engine_end,
+                None,
+                None,
+                &[],
+            )
         });
-        let rz = frames::encode(frames::FRAME_PTY_RESIZE,
-                                &frames::pty_resize_payload(40, 100));
+        let rz = frames::encode(
+            frames::FRAME_PTY_RESIZE,
+            &frames::pty_resize_payload(40, 100),
+        );
         client_end.write_all(&rz).expect("send resize");
         client_end.flush().ok();
         let stream = drain_to_eof(client_end);
         let _ = h.join();
         let (data, _) = collect_pty_data(&stream);
         let text = String::from_utf8_lossy(&data);
-        assert!(text.contains("40 100"),
-                "resize did not reach the child tty; stty output=\n{text}");
+        assert!(
+            text.contains("40 100"),
+            "resize did not reach the child tty; stty output=\n{text}"
+        );
     }
 
     // TERMINAL QUERIES: a child that writes CSI 6 n (DSR — cursor position) or
@@ -390,8 +496,15 @@ mod tests {
     fn engine_pty_surfaces_spawn_error() {
         let (engine_end, client_end) = UnixStream::pair().expect("socketpair");
         let h = std::thread::spawn(move || {
-            serve_pty(&["definitely-not-a-real-binary-xyzzy".into()],
-                      24, 80, engine_end, None, None, &[])
+            serve_pty(
+                &["definitely-not-a-real-binary-xyzzy".into()],
+                24,
+                80,
+                engine_end,
+                None,
+                None,
+                &[],
+            )
         });
         let stream = drain_to_eof(client_end);
         let rc = h.join().unwrap();
@@ -399,10 +512,14 @@ mod tests {
         let (data, eof) = collect_pty_data(&stream);
         assert!(eof, "EOF frame must follow a failed spawn");
         let text = String::from_utf8_lossy(&data);
-        assert!(text.contains("definitely-not-a-real-binary-xyzzy"),
-                "error text should name the bad executable; got {text:?}");
-        assert!(text.contains("pty: spawn"),
-                "error text should be tagged; got {text:?}");
+        assert!(
+            text.contains("definitely-not-a-real-binary-xyzzy"),
+            "error text should name the bad executable; got {text:?}"
+        );
+        assert!(
+            text.contains("pty: spawn"),
+            "error text should be tagged; got {text:?}"
+        );
     }
 
     // TEE: the optional sink records the session bytes (so an engine PTY box can
@@ -419,20 +536,30 @@ mod tests {
                     self.0.lock().unwrap().extend_from_slice(b);
                     Ok(b.len())
                 }
-                fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+                fn flush(&mut self) -> std::io::Result<()> {
+                    Ok(())
+                }
             }
             Arc::new(Mutex::new(W(sink.clone())))
         };
         let h = std::thread::spawn(move || {
             serve_pty(
                 &["sh".into(), "-c".into(), "echo RECORDED-MARKER".into()],
-                24, 80, engine_end, Some(sink_dyn), None, &[])
+                24,
+                80,
+                engine_end,
+                Some(sink_dyn),
+                None,
+                &[],
+            )
         });
         let _ = drain_to_eof(client_end);
         let _ = h.join();
         let recorded = sink.lock().unwrap().clone();
         let text = String::from_utf8_lossy(&recorded);
-        assert!(text.contains("RECORDED-MARKER"),
-                "sink did not record the session; got=\n{text}");
+        assert!(
+            text.contains("RECORDED-MARKER"),
+            "sink did not record the session; got=\n{text}"
+        );
     }
 }

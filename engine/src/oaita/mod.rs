@@ -56,8 +56,12 @@ pub mod turns;
 /// main.rs). Looks at argv[0]'s basename ONLY — no env var gate, because a
 /// symlinked launch outside a sarun box is the supported workflow too.
 pub fn is_oaita_invocation() -> bool {
-    let Some(arg0) = std::env::args_os().next() else { return false; };
+    let Some(arg0) = std::env::args_os().next() else {
+        return false;
+    };
     let p = std::path::Path::new(&arg0);
-    let Some(stem) = p.file_name().and_then(|s| s.to_str()) else { return false; };
+    let Some(stem) = p.file_name().and_then(|s| s.to_str()) else {
+        return false;
+    };
     stem == "oaita"
 }

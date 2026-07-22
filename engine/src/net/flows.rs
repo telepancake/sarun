@@ -19,10 +19,10 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use parking_lot::Mutex;
-use pcap_file::pcapng::PcapNgWriter;
-use pcap_file::pcapng::blocks::interface_description::InterfaceDescriptionBlock;
-use pcap_file::pcapng::blocks::enhanced_packet::EnhancedPacketBlock;
 use pcap_file::DataLink;
+use pcap_file::pcapng::PcapNgWriter;
+use pcap_file::pcapng::blocks::enhanced_packet::EnhancedPacketBlock;
+use pcap_file::pcapng::blocks::interface_description::InterfaceDescriptionBlock;
 
 pub struct FlowsLog {
     pub keylog_path: PathBuf,
@@ -31,13 +31,15 @@ pub struct FlowsLog {
 }
 
 impl FlowsLog {
-    pub fn create(box_dir: &std::path::Path, ts: u64, box_id: u16)
-                  -> Result<Arc<Self>> {
+    pub fn create(box_dir: &std::path::Path, ts: u64, box_id: u16) -> Result<Arc<Self>> {
         std::fs::create_dir_all(box_dir)?;
         let path = box_dir.join(format!("flows-{ts}-box{box_id}.pcapng"));
         let keylog_path = box_dir.join(format!("flows-{ts}-box{box_id}.keys"));
         let f = std::fs::OpenOptions::new()
-            .create(true).truncate(true).write(true).open(&path)?;
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&path)?;
         let mut w = PcapNgWriter::new(f)?;
         let idb = InterfaceDescriptionBlock {
             linktype: DataLink::ETHERNET,
@@ -47,7 +49,8 @@ impl FlowsLog {
         w.write_pcapng_block(idb)?;
         let started_ns = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos()).unwrap_or(0);
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
         Ok(Arc::new(Self {
             keylog_path,
             writer: Mutex::new(w),
@@ -59,7 +62,8 @@ impl FlowsLog {
     pub fn record(&self, frame: &[u8]) -> Result<()> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos()).unwrap_or(self.started_ns);
+            .map(|d| d.as_nanos())
+            .unwrap_or(self.started_ns);
         let blk = EnhancedPacketBlock {
             interface_id: 0,
             timestamp: std::time::Duration::from_nanos(now as u64),
@@ -77,28 +81,32 @@ impl FlowsLog {
 #[derive(Clone, Debug)]
 struct FlowRow {
     pub frame: u64,
-    pub t: f64,            // seconds since capture start
+    pub t: f64, // seconds since capture start
     pub src: String,
     pub dst: String,
-    pub sni: String,       // SNI (TLS) or http.host
-    pub host: String,      // http.host (cleartext) — populated post-MITM-decrypt
+    pub sni: String,  // SNI (TLS) or http.host
+    pub host: String, // http.host (cleartext) — populated post-MITM-decrypt
     pub method: String,
     pub uri: String,
     pub status: String,
     /// tshark's tcp.stream id (per-connection u32). Lets the UI ask for
     /// every packet in this flow's stream via `tshark_packets`.
-    pub stream: i64,       // -1 when tshark couldn't fill it in
+    pub stream: i64, // -1 when tshark couldn't fill it in
 }
 
 impl FlowRow {
     fn into_typed(self) -> Result<crate::generated_wire::FlowRow, String> {
         let short = |value: String| -> Result<
-            crate::wire::BoundedText<{ crate::generated_wire::LIMIT_SHORT_BYTES }>, String> {
+            crate::wire::BoundedText<{ crate::generated_wire::LIMIT_SHORT_BYTES }>,
+            String,
+        > {
             crate::wire::BoundedText::new(value)
                 .map_err(|error| format!("flow short text exceeds relation bound: {error:?}"))
         };
         let text = |value: String| -> Result<
-            crate::wire::BoundedText<{ crate::generated_wire::LIMIT_TEXT_BYTES }>, String> {
+            crate::wire::BoundedText<{ crate::generated_wire::LIMIT_TEXT_BYTES }>,
+            String,
+        > {
             crate::wire::BoundedText::new(value)
                 .map_err(|error| format!("flow text exceeds relation bound: {error:?}"))
         };
@@ -125,15 +133,17 @@ struct PacketRow {
     pub t: f64,
     pub src: String,
     pub dst: String,
-    pub proto: String,   // tshark's _ws.col.protocol (TCP / TLSv1.3 / HTTP / …)
+    pub proto: String, // tshark's _ws.col.protocol (TCP / TLSv1.3 / HTTP / …)
     pub len: u32,
-    pub info: String,    // tshark's _ws.col.info
+    pub info: String, // tshark's _ws.col.info
 }
 
 impl PacketRow {
     fn into_typed(self) -> Result<crate::generated_wire::PacketRow, String> {
         let short = |value: String| -> Result<
-            crate::wire::BoundedText<{ crate::generated_wire::LIMIT_SHORT_BYTES }>, String> {
+            crate::wire::BoundedText<{ crate::generated_wire::LIMIT_SHORT_BYTES }>,
+            String,
+        > {
             crate::wire::BoundedText::new(value)
                 .map_err(|error| format!("packet short text exceeds relation bound: {error:?}"))
         };
@@ -145,8 +155,7 @@ impl PacketRow {
             protocol: short(self.proto)?,
             length: self.len,
             summary: crate::wire::BoundedText::new(self.info)
-                .map_err(|error| format!(
-                    "packet summary exceeds relation bound: {error:?}"))?,
+                .map_err(|error| format!("packet summary exceeds relation bound: {error:?}"))?,
         })
     }
 }
@@ -165,25 +174,47 @@ fn run_tshark_in_box_sandbox(box_state_root: &Path, argv: &[&str]) -> Result<Str
     let inside_dir = "/tmp/ut";
     let inside_pcap = format!("{inside_dir}/{pcap_name}");
     let inside_keys = format!("{inside_dir}/{keys_name}");
-    let resolved: Vec<String> = argv.iter().map(|a| match *a {
-        "{pcap}" => inside_pcap.clone(),
-        "{keys}" => inside_keys.clone(),
-        s if s.contains("tls.keylog_file:{keys}")
-              => s.replace("{keys}", &inside_keys),
-        other => other.to_string(),
-    }).collect();
+    let resolved: Vec<String> = argv
+        .iter()
+        .map(|a| match *a {
+            "{pcap}" => inside_pcap.clone(),
+            "{keys}" => inside_keys.clone(),
+            s if s.contains("tls.keylog_file:{keys}") => s.replace("{keys}", &inside_keys),
+            other => other.to_string(),
+        })
+        .collect();
 
     if which("bwrap") {
         let mut cmd = std::process::Command::new("bwrap");
-        cmd.args(["--unshare-pid", "--unshare-ipc", "--unshare-uts",
-                  "--unshare-net", "--die-with-parent", "--new-session",
-                  "--cap-drop", "ALL",
-                  "--ro-bind", "/", "/",
-                  "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"]);
+        cmd.args([
+            "--unshare-pid",
+            "--unshare-ipc",
+            "--unshare-uts",
+            "--unshare-net",
+            "--die-with-parent",
+            "--new-session",
+            "--cap-drop",
+            "ALL",
+            "--ro-bind",
+            "/",
+            "/",
+            "--proc",
+            "/proc",
+            "--dev",
+            "/dev",
+            "--tmpfs",
+            "/tmp",
+        ]);
         cmd.arg("--ro-bind").arg(&host_dir).arg(inside_dir);
-        cmd.args(["--chdir", inside_dir, "--clearenv",
-                  "--setenv", "PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-                  "--"]);
+        cmd.args([
+            "--chdir",
+            inside_dir,
+            "--clearenv",
+            "--setenv",
+            "PATH",
+            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "--",
+        ]);
         cmd.args(&resolved);
         cmd.stdin(std::process::Stdio::null());
         match cmd.output() {
@@ -192,7 +223,10 @@ fn run_tshark_in_box_sandbox(box_state_root: &Path, argv: &[&str]) -> Result<Str
                     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
                 } else {
                     Err(String::from_utf8_lossy(&out.stderr)
-                        .trim().chars().take(2000).collect())
+                        .trim()
+                        .chars()
+                        .take(2000)
+                        .collect())
                 }
             }
             Err(e) => Err(format!("spawn failed: {e}")),
@@ -201,21 +235,27 @@ fn run_tshark_in_box_sandbox(box_state_root: &Path, argv: &[&str]) -> Result<Str
         // Fallback: no bwrap → run raw on host (still safe-ish since tshark
         // is treated as untrusted by us, but no sandbox is no sandbox; the
         // test environment may legitimately lack bwrap).
-        match std::process::Command::new(&resolved[0]).args(&resolved[1..])
-            .stdin(std::process::Stdio::null()).output() {
-            Ok(out) if out.status.success() =>
-                Ok(String::from_utf8_lossy(&out.stdout).into_owned()),
+        match std::process::Command::new(&resolved[0])
+            .args(&resolved[1..])
+            .stdin(std::process::Stdio::null())
+            .output()
+        {
+            Ok(out) if out.status.success() => {
+                Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+            }
             Ok(out) => Err(String::from_utf8_lossy(&out.stderr)
-                .trim().chars().take(2000).collect()),
+                .trim()
+                .chars()
+                .take(2000)
+                .collect()),
             Err(e) => Err(format!("spawn failed (no bwrap): {e}")),
         }
     }
 }
 
 fn which(cmd: &str) -> bool {
-    std::env::var_os("PATH").is_some_and(|p| {
-        std::env::split_paths(&p).any(|d| d.join(cmd).is_file())
-    })
+    std::env::var_os("PATH")
+        .is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(cmd).is_file()))
 }
 
 /// Newest pcapng/keys pair for a box.
@@ -223,115 +263,180 @@ fn find_flows_files(box_state_root: &Path) -> Option<(PathBuf, PathBuf)> {
     // A missing/unreadable box dir or unreadable entry simply means "no flows
     // here" → None, which the caller turns into a clear "no flows files for
     // this box" error. So returning None on read failure is correct, not silent.
-    let mut entries: Vec<PathBuf> = std::fs::read_dir(box_state_root).ok()?
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(box_state_root)
+        .ok()?
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.extension().is_some_and(|e| e == "pcapng"))
         .collect();
     entries.sort();
     let pcap = entries.pop()?;
     let keys = pcap.with_extension("keys");
-    if !keys.exists() { return None; }
+    if !keys.exists() {
+        return None;
+    }
     Some((pcap, keys))
 }
 
 const FLOW_FIELDS: &[&str] = &[
-    "frame.number", "frame.time_relative", "ip.src", "ip.dst",
+    "frame.number",
+    "frame.time_relative",
+    "ip.src",
+    "ip.dst",
     "tls.handshake.extensions_server_name",
-    "http.host", "http.request.method", "http.request.uri", "http.response.code",
+    "http.host",
+    "http.request.method",
+    "http.request.uri",
+    "http.response.code",
     "tcp.stream",
 ];
 
 const PACKET_FIELDS: &[&str] = &[
-    "frame.number", "frame.time_relative", "ip.src", "ip.dst",
-    "_ws.col.protocol", "frame.len", "_ws.col.info",
+    "frame.number",
+    "frame.time_relative",
+    "ip.src",
+    "ip.dst",
+    "_ws.col.protocol",
+    "frame.len",
+    "_ws.col.info",
 ];
 
 /// Parse tshark `-T fields` tab-separated output into FlowRows.
 fn parse_flow_rows(out: &str) -> Vec<FlowRow> {
-    out.lines().filter_map(|line| {
-        let mut it = line.split('\t');
-        // tshark `-T fields` emits one tab-separated cell per requested field,
-        // EMPTY when a field doesn't apply to that packet (a TCP frame has no
-        // http.host, etc). So `unwrap_or("")`/`unwrap_or(default)` below is the
-        // correct representation of an absent field, not a swallowed parse error.
-        // A row whose frame.number won't parse is header/junk — drop it via `?`.
-        let frame: u64 = it.next()?.parse().ok()?;
-        let t: f64 = it.next()?.parse().unwrap_or(0.0);
-        let src = it.next().unwrap_or("").to_string();
-        let dst = it.next().unwrap_or("").to_string();
-        let sni = it.next().unwrap_or("").to_string();
-        let host = it.next().unwrap_or("").to_string();
-        let method = it.next().unwrap_or("").to_string();
-        let uri = it.next().unwrap_or("").to_string();
-        let status = it.next().unwrap_or("").to_string();
-        let stream: i64 = it.next().unwrap_or("").parse().unwrap_or(-1);
-        // Drop fully-empty rows (junk between blocks).
-        if sni.is_empty() && host.is_empty() && method.is_empty()
-            && status.is_empty() { return None; }
-        Some(FlowRow { frame, t, src, dst, sni, host, method, uri, status,
-                       stream })
-    }).collect()
+    out.lines()
+        .filter_map(|line| {
+            let mut it = line.split('\t');
+            // tshark `-T fields` emits one tab-separated cell per requested field,
+            // EMPTY when a field doesn't apply to that packet (a TCP frame has no
+            // http.host, etc). So `unwrap_or("")`/`unwrap_or(default)` below is the
+            // correct representation of an absent field, not a swallowed parse error.
+            // A row whose frame.number won't parse is header/junk — drop it via `?`.
+            let frame: u64 = it.next()?.parse().ok()?;
+            let t: f64 = it.next()?.parse().unwrap_or(0.0);
+            let src = it.next().unwrap_or("").to_string();
+            let dst = it.next().unwrap_or("").to_string();
+            let sni = it.next().unwrap_or("").to_string();
+            let host = it.next().unwrap_or("").to_string();
+            let method = it.next().unwrap_or("").to_string();
+            let uri = it.next().unwrap_or("").to_string();
+            let status = it.next().unwrap_or("").to_string();
+            let stream: i64 = it.next().unwrap_or("").parse().unwrap_or(-1);
+            // Drop fully-empty rows (junk between blocks).
+            if sni.is_empty() && host.is_empty() && method.is_empty() && status.is_empty() {
+                return None;
+            }
+            Some(FlowRow {
+                frame,
+                t,
+                src,
+                dst,
+                sni,
+                host,
+                method,
+                uri,
+                status,
+                stream,
+            })
+        })
+        .collect()
 }
 
 /// Parse the packet-list tshark output.
 fn parse_packet_rows(out: &str) -> Vec<PacketRow> {
-    out.lines().filter_map(|line| {
-        let mut it = line.split('\t');
-        // Same as parse_flow_rows: empty cells = absent fields (expected); the
-        // frame.number `?`/`ok()?` gate drops non-data lines.
-        let frame: u64 = it.next()?.parse().ok()?;
-        let t: f64 = it.next()?.parse().unwrap_or(0.0);
-        let src = it.next().unwrap_or("").to_string();
-        let dst = it.next().unwrap_or("").to_string();
-        let proto = it.next().unwrap_or("").to_string();
-        let len: u32 = it.next().unwrap_or("").parse().unwrap_or(0);
-        let info = it.next().unwrap_or("").to_string();
-        Some(PacketRow { frame, t, src, dst, proto, len, info })
-    }).collect()
+    out.lines()
+        .filter_map(|line| {
+            let mut it = line.split('\t');
+            // Same as parse_flow_rows: empty cells = absent fields (expected); the
+            // frame.number `?`/`ok()?` gate drops non-data lines.
+            let frame: u64 = it.next()?.parse().ok()?;
+            let t: f64 = it.next()?.parse().unwrap_or(0.0);
+            let src = it.next().unwrap_or("").to_string();
+            let dst = it.next().unwrap_or("").to_string();
+            let proto = it.next().unwrap_or("").to_string();
+            let len: u32 = it.next().unwrap_or("").parse().unwrap_or(0);
+            let info = it.next().unwrap_or("").to_string();
+            Some(PacketRow {
+                frame,
+                t,
+                src,
+                dst,
+                proto,
+                len,
+                info,
+            })
+        })
+        .collect()
 }
 
 /// List interesting flows in the box's pcapng. "Interesting" = HTTP
 /// request/response rows + TLS ClientHello (so the user sees SNIs for
 /// connections that didn't decrypt for whatever reason).
-pub fn tshark_list(
-    box_state_root: &Path,
-) -> Result<Vec<crate::generated_wire::FlowRow>, String> {
+pub fn tshark_list(box_state_root: &Path) -> Result<Vec<crate::generated_wire::FlowRow>, String> {
     let mut argv: Vec<&str> = vec![
-        "tshark", "-r", "{pcap}",
-        "-o", "tls.keylog_file:{keys}",
-        "-Y", "http or tls.handshake.type==1",
-        "-T", "fields",
+        "tshark",
+        "-r",
+        "{pcap}",
+        "-o",
+        "tls.keylog_file:{keys}",
+        "-Y",
+        "http or tls.handshake.type==1",
+        "-T",
+        "fields",
     ];
-    for f in FLOW_FIELDS { argv.push("-e"); argv.push(f); }
+    for f in FLOW_FIELDS {
+        argv.push("-e");
+        argv.push(f);
+    }
     let out = run_tshark_in_box_sandbox(box_state_root, &argv)?;
-    parse_flow_rows(&out).into_iter().map(FlowRow::into_typed).collect()
+    parse_flow_rows(&out)
+        .into_iter()
+        .map(FlowRow::into_typed)
+        .collect()
 }
 
 /// Every frame in `tcp.stream == STREAM` — i.e. the whole TCP connection
 /// the user clicked into. Powers the packet-list drill-down on the flows
 /// pane. Returns rows in time order (tshark already emits them ordered).
-pub fn tshark_packets(box_state_root: &Path, stream: i64)
-                      -> Result<Vec<crate::generated_wire::PacketRow>, String> {
+pub fn tshark_packets(
+    box_state_root: &Path,
+    stream: i64,
+) -> Result<Vec<crate::generated_wire::PacketRow>, String> {
     let filter = format!("tcp.stream == {stream}");
     let mut argv: Vec<&str> = vec![
-        "tshark", "-r", "{pcap}",
-        "-o", "tls.keylog_file:{keys}",
-        "-Y", &filter,
-        "-T", "fields",
+        "tshark",
+        "-r",
+        "{pcap}",
+        "-o",
+        "tls.keylog_file:{keys}",
+        "-Y",
+        &filter,
+        "-T",
+        "fields",
     ];
-    for f in PACKET_FIELDS { argv.push("-e"); argv.push(f); }
+    for f in PACKET_FIELDS {
+        argv.push("-e");
+        argv.push(f);
+    }
     let out = run_tshark_in_box_sandbox(box_state_root, &argv)?;
-    parse_packet_rows(&out).into_iter().map(PacketRow::into_typed).collect()
+    parse_packet_rows(&out)
+        .into_iter()
+        .map(PacketRow::into_typed)
+        .collect()
 }
 
 /// Verbose dissection of one frame: `tshark -V` filtered to that frame.
 /// Lets a user drill into headers / body / certificate details.
 pub fn tshark_detail(box_state_root: &Path, frame: u64) -> Result<String, String> {
     let filter = format!("frame.number == {frame}");
-    let argv = ["tshark", "-r", "{pcap}",
-                "-o", "tls.keylog_file:{keys}",
-                "-Y", &filter,
-                "-V"];
+    let argv = [
+        "tshark",
+        "-r",
+        "{pcap}",
+        "-o",
+        "tls.keylog_file:{keys}",
+        "-Y",
+        &filter,
+        "-V",
+    ];
     run_tshark_in_box_sandbox(box_state_root, &argv)
 }
 
@@ -348,9 +453,7 @@ mod tests {
         assert_eq!((flow.frame, flow.time, flow.stream), (7, 1.5, Some(3)));
         assert_eq!(flow.host.as_str(), "example.test");
 
-        let mut packets = parse_packet_rows(
-            "8\t1.75\t10.0.0.1\t10.0.0.2\tHTTP\t42\tGET /a\n",
-        );
+        let mut packets = parse_packet_rows("8\t1.75\t10.0.0.1\t10.0.0.2\tHTTP\t42\tGET /a\n");
         let packet = packets.remove(0).into_typed().unwrap();
         assert_eq!((packet.frame, packet.time, packet.length), (8, 1.75, 42));
         assert_eq!(packet.protocol.as_str(), "HTTP");

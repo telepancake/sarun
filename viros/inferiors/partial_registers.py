@@ -17,8 +17,17 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 import re
-from typing import Mapping
+from typing import ClassVar, Mapping
 import xml.etree.ElementTree as ET
+
+from .kernel_events import (
+    ARCH_X86,
+    EVENT_KERNEL_DIE,
+    EVENT_REGS_USER,
+    EVENT_REGS_VALID,
+    EVENT_USER_SIGNAL,
+    KernelEvent,
+)
 
 
 class PartialRegisterError(ValueError):
@@ -33,6 +42,65 @@ AARCH64_USER_REGISTERS = tuple(f"x{number}" for number in range(31)) + (
 
 _EXPECTED_BITS = {
     name: 32 if name == "cpsr" else 64 for name in AARCH64_USER_REGISTERS
+}
+
+# Linux 5.6's x86-64 ``struct pt_regs`` field order.  The observer publishes
+# this normalized order for native and IA32 tasks; EVENT_REGS_COMPAT selects
+# whether the values represent the full registers or their user-visible low
+# halves.
+X86_PT_REGS_REGISTERS = (
+    "r15",
+    "r14",
+    "r13",
+    "r12",
+    "rbp",
+    "rbx",
+    "r11",
+    "r10",
+    "r9",
+    "r8",
+    "rax",
+    "rcx",
+    "rdx",
+    "rsi",
+    "rdi",
+    "orig_rax",
+    "rip",
+    "cs",
+    "eflags",
+    "rsp",
+    "ss",
+)
+
+X86_64_USER_REGISTERS = (
+    "rax",
+    "rbx",
+    "rcx",
+    "rdx",
+    "rsi",
+    "rdi",
+    "rbp",
+    "rsp",
+    "r8",
+    "r9",
+    "r10",
+    "r11",
+    "r12",
+    "r13",
+    "r14",
+    "r15",
+    "rip",
+    "eflags",
+    "cs",
+    "ss",
+)
+
+_X86_EXPECTED_BITS = {
+    name: 32 if name in {"eflags", "cs", "ss"} else 64
+    for name in X86_64_USER_REGISTERS
+}
+_X86_PT_REGS_INDEX = {
+    name: index for index, name in enumerate(X86_PT_REGS_REGISTERS)
 }
 _DECIMAL = re.compile(r"[0-9]+")
 _HEX = re.compile(r"0[xX][0-9a-fA-F]+")
@@ -54,6 +122,16 @@ class Aarch64PartialRegisterLayout:
 
     registers: tuple[RegisterDescription, ...]
     byte_order: str
+
+    _EXPECTED_ARCHITECTURES: ClassVar[frozenset[str]] = frozenset(
+        {"aarch64", "aarch64:little"}
+    )
+    _EXPLICIT_LITTLE_ARCHITECTURES: ClassVar[frozenset[str]] = frozenset(
+        {"aarch64:little"}
+    )
+    _ARCHITECTURE_LABEL: ClassVar[str] = "AArch64"
+    _REQUIRED_BITS: ClassVar[Mapping[str, int]] = _EXPECTED_BITS
+    _OPTIONAL_BITS: ClassVar[Mapping[str, int]] = {}
 
     @classmethod
     def from_target_descriptions(
@@ -291,11 +369,15 @@ class Aarch64PartialRegisterLayout:
                 active.pop()
 
         visit("target.xml")
-        if architecture not in {"aarch64", "aarch64:little"}:
+        if architecture not in cls._EXPECTED_ARCHITECTURES:
             raise PartialRegisterError(
-                f"target architecture is {architecture!r}, expected AArch64"
+                f"target architecture is {architecture!r}, "
+                f"expected {cls._ARCHITECTURE_LABEL}"
             )
-        if architecture == "aarch64:little" and byte_order != "little":
+        if (
+            architecture in cls._EXPLICIT_LITTLE_ARCHITECTURES
+            and byte_order != "little"
+        ):
             raise PartialRegisterError(
                 "target architecture explicitly says little-endian"
             )
@@ -321,17 +403,24 @@ class Aarch64PartialRegisterLayout:
         core_registers = ordered[:prefix_end]
 
         by_name = {register.name: register for register in core_registers}
-        missing = [name for name in AARCH64_USER_REGISTERS if name not in by_name]
+        missing = [name for name in cls._REQUIRED_BITS if name not in by_name]
         if missing:
             raise PartialRegisterError(
-                "observed g-packet prefix lacks required AArch64 registers: "
+                "observed g-packet prefix lacks required "
+                f"{cls._ARCHITECTURE_LABEL} registers: "
                 + ", ".join(missing)
             )
-        for name, expected in _EXPECTED_BITS.items():
+        for name, expected in cls._REQUIRED_BITS.items():
             actual = by_name[name].bitsize
             if actual != expected:
                 raise PartialRegisterError(
                     f"target describes {name!r} as {actual} bits, expected {expected}"
+                )
+        for name, expected in cls._OPTIONAL_BITS.items():
+            if name in by_name and by_name[name].bitsize != expected:
+                raise PartialRegisterError(
+                    f"target describes {name!r} as {by_name[name].bitsize} bits, "
+                    f"expected {expected}"
                 )
 
         return cls(core_registers, byte_order)
@@ -377,5 +466,107 @@ class Aarch64PartialRegisterLayout:
                     f"{value!r}"
                 )
             raw = value.to_bytes(register.bitsize // 8, self.byte_order)
+            chunks.append(raw.hex().encode("ascii"))
+        return b"".join(chunks)
+
+
+class X86KernelEventRegisterLayout(Aarch64PartialRegisterLayout):
+    """QEMU x86-64 ``g`` layout populated from a Linux userspace event.
+
+    The target-description parser and observed-prefix handling are shared with
+    the AArch64 facade because those rules belong to GDB's protocol, not to an
+    architecture.  Only the required register names, widths, and event mapping
+    differ here.
+    """
+
+    _EXPECTED_ARCHITECTURES: ClassVar[frozenset[str]] = frozenset(
+        {"i386:x86-64"}
+    )
+    _EXPLICIT_LITTLE_ARCHITECTURES: ClassVar[frozenset[str]] = frozenset(
+        {"i386:x86-64"}
+    )
+    _ARCHITECTURE_LABEL: ClassVar[str] = "x86-64"
+    _REQUIRED_BITS: ClassVar[Mapping[str, int]] = _X86_EXPECTED_BITS
+    _OPTIONAL_BITS: ClassVar[Mapping[str, int]] = {"orig_rax": 64}
+
+    def encode_kernel_event(self, event: KernelEvent) -> bytes:
+        """Return an unframed partial ``g`` reply for one x86 user event.
+
+        Native events supply the integer and control registers present in
+        ``struct pt_regs``.  IA32 events expose the low 32 bits in QEMU's
+        x86-64 register slots; registers r8-r15 and all registers outside the
+        normalized frame are reported with GDB's unavailable marker.
+        """
+
+        if not isinstance(event, KernelEvent):
+            raise TypeError("event must be a KernelEvent")
+        if event.arch != ARCH_X86:
+            raise PartialRegisterError("event is not an x86 event")
+        if event.byte_order != "little" or self.byte_order != "little":
+            raise PartialRegisterError("x86 event and target must be little-endian")
+        if event.pointer_bits != 64:
+            raise PartialRegisterError(
+                "x86 event must use the 64-bit kernel pt_regs layout"
+            )
+        if event.kind not in {EVENT_USER_SIGNAL, EVENT_KERNEL_DIE}:
+            raise PartialRegisterError("x86 event kind is unsupported")
+        if not event.flags & EVENT_REGS_VALID:
+            raise PartialRegisterError("x86 event lacks a valid register frame")
+        if event.kind == EVENT_USER_SIGNAL and not event.flags & EVENT_REGS_USER:
+            raise PartialRegisterError("x86 userspace event lacks a userspace frame")
+        if event.kind == EVENT_KERNEL_DIE and event.flags & EVENT_REGS_USER:
+            raise PartialRegisterError("x86 kernel event is marked as userspace")
+        if len(event.registers) != len(X86_PT_REGS_REGISTERS):
+            raise PartialRegisterError(
+                "x86 event must contain exactly 21 normalized pt_regs values"
+            )
+        if (
+            not event.register_valid_mask
+            or event.register_valid_mask >> len(event.registers)
+        ):
+            raise PartialRegisterError("x86 event has an invalid register mask")
+
+        for value in event.registers:
+            if (
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or value < 0
+                or value >= 1 << 64
+            ):
+                raise PartialRegisterError(
+                    f"x86 event has an invalid 64-bit register value: {value!r}"
+                )
+
+        compat_unavailable = {
+            "r8",
+            "r9",
+            "r10",
+            "r11",
+            "r12",
+            "r13",
+            "r14",
+            "r15",
+        }
+        chunks: list[bytes] = []
+        for register in self.registers:
+            index = _X86_PT_REGS_INDEX.get(register.name)
+            unavailable = (
+                index is None
+                or not event.register_available(index)
+                or (event.compat and register.name in compat_unavailable)
+            )
+            if unavailable:
+                chunks.append(b"x" * (register.bitsize // 4))
+                continue
+
+            value = event.registers[index]
+            if event.compat:
+                value &= 0xFFFFFFFF
+            elif value >= 1 << register.bitsize:
+                raise PartialRegisterError(
+                    f"event value for {register.name!r} exceeds the described "
+                    f"{register.bitsize}-bit register"
+                )
+            raw = value.to_bytes(register.bitsize // 8, "little")
             chunks.append(raw.hex().encode("ascii"))
         return b"".join(chunks)

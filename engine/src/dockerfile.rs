@@ -83,7 +83,10 @@ pub enum Instruction {
     /// A verb Docker knows but we don't act on (only MAINTAINER now — it maps
     /// to the deprecated `author` field). Carried, not dropped, so the builder
     /// warns.
-    Unsupported { verb: String, rest: String },
+    Unsupported {
+        verb: String,
+        rest: String,
+    },
 }
 
 /// Parsed HEALTHCHECK. `none` (from `HEALTHCHECK NONE`) disables an inherited
@@ -128,9 +131,24 @@ impl std::error::Error for ParseError {}
 /// "unknown instruction" error (moby instructions/parse.go: `errors.Errorf(
 /// "unknown instruction: %s", ...)`).
 const KNOWN_VERBS: &[&str] = &[
-    "FROM", "RUN", "CMD", "ENTRYPOINT", "COPY", "ADD", "ENV", "ARG", "WORKDIR",
-    "USER", "LABEL", "EXPOSE", "VOLUME", "SHELL", "MAINTAINER", "HEALTHCHECK",
-    "ONBUILD", "STOPSIGNAL",
+    "FROM",
+    "RUN",
+    "CMD",
+    "ENTRYPOINT",
+    "COPY",
+    "ADD",
+    "ENV",
+    "ARG",
+    "WORKDIR",
+    "USER",
+    "LABEL",
+    "EXPOSE",
+    "VOLUME",
+    "SHELL",
+    "MAINTAINER",
+    "HEALTHCHECK",
+    "ONBUILD",
+    "STOPSIGNAL",
 ];
 
 impl Dockerfile {
@@ -149,7 +167,10 @@ impl Dockerfile {
             let inst = parse_instruction(&verb, rest, line_no)?;
             instructions.push((line_no, inst));
         }
-        Ok(Dockerfile { instructions, escape })
+        Ok(Dockerfile {
+            instructions,
+            escape,
+        })
     }
 }
 
@@ -173,7 +194,9 @@ fn parse_directives(text: &str) -> Result<char, ParseError> {
         }
         let t = line.trim_start();
         // First non-comment line ends the directive zone (done = true).
-        let Some(body) = t.strip_prefix('#') else { break };
+        let Some(body) = t.strip_prefix('#') else {
+            break;
+        };
         let Some((key, val)) = directive_kv(body) else {
             // A comment that isn't `key = value` shape also ends the zone.
             break;
@@ -196,9 +219,7 @@ fn parse_directives(text: &str) -> Result<char, ParseError> {
                 other => {
                     return Err(ParseError {
                         line: line_no,
-                        msg: format!(
-                            "invalid escape token '{other}': must be \\ or `"
-                        ),
+                        msg: format!("invalid escape token '{other}': must be \\ or `"),
                     });
                 }
             };
@@ -304,9 +325,7 @@ fn split_verb(line: &str) -> (String, &str) {
     }
 }
 
-fn parse_instruction(verb: &str, rest: &str, line: usize)
-    -> Result<Instruction, ParseError>
-{
+fn parse_instruction(verb: &str, rest: &str, line: usize) -> Result<Instruction, ParseError> {
     let err = |m: String| ParseError { line, msg: m };
     Ok(match verb {
         "FROM" => parse_from(rest).map_err(err)?,
@@ -347,8 +366,8 @@ fn parse_instruction(verb: &str, rest: &str, line: usize)
             Instruction::Volume(v)
         }
         "SHELL" => {
-            let v = parse_json_array(rest)
-                .ok_or_else(|| err("SHELL requires a JSON array".into()))?;
+            let v =
+                parse_json_array(rest).ok_or_else(|| err("SHELL requires a JSON array".into()))?;
             Instruction::Shell(v)
         }
         "STOPSIGNAL" => {
@@ -361,9 +380,10 @@ fn parse_instruction(verb: &str, rest: &str, line: usize)
         "ONBUILD" => parse_onbuild(rest, line).map_err(err)?,
         "HEALTHCHECK" => Instruction::Healthcheck(parse_healthcheck(rest).map_err(err)?),
         // Known to Docker, irrelevant to a from-source build: carry, don't drop.
-        "MAINTAINER" => {
-            Instruction::Unsupported { verb: verb.to_string(), rest: rest.to_string() }
-        }
+        "MAINTAINER" => Instruction::Unsupported {
+            verb: verb.to_string(),
+            rest: rest.to_string(),
+        },
         other => {
             // moby: `unknown instruction: FOO`.
             return Err(err(format!("unknown instruction: {other}")));
@@ -390,7 +410,11 @@ fn parse_from(rest: &str) -> Result<Instruction, String> {
         Some(ref kw) if kw == "AS" => toks.get(2).map(|s| s.to_string()),
         _ => None,
     };
-    Ok(Instruction::From { image, platform, stage_as })
+    Ok(Instruction::From {
+        image,
+        platform,
+        stage_as,
+    })
 }
 
 /// RUN: strip leading BuildKit `--flag[=val]` tokens (e.g. `--mount`,
@@ -449,9 +473,12 @@ fn parse_copy_add(rest: &str, is_add: bool) -> Result<Instruction, String> {
             chown = Some(v.to_string());
         } else if let Some(v) = flag.strip_prefix("chmod=") {
             chmod = Some(v.to_string());
-        } else if flag == "link" || flag.starts_with("link=")
-            || flag == "parents" || flag.starts_with("exclude=")
-            || flag == "keep-git-dir" || flag.starts_with("checksum=")
+        } else if flag == "link"
+            || flag.starts_with("link=")
+            || flag == "parents"
+            || flag.starts_with("exclude=")
+            || flag == "keep-git-dir"
+            || flag.starts_with("checksum=")
         {
             // Recognized buildkit COPY/ADD flags we don't need to act on for
             // our model — accepted (not an error) and ignored.
@@ -463,7 +490,10 @@ fn parse_copy_add(rest: &str, is_add: bool) -> Result<Instruction, String> {
     let mut operands = if let Some(v) = parse_json_array(operand_str) {
         v
     } else {
-        operand_str.split_whitespace().map(|s| s.to_string()).collect()
+        operand_str
+            .split_whitespace()
+            .map(|s| s.to_string())
+            .collect()
     };
     // moby: COPY/ADD need >= 2 args (>=1 source + dest).
     if operands.len() < 2 {
@@ -472,9 +502,20 @@ fn parse_copy_add(rest: &str, is_add: bool) -> Result<Instruction, String> {
     let dest = operands.pop().unwrap();
     let sources = operands;
     Ok(if is_add {
-        Instruction::Add { sources, dest, chown, chmod }
+        Instruction::Add {
+            sources,
+            dest,
+            chown,
+            chmod,
+        }
     } else {
-        Instruction::Copy { sources, dest, from, chown, chmod }
+        Instruction::Copy {
+            sources,
+            dest,
+            from,
+            chown,
+            chmod,
+        }
     })
 }
 
@@ -507,7 +548,8 @@ fn parse_kv(rest: &str, verb: &str) -> Result<Vec<(String, String)>, String> {
     let toks = tokenize_quoted(rest);
     let mut out = Vec::new();
     for t in toks {
-        let (k, v) = t.split_once('=')
+        let (k, v) = t
+            .split_once('=')
             .ok_or_else(|| format!("{verb} token '{t}' is not KEY=VALUE"))?;
         if k.is_empty() {
             // moby: `ENV requires name=value` on a blank name (`ENV =arg`).
@@ -529,9 +571,15 @@ fn parse_arg(rest: &str) -> Result<Instruction, String> {
             if name.is_empty() {
                 return Err("ARG requires a name".into());
             }
-            Ok(Instruction::Arg { name, default: Some(unquote(d.trim())) })
+            Ok(Instruction::Arg {
+                name,
+                default: Some(unquote(d.trim())),
+            })
         }
-        None => Ok(Instruction::Arg { name: rest.to_string(), default: None }),
+        None => Ok(Instruction::Arg {
+            name: rest.to_string(),
+            default: None,
+        }),
     }
 }
 
@@ -564,32 +612,50 @@ fn parse_healthcheck(rest: &str) -> Result<HealthcheckSpec, String> {
     }
     if trimmed.eq_ignore_ascii_case("none") {
         return Ok(HealthcheckSpec {
-            none: true, test: None, interval: None, timeout: None,
-            start_period: None, start_interval: None, retries: None,
+            none: true,
+            test: None,
+            interval: None,
+            timeout: None,
+            start_period: None,
+            start_interval: None,
+            retries: None,
         });
     }
     let mut spec = HealthcheckSpec {
-        none: false, test: None, interval: None, timeout: None,
-        start_period: None, start_interval: None, retries: None,
+        none: false,
+        test: None,
+        interval: None,
+        timeout: None,
+        start_period: None,
+        start_interval: None,
+        retries: None,
     };
     // Strip leading `--opt=val` flags up to the `CMD` keyword.
     let mut s = trimmed;
     loop {
         let t = s.trim_start();
-        let Some(flagrest) = t.strip_prefix("--") else { s = t; break; };
+        let Some(flagrest) = t.strip_prefix("--") else {
+            s = t;
+            break;
+        };
         let (flag, tail) = match flagrest.find(char::is_whitespace) {
             Some(i) => (&flagrest[..i], &flagrest[i + 1..]),
             None => (flagrest, ""),
         };
-        let (k, v) = flag.split_once('=')
+        let (k, v) = flag
+            .split_once('=')
             .ok_or_else(|| format!("HEALTHCHECK flag --{flag} needs a value"))?;
         match k {
             "interval" => spec.interval = Some(v.to_string()),
             "timeout" => spec.timeout = Some(v.to_string()),
             "start-period" => spec.start_period = Some(v.to_string()),
             "start-interval" => spec.start_interval = Some(v.to_string()),
-            "retries" => spec.retries = Some(v.parse()
-                .map_err(|_| format!("HEALTHCHECK --retries wants an integer, got '{v}'"))?),
+            "retries" => {
+                spec.retries =
+                    Some(v.parse().map_err(|_| {
+                        format!("HEALTHCHECK --retries wants an integer, got '{v}'")
+                    })?)
+            }
             other => return Err(format!("unknown HEALTHCHECK flag --{other}")),
         }
         s = tail;
@@ -636,9 +702,7 @@ fn unquote(s: &str) -> String {
     let s = s.trim();
     if s.len() >= 2 {
         let b = s.as_bytes();
-        if (b[0] == b'"' && b[s.len() - 1] == b'"')
-            || (b[0] == b'\'' && b[s.len() - 1] == b'\'')
-        {
+        if (b[0] == b'"' && b[s.len() - 1] == b'"') || (b[0] == b'\'' && b[s.len() - 1] == b'\'') {
             return s[1..s.len() - 1].to_string();
         }
     }
@@ -726,9 +790,8 @@ pub fn expand(s: &str, vars: &HashMap<String, String>) -> String {
             let mut j = start;
             while j < bytes.len() {
                 let ch = bytes[j];
-                let ok = ch == b'_'
-                    || ch.is_ascii_alphabetic()
-                    || (j > start && ch.is_ascii_digit());
+                let ok =
+                    ch == b'_' || ch.is_ascii_alphabetic() || (j > start && ch.is_ascii_digit());
                 if !ok {
                     break;
                 }
@@ -782,8 +845,12 @@ mod tests {
     use std::collections::HashMap;
 
     fn parse(s: &str) -> Vec<Instruction> {
-        Dockerfile::parse(s).unwrap().instructions
-            .into_iter().map(|(_, i)| i).collect()
+        Dockerfile::parse(s)
+            .unwrap()
+            .instructions
+            .into_iter()
+            .map(|(_, i)| i)
+            .collect()
     }
     fn parse_err(s: &str) -> ParseError {
         Dockerfile::parse(s).unwrap_err()
@@ -791,25 +858,46 @@ mod tests {
 
     #[test]
     fn from_basic_and_as() {
-        assert_eq!(parse("FROM alpine:3.20"), vec![Instruction::From {
-            image: "alpine:3.20".into(), platform: None, stage_as: None }]);
-        assert_eq!(parse("FROM --platform=linux/amd64 golang:1.22 AS build"),
+        assert_eq!(
+            parse("FROM alpine:3.20"),
+            vec![Instruction::From {
+                image: "alpine:3.20".into(),
+                platform: None,
+                stage_as: None
+            }]
+        );
+        assert_eq!(
+            parse("FROM --platform=linux/amd64 golang:1.22 AS build"),
             vec![Instruction::From {
                 image: "golang:1.22".into(),
                 platform: Some("linux/amd64".into()),
-                stage_as: Some("build".into()) }]);
+                stage_as: Some("build".into())
+            }]
+        );
         // `as` is case-insensitive.
-        assert_eq!(parse("FROM x as y"), vec![Instruction::From {
-            image: "x".into(), platform: None, stage_as: Some("y".into()) }]);
+        assert_eq!(
+            parse("FROM x as y"),
+            vec![Instruction::From {
+                image: "x".into(),
+                platform: None,
+                stage_as: Some("y".into())
+            }]
+        );
     }
 
     #[test]
     fn run_shell_and_exec() {
-        assert_eq!(parse("RUN make install"),
-            vec![Instruction::Run(Cmdline::Shell("make install".into()))]);
-        assert_eq!(parse(r#"RUN ["make", "install"]"#),
-            vec![Instruction::Run(Cmdline::Exec(
-                vec!["make".into(), "install".into()]))]);
+        assert_eq!(
+            parse("RUN make install"),
+            vec![Instruction::Run(Cmdline::Shell("make install".into()))]
+        );
+        assert_eq!(
+            parse(r#"RUN ["make", "install"]"#),
+            vec![Instruction::Run(Cmdline::Exec(vec![
+                "make".into(),
+                "install".into()
+            ]))]
+        );
     }
 
     #[test]
@@ -817,10 +905,13 @@ mod tests {
         // moby parses RUN flags before the command; `--mount` precedes it.
         assert_eq!(
             parse("RUN --mount=type=cache,target=/root/.cache make"),
-            vec![Instruction::Run(Cmdline::Shell("make".into()))]);
+            vec![Instruction::Run(Cmdline::Shell("make".into()))]
+        );
         // A `--foo` that's part of the command (not leading) is untouched.
-        assert_eq!(parse("RUN echo --foo"),
-            vec![Instruction::Run(Cmdline::Shell("echo --foo".into()))]);
+        assert_eq!(
+            parse("RUN echo --foo"),
+            vec![Instruction::Run(Cmdline::Shell("echo --foo".into()))]
+        );
     }
 
     #[test]
@@ -828,8 +919,12 @@ mod tests {
         // moby preserves leading ws on continued lines: `a \` + `  b` → `a   b`
         // (the trailing space before `\` + the 2 leading spaces).
         let i = parse("RUN apt-get update \\\n  && apt-get install -y gcc");
-        assert_eq!(i, vec![Instruction::Run(Cmdline::Shell(
-            "apt-get update   && apt-get install -y gcc".into()))]);
+        assert_eq!(
+            i,
+            vec![Instruction::Run(Cmdline::Shell(
+                "apt-get update   && apt-get install -y gcc".into()
+            ))]
+        );
     }
 
     #[test]
@@ -838,7 +933,10 @@ mod tests {
         // (lineContinuationRegex requires `[^\\]` before the final `\`).
         let i = parse("RUN echo foo\\\\\nRUN echo bar");
         assert_eq!(i.len(), 2);
-        assert_eq!(i[0], Instruction::Run(Cmdline::Shell("echo foo\\\\".into())));
+        assert_eq!(
+            i[0],
+            Instruction::Run(Cmdline::Shell("echo foo\\\\".into()))
+        );
     }
 
     #[test]
@@ -847,8 +945,10 @@ mod tests {
         // continuation inserts NOTHING between joined lines (the classic Docker
         // gotcha: `echo a\` + `echo b` → `echo aecho b`, not `echo a echo b`).
         let i = parse("RUN echo a\\\n\\\necho b");
-        assert_eq!(i, vec![Instruction::Run(Cmdline::Shell(
-            "echo aecho b".into()))]);
+        assert_eq!(
+            i,
+            vec![Instruction::Run(Cmdline::Shell("echo aecho b".into()))]
+        );
     }
 
     #[test]
@@ -868,8 +968,10 @@ mod tests {
     fn escape_directive_backtick() {
         // `# escape=\`` selects backtick as the continuation char.
         let src = "# escape=`\nRUN a `\n  b";
-        assert_eq!(parse(src), vec![Instruction::Run(Cmdline::Shell(
-            "a   b".into()))]);
+        assert_eq!(
+            parse(src),
+            vec![Instruction::Run(Cmdline::Shell("a   b".into()))]
+        );
     }
 
     #[test]
@@ -895,24 +997,32 @@ mod tests {
 
     #[test]
     fn shebang_skipped_then_directive() {
-        let df = Dockerfile::parse("#!/usr/bin/env foo\n# escape=`\nFROM x")
-            .unwrap();
+        let df = Dockerfile::parse("#!/usr/bin/env foo\n# escape=`\nFROM x").unwrap();
         assert_eq!(df.escape, '`');
     }
 
     #[test]
     fn env_modern_and_legacy() {
-        assert_eq!(parse("ENV A=1 B=\"two words\" C=3"),
+        assert_eq!(
+            parse("ENV A=1 B=\"two words\" C=3"),
             vec![Instruction::Env(vec![
                 ("A".into(), "1".into()),
                 ("B".into(), "two words".into()),
-                ("C".into(), "3".into())])]);
+                ("C".into(), "3".into())
+            ])]
+        );
         // Legacy `ENV KEY value-with-spaces` → single var, value = rest-of-line.
-        assert_eq!(parse("ENV NAME some value"),
-            vec![Instruction::Env(vec![("NAME".into(), "some value".into())])]);
-        assert_eq!(parse("ENV PATH /usr/local/bin:/usr/bin"),
-            vec![Instruction::Env(vec![
-                ("PATH".into(), "/usr/local/bin:/usr/bin".into())])]);
+        assert_eq!(
+            parse("ENV NAME some value"),
+            vec![Instruction::Env(vec![("NAME".into(), "some value".into())])]
+        );
+        assert_eq!(
+            parse("ENV PATH /usr/local/bin:/usr/bin"),
+            vec![Instruction::Env(vec![(
+                "PATH".into(),
+                "/usr/local/bin:/usr/bin".into()
+            )])]
+        );
     }
 
     #[test]
@@ -925,28 +1035,49 @@ mod tests {
 
     #[test]
     fn arg_with_and_without_default() {
-        assert_eq!(parse("ARG VERSION=1.2.3"), vec![Instruction::Arg {
-            name: "VERSION".into(), default: Some("1.2.3".into()) }]);
-        assert_eq!(parse("ARG TOKEN"),
-            vec![Instruction::Arg { name: "TOKEN".into(), default: None }]);
+        assert_eq!(
+            parse("ARG VERSION=1.2.3"),
+            vec![Instruction::Arg {
+                name: "VERSION".into(),
+                default: Some("1.2.3".into())
+            }]
+        );
+        assert_eq!(
+            parse("ARG TOKEN"),
+            vec![Instruction::Arg {
+                name: "TOKEN".into(),
+                default: None
+            }]
+        );
     }
 
     #[test]
     fn copy_flags_and_operands() {
         let i = parse("COPY --from=build --chown=0:0 /src/a /src/b /dst/");
-        assert_eq!(i, vec![Instruction::Copy {
-            sources: vec!["/src/a".into(), "/src/b".into()],
-            dest: "/dst/".into(),
-            from: Some("build".into()),
-            chown: Some("0:0".into()),
-            chmod: None }]);
+        assert_eq!(
+            i,
+            vec![Instruction::Copy {
+                sources: vec!["/src/a".into(), "/src/b".into()],
+                dest: "/dst/".into(),
+                from: Some("build".into()),
+                chown: Some("0:0".into()),
+                chmod: None
+            }]
+        );
     }
 
     #[test]
     fn copy_json_form() {
-        assert_eq!(parse(r#"COPY ["a b", "dst"]"#), vec![Instruction::Copy {
-            sources: vec!["a b".into()], dest: "dst".into(),
-            from: None, chown: None, chmod: None }]);
+        assert_eq!(
+            parse(r#"COPY ["a b", "dst"]"#),
+            vec![Instruction::Copy {
+                sources: vec!["a b".into()],
+                dest: "dst".into(),
+                from: None,
+                chown: None,
+                chmod: None
+            }]
+        );
     }
 
     #[test]
@@ -959,22 +1090,32 @@ mod tests {
     #[test]
     fn add_with_chmod() {
         let i = parse("ADD --chmod=755 https://x/y.sh /usr/local/bin/y");
-        assert_eq!(i, vec![Instruction::Add {
-            sources: vec!["https://x/y.sh".into()],
-            dest: "/usr/local/bin/y".into(),
-            chown: None, chmod: Some("755".into()) }]);
+        assert_eq!(
+            i,
+            vec![Instruction::Add {
+                sources: vec!["https://x/y.sh".into()],
+                dest: "/usr/local/bin/y".into(),
+                chown: None,
+                chmod: Some("755".into())
+            }]
+        );
     }
 
     #[test]
     fn cmd_entrypoint_workdir_user() {
-        let i = parse("WORKDIR /app\nUSER 1000:1000\n\
-                       ENTRYPOINT [\"/bin/app\"]\nCMD [\"--help\"]");
-        assert_eq!(i, vec![
-            Instruction::Workdir("/app".into()),
-            Instruction::User("1000:1000".into()),
-            Instruction::Entrypoint(Cmdline::Exec(vec!["/bin/app".into()])),
-            Instruction::Cmd(Cmdline::Exec(vec!["--help".into()])),
-        ]);
+        let i = parse(
+            "WORKDIR /app\nUSER 1000:1000\n\
+                       ENTRYPOINT [\"/bin/app\"]\nCMD [\"--help\"]",
+        );
+        assert_eq!(
+            i,
+            vec![
+                Instruction::Workdir("/app".into()),
+                Instruction::User("1000:1000".into()),
+                Instruction::Entrypoint(Cmdline::Exec(vec!["/bin/app".into()])),
+                Instruction::Cmd(Cmdline::Exec(vec!["--help".into()])),
+            ]
+        );
     }
 
     #[test]
@@ -1000,37 +1141,62 @@ mod tests {
 
     #[test]
     fn stopsignal_onbuild_healthcheck_parsed() {
-        assert_eq!(parse("STOPSIGNAL SIGTERM"),
-            vec![Instruction::Stopsignal("SIGTERM".into())]);
-        assert_eq!(parse("ONBUILD RUN make"),
-            vec![Instruction::Onbuild("RUN make".into())]);
+        assert_eq!(
+            parse("STOPSIGNAL SIGTERM"),
+            vec![Instruction::Stopsignal("SIGTERM".into())]
+        );
+        assert_eq!(
+            parse("ONBUILD RUN make"),
+            vec![Instruction::Onbuild("RUN make".into())]
+        );
         // HEALTHCHECK NONE disables an inherited check.
-        assert_eq!(parse("HEALTHCHECK NONE"),
+        assert_eq!(
+            parse("HEALTHCHECK NONE"),
             vec![Instruction::Healthcheck(HealthcheckSpec {
-                none: true, test: None, interval: None, timeout: None,
-                start_period: None, start_interval: None, retries: None })]);
+                none: true,
+                test: None,
+                interval: None,
+                timeout: None,
+                start_period: None,
+                start_interval: None,
+                retries: None
+            })]
+        );
         // Options + shell-form CMD.
         assert_eq!(
             parse("HEALTHCHECK --interval=30s --retries=3 CMD curl -f http://localhost/"),
             vec![Instruction::Healthcheck(HealthcheckSpec {
                 none: false,
                 test: Some(Cmdline::Shell("curl -f http://localhost/".into())),
-                interval: Some("30s".into()), timeout: None,
-                start_period: None, start_interval: None, retries: Some(3) })]);
+                interval: Some("30s".into()),
+                timeout: None,
+                start_period: None,
+                start_interval: None,
+                retries: Some(3)
+            })]
+        );
     }
 
     #[test]
     fn onbuild_and_healthcheck_errors() {
         assert!(parse_err("ONBUILD ONBUILD RUN x").msg.contains("Chaining"));
         assert!(parse_err("ONBUILD FROM x").msg.contains("isn't allowed"));
-        assert!(parse_err("HEALTHCHECK --interval=30s curl x").msg.contains("CMD"));
+        assert!(
+            parse_err("HEALTHCHECK --interval=30s curl x")
+                .msg
+                .contains("CMD")
+        );
     }
 
     #[test]
     fn label_multi() {
-        assert_eq!(parse(r#"LABEL a=1 b="x y""#),
+        assert_eq!(
+            parse(r#"LABEL a=1 b="x y""#),
             vec![Instruction::Label(vec![
-                ("a".into(), "1".into()), ("b".into(), "x y".into())])]);
+                ("a".into(), "1".into()),
+                ("b".into(), "x y".into())
+            ])]
+        );
     }
 
     #[test]

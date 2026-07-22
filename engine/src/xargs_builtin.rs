@@ -106,8 +106,12 @@ impl brush_core::builtins::Command for XargsBuiltin {
         argv.extend(self.args.iter().cloned());
 
         // Capture logical I/O as owned Send values for the worker thread.
-        let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
-        let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
+        let out = context
+            .try_fd(1)
+            .unwrap_or_else(|| std::io::stdout().into());
+        let err = context
+            .try_fd(2)
+            .unwrap_or_else(|| std::io::stderr().into());
         let input = context.stdin();
 
         // Snapshot the shell's LOGICAL exported env for the child commands (the
@@ -153,7 +157,9 @@ impl brush_core::builtins::Command for XargsBuiltin {
             Ok(handle) => handle.join().unwrap_or(1),
             Err(_) => 1,
         };
-        Ok(brush_core::results::ExecutionResult::new(exit_code_to_u8(code)))
+        Ok(brush_core::results::ExecutionResult::new(exit_code_to_u8(
+            code,
+        )))
     }
 }
 

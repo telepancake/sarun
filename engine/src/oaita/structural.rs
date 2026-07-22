@@ -49,7 +49,9 @@ pub fn parse_symbols(path: &str, bytes: &[u8]) -> Option<Vec<Symbol>> {
 
 fn language_for(path: &str) -> Option<tree_sitter::Language> {
     let ext = std::path::Path::new(path)
-        .extension().and_then(|e| e.to_str()).unwrap_or("");
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
     match ext {
         "rs" => Some(tree_sitter_rust::LANGUAGE.into()),
         "py" => Some(tree_sitter_python::LANGUAGE.into()),
@@ -68,7 +70,9 @@ fn recurse_into(kind: &str) -> bool {
 
 fn walk(node: Node, bytes: &[u8], path: &str, depth: usize, out: &mut Vec<Symbol>) {
     let ext = std::path::Path::new(path)
-        .extension().and_then(|e| e.to_str()).unwrap_or("");
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
     if let Some((kind, name)) = classify(ext, node, bytes) {
         out.push(Symbol {
             name,
@@ -100,19 +104,19 @@ fn classify(ext: &str, node: Node, bytes: &[u8]) -> Option<(&'static str, String
     let nk = node.kind();
     let kind: &'static str = match (ext, nk) {
         // Rust ─────────────────────────────────────────────────────────────
-        ("rs", "function_item")        => "fn",
-        ("rs", "struct_item")          => "struct",
-        ("rs", "enum_item")            => "enum",
-        ("rs", "trait_item")           => "trait",
-        ("rs", "mod_item")             => "mod",
-        ("rs", "impl_item")            => "impl",
-        ("rs", "macro_definition")     => "macro",
-        ("rs", "const_item")           => "const",
-        ("rs", "static_item")          => "static",
-        ("rs", "type_item")            => "type",
+        ("rs", "function_item") => "fn",
+        ("rs", "struct_item") => "struct",
+        ("rs", "enum_item") => "enum",
+        ("rs", "trait_item") => "trait",
+        ("rs", "mod_item") => "mod",
+        ("rs", "impl_item") => "impl",
+        ("rs", "macro_definition") => "macro",
+        ("rs", "const_item") => "const",
+        ("rs", "static_item") => "static",
+        ("rs", "type_item") => "type",
         // Python ───────────────────────────────────────────────────────────
         ("py", "function_definition") => "fn",
-        ("py", "class_definition")    => "class",
+        ("py", "class_definition") => "class",
         // Bash ─────────────────────────────────────────────────────────────
         ("sh", "function_definition") => "fn",
         ("bash", "function_definition") => "fn",
@@ -132,23 +136,27 @@ fn symbol_name(ext: &str, nk: &str, node: Node, bytes: &[u8]) -> Option<String> 
         return Some(name_node.utf8_text(bytes).ok()?.to_string());
     }
     if ext == "rs" && nk == "impl_item" {
-        let type_part = node.child_by_field_name("type")
+        let type_part = node
+            .child_by_field_name("type")
             .and_then(|n| n.utf8_text(bytes).ok())
             .map(String::from);
-        let trait_part = node.child_by_field_name("trait")
+        let trait_part = node
+            .child_by_field_name("trait")
             .and_then(|n| n.utf8_text(bytes).ok())
             .map(String::from);
         return match (trait_part, type_part) {
             (Some(t), Some(ty)) => Some(format!("{t} for {ty}")),
-            (None,    Some(ty)) => Some(ty),
+            (None, Some(ty)) => Some(ty),
             _ => None,
         };
     }
     // Generic fallback: scan children for the first identifier-ish leaf.
     let mut cur = node.walk();
     for child in node.children(&mut cur) {
-        if matches!(child.kind(),
-                    "identifier" | "type_identifier" | "field_identifier" | "word") {
+        if matches!(
+            child.kind(),
+            "identifier" | "type_identifier" | "field_identifier" | "word"
+        ) {
             return child.utf8_text(bytes).ok().map(String::from);
         }
     }
@@ -157,8 +165,9 @@ fn symbol_name(ext: &str, nk: &str, node: Node, bytes: &[u8]) -> Option<String> 
 
 /// Find the Nth occurrence of `name` in `symbols` (1-based). Returns None
 /// when there aren't that many matches.
-pub fn find_symbol<'a>(symbols: &'a [Symbol], name: &str, occurrence: usize)
-    -> Option<&'a Symbol>
-{
-    symbols.iter().filter(|s| s.name == name).nth(occurrence.saturating_sub(1))
+pub fn find_symbol<'a>(symbols: &'a [Symbol], name: &str, occurrence: usize) -> Option<&'a Symbol> {
+    symbols
+        .iter()
+        .filter(|s| s.name == name)
+        .nth(occurrence.saturating_sub(1))
 }

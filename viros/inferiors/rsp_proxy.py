@@ -23,6 +23,10 @@ class QemuBackend(Protocol):
     def step(self, cpu: int) -> None: ...
 
 
+class InternalContinueController(Protocol):
+    def begin_continue(self) -> bool: ...
+
+
 class FacadeState(Enum):
     STOPPED = auto()
     RUNNING = auto()
@@ -40,6 +44,9 @@ _QXFER = re.compile(
     rb"^qXfer:([^:]+):read:([^:]*):([0-9a-fA-F]+),([0-9a-fA-F]+)$"
 )
 _BREAKPOINT = re.compile(rb"^([Zz])([01]),([0-9a-fA-F]+),([0-9a-fA-F]+)$")
+_CONTINUE = re.compile(
+    rb"^(?:c|C([0-9a-fA-F]{2})|vCont;(?:c|C([0-9a-fA-F]{2}))(?::([^;]+))?)$"
+)
 
 
 class RspFacade:
@@ -52,6 +59,7 @@ class RspFacade:
         target_xml: bytes,
         packet_size: int = 4096,
         target_descriptions: dict[bytes, bytes] | None = None,
+        internal_continue: InternalContinueController | None = None,
     ) -> None:
         self.oracle = oracle
         self.qemu = qemu
@@ -59,6 +67,7 @@ class RspFacade:
         self.target_descriptions = dict(target_descriptions or {})
         self.target_descriptions.setdefault(b"target.xml", target_xml)
         self.packet_size = packet_size
+        self.internal_continue = internal_continue
         self.state = FacadeState.STOPPED
         self.snapshot = self._snapshot()
         # GDB commonly reads registers immediately after connecting.  Prefer a
@@ -69,6 +78,8 @@ class RspFacade:
         self.general_thread: TaskId | None = first
         self.continue_thread: TaskId | None = first
         self.stop_thread: TaskId | None = first
+        self.stop_signal = 5
+        self._stop_registers: dict[TaskId, RegisterRead] = {}
         self._thread_xml = b""
         self._breakpoints: dict[BreakpointKey, set[int]] = {}
 
@@ -79,6 +90,24 @@ class RspFacade:
 
     def refresh(self) -> Snapshot:
         self.snapshot = self._snapshot()
+        return self.snapshot
+
+    def merge_event_task(self, task: TaskSnapshot) -> Snapshot:
+        """Merge the exact event owner without running the task snapshot call."""
+
+        if not isinstance(task, TaskSnapshot):
+            raise TypeError("event task must be a TaskSnapshot")
+        tasks = tuple(
+            sorted(
+                (
+                    *(item for item in self.snapshot.tasks if item.identity != task.identity),
+                    task,
+                ),
+                key=lambda item: item.identity,
+            )
+        )
+        self.snapshot = Snapshot(self.snapshot.generation, tasks)
+        self._thread_xml = b""
         return self.snapshot
 
     def _task(self, identity: TaskId | None = None) -> TaskSnapshot | None:
@@ -211,11 +240,16 @@ class RspFacade:
         identity: TaskId,
         signal: int = 5,
         address: int | None = None,
+        registers: RegisterRead | None = None,
         *,
         refresh: bool = True,
     ) -> bytes | None:
         """Attribute a downstream all-stop event, swallowing false PID hits."""
 
+        if isinstance(signal, bool) or not isinstance(signal, int) or not 0 < signal <= 0xFF:
+            raise ValueError("stop signal must fit one nonzero RSP signal byte")
+        if registers is not None and not isinstance(registers, RegisterRead):
+            raise TypeError("stop register override must be a RegisterRead")
         if refresh:
             self.refresh()
         if self.snapshot.task(identity) is None:
@@ -226,6 +260,8 @@ class RspFacade:
             return None
         self.stop_thread = identity
         self.general_thread = identity
+        self.stop_signal = signal
+        self._stop_registers = {identity: registers} if registers is not None else {}
         self.state = FacadeState.STOPPED
         return f"T{signal:02x}thread:{identity.rsp()};".encode("ascii")
 
@@ -241,7 +277,7 @@ class RspFacade:
         if payload == b"?":
             if self.stop_thread is None:
                 return b"S05"
-            return f"T05thread:{self.stop_thread.rsp()};".encode("ascii")
+            return f"T{self.stop_signal:02x}thread:{self.stop_thread.rsp()};".encode("ascii")
         xfer = self._handle_xfer(payload)
         if xfer is not None:
             return xfer
@@ -280,6 +316,9 @@ class RspFacade:
             task = self._task()
             if task is None:
                 return b"E01"
+            override = self._stop_registers.get(task.identity)
+            if override is not None:
+                return override.payload
             try:
                 registers = self.oracle.read_registers(task)
                 if isinstance(registers, RegisterRead):
@@ -309,16 +348,28 @@ class RspFacade:
         if payload.startswith((b"M", b"X")):
             return b"E14"
         if payload == b"vCont?":
-            return b"vCont;c;s"
-        if payload.startswith(b"vCont;c") or payload == b"c":
-            if payload.startswith(b"vCont;c:"):
+            return b"vCont;c;C;s"
+        continue_match = _CONTINUE.fullmatch(payload)
+        if continue_match is not None:
+            signal_text = continue_match.group(1) or continue_match.group(2)
+            if signal_text is not None and int(signal_text, 16) != self.stop_signal:
+                return b"E01"
+            thread_text = continue_match.group(3)
+            if thread_text is not None:
                 try:
                     self.continue_thread = self._resolve_thread(
-                        payload.split(b":", 1)[1].decode("ascii"), allow_all=True
+                        thread_text.decode("ascii"), allow_all=True
                     )
                 except (UnicodeDecodeError, ValueError, LookupError):
                     return b"E01"
-            self.qemu.resume()
+            handled = (
+                self.internal_continue.begin_continue()
+                if self.internal_continue is not None
+                else False
+            )
+            if not handled:
+                self.qemu.resume()
+            self._stop_registers.clear()
             self.state = FacadeState.RUNNING
             return None
         if payload.startswith(b"vCont;s") or payload == b"s":
@@ -334,6 +385,7 @@ class RspFacade:
             if task is None or task.current_cpu is None:
                 return b"E01"
             self.qemu.step(task.current_cpu)
+            self._stop_registers.clear()
             self.state = FacadeState.RUNNING
             return None
         if payload.startswith(b"D"):

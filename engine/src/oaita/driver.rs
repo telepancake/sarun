@@ -8,18 +8,17 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::oaita::client::Client;
 use crate::oaita::config::Config;
-use crate::oaita::exec::{box_name, Executor};
+use crate::oaita::exec::{Executor, box_name};
 use crate::oaita::ids::{is_adoptable_slug, new_turn_id};
 use crate::oaita::inspect::{inspect, parse_locator, read_path, write_at_locator};
-use crate::oaita::tools::{tools_array, ExecResult};
+use crate::oaita::tools::{ExecResult, tools_array};
 use crate::oaita::turns::{
-    append_turn, assign_slugs, build_messages, load_stitched, load_turns,
-    next_number, parse_stitch, session_dir, strip_emitted_turn_id,
-    target_segment, turn_filename, Turn,
+    Turn, append_turn, assign_slugs, build_messages, load_stitched, load_turns, next_number,
+    parse_stitch, session_dir, strip_emitted_turn_id, target_segment, turn_filename,
 };
 
 #[derive(Clone, Debug)]
@@ -35,15 +34,16 @@ pub struct Settings {
 }
 
 impl Settings {
-    pub fn resolve(model: Option<String>, base_url: Option<String>,
-                   api_key: Option<String>,
-                   capabilities: Option<String>,
-                   tool_context: Option<String>,
-                   sarun_override: Option<String>,
-                   no_sandbox: bool,
-                   depth: Option<u32>)
-        -> Result<Self, String>
-    {
+    pub fn resolve(
+        model: Option<String>,
+        base_url: Option<String>,
+        api_key: Option<String>,
+        capabilities: Option<String>,
+        tool_context: Option<String>,
+        sarun_override: Option<String>,
+        no_sandbox: bool,
+        depth: Option<u32>,
+    ) -> Result<Self, String> {
         let cfg = Config::load();
         // Inside an --api box the client reaches the model through the
         // engine's broker/proxy, which supplies the routing AND the model —
@@ -52,14 +52,17 @@ impl Settings {
         // broker mode a missing model defaults to a placeholder the engine
         // overrides; base_url is ignored (the broker wins).
         let brokered = std::env::var("SARUN_BROKER")
-            .map(|s| !s.is_empty()).unwrap_or(false);
+            .map(|s| !s.is_empty())
+            .unwrap_or(false);
         let (model_d, base_d, key_d) = match cfg.resolve() {
             Ok(t) => t,
             Err(_) if brokered => (
-                cfg.model.filter(|m| !m.trim().is_empty())
+                cfg.model
+                    .filter(|m| !m.trim().is_empty())
                     .unwrap_or_else(|| "local".into()),
                 cfg.base_url.clone().unwrap_or_default(),
-                cfg.api_key.clone().unwrap_or_default()),
+                cfg.api_key.clone().unwrap_or_default(),
+            ),
             Err(e) => return Err(e),
         };
         Ok(Settings {
@@ -84,23 +87,22 @@ impl Settings {
 pub fn generate(spec: &str, set: &Settings) -> Result<Vec<PathBuf>, String> {
     let segs = parse_stitch(spec)?;
     let target = segs.last().unwrap().clone();
-    fs::create_dir_all(session_dir(&target))
-        .map_err(|e| format!("create session dir: {e}"))?;
+    fs::create_dir_all(session_dir(&target)).map_err(|e| format!("create session dir: {e}"))?;
 
     // Ensure every turn has a slug; turn-ids stay unique across the stitched
     // context.
     let stitched = load_stitched(spec)?;
     // The TARGET session's current turn list (for resume / append logic).
     let mut target_turns = load_turns(&target);
-    let mut existing: HashSet<String> = stitched.iter()
-        .filter_map(|t| t.slug.clone()).collect();
-    target_turns = assign_slugs(target_turns, &mut existing)
-        .map_err(|e| format!("assign slugs: {e}"))?;
+    let mut existing: HashSet<String> = stitched.iter().filter_map(|t| t.slug.clone()).collect();
+    target_turns =
+        assign_slugs(target_turns, &mut existing).map_err(|e| format!("assign slugs: {e}"))?;
 
     // Resume rules: if the LAST target turn is `p`-flagged, regenerate IN
     // PLACE and EXCLUDE it from the prompt. Otherwise append a new
     // `p`-flagged turn.
-    let resume = target_turns.last()
+    let resume = target_turns
+        .last()
         .map(|t| t.kind == "assistant" && t.flags.contains('p'))
         .unwrap_or(false);
 
@@ -119,9 +121,13 @@ pub fn generate(spec: &str, set: &Settings) -> Result<Vec<PathBuf>, String> {
 
     // The prompt: stitched context up to and excluding our target if resuming.
     let prompt_turns: Vec<Turn> = if resume {
-        stitched.into_iter()
-            .filter(|t| t.path != target_path).collect()
-    } else { stitched };
+        stitched
+            .into_iter()
+            .filter(|t| t.path != target_path)
+            .collect()
+    } else {
+        stitched
+    };
 
     let mut messages = build_messages(&prompt_turns);
     // Baseline harness guide: if the session doesn't already have a system
@@ -130,14 +136,18 @@ pub fn generate(spec: &str, set: &Settings) -> Result<Vec<PathBuf>, String> {
     // mimo / and most open models default to "I'll just use shell+python"
     // because that's what training reinforced — they bypass inspect/read
     // even when those would be cheaper and cleaner.
-    let has_system = messages.iter().any(|m|
+    let has_system = messages.iter().any(|m| {
         m.get("role").and_then(Value::as_str) == Some("system")
-        || m.get("role").and_then(Value::as_str) == Some("developer"));
+            || m.get("role").and_then(Value::as_str) == Some("developer")
+    });
     if !has_system {
-        messages.insert(0, serde_json::json!({
-            "role": "system",
-            "content": HARNESS_GUIDE,
-        }));
+        messages.insert(
+            0,
+            serde_json::json!({
+                "role": "system",
+                "content": HARNESS_GUIDE,
+            }),
+        );
     }
     // Announcement: surface unhandled completed sub-tasks (act sub-agents
     // that have settled but whose box hasn't been apply/reject'd). Without
@@ -189,34 +199,41 @@ pub fn generate(spec: &str, set: &Settings) -> Result<Vec<PathBuf>, String> {
     let mut finish_reason: String = String::new();
 
     crate::oaita::client::block_on(async {
-        client.post_stream("/chat/completions", body, |payload| {
-            let Ok(v) = serde_json::from_str::<Value>(payload) else { return; };
-            let Some(choices) = v.get("choices").and_then(Value::as_array)
-                else { return; };
-            for choice in choices {
-                if let Some(d) = choice.get("delta").and_then(Value::as_object) {
-                    if let Some(c) = d.get("content").and_then(Value::as_str) {
-                        if !c.is_empty() {
-                            content.push_str(c);
-                            // Stream-into-target: write the partial whenever
-                            // content grows. Resilient resume needs the file
-                            // to reflect what we have RIGHT NOW. We do NOT
-                            // echo chunks to stdout — the persisted turn file
-                            // IS the canonical record, and a chatty stdout
-                            // pollutes anyone capturing this process's
-                            // output (e.g. `ask` running us as a sub-agent).
-                            let _ = fs::write(&target_path, &content);
+        client
+            .post_stream("/chat/completions", body, |payload| {
+                let Ok(v) = serde_json::from_str::<Value>(payload) else {
+                    return;
+                };
+                let Some(choices) = v.get("choices").and_then(Value::as_array) else {
+                    return;
+                };
+                for choice in choices {
+                    if let Some(d) = choice.get("delta").and_then(Value::as_object) {
+                        if let Some(c) = d.get("content").and_then(Value::as_str) {
+                            if !c.is_empty() {
+                                content.push_str(c);
+                                // Stream-into-target: write the partial whenever
+                                // content grows. Resilient resume needs the file
+                                // to reflect what we have RIGHT NOW. We do NOT
+                                // echo chunks to stdout — the persisted turn file
+                                // IS the canonical record, and a chatty stdout
+                                // pollutes anyone capturing this process's
+                                // output (e.g. `ask` running us as a sub-agent).
+                                let _ = fs::write(&target_path, &content);
+                            }
+                        }
+                        if let Some(tcs) = d.get("tool_calls").and_then(Value::as_array) {
+                            assemble_tool_calls(&mut tool_calls, tcs);
                         }
                     }
-                    if let Some(tcs) = d.get("tool_calls").and_then(Value::as_array) {
-                        assemble_tool_calls(&mut tool_calls, tcs);
+                    if let Some(fr) = choice.get("finish_reason").and_then(Value::as_str) {
+                        if !fr.is_empty() {
+                            finish_reason = fr.to_string();
+                        }
                     }
                 }
-                if let Some(fr) = choice.get("finish_reason").and_then(Value::as_str) {
-                    if !fr.is_empty() { finish_reason = fr.to_string(); }
-                }
-            }
-        }).await
+            })
+            .await
     })?;
 
     // Strip an emitted turn-id header and possibly ADOPT it as our slug.
@@ -251,10 +268,9 @@ pub fn generate(spec: &str, set: &Settings) -> Result<Vec<PathBuf>, String> {
     // — clean otherwise.
     let kept_partial = finish_reason == "length";
     let final_flags = if kept_partial { "p" } else { "" };
-    let number = parse_existing_number(&target_path)
-        .unwrap_or_else(|| next_number(&load_turns(&target)));
-    let final_name = turn_filename(number, "assistant", Some(&new_slug),
-                                   None, final_flags);
+    let number =
+        parse_existing_number(&target_path).unwrap_or_else(|| next_number(&load_turns(&target)));
+    let final_name = turn_filename(number, "assistant", Some(&new_slug), None, final_flags);
     let final_path = target_path.parent().unwrap().join(final_name);
     // Tool-call-ONLY reply (no prose): the streamed content is empty and we
     // already persist each call as its own c-flagged turn below. Drop the
@@ -269,7 +285,9 @@ pub fn generate(spec: &str, set: &Settings) -> Result<Vec<PathBuf>, String> {
         if final_path != target_path {
             let _ = fs::rename(&target_path, &final_path);
         }
-        if !body.is_empty() { produced.push(final_path.clone()); }
+        if !body.is_empty() {
+            produced.push(final_path.clone());
+        }
     }
 
     // Persist tool calls as `c`-flagged assistant turns. ONE turn per call.
@@ -297,8 +315,12 @@ fn parse_existing_number(path: &PathBuf) -> Option<u32> {
 fn adopt_call_id(wire_id: Option<&str>, taken: &mut HashSet<String>) -> String {
     if let Some(id) = wire_id {
         // Sanitize: lowercase, [a-z0-9]+, length-bound.
-        let sane: String = id.chars().filter(|c| c.is_ascii_alphanumeric())
-            .flat_map(|c| c.to_lowercase()).take(16).collect();
+        let sane: String = id
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .flat_map(|c| c.to_lowercase())
+            .take(16)
+            .collect();
         if !sane.is_empty() && !taken.contains(&sane) {
             taken.insert(sane.clone());
             return sane;
@@ -317,7 +339,8 @@ struct AssembledToolCall {
 }
 impl AssembledToolCall {
     fn arguments_json(&self) -> Value {
-        serde_json::from_str(&self.arguments).unwrap_or_else(|_| Value::String(self.arguments.clone()))
+        serde_json::from_str(&self.arguments)
+            .unwrap_or_else(|_| Value::String(self.arguments.clone()))
     }
 }
 
@@ -332,14 +355,26 @@ impl AssembledToolCall {
 /// content that legitimately starts with a JSON object is not eaten.
 fn rescue_content_tool_call(body: &str) -> Option<AssembledToolCall> {
     let trimmed = body.trim();
-    if !trimmed.starts_with('{') { return None; }
+    if !trimmed.starts_with('{') {
+        return None;
+    }
     let v: Value = serde_json::from_str(trimmed).ok()?;
     let obj = v.as_object()?;
     let tool = obj.get("tool").and_then(Value::as_str)?;
     // Only rescue tools we actually dispatch — `tool` could legitimately
     // appear in a free-form answer that happens to be JSON.
-    if !matches!(tool, "ask" | "shell" | "inspect" | "read" | "write" |
-                       "apply" | "reject" | "backtrack" | "delete") {
+    if !matches!(
+        tool,
+        "ask"
+            | "shell"
+            | "inspect"
+            | "read"
+            | "write"
+            | "apply"
+            | "reject"
+            | "backtrack"
+            | "delete"
+    ) {
         return None;
     }
     let args = obj.get("arguments").cloned().unwrap_or(Value::Null);
@@ -353,7 +388,9 @@ fn rescue_content_tool_call(body: &str) -> Option<AssembledToolCall> {
 fn assemble_tool_calls(acc: &mut Vec<AssembledToolCall>, frags: &[Value]) {
     for frag in frags {
         let idx = frag.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
-        while acc.len() <= idx { acc.push(AssembledToolCall::default()); }
+        while acc.len() <= idx {
+            acc.push(AssembledToolCall::default());
+        }
         let row = &mut acc[idx];
         if row.id.is_none() {
             if let Some(s) = frag.get("id").and_then(Value::as_str) {
@@ -499,14 +536,24 @@ RULES
 fn spawned_by(outer: &str) -> Vec<String> {
     let mut out = Vec::new();
     let root = crate::paths::oaita_state_home();
-    let Ok(rd) = std::fs::read_dir(&root) else { return out; };
+    let Ok(rd) = std::fs::read_dir(&root) else {
+        return out;
+    };
     for entry in rd.flatten() {
         let p = entry.path();
-        if !p.is_dir() { continue; }
-        let Some(name) = p.file_name().and_then(|s| s.to_str()) else { continue; };
-        if name == outer { continue; }
+        if !p.is_dir() {
+            continue;
+        }
+        let Some(name) = p.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if name == outer {
+            continue;
+        }
         let inner_turns = crate::oaita::turns::load_turns(name);
-        let Some(first) = inner_turns.first() else { continue; };
+        let Some(first) = inner_turns.first() else {
+            continue;
+        };
         if first.sender.as_deref() == Some(outer) {
             out.push(name.to_string());
         }
@@ -519,10 +566,12 @@ fn spawned_by(outer: &str) -> Vec<String> {
 fn session_settled(session: &str) -> bool {
     let ts = crate::oaita::turns::load_turns(session);
     ts.last()
-        .map(|t| t.kind == "assistant"
-            && !t.flags.contains('p')
-            && !t.flags.contains('c')
-            && !t.flags.contains('b'))
+        .map(|t| {
+            t.kind == "assistant"
+                && !t.flags.contains('p')
+                && !t.flags.contains('c')
+                && !t.flags.contains('b')
+        })
         .unwrap_or(false)
 }
 
@@ -531,16 +580,24 @@ fn session_settled(session: &str) -> bool {
 fn already_resolved(outer: &str, inner: &str) -> bool {
     let turns = crate::oaita::turns::load_turns(outer);
     for t in &turns {
-        if t.kind != "assistant" || !t.flags.contains('c') { continue; }
-        let Ok(content) = t.read() else { continue; };
-        let Ok(v) = serde_json::from_str::<Value>(&content) else { continue; };
+        if t.kind != "assistant" || !t.flags.contains('c') {
+            continue;
+        }
+        let Ok(content) = t.read() else {
+            continue;
+        };
+        let Ok(v) = serde_json::from_str::<Value>(&content) else {
+            continue;
+        };
         let tool = v.get("tool").and_then(Value::as_str).unwrap_or("");
         let args = v.get("arguments").cloned().unwrap_or(Value::Null);
         let target_match = matches!(tool, "apply" | "reject")
             && args.get("target").and_then(Value::as_str) == Some(inner);
-        let session_match = tool == "delete"
-            && args.get("session").and_then(Value::as_str) == Some(inner);
-        if target_match || session_match { return true; }
+        let session_match =
+            tool == "delete" && args.get("session").and_then(Value::as_str) == Some(inner);
+        if target_match || session_match {
+            return true;
+        }
     }
     false
 }
@@ -568,10 +625,14 @@ fn tool_result_looks_failed(content: &str) -> bool {
         "core dumped",
         "exited with status",
     ];
-    if markers.iter().any(|m| lc.contains(m)) { return true; }
+    if markers.iter().any(|m| lc.contains(m)) {
+        return true;
+    }
     // sh `set -e` aborts emit lines like "line 12: foo: ...". A bare
     // "error" or "failed" token is too noisy; require a prefix.
-    if lc.contains(": error:") || lc.contains(": failed:") { return true; }
+    if lc.contains(": error:") || lc.contains(": failed:") {
+        return true;
+    }
     false
 }
 
@@ -591,20 +652,29 @@ fn backtrack_behavioural_announcement(target: &str) -> Option<String> {
     // We need a few rounds of activity before either pattern fires —
     // otherwise the announcement looks gratuitous in short tasks.
     let n_tool = turns.iter().filter(|t| t.kind == "tool").count();
-    if n_tool < 3 { return None; }
+    if n_tool < 3 {
+        return None;
+    }
     // Find the first user turn — that's where backtrack(turn_id=..., final=true,
     // inclusive=false) should rewind TO so the original question stays.
-    let first_user_id: Option<String> = turns.iter()
+    let first_user_id: Option<String> = turns
+        .iter()
         .find(|t| t.kind == "user")
         .and_then(|t| t.slug.clone());
 
     // Walk the LAST 5 tool turns. Tally clean vs errory.
-    let recent_tools: Vec<&crate::oaita::turns::Turn> =
-        turns.iter().filter(|t| t.kind == "tool").rev().take(5).collect();
+    let recent_tools: Vec<&crate::oaita::turns::Turn> = turns
+        .iter()
+        .filter(|t| t.kind == "tool")
+        .rev()
+        .take(5)
+        .collect();
     let mut errs = 0;
     for t in &recent_tools {
         let content = t.read().unwrap_or_default();
-        if tool_result_looks_failed(&content) { errs += 1; }
+        if tool_result_looks_failed(&content) {
+            errs += 1;
+        }
     }
     // The productive-cluster case is now handled by the hint mechanism
     // (see hints::productive_cluster_append). evaluate_call appends the
@@ -621,30 +691,41 @@ fn backtrack_behavioural_announcement(target: &str) -> Option<String> {
         let tid = first_user_id.as_deref().unwrap_or("<first-user-turn-id>");
         let used = used_tools_so_far(&turns);
         let candidates = ["ask", "inspect", "read", "shell", "write"];
-        let unused: Vec<&str> = candidates.iter().copied()
-            .filter(|n| !used.contains(*n)).collect();
+        let unused: Vec<&str> = candidates
+            .iter()
+            .copied()
+            .filter(|n| !used.contains(*n))
+            .collect();
         let mut parts: Vec<String> = Vec::new();
         for t in &unused {
             let blurb = match *t {
-                "ask" => "ask(request=…) — send the task to a sub-agent \
-                          that works in its own conversation",
-                "inspect" => "inspect(path=…) — paged structural view of a \
-                              file or directory",
+                "ask" => {
+                    "ask(request=…) — send the task to a sub-agent \
+                          that works in its own conversation"
+                }
+                "inspect" => {
+                    "inspect(path=…) — paged structural view of a \
+                              file or directory"
+                }
                 "read" => "read(path=…) — byte-faithful slice of a file",
                 "shell" => "shell(script=…) — run a script in this box",
-                "write" => "write(path=…, content=…) — overlay write to a \
-                            file or named range",
+                "write" => {
+                    "write(path=…, content=…) — overlay write to a \
+                            file or named range"
+                }
                 _ => continue,
             };
             parts.push(blurb.to_string());
         }
         parts.push(format!(
             "backtrack(turn_id={tid:?}, final=false, summary=…) — rewind \
-             to a clean state, keeping `summary` as a waypoint note"));
+             to a clean state, keeping `summary` as a waypoint note"
+        ));
         parts.push(format!(
             "backtrack(turn_id={tid:?}, final=true, summary=<answer>) \
              — ship; the harness collapses the session to \
-             {{question, summary}}"));
+             {{question, summary}}"
+        ));
         return Some(format!(
             "{errs} of the last {total} tool calls returned error markers. \
              Available levers not yet used in this run, listed for \
@@ -664,18 +745,28 @@ const ANNOUNCEMENT_STAMP: &str = ".last_announcement";
 const MIN_GAP_TURN_NUMS: u32 = 50;
 
 fn announcement_rate_limit_ok(target: &str) -> bool {
-    let cur = crate::oaita::turns::load_turns(target).iter()
-        .map(|t| t.number).max().unwrap_or(0);
+    let cur = crate::oaita::turns::load_turns(target)
+        .iter()
+        .map(|t| t.number)
+        .max()
+        .unwrap_or(0);
     let stamp = crate::oaita::turns::session_dir(target).join(ANNOUNCEMENT_STAMP);
-    let last: u32 = std::fs::read_to_string(&stamp).ok()
-        .and_then(|s| s.trim().parse().ok()).unwrap_or(0);
-    if last == 0 { return true; }
+    let last: u32 = std::fs::read_to_string(&stamp)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0);
+    if last == 0 {
+        return true;
+    }
     cur.saturating_sub(last) >= MIN_GAP_TURN_NUMS
 }
 
 fn record_announcement(target: &str) {
-    let cur = crate::oaita::turns::load_turns(target).iter()
-        .map(|t| t.number).max().unwrap_or(0);
+    let cur = crate::oaita::turns::load_turns(target)
+        .iter()
+        .map(|t| t.number)
+        .max()
+        .unwrap_or(0);
     let stamp = crate::oaita::turns::session_dir(target).join(ANNOUNCEMENT_STAMP);
     let _ = std::fs::write(stamp, cur.to_string());
 }
@@ -685,9 +776,15 @@ fn record_announcement(target: &str) {
 fn used_tools_so_far(turns: &[crate::oaita::turns::Turn]) -> std::collections::HashSet<String> {
     let mut out = std::collections::HashSet::new();
     for t in turns {
-        if t.kind != "assistant" || !t.flags.contains('c') { continue; }
-        let Ok(body) = t.read() else { continue; };
-        let Ok(v) = serde_json::from_str::<Value>(&body) else { continue; };
+        if t.kind != "assistant" || !t.flags.contains('c') {
+            continue;
+        }
+        let Ok(body) = t.read() else {
+            continue;
+        };
+        let Ok(v) = serde_json::from_str::<Value>(&body) else {
+            continue;
+        };
         if let Some(name) = v.get("tool").and_then(Value::as_str) {
             out.insert(name.to_string());
         }
@@ -702,11 +799,17 @@ fn used_tools_so_far(turns: &[crate::oaita::turns::Turn]) -> std::collections::H
 fn unhandled_subtasks_announcement(outer: &str) -> Option<String> {
     let mut unhandled: Vec<String> = Vec::new();
     for inner in spawned_by(outer) {
-        if !session_settled(&inner) { continue; }
-        if already_resolved(outer, &inner) { continue; }
+        if !session_settled(&inner) {
+            continue;
+        }
+        if already_resolved(outer, &inner) {
+            continue;
+        }
         unhandled.push(inner);
     }
-    if unhandled.is_empty() { return None; }
+    if unhandled.is_empty() {
+        return None;
+    }
     Some(format!(
         "HARNESS ANNOUNCEMENT: {n} sub-agent task(s) you launched have \
          completed and are awaiting your resolution. Each holds staged \
@@ -765,12 +868,15 @@ fn cleanup_spawned_subagents(outer: &str) {
 /// answers k-th call in the trailing call/result block). The result is
 /// posted back as a `.tool` turn carrying from=<inner-session> when the
 /// caller is delegated; otherwise just a plain result turn.
-pub fn evaluate_call(spec: &str, set: &Settings,
-                     executor: Option<&dyn Executor>) -> Result<Vec<PathBuf>, String> {
+pub fn evaluate_call(
+    spec: &str,
+    set: &Settings,
+    executor: Option<&dyn Executor>,
+) -> Result<Vec<PathBuf>, String> {
     let target = target_segment(spec)?;
     let turns = load_turns(&target);
-    let pending = first_pending_call(&turns)
-        .ok_or_else(|| "no unanswered tool calls".to_string())?;
+    let pending =
+        first_pending_call(&turns).ok_or_else(|| "no unanswered tool calls".to_string())?;
 
     let (tool, arguments) = parse_call_envelope(&pending.read().map_err(|e| e.to_string())?)?;
 
@@ -803,12 +909,12 @@ pub fn evaluate_call(spec: &str, set: &Settings,
             // preamble (`[sub-agent session id: ID — …]`) emitted by
             // format_act_result. If the exhausted session != that inner id,
             // an ancestor cap fired, not the sub-agent's own cap.
-            let own_cap = result_text.contains(&format!(
-                "[sub-agent session id: {exhausted} —"));
+            let own_cap = result_text.contains(&format!("[sub-agent session id: {exhausted} —"));
             if !own_cap {
                 return Err(format!(
                     "budget exhausted at session \"{exhausted}\" \
-                     (propagated through ask)"));
+                     (propagated through ask)"
+                ));
             }
         }
     }
@@ -817,19 +923,25 @@ pub fn evaluate_call(spec: &str, set: &Settings,
     // this result is clean AND the four prior tool results were clean too;
     // its marker stays in context so subsequent results don't repeat it.
     // Backtrack purges the carrying turn naturally on rewind.
-    let first_user_id = turns.iter().find(|t| t.kind == "user")
+    let first_user_id = turns
+        .iter()
+        .find(|t| t.kind == "user")
         .and_then(|t| t.slug.clone());
     let current_clean = !tool_result_looks_failed(&result_text);
     let extra = crate::oaita::hints::productive_cluster_append(
-        &turns, current_clean, first_user_id.as_deref());
-    if !extra.is_empty() { result_text.push_str(&extra); }
+        &turns,
+        current_clean,
+        first_user_id.as_deref(),
+    );
+    if !extra.is_empty() {
+        result_text.push_str(&extra);
+    }
 
     // Write the result turn. Sender = self by default; for an inner sub-agent
     // case the executor is the box, and `act` builds its own machinery — for
     // a directly-dispatched call we simply post under the session's own name.
     let n = next_number(&load_turns(&target));
-    let mut existing: HashSet<String> = turns.iter()
-        .filter_map(|t| t.slug.clone()).collect();
+    let mut existing: HashSet<String> = turns.iter().filter_map(|t| t.slug.clone()).collect();
     let slug = new_turn_id(&existing);
     existing.insert(slug.clone());
     let name = turn_filename(n, "tool", Some(&slug), None, "");
@@ -844,7 +956,10 @@ fn first_pending_call(turns: &[Turn]) -> Option<&Turn> {
     let mut calls: Vec<&Turn> = Vec::new();
     let mut results = 0usize;
     for t in turns.iter().rev() {
-        if t.kind == "tool" { results += 1; continue; }
+        if t.kind == "tool" {
+            results += 1;
+            continue;
+        }
         if t.kind == "assistant" && t.flags.contains('c') {
             calls.push(t);
             continue;
@@ -856,16 +971,24 @@ fn first_pending_call(turns: &[Turn]) -> Option<&Turn> {
 }
 
 fn parse_call_envelope(content: &str) -> Result<(String, Value), String> {
-    let v: Value = serde_json::from_str(content)
-        .map_err(|e| format!("bad call envelope: {e}"))?;
-    let tool = v.get("tool").and_then(Value::as_str)
-        .ok_or_else(|| "call envelope missing `tool`".to_string())?.to_string();
+    let v: Value = serde_json::from_str(content).map_err(|e| format!("bad call envelope: {e}"))?;
+    let tool = v
+        .get("tool")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "call envelope missing `tool`".to_string())?
+        .to_string();
     let args = v.get("arguments").cloned().unwrap_or(Value::Null);
     Ok((tool, args))
 }
 
-fn dispatch(tool: &str, arguments: &Value, target: &str, set: &Settings,
-            executor: Option<&dyn Executor>, turns: &[Turn]) -> String {
+fn dispatch(
+    tool: &str,
+    arguments: &Value,
+    target: &str,
+    set: &Settings,
+    executor: Option<&dyn Executor>,
+    turns: &[Turn],
+) -> String {
     match tool {
         "ask" => dispatch_act(arguments, target, set, executor),
         "shell" => dispatch_shell(arguments, target, executor, turns),
@@ -875,8 +998,10 @@ fn dispatch(tool: &str, arguments: &Value, target: &str, set: &Settings,
         "apply" | "reject" => dispatch_box_resolve(tool, arguments, target),
         "backtrack" => dispatch_backtrack(arguments, target),
         "delete" => dispatch_delete(arguments),
-        other => format!("error: unknown tool {other:?}{}",
-                         crate::oaita::hints::append(turns, &["unknown-tool"])),
+        other => format!(
+            "error: unknown tool {other:?}{}",
+            crate::oaita::hints::append(turns, &["unknown-tool"])
+        ),
     }
 }
 
@@ -887,8 +1012,12 @@ fn args_bool(v: &Value, k: &str) -> bool {
     v.get(k).and_then(Value::as_bool).unwrap_or(false)
 }
 
-fn dispatch_act(args: &Value, outer: &str, set: &Settings,
-                executor: Option<&dyn Executor>) -> String {
+fn dispatch_act(
+    args: &Value,
+    outer: &str,
+    set: &Settings,
+    executor: Option<&dyn Executor>,
+) -> String {
     if set.depth >= crate::oaita::tools::max_depth() {
         return "ask: too deep — do the task yourself".to_string();
     }
@@ -901,7 +1030,9 @@ fn dispatch_act(args: &Value, outer: &str, set: &Settings,
     // (only the parent's chain caps apply, matching `take_chain`'s
     // absent-entry-is-pass-through rule). When set, it's a GRANT —
     // additive on follow_up, initial on a fresh sub-agent.
-    let max_steps = args.get("max_steps").and_then(Value::as_i64)
+    let max_steps = args
+        .get("max_steps")
+        .and_then(Value::as_i64)
         .filter(|n| *n > 0);
     // Inner session: if follow_up names a previous act call, reuse its
     // sub-agent id; otherwise mint a new one (folder name is the slug too).
@@ -915,9 +1046,20 @@ fn dispatch_act(args: &Value, outer: &str, set: &Settings,
     };
     let _ = fs::create_dir_all(session_dir(&inner));
     // Seed: a user turn from the outer session.
-    let seed_content = if data.is_empty() { request.clone() }
-                       else { format!("{request}\n\n{data}") };
-    let _ = append_turn(&inner, "user", &seed_content, None, Some(outer.to_string()), "", None);
+    let seed_content = if data.is_empty() {
+        request.clone()
+    } else {
+        format!("{request}\n\n{data}")
+    };
+    let _ = append_turn(
+        &inner,
+        "user",
+        &seed_content,
+        None,
+        Some(outer.to_string()),
+        "",
+        None,
+    );
     // Run the inner session in its own box, parented under the agent's
     // OWN persistent shell box (`OAITA-<outer>.OAITA-<inner>` — dotted
     // form, parsed by control.rs register's `rsplit_once('.')`).
@@ -945,11 +1087,13 @@ fn dispatch_act(args: &Value, outer: &str, set: &Settings,
     // Make sure the parent box exists FIRST: dotted-name register errors
     // if the prefix segment can't be resolved (see control.rs:644). One
     // no-op materialization is cheap and idempotent.
-    let _ = exe.run(&outer_box, "true", /*discard=*/false, /*api_access=*/false);
+    let _ = exe.run(
+        &outer_box, "true", /*discard=*/ false, /*api_access=*/ false,
+    );
     // act sub-agents are `oaita run` PROCESSES IN A BOX — they re-exec the
     // engine binary via /proc/self/exe and need proxy access for the LLM
     // call. Pass --api so the engine admits the box on the proxy gate.
-    let r = exe.run(&dotted, &script, false, /*api_access=*/true);
+    let r = exe.run(&dotted, &script, false, /*api_access=*/ true);
     format_act_result(&r, &inner) + &format_sub_agent_status(outer)
 }
 
@@ -982,7 +1126,9 @@ fn act_script(inner: &str, child_depth: u32, max_steps: i64) -> String {
 /// that case — avoids noise on the very first turn).
 fn format_sub_agent_status(outer: &str) -> String {
     let kids = spawned_by(outer);
-    if kids.is_empty() { return String::new(); }
+    if kids.is_empty() {
+        return String::new();
+    }
     let mut rows: Vec<String> = vec!["=== sub-agents ===".to_string()];
     for inner in &kids {
         let resolved = already_resolved(outer, inner);
@@ -1037,7 +1183,8 @@ fn format_act_result(r: &ExecResult, inner: &str) -> String {
              [stopped on budget — box preserved, conversation \
              resumable. Continue with: `ask(follow_up={inner:?}, \
              request=\"...\", max_steps=N)` — once the chain has \
-             room, the sub-agent picks up where it left off]\n\n"));
+             room, the sub-agent picks up where it left off]\n\n"
+        ));
         text.push_str(&r.text);
         return text;
     }
@@ -1049,13 +1196,18 @@ fn format_act_result(r: &ExecResult, inner: &str) -> String {
     let mut text = String::new();
     text.push_str(&format!(
         "[sub-agent session id: {inner} — pass this as `target` to \
-         apply/reject/delete]\n\n"));
+         apply/reject/delete]\n\n"
+    ));
     text.push_str(&r.text);
     text
 }
 
-fn dispatch_shell(args: &Value, target: &str, executor: Option<&dyn Executor>,
-                  turns: &[Turn]) -> String {
+fn dispatch_shell(
+    args: &Value,
+    target: &str,
+    executor: Option<&dyn Executor>,
+    turns: &[Turn],
+) -> String {
     let Some(script) = args_str(args, "script") else {
         return "shell: missing required `script`".to_string();
     };
@@ -1065,13 +1217,21 @@ fn dispatch_shell(args: &Value, target: &str, executor: Option<&dyn Executor>,
     };
     // Plain shell tool calls: no API proxy access (the script is user code,
     // not an oaita sub-agent). Cf. dispatch_act which sets api_access=true.
-    let r = exe.run(&box_name(target), &script, discard, /*api_access=*/false);
-    r.text + &format_sub_agent_status(target)
-        + &crate::oaita::hints::append(turns, &["shell"])
+    let r = exe.run(
+        &box_name(target),
+        &script,
+        discard,
+        /*api_access=*/ false,
+    );
+    r.text + &format_sub_agent_status(target) + &crate::oaita::hints::append(turns, &["shell"])
 }
 
-fn dispatch_inspect(args: &Value, target: &str, executor: Option<&dyn Executor>,
-                    turns: &[Turn]) -> String {
+fn dispatch_inspect(
+    args: &Value,
+    target: &str,
+    executor: Option<&dyn Executor>,
+    turns: &[Turn],
+) -> String {
     let Some(path) = args_str(args, "path") else {
         return "inspect: missing required `path`".to_string();
     };
@@ -1082,8 +1242,12 @@ fn dispatch_inspect(args: &Value, target: &str, executor: Option<&dyn Executor>,
     inspect(&loc, turns, &box_name(target), exe)
 }
 
-fn dispatch_read(args: &Value, target: &str, executor: Option<&dyn Executor>,
-                 turns: &[Turn]) -> String {
+fn dispatch_read(
+    args: &Value,
+    target: &str,
+    executor: Option<&dyn Executor>,
+    turns: &[Turn],
+) -> String {
     let Some(path) = args_str(args, "path") else {
         return "read: missing required `path`".to_string();
     };
@@ -1094,8 +1258,12 @@ fn dispatch_read(args: &Value, target: &str, executor: Option<&dyn Executor>,
     read_path(&loc, turns, &box_name(target), exe)
 }
 
-fn dispatch_write(args: &Value, target: &str, executor: Option<&dyn Executor>,
-                  turns: &[Turn]) -> String {
+fn dispatch_write(
+    args: &Value,
+    target: &str,
+    executor: Option<&dyn Executor>,
+    turns: &[Turn],
+) -> String {
     let Some(path) = args_str(args, "path") else {
         return "write: missing required `path`".to_string();
     };
@@ -1137,7 +1305,8 @@ fn dispatch_box_resolve(verb: &str, args: &Value, outer: &str) -> String {
     // into the right parent (the agent's box, which inspect/read see).
     let dotted = format!("{}.{inner_box}", box_name(outer));
     let r = std::process::Command::new(&sarun)
-        .args([&dotted, cmd]).output();
+        .args([&dotted, cmd])
+        .output();
     match r {
         Ok(o) if o.status.success() => {
             // Stdout looks like `OAITA-X: <count> apply` (or `discard`).
@@ -1148,7 +1317,8 @@ fn dispatch_box_resolve(verb: &str, args: &Value, outer: &str) -> String {
             // zero, and the model assumed its sub-agent's work was
             // present and went looking for it.
             let out = String::from_utf8_lossy(&o.stdout);
-            let count = out.split_whitespace()
+            let count = out
+                .split_whitespace()
                 .find_map(|w| w.parse::<usize>().ok())
                 .unwrap_or(usize::MAX);
             match (verb, count) {
@@ -1157,16 +1327,21 @@ fn dispatch_box_resolve(verb: &str, args: &Value, outer: &str) -> String {
                      captured no writes. Common cause: the sub-agent wrote \
                      under /tmp (a bwrap-private tmpfs the overlay doesn't \
                      capture) or under another transient path. Use \
-                     /root/… or /home/… for changes that survive apply."),
-                ("apply", n) if n != usize::MAX => format!(
-                    "apply({inner_box}): {n} file(s) folded into the parent."),
-                ("reject", n) if n != usize::MAX => format!(
-                    "reject({inner_box}): {n} staged change(s) discarded."),
+                     /root/… or /home/… for changes that survive apply."
+                ),
+                ("apply", n) if n != usize::MAX => {
+                    format!("apply({inner_box}): {n} file(s) folded into the parent.")
+                }
+                ("reject", n) if n != usize::MAX => {
+                    format!("reject({inner_box}): {n} staged change(s) discarded.")
+                }
                 _ => format!("{verb}({inner_box}) ok"),
             }
         }
-        Ok(o) => format!("{verb}({inner_box}) failed: {}",
-                         String::from_utf8_lossy(&o.stderr)),
+        Ok(o) => format!(
+            "{verb}({inner_box}) failed: {}",
+            String::from_utf8_lossy(&o.stderr)
+        ),
         Err(e) => format!("{verb}: cannot run sarun: {e}"),
     }
 }
@@ -1182,14 +1357,21 @@ fn dispatch_backtrack(args: &Value, target: &str) -> String {
     // form (inclusive=true) is opt-in. Earlier the default was true and a
     // model that omitted the argument silently erased the user's original
     // question along with the derivation; that's the wrong default.
-    let inclusive = args.get("inclusive").and_then(Value::as_bool).unwrap_or(false);
+    let inclusive = args
+        .get("inclusive")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let final_answer = args_bool(args, "final");
     let turns = load_turns(target);
-    let cut = turns.iter().position(|t| t.slug.as_deref() == Some(turn_id.as_str()));
+    let cut = turns
+        .iter()
+        .position(|t| t.slug.as_deref() == Some(turn_id.as_str()));
     let Some(mut cut) = cut else {
         return format!("backtrack: no turn with id {turn_id:?}");
     };
-    if !inclusive { cut += 1; }
+    if !inclusive {
+        cut += 1;
+    }
     // User-kind turns are immutable to backtrack. The first user turn is
     // the original question (the conversation's reason for being); a
     // later user turn carrying `from=<outer>` is a delegation seed from
@@ -1205,7 +1387,9 @@ fn dispatch_backtrack(args: &Value, target: &str) -> String {
     // Remove every turn from `cut` onward.
     let mut removed = 0usize;
     for t in &turns[cut..] {
-        if fs::remove_file(&t.path).is_ok() { removed += 1; }
+        if fs::remove_file(&t.path).is_ok() {
+            removed += 1;
+        }
     }
     // Plant the summary as an assistant turn — `b`-flagged unless final.
     let kept = &turns[..cut];
@@ -1217,9 +1401,11 @@ fn dispatch_backtrack(args: &Value, target: &str) -> String {
     let name = turn_filename(n, "assistant", Some(&slug), None, flags);
     let path = session_dir(target).join(name);
     let _ = fs::write(&path, &summary);
-    format!("backtrack: removed {removed} turns; {} planted at {}",
-            if final_answer { "answer" } else { "waypoint" },
-            path.display())
+    format!(
+        "backtrack: removed {removed} turns; {} planted at {}",
+        if final_answer { "answer" } else { "waypoint" },
+        path.display()
+    )
 }
 
 fn dispatch_delete(args: &Value) -> String {
@@ -1231,7 +1417,8 @@ fn dispatch_delete(args: &Value) -> String {
     // Also discard the session's box (if any).
     let sarun = crate::oaita::exec::SarunExecutor::new(None).sarun;
     let _ = std::process::Command::new(&sarun)
-        .args([&box_name(&session), "discard"]).output();
+        .args([&box_name(&session), "discard"])
+        .output();
     format!("delete: dropped session {session}")
 }
 
@@ -1244,9 +1431,11 @@ fn dispatch_delete(args: &Value) -> String {
 /// and we exit cleanly. The box stays alive in intermediate state; a
 /// follow-up `oaita run <session> --max-steps N` adds to the same pool
 /// and resumes.
-pub fn run_to_completion(spec: &str, set: &Settings,
-                         executor: Option<&dyn Executor>)
-                         -> Result<Vec<PathBuf>, String> {
+pub fn run_to_completion(
+    spec: &str,
+    set: &Settings,
+    executor: Option<&dyn Executor>,
+) -> Result<Vec<PathBuf>, String> {
     let target = target_segment(spec)?;
     let mut produced: Vec<PathBuf> = Vec::new();
     loop {
@@ -1256,7 +1445,8 @@ pub fn run_to_completion(spec: &str, set: &Settings,
             if last.kind == "assistant"
                 && !last.flags.contains('p')
                 && !last.flags.contains('c')
-                && !last.flags.contains('b') {
+                && !last.flags.contains('b')
+            {
                 cleanup_spawned_subagents(&target);
                 return Ok(produced);
             }

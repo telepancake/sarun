@@ -8,6 +8,7 @@ from inferiors.qemu_rsp import (
     RspRestorationError,
 )
 from inferiors.rsp_transport import RspStream
+from inferiors.rsp_codec import Interrupt
 from test_rsp_support import memory_duplex_pair
 
 
@@ -59,6 +60,60 @@ class QemuRspClientTests(unittest.TestCase):
         result, seen = self.run_script(script, lambda client: client.read_physical(0x1000, 4))
         self.assertEqual(result, b"\x01\x02\x03\x04")
         self.assertEqual(seen, [command for command, _ in script])
+
+    def test_interrupt_handoff_consumes_console_output_then_stop(self):
+        client_socket, remote_socket = memory_duplex_pair()
+        client = QemuRspClient(client_socket, timeout=2)
+        remote = RspStream(remote_socket)
+        errors = []
+
+        def remote_run():
+            try:
+                self.assertIsInstance(remote.receive_event(2), Interrupt)
+                remote.send_packet(b"O" + b"booting\n".hex().encode(), 2)
+                remote.send_packet(b"T02thread:1;", 2)
+            except BaseException as exc:
+                errors.append(exc)
+
+        thread = threading.Thread(target=remote_run)
+        thread.start()
+        try:
+            self.assertEqual(
+                client.interrupt_and_wait_for_stop(), b"T02thread:1;"
+            )
+        finally:
+            thread.join(3)
+            client.close()
+            remote.close()
+        self.assertFalse(thread.is_alive())
+        if errors:
+            raise errors[0]
+
+    def test_interrupt_handoff_rejects_a_non_stop_reply(self):
+        client_socket, remote_socket = memory_duplex_pair()
+        client = QemuRspClient(client_socket, timeout=2)
+        remote = RspStream(remote_socket)
+        errors = []
+
+        def remote_run():
+            try:
+                self.assertIsInstance(remote.receive_event(2), Interrupt)
+                remote.send_packet(b"OK", 2)
+            except BaseException as exc:
+                errors.append(exc)
+
+        thread = threading.Thread(target=remote_run)
+        thread.start()
+        try:
+            with self.assertRaises(RspRemoteError):
+                client.interrupt_and_wait_for_stop()
+        finally:
+            thread.join(3)
+            client.close()
+            remote.close()
+        self.assertFalse(thread.is_alive())
+        if errors:
+            raise errors[0]
 
     def test_physical_read_restores_mode_after_remote_error(self):
         script = [

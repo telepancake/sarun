@@ -26,6 +26,8 @@ pub fn new_turn_id(existing: &HashSet<String>) -> String {
 /// emitted a `{"turn-id":"..."}` header atop its reply? Same rules as the
 /// filename grammar's turnid field — `[a-z0-9]+`, length-bounded.
 pub fn is_adoptable_slug(s: &str) -> bool {
-    !s.is_empty() && s.len() <= 64
-        && s.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+    !s.is_empty()
+        && s.len() <= 64
+        && s.chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
 }

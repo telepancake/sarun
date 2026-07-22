@@ -1,0 +1,976 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Wed, 22 Jul 2026 16:38:55 +0000
+Subject: [PATCH] Route embedded shell path reads through box filesystem provider
+
+---
+diff --git a/src/commands.rs b/src/commands.rs
+index c8ca618..b007c7e 100644
+--- a/src/commands.rs
++++ b/src/commands.rs
+@@ -19,7 +19,7 @@ use crate::{
+     functions,
+     interp::{self, Execute, ProcessGroupPolicy},
+     openfiles::{self, OpenFile, OpenFiles},
+-    pathsearch, processes,
++    processes,
+     results::ExecutionSpawnResult,
+     sys, trace_categories, traps, variables,
+ };
+@@ -517,10 +517,20 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
+             // All else failed; if we were given path directories to search, try to look through
+             // them for a matching executable. Otherwise, use our default search logic.
+             let path = if let Some(path_dirs) = &self.path_dirs {
+-                let absolute_dirs = path_dirs
+-                    .iter()
+-                    .map(|dir| self.shell.absolute_path(dir));
+-                pathsearch::search_for_executable(absolute_dirs, self.command_name.as_str()).next()
++                let absolute_dirs = path_dirs.iter().map(|dir| self.shell.absolute_path(dir));
++                absolute_dirs
++                    .map(|dir| dir.join(self.command_name.as_str()))
++                    .find(|candidate| {
++                        self.shell
++                            .box_vfs()
++                            .metadata(candidate)
++                            .is_ok_and(|metadata| !metadata.is_dir())
++                            && self
++                                .shell
++                                .box_vfs()
++                                .access(candidate, crate::vfs::VfsAccess::Execute)
++                                .is_ok()
++                    })
+             } else {
+                 self.shell
+                     .find_first_executable_in_path_using_cache(&self.command_name)
+@@ -864,7 +874,12 @@ pub(crate) fn execute_external_command(
+             }
+ 
+             if spawn_err.kind() == std::io::ErrorKind::NotFound {
+-                if !context.shell.working_dir().exists() {
++                if context
++                    .shell
++                    .box_vfs()
++                    .metadata(context.shell.working_dir())
++                    .is_err()
++                {
+                     Err(
+                         error::ErrorKind::WorkingDirMissing(context.shell.working_dir().to_owned())
+                             .into(),
+diff --git a/src/completion.rs b/src/completion.rs
+index 35858d8..a86a534 100644
+--- a/src/completion.rs
++++ b/src/completion.rs
+@@ -328,6 +328,7 @@ impl Spec {
+ 
+             let expansions = pattern
+                 .expand(
++                    shell.box_vfs(),
+                     shell.working_dir(),
+                     Some(&patterns::Pattern::accept_all_expand_filter),
+                     &patterns::FilenameExpansionOptions::default(),
+@@ -1214,7 +1215,13 @@ async fn get_file_completions(
+ 
+     let glob = std::format!("{expanded_token}*");
+ 
+-    let path_filter = |path: &Path| !must_be_dir || shell.absolute_path(path).is_dir();
++    let path_filter = |path: &Path| {
++        !must_be_dir
++            || shell
++                .box_vfs()
++                .metadata(&shell.absolute_path(path))
++                .is_ok_and(crate::vfs::VfsMetadata::is_dir)
++    };
+ 
+     let pattern = patterns::Pattern::from(glob)
+         .set_extended_globbing(shell.options().extended_globbing)
+@@ -1222,6 +1229,7 @@ async fn get_file_completions(
+ 
+     let mut completions: Vec<String> = pattern
+         .expand(
++            shell.box_vfs(),
+             shell.working_dir(),
+             Some(&path_filter),
+             &patterns::FilenameExpansionOptions::default(),
+diff --git a/src/expansion.rs b/src/expansion.rs
+index 4432ae0..6d2f39e 100644
+--- a/src/expansion.rs
++++ b/src/expansion.rs
+@@ -858,6 +858,7 @@ impl<'a, SE: extensions::ShellExtensions> WordExpander<'a, SE> {
+         // passes through as a literal rather than triggering failglob.
+         let expansion = pattern
+             .expand(
++                self.shell.box_vfs(),
+                 self.shell.working_dir(),
+                 Some(&patterns::Pattern::accept_all_expand_filter),
+                 &options,
+diff --git a/src/extendedtests.rs b/src/extendedtests.rs
+index 3da833e..9cca4c9 100644
+--- a/src/extendedtests.rs
++++ b/src/extendedtests.rs
+@@ -79,7 +79,7 @@ pub(crate) fn apply_unary_predicate_to_str(
+         ast::UnaryPredicate::StringHasZeroLength => Ok(operand.is_empty()),
+         ast::UnaryPredicate::FileExists => {
+             let path = shell.absolute_path(Path::new(operand));
+-            Ok(path.exists())
++            Ok(shell.box_vfs().metadata(&path).is_ok())
+         }
+         ast::UnaryPredicate::FileExistsAndIsBlockSpecialFile => {
+             let path = shell.absolute_path(Path::new(operand));
+@@ -91,11 +91,17 @@ pub(crate) fn apply_unary_predicate_to_str(
+         }
+         ast::UnaryPredicate::FileExistsAndIsDir => {
+             let path = shell.absolute_path(Path::new(operand));
+-            Ok(path.is_dir())
++            Ok(shell
++                .box_vfs()
++                .metadata(&path)
++                .is_ok_and(crate::vfs::VfsMetadata::is_dir))
+         }
+         ast::UnaryPredicate::FileExistsAndIsRegularFile => {
+             let path = shell.absolute_path(Path::new(operand));
+-            Ok(path.is_file())
++            Ok(shell
++                .box_vfs()
++                .metadata(&path)
++                .is_ok_and(crate::vfs::VfsMetadata::is_file))
+         }
+         ast::UnaryPredicate::FileExistsAndIsSetgid => {
+             let path = shell.absolute_path(Path::new(operand));
+@@ -103,7 +109,10 @@ pub(crate) fn apply_unary_predicate_to_str(
+         }
+         ast::UnaryPredicate::FileExistsAndIsSymlink => {
+             let path = shell.absolute_path(Path::new(operand));
+-            Ok(path.is_symlink())
++            Ok(shell
++                .box_vfs()
++                .symlink_metadata(&path)
++                .is_ok_and(crate::vfs::VfsMetadata::is_symlink))
+         }
+         ast::UnaryPredicate::FileExistsAndHasStickyBit => {
+             let path = shell.absolute_path(Path::new(operand));
+@@ -115,12 +124,15 @@ pub(crate) fn apply_unary_predicate_to_str(
+         }
+         ast::UnaryPredicate::FileExistsAndIsReadable => {
+             let path = shell.absolute_path(Path::new(operand));
+-            Ok(path.readable())
++            Ok(shell
++                .box_vfs()
++                .access(&path, crate::vfs::VfsAccess::Read)
++                .is_ok())
+         }
+         ast::UnaryPredicate::FileExistsAndIsNotZeroLength => {
+             let path = shell.absolute_path(Path::new(operand));
+-            if let Ok(metadata) = path.metadata() {
+-                Ok(metadata.len() > 0)
++            if let Ok(metadata) = shell.box_vfs().metadata(&path) {
++                Ok(metadata.len > 0)
+             } else {
+                 Ok(false)
+             }
+@@ -143,11 +155,17 @@ pub(crate) fn apply_unary_predicate_to_str(
+         }
+         ast::UnaryPredicate::FileExistsAndIsWritable => {
+             let path = shell.absolute_path(Path::new(operand));
+-            Ok(path.writable())
++            Ok(shell
++                .box_vfs()
++                .access(&path, crate::vfs::VfsAccess::Write)
++                .is_ok())
+         }
+         ast::UnaryPredicate::FileExistsAndIsExecutable => {
+             let path = shell.absolute_path(Path::new(operand));
+-            Ok(path.executable())
++            Ok(shell
++                .box_vfs()
++                .access(&path, crate::vfs::VfsAccess::Execute)
++                .is_ok())
+         }
+         ast::UnaryPredicate::FileExistsAndOwnedByEffectiveGroupId => {
+             let path = shell.absolute_path(Path::new(operand));
+diff --git a/src/lib.rs b/src/lib.rs
+index 2d52769..6ba1920 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -40,6 +40,7 @@ pub mod timing;
+ pub mod trace_categories;
+ pub mod traps;
+ pub mod variables;
++pub mod vfs;
+ mod wellknownvars;
+ 
+ /// Re-export parser types used in core definitions.
+diff --git a/src/patterns.rs b/src/patterns.rs
+index f27667d..88bd662 100644
+--- a/src/patterns.rs
++++ b/src/patterns.rs
+@@ -164,6 +164,7 @@ impl Pattern {
+     #[expect(clippy::too_many_lines)]
+     pub(crate) fn expand<PF>(
+         &self,
++        box_vfs: &dyn crate::vfs::BoxVfs,
+         working_dir: &Path,
+         path_filter: Option<&PF>,
+         options: &FilenameExpansionOptions,
+@@ -285,25 +286,24 @@ impl Pattern {
+                 let allow_dot_files = !options.require_dot_in_pattern_to_match_dot_files
+                     || subpattern_starts_with_dot;
+ 
+-                let matches_dotfile_policy = |dir_entry: &std::fs::DirEntry| {
+-                    !dir_entry.file_name().to_string_lossy().starts_with('.') || allow_dot_files
++                let matches_dotfile_policy = |dir_entry: &crate::vfs::VfsDirEntry| {
++                    !dir_entry.file_name.to_string_lossy().starts_with('.') || allow_dot_files
+                 };
+ 
+                 let regex = subpattern.to_regex(true, true)?;
+-                let matches_regex = |dir_entry: &std::fs::DirEntry| {
++                let matches_regex = |dir_entry: &crate::vfs::VfsDirEntry| {
+                     regex
+-                        .is_match(dir_entry.file_name().to_string_lossy().as_ref())
++                        .is_match(dir_entry.file_name.to_string_lossy().as_ref())
+                         .unwrap_or(false)
+                 };
+ 
+-                let mut matching_paths_in_dir: Vec<_> = current_path
+-                    .read_dir()
+-                    .map_or_else(|_| vec![], |dir| dir.into_iter().collect())
++                let mut matching_paths_in_dir: Vec<_> = box_vfs
++                    .read_dir(&current_path)
++                    .unwrap_or_default()
+                     .into_iter()
+-                    .filter_map(|result| result.ok())
+                     .filter(matches_regex)
+                     .filter(matches_dotfile_policy)
+-                    .map(|entry| entry.path())
++                    .map(|entry| entry.path)
+                     .collect();
+ 
+                 matching_paths_in_dir.sort();
+@@ -320,7 +320,7 @@ impl Pattern {
+             // `dir/regular-file/leaf`.  Use no-follow metadata so a dangling
+             // symlink matched as the final component remains a valid glob
+             // result, as it is in other shells.
+-            .filter(|path| std::fs::symlink_metadata(path).is_ok())
++            .filter(|path| box_vfs.symlink_metadata(path).is_ok())
+             .filter_map(|path| {
+                 if let Some(filter) = path_filter
+                     && !filter(path.as_path())
+@@ -566,6 +566,51 @@ pub(crate) fn remove_smallest_matching_suffix<'a>(
+ mod tests {
+     use super::*;
+     use anyhow::Result;
++    use std::{ffi::OsString, path::PathBuf};
++
++    struct StrictPatternVfs;
++
++    impl crate::vfs::BoxVfs for StrictPatternVfs {
++        fn metadata(&self, _path: &Path) -> std::io::Result<crate::vfs::VfsMetadata> {
++            Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
++        }
++
++        fn symlink_metadata(&self, path: &Path) -> std::io::Result<crate::vfs::VfsMetadata> {
++            match path.to_str() {
++                Some("/provider/one.txt" | "/provider/two.txt") => Ok(crate::vfs::VfsMetadata {
++                    file_type: crate::vfs::VfsFileType::File,
++                    len: 0,
++                }),
++                _ => Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
++            }
++        }
++
++        fn read_dir(&self, path: &Path) -> std::io::Result<Vec<crate::vfs::VfsDirEntry>> {
++            if path != Path::new("/provider") {
++                return Err(std::io::Error::from(std::io::ErrorKind::NotFound));
++            }
++            Ok(["one.txt", "two.txt"]
++                .into_iter()
++                .map(|name| crate::vfs::VfsDirEntry {
++                    path: path.join(name),
++                    file_name: OsString::from(name),
++                    file_type: crate::vfs::VfsFileType::File,
++                })
++                .collect())
++        }
++
++        fn read_link(&self, _path: &Path) -> std::io::Result<PathBuf> {
++            Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
++        }
++
++        fn read(&self, _path: &Path) -> std::io::Result<Vec<u8>> {
++            Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
++        }
++
++        fn access(&self, _path: &Path, _access: crate::vfs::VfsAccess) -> std::io::Result<()> {
++            Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
++        }
++    }
+ 
+     fn pattern_to_exact_regex_str<P>(pattern: P) -> Result<String, error::Error>
+     where
+@@ -939,6 +984,24 @@ mod tests {
+         assert!(requires_expansion("@(a)", true));
+     }
+ 
++    #[test]
++    fn glob_observations_use_only_the_supplied_provider() -> Result<()> {
++        let result = Pattern::from("/provider/*.txt").expand::<fn(&Path) -> bool>(
++            &StrictPatternVfs,
++            Path::new("/"),
++            None,
++            &FilenameExpansionOptions::default(),
++        )?;
++        assert_eq!(
++            expect_expanded(result)?,
++            vec![
++                "/provider/one.txt".to_string(),
++                "/provider/two.txt".to_string()
++            ]
++        );
++        Ok(())
++    }
++
+     /// Extracts the `Expanded` payload from a `PatternExpansionResult`,
+     /// failing the test via `anyhow::bail!` otherwise. Avoids `panic!` which
+     /// is forbidden by the workspace clippy config.
+@@ -971,6 +1034,7 @@ mod tests {
+ 
+         let pattern = Pattern::from("sub/*.txt").set_extended_globbing(false);
+         let result = pattern.expand::<fn(&Path) -> bool>(
++            &crate::vfs::NativeBoxVfs,
+             scratch.path(),
+             None,
+             &FilenameExpansionOptions::default(),
+@@ -1013,6 +1077,7 @@ mod tests {
+ 
+         let pattern = Pattern::from("gcc/*/config-lang.in").set_extended_globbing(false);
+         let result = pattern.expand::<fn(&Path) -> bool>(
++            &crate::vfs::NativeBoxVfs,
+             scratch.path(),
+             None,
+             &FilenameExpansionOptions::default(),
+@@ -1044,6 +1109,7 @@ mod tests {
+ 
+         let pattern = Pattern::from(abs_pattern.as_str()).set_extended_globbing(false);
+         let result = pattern.expand::<fn(&Path) -> bool>(
++            &crate::vfs::NativeBoxVfs,
+             Path::new("/"),
+             None,
+             &FilenameExpansionOptions::default(),
+diff --git a/src/shell/builder.rs b/src/shell/builder.rs
+index 3230274..4e6f727 100644
+--- a/src/shell/builder.rs
++++ b/src/shell/builder.rs
+@@ -1,6 +1,6 @@
+ //! Module defining the builder for creating shell instances.
+ 
+-use std::{collections::HashMap, path::PathBuf};
++use std::{collections::HashMap, path::PathBuf, sync::Arc};
+ 
+ pub use shell_builder::State as ShellBuilderState;
+ 
+@@ -8,7 +8,7 @@ use super::Shell;
+ use crate::{
+     ProfileLoadBehavior, RcLoadBehavior, ShellFd, ShellVariable, builtins, callstack, completion,
+     env, error, extensions, functions, jobs, openfiles, options, pathcache,
+-    shell::KeyBindingsHelper, traps,
++    shell::KeyBindingsHelper, traps, vfs,
+ };
+ 
+ impl<SE: extensions::ShellExtensions, S: shell_builder::IsComplete> ShellBuilder<SE, S> {
+@@ -143,6 +143,8 @@ pub struct CreateOptions<SE: extensions::ShellExtensions = extensions::DefaultSh
+     /// are assigned *after* inherited or well-known variables are set (when applicable).
+     #[builder(field)]
+     pub vars: HashMap<String, ShellVariable>,
++    /// Backend-neutral filesystem provider installed before profile/rc loading.
++    pub box_vfs: Option<Arc<dyn vfs::BoxVfs>>,
+     /// Error behavior implementation.
+     #[builder(default)]
+     pub error_formatter: SE::ErrorFormatter,
+@@ -233,6 +235,7 @@ impl<SE: extensions::ShellExtensions> Default for Shell<SE> {
+     fn default() -> Self {
+         Self {
+             error_formatter: SE::ErrorFormatter::default(),
++            box_vfs: super::default_box_vfs(),
+             traps: traps::TrapHandlerConfig::default(),
+             open_files: openfiles::OpenFiles::default(),
+             working_dir: PathBuf::default(),
+diff --git a/src/shell/execution.rs b/src/shell/execution.rs
+index bea89e3..f113f5e 100644
+--- a/src/shell/execution.rs
++++ b/src/shell/execution.rs
+@@ -4,8 +4,7 @@ use std::{io::Read, path::Path};
+ 
+ use crate::{
+     ExecutionControlFlow, ExecutionParameters, ExecutionResult, ProcessGroupPolicy, SourceInfo,
+-    arithmetic::Evaluatable as _, callstack, error, interp::Execute as _, openfiles,
+-    trace_categories,
++    arithmetic::Evaluatable as _, callstack, error, interp::Execute as _, trace_categories,
+ };
+ 
+ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
+@@ -27,9 +26,9 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
+         path: impl AsRef<Path>,
+         params: &ExecutionParameters,
+     ) -> Result<bool, error::Error> {
+-        let path = path.as_ref();
+-        if path.exists() {
+-            self.source_script(path, std::iter::empty::<String>(), params)
++        let path = self.absolute_path(path.as_ref());
++        if self.box_vfs().metadata(&path).is_ok() {
++            self.source_script(&path, std::iter::empty::<String>(), params)
+                 .await?;
+             Ok(true)
+         } else {
+@@ -79,28 +78,24 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
+         params: &ExecutionParameters,
+         call_type: callstack::ScriptCallType,
+     ) -> Result<ExecutionResult, error::Error> {
+-        let path = path.as_ref();
++        let path = self.absolute_path(path.as_ref());
+         tracing::debug!("sourcing: {}", path.display());
+ 
+-        let mut options = std::fs::File::options();
+-        options.read(true);
+-
+-        let opened_file: openfiles::OpenFile = self
+-            .open_file(&options, path, params)
++        let bytes = self
++            .box_vfs()
++            .read(&path)
+             .map_err(|e| error::ErrorKind::FailedSourcingFile(path.to_owned(), e))?;
+ 
+-        if opened_file.is_dir() {
+-            return Err(error::ErrorKind::FailedSourcingFile(
+-                path.to_owned(),
+-                std::io::Error::from(std::io::ErrorKind::IsADirectory),
+-            )
+-            .into());
+-        }
+-
+         let source_info = crate::SourceInfo::from(path.to_owned());
+ 
+         let mut result = self
+-            .source_file(opened_file, &source_info, args, params, call_type)
++            .source_file(
++                std::io::Cursor::new(bytes),
++                &source_info,
++                args,
++                params,
++                call_type,
++            )
+             .await?;
+ 
+         // Handle control flow at script execution boundary. If execution completed
+diff --git a/src/shell/fs.rs b/src/shell/fs.rs
+index 546cec6..365dc3c 100644
+--- a/src/shell/fs.rs
++++ b/src/shell/fs.rs
+@@ -7,9 +7,10 @@ use normalize_path::NormalizePath as _;
+ use crate::{
+     ExecutionParameters, ShellFd,
+     env::{EnvironmentLookup, EnvironmentScope},
+-    error, openfiles, pathsearch,
+-    sys::{fs::PathExt as _, users},
++    error, openfiles,
++    sys::users,
+     variables,
++    vfs::VfsAccess,
+ };
+ 
+ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
+@@ -21,11 +22,12 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
+     pub fn set_working_dir(&mut self, target_dir: impl AsRef<Path>) -> Result<(), error::Error> {
+         let abs_path = self.absolute_path(target_dir.as_ref());
+ 
+-        match std::fs::metadata(&abs_path) {
++        match self.box_vfs().metadata(&abs_path) {
+             Ok(m) => {
+                 if !m.is_dir() {
+                     return Err(error::ErrorKind::NotADirectory(abs_path).into());
+                 }
++                self.box_vfs().access(&abs_path, VfsAccess::Execute)?;
+             }
+             Err(e) => {
+                 return Err(e.into());
+@@ -93,7 +95,16 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
+         let path_var = self.env.get_str("PATH", self).unwrap_or_default();
+         let paths = crate::sys::fs::split_paths(path_var.as_ref());
+ 
+-        pathsearch::search_for_executable(paths, filename)
++        let matches: Vec<_> = paths
++            .map(|directory| self.absolute_path(directory).join(filename))
++            .filter(|candidate| {
++                self.box_vfs()
++                    .metadata(candidate)
++                    .is_ok_and(|metadata| !metadata.is_dir())
++                    && self.box_vfs().access(candidate, VfsAccess::Execute).is_ok()
++            })
++            .collect();
++        matches.into_iter()
+     }
+ 
+     /// Finds executables in the shell's current default PATH, with filenames matching the
+@@ -109,8 +120,35 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
+     ) -> impl Iterator<Item = PathBuf> {
+         let path_var = self.env.get_str("PATH", self).unwrap_or_default();
+         let paths = crate::sys::fs::split_paths(path_var.as_ref());
+-
+-        pathsearch::search_for_executable_with_prefix(paths, filename_prefix, case_insensitive)
++        let mut matches = Vec::new();
++        for directory in paths {
++            let directory = self.absolute_path(directory);
++            let Ok(entries) = self.box_vfs().read_dir(&directory) else {
++                continue;
++            };
++            for entry in entries {
++                let name = entry.file_name.to_string_lossy();
++                let name_matches = if case_insensitive {
++                    name.to_ascii_lowercase()
++                        .starts_with(&filename_prefix.to_ascii_lowercase())
++                } else {
++                    name.starts_with(filename_prefix)
++                };
++                if name_matches
++                    && self
++                        .box_vfs()
++                        .metadata(&entry.path)
++                        .is_ok_and(|metadata| metadata.is_file())
++                    && self
++                        .box_vfs()
++                        .access(&entry.path, VfsAccess::Execute)
++                        .is_ok()
++                {
++                    matches.push(entry.path);
++                }
++            }
++        }
++        matches.into_iter()
+     }
+ 
+     /// Determines whether the given filename is the name of an executable in one of the
+@@ -129,7 +167,11 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
+             // not the embedding process cwd.  Return that same resolved path
+             // to command execution and any exec interposer.
+             let candidate_path = self.absolute_path(one_dir).join(candidate_name.as_ref());
+-            if candidate_path.executable() {
++            if self
++                .box_vfs()
++                .access(&candidate_path, VfsAccess::Execute)
++                .is_ok()
++            {
+                 return Some(candidate_path);
+             }
+         }
+@@ -241,3 +283,160 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
+         &self.open_files
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use std::{
++        collections::HashMap,
++        io,
++        path::{Path, PathBuf},
++        sync::{Arc, Mutex},
++    };
++
++    use crate::vfs::{BoxVfs, VfsAccess, VfsDirEntry, VfsFileType, VfsMetadata};
++
++    #[derive(Default)]
++    struct StrictMockVfs {
++        metadata: HashMap<PathBuf, VfsMetadata>,
++        files: HashMap<PathBuf, Vec<u8>>,
++        executable: Vec<PathBuf>,
++        calls: Mutex<Vec<(&'static str, PathBuf)>>,
++    }
++
++    impl StrictMockVfs {
++        fn unsupported(&self, operation: &'static str, path: &Path) -> io::Error {
++            self.calls
++                .lock()
++                .unwrap()
++                .push((operation, path.to_owned()));
++            io::Error::new(io::ErrorKind::Unsupported, operation)
++        }
++    }
++
++    impl BoxVfs for StrictMockVfs {
++        fn metadata(&self, path: &Path) -> io::Result<VfsMetadata> {
++            self.calls
++                .lock()
++                .unwrap()
++                .push(("metadata", path.to_owned()));
++            self.metadata
++                .get(path)
++                .copied()
++                .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))
++        }
++
++        fn symlink_metadata(&self, path: &Path) -> io::Result<VfsMetadata> {
++            Err(self.unsupported("symlink_metadata", path))
++        }
++
++        fn read_dir(&self, path: &Path) -> io::Result<Vec<VfsDirEntry>> {
++            Err(self.unsupported("read_dir", path))
++        }
++
++        fn read_link(&self, path: &Path) -> io::Result<PathBuf> {
++            Err(self.unsupported("read_link", path))
++        }
++
++        fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
++            self.calls.lock().unwrap().push(("read", path.to_owned()));
++            self.files
++                .get(path)
++                .cloned()
++                .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))
++        }
++
++        fn access(&self, path: &Path, access: VfsAccess) -> io::Result<()> {
++            self.calls.lock().unwrap().push(("access", path.to_owned()));
++            if access == VfsAccess::Execute && self.executable.iter().any(|p| p == path) {
++                Ok(())
++            } else {
++                Err(io::Error::from(io::ErrorKind::PermissionDenied))
++            }
++        }
++    }
++
++    #[tokio::test]
++    async fn cwd_validation_uses_provider_and_provider_is_clone_shared() {
++        let virtual_dir = PathBuf::from("/not-on-the-host/provider-cwd");
++        let provider = Arc::new(StrictMockVfs {
++            metadata: HashMap::from([(
++                virtual_dir.clone(),
++                VfsMetadata {
++                    file_type: VfsFileType::Directory,
++                    len: 0,
++                },
++            )]),
++            executable: vec![virtual_dir.clone()],
++            ..StrictMockVfs::default()
++        });
++        let provider_handle: Arc<dyn BoxVfs> = provider.clone();
++        let mut shell = crate::Shell::builder()
++            .box_vfs(provider_handle)
++            .build()
++            .await
++            .unwrap();
++
++        shell.set_working_dir(&virtual_dir).unwrap();
++        let cloned = shell.clone();
++        let shell_vfs = shell.box_vfs_handle();
++        let cloned_vfs = cloned.box_vfs_handle();
++
++        assert_eq!(shell.working_dir(), virtual_dir);
++        assert!(Arc::ptr_eq(&shell_vfs, &cloned_vfs));
++        assert_eq!(
++            provider.calls.lock().unwrap().as_slice(),
++            &[("metadata", virtual_dir.clone()), ("access", virtual_dir)]
++        );
++    }
++
++    #[tokio::test]
++    async fn path_lookup_uses_provider_without_native_fallback() {
++        let executable = PathBuf::from("/provider-only/bin/tool");
++        let provider = Arc::new(StrictMockVfs {
++            executable: vec![executable.clone()],
++            ..StrictMockVfs::default()
++        });
++        let mut shell = crate::Shell::builder().build().await.unwrap();
++        shell.set_box_vfs(provider.clone());
++        shell
++            .env_mut()
++            .set_global("PATH", crate::ShellVariable::new("/provider-only/bin"))
++            .unwrap();
++
++        assert_eq!(
++            shell.find_first_executable_in_path("tool"),
++            Some(executable.clone())
++        );
++        assert_eq!(
++            provider.calls.lock().unwrap().as_slice(),
++            &[("access", executable)]
++        );
++    }
++
++    #[tokio::test]
++    async fn sourced_script_bytes_use_provider_without_native_fallback() {
++        let virtual_script = PathBuf::from("/provider-only/profile.sh");
++        let provider = Arc::new(StrictMockVfs {
++            files: HashMap::from([(virtual_script.clone(), b"provider_value=typed\n".to_vec())]),
++            ..StrictMockVfs::default()
++        });
++        let provider_handle: Arc<dyn BoxVfs> = provider.clone();
++        let mut shell = crate::Shell::builder()
++            .box_vfs(provider_handle)
++            .build()
++            .await
++            .unwrap();
++        let params = shell.default_exec_params();
++
++        shell
++            .source_script(&virtual_script, std::iter::empty::<String>(), &params)
++            .await
++            .unwrap();
++
++        assert_eq!(shell.env_str("provider_value").as_deref(), Some("typed"));
++        assert_eq!(
++            provider.calls.lock().unwrap().as_slice(),
++            &[("read", virtual_script)]
++        );
++    }
++}
+diff --git a/src/shell.rs b/src/shell.rs
+index 7b56649..70509da 100644
+--- a/src/shell.rs
++++ b/src/shell.rs
+@@ -9,10 +9,14 @@ use tokio::sync::Mutex;
+ 
+ use crate::{
+     ExecutionControlFlow, ExecutionResult, builtins, env::ShellEnvironment, error, extensions,
+-    functions, interfaces, jobs, keywords, openfiles, options::RuntimeOptions, pathcache,
++    functions, interfaces, jobs, keywords, openfiles, options::RuntimeOptions, pathcache, vfs,
+     wellknownvars,
+ };
+ 
++fn default_box_vfs() -> Arc<dyn vfs::BoxVfs> {
++    Arc::new(vfs::NativeBoxVfs)
++}
++
+ /// Type for storing a key bindings helper.
+ pub type KeyBindingsHelper = Arc<Mutex<dyn interfaces::KeyBindings>>;
+ 
+@@ -61,6 +65,11 @@ pub struct Shell<SE: extensions::ShellExtensions = extensions::DefaultShellExten
+     #[cfg_attr(feature = "serde", serde(skip, default = "default_error_formatter"))]
+     error_formatter: SE::ErrorFormatter,
+ 
++    /// Runtime filesystem provider for operations that do not expose a real fd.
++    /// Shared by subshell clones so an embedder's handle and inode view stays coherent.
++    #[cfg_attr(feature = "serde", serde(skip, default = "default_box_vfs"))]
++    box_vfs: Arc<dyn vfs::BoxVfs>,
++
+     /// Trap handler configuration for the shell.
+     traps: crate::traps::TrapHandlerConfig,
+ 
+@@ -169,6 +178,7 @@ impl<SE: extensions::ShellExtensions> Clone for Shell<SE> {
+     fn clone(&self) -> Self {
+         Self {
+             error_formatter: self.error_formatter.clone(),
++            box_vfs: Arc::clone(&self.box_vfs),
+             traps: self.traps.clone(),
+             open_files: self.open_files.clone(),
+             working_dir: self.working_dir.clone(),
+@@ -224,6 +234,24 @@ impl<SE: extensions::ShellExtensions> AsMut<Self> for Shell<SE> {
+ }
+ 
+ impl<SE: extensions::ShellExtensions> Shell<SE> {
++    /// Replace the read-only filesystem provider used by shell evaluation.
++    ///
++    /// Redirections and descriptors intentionally continue through the native descriptor
++    /// path; this interface is only for operations that return values or owned bytes.
++    pub fn set_box_vfs(&mut self, box_vfs: Arc<dyn vfs::BoxVfs>) {
++        self.box_vfs = box_vfs;
++    }
++
++    /// Return the shell's clone-shared filesystem provider.
++    pub fn box_vfs(&self) -> &dyn vfs::BoxVfs {
++        self.box_vfs.as_ref()
++    }
++
++    /// Clone the provider capability, for iterators or embedder-owned helpers.
++    pub fn box_vfs_handle(&self) -> Arc<dyn vfs::BoxVfs> {
++        Arc::clone(&self.box_vfs)
++    }
++
+     /// Mutable call stack — the interpreter records the current execution
+     /// position here so $LINENO tracks the running statement.
+     pub fn call_stack_mut(&mut self) -> &mut crate::callstack::CallStack {
+@@ -243,6 +271,7 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
+         // Instantiate the shell with some defaults.
+         let mut shell = Self {
+             error_formatter: options.error_formatter,
++            box_vfs: options.box_vfs.unwrap_or_else(default_box_vfs),
+             open_files: openfiles::OpenFiles::new(),
+             options: runtime_options,
+             name: options.shell_name,
+diff --git a/src/vfs.rs b/src/vfs.rs
+new file mode 100644
+index 0000000..194fac1
+--- /dev/null
++++ b/src/vfs.rs
+@@ -0,0 +1,174 @@
++//! Backend-neutral, read-only filesystem access for shell evaluation.
++//!
++//! File descriptors and mutations intentionally remain outside this interface. An
++//! embedder can therefore route metadata-heavy shell operations to its own filesystem
++//! without accidentally letting a virtual descriptor escape to an external process.
++
++use std::{
++    ffi::OsString,
++    io,
++    path::{Path, PathBuf},
++};
++
++use crate::sys::fs::PathExt as _;
++
++/// The filesystem object kind returned by [`BoxVfs`].
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub enum VfsFileType {
++    File,
++    Directory,
++    Symlink,
++    Other,
++}
++
++/// Backend-neutral metadata. This deliberately does not expose
++/// [`std::fs::Metadata`], whose methods would tie callers to the host filesystem.
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub struct VfsMetadata {
++    pub file_type: VfsFileType,
++    pub len: u64,
++}
++
++impl VfsMetadata {
++    #[must_use]
++    pub const fn is_file(self) -> bool {
++        matches!(self.file_type, VfsFileType::File)
++    }
++
++    #[must_use]
++    pub const fn is_dir(self) -> bool {
++        matches!(self.file_type, VfsFileType::Directory)
++    }
++
++    #[must_use]
++    pub const fn is_symlink(self) -> bool {
++        matches!(self.file_type, VfsFileType::Symlink)
++    }
++}
++
++/// A directory entry whose name remains an `OsString`, including non-UTF-8 names.
++#[derive(Clone, Debug, Eq, PartialEq)]
++pub struct VfsDirEntry {
++    pub path: PathBuf,
++    pub file_name: OsString,
++    pub file_type: VfsFileType,
++}
++
++/// Access check requested from a filesystem provider.
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub enum VfsAccess {
++    Read,
++    Write,
++    Execute,
++}
++
++/// Read-only filesystem operations that are safe to use without exporting a host fd.
++///
++/// Providers must not silently fall back to `std::fs` for provider-owned paths. Every
++/// method is explicit so tests can use a backend that fails on any unexpected operation.
++pub trait BoxVfs: Send + Sync + 'static {
++    /// Metadata while following the final symlink.
++    fn metadata(&self, path: &Path) -> io::Result<VfsMetadata>;
++
++    /// Metadata without following the final symlink.
++    fn symlink_metadata(&self, path: &Path) -> io::Result<VfsMetadata>;
++
++    fn read_dir(&self, path: &Path) -> io::Result<Vec<VfsDirEntry>>;
++
++    fn read_link(&self, path: &Path) -> io::Result<PathBuf>;
++
++    /// Read a complete regular file without exposing a descriptor to the caller.
++    fn read(&self, path: &Path) -> io::Result<Vec<u8>>;
++
++    fn access(&self, path: &Path, access: VfsAccess) -> io::Result<()>;
++}
++
++/// Default provider retaining ordinary Brush behavior.
++#[derive(Debug, Default)]
++pub struct NativeBoxVfs;
++
++fn file_type(file_type: std::fs::FileType) -> VfsFileType {
++    if file_type.is_file() {
++        VfsFileType::File
++    } else if file_type.is_dir() {
++        VfsFileType::Directory
++    } else if file_type.is_symlink() {
++        VfsFileType::Symlink
++    } else {
++        VfsFileType::Other
++    }
++}
++
++fn metadata(metadata: std::fs::Metadata) -> VfsMetadata {
++    VfsMetadata {
++        file_type: file_type(metadata.file_type()),
++        len: metadata.len(),
++    }
++}
++
++impl BoxVfs for NativeBoxVfs {
++    fn metadata(&self, path: &Path) -> io::Result<VfsMetadata> {
++        std::fs::metadata(path).map(metadata)
++    }
++
++    fn symlink_metadata(&self, path: &Path) -> io::Result<VfsMetadata> {
++        std::fs::symlink_metadata(path).map(metadata)
++    }
++
++    fn read_dir(&self, path: &Path) -> io::Result<Vec<VfsDirEntry>> {
++        std::fs::read_dir(path)?
++            .map(|entry| {
++                let entry = entry?;
++                Ok(VfsDirEntry {
++                    path: entry.path(),
++                    file_name: entry.file_name(),
++                    file_type: file_type(entry.file_type()?),
++                })
++            })
++            .collect()
++    }
++
++    fn read_link(&self, path: &Path) -> io::Result<PathBuf> {
++        std::fs::read_link(path)
++    }
++
++    fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
++        std::fs::read(path)
++    }
++
++    fn access(&self, path: &Path, access: VfsAccess) -> io::Result<()> {
++        let allowed = match access {
++            VfsAccess::Read => path.readable(),
++            VfsAccess::Write => path.writable(),
++            VfsAccess::Execute => path.executable(),
++        };
++        if allowed {
++            Ok(())
++        } else {
++            Err(io::Error::from(io::ErrorKind::PermissionDenied))
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn native_provider_preserves_raw_directory_names_and_file_kinds() -> io::Result<()> {
++        let scratch = tempfile::tempdir()?;
++        std::fs::write(scratch.path().join("plain"), b"contents")?;
++        std::fs::create_dir(scratch.path().join("directory"))?;
++
++        let fs = NativeBoxVfs;
++        let mut entries = fs.read_dir(scratch.path())?;
++        entries.sort_by(|a, b| a.file_name.cmp(&b.file_name));
++
++        assert_eq!(entries[0].file_name, OsString::from("directory"));
++        assert_eq!(entries[0].file_type, VfsFileType::Directory);
++        assert_eq!(entries[1].file_name, OsString::from("plain"));
++        assert_eq!(entries[1].file_type, VfsFileType::File);
++        assert_eq!(fs.read(&entries[1].path)?, b"contents");
++        Ok(())
++    }
++}

@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 import socket
 import threading
+import time
 from contextlib import contextmanager
 from typing import Iterator
 
@@ -28,6 +29,8 @@ class RspRestorationError(RuntimeError):
 
 
 _THREAD_ID = re.compile(r"(?:-1|0|[0-9a-fA-F]+|p[0-9a-fA-F]+\.(?:-1|0|[0-9a-fA-F]+))\Z")
+_STOP_REPLY = re.compile(rb"(?:S[0-9a-fA-F]{2}|T[0-9a-fA-F]{2}[ -~]*)\Z")
+_CONSOLE_OUTPUT = re.compile(rb"O(?:[0-9a-fA-F]{2})*\Z")
 MAX_VIRTUAL_READ_BYTES = 16 * 1024 * 1024
 
 
@@ -80,6 +83,27 @@ class QemuRspClient:
         # A raw interrupt is allowed while a resume command has no pending RSP
         # response, so it does not need the request/reply lock.
         self.stream.send_interrupt()
+
+    def interrupt_and_wait_for_stop(self) -> bytes:
+        """Stop a running target and consume its first valid stop reply.
+
+        QEMU can emit console-output packets before the stop reply.  They are
+        acknowledged and discarded here because no upstream GDB connection
+        exists during this one-time ownership handoff.
+        """
+
+        deadline = time.monotonic() + self.timeout
+        self.forward_interrupt()
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("timed out waiting for QEMU to stop")
+            packet = self.receive_async_packet(remaining)
+            if _CONSOLE_OUTPUT.fullmatch(packet):
+                continue
+            if _STOP_REPLY.fullmatch(packet):
+                return packet
+            raise RspRemoteError(packet)
 
     def insert_breakpoint(self, kind: int, address: int, size: int) -> None:
         reply = self.request(f"Z{kind},{address:x},{size:x}")

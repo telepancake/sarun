@@ -22,10 +22,9 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use base64::{Engine as _, prelude::BASE64_STANDARD};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
-use crate::oaita::tools::{ExecResult, summarize_patch, fit_output,
-                          RESULT_BUDGET, CHANGES_BUDGET};
+use crate::oaita::tools::{CHANGES_BUDGET, ExecResult, RESULT_BUDGET, fit_output, summarize_patch};
 
 /// One synchronous request/reply over the engine control socket. The dial
 /// path is broker-via-SARUN_BROKER when in-box, filesystem host UDS when
@@ -33,24 +32,25 @@ use crate::oaita::tools::{ExecResult, summarize_patch, fit_output,
 pub(crate) fn ctrl_rpc(verb: &str, args: Value) -> Result<Value, String> {
     let broker = std::env::var("SARUN_BROKER").ok().filter(|s| !s.is_empty());
     let mut s = if let Some(name) = broker.as_ref() {
-        crate::runner::broker_dial(name)
-            .map_err(|e| format!("broker dial {name}: {e}"))?
+        crate::runner::broker_dial(name).map_err(|e| format!("broker dial {name}: {e}"))?
     } else {
         let sock: PathBuf = crate::paths::sock_path();
-        UnixStream::connect(&sock)
-            .map_err(|e| format!("connect {}: {e}", sock.display()))?
+        UnixStream::connect(&sock).map_err(|e| format!("connect {}: {e}", sock.display()))?
     };
     let msg = json!({"type": "ui", "verb": verb, "args": args});
     s.write_all(format!("{msg}\n").as_bytes())
         .map_err(|e| format!("write: {e}"))?;
     let mut line = String::new();
-    BufReader::new(&s).read_line(&mut line)
+    BufReader::new(&s)
+        .read_line(&mut line)
         .map_err(|e| format!("read: {e}"))?;
-    let rep: Value = serde_json::from_str(&line)
-        .map_err(|e| format!("parse: {e}"))?;
+    let rep: Value = serde_json::from_str(&line).map_err(|e| format!("parse: {e}"))?;
     if rep.get("ok").and_then(Value::as_bool) != Some(true) {
-        return Err(rep.get("error").and_then(Value::as_str)
-                   .unwrap_or("rpc failed").to_string());
+        return Err(rep
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("rpc failed")
+            .to_string());
     }
     Ok(rep.get("r").cloned().unwrap_or(Value::Null))
 }
@@ -60,10 +60,14 @@ pub(crate) fn ctrl_rpc(verb: &str, args: Value) -> Result<Value, String> {
 /// against the runner's cwd.
 fn to_box_rel(path: &str) -> String {
     let p = PathBuf::from(path);
-    let abs = if p.is_absolute() { p }
-              else { std::env::current_dir().unwrap_or_default().join(p) };
-    abs.strip_prefix("/").map(|q| q.to_string_lossy().into_owned())
-       .unwrap_or_else(|_| abs.to_string_lossy().into_owned())
+    let abs = if p.is_absolute() {
+        p
+    } else {
+        std::env::current_dir().unwrap_or_default().join(p)
+    };
+    abs.strip_prefix("/")
+        .map(|q| q.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| abs.to_string_lossy().into_owned())
 }
 
 pub trait Executor: Send + Sync {
@@ -86,12 +90,10 @@ pub trait Executor: Send + Sync {
 
     /// Replace `path` in `box_id`'s upper with `bytes`. Staged exactly like
     /// a shell-inside-the-box write — the host fs is never touched.
-    fn write_file(&self, box_id: &str, path: &str, bytes: &[u8])
-                  -> std::io::Result<()>;
+    fn write_file(&self, box_id: &str, path: &str, bytes: &[u8]) -> std::io::Result<()>;
 
     /// Directory listing as (name, kind_char) where kind ∈ 'f'/'d'/'l'/'s'/'?'.
-    fn list_dir(&self, box_id: &str, path: &str)
-                -> std::io::Result<Vec<(String, char)>>;
+    fn list_dir(&self, box_id: &str, path: &str) -> std::io::Result<Vec<(String, char)>>;
 
     /// Kind of `path`: 'f' (file), 'd' (dir), 'l' (symlink), 's' (special),
     /// '?' (absent). A stat-without-error gateway for the inspect tool.
@@ -111,9 +113,7 @@ pub struct SarunExecutor {
 
 impl SarunExecutor {
     pub fn new(sarun_override: Option<String>) -> Self {
-        let sarun = sarun_override
-            .or_else(|| Some(default_sarun()))
-            .unwrap();
+        let sarun = sarun_override.or_else(|| Some(default_sarun())).unwrap();
         SarunExecutor { sarun }
     }
 }
@@ -123,7 +123,8 @@ impl SarunExecutor {
 /// one informational `sarun-engine: box N (overlay root: ...) UI connected`
 /// per launch; that's noise to the LLM, never something it can act on.
 fn filter_sarun_noise(stderr: &str) -> String {
-    stderr.lines()
+    stderr
+        .lines()
         .filter(|l| !l.starts_with("sarun-engine:"))
         .collect::<Vec<_>>()
         .join("\n")
@@ -143,7 +144,9 @@ fn default_sarun() -> String {
     // In-box: re-exec the engine via the ferried fd (SARUN_EXE), which
     // resolves on ANY rootfs — not `/proc/self/exe`, whose path is absent in a
     // closed OCI rootfs. See runner::in_box_self_exe.
-    if in_box() { return crate::runner::in_box_self_exe(); }
+    if in_box() {
+        return crate::runner::in_box_self_exe();
+    }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(stem) = exe.file_name().and_then(|s| s.to_str()) {
             if stem == "sarun" || stem == "sarun-engine" {
@@ -152,7 +155,9 @@ fn default_sarun() -> String {
         }
         if let Some(parent) = exe.parent() {
             let sib = parent.join("sarun");
-            if sib.exists() { return sib.to_string_lossy().into_owned(); }
+            if sib.exists() {
+                return sib.to_string_lossy().into_owned();
+            }
         }
     }
     "sarun".to_string()
@@ -170,13 +175,12 @@ impl Executor for SarunExecutor {
         let r = ctrl_rpc("box_file_read", json!([box_id, rel]))
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
         let b64 = r.get("bytes").and_then(Value::as_str).unwrap_or("");
-        BASE64_STANDARD.decode(b64)
+        BASE64_STANDARD
+            .decode(b64)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
 
-    fn write_file(&self, box_id: &str, path: &str, bytes: &[u8])
-        -> std::io::Result<()>
-    {
+    fn write_file(&self, box_id: &str, path: &str, bytes: &[u8]) -> std::io::Result<()> {
         let rel = to_box_rel(path);
         let b64 = BASE64_STANDARD.encode(bytes);
         ctrl_rpc("box_file_write", json!([box_id, rel, b64]))
@@ -184,26 +188,34 @@ impl Executor for SarunExecutor {
         Ok(())
     }
 
-    fn list_dir(&self, box_id: &str, path: &str)
-        -> std::io::Result<Vec<(String, char)>>
-    {
+    fn list_dir(&self, box_id: &str, path: &str) -> std::io::Result<Vec<(String, char)>> {
         let rel = to_box_rel(path);
         let r = ctrl_rpc("box_dir_list", json!([box_id, rel]))
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
         let arr = r.as_array().cloned().unwrap_or_default();
-        Ok(arr.into_iter().filter_map(|e| {
-            let n = e.get("name").and_then(Value::as_str)?.to_string();
-            let k = e.get("kind").and_then(Value::as_str)?
-                     .chars().next().unwrap_or('?');
-            Some((n, k))
-        }).collect())
+        Ok(arr
+            .into_iter()
+            .filter_map(|e| {
+                let n = e.get("name").and_then(Value::as_str)?.to_string();
+                let k = e
+                    .get("kind")
+                    .and_then(Value::as_str)?
+                    .chars()
+                    .next()
+                    .unwrap_or('?');
+                Some((n, k))
+            })
+            .collect())
     }
 
     fn path_kind(&self, box_id: &str, path: &str) -> char {
         let rel = to_box_rel(path);
         match ctrl_rpc("box_path_kind", json!([box_id, rel])) {
-            Ok(r) => r.get("kind").and_then(Value::as_str)
-                      .and_then(|s| s.chars().next()).unwrap_or('?'),
+            Ok(r) => r
+                .get("kind")
+                .and_then(Value::as_str)
+                .and_then(|s| s.chars().next())
+                .unwrap_or('?'),
             Err(_) => '?',
         }
     }
@@ -227,7 +239,9 @@ impl Executor for SarunExecutor {
         let out = if discard {
             let mut cmd = Command::new(&self.sarun);
             cmd.arg("run").arg("-b");
-            if api_access { cmd.arg("--api"); }
+            if api_access {
+                cmd.arg("--api");
+            }
             cmd.args(["PEEK", "--", "sh", "-c", script])
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
@@ -242,16 +256,24 @@ impl Executor for SarunExecutor {
                 .output()
         };
         let (stdout, stderr, rc) = match out {
-            Ok(o) => (String::from_utf8_lossy(&o.stdout).into_owned(),
-                      filter_sarun_noise(&String::from_utf8_lossy(&o.stderr)),
-                      o.status.code().unwrap_or(-1)),
-            Err(e) => return ExecResult {
-                text: format!("error: cannot run sh: {e}"),
-                rc: -1, ..Default::default()
+            Ok(o) => (
+                String::from_utf8_lossy(&o.stdout).into_owned(),
+                filter_sarun_noise(&String::from_utf8_lossy(&o.stderr)),
+                o.status.code().unwrap_or(-1),
+            ),
+            Err(e) => {
+                return ExecResult {
+                    text: format!("error: cannot run sh: {e}"),
+                    rc: -1,
+                    ..Default::default()
+                };
             }
         };
-        let combined = if stderr.is_empty() { stdout.clone() }
-                       else { format!("{stdout}{stderr}") };
+        let combined = if stderr.is_empty() {
+            stdout.clone()
+        } else {
+            format!("{stdout}{stderr}")
+        };
         // Patch summary:
         //   discard: PEEK's own upper (just this script's writes), then reaped.
         //   non-discard: skipped — the wrapper's patch is cumulative across
@@ -259,12 +281,17 @@ impl Executor for SarunExecutor {
         //   noise that grows monotonically. The model can call inspect/read
         //   if it needs to see the current overlay state.
         let (patch, changes) = if discard {
-            let p = Command::new(&self.sarun).args(["PEEK", "patch"]).output()
+            let p = Command::new(&self.sarun)
+                .args(["PEEK", "patch"])
+                .output()
                 .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
                 .unwrap_or_default();
             let s = summarize_patch(&p, CHANGES_BUDGET);
-            let _ = Command::new(&self.sarun).args(["PEEK", "discard"])
-                .stdout(Stdio::null()).stderr(Stdio::null()).status();
+            let _ = Command::new(&self.sarun)
+                .args(["PEEK", "discard"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
             (p, s)
         } else {
             (String::new(), String::new())
@@ -276,16 +303,24 @@ impl Executor for SarunExecutor {
         } else {
             format!("{trimmed}\n\n=== changes ===\n{changes}")
         };
-        ExecResult { text, raw_output: combined, patch, rc }
+        ExecResult {
+            text,
+            raw_output: combined,
+            patch,
+            rc,
+        }
     }
 }
 
 /// Build the executor implied by args. `--no-sandbox` returns None so the
 /// shell/inspect/read/write tools surface an error result back to the model
 /// instead of dispatching ungated host operations.
-pub fn build_executor(no_sandbox: bool, sarun_override: Option<String>)
-    -> Option<Box<dyn Executor>>
-{
-    if no_sandbox { return None; }
+pub fn build_executor(
+    no_sandbox: bool,
+    sarun_override: Option<String>,
+) -> Option<Box<dyn Executor>> {
+    if no_sandbox {
+        return None;
+    }
     Some(Box::new(SarunExecutor::new(sarun_override)))
 }

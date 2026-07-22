@@ -1,7 +1,7 @@
 import struct
 import unittest
 
-from inferiors.linux_oracle import Snapshot, TaskId, TaskSnapshot
+from inferiors.linux_oracle import RegisterRead, Snapshot, TaskId, TaskSnapshot
 from inferiors.rsp_proxy import FacadeState, RspFacade
 
 
@@ -51,6 +51,16 @@ class FakeQemu:
 
     def step(self, cpu):
         self.steps.append(cpu)
+
+
+class FakeInternalContinue:
+    def __init__(self, handled):
+        self.handled = handled
+        self.calls = 0
+
+    def begin_continue(self):
+        self.calls += 1
+        return self.handled
 
 
 class RspFacadeTests(unittest.TestCase):
@@ -120,6 +130,43 @@ class RspFacadeTests(unittest.TestCase):
         self.facade.state = FacadeState.STOPPED
         self.facade.handle(b"Hcp1.1")
         self.assertEqual(self.facade.handle(b"vCont;s:p1.1"), b"E01")
+
+    def test_signal_stop_uses_event_registers_until_resume(self):
+        event_registers = RegisterRead(b"11223344xxxxxxxx")
+        stop = self.facade.on_stop(
+            TaskId(42, 42), signal=11, registers=event_registers
+        )
+        self.assertEqual(stop, b"T0bthread:p2a.2a;")
+        self.assertEqual(self.facade.handle(b"?"), b"T0bthread:p2a.2a;")
+        self.assertEqual(self.facade.handle(b"g"), event_registers.payload)
+
+        self.assertIsNone(self.facade.handle(b"c"))
+        self.facade.state = FacadeState.STOPPED
+        self.assertEqual(
+            self.facade.handle(b"g"),
+            struct.pack("<II", 42, 42).hex().encode(),
+        )
+
+    def test_internal_continue_step_replaces_ordinary_resume(self):
+        controller = FakeInternalContinue(True)
+        facade = RspFacade(
+            self.oracle,
+            self.qemu,
+            b"<target/>",
+            internal_continue=controller,
+        )
+        self.assertIsNone(facade.handle(b"c"))
+        self.assertEqual(controller.calls, 1)
+        self.assertEqual(self.qemu.resumes, 0)
+        self.assertEqual(facade.state, FacadeState.RUNNING)
+
+    def test_signal_continue_acknowledges_only_the_reported_linux_event(self):
+        self.facade.on_stop(TaskId(42, 42), signal=11)
+        self.assertEqual(self.facade.handle(b"C06"), b"E01")
+        self.assertEqual(self.qemu.resumes, 0)
+        self.assertIsNone(self.facade.handle(b"vCont;C0b:p2a.2a"))
+        self.assertEqual(self.facade.continue_thread, TaskId(42, 42))
+        self.assertEqual(self.qemu.resumes, 1)
 
 
 if __name__ == "__main__":

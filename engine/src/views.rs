@@ -26,7 +26,10 @@
 use std::collections::HashMap;
 
 use crate::discover;
-use crate::rules::{Clause, Join, Match, PathTarget, ProcFilterTarget, PipelineFilterTarget, EdgeFilterTarget, Subject, eval_clauses};
+use crate::rules::{
+    Clause, EdgeFilterTarget, Join, Match, PathTarget, PipelineFilterTarget, ProcFilterTarget,
+    Subject, eval_clauses,
+};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Kind {
@@ -54,7 +57,8 @@ impl Kind {
 /// tree rows, depth + connector included). `idx` is the surviving indices
 /// after the current filter, or the natural 0..N range when no filter is active.
 pub struct View {
-    #[allow(dead_code)] pub sid: i64,
+    #[allow(dead_code)]
+    pub sid: i64,
     pub source: ViewRows,
     pub idx: Vec<usize>,
     pub filter: Option<Vec<Clause>>,
@@ -84,11 +88,11 @@ impl ViewRows {
 }
 
 pub enum ViewAux {
-    Changes(Vec<Vec<i64>>),    // writer ids per row index
-    Procs(Vec<Subject>),       // subject per row index
-    Outputs(Vec<Subject>),     // subject per row index
-    Pipelines,                 // filter targets extracted from rows inline
-    BuildEdges,                // filter targets extracted from rows inline
+    Changes(Vec<Vec<i64>>), // writer ids per row index
+    Procs(Vec<Subject>),    // subject per row index
+    Outputs(Vec<Subject>),  // subject per row index
+    Pipelines,              // filter targets extracted from rows inline
+    BuildEdges,             // filter targets extracted from rows inline
 }
 
 // ── building source rows per kind ────────────────────────────────────────────
@@ -109,19 +113,26 @@ fn source_changes(
     // "kind=xattr" child row right after each file leaf without a
     // per-leaf sqlite hit. Empty for boxes without the xattr table or
     // without any xattr writes.
-    let mut xattr_by_name: std::collections::HashMap<String, Vec<(String, i64)>>
-        = std::collections::HashMap::new();
-    let has_xattr = conn.query_row(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='xattr'",
-        [], |_| Ok(())).is_ok();
+    let mut xattr_by_name: std::collections::HashMap<String, Vec<(String, i64)>> =
+        std::collections::HashMap::new();
+    let has_xattr = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='xattr'",
+            [],
+            |_| Ok(()),
+        )
+        .is_ok();
     if has_xattr {
-        if let Ok(mut st) = conn.prepare(
-            "SELECT name, key, length(value) FROM xattr ORDER BY name, key") {
-            if let Ok(it) = st.query_map([], |r| Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, i64>(2)?,
-            ))) {
+        if let Ok(mut st) =
+            conn.prepare("SELECT name, key, length(value) FROM xattr ORDER BY name, key")
+        {
+            if let Ok(it) = st.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            }) {
                 for (name, key, vlen) in it.flatten() {
                     xattr_by_name.entry(name).or_default().push((key, vlen));
                 }
@@ -130,8 +141,9 @@ fn source_changes(
     }
     // Pull leaves first (sorted by name), then walk to build the tree.
     let mut leaves: Vec<(String, &'static str, i64, Vec<i64>)> = vec![];
-    if let Ok(mut st) = conn.prepare(
-        "SELECT name, mode, sz, writer, last_writer FROM sqlar ORDER BY name") {
+    if let Ok(mut st) =
+        conn.prepare("SELECT name, mode, sz, writer, last_writer FROM sqlar ORDER BY name")
+    {
         let it = st.query_map([], |r| {
             Ok((
                 r.get::<_, String>(0)?,
@@ -143,12 +155,18 @@ fn source_changes(
         });
         if let Ok(it) = it {
             for (name, mode, sz, w0, w1) in it.flatten() {
-                let kind = if mode & S_IFMT == S_IFCHR { "deleted" }
-                           else if mode & S_IFMT == S_IFLNK { "symlink" }
-                           else { "changed" };
+                let kind = if mode & S_IFMT == S_IFCHR {
+                    "deleted"
+                } else if mode & S_IFMT == S_IFLNK {
+                    "symlink"
+                } else {
+                    "changed"
+                };
                 let mut wids = vec![];
                 for w in [w0, w1].into_iter().flatten() {
-                    if !wids.contains(&w) { wids.push(w); }
+                    if !wids.contains(&w) {
+                        wids.push(w);
+                    }
                 }
                 leaves.push((name, kind, sz, wids));
             }
@@ -166,27 +184,44 @@ fn source_changes(
     // need to still emit xattr children. We catch them by iterating
     // xattr_by_name entries we never consumed (the file may not appear
     // in sqlar at all if it's an xattr-only modification of a lower).
-    let mut consumed: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
+    let mut consumed: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (name, kind, sz, wids) in leaves {
-        let parts: Vec<String> = name.split('/')
-            .filter(|s| !s.is_empty()).map(String::from).collect();
-        if parts.is_empty() { continue; }
+        let parts: Vec<String> = name
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect();
+        if parts.is_empty() {
+            continue;
+        }
         let leaf_depth = parts.len() - 1;
         let mut common = 0;
-        while common < parts.len() && common < prev.len()
-            && parts[common] == prev[common] {
+        while common < parts.len() && common < prev.len() && parts[common] == prev[common] {
             common += 1;
         }
         // Emit connector rows for any newly-entered directory levels.
         for d in common..leaf_depth {
             rows.push(view_change_row(
-                &parts[..=d].join("/"), &parts[d], "dir", 0, d, true, None, None,
+                &parts[..=d].join("/"),
+                &parts[d],
+                "dir",
+                0,
+                d,
+                true,
+                None,
+                None,
             )?);
             ids.push(vec![]);
         }
         rows.push(view_change_row(
-            &name, &parts[leaf_depth], kind, sz, leaf_depth, false, None, None,
+            &name,
+            &parts[leaf_depth],
+            kind,
+            sz,
+            leaf_depth,
+            false,
+            None,
+            None,
         )?);
         ids.push(wids);
         // Xattr children: one row per (file, key) pair, indented one
@@ -199,8 +234,14 @@ fn source_changes(
         if let Some(xs) = xattr_by_name.get(&name) {
             for (key, vlen) in xs {
                 rows.push(view_change_row(
-                    &format!("{name}#xattr={key}"), key, "xattr", *vlen,
-                    leaf_depth + 1, false, Some(&name), Some(key),
+                    &format!("{name}#xattr={key}"),
+                    key,
+                    "xattr",
+                    *vlen,
+                    leaf_depth + 1,
+                    false,
+                    Some(&name),
+                    Some(key),
                 )?);
                 ids.push(vec![]);
             }
@@ -212,23 +253,35 @@ fn source_changes(
     // file the box just chattr-tagged, say). Append them at the end,
     // sorted by name, each with its own minimal connector chain so
     // they slot into the right directory.
-    let mut leftover: Vec<(String, Vec<(String, i64)>)> = xattr_by_name.into_iter()
+    let mut leftover: Vec<(String, Vec<(String, i64)>)> = xattr_by_name
+        .into_iter()
         .filter(|(n, _)| !consumed.contains(n))
         .collect();
     leftover.sort_by(|a, b| a.0.cmp(&b.0));
     for (name, xs) in leftover {
-        let parts: Vec<String> = name.split('/')
-            .filter(|s| !s.is_empty()).map(String::from).collect();
-        if parts.is_empty() { continue; }
+        let parts: Vec<String> = name
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect();
+        if parts.is_empty() {
+            continue;
+        }
         let leaf_depth = parts.len() - 1;
         let mut common = 0;
-        while common < parts.len() && common < prev.len()
-            && parts[common] == prev[common] {
+        while common < parts.len() && common < prev.len() && parts[common] == prev[common] {
             common += 1;
         }
         for d in common..leaf_depth {
             rows.push(view_change_row(
-                &parts[..=d].join("/"), &parts[d], "dir", 0, d, true, None, None,
+                &parts[..=d].join("/"),
+                &parts[d],
+                "dir",
+                0,
+                d,
+                true,
+                None,
+                None,
             )?);
             ids.push(vec![]);
         }
@@ -236,13 +289,26 @@ fn source_changes(
         // the air: kind="xattr-only" carries a hint glyph distinct
         // from a real "changed" file.
         rows.push(view_change_row(
-            &name, &parts[leaf_depth], "xattr-only", 0, leaf_depth, false, None, None,
+            &name,
+            &parts[leaf_depth],
+            "xattr-only",
+            0,
+            leaf_depth,
+            false,
+            None,
+            None,
         )?);
         ids.push(vec![]);
         for (key, vlen) in xs {
             rows.push(view_change_row(
-                &format!("{name}#xattr={key}"), &key, "xattr", vlen,
-                leaf_depth + 1, false, Some(&name), Some(&key),
+                &format!("{name}#xattr={key}"),
+                &key,
+                "xattr",
+                vlen,
+                leaf_depth + 1,
+                false,
+                Some(&name),
+                Some(&key),
             )?);
             ids.push(vec![]);
         }
@@ -260,15 +326,22 @@ fn source_outputs(
     // ONCE — one sqlite scan, indexed by row id — so we don't run a
     // proc_prov / process row query per output.
     let pmap: HashMap<i64, (String, i64)> = discover::open_ro_for(sid)
-        .and_then(|c| c.prepare("SELECT id, tgid, exe FROM process").ok().map(|mut st| {
-            st.query_map([], |r| Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, Option<i64>>(1)?.unwrap_or(0),
-                r.get::<_, Option<String>>(2)?.unwrap_or_default(),
-            ))).ok()
-              .map(|it| it.flatten().map(|(id, tg, ex)| (id, (ex, tg))).collect())
-              .unwrap_or_default()
-        }))
+        .and_then(|c| {
+            c.prepare("SELECT id, tgid, exe FROM process")
+                .ok()
+                .map(|mut st| {
+                    st.query_map([], |r| {
+                        Ok((
+                            r.get::<_, i64>(0)?,
+                            r.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                            r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                        ))
+                    })
+                    .ok()
+                    .map(|it| it.flatten().map(|(id, tg, ex)| (id, (ex, tg))).collect())
+                    .unwrap_or_default()
+                })
+        })
         .unwrap_or_default();
     // Subject + (exe, tgid) annotations. Subject is for the filter; the
     // annotations are embedded into each row so the UI doesn't have to RPC
@@ -276,11 +349,18 @@ fn source_outputs(
     let mut rows_out = Vec::with_capacity(rows.len());
     let mut subjects = Vec::with_capacity(rows.len());
     for output in rows {
-        let pid = output.process.and_then(|value| i64::try_from(value).ok()).unwrap_or(-1);
+        let pid = output
+            .process
+            .and_then(|value| i64::try_from(value).ok())
+            .unwrap_or(-1);
         let (exe, tgid) = pmap.get(&pid).cloned().unwrap_or_default();
         let argv: Vec<String> = vec![]; // outputs filter doesn't use arg
-        subjects.push(Subject { box_name: String::new(),
-                                exe: exe.clone(), cwd: String::new(), argv });
+        subjects.push(Subject {
+            box_name: String::new(),
+            exe: exe.clone(),
+            cwd: String::new(),
+            argv,
+        });
         rows_out.push(crate::generated_wire::ViewOutputRow {
             output,
             executable: wire_path(&exe)?,
@@ -307,10 +387,12 @@ fn source_procs(
         use std::collections::HashMap;
         let mut alive: HashMap<u32, bool> = HashMap::new();
         procs.retain(|process| {
-            let Some(tgid) = process.tgid.filter(|value| *value != 0) else { return false };
-            *alive.entry(tgid).or_insert_with(|| {
-                i32::try_from(tgid).is_ok_and(crate::control::pid_alive)
-            })
+            let Some(tgid) = process.tgid.filter(|value| *value != 0) else {
+                return false;
+            };
+            *alive
+                .entry(tgid)
+                .or_insert_with(|| i32::try_from(tgid).is_ok_and(crate::control::pid_alive))
         });
     }
     let roots = discover::proc_roots_typed(sid)?.into_iter().collect();
@@ -320,21 +402,40 @@ fn source_procs(
     // (rid → cwd) pairs in ONE sqlite scan so a million-row procs view isn't
     // a million per-row queries (which made view.open take ~30 s at scale).
     let cwd_by_rid: HashMap<u64, String> = discover::open_ro_for(sid)
-        .and_then(|c| c.prepare("SELECT id, cwd FROM process").ok().map(|mut st| {
-            st.query_map([], |r| Ok((r.get::<_, i64>(0)?,
-                                     r.get::<_, Option<String>>(1)?.unwrap_or_default())))
-              .ok().map(|it| it.flatten().filter_map(|(id, cwd)|
-                  u64::try_from(id).ok().map(|id| (id, cwd))).collect::<HashMap<_, _>>())
-              .unwrap_or_default()
-        }))
+        .and_then(|c| {
+            c.prepare("SELECT id, cwd FROM process").ok().map(|mut st| {
+                st.query_map([], |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                    ))
+                })
+                .ok()
+                .map(|it| {
+                    it.flatten()
+                        .filter_map(|(id, cwd)| u64::try_from(id).ok().map(|id| (id, cwd)))
+                        .collect::<HashMap<_, _>>()
+                })
+                .unwrap_or_default()
+            })
+        })
         .unwrap_or_default();
     let mut subjects = Vec::with_capacity(rows.len());
     for row in &rows {
         let exe = String::from_utf8_lossy(row.executable.as_slice()).into_owned();
-        let argv = row.argv.as_slice().iter()
-            .map(|word| String::from_utf8_lossy(word.as_slice()).into_owned()).collect();
+        let argv = row
+            .argv
+            .as_slice()
+            .iter()
+            .map(|word| String::from_utf8_lossy(word.as_slice()).into_owned())
+            .collect();
         let cwd = cwd_by_rid.get(&row.id).cloned().unwrap_or_default();
-        subjects.push(Subject { box_name: String::new(), exe, cwd, argv });
+        subjects.push(Subject {
+            box_name: String::new(),
+            exe,
+            cwd,
+            argv,
+        });
     }
     Ok((rows, subjects))
 }
@@ -399,19 +500,27 @@ fn build_proc_tree(
         let mut seen = HashSet::new();
         let mut cur = start;
         for _ in 0..PROC_TREE_DEPTH {
-            if seen.contains(&cur) { break; }
+            if seen.contains(&cur) {
+                break;
+            }
             seen.insert(cur);
             path.push(cur);
-            if roots.contains(&cur) { break; }
+            if roots.contains(&cur) {
+                break;
+            }
             let got = match nodes.get(&cur) {
                 Some(n) => n.clone(),
                 None => {
-                    let Some(process) = discover::proc_info_typed(sid, cur)? else { break };
+                    let Some(process) = discover::proc_info_typed(sid, cur)? else {
+                        break;
+                    };
                     process_info_node(process)
                 }
             };
             let Some(parent_id) = got.parent else { break };
-            if parent_id == 0 { break; }
+            if parent_id == 0 {
+                break;
+            }
             if !nodes.contains_key(&parent_id) {
                 if let Some(process) = discover::proc_info_typed(sid, parent_id)? {
                     nodes.insert(parent_id, process_info_node(process));
@@ -432,9 +541,13 @@ fn build_proc_tree(
     let mut out = vec![];
     for path in &paths {
         for (depth, &rid) in path.iter().enumerate() {
-            if !emitted.insert(rid) { continue; }
+            if !emitted.insert(rid) {
+                continue;
+            }
             let connector = !members.contains_key(&rid);
-            let Some(node) = nodes.get(&rid) else { continue };
+            let Some(node) = nodes.get(&rid) else {
+                continue;
+            };
             out.push(crate::generated_wire::ViewProcessRow {
                 id: rid,
                 tgid: node.tgid,
@@ -503,38 +616,43 @@ fn view_change_row(
 
 // ── filter parsing + application ────────────────────────────────────────────
 
-fn relation_filter(
-    filter: Option<&crate::generated_wire::FilterSpec>,
-) -> Option<Vec<Clause>> {
+fn relation_filter(filter: Option<&crate::generated_wire::FilterSpec>) -> Option<Vec<Clause>> {
     let clauses = filter?.as_slice();
-    if clauses.is_empty() { return None; }
-    let out = clauses.iter().map(|clause| {
-        let kind = match clause.kind {
-            crate::generated_wire::FilterKind::Path => "path",
-            crate::generated_wire::FilterKind::Box => "box",
-            crate::generated_wire::FilterKind::Exe => "exe",
-            crate::generated_wire::FilterKind::Cwd => "cwd",
-            crate::generated_wire::FilterKind::Arg => "arg",
-            crate::generated_wire::FilterKind::Ids => "ids",
-            crate::generated_wire::FilterKind::Err => "err",
-            crate::generated_wire::FilterKind::Cmd => "cmd",
-            crate::generated_wire::FilterKind::Target => "target",
-        };
-        let join = match clause.join {
-            crate::generated_wire::FilterJoin::And => Join::And,
-            crate::generated_wire::FilterJoin::Or => Join::Or,
-        };
-        Clause {
-            m: Match {
-                kind: kind.into(),
-                pattern: clause.pattern.as_str().into(),
-            },
-            join,
-            negate: clause.negated,
-            enabled: clause.enabled,
-        }
-    }).collect::<Vec<_>>();
-    if out.iter().all(|c| !c.enabled) { return None; }
+    if clauses.is_empty() {
+        return None;
+    }
+    let out = clauses
+        .iter()
+        .map(|clause| {
+            let kind = match clause.kind {
+                crate::generated_wire::FilterKind::Path => "path",
+                crate::generated_wire::FilterKind::Box => "box",
+                crate::generated_wire::FilterKind::Exe => "exe",
+                crate::generated_wire::FilterKind::Cwd => "cwd",
+                crate::generated_wire::FilterKind::Arg => "arg",
+                crate::generated_wire::FilterKind::Ids => "ids",
+                crate::generated_wire::FilterKind::Err => "err",
+                crate::generated_wire::FilterKind::Cmd => "cmd",
+                crate::generated_wire::FilterKind::Target => "target",
+            };
+            let join = match clause.join {
+                crate::generated_wire::FilterJoin::And => Join::And,
+                crate::generated_wire::FilterJoin::Or => Join::Or,
+            };
+            Clause {
+                m: Match {
+                    kind: kind.into(),
+                    pattern: clause.pattern.as_str().into(),
+                },
+                join,
+                negate: clause.negated,
+                enabled: clause.enabled,
+            }
+        })
+        .collect::<Vec<_>>();
+    if out.iter().all(|c| !c.enabled) {
+        return None;
+    }
     Some(out)
 }
 
@@ -545,61 +663,128 @@ fn rebuild_idx(view: &mut View) {
     };
     match (&view.source, &view.aux) {
         (ViewRows::Changes(rows), ViewAux::Changes(ids)) => {
-            view.idx = rows.iter().enumerate().filter_map(|(i, row)| {
-                // A filter is a "show me these rows" set — connectors are
-                // tree-scaffolding, not changes to match against; they only
-                // appear in the unfiltered tree view.
-                if row.connector {
-                    return None;
-                }
-                let rel = std::str::from_utf8(row.path.as_slice()).unwrap_or("");
-                let row_ids = ids.get(i).cloned().unwrap_or_default();
-                let t = PathTarget { rel, subject: Subject::default(), ids: row_ids };
-                if eval_clauses(&t, clauses) { Some(i) } else { None }
-            }).collect();
+            view.idx = rows
+                .iter()
+                .enumerate()
+                .filter_map(|(i, row)| {
+                    // A filter is a "show me these rows" set — connectors are
+                    // tree-scaffolding, not changes to match against; they only
+                    // appear in the unfiltered tree view.
+                    if row.connector {
+                        return None;
+                    }
+                    let rel = std::str::from_utf8(row.path.as_slice()).unwrap_or("");
+                    let row_ids = ids.get(i).cloned().unwrap_or_default();
+                    let t = PathTarget {
+                        rel,
+                        subject: Subject::default(),
+                        ids: row_ids,
+                    };
+                    if eval_clauses(&t, clauses) {
+                        Some(i)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
         }
         (ViewRows::Processes(rows), ViewAux::Procs(subjects)) => {
-            view.idx = rows.iter().enumerate().filter_map(|(i, row)| {
-                if row.connector {
-                    return None;   // connectors never survive a typed filter
-                }
-                let rid = i64::try_from(row.id).unwrap_or(i64::MAX);
-                let subject = subjects.get(i).cloned().unwrap_or_default();
-                let t = ProcFilterTarget { row_id: rid, subject, err: false };
-                if eval_clauses(&t, clauses) { Some(i) } else { None }
-            }).collect();
+            view.idx = rows
+                .iter()
+                .enumerate()
+                .filter_map(|(i, row)| {
+                    if row.connector {
+                        return None; // connectors never survive a typed filter
+                    }
+                    let rid = i64::try_from(row.id).unwrap_or(i64::MAX);
+                    let subject = subjects.get(i).cloned().unwrap_or_default();
+                    let t = ProcFilterTarget {
+                        row_id: rid,
+                        subject,
+                        err: false,
+                    };
+                    if eval_clauses(&t, clauses) {
+                        Some(i)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
         }
         (ViewRows::Outputs(rows), ViewAux::Outputs(subjects)) => {
-            view.idx = rows.iter().enumerate().filter_map(|(i, row)| {
-                let pid = row.output.process
-                    .and_then(|id| i64::try_from(id).ok()).unwrap_or(-1);
-                let subject = subjects.get(i).cloned().unwrap_or_default();
-                let err = row.output.stream == crate::generated_wire::EchoStream::Stderr;
-                let t = ProcFilterTarget { row_id: pid, subject, err };
-                if eval_clauses(&t, clauses) { Some(i) } else { None }
-            }).collect();
+            view.idx = rows
+                .iter()
+                .enumerate()
+                .filter_map(|(i, row)| {
+                    let pid = row
+                        .output
+                        .process
+                        .and_then(|id| i64::try_from(id).ok())
+                        .unwrap_or(-1);
+                    let subject = subjects.get(i).cloned().unwrap_or_default();
+                    let err = row.output.stream == crate::generated_wire::EchoStream::Stderr;
+                    let t = ProcFilterTarget {
+                        row_id: pid,
+                        subject,
+                        err,
+                    };
+                    if eval_clauses(&t, clauses) {
+                        Some(i)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
         }
         (ViewRows::Pipelines(rows), ViewAux::Pipelines) => {
-            view.idx = rows.iter().enumerate().filter_map(|(i, row)| {
-                let row_id = i64::try_from(row.id).unwrap_or(i64::MAX);
-                let cmd = row.command.as_str().to_string();
-                let err = row.exit_code.is_some_and(|code| code > 0);
-                let t = PipelineFilterTarget { row_id, cmd, err };
-                if eval_clauses(&t, clauses) { Some(i) } else { None }
-            }).collect();
+            view.idx = rows
+                .iter()
+                .enumerate()
+                .filter_map(|(i, row)| {
+                    let row_id = i64::try_from(row.id).unwrap_or(i64::MAX);
+                    let cmd = row.command.as_str().to_string();
+                    let err = row.exit_code.is_some_and(|code| code > 0);
+                    let t = PipelineFilterTarget { row_id, cmd, err };
+                    if eval_clauses(&t, clauses) {
+                        Some(i)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
         }
         (ViewRows::BuildEdges(rows), ViewAux::BuildEdges) => {
-            view.idx = rows.iter().enumerate().filter_map(|(i, row)| {
-                let row_id = i64::try_from(row.id).unwrap_or(i64::MAX);
-                let targets = row.outputs.as_slice().iter()
-                    .map(|path| String::from_utf8_lossy(path.as_slice()).into_owned())
-                    .collect();
-                let cmd = row.command.as_ref().map(|value| value.as_str())
-                    .unwrap_or("").to_string();
-                let err = row.exit_code.is_some_and(|code| code != 0);
-                let t = EdgeFilterTarget { row_id, targets, cmd, err };
-                if eval_clauses(&t, clauses) { Some(i) } else { None }
-            }).collect();
+            view.idx = rows
+                .iter()
+                .enumerate()
+                .filter_map(|(i, row)| {
+                    let row_id = i64::try_from(row.id).unwrap_or(i64::MAX);
+                    let targets = row
+                        .outputs
+                        .as_slice()
+                        .iter()
+                        .map(|path| String::from_utf8_lossy(path.as_slice()).into_owned())
+                        .collect();
+                    let cmd = row
+                        .command
+                        .as_ref()
+                        .map(|value| value.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let err = row.exit_code.is_some_and(|code| code != 0);
+                    let t = EdgeFilterTarget {
+                        row_id,
+                        targets,
+                        cmd,
+                        err,
+                    };
+                    if eval_clauses(&t, clauses) {
+                        Some(i)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
         }
         // (kind, aux) are constructed in lockstep in `open`, so the cross
         // arms are unreachable — fall back to the unfiltered set defensively.
@@ -633,15 +818,23 @@ pub fn open(
             let (rows, subjects) = source_outputs(sid)?;
             (ViewRows::Outputs(rows), ViewAux::Outputs(subjects))
         }
-        Kind::Pipelines => {
-            (ViewRows::Pipelines(source_pipelines(sid)?), ViewAux::Pipelines)
-        }
-        Kind::BuildEdges => {
-            (ViewRows::BuildEdges(source_build_edges(sid)?), ViewAux::BuildEdges)
-        }
+        Kind::Pipelines => (
+            ViewRows::Pipelines(source_pipelines(sid)?),
+            ViewAux::Pipelines,
+        ),
+        Kind::BuildEdges => (
+            ViewRows::BuildEdges(source_build_edges(sid)?),
+            ViewAux::BuildEdges,
+        ),
     };
     let filter = relation_filter(filter.as_ref());
-    let mut view = View { sid, source, idx: vec![], filter, aux };
+    let mut view = View {
+        sid,
+        source,
+        idx: vec![],
+        filter,
+        aux,
+    };
     rebuild_idx(&mut view);
     *next_id = next_id.checked_add(1).ok_or("view identity exhausted")?;
     let id = *next_id;
@@ -671,11 +864,17 @@ pub fn window(
     let total = u64::try_from(view.idx.len()).map_err(|_| "view row count exceeds u64")?;
     macro_rules! window_rows {
         ($rows:expr, $variant:ident) => {{
-            let selected = view.idx[start..end].iter()
-                .map(|&index| $rows[index].clone()).collect();
+            let selected = view.idx[start..end]
+                .iter()
+                .map(|&index| $rows[index].clone())
+                .collect();
             let rows = crate::wire::BoundedVec::<_, 0, LIMIT_COLLECTION_ITEMS>::new(selected)
                 .map_err(|error| format!("view window exceeds relation bound: {error:?}"))?;
-            ViewWindow::$variant { start: start_wire, total, rows }
+            ViewWindow::$variant {
+                start: start_wire,
+                total,
+                rows,
+            }
         }};
     }
     Ok(match &view.source {
@@ -715,7 +914,8 @@ pub fn find(reg: &Registry, view_id: u64, target_id: u64) -> Result<Option<u64>,
             ViewRows::BuildEdges(rows) => Some(rows[i].id),
         };
         if id == Some(target_id) {
-            return u64::try_from(pos).map(Some)
+            return u64::try_from(pos)
+                .map(Some)
                 .map_err(|_| "view position exceeds u64".into());
         }
     }
@@ -734,9 +934,19 @@ mod tests {
 
     #[test]
     fn every_view_row_family_materializes_into_its_closed_window_variant() {
-        let change = vec![view_change_row(
-            "src/main.rs", "main.rs", "changed", 12, 1, false, None, None,
-        ).unwrap()];
+        let change = vec![
+            view_change_row(
+                "src/main.rs",
+                "main.rs",
+                "changed",
+                12,
+                1,
+                false,
+                None,
+                None,
+            )
+            .unwrap(),
+        ];
         assert_eq!(change[0].kind, ChangeKind::Changed);
 
         let process = vec![crate::generated_wire::ViewProcessRow {
@@ -748,7 +958,8 @@ mod tests {
                 wire_os_string("sh").unwrap(),
                 wire_os_string("-c").unwrap(),
                 wire_os_string("true").unwrap(),
-            ]).unwrap(),
+            ])
+            .unwrap(),
             depth: 0,
             connector: false,
         }];
@@ -776,10 +987,13 @@ mod tests {
                 negated: false,
                 stages: crate::wire::BoundedVec::new(vec![PipelineStage::Simple {
                     words: crate::wire::BoundedVec::new(vec![
-                        wire_os_string("echo").unwrap(), wire_os_string("hi").unwrap(),
-                    ]).unwrap(),
+                        wire_os_string("echo").unwrap(),
+                        wire_os_string("hi").unwrap(),
+                    ])
+                    .unwrap(),
                     redirects: 1,
-                }]).unwrap(),
+                }])
+                .unwrap(),
                 output_targets: crate::wire::BoundedVec::new(vec![wire_path("out").unwrap()])
                     .unwrap(),
                 uid: 12,
@@ -799,7 +1013,10 @@ mod tests {
             processes: crate::wire::BoundedVec::new(vec![7]).unwrap(),
         }];
         let record = pipeline[0].record.as_ref().unwrap();
-        assert!(matches!(record.stages.as_slice()[0], PipelineStage::Simple { .. }));
+        assert!(matches!(
+            record.stages.as_slice()[0],
+            PipelineStage::Simple { .. }
+        ));
         assert_eq!(record.edge_output.as_ref().unwrap().as_slice(), b"out");
 
         let edge = vec![crate::generated_wire::BuildEdgeRow {
@@ -825,19 +1042,22 @@ mod tests {
         for (index, source) in families.into_iter().enumerate() {
             let view_id = index as u64 + 1;
             let mut registry = Registry::new();
-            registry.insert(view_id, View {
-                sid: 1,
-                source,
-                idx: vec![0],
-                filter: None,
-                aux: match index {
-                    0 => ViewAux::Changes(vec![vec![]]),
-                    1 => ViewAux::Procs(vec![Subject::default()]),
-                    2 => ViewAux::Outputs(vec![Subject::default()]),
-                    3 => ViewAux::Pipelines,
-                    _ => ViewAux::BuildEdges,
+            registry.insert(
+                view_id,
+                View {
+                    sid: 1,
+                    source,
+                    idx: vec![0],
+                    filter: None,
+                    aux: match index {
+                        0 => ViewAux::Changes(vec![vec![]]),
+                        1 => ViewAux::Procs(vec![Subject::default()]),
+                        2 => ViewAux::Outputs(vec![Subject::default()]),
+                        3 => ViewAux::Pipelines,
+                        _ => ViewAux::BuildEdges,
+                    },
                 },
-            });
+            );
             let window = window(&registry, view_id, 0, 1).unwrap();
             assert_eq!(window.code(), index as u64 + 1);
             match window {

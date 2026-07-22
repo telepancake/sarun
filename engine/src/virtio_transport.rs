@@ -28,11 +28,7 @@ impl BoxExport {
         Self::start_at(fs, box_id, crate::paths::virtiofs_socket(box_id))
     }
 
-    fn start_at(
-        fs: &crate::sarunfs::SarunFs,
-        box_id: i64,
-        socket: PathBuf,
-    ) -> io::Result<Self> {
+    fn start_at(fs: &crate::sarunfs::SarunFs, box_id: i64, socket: PathBuf) -> io::Result<Self> {
         let scoped = fs.export_box(box_id)?;
         if let Some(parent) = socket.parent() {
             std::fs::create_dir_all(parent)?;
@@ -42,9 +38,12 @@ impl BoxExport {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
-        let socket_text = socket.to_str().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "virtio-fs socket is not UTF-8")
-        })?.to_owned();
+        let socket_text = socket
+            .to_str()
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "virtio-fs socket is not UTF-8")
+            })?
+            .to_owned();
         let thread = std::thread::Builder::new()
             .name(format!("virtiofs-box-{box_id}"))
             .spawn(move || {
@@ -55,7 +54,10 @@ impl BoxExport {
                     0,
                 )
             })?;
-        let export = Self { socket, thread: Some(thread) };
+        let export = Self {
+            socket,
+            thread: Some(thread),
+        };
         export.wait_ready(READY_TIMEOUT)?;
         Ok(export)
     }
@@ -66,7 +68,10 @@ impl BoxExport {
 
     /// Wait for the frontend to disconnect and remove the stale socket name.
     pub fn wait(mut self) -> io::Result<()> {
-        let result = self.thread.take().expect("export thread present")
+        let result = self
+            .thread
+            .take()
+            .expect("export thread present")
             .join()
             .map_err(|_| io::Error::other("virtio-fs transport thread panicked"))?;
         let _ = std::fs::remove_file(&self.socket);
@@ -83,7 +88,8 @@ impl BoxExport {
         if forced {
             let _ = std::os::unix::net::UnixStream::connect(&self.socket);
         }
-        let result = thread.join()
+        let result = thread
+            .join()
             .map_err(|_| io::Error::other("virtio-fs transport thread panicked"))?;
         let _ = std::fs::remove_file(&self.socket);
         if forced {
@@ -104,10 +110,7 @@ impl BoxExport {
         loop {
             match std::fs::symlink_metadata(&self.socket) {
                 Ok(meta) if meta.file_type().is_socket() => {
-                    std::fs::set_permissions(
-                        &self.socket,
-                        std::fs::Permissions::from_mode(0o600),
-                    )?;
+                    std::fs::set_permissions(&self.socket, std::fs::Permissions::from_mode(0o600))?;
                     return Ok(());
                 }
                 Ok(_) => {
@@ -120,12 +123,17 @@ impl BoxExport {
                 Err(error) => return Err(error),
             }
             if self.thread.as_ref().is_some_and(JoinHandle::is_finished) {
-                return Err(io::Error::other("virtio-fs transport exited before binding"));
+                return Err(io::Error::other(
+                    "virtio-fs transport exited before binding",
+                ));
             }
             if Instant::now() >= deadline {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
-                    format!("virtio-fs socket did not appear at {}", self.socket.display()),
+                    format!(
+                        "virtio-fs socket did not appear at {}",
+                        self.socket.display()
+                    ),
                 ));
             }
             std::thread::sleep(Duration::from_millis(5));

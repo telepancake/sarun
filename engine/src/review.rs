@@ -52,28 +52,28 @@ fn relation_text<const MAXIMUM: usize>(
 fn relation_list<T>(
     values: Vec<T>,
     field: &str,
-) -> Result<crate::wire::BoundedVec<
-    T, 0, { crate::generated_wire::LIMIT_COLLECTION_ITEMS },
->, String> {
+) -> Result<crate::wire::BoundedVec<T, 0, { crate::generated_wire::LIMIT_COLLECTION_ITEMS }>, String>
+{
     crate::wire::BoundedVec::new(values)
         .map_err(|error| format!("{field} exceeds relation bound: {error:?}"))
 }
 
-pub fn session_changes_typed(id: i64)
-    -> Result<Vec<crate::generated_wire::ChangeRow>, String>
-{
+pub fn session_changes_typed(id: i64) -> Result<Vec<crate::generated_wire::ChangeRow>, String> {
     use crate::generated_wire::{ChangeKind, ChangeRow};
-    let conn = Connection::open_with_flags(
-        sqlar_path(id), OpenFlags::SQLITE_OPEN_READ_ONLY)
+    let conn = Connection::open_with_flags(sqlar_path(id), OpenFlags::SQLITE_OPEN_READ_ONLY)
         .map_err(|error| error.to_string())?;
-    let mut statement = conn.prepare(
-        "SELECT name,mode,sz FROM sqlar ORDER BY name")
+    let mut statement = conn
+        .prepare("SELECT name,mode,sz FROM sqlar ORDER BY name")
         .map_err(|error| error.to_string())?;
-    let rows = statement.query_map([], |row| Ok((
-        row.get::<_, String>(0)?,
-        row.get::<_, i64>(1)?,
-        row.get::<_, i64>(2)?,
-    ))).map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })
+        .map_err(|error| error.to_string())?;
     rows.map(|row| {
         let (name, mode, size) = row.map_err(|error| error.to_string())?;
         let mode = u32::try_from(mode).map_err(|_| "stored file mode exceeds u32")?;
@@ -90,7 +90,8 @@ pub fn session_changes_typed(id: i64)
             kind,
             size: u64::try_from(size).map_err(|_| "negative stored change size")?,
         })
-    }).collect()
+    })
+    .collect()
 }
 
 /// The box's current bytes for `rel`: symlink target (raw in the row) or the
@@ -121,9 +122,10 @@ pub fn current_mode(id: i64, rel: &str) -> Option<u32> {
     crate::depot::archive_mode(&conn, rel)
 }
 
-fn diff_line(style: &str, text: impl Into<String>)
-    -> Result<crate::generated_wire::DiffLine, String>
-{
+fn diff_line(
+    style: &str,
+    text: impl Into<String>,
+) -> Result<crate::generated_wire::DiffLine, String> {
     Ok(crate::generated_wire::DiffLine {
         style: crate::wire::BoundedText::new(style.to_owned())
             .map_err(|error| format!("diff style exceeds relation bound: {error:?}"))?,
@@ -132,9 +134,7 @@ fn diff_line(style: &str, text: impl Into<String>)
     })
 }
 
-pub fn hunks_typed(id: i64, rel: &str)
-    -> Result<crate::generated_wire::FileDiff, String>
-{
+pub fn hunks_typed(id: i64, rel: &str) -> Result<crate::generated_wire::FileDiff, String> {
     use crate::generated_wire::{ChangeKind, DiffHunk, FileDiff};
     let rel = rel.trim_start_matches('/');
     let Some(mode) = current_mode(id, rel) else {
@@ -159,43 +159,77 @@ pub fn hunks_typed(id: i64, rel: &str)
     }
     let cur = current_bytes(id, rel).unwrap_or_default();
     let low = lower_bytes(rel);
-    let text = !cur.contains(&0) && !low.contains(&0)
-        && std::str::from_utf8(&cur).is_ok() && std::str::from_utf8(&low).is_ok();
+    let text = !cur.contains(&0)
+        && !low.contains(&0)
+        && std::str::from_utf8(&cur).is_ok()
+        && std::str::from_utf8(&low).is_ok();
     if !text {
         let modified = host.exists();
-        let kind = if modified { ChangeKind::Modified } else { ChangeKind::Created };
+        let kind = if modified {
+            ChangeKind::Modified
+        } else {
+            ChangeKind::Created
+        };
         let content = crate::wire::BoundedBytes::new(cur)
             .map_err(|error| format!("binary diff content exceeds relation bound: {error:?}"))?;
         let content_before = if modified && !low.is_empty() {
-            Some(crate::wire::BoundedBytes::new(low).map_err(|error| format!(
-                "binary base content exceeds relation bound: {error:?}"))?)
+            Some(crate::wire::BoundedBytes::new(low).map_err(|error| {
+                format!("binary base content exceeds relation bound: {error:?}")
+            })?)
         } else {
             None
         };
-        return Ok(FileDiff::Binary { kind, content, content_before });
+        return Ok(FileDiff::Binary {
+            kind,
+            content,
+            content_before,
+        });
     }
     // text: grouped unified diff, lines tagged like _build_hunks_display.
     let lo = String::from_utf8(low).map_err(|_| "invalid UTF-8 base diff")?;
     let cu = String::from_utf8(cur).map_err(|_| "invalid UTF-8 current diff")?;
     let diff = TextDiff::from_lines(&lo, &cu);
-    let ll: Vec<&str> = diff.iter_old_slices().map(|s| s.trim_end_matches(['\r', '\n'])).collect();
-    let ul: Vec<&str> = diff.iter_new_slices().map(|s| s.trim_end_matches(['\r', '\n'])).collect();
+    let ll: Vec<&str> = diff
+        .iter_old_slices()
+        .map(|s| s.trim_end_matches(['\r', '\n']))
+        .collect();
+    let ul: Vec<&str> = diff
+        .iter_new_slices()
+        .map(|s| s.trim_end_matches(['\r', '\n']))
+        .collect();
     let mut hunks = Vec::new();
     for (gi, group) in diff.grouped_ops(3).iter().enumerate() {
-        if group.is_empty() { continue; }
+        if group.is_empty() {
+            continue;
+        }
         let (_, a0, _) = group[0].as_tag_tuple();
         let (_, alast, blast) = group[group.len() - 1].as_tag_tuple();
         let (_, _, b0) = group[0].as_tag_tuple();
-        let mut lines = vec![diff_line("hdr",
-            format!("@@ -{},{} +{},{} @@", a0.start + 1, alast.end - a0.start,
-                    b0.start + 1, blast.end - b0.start))?];
+        let mut lines = vec![diff_line(
+            "hdr",
+            format!(
+                "@@ -{},{} +{},{} @@",
+                a0.start + 1,
+                alast.end - a0.start,
+                b0.start + 1,
+                blast.end - b0.start
+            ),
+        )?];
         for op in group {
             let (tag, orange, nrange) = op.as_tag_tuple();
             match tag {
-                DiffTag::Equal => for k in orange { lines.push(diff_line(" ", ll[k])?); },
+                DiffTag::Equal => {
+                    for k in orange {
+                        lines.push(diff_line(" ", ll[k])?);
+                    }
+                }
                 _ => {
-                    for k in orange { lines.push(diff_line("-", ll[k])?); }
-                    for k in nrange { lines.push(diff_line("+", ul[k])?); }
+                    for k in orange {
+                        lines.push(diff_line("-", ll[k])?);
+                    }
+                    for k in nrange {
+                        lines.push(diff_line("+", ul[k])?);
+                    }
                 }
             }
         }
@@ -218,12 +252,8 @@ pub fn hunks_typed(id: i64, rel: &str)
 pub fn file_bytes_typed(id: i64, rel: &str) -> Result<Vec<u8>, String> {
     let rel = rel.trim_start_matches('/');
     match current_mode(id, rel) {
-        Some(mode) if mode & S_IFMT == S_IFCHR => {
-            Err("deleted in box".into())
-        }
-        Some(mode) if mode & S_IFMT == S_IFLNK => {
-            Err("symlink, not a document".into())
-        }
+        Some(mode) if mode & S_IFMT == S_IFCHR => Err("deleted in box".into()),
+        Some(mode) if mode & S_IFMT == S_IFLNK => Err("symlink, not a document".into()),
         Some(_) => match current_bytes(id, rel) {
             Some(current) => Ok(current),
             None => Err("content unavailable".into()),
@@ -281,9 +311,7 @@ pub fn write_file_checked_typed(
 /// is the ONLY behavioral difference between the two callers (see
 /// `write_file_checked`): when true a path that exists nowhere passes (the
 /// agent creates a new file in the box's upper); when false it is refused.
-fn write_file_guard(id: i64, rel: &str, bytes: &[u8], allow_create: bool)
-    -> Result<(), String>
-{
+fn write_file_guard(id: i64, rel: &str, bytes: &[u8], allow_create: bool) -> Result<(), String> {
     if rel.is_empty() {
         return Err("empty path".into());
     }
@@ -323,8 +351,7 @@ fn write_file_guard(id: i64, rel: &str, bytes: &[u8], allow_create: bool)
                 // Exists nowhere: the editor refuses (it opens existing
                 // files); the agent file-write tool creates it.
                 Err(_) if allow_create => Ok(()),
-                Err(_) => Err(
-                    "no such file (neither captured nor on the host)".into()),
+                Err(_) => Err("no such file (neither captured nor on the host)".into()),
             }
         }
     }
@@ -343,9 +370,10 @@ pub fn current_mtime(id: i64, rel: &str) -> Option<i64> {
 /// Decorate a batch of paths in one go (one RPC, one server-side host stat
 /// loop). Used by the UI to decorate a window of changes-pane rows without
 /// paying a round-trip per row.
-pub fn decorate_many_typed(id: i64, rels: &[&str])
-    -> Result<Vec<crate::generated_wire::ChangeDecoration>, String>
-{
+pub fn decorate_many_typed(
+    id: i64,
+    rels: &[&str],
+) -> Result<Vec<crate::generated_wire::ChangeDecoration>, String> {
     rels.iter().map(|rel| decorate_typed(id, rel)).collect()
 }
 
@@ -358,13 +386,13 @@ pub fn recent_changes_typed(
     limit: u64,
 ) -> Result<Vec<crate::generated_wire::ChangeRow>, String> {
     use crate::generated_wire::{ChangeKind, ChangeRow};
-    let conn = Connection::open_with_flags(
-        sqlar_path(id), OpenFlags::SQLITE_OPEN_READ_ONLY)
+    let conn = Connection::open_with_flags(sqlar_path(id), OpenFlags::SQLITE_OPEN_READ_ONLY)
         .map_err(|error| error.to_string())?;
     let limit = i64::try_from(limit).map_err(|_| "change limit exceeds SQLite range")?;
-    crate::depot::archive_recent(&conn, limit).map_err(|error| error.to_string())?
-        .into_iter().map(
-        |(name, mode, size, _)| {
+    crate::depot::archive_recent(&conn, limit)
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .map(|(name, mode, size, _)| {
             let mode = u32::try_from(mode).map_err(|_| "stored file mode exceeds u32")?;
             let kind = if mode & S_IFMT == S_IFCHR {
                 ChangeKind::Deleted
@@ -379,8 +407,8 @@ pub fn recent_changes_typed(
                 kind,
                 size: u64::try_from(size).map_err(|_| "negative stored change size")?,
             })
-        },
-    ).collect()
+        })
+        .collect()
 }
 
 /// Five-list bundle for the Sessions-view right pane: newest-first
@@ -389,72 +417,98 @@ pub fn recent_changes_typed(
 /// changes list as their own rows (kind="xattr"), tagged with the file
 /// they hang off + the xattr key — they were invisible before, now
 /// they aren't.
-pub fn box_summary_typed(
-    id: i64,
-    limit: u64,
-) -> Result<crate::generated_wire::BoxSummary, String> {
+pub fn box_summary_typed(id: i64, limit: u64) -> Result<crate::generated_wire::BoxSummary, String> {
     use crate::generated_wire::{
         BoxSummary, ChangeKind, ChangePreview, EchoStream, EdgePreview, FailureKind,
         FailurePreview, OutputPreview, PipelinePreview, ProcessPreview,
     };
-    let conn = Connection::open_with_flags(
-        sqlar_path(id), OpenFlags::SQLITE_OPEN_READ_ONLY)
+    let conn = Connection::open_with_flags(sqlar_path(id), OpenFlags::SQLITE_OPEN_READ_ONLY)
         .map_err(|error| error.to_string())?;
     let sql_limit = i64::try_from(limit).map_err(|_| "summary limit exceeds SQLite range")?;
 
     let mut changes = crate::depot::archive_recent(&conn, sql_limit)
-        .map_err(|error| error.to_string())?.into_iter().map(
-            |(path, mode, size, modified_at)| {
-                let mode = u32::try_from(mode)
-                    .map_err(|_| "stored file mode exceeds u32")?;
-                Ok((modified_at, ChangePreview {
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .map(|(path, mode, size, modified_at)| {
+            let mode = u32::try_from(mode).map_err(|_| "stored file mode exceeds u32")?;
+            Ok((
+                modified_at,
+                ChangePreview {
                     path: relation_bytes(path, "summary change path")?,
-                    kind: if mode & S_IFMT == S_IFCHR { ChangeKind::Deleted }
-                        else if mode & S_IFMT == S_IFLNK { ChangeKind::Symlink }
-                        else { ChangeKind::Changed },
-                    size: u64::try_from(size)
-                        .map_err(|_| "negative summary change size")?,
+                    kind: if mode & S_IFMT == S_IFCHR {
+                        ChangeKind::Deleted
+                    } else if mode & S_IFMT == S_IFLNK {
+                        ChangeKind::Symlink
+                    } else {
+                        ChangeKind::Changed
+                    },
+                    size: u64::try_from(size).map_err(|_| "negative summary change size")?,
                     modified_at,
                     xattr_key: None,
                     xattr_length: None,
-                }))
-            },
-        ).collect::<Result<Vec<_>, String>>()?;
+                },
+            ))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     if has_table_typed(&conn, "xattr")? {
-        let mut statement = conn.prepare(
-            "SELECT x.name, x.key, length(x.value), COALESCE(s.mtime, 0) \
+        let mut statement = conn
+            .prepare(
+                "SELECT x.name, x.key, length(x.value), COALESCE(s.mtime, 0) \
              FROM xattr x LEFT JOIN sqlar s ON s.name=x.name \
-             ORDER BY COALESCE(s.mtime, 0) DESC LIMIT ?1")
+             ORDER BY COALESCE(s.mtime, 0) DESC LIMIT ?1",
+            )
             .map_err(|error| error.to_string())?;
-        let rows = statement.query_map([sql_limit], |row| Ok((
-            row.get::<_, String>(0)?, row.get::<_, String>(1)?,
-            row.get::<_, i64>(2)?, row.get::<_, i64>(3)?,
-        ))).map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([sql_limit], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })
+            .map_err(|error| error.to_string())?;
         for row in rows {
             let (path, key, length, modified_at) = row.map_err(|error| error.to_string())?;
-            changes.push((modified_at, ChangePreview {
-                path: relation_bytes(path, "summary xattr path")?,
-                kind: ChangeKind::Xattr,
-                size: 0,
+            changes.push((
                 modified_at,
-                xattr_key: Some(relation_bytes(key, "summary xattr key")?),
-                xattr_length: Some(u64::try_from(length)
-                    .map_err(|_| "negative summary xattr length")?),
-            }));
+                ChangePreview {
+                    path: relation_bytes(path, "summary xattr path")?,
+                    kind: ChangeKind::Xattr,
+                    size: 0,
+                    modified_at,
+                    xattr_key: Some(relation_bytes(key, "summary xattr key")?),
+                    xattr_length: Some(
+                        u64::try_from(length).map_err(|_| "negative summary xattr length")?,
+                    ),
+                },
+            ));
         }
     }
     changes.sort_by(|left, right| right.0.cmp(&left.0));
-    let changes = changes.into_iter().take(limit as usize)
-        .map(|(_, row)| row).collect();
+    let changes = changes
+        .into_iter()
+        .take(limit as usize)
+        .map(|(_, row)| row)
+        .collect();
 
-    let mut statement = conn.prepare(
-        "SELECT id, ts, stream, length(content), CAST(substr(content,1,80) AS TEXT) \
-         FROM outputs ORDER BY id DESC LIMIT ?1")
+    let mut statement = conn
+        .prepare(
+            "SELECT id, ts, stream, length(content), CAST(substr(content,1,80) AS TEXT) \
+         FROM outputs ORDER BY id DESC LIMIT ?1",
+        )
         .map_err(|error| error.to_string())?;
-    let rows = statement.query_map([sql_limit], |row| Ok((
-        row.get::<_, i64>(0)?, row.get::<_, f64>(1)?, row.get::<_, i64>(2)?,
-        row.get::<_, i64>(3)?, row.get::<_, Option<String>>(4)?,
-    ))).map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([sql_limit], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, f64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, Option<String>>(4)?,
+            ))
+        })
+        .map_err(|error| error.to_string())?;
     let mut outputs = Vec::new();
     for row in rows {
         let (id, time, stream, length, preview) = row.map_err(|error| error.to_string())?;
@@ -472,13 +526,19 @@ pub fn box_summary_typed(
     }
     drop(statement);
 
-    let mut statement = conn.prepare(
-        "SELECT id, tgid, exe, argv FROM process ORDER BY id DESC LIMIT ?1")
+    let mut statement = conn
+        .prepare("SELECT id, tgid, exe, argv FROM process ORDER BY id DESC LIMIT ?1")
         .map_err(|error| error.to_string())?;
-    let rows = statement.query_map([sql_limit], |row| Ok((
-        row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?,
-        row.get::<_, String>(2)?, row.get::<_, String>(3)?,
-    ))).map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([sql_limit], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Option<i64>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .map_err(|error| error.to_string())?;
     let mut processes = Vec::new();
     for row in rows {
         let (id, tgid, executable, argv) = row.map_err(|error| error.to_string())?;
@@ -486,8 +546,9 @@ pub fn box_summary_typed(
             .map_err(|error| format!("invalid stored process argv: {error}"))?;
         processes.push(ProcessPreview {
             id: u64::try_from(id).map_err(|_| "negative process row id")?,
-            tgid: tgid.map(|value| u32::try_from(value)
-                .map_err(|_| "process tgid exceeds u32")).transpose()?,
+            tgid: tgid
+                .map(|value| u32::try_from(value).map_err(|_| "process tgid exceeds u32"))
+                .transpose()?,
             executable: relation_bytes(executable, "process executable")?,
             argv0: relation_bytes(argv.into_iter().next().unwrap_or_default(), "process argv0")?,
         });
@@ -496,12 +557,18 @@ pub fn box_summary_typed(
 
     let mut pipelines = Vec::new();
     if has_table_typed(&conn, "brushprov")? {
-        let mut statement = conn.prepare(
-            "SELECT id, cmd, COALESCE(nested,0) FROM brushprov ORDER BY id DESC LIMIT ?1")
+        let mut statement = conn
+            .prepare("SELECT id, cmd, COALESCE(nested,0) FROM brushprov ORDER BY id DESC LIMIT ?1")
             .map_err(|error| error.to_string())?;
-        let rows = statement.query_map([sql_limit], |row| Ok((
-            row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?,
-        ))).map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([sql_limit], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .map_err(|error| error.to_string())?;
         for row in rows {
             let (id, command, nested) = row.map_err(|error| error.to_string())?;
             pipelines.push(PipelinePreview {
@@ -514,24 +581,33 @@ pub fn box_summary_typed(
 
     let mut edges = Vec::new();
     if has_table_typed(&conn, "build_edges")? {
-        let mut statement = conn.prepare(
-            "SELECT id, outs, cmd FROM build_edges ORDER BY id DESC LIMIT ?1")
+        let mut statement = conn
+            .prepare("SELECT id, outs, cmd FROM build_edges ORDER BY id DESC LIMIT ?1")
             .map_err(|error| error.to_string())?;
-        let rows = statement.query_map([sql_limit], |row| Ok((
-            row.get::<_, i64>(0)?, row.get::<_, String>(1)?,
-            row.get::<_, Option<String>>(2)?,
-        ))).map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([sql_limit], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })
+            .map_err(|error| error.to_string())?;
         for row in rows {
             let (id, outputs, command) = row.map_err(|error| error.to_string())?;
             let outputs: Vec<String> = serde_json::from_str(&outputs)
                 .map_err(|error| format!("invalid stored build outputs: {error}"))?;
             edges.push(EdgePreview {
                 id: u64::try_from(id).map_err(|_| "negative build edge row id")?,
-                output: outputs.first().cloned()
-                    .map(|value| relation_bytes(value, "build edge output")).transpose()?,
+                output: outputs
+                    .first()
+                    .cloned()
+                    .map(|value| relation_bytes(value, "build edge output"))
+                    .transpose()?,
                 output_count: u32::try_from(outputs.len())
                     .map_err(|_| "build edge output count exceeds u32")?,
-                command: command.map(|value| relation_text(value, "build edge command"))
+                command: command
+                    .map(|value| relation_text(value, "build edge command"))
                     .transpose()?,
             });
         }
@@ -539,15 +615,22 @@ pub fn box_summary_typed(
 
     let mut failures = Vec::new();
     if has_table_typed(&conn, "build_edges")? {
-        let mut statement = conn.prepare(
-            "SELECT json_extract(outs,'$[0]'), exit_code, COALESCE(output_excerpt,'') \
+        let mut statement = conn
+            .prepare(
+                "SELECT json_extract(outs,'$[0]'), exit_code, COALESCE(output_excerpt,'') \
              FROM build_edges WHERE exit_code IS NOT NULL AND exit_code != 0 \
-             ORDER BY id DESC LIMIT ?1")
+             ORDER BY id DESC LIMIT ?1",
+            )
             .map_err(|error| error.to_string())?;
-        let rows = statement.query_map([sql_limit], |row| Ok((
-            row.get::<_, Option<String>>(0)?, row.get::<_, i64>(1)?,
-            row.get::<_, String>(2)?,
-        ))).map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([sql_limit], |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|error| error.to_string())?;
         for row in rows {
             let (label, code, excerpt) = row.map_err(|error| error.to_string())?;
             failures.push(FailurePreview {
@@ -559,13 +642,17 @@ pub fn box_summary_typed(
         }
     }
     if has_table_typed(&conn, "brushprov")? {
-        let mut statement = conn.prepare(
-            "SELECT cmd, exit_code FROM brushprov WHERE exit_code > 0 \
-             ORDER BY id DESC LIMIT ?1")
+        let mut statement = conn
+            .prepare(
+                "SELECT cmd, exit_code FROM brushprov WHERE exit_code > 0 \
+             ORDER BY id DESC LIMIT ?1",
+            )
             .map_err(|error| error.to_string())?;
-        let rows = statement.query_map([sql_limit], |row| Ok((
-            row.get::<_, String>(0)?, row.get::<_, i64>(1)?,
-        ))).map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([sql_limit], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(|error| error.to_string())?;
         for row in rows {
             let (label, code) = row.map_err(|error| error.to_string())?;
             failures.push(FailurePreview {
@@ -579,10 +666,14 @@ pub fn box_summary_typed(
     failures.truncate(limit as usize);
 
     let has_rows = |table: &str, predicate: &str| -> Result<bool, String> {
-        if !has_table_typed(&conn, table)? { return Ok(false); }
+        if !has_table_typed(&conn, table)? {
+            return Ok(false);
+        }
         let sql = format!("SELECT 1 FROM {table} WHERE {predicate} LIMIT 1");
-        conn.query_row(&sql, [], |_| Ok(())).optional()
-            .map(|row| row.is_some()).map_err(|error| error.to_string())
+        conn.query_row(&sql, [], |_| Ok(()))
+            .optional()
+            .map(|row| row.is_some())
+            .map_err(|error| error.to_string())
     };
     Ok(BoxSummary {
         outputs: relation_list(outputs, "summary outputs")?,
@@ -602,46 +693,81 @@ pub fn box_summary_typed(
 /// matches as a substring, empty matches everything. Rows come back in
 /// assignment order so a value's history reads top-to-bottom.
 pub fn makevars_typed(
-    id: i64, name_pat: &str, value_pat: &str, limit: u64, any: bool,
+    id: i64,
+    name_pat: &str,
+    value_pat: &str,
+    limit: u64,
+    any: bool,
 ) -> Result<Vec<crate::generated_wire::MakeVariableRow>, String> {
     use crate::generated_wire::MakeVariableRow;
-    let conn = Connection::open_with_flags(
-        sqlar_path(id), OpenFlags::SQLITE_OPEN_READ_ONLY)
+    let conn = Connection::open_with_flags(sqlar_path(id), OpenFlags::SQLITE_OPEN_READ_ONLY)
         .map_err(|error| error.to_string())?;
-    if !has_table_typed(&conn, "makevar")? { return Ok(Vec::new()); }
-    if limit == 0 { return Ok(Vec::new()); }
+    if !has_table_typed(&conn, "makevar")? {
+        return Ok(Vec::new());
+    }
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
     let mut out = vec![];
     // edge_id / pipeline_id resolve the capture-time anchors (recipe edge's
     // primary output / pipeline uid) to the row ids the cross-pane "ids"
     // filters key on, so the UI can navigate without another round-trip.
-    let mut st = conn.prepare(
-        "SELECT m.id, m.name, m.loc, m.value, m.make_dir, m.rhs, m.refs,
+    let mut st = conn
+        .prepare(
+            "SELECT m.id, m.name, m.loc, m.value, m.make_dir, m.rhs, m.refs,
                 m.edge_out, m.uid, m.flags,
                 (SELECT e.id FROM build_edges e
                   WHERE json_extract(e.outs,'$[0]') = m.edge_out LIMIT 1),
                 (SELECT p.id FROM brushprov p WHERE p.uid = m.uid LIMIT 1)
-         FROM makevar m ORDER BY m.id")
+         FROM makevar m ORDER BY m.id",
+        )
         .map_err(|error| error.to_string())?;
-    let it = st.query_map([], |r| Ok((
-        r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?,
-        r.get::<_, String>(3)?, r.get::<_, String>(4)?,
-        r.get::<_, Option<String>>(5)?, r.get::<_, Option<String>>(6)?,
-        r.get::<_, Option<String>>(7)?, r.get::<_, Option<i64>>(8)?,
-        r.get::<_, Option<String>>(9)?,
-        r.get::<_, Option<i64>>(10)?, r.get::<_, Option<i64>>(11)?,
-    ))).map_err(|error| error.to_string())?;
-    for row in it
-    {
-        let (rid, name, loc, value, make_dir, rhs, refs, edge_out, uid, flags,
-             edge_id, pipeline_id) = row.map_err(|error| error.to_string())?;
-        let name_ok = name_pat.is_empty()
-            || crate::rules::cmd_match(name_pat, &name);
-        let value_ok = value_pat.is_empty()
-            || crate::rules::cmd_match(value_pat, &value);
-        if any { if !(name_ok || value_ok) { continue; } }
-        else if !(name_ok && value_ok) { continue; }
-        let bytes = |value: String, field: &str| crate::wire::BoundedBytes::new(value.into_bytes())
-            .map_err(|error| format!("make variable {field} exceeds relation bound: {error:?}"));
+    let it = st
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, Option<String>>(5)?,
+                r.get::<_, Option<String>>(6)?,
+                r.get::<_, Option<String>>(7)?,
+                r.get::<_, Option<i64>>(8)?,
+                r.get::<_, Option<String>>(9)?,
+                r.get::<_, Option<i64>>(10)?,
+                r.get::<_, Option<i64>>(11)?,
+            ))
+        })
+        .map_err(|error| error.to_string())?;
+    for row in it {
+        let (
+            rid,
+            name,
+            loc,
+            value,
+            make_dir,
+            rhs,
+            refs,
+            edge_out,
+            uid,
+            flags,
+            edge_id,
+            pipeline_id,
+        ) = row.map_err(|error| error.to_string())?;
+        let name_ok = name_pat.is_empty() || crate::rules::cmd_match(name_pat, &name);
+        let value_ok = value_pat.is_empty() || crate::rules::cmd_match(value_pat, &value);
+        if any {
+            if !(name_ok || value_ok) {
+                continue;
+            }
+        } else if !(name_ok && value_ok) {
+            continue;
+        }
+        let bytes = |value: String, field: &str| {
+            crate::wire::BoundedBytes::new(value.into_bytes())
+                .map_err(|error| format!("make variable {field} exceeds relation bound: {error:?}"))
+        };
         out.push(MakeVariableRow {
             id: u64::try_from(rid).map_err(|_| "negative make variable row id")?,
             name: bytes(name, "name")?,
@@ -652,15 +778,24 @@ pub fn makevars_typed(
             references: bytes(refs.unwrap_or_default(), "references")?,
             flags: crate::wire::BoundedText::new(flags.unwrap_or_default())
                 .map_err(|error| format!("make variable flags exceed relation bound: {error:?}"))?,
-            edge_output: edge_out.map(|value| bytes(value, "edge output")).transpose()?,
-            pipeline_uid: uid.map(|value| u64::try_from(value)
-                .map_err(|_| "negative make variable pipeline uid")).transpose()?,
-            edge: edge_id.map(|value| u64::try_from(value)
-                .map_err(|_| "negative make variable edge id")).transpose()?,
-            pipeline: pipeline_id.map(|value| u64::try_from(value)
-                .map_err(|_| "negative make variable pipeline id")).transpose()?,
+            edge_output: edge_out
+                .map(|value| bytes(value, "edge output"))
+                .transpose()?,
+            pipeline_uid: uid
+                .map(|value| {
+                    u64::try_from(value).map_err(|_| "negative make variable pipeline uid")
+                })
+                .transpose()?,
+            edge: edge_id
+                .map(|value| u64::try_from(value).map_err(|_| "negative make variable edge id"))
+                .transpose()?,
+            pipeline: pipeline_id
+                .map(|value| u64::try_from(value).map_err(|_| "negative make variable pipeline id"))
+                .transpose()?,
         });
-        if out.len() as u64 >= limit { break; }
+        if out.len() as u64 >= limit {
+            break;
+        }
     }
     Ok(out)
 }
@@ -683,15 +818,19 @@ pub fn map_ids_typed(
     ids: &[u64],
     to: crate::generated_wire::ProvenanceDomain,
 ) -> Result<Vec<u64>, String> {
-    if ids.is_empty() || from == to { return Ok(ids.to_vec()); }
-    let conn = Connection::open_with_flags(
-        sqlar_path(id), OpenFlags::SQLITE_OPEN_READ_ONLY)
+    if ids.is_empty() || from == to {
+        return Ok(ids.to_vec());
+    }
+    let conn = Connection::open_with_flags(sqlar_path(id), OpenFlags::SQLITE_OPEN_READ_ONLY)
         .map_err(|error| error.to_string())?;
-    let ids = ids.iter().map(|id| i64::try_from(*id)
-        .map_err(|_| "provenance row id exceeds SQLite range"))
+    let ids = ids
+        .iter()
+        .map(|id| i64::try_from(*id).map_err(|_| "provenance row id exceeds SQLite range"))
         .collect::<Result<Vec<_>, _>>()?;
-    map_ids_conn(&conn, from, &ids, to)?.into_iter().map(|id|
-        u64::try_from(id).map_err(|_| "negative mapped provenance row id".into())).collect()
+    map_ids_conn(&conn, from, &ids, to)?
+        .into_iter()
+        .map(|id| u64::try_from(id).map_err(|_| "negative mapped provenance row id".into()))
+        .collect()
 }
 
 fn map_ids_conn(
@@ -704,12 +843,18 @@ fn map_ids_conn(
     if ids.is_empty() || from == to {
         return Ok(ids.to_vec());
     }
-    let inlist = ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+    let inlist = ids
+        .iter()
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
     let query = |sql: String| -> Result<Vec<i64>, String> {
         let mut statement = conn.prepare(&sql).map_err(|error| error.to_string())?;
-        let rows = statement.query_map([], |row| row.get::<_, i64>(0))
+        let rows = statement
+            .query_map([], |row| row.get::<_, i64>(0))
             .map_err(|error| error.to_string())?;
-        rows.map(|row| row.map_err(|error| error.to_string())).collect()
+        rows.map(|row| row.map_err(|error| error.to_string()))
+            .collect()
     };
     // Small slack on the window ends: the edge started/done stamps and the
     // pipeline's spawn_ts are written by different threads around the same
@@ -717,11 +862,15 @@ fn map_ids_conn(
     match (from, to) {
         (Process, Pipeline) => query(format!(
             "SELECT DISTINCT brush_pipeline_id FROM process \
-             WHERE id IN ({inlist}) AND brush_pipeline_id > 0")),
+             WHERE id IN ({inlist}) AND brush_pipeline_id > 0"
+        )),
         (Pipeline, Process) => query(format!(
-            "SELECT id FROM process WHERE brush_pipeline_id IN ({inlist})")),
+            "SELECT id FROM process WHERE brush_pipeline_id IN ({inlist})"
+        )),
         (Pipeline, Edge) => {
-            if !has_table_typed(conn, "build_edges")? { return Ok(vec![]); }
+            if !has_table_typed(conn, "build_edges")? {
+                return Ok(vec![]);
+            }
             // Exact link: pipelines are stamped with the edge whose recipe
             // spawned them (record JSON `edge_out` == the edge's outs[0]).
             query(format!(
@@ -729,16 +878,20 @@ fn map_ids_conn(
                  WHERE b.id IN ({inlist}) \
                    AND json_extract(b.record,'$.edge_out') IS NOT NULL \
                    AND json_extract(b.record,'$.edge_out') = \
-                       json_extract(e.outs,'$[0]')"))
+                       json_extract(e.outs,'$[0]')"
+            ))
         }
         (Edge, Pipeline) => {
-            if !has_table_typed(conn, "build_edges")? { return Ok(vec![]); }
+            if !has_table_typed(conn, "build_edges")? {
+                return Ok(vec![]);
+            }
             query(format!(
                 "SELECT DISTINCT b.id FROM brushprov b, build_edges e \
                  WHERE e.id IN ({inlist}) \
                    AND json_extract(b.record,'$.edge_out') IS NOT NULL \
                    AND json_extract(b.record,'$.edge_out') = \
-                       json_extract(e.outs,'$[0]')"))
+                       json_extract(e.outs,'$[0]')"
+            ))
         }
         (Process, Edge) => {
             let pipes = map_ids_conn(conn, Process, ids, Pipeline)?;
@@ -762,8 +915,7 @@ pub fn pipeline_context_typed(
     prov_id: u64,
 ) -> Result<crate::generated_wire::PipelineContext, String> {
     use crate::generated_wire::{PipelineContext, PipelineContextItem};
-    let conn = Connection::open_with_flags(
-        sqlar_path(id), OpenFlags::SQLITE_OPEN_READ_ONLY)
+    let conn = Connection::open_with_flags(sqlar_path(id), OpenFlags::SQLITE_OPEN_READ_ONLY)
         .map_err(|error| error.to_string())?;
     let prov_id = i64::try_from(prov_id).map_err(|_| "pipeline id exceeds SQLite range")?;
     let (uid, parent_uid, edge_out) = conn.query_row(
@@ -777,22 +929,34 @@ pub fn pipeline_context_typed(
             id: u64::try_from(row.0).map_err(|_| "negative pipeline row id")?,
             command: crate::wire::BoundedText::new(row.1)
                 .map_err(|error| format!("pipeline command exceeds relation bound: {error:?}"))?,
-            exit_code: row.2.map(|code| i32::try_from(code)
-                .map_err(|_| "pipeline exit code exceeds i32")).transpose()?,
+            exit_code: row
+                .2
+                .map(|code| i32::try_from(code).map_err(|_| "pipeline exit code exceeds i32"))
+                .transpose()?,
         })
     };
     let parent = if parent_uid > 0 {
-        conn.query_row("SELECT id, cmd, exit_code FROM brushprov WHERE uid=?1", [parent_uid],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
-            .optional().map_err(|error| error.to_string())?.map(item).transpose()?
-    } else { None };
+        conn.query_row(
+            "SELECT id, cmd, exit_code FROM brushprov WHERE uid=?1",
+            [parent_uid],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+        .map(item)
+        .transpose()?
+    } else {
+        None
+    };
     let mut children = vec![];
     if uid > 0 {
-        let mut statement = conn.prepare(
-            "SELECT id, cmd, exit_code FROM brushprov WHERE parent_uid=?1 ORDER BY id LIMIT 40")
+        let mut statement = conn
+            .prepare(
+                "SELECT id, cmd, exit_code FROM brushprov WHERE parent_uid=?1 ORDER BY id LIMIT 40",
+            )
             .map_err(|error| error.to_string())?;
-        let rows = statement.query_map([uid], |row| Ok((
-            row.get(0)?, row.get(1)?, row.get(2)?)))
+        let rows = statement
+            .query_map([uid], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
             .map_err(|error| error.to_string())?;
         for row in rows {
             children.push(item(row.map_err(|error| error.to_string())?)?);
@@ -802,9 +966,12 @@ pub fn pipeline_context_typed(
         parent,
         children: crate::wire::BoundedVec::new(children)
             .map_err(|error| format!("pipeline children exceed relation bound: {error:?}"))?,
-        edge_output: (!edge_out.is_empty()).then(|| crate::wire::BoundedBytes::new(
-            edge_out.into_bytes()).map_err(|error|
-                format!("pipeline edge output exceeds relation bound: {error:?}")))
+        edge_output: (!edge_out.is_empty())
+            .then(|| {
+                crate::wire::BoundedBytes::new(edge_out.into_bytes()).map_err(|error| {
+                    format!("pipeline edge output exceeds relation bound: {error:?}")
+                })
+            })
             .transpose()?,
     })
 }
@@ -812,24 +979,33 @@ pub fn pipeline_context_typed(
 fn has_table_typed(conn: &Connection, name: &str) -> Result<bool, String> {
     conn.query_row(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
-        [name], |_| Ok(()),
-    ).optional().map(|row| row.is_some()).map_err(|error| error.to_string())
+        [name],
+        |_| Ok(()),
+    )
+    .optional()
+    .map(|row| row.is_some())
+    .map_err(|error| error.to_string())
 }
 
-pub fn decorate_typed(id: i64, rel: &str)
-    -> Result<crate::generated_wire::ChangeDecoration, String>
-{
+pub fn decorate_typed(
+    id: i64,
+    rel: &str,
+) -> Result<crate::generated_wire::ChangeDecoration, String> {
     use crate::generated_wire::{ChangeDecoration, ChangeKind};
     let rel = rel.trim_start_matches('/');
     let Some(mode) = current_mode(id, rel) else {
         return Ok(ChangeDecoration {
-            is_text: false, stale: false, kind: ChangeKind::Changed,
+            is_text: false,
+            stale: false,
+            kind: ChangeKind::Changed,
         });
     };
     let host = Path::new("/").join(rel);
     if mode & S_IFMT == S_IFCHR {
         return Ok(ChangeDecoration {
-            is_text: false, stale: false, kind: ChangeKind::Deleted,
+            is_text: false,
+            stale: false,
+            kind: ChangeKind::Deleted,
         });
     }
     // is_text: both base and current NUL-free, and not a symlink/tombstone.
@@ -843,7 +1019,11 @@ pub fn decorate_typed(id: i64, rel: &str)
     };
     let hstat = host.symlink_metadata();
     let exists = hstat.is_ok();
-    let kind = if exists { ChangeKind::Modified } else { ChangeKind::Created };
+    let kind = if exists {
+        ChangeKind::Modified
+    } else {
+        ChangeKind::Created
+    };
     let mut stale = false;
     if let Ok(md) = &hstat {
         if let Some(cm) = current_mtime(id, rel) {
@@ -852,7 +1032,11 @@ pub fn decorate_typed(id: i64, rel: &str)
             stale = host_ns > cm;
         }
     }
-    Ok(ChangeDecoration { is_text, stale, kind })
+    Ok(ChangeDecoration {
+        is_text,
+        stale,
+        kind,
+    })
 }
 
 // ── host-mutating review actions (top-level boxes; nested promotion deferred) ──
@@ -892,9 +1076,11 @@ impl NestCtx {
 
     /// `id`'s immediate child box ids (parent_box_id == id), live + at-rest.
     fn children_of(&self, id: i64) -> Vec<i64> {
-        crate::discover::discover().values()
+        crate::discover::discover()
+            .values()
             .filter(|b| b.parent == Some(id) && b.box_id != id)
-            .map(|b| b.box_id).collect()
+            .map(|b| b.box_id)
+            .collect()
     }
 
     /// `id`'s live BoxState, used ONLY to refresh the in-RAM mirror after a
@@ -908,8 +1094,10 @@ impl NestCtx {
     /// same answer running or not. The flag is a child's ATTITUDE toward its
     /// parent; it stops `apply` from promoting captured changes into the parent.
     fn readonly_parent_of(&self, id: i64) -> bool {
-        crate::discover::box_meta(id).get("readonly_parent")
-            .map(String::as_str) == Some("1")
+        crate::discover::box_meta(id)
+            .get("readonly_parent")
+            .map(String::as_str)
+            == Some("1")
     }
 }
 
@@ -931,15 +1119,26 @@ const S_IFBLK: u32 = 0o060000;
 /// confinement that does not follow the final symlink), except it returns a
 /// Result so a failed restore can abort the apply rather than be silently lost.
 /// Lives here (not hostfs) only because hostfs is out of scope for this change.
-fn setxattr_at_checked(parent: BorrowedFd, name: &CStr, key: &CStr, val: &[u8])
-    -> Result<(), String> {
-    let leaf = name.to_str().map_err(|_| "non-utf8 leaf name".to_string())?;
+fn setxattr_at_checked(
+    parent: BorrowedFd,
+    name: &CStr,
+    key: &CStr,
+    val: &[u8],
+) -> Result<(), String> {
+    let leaf = name
+        .to_str()
+        .map_err(|_| "non-utf8 leaf name".to_string())?;
     let path = format!("/proc/self/fd/{}/{}", parent.as_raw_fd(), leaf);
     let cpath = CString::new(path).map_err(|_| "NUL in xattr path".to_string())?;
     // SAFETY: valid C strings and byte buffer.
     let r = unsafe {
-        libc::lsetxattr(cpath.as_ptr(), key.as_ptr(),
-                        val.as_ptr().cast(), val.len(), 0)
+        libc::lsetxattr(
+            cpath.as_ptr(),
+            key.as_ptr(),
+            val.as_ptr().cast(),
+            val.len(),
+            0,
+        )
     };
     if r != 0 {
         return Err(std::io::Error::last_os_error().to_string());
@@ -958,8 +1157,12 @@ fn setxattr_at_checked(parent: BorrowedFd, name: &CStr, key: &CStr, val: &[u8])
 /// did, a pre-existing SYMLINK at the leaf is refused (we must not replace a
 /// box-planted symlink with content — that was the C2-class escape the leaf
 /// O_NOFOLLOW check guarded against), so we lstat first and bail on a symlink.
-fn write_file_atomic_at(parent: BorrowedFd, name: &CStr, bytes: &[u8], mode: u32)
-    -> Result<(), String> {
+fn write_file_atomic_at(
+    parent: BorrowedFd,
+    name: &CStr,
+    bytes: &[u8],
+    mode: u32,
+) -> Result<(), String> {
     // Refuse to clobber a symlink leaf (parity with write_file_at's O_NOFOLLOW
     // open, which errored on an existing symlink rather than following it).
     if let Some(st) = hostfs::lstat_at(parent, name) {
@@ -970,14 +1173,19 @@ fn write_file_atomic_at(parent: BorrowedFd, name: &CStr, bytes: &[u8], mode: u32
     // Unique sibling temp name under the SAME parent dir (same filesystem → the
     // rename is atomic). Created O_EXCL|O_NOFOLLOW so it can never race onto an
     // attacker-planted name or symlink.
-    let leaf = name.to_str().map_err(|_| "non-utf8 leaf name".to_string())?;
-    let tmp_name = format!(".sarun-apply-tmp-{}-{}-{}",
-        std::process::id(), apply_tmp_seq(), leaf);
+    let leaf = name
+        .to_str()
+        .map_err(|_| "non-utf8 leaf name".to_string())?;
+    let tmp_name = format!(
+        ".sarun-apply-tmp-{}-{}-{}",
+        std::process::id(),
+        apply_tmp_seq(),
+        leaf
+    );
     // Cap the length so a very long leaf can't push us past NAME_MAX (255).
     let tmp_name: String = tmp_name.chars().take(250).collect();
     let ctmp = CString::new(tmp_name).map_err(|_| "NUL in temp name".to_string())?;
-    let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL
-        | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
     // SAFETY: valid dirfd and C string; variadic mode arg for O_CREAT.
     let fd = unsafe { libc::openat(parent.as_raw_fd(), ctmp.as_ptr(), flags, mode & 0o7777) };
     if fd < 0 {
@@ -986,7 +1194,9 @@ fn write_file_atomic_at(parent: BorrowedFd, name: &CStr, bytes: &[u8], mode: u32
     // SAFETY: fresh owned fd; File takes ownership and closes it on drop.
     let owned = unsafe { OwnedFd::from_raw_fd(fd) };
     // Helper to clean up the temp on any failure below.
-    let cleanup = || { let _ = hostfs::unlink_at(parent, &ctmp); };
+    let cleanup = || {
+        let _ = hostfs::unlink_at(parent, &ctmp);
+    };
     let write_res = (|| -> Result<(), String> {
         use std::io::Write;
         let mut f = std::fs::File::from(owned);
@@ -1014,8 +1224,12 @@ fn write_file_atomic_at(parent: BorrowedFd, name: &CStr, bytes: &[u8], mode: u32
     // target is replaced as a whole — no write-through-symlink escape.
     // SAFETY: valid dirfds and C strings.
     let r = unsafe {
-        libc::renameat(parent.as_raw_fd(), ctmp.as_ptr(),
-                       parent.as_raw_fd(), name.as_ptr())
+        libc::renameat(
+            parent.as_raw_fd(),
+            ctmp.as_ptr(),
+            parent.as_raw_fd(),
+            name.as_ptr(),
+        )
     };
     if r != 0 {
         let e = std::io::Error::last_os_error();
@@ -1041,27 +1255,35 @@ fn apply_tmp_seq() -> u64 {
 /// xattrs, by contrast, can carry security-relevant state (capabilities, ACLs,
 /// SELinux labels), so a dropped setxattr is a real divergence — collected and
 /// returned.
-fn restore_metadata_at(conn: &Connection, rel: &str, parent: BorrowedFd, leaf: &CStr, mtime_ns: i64)
-    -> Result<(), String> {
+fn restore_metadata_at(
+    conn: &Connection,
+    rel: &str,
+    parent: BorrowedFd,
+    leaf: &CStr,
+    mtime_ns: i64,
+) -> Result<(), String> {
     // mtime (atime = mtime): drives downstream make/rebuild decisions.
     hostfs::utimens_at(parent, leaf, mtime_ns);
     // owner: best-effort. lchown EPERMs for an unprivileged host user (it cannot
     // give a file away to another uid/gid), which is the common case here, so a
     // failure is expected and deliberately ignored — see the doc comment above.
-    if let Ok((uid, gid)) = conn.query_row(
-        "SELECT uid,gid FROM ownership WHERE name=?1", [rel],
-        |r| Ok((r.get::<_,i64>(0)? as u32, r.get::<_,i64>(1)? as u32))) {
+    if let Ok((uid, gid)) =
+        conn.query_row("SELECT uid,gid FROM ownership WHERE name=?1", [rel], |r| {
+            Ok((r.get::<_, i64>(0)? as u32, r.get::<_, i64>(1)? as u32))
+        })
+    {
         hostfs::chown_at(parent, leaf, uid, gid);
     }
     // xattrs: surface failures. A dropped setxattr can silently lose a security
     // attribute (file caps / ACL / label), so the FIRST failure aborts and is
     // returned rather than logged-and-forgotten.
     if let Ok(mut st) = conn.prepare("SELECT key,value FROM xattr WHERE name=?1") {
-        if let Ok(rows) = st.query_map([rel], |r|
-            Ok((r.get::<_,String>(0)?, r.get::<_,Vec<u8>>(1)?))) {
+        if let Ok(rows) = st.query_map([rel], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
+        }) {
             for (k, v) in rows.flatten() {
-                let ck = CString::new(k.clone())
-                    .map_err(|_| format!("xattr key '{k}' contains NUL"))?;
+                let ck =
+                    CString::new(k.clone()).map_err(|_| format!("xattr key '{k}' contains NUL"))?;
                 setxattr_at_checked(parent, leaf, &ck, &v)
                     .map_err(|e| format!("setxattr '{k}': {e}"))?;
             }
@@ -1109,8 +1331,9 @@ fn materialize_at(root: BorrowedFd, conn: &Connection, id: i64, rel: &str) -> Re
         hostfs::mkdir_at(parent, &leaf, mode)?;
     } else if mode & S_IFMT == S_IFIFO || mode & S_IFMT == S_IFBLK {
         // fifo / block device: recreate the node on the host.
-        let rdev: i64 = conn.query_row("SELECT dev FROM rdev WHERE name=?1", [rel],
-                                       |r| r.get(0)).unwrap_or(0);
+        let rdev: i64 = conn
+            .query_row("SELECT dev FROM rdev WHERE name=?1", [rel], |r| r.get(0))
+            .unwrap_or(0);
         hostfs::mknod_at(parent, &leaf, mode, rdev as u64)?;
     } else {
         let bytes = match data {
@@ -1153,10 +1376,16 @@ fn host_changed_since_capture(id: i64, rel: &str) -> bool {
     let Some((_, mode, _)) = open_ro(id).and_then(|c| row_of(&c, rel)) else {
         return false;
     };
-    if mode & S_IFMT == S_IFCHR { return false; } // deletion tombstone: not gated
+    if mode & S_IFMT == S_IFCHR {
+        return false;
+    } // deletion tombstone: not gated
     let host = Path::new("/").join(rel);
-    let Ok(md) = host.symlink_metadata() else { return false };
-    let Some(cap_ns) = current_mtime(id, rel) else { return false };
+    let Ok(md) = host.symlink_metadata() else {
+        return false;
+    };
+    let Some(cap_ns) = current_mtime(id, rel) else {
+        return false;
+    };
     use std::os::unix::fs::MetadataExt;
     let host_ns = md.mtime() * 1_000_000_000 + md.mtime_nsec();
     host_ns > cap_ns
@@ -1234,28 +1463,31 @@ pub fn apply_typed(
             Err("parent is read-only (--readonly-parent); apply refused".into())
         } else if let Err(e) = preserve_sibling_views(id, &rel, ctx) {
             Err(e)
-        } else { match parent {
-            Some(p) => {
-                // Nested box: promote into the parent's overlay, not the host.
-                let plive = ctx.live(p);
-                promote_into_parent(id, p, plive.as_deref(), &rel)
-            }
-            None => {
-                // Top-level: write the real host. Audit M1 — refuse to silently
-                // overwrite a host file that changed AFTER this box captured it
-                // (the host mtime is newer than the stored capture mtime). The
-                // `decorate` stale flag is the same advisory the UI shows; here
-                // it becomes a hard refusal so a concurrent edit isn't clobbered
-                // without the user knowing. The user can re-capture / re-run to
-                // pick up the new baseline.
-                if host_changed_since_capture(id, &rel) {
-                    Err("host file changed since capture (stale); apply refused \
-                         — re-run the box to pick up the new contents".into())
-                } else {
-                    materialize(&conn, id, &rel)
+        } else {
+            match parent {
+                Some(p) => {
+                    // Nested box: promote into the parent's overlay, not the host.
+                    let plive = ctx.live(p);
+                    promote_into_parent(id, p, plive.as_deref(), &rel)
+                }
+                None => {
+                    // Top-level: write the real host. Audit M1 — refuse to silently
+                    // overwrite a host file that changed AFTER this box captured it
+                    // (the host mtime is newer than the stored capture mtime). The
+                    // `decorate` stale flag is the same advisory the UI shows; here
+                    // it becomes a hard refusal so a concurrent edit isn't clobbered
+                    // without the user knowing. The user can re-capture / re-run to
+                    // pick up the new baseline.
+                    if host_changed_since_capture(id, &rel) {
+                        Err("host file changed since capture (stale); apply refused \
+                         — re-run the box to pick up the new contents"
+                            .into())
+                    } else {
+                        materialize(&conn, id, &rel)
+                    }
                 }
             }
-        }};
+        };
         match result {
             Ok(()) => {
                 if let Some((rowid, _, _)) = row_of(&conn, &rel) {
@@ -1403,8 +1635,8 @@ fn settle(id: i64, rel: &str) {
 fn write_current(id: i64, rel: &str, data: &[u8]) -> Result<(), String> {
     let rel = rel.trim_start_matches('/');
     let conn = open_rw(id).ok_or("archive unavailable")?;
-    let rowid = crate::depot::archive_write_inline(&conn, rel, data)
-        .map_err(|error| error.to_string())?;
+    let rowid =
+        crate::depot::archive_write_inline(&conn, rel, data).map_err(|error| error.to_string())?;
     if let Some(r) = rowid {
         match std::fs::remove_file(blob_path(id, r)) {
             Ok(()) => {}
@@ -1484,21 +1716,41 @@ struct SrcEntry {
 fn read_src_entry(src: i64, rel: &str) -> Option<SrcEntry> {
     let pc = open_ro(src)?;
     let n = crate::depot::archive_node(&pc, rel)?;
-    let (rowid, mode, mtime, sz, data, opaque) =
-        (n.rowid, n.mode as i64, n.mtime, n.sz, n.data, n.opaque as i64);
-    let owner: Option<(i64, i64)> = pc.query_row(
-        "SELECT uid,gid FROM ownership WHERE name=?1", [rel],
-        |r| Ok((r.get(0)?, r.get(1)?))).ok();
-    let rdev: Option<i64> = pc.query_row("SELECT dev FROM rdev WHERE name=?1", [rel],
-                                         |r| r.get(0)).ok();
+    let (rowid, mode, mtime, sz, data, opaque) = (
+        n.rowid,
+        n.mode as i64,
+        n.mtime,
+        n.sz,
+        n.data,
+        n.opaque as i64,
+    );
+    let owner: Option<(i64, i64)> = pc
+        .query_row("SELECT uid,gid FROM ownership WHERE name=?1", [rel], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .ok();
+    let rdev: Option<i64> = pc
+        .query_row("SELECT dev FROM rdev WHERE name=?1", [rel], |r| r.get(0))
+        .ok();
     let mut xattrs: Vec<(String, Vec<u8>)> = vec![];
     if let Ok(mut st) = pc.prepare("SELECT key,value FROM xattr WHERE name=?1") {
-        if let Ok(rows) = st.query_map([rel], |r|
-            Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))) {
+        if let Ok(rows) = st.query_map([rel], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
+        }) {
             xattrs = rows.flatten().collect();
         }
     }
-    Some(SrcEntry { rowid, mode: mode as u32, mtime, sz, data, opaque, owner, rdev, xattrs })
+    Some(SrcEntry {
+        rowid,
+        mode: mode as u32,
+        mtime,
+        sz,
+        data,
+        opaque,
+        owner,
+        rdev,
+        xattrs,
+    })
 }
 
 /// Does `id`'s OWN view resolve `rel` to "whiteout" (a tombstone), "present"
@@ -1512,7 +1764,11 @@ fn read_src_entry(src: i64, rel: &str) -> Option<SrcEntry> {
 fn own_kind(id: i64, rel: &str) -> Option<&'static str> {
     let conn = open_ro(id)?;
     let mode: u32 = crate::depot::archive_mode(&conn, rel)?;
-    Some(if mode & S_IFMT == S_IFCHR { "whiteout" } else { "present" })
+    Some(if mode & S_IFMT == S_IFCHR {
+        "whiteout"
+    } else {
+        "present"
+    })
 }
 
 /// Does `id`'s LOWER (what it INHERITS, ignoring its own overlay) currently
@@ -1556,9 +1812,14 @@ pub fn lower_has(id: i64, rel: &str) -> bool {
 /// shadow whatever the destination's lower still resolves); false → just drop
 /// the destination's own row + blob (its lower has nothing here, so no shadow is
 /// needed — a plain row-drop, mirroring _promote_into_parent's delete branch).
-fn promote_record(e: &SrcEntry, src: i64, dst: i64,
-                  dst_live: Option<&crate::capture::BoxState>,
-                  rel: &str, tombstone_as_whiteout: bool) -> Result<(), String> {
+fn promote_record(
+    e: &SrcEntry,
+    src: i64,
+    dst: i64,
+    dst_live: Option<&crate::capture::BoxState>,
+    rel: &str,
+    tombstone_as_whiteout: bool,
+) -> Result<(), String> {
     let kind = e.mode & S_IFMT;
 
     // ONE write path: write the destination's authoritative sqlar (a fresh RW
@@ -1584,7 +1845,14 @@ fn promote_record(e: &SrcEntry, src: i64, dst: i64,
             let _ = std::fs::remove_file(blob_path(dst, old_rowid));
         }
         let new_rowid = crate::depot::archive_upsert(
-            &cc, rel, e.mode, e.mtime, e.sz, e.data.as_deref(), e.opaque)?;
+            &cc,
+            rel,
+            e.mode,
+            e.mtime,
+            e.sz,
+            e.data.as_deref(),
+            e.opaque,
+        )?;
         if kind == 0o100000 {
             let s = blob_path(src, e.rowid);
             if s.exists() {
@@ -1600,18 +1868,27 @@ fn promote_record(e: &SrcEntry, src: i64, dst: i64,
         // a missing device number, or lost xattrs while apply reported
         // success — a silent partial-corruption. Fail the apply instead.
         if let Some((u, g)) = e.owner {
-            cc.execute("INSERT OR REPLACE INTO ownership(name,uid,gid) \
-                        VALUES(?1,?2,?3)", params![rel, u, g])
-              .map_err(|x| x.to_string())?;
+            cc.execute(
+                "INSERT OR REPLACE INTO ownership(name,uid,gid) \
+                        VALUES(?1,?2,?3)",
+                params![rel, u, g],
+            )
+            .map_err(|x| x.to_string())?;
         }
         if let Some(dev) = e.rdev {
-            cc.execute("INSERT OR REPLACE INTO rdev(name,dev) VALUES(?1,?2)",
-                       params![rel, dev]).map_err(|x| x.to_string())?;
+            cc.execute(
+                "INSERT OR REPLACE INTO rdev(name,dev) VALUES(?1,?2)",
+                params![rel, dev],
+            )
+            .map_err(|x| x.to_string())?;
         }
         for (k, v) in &e.xattrs {
-            cc.execute("INSERT OR REPLACE INTO xattr(name,key,value) \
-                        VALUES(?1,?2,?3)", params![rel, k, v])
-              .map_err(|x| x.to_string())?;
+            cc.execute(
+                "INSERT OR REPLACE INTO xattr(name,key,value) \
+                        VALUES(?1,?2,?3)",
+                params![rel, k, v],
+            )
+            .map_err(|x| x.to_string())?;
         }
         Ok(())
         // cc is dropped here, releasing the write lock BEFORE the mirror refresh.
@@ -1634,9 +1911,12 @@ fn promote_record(e: &SrcEntry, src: i64, dst: i64,
 /// live BoxState (RAM mirror) when the parent is running. A deletion promotes as
 /// a whiteout iff the PARENT's own lower (its parent chain) still resolves rel to
 /// a present entry; otherwise it drops the parent's own row.
-pub fn promote_into_parent(box_id: i64, parent: i64,
-                           parent_live: Option<&crate::capture::BoxState>,
-                           rel: &str) -> Result<(), String> {
+pub fn promote_into_parent(
+    box_id: i64,
+    parent: i64,
+    parent_live: Option<&crate::capture::BoxState>,
+    rel: &str,
+) -> Result<(), String> {
     let rel = rel.trim_start_matches('/');
     let Some(e) = read_src_entry(box_id, rel) else {
         return Err("not in archive".into());
@@ -1658,14 +1938,15 @@ pub fn promote_into_parent(box_id: i64, parent: i64,
 /// an ABSENT host path becomes a whiteout, so a sibling doesn't suddenly see
 /// the file `a` is newly creating. Fail-closed: an error means the caller
 /// must NOT promote this path.
-pub fn preserve_sibling_views(a: i64, rel: &str, ctx: &NestCtx)
-    -> Result<(), String> {
+pub fn preserve_sibling_views(a: i64, rel: &str, ctx: &NestCtx) -> Result<(), String> {
     let rel = rel.trim_start_matches('/');
     let boxes = crate::discover::discover();
     let parent = boxes.get(&a).and_then(|b| b.parent);
-    let sibs: Vec<i64> = boxes.values()
+    let sibs: Vec<i64> = boxes
+        .values()
         .filter(|b| b.parent == parent && b.box_id != a)
-        .map(|b| b.box_id).collect();
+        .map(|b| b.box_id)
+        .collect();
     if sibs.is_empty() {
         return Ok(());
     }
@@ -1676,8 +1957,13 @@ pub fn preserve_sibling_views(a: i64, rel: &str, ctx: &NestCtx)
     let mut cur = parent;
     let mut seen = std::collections::HashSet::new();
     while let Some(o) = cur {
-        if !seen.insert(o) { break; }
-        if own_kind(o, rel).is_some() { src = Some(o); break; }
+        if !seen.insert(o) {
+            break;
+        }
+        if own_kind(o, rel).is_some() {
+            src = Some(o);
+            break;
+        }
         cur = boxes.get(&o).and_then(|b| b.parent);
     }
     for s in sibs {
@@ -1697,8 +1983,11 @@ pub fn preserve_sibling_views(a: i64, rel: &str, ctx: &NestCtx)
 /// real host. Only if `dst` has no own row (same guard as copy_down_entry).
 /// An ABSENT host path snapshots as a whiteout: the sibling's old view was
 /// "no such file" and must stay that way once the host gains the file.
-fn snapshot_host_into(dst: i64, dst_live: Option<&crate::capture::BoxState>,
-                      rel: &str) -> Result<(), String> {
+fn snapshot_host_into(
+    dst: i64,
+    dst_live: Option<&crate::capture::BoxState>,
+    rel: &str,
+) -> Result<(), String> {
     let rel = rel.trim_start_matches('/');
     let has = open_ro(dst)
         .map(|c| crate::depot::archive_exists(&c, rel))
@@ -1719,20 +2008,31 @@ fn snapshot_host_into(dst: i64, dst_live: Option<&crate::capture::BoxState>,
         let mtime_ns = md.mtime() * 1_000_000_000 + md.mtime_nsec();
         match mode & S_IFMT {
             S_IFLNK => {
-                let tgt = std::fs::read_link(&host)
-                    .map_err(|e| e.to_string())?;
+                let tgt = std::fs::read_link(&host).map_err(|e| e.to_string())?;
                 let bytes = tgt.as_os_str().as_encoded_bytes().to_vec();
-                crate::depot::archive_upsert(&cc, rel, mode, mtime_ns,
-                                             bytes.len() as i64,
-                                             Some(&bytes), 0)?;
+                crate::depot::archive_upsert(
+                    &cc,
+                    rel,
+                    mode,
+                    mtime_ns,
+                    bytes.len() as i64,
+                    Some(&bytes),
+                    0,
+                )?;
             }
             0o040000 => {
-                crate::depot::archive_upsert(&cc, rel, mode, mtime_ns,
-                                             0, None, 0)?;
+                crate::depot::archive_upsert(&cc, rel, mode, mtime_ns, 0, None, 0)?;
             }
             0o100000 => {
                 let rowid = crate::depot::archive_upsert(
-                    &cc, rel, mode, mtime_ns, md.size() as i64, None, 0)?;
+                    &cc,
+                    rel,
+                    mode,
+                    mtime_ns,
+                    md.size() as i64,
+                    None,
+                    0,
+                )?;
                 let dstb = blob_path(dst, rowid);
                 if let Some(p) = dstb.parent() {
                     std::fs::create_dir_all(p).map_err(|e| e.to_string())?;
@@ -1743,18 +2043,27 @@ fn snapshot_host_into(dst: i64, dst_live: Option<&crate::capture::BoxState>,
             // is unrepresentable (S_IFCHR rows are the tombstone convention);
             // fail closed rather than snapshot a "deleted" view.
             k if k == S_IFIFO || k == S_IFBLK => {
-                crate::depot::archive_upsert(&cc, rel, mode, mtime_ns,
-                                             0, None, 0)?;
-                cc.execute("INSERT OR REPLACE INTO rdev(name,dev) \
-                            VALUES(?1,?2)", params![rel, md.rdev() as i64])
-                  .map_err(|e| e.to_string())?;
+                crate::depot::archive_upsert(&cc, rel, mode, mtime_ns, 0, None, 0)?;
+                cc.execute(
+                    "INSERT OR REPLACE INTO rdev(name,dev) \
+                            VALUES(?1,?2)",
+                    params![rel, md.rdev() as i64],
+                )
+                .map_err(|e| e.to_string())?;
             }
-            _ => return Err(format!(
-                "host {rel}: unrepresentable file type {:o}", mode & S_IFMT)),
+            _ => {
+                return Err(format!(
+                    "host {rel}: unrepresentable file type {:o}",
+                    mode & S_IFMT
+                ));
+            }
         }
-        cc.execute("INSERT OR REPLACE INTO ownership(name,uid,gid) \
-                    VALUES(?1,?2,?3)", params![rel, md.uid(), md.gid()])
-          .map_err(|e| e.to_string())?;
+        cc.execute(
+            "INSERT OR REPLACE INTO ownership(name,uid,gid) \
+                    VALUES(?1,?2,?3)",
+            params![rel, md.uid(), md.gid()],
+        )
+        .map_err(|e| e.to_string())?;
         Ok(())
     })();
     drop(cc);
@@ -1780,9 +2089,12 @@ fn snapshot_host_into(dst: i64, dst_live: Option<&crate::capture::BoxState>,
 /// copy the parent blob into the child's pool under a fresh rowid;
 /// symlinks/tombstones/special carry their row data + side tables. A tombstone
 /// copies down AS a whiteout (the child keeps seeing 'absent').
-pub fn copy_down_entry(parent: i64, child: i64, rel: &str,
-                       child_live: Option<&crate::capture::BoxState>)
-    -> Result<(), String> {
+pub fn copy_down_entry(
+    parent: i64,
+    child: i64,
+    rel: &str,
+    child_live: Option<&crate::capture::BoxState>,
+) -> Result<(), String> {
     let rel = rel.trim_start_matches('/');
     // Child already speaks for this path (its own sqlar row exists) — its view
     // is self-contained, nothing to copy down. Read the sqlar, not a live mirror.
@@ -1795,7 +2107,9 @@ pub fn copy_down_entry(parent: i64, child: i64, rel: &str,
     let Some(e) = read_src_entry(parent, rel) else {
         return Err("parent has no such entry".into());
     };
-    promote_record(&e, parent, child, child_live, rel, /*tombstone_as_whiteout=*/true)
+    promote_record(
+        &e, parent, child, child_live, rel, /*tombstone_as_whiteout=*/ true,
+    )
 }
 
 /// Copy `rel` DOWN into every immediate child of `sid` that inherits it (has no
@@ -1805,10 +2119,16 @@ pub fn copy_down_entry(parent: i64, child: i64, rel: &str,
 /// `resolve_live(c)` is each child's live BoxState when running. Returns
 /// Err(msg) if any child copy-down failed (the caller MUST NOT then drop the
 /// row — the child would lose its inherited view).
-fn copydown_to_children<C, F>(sid: i64, rel: &str, children_of: &C, resolve_live: &F)
-    -> Result<(), String>
-    where C: Fn(i64) -> Vec<i64>,
-          F: Fn(i64) -> Option<std::sync::Arc<crate::capture::BoxState>> {
+fn copydown_to_children<C, F>(
+    sid: i64,
+    rel: &str,
+    children_of: &C,
+    resolve_live: &F,
+) -> Result<(), String>
+where
+    C: Fn(i64) -> Vec<i64>,
+    F: Fn(i64) -> Option<std::sync::Arc<crate::capture::BoxState>>,
+{
     let kids = children_of(sid);
     if kids.is_empty() {
         return Ok(());
@@ -1833,9 +2153,11 @@ pub fn set_parent_meta(child: i64, new: Option<i64>) -> Result<(), String> {
     match new {
         Some(p) => cc.execute(
             "INSERT OR REPLACE INTO meta(key,value) VALUES('parent_box_id',?1)",
-            params![p.to_string()]),
+            params![p.to_string()],
+        ),
         None => cc.execute("DELETE FROM meta WHERE key='parent_box_id'", []),
-    }.map_err(|e| e.to_string())?;
+    }
+    .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -1851,14 +2173,17 @@ pub fn set_no_host_meta(child: i64) -> Result<(), String> {
     cc.execute(
         "INSERT OR REPLACE INTO meta(key,value) VALUES('no_host_fallback','1')",
         [],
-    ).map_err(|e| e.to_string())?;
+    )
+    .map_err(|e| e.to_string())?;
     Ok(())
 }
 
 /// All changed paths a box captured (apply- and discard-bound alike) — the set
 /// a child may have inherited a view of through this box.
 pub fn changed_paths(id: i64) -> Vec<String> {
-    session_changes_typed(id).unwrap_or_default().into_iter()
+    session_changes_typed(id)
+        .unwrap_or_default()
+        .into_iter()
         .filter_map(|change| String::from_utf8(change.path.as_slice().to_vec()).ok())
         .collect()
 }
@@ -1946,9 +2271,10 @@ fn next_id() -> u64 {
     N.fetch_add(1, Ordering::Relaxed)
 }
 
-fn pair(style: &str, text: impl Into<String>)
-    -> Result<crate::generated_wire::StructuralLine, String>
-{
+fn pair(
+    style: &str,
+    text: impl Into<String>,
+) -> Result<crate::generated_wire::StructuralLine, String> {
     Ok(crate::generated_wire::StructuralLine {
         style: crate::wire::BoundedText::new(style.to_owned())
             .map_err(|error| format!("structural style exceeds relation bound: {error:?}"))?,
@@ -1957,13 +2283,16 @@ fn pair(style: &str, text: impl Into<String>)
     })
 }
 
-fn bounded_lines(lines: Vec<crate::generated_wire::StructuralLine>)
-    -> Result<crate::wire::BoundedVec<
+fn bounded_lines(
+    lines: Vec<crate::generated_wire::StructuralLine>,
+) -> Result<
+    crate::wire::BoundedVec<
         crate::generated_wire::StructuralLine,
         0,
         { crate::generated_wire::LIMIT_COLLECTION_ITEMS },
-    >, String>
-{
+    >,
+    String,
+> {
     crate::wire::BoundedVec::new(lines)
         .map_err(|error| format!("structural lines exceed relation bound: {error:?}"))
 }
@@ -1996,7 +2325,10 @@ fn struct_type(data: &[u8]) -> String {
 fn file_type(data: &[u8]) -> Option<String> {
     let tmp = scratch_file("sniff", data).ok()?;
     let out = std::process::Command::new("file")
-        .arg("--brief").arg(&tmp).output().ok();
+        .arg("--brief")
+        .arg(&tmp)
+        .output()
+        .ok();
     let _ = std::fs::remove_file(&tmp);
     let out = out?;
     if !out.status.success() {
@@ -2023,8 +2355,11 @@ fn differ_for(mtype: &str, data: &[u8]) -> Option<(Vec<String>, String)> {
     if mt.contains("zip archive") || &data[..data.len().min(2)] == b"PK" {
         return Some((v(&["unzip", "-l", "{in}"]), "zip (unzip -l)".into()));
     }
-    if mt.contains("tar archive") || mt.contains("gzip compressed")
-        || mt.contains("bzip2") || mt.contains("xz compressed") {
+    if mt.contains("tar archive")
+        || mt.contains("gzip compressed")
+        || mt.contains("bzip2")
+        || mt.contains("xz compressed")
+    {
         return Some((v(&["tar", "-tvf", "{in}"]), "tar (tar -tvf)".into()));
     }
     None
@@ -2032,43 +2367,69 @@ fn differ_for(mtype: &str, data: &[u8]) -> Option<(Vec<String>, String)> {
 
 /// FAST half: type line(s) + differ selection. When `job` is absent the lines
 /// are the complete result (unrecognized type or over the size cap).
-pub fn struct_quick(id: i64, rel: &str)
-    -> Result<crate::generated_wire::StructuralQuick, String>
-{
+pub fn struct_quick(id: i64, rel: &str) -> Result<crate::generated_wire::StructuralQuick, String> {
     use crate::generated_wire::StructuralQuick;
     let rel = rel.trim_start_matches('/');
     let base = lower_bytes(rel);
     let cur = current_bytes(id, rel).unwrap_or_default();
     let mut lines = Vec::new();
     if !base.is_empty() && !cur.is_empty() {
-        lines.push(pair("type", format!("type (base): {}", struct_type(&base)))?);
-        lines.push(pair("type", format!("type (current): {}", struct_type(&cur)))?);
+        lines.push(pair(
+            "type",
+            format!("type (base): {}", struct_type(&base)),
+        )?);
+        lines.push(pair(
+            "type",
+            format!("type (current): {}", struct_type(&cur)),
+        )?);
     } else {
         let sniff = if cur.is_empty() { &base } else { &cur };
         lines.push(pair("type", format!("type: {}", struct_type(sniff)))?);
     }
-    let sniff = if cur.is_empty() { base.clone() } else { cur.clone() };
-    let Some((argv, label)) = differ_for(&struct_type(&sniff), &sniff) else {
-        return Ok(StructuralQuick { lines: bounded_lines(lines)?, job: None });
+    let sniff = if cur.is_empty() {
+        base.clone()
+    } else {
+        cur.clone()
     };
-    lines.push(pair("hdr", format!(
-        "\u{2500}\u{2500} structural diff \u{b7} {label} \u{2500}\u{2500}"))?);
+    let Some((argv, label)) = differ_for(&struct_type(&sniff), &sniff) else {
+        return Ok(StructuralQuick {
+            lines: bounded_lines(lines)?,
+            job: None,
+        });
+    };
+    lines.push(pair(
+        "hdr",
+        format!("\u{2500}\u{2500} structural diff \u{b7} {label} \u{2500}\u{2500}"),
+    )?);
     if base.len() > STRUCT_MAX || cur.len() > STRUCT_MAX {
-        lines.push(pair("dim", format!("(skipped: file exceeds {STRUCT_MAX} bytes)"))?);
-        return Ok(StructuralQuick { lines: bounded_lines(lines)?, job: None });
+        lines.push(pair(
+            "dim",
+            format!("(skipped: file exceeds {STRUCT_MAX} bytes)"),
+        )?);
+        return Ok(StructuralQuick {
+            lines: bounded_lines(lines)?,
+            job: None,
+        });
     }
     let jid = next_id();
-    job_registry().lock().unwrap().insert(jid, StructJob {
-        argv, base, cur, head: lines.clone(),
-    });
-    Ok(StructuralQuick { lines: bounded_lines(lines)?, job: Some(jid) })
+    job_registry().lock().unwrap().insert(
+        jid,
+        StructJob {
+            argv,
+            base,
+            cur,
+            head: lines.clone(),
+        },
+    );
+    Ok(StructuralQuick {
+        lines: bounded_lines(lines)?,
+        job: Some(jid),
+    })
 }
 
 /// SLOW half: run the sandboxed dump(s) for `job` and build the unified
 /// structural diff.
-pub fn struct_finish(job_id: u64)
-    -> Result<crate::generated_wire::StructuralDiff, String>
-{
+pub fn struct_finish(job_id: u64) -> Result<crate::generated_wire::StructuralDiff, String> {
     use crate::generated_wire::StructuralDiff;
     let Some(job) = job_registry().lock().unwrap().remove(&job_id) else {
         return Ok(StructuralDiff {
@@ -2089,26 +2450,48 @@ pub fn struct_finish(job_id: u64)
         let bd = dump(&job.base);
         let cd = dump(&job.cur);
         let diff = TextDiff::from_lines(&bd, &cd);
-        let bl: Vec<&str> = diff.iter_old_slices()
-            .map(|s| s.trim_end_matches(['\r', '\n'])).collect();
-        let cl: Vec<&str> = diff.iter_new_slices()
-            .map(|s| s.trim_end_matches(['\r', '\n'])).collect();
+        let bl: Vec<&str> = diff
+            .iter_old_slices()
+            .map(|s| s.trim_end_matches(['\r', '\n']))
+            .collect();
+        let cl: Vec<&str> = diff
+            .iter_new_slices()
+            .map(|s| s.trim_end_matches(['\r', '\n']))
+            .collect();
         let mut any = false;
         for group in diff.grouped_ops(3) {
-            if group.is_empty() { continue; }
+            if group.is_empty() {
+                continue;
+            }
             let (_, a0, _) = group[0].as_tag_tuple();
             let (_, alast, blast) = group[group.len() - 1].as_tag_tuple();
             let (_, _, b0) = group[0].as_tag_tuple();
-            lines.push(pair("@", format!("@@ -{},{} +{},{} @@",
-                a0.start + 1, alast.end - a0.start, b0.start + 1, blast.end - b0.start))?);
+            lines.push(pair(
+                "@",
+                format!(
+                    "@@ -{},{} +{},{} @@",
+                    a0.start + 1,
+                    alast.end - a0.start,
+                    b0.start + 1,
+                    blast.end - b0.start
+                ),
+            )?);
             any = true;
             for op in &group {
                 let (tag, orange, nrange) = op.as_tag_tuple();
                 match tag {
-                    DiffTag::Equal => for k in orange { lines.push(pair(" ", bl[k])?); },
+                    DiffTag::Equal => {
+                        for k in orange {
+                            lines.push(pair(" ", bl[k])?);
+                        }
+                    }
                     _ => {
-                        for k in orange { lines.push(pair("-", bl[k])?); }
-                        for k in nrange { lines.push(pair("+", cl[k])?); }
+                        for k in orange {
+                            lines.push(pair("-", bl[k])?);
+                        }
+                        for k in nrange {
+                            lines.push(pair("+", cl[k])?);
+                        }
                     }
                 }
             }
@@ -2117,14 +2500,24 @@ pub fn struct_finish(job_id: u64)
             lines.push(pair("dim", "(structural dumps identical)")?);
         }
     } else {
-        let which_side = if job.cur.is_empty() { "base" } else { "current" };
+        let which_side = if job.cur.is_empty() {
+            "base"
+        } else {
+            "current"
+        };
         lines.push(pair("dim", format!("({which_side} only)"))?);
-        let data = if job.cur.is_empty() { &job.base } else { &job.cur };
+        let data = if job.cur.is_empty() {
+            &job.base
+        } else {
+            &job.cur
+        };
         for ln in dump(data).split('\n') {
             lines.push(pair(" ", ln.trim_end_matches('\r'))?);
         }
     }
-    Ok(StructuralDiff { lines: bounded_lines(lines)? })
+    Ok(StructuralDiff {
+        lines: bounded_lines(lines)?,
+    })
 }
 
 pub fn struct_cancel(job_id: u64) {
@@ -2134,7 +2527,11 @@ pub fn struct_cancel(job_id: u64) {
 /// Write `data` to a uniquely-named scratch file under the system temp dir.
 fn scratch_file(tag: &str, data: &[u8]) -> std::io::Result<PathBuf> {
     let dir = std::env::temp_dir();
-    let p = dir.join(format!("sarun-ut-{tag}-{}-{}", std::process::id(), next_id()));
+    let p = dir.join(format!(
+        "sarun-ut-{tag}-{}-{}",
+        std::process::id(),
+        next_id()
+    ));
     std::fs::write(&p, data)?;
     Ok(p)
 }
@@ -2147,35 +2544,70 @@ fn scratch_file(tag: &str, data: &[u8]) -> std::io::Result<PathBuf> {
 /// (noted in any error). Output is capped at 256 KiB. Never panics.
 fn run_on_untrusted(argv: &[String], data: &[u8]) -> Result<String, String> {
     // A dedicated dir so we can ro-bind exactly the input into the sandbox.
-    let dir = std::env::temp_dir()
-        .join(format!("sarun-utd-{}-{}", std::process::id(), next_id()));
+    let dir = std::env::temp_dir().join(format!("sarun-utd-{}-{}", std::process::id(), next_id()));
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let host_in = dir.join("in");
     let res = (|| {
         std::fs::write(&host_in, data).map_err(|e| e.to_string())?;
         let inside_dir = "/tmp/ut";
         let inside_in = format!("{inside_dir}/in");
-        let is_in = |a: &str| a.starts_with('{') && a.ends_with('}')
-            && &a[1..a.len() - 1] == "in";
+        let is_in = |a: &str| a.starts_with('{') && a.ends_with('}') && &a[1..a.len() - 1] == "in";
         let out = if which("bwrap") {
             let mut cmd = std::process::Command::new("bwrap");
-            cmd.args(["--unshare-pid", "--unshare-ipc", "--unshare-uts",
-                      "--unshare-net", "--die-with-parent", "--new-session",
-                      "--cap-drop", "ALL", "--ro-bind", "/", "/",
-                      "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"]);
+            cmd.args([
+                "--unshare-pid",
+                "--unshare-ipc",
+                "--unshare-uts",
+                "--unshare-net",
+                "--die-with-parent",
+                "--new-session",
+                "--cap-drop",
+                "ALL",
+                "--ro-bind",
+                "/",
+                "/",
+                "--proc",
+                "/proc",
+                "--dev",
+                "/dev",
+                "--tmpfs",
+                "/tmp",
+            ]);
             cmd.arg("--ro-bind").arg(&dir).arg(inside_dir);
-            cmd.args(["--chdir", inside_dir, "--clearenv",
-                      "--setenv", "PATH", SANDBOX_PATH, "--"]);
-            cmd.args(argv.iter().map(|a| if is_in(a) { inside_in.clone() }
-                                       else { a.clone() }));
+            cmd.args([
+                "--chdir",
+                inside_dir,
+                "--clearenv",
+                "--setenv",
+                "PATH",
+                SANDBOX_PATH,
+                "--",
+            ]);
+            cmd.args(argv.iter().map(|a| {
+                if is_in(a) {
+                    inside_in.clone()
+                } else {
+                    a.clone()
+                }
+            }));
             cmd.stdin(std::process::Stdio::null());
             cmd.output().map_err(|e| format!("spawn failed: {e}"))?
         } else {
-            let real: Vec<String> = argv.iter().map(|a| if is_in(a) {
-                host_in.to_string_lossy().into_owned() } else { a.clone() }).collect();
-            std::process::Command::new(&real[0]).args(&real[1..])
+            let real: Vec<String> = argv
+                .iter()
+                .map(|a| {
+                    if is_in(a) {
+                        host_in.to_string_lossy().into_owned()
+                    } else {
+                        a.clone()
+                    }
+                })
+                .collect();
+            std::process::Command::new(&real[0])
+                .args(&real[1..])
                 .stdin(std::process::Stdio::null())
-                .output().map_err(|e| format!("spawn failed (no bwrap): {e}"))?
+                .output()
+                .map_err(|e| format!("spawn failed (no bwrap): {e}"))?
         };
         let stdout = String::from_utf8_lossy(&out.stdout);
         let capped: String = stdout.chars().take(256 * 1024).collect();
@@ -2183,7 +2615,10 @@ fn run_on_untrusted(argv: &[String], data: &[u8]) -> Result<String, String> {
             let err = String::from_utf8_lossy(&out.stderr);
             let msg: String = err.trim().chars().take(2000).collect();
             return Err(if msg.is_empty() {
-                format!("exit {:?}", out.status.code()) } else { msg });
+                format!("exit {:?}", out.status.code())
+            } else {
+                msg
+            });
         }
         Ok(capped)
     })();
@@ -2192,9 +2627,9 @@ fn run_on_untrusted(argv: &[String], data: &[u8]) -> Result<String, String> {
 }
 
 fn which(prog: &str) -> bool {
-    std::env::var_os("PATH").map(|paths| {
-        std::env::split_paths(&paths).any(|p| p.join(prog).is_file())
-    }).unwrap_or(false)
+    std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).any(|p| p.join(prog).is_file()))
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -2210,13 +2645,17 @@ mod tests {
     #[test]
     fn promote_into_live_parent_refreshes_the_ram_mirror() {
         let _g = crate::depot::TEST_STATE_HOME_LOCK.lock().unwrap();
-        let tmp = std::env::temp_dir()
-            .join(format!("sarun-promote-{}-{:?}", std::process::id(),
-                          std::time::SystemTime::now()));
+        let tmp = std::env::temp_dir().join(format!(
+            "sarun-promote-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+        ));
         std::fs::create_dir_all(&tmp).unwrap();
         // SAFETY: state_home() is derived from XDG_STATE_HOME; no concurrent test
         // in this binary reads it (the others use temp_dir()).
-        unsafe { std::env::set_var("XDG_STATE_HOME", &tmp); }
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", &tmp);
+        }
         std::fs::create_dir_all(crate::paths::state_home()).unwrap();
 
         let (parent_id, child_id) = (9001, 9002);
@@ -2230,15 +2669,20 @@ mod tests {
         std::fs::write(&cblob, b"hi").unwrap();
         child.finalize_file("foo.txt", 2, 0, 0);
 
-        assert!(parent.entry("foo.txt").is_none(), "precondition: parent empty");
+        assert!(
+            parent.entry("foo.txt").is_none(),
+            "precondition: parent empty"
+        );
 
         promote_into_parent(child_id, parent_id, Some(&parent), "foo.txt").unwrap();
 
         // sqlar got the row...
         let mode: i64 = {
             let c = parent.conn.lock().unwrap();
-            c.query_row("SELECT mode FROM sqlar WHERE name='foo.txt'", [], |r| r.get(0))
-                .expect("row in parent sqlar")
+            c.query_row("SELECT mode FROM sqlar WHERE name='foo.txt'", [], |r| {
+                r.get(0)
+            })
+            .expect("row in parent sqlar")
         };
         assert_eq!(mode as u32 & S_IFMT, 0o100000, "promoted as a regular file");
 
@@ -2246,7 +2690,11 @@ mod tests {
         match parent.entry("foo.txt") {
             Some(Entry::File { rowid, .. }) => {
                 let pblob = crate::depot::blob_path(parent_id, rowid);
-                assert_eq!(std::fs::read(&pblob).unwrap(), b"hi", "promoted blob copied");
+                assert_eq!(
+                    std::fs::read(&pblob).unwrap(),
+                    b"hi",
+                    "promoted blob copied"
+                );
             }
             Some(_) => panic!("live parent mirror has wrong entry kind after promote"),
             None => panic!("live parent mirror NOT refreshed by promote (still absent)"),
@@ -2261,13 +2709,17 @@ mod tests {
     #[test]
     fn write_file_guard_refuses_tombstone_symlink_binary_missing() {
         let _g = crate::depot::TEST_STATE_HOME_LOCK.lock().unwrap();
-        let tmp = std::env::temp_dir()
-            .join(format!("sarun-wguard-{}-{:?}", std::process::id(),
-                          std::time::SystemTime::now()));
+        let tmp = std::env::temp_dir().join(format!(
+            "sarun-wguard-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+        ));
         std::fs::create_dir_all(&tmp).unwrap();
         // SAFETY: serialized by TEST_STATE_HOME_LOCK (same convention as the
         // promote test above).
-        unsafe { std::env::set_var("XDG_STATE_HOME", &tmp); }
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", &tmp);
+        }
         std::fs::create_dir_all(crate::paths::state_home()).unwrap();
 
         let id = 9101;
@@ -2289,38 +2741,68 @@ mod tests {
         // (allow_create = true) share this exact gate; only the nowhere-path
         // arm differs (asserted below). Every refusal here must fire in both.
         let err = |rel: &str, bytes: &[u8]| {
-            let e = write_file_guard(id, rel, bytes, false).expect_err(rel).to_string();
+            let e = write_file_guard(id, rel, bytes, false)
+                .expect_err(rel)
+                .to_string();
             // The shared gate: identical under allow_create for all these.
-            assert_eq!(write_file_guard(id, rel, bytes, true).expect_err(rel).to_string(),
-                       e, "guard for {rel} must not depend on allow_create");
+            assert_eq!(
+                write_file_guard(id, rel, bytes, true)
+                    .expect_err(rel)
+                    .to_string(),
+                e,
+                "guard for {rel} must not depend on allow_create"
+            );
             e
         };
-        assert!(err("gone.txt", b"x").contains("deleted"), "tombstone refused");
+        assert!(
+            err("gone.txt", b"x").contains("deleted"),
+            "tombstone refused"
+        );
         assert!(err("ln.txt", b"x").contains("symlink"), "symlink refused");
-        assert!(err("bin.dat", b"x").contains("binary"), "captured binary refused");
-        assert!(err("ok.txt", b"a\0b").contains("binary"), "NUL payload refused");
+        assert!(
+            err("bin.dat", b"x").contains("binary"),
+            "captured binary refused"
+        );
+        assert!(
+            err("ok.txt", b"a\0b").contains("binary"),
+            "NUL payload refused"
+        );
         // Nowhere-path: the ONE axis that differs. The editor refuses it; the
         // agent tool (allow_create) creates it.
         let missing = tmp.join("absent.txt");
         let missing_rel = missing.to_str().unwrap().trim_start_matches('/');
-        assert!(write_file_guard(id, missing_rel, b"x", false)
-                    .expect_err("editor").to_string().contains("no such file"),
-                "editor refuses a nowhere-path");
-        assert!(write_file_guard(id, missing_rel, b"x", true).is_ok(),
-                "agent tool creates a nowhere-path");
+        assert!(
+            write_file_guard(id, missing_rel, b"x", false)
+                .expect_err("editor")
+                .to_string()
+                .contains("no such file"),
+            "editor refuses a nowhere-path"
+        );
+        assert!(
+            write_file_guard(id, missing_rel, b"x", true).is_ok(),
+            "agent tool creates a nowhere-path"
+        );
         // …but a NUL payload to that nowhere-path is still refused for the
         // agent (the binary guard precedes the existence check).
-        assert!(write_file_guard(id, missing_rel, b"a\0b", true)
-                    .expect_err("agent NUL").to_string().contains("binary"),
-                "agent tool still refuses a NUL payload");
-        assert!(write_file_guard(id, "ok.txt", b"new\n", false).is_ok(),
-                "captured text row passes");
+        assert!(
+            write_file_guard(id, missing_rel, b"a\0b", true)
+                .expect_err("agent NUL")
+                .to_string()
+                .contains("binary"),
+            "agent tool still refuses a NUL payload"
+        );
+        assert!(
+            write_file_guard(id, "ok.txt", b"new\n", false).is_ok(),
+            "captured text row passes"
+        );
         // Host fallback: a real host file outside the change set passes.
         let host = tmp.join("host.txt");
         std::fs::write(&host, "host\n").unwrap();
         let host_rel = host.to_str().unwrap().trim_start_matches('/');
-        assert!(write_file_guard(id, host_rel, b"edited\n", false).is_ok(),
-                "host-file fallback passes");
+        assert!(
+            write_file_guard(id, host_rel, b"edited\n", false).is_ok(),
+            "host-file fallback passes"
+        );
         std::fs::remove_dir_all(&tmp).ok();
     }
 
@@ -2333,12 +2815,16 @@ mod tests {
     fn outline_inline_row_materializes_reverted_row() {
         use crate::depot::BoxDepot;
         let _g = crate::depot::TEST_STATE_HOME_LOCK.lock().unwrap();
-        let tmp = std::env::temp_dir()
-            .join(format!("sarun-outline-{}-{:?}", std::process::id(),
-                          std::time::SystemTime::now()));
+        let tmp = std::env::temp_dir().join(format!(
+            "sarun-outline-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+        ));
         std::fs::create_dir_all(&tmp).unwrap();
         // SAFETY: serialized by TEST_STATE_HOME_LOCK.
-        unsafe { std::env::set_var("XDG_STATE_HOME", &tmp); }
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", &tmp);
+        }
         std::fs::create_dir_all(crate::paths::state_home()).unwrap();
 
         let id = 9102;
@@ -2350,8 +2836,10 @@ mod tests {
         std::fs::write(&bp, b"orig\n").unwrap();
         b.finalize_file("f.txt", 5, 0, 0);
         // Already blob-backed → no-op.
-        assert!(!b.outline_inline_row("f.txt").unwrap(),
-                "blob-backed row is a no-op");
+        assert!(
+            !b.outline_inline_row("f.txt").unwrap(),
+            "blob-backed row is a no-op"
+        );
         // Simulate discard_hunk's revert: inline the bytes, drop the blob.
         {
             let conn = open_rw(id).unwrap();
@@ -2360,18 +2848,25 @@ mod tests {
         std::fs::remove_file(&bp).ok();
         assert!(!bp.exists(), "revert dropped the pool blob");
         // Now the row is inline — copy_up could not source it. Materialize.
-        assert!(b.outline_inline_row("f.txt").unwrap(),
-                "inline row is materialized");
-        assert_eq!(std::fs::read(&bp).unwrap(), b"reverted\n",
-                   "inline bytes are now the pool blob");
+        assert!(
+            b.outline_inline_row("f.txt").unwrap(),
+            "inline row is materialized"
+        );
+        assert_eq!(
+            std::fs::read(&bp).unwrap(),
+            b"reverted\n",
+            "inline bytes are now the pool blob"
+        );
         {
             let conn = open_ro(id).unwrap();
             let n = crate::depot::archive_node(&conn, "f.txt").unwrap();
             assert!(n.data.is_none(), "inline column cleared after materialize");
         }
         // Absent path → no-op, not an error.
-        assert!(!b.outline_inline_row("nope.txt").unwrap(),
-                "absent path is a no-op");
+        assert!(
+            !b.outline_inline_row("nope.txt").unwrap(),
+            "absent path is a no-op"
+        );
         std::fs::remove_dir_all(&tmp).ok();
     }
 }

@@ -66,7 +66,8 @@ impl EnvPlan {
         };
 
         let mut i = 0;
-        while i < args.len() { // option phase
+        while i < args.len() {
+            // option phase
             let arg = &args[i];
             if arg == "--" {
                 i += 1;
@@ -381,12 +382,19 @@ impl builtins::Command for NiceCommand {
                     i += 1;
                     match args.get(i) {
                         Some(v) => v.clone(),
-                        None => return nice_usage_error(&context, "option '--adjustment' requires an argument"),
+                        None => {
+                            return nice_usage_error(
+                                &context,
+                                "option '--adjustment' requires an argument",
+                            );
+                        }
                     }
                 };
                 match val.parse::<i32>() {
                     Ok(n) => adjustment = n,
-                    Err(_) => return nice_usage_error(&context, &format!("invalid adjustment '{val}'")),
+                    Err(_) => {
+                        return nice_usage_error(&context, &format!("invalid adjustment '{val}'"));
+                    }
                 }
                 i += 1;
                 continue;
@@ -396,11 +404,15 @@ impl builtins::Command for NiceCommand {
                 i += 1;
                 let val = match args.get(i) {
                     Some(v) => v.clone(),
-                    None => return nice_usage_error(&context, "option requires an argument -- 'n'"),
+                    None => {
+                        return nice_usage_error(&context, "option requires an argument -- 'n'");
+                    }
                 };
                 match val.parse::<i32>() {
                     Ok(n) => adjustment = n,
-                    Err(_) => return nice_usage_error(&context, &format!("invalid adjustment '{val}'")),
+                    Err(_) => {
+                        return nice_usage_error(&context, &format!("invalid adjustment '{val}'"));
+                    }
                 }
                 i += 1;
                 continue;
@@ -408,7 +420,9 @@ impl builtins::Command for NiceCommand {
             if let Some(v) = arg.strip_prefix("-n") {
                 match v.parse::<i32>() {
                     Ok(n) => adjustment = n,
-                    Err(_) => return nice_usage_error(&context, &format!("invalid adjustment '{v}'")),
+                    Err(_) => {
+                        return nice_usage_error(&context, &format!("invalid adjustment '{v}'"));
+                    }
                 }
                 i += 1;
                 continue;

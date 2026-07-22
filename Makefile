@@ -90,7 +90,7 @@ release-licenses: vendor ## Regenerate notices beside the current static release
 
 .PHONY: swipl
 swipl: tools ## Build pinned static SWI-Prolog + zlib artifacts (cached outside the repo)
-	$(TOOLS_RUN) uv run --with cmake --with ninja \
+	$(TOOLS_RUN) uv run --with 'cmake==4.2.3' --with ninja \
 	  python3 scripts/swipl.py --target $(SWIPL_TARGET)
 
 .PHONY: wire-codegen

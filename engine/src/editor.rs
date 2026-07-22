@@ -227,10 +227,10 @@ fn brush_analysis(
 ) -> Result<crate::prolog::BrushDocumentAnalysis, String> {
     analyze_brush_document_resolved(
         &BrushDocumentRequest {
-        source: code.to_string(),
-        assist,
-        initial_bindings: vec![],
-        observations: vec![],
+            source: code.to_string(),
+            assist,
+            initial_bindings: vec![],
+            observations: vec![],
         },
         context,
     )

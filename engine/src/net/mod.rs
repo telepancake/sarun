@@ -49,32 +49,44 @@ pub mod subnet;
 /// engine's own netns (the pre-feature behavior). Tap wires the box up to
 /// the per-box smoltcp stack.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum NetMode { Off, Tap, Host }
+pub enum NetMode {
+    Off,
+    Tap,
+    Host,
+}
 
 impl NetMode {
     pub fn as_str(self) -> &'static str {
-        match self { Self::Off => "off", Self::Tap => "tap", Self::Host => "host" }
+        match self {
+            Self::Off => "off",
+            Self::Tap => "tap",
+            Self::Host => "host",
+        }
     }
     pub fn parse(s: &str) -> Option<Self> {
-        match s { "off" => Some(Self::Off), "tap" => Some(Self::Tap),
-                  "host" => Some(Self::Host), _ => None }
+        match s {
+            "off" => Some(Self::Off),
+            "tap" => Some(Self::Tap),
+            "host" => Some(Self::Host),
+            _ => None,
+        }
     }
 }
 
 // Runtime modules.
-pub mod tap;
-pub mod stack;
+pub mod bridge;
 pub mod dhcp;
+pub mod dispatch;
 pub mod dns;
-pub mod mitm;
-pub mod l4;
+pub mod filter;
 pub mod flows;
+pub mod l4;
+pub mod mitm;
 pub mod policy;
 pub mod prompt;
-pub mod bridge;
-pub mod dispatch;
+pub mod stack;
+pub mod tap;
 pub mod webcap;
-pub mod filter;
 
 /// The per-box hooks the MITM proxy applies to each flow (DESIGN-web.md
 /// W2/W7). Bundled so one optional handle threads through the dispatcher and
@@ -101,7 +113,6 @@ pub struct ReplaySource {
     pub source_box: i64,
     pub asof: Option<f64>,
 }
-
 
 use std::sync::Arc;
 

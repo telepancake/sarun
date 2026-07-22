@@ -81,7 +81,6 @@ const HINTS: &[Hint] = &[
                call `apply(target=<id>)`; to drop them call \
                `reject(target=<id>)`.",
     },
-
     // ── tool meta ─────────────────────────────────────────────────────────
     Hint {
         id: "unknown-tool",
@@ -99,7 +98,6 @@ const HINTS: &[Hint] = &[
                sub-agent session entirely. Names outside this set raise \
                this error.",
     },
-
     // ── conditional, streak-driven ───────────────────────────────────────
     //
     // productive-cluster fires from inside evaluate_call when the current
@@ -119,7 +117,6 @@ const HINTS: &[Hint] = &[
                derivation. (User turns stay in place; the derivation turns \
                between go.)",
     },
-
     // ── shell composition reminders ───────────────────────────────────────
     Hint {
         id: "shell",
@@ -152,12 +149,23 @@ const HINTS: &[Hint] = &[
 ///   * the productive-cluster marker isn't already in any prior turn.
 /// `first_user_id` templates into the suggested backtrack invocation. When
 /// any condition fails, returns an empty string.
-pub fn productive_cluster_append(turns: &[Turn], current_clean: bool,
-                                 first_user_id: Option<&str>) -> String {
-    if !current_clean { return String::new(); }
-    let recent_tools: Vec<&Turn> = turns.iter()
-        .filter(|t| t.kind == "tool").rev().take(8).collect();
-    if recent_tools.len() < 5 { return String::new(); }
+pub fn productive_cluster_append(
+    turns: &[Turn],
+    current_clean: bool,
+    first_user_id: Option<&str>,
+) -> String {
+    if !current_clean {
+        return String::new();
+    }
+    let recent_tools: Vec<&Turn> = turns
+        .iter()
+        .filter(|t| t.kind == "tool")
+        .rev()
+        .take(8)
+        .collect();
+    if recent_tools.len() < 5 {
+        return String::new();
+    }
     let mut substantive_clean = 0usize;
     let mut errs = 0usize;
     for t in &recent_tools {
@@ -168,13 +176,20 @@ pub fn productive_cluster_append(turns: &[Turn], current_clean: bool,
             substantive_clean += 1;
         }
     }
-    if substantive_clean < 5 || errs > 2 { return String::new(); }
+    if substantive_clean < 5 || errs > 2 {
+        return String::new();
+    }
     // Marker dedup against the full session.
-    let marker = HINTS.iter().find(|h| h.id == "productive-cluster")
-        .map(|h| h.marker).unwrap_or("");
+    let marker = HINTS
+        .iter()
+        .find(|h| h.id == "productive-cluster")
+        .map(|h| h.marker)
+        .unwrap_or("");
     for t in turns {
         if let Ok(content) = t.read() {
-            if content.contains(marker) { return String::new(); }
+            if content.contains(marker) {
+                return String::new();
+            }
         }
     }
     let Some(h) = HINTS.iter().find(|h| h.id == "productive-cluster") else {
@@ -199,7 +214,9 @@ fn is_substantive(content: &str) -> bool {
     // signal the model produced.
     let core = content.split("\n\n--- hint:").next().unwrap_or(content);
     let trimmed = core.trim();
-    if trimmed.len() < 80 { return false; }
+    if trimmed.len() < 80 {
+        return false;
+    }
     let line_count = trimmed.lines().filter(|l| !l.trim().is_empty()).count();
     line_count >= 3
 }
@@ -209,13 +226,23 @@ fn is_substantive(content: &str) -> bool {
 fn looks_failed(content: &str) -> bool {
     let lc = content.to_ascii_lowercase();
     let markers = &[
-        "no such file or directory", "permission denied", "command not found",
-        "syntax error", "traceback (most recent call last)",
-        "error: unknown tool", "fatal error", "segfault", "core dumped",
+        "no such file or directory",
+        "permission denied",
+        "command not found",
+        "syntax error",
+        "traceback (most recent call last)",
+        "error: unknown tool",
+        "fatal error",
+        "segfault",
+        "core dumped",
         "exited with status",
     ];
-    if markers.iter().any(|m| lc.contains(m)) { return true; }
-    if lc.contains(": error:") || lc.contains(": failed:") { return true; }
+    if markers.iter().any(|m| lc.contains(m)) {
+        return true;
+    }
+    if lc.contains(": error:") || lc.contains(": failed:") {
+        return true;
+    }
     false
 }
 
@@ -226,7 +253,9 @@ fn looks_failed(content: &str) -> bool {
 pub fn append(turns: &[Turn], ids: &[&str]) -> String {
     let mut seen: HashSet<&str> = HashSet::new();
     for t in turns {
-        let Ok(content) = t.read() else { continue; };
+        let Ok(content) = t.read() else {
+            continue;
+        };
         for h in HINTS {
             if content.contains(h.marker) {
                 seen.insert(h.id);
@@ -235,8 +264,12 @@ pub fn append(turns: &[Turn], ids: &[&str]) -> String {
     }
     let mut out = String::new();
     for id in ids {
-        if seen.contains(*id) { continue; }
-        let Some(h) = HINTS.iter().find(|h| h.id == *id) else { continue; };
+        if seen.contains(*id) {
+            continue;
+        }
+        let Some(h) = HINTS.iter().find(|h| h.id == *id) else {
+            continue;
+        };
         out.push_str("\n\n");
         out.push_str(h.marker);
         out.push('\n');

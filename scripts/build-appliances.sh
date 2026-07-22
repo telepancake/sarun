@@ -65,21 +65,29 @@ build_qemu() {
         "$trees/qemu-$qemu_version/configs/devices/aarch64-softmmu/sarun.mak"
     install -m644 "$repo/engine/appliance/qemu-x86_64.mak" \
         "$trees/qemu-$qemu_version/configs/devices/x86_64-softmmu/sarun.mak"
+    install -m644 "$repo/engine/appliance/qemu-arm.mak" \
+        "$trees/qemu-$qemu_version/configs/devices/arm-softmmu/sarun.mak"
+    install -m644 "$repo/engine/appliance/qemu-mipsel.mak" \
+        "$trees/qemu-$qemu_version/configs/devices/mipsel-softmmu/sarun.mak"
     # QEMU's device Kconfig output survives reconfigure.  A fresh build tree is
     # required when the deliberately tiny device manifests change.
     rm -rf "$qbuild"
     mkdir -p "$qbuild"
     (cd "$qbuild" && "$trees/qemu-$qemu_version/configure" \
         --python="$python" \
-        --target-list=aarch64-softmmu,x86_64-softmmu \
+        --target-list=aarch64-softmmu,x86_64-softmmu,arm-softmmu,mipsel-softmmu \
         --without-default-features --enable-system --enable-tcg \
         --enable-kvm --enable-vhost-user --enable-slirp --enable-pie \
         --without-default-devices \
-        --with-devices-aarch64=sarun --with-devices-x86_64=sarun)
-    ninja -C "$qbuild" qemu-system-aarch64 qemu-system-x86_64
+        --with-devices-aarch64=sarun --with-devices-x86_64=sarun \
+        --with-devices-arm=sarun --with-devices-mipsel=sarun)
+    ninja -C "$qbuild" \
+        qemu-system-aarch64 qemu-system-x86_64 qemu-system-arm qemu-system-mipsel
     mkdir -p "$out/host-$host_arch"
     install -m755 "$qbuild/qemu-system-aarch64" "$out/host-$host_arch/"
     install -m755 "$qbuild/qemu-system-x86_64" "$out/host-$host_arch/"
+    install -m755 "$qbuild/qemu-system-arm" "$out/host-$host_arch/"
+    install -m755 "$qbuild/qemu-system-mipsel" "$out/host-$host_arch/"
     mkdir -p "$out/host-$host_arch/LICENSES"
     install -m644 "$trees/qemu-$qemu_version/COPYING" \
         "$out/host-$host_arch/LICENSES/QEMU-GPL-2.0.txt"

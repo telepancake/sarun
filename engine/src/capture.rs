@@ -77,6 +77,13 @@ CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS outputs(id INTEGER PRIMARY KEY AUTOINCREMENT,
  ts REAL, process_id INT, stream INT, content BLOB, brush_pipeline_id INT);
 CREATE INDEX IF NOT EXISTS idx_outputs_stream_ts ON outputs(stream, ts);
+-- Successful file opens attributed while the requesting process is still
+-- blocked at the filesystem boundary. `flags` retains the original access
+-- mode; paths are canonical provider-root-relative names. This is the compact
+-- query surface over the backend-neutral TRACE stream.
+CREATE TABLE IF NOT EXISTS file_access(process_id INT, path TEXT, flags INT,
+ ts REAL, PRIMARY KEY(process_id,path,flags));
+CREATE INDEX IF NOT EXISTS idx_file_access_path ON file_access(path);
 -- Rust-engine extensions (additive; the Python readers ignore them):
 CREATE TABLE IF NOT EXISTS xattr(name TEXT, key TEXT, value BLOB,
  PRIMARY KEY(name,key));
@@ -185,27 +192,38 @@ CREATE TABLE IF NOT EXISTS webcap(id INTEGER PRIMARY KEY AUTOINCREMENT,
  truncated INT DEFAULT 0);
 CREATE INDEX IF NOT EXISTS idx_webcap_host ON webcap(host);
 CREATE INDEX IF NOT EXISTS idx_webcap_url ON webcap(url);
--- sud TRACE stream (engine/DESIGN-sud.md step 2): the raw wire-format event
--- stream a sud box's tracer emitted (EXEC/ARGV/ENV/OPEN/CWD/STDOUT/STDERR/EXIT),
--- teed live to live/<id>/sud.trace and folded into the box's durable record by
--- SUD trace finalization. Single-row (one blob per box): set_sudtrace deletes then
--- inserts so a rerun overwrites. Decoded on demand by the `sudtrace` control
--- verb (crate::sudwire::Decoder). Absent for FUSE boxes — only sud boxes ever
--- populate it, which is what gates the UI's Trace chip.
+-- Backend-neutral TRACE v3 stream (the table and RPC retain their historical
+-- `sudtrace` names). SUD supplies syscall events through its trace pipe; FUSE
+-- emits byte-identical process/open/output events at its filesystem boundary.
+-- The live stream is folded into this single row at box completion and decoded
+-- on demand by crate::sudwire::Decoder.
 CREATE TABLE IF NOT EXISTS sudtrace(content BLOB);
 ";
 
 #[derive(Clone)]
 pub enum Entry {
-    File { rowid: i64, mode: u32 },
+    File {
+        rowid: i64,
+        mode: u32,
+    },
     /// `rebased`: backdrop-anchored (DEPOT-DESIGN.md §2) — this dir's
     /// recorded LOWER contributions (parent boxes) are erased, while the
     /// backdrop (host) still shows through. Distinct from `opaque`,
     /// which masks recorded lower AND backdrop children. Produced by
     /// rotation; stored as bit 1 of the `opaque` column.
-    Dir { mode: u32, mtime_ns: i64, opaque: bool, rebased: bool },
-    Symlink { target: PathBuf },
-    Special { mode: u32, rdev: u64 },  // fifo / char / block device
+    Dir {
+        mode: u32,
+        mtime_ns: i64,
+        opaque: bool,
+        rebased: bool,
+    },
+    Symlink {
+        target: PathBuf,
+    },
+    Special {
+        mode: u32,
+        rdev: u64,
+    }, // fifo / char / block device
     Whiteout,
     /// A hole (DEPOT-DESIGN.md §2): "this key is not occluded" — skip
     /// every recorded lower layer and resolve from the BACKDROP (host,
@@ -238,7 +256,10 @@ pub struct LayerMirror {
 
 impl LayerMirror {
     fn new() -> Self {
-        Self { entries: HashMap::new(), children: HashMap::new() }
+        Self {
+            entries: HashMap::new(),
+            children: HashMap::new(),
+        }
     }
 
     fn parent_name(path: &str) -> Option<(&str, &str)> {
@@ -261,8 +282,7 @@ impl LayerMirror {
         if let Some((parent, name)) = Self::parent_name(&path) {
             let state = Self::child_state(&entry);
             let siblings = self.children.entry(parent.to_owned()).or_default();
-            if let Some((_, old_state)) = siblings.iter_mut()
-                .find(|(old_name, _)| old_name == name)
+            if let Some((_, old_state)) = siblings.iter_mut().find(|(old_name, _)| old_name == name)
             {
                 *old_state = state;
             } else {
@@ -297,6 +317,17 @@ impl LayerMirror {
 
     pub fn get_mut(&mut self, path: &str) -> Option<&mut Entry> {
         self.entries.get_mut(path)
+    }
+
+    /// Snapshot the own-layer regular-file keys in O(number of captured
+    /// paths). This deliberately does not enumerate a merged filesystem: a
+    /// consumer selecting recorded build artifacts must not discover an
+    /// unrelated host file or a file hidden behind a whiteout.
+    fn regular_file_paths(&self) -> Vec<String> {
+        self.entries
+            .iter()
+            .filter_map(|(path, entry)| matches!(entry, Entry::File { .. }).then(|| path.clone()))
+            .collect()
     }
 
     pub fn children_of(&self, parent: &str) -> (Vec<String>, Vec<String>, Vec<String>) {
@@ -446,15 +477,22 @@ impl BoxState {
     }
 
     pub fn set_parent(&self, p: Option<i64>) {
-        self.parent.store(p.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
+        self.parent
+            .store(p.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
     }
     pub fn parent(&self) -> Option<i64> {
         match self.parent.load(std::sync::atomic::Ordering::Relaxed) {
-            0 => None, p => Some(p),
+            0 => None,
+            p => Some(p),
         }
     }
+
+    pub(crate) fn regular_captured_paths_snapshot(&self) -> Vec<String> {
+        self.kinds.read().unwrap().regular_file_paths()
+    }
     pub fn set_env_capture(&self, on: bool) {
-        self.env_capture.store(on, std::sync::atomic::Ordering::Relaxed);
+        self.env_capture
+            .store(on, std::sync::atomic::Ordering::Relaxed);
     }
     pub fn env_capture(&self) -> bool {
         self.env_capture.load(std::sync::atomic::Ordering::Relaxed)
@@ -466,20 +504,24 @@ impl BoxState {
         self.direct.load(std::sync::atomic::Ordering::Relaxed)
     }
     pub fn set_readonly_parent(&self, on: bool) {
-        self.readonly_parent.store(on, std::sync::atomic::Ordering::Relaxed);
+        self.readonly_parent
+            .store(on, std::sync::atomic::Ordering::Relaxed);
     }
     pub fn set_no_host_fallback(&self, on: bool) {
-        self.no_host_fallback.store(on, std::sync::atomic::Ordering::Relaxed);
+        self.no_host_fallback
+            .store(on, std::sync::atomic::Ordering::Relaxed);
     }
     pub fn no_host_fallback(&self) -> bool {
-        self.no_host_fallback.load(std::sync::atomic::Ordering::Relaxed)
+        self.no_host_fallback
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
     /// Record the HOST tgid of this box's embedded brush --inner process (the
     /// brush↔process linkage root). The engine resolves it from the MUTE pidfd
     /// the brush shell sends and stamps it here, so the forest walk can decide
     /// which process rows brush spawned. 0 disables linkage.
     pub fn set_is_brush(&self, on: bool) {
-        self.is_brush.store(on, std::sync::atomic::Ordering::Relaxed);
+        self.is_brush
+            .store(on, std::sync::atomic::Ordering::Relaxed);
     }
     pub fn is_brush(&self) -> bool {
         self.is_brush.load(std::sync::atomic::Ordering::Relaxed)
@@ -497,17 +539,24 @@ impl BoxState {
         self.is_tap.load(std::sync::atomic::Ordering::Relaxed)
     }
     pub fn set_brush_host_tgid(&self, tgid: u32) {
-        self.brush_host_tgid.store(tgid, std::sync::atomic::Ordering::Relaxed);
+        self.brush_host_tgid
+            .store(tgid, std::sync::atomic::Ordering::Relaxed);
     }
     pub fn brush_host_tgid(&self) -> u32 {
-        self.brush_host_tgid.load(std::sync::atomic::Ordering::Relaxed)
+        self.brush_host_tgid
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
     /// Called when a pipeline's FRAME_PROV arrives: remember its (brushprov id,
     /// literal output-redirect target paths) so the EXACT link can be made at
     /// teardown. `targets` are box-absolute paths as brush parsed them.
     pub fn on_brush_prov(&self, pipeline_id: i64, targets: Vec<String>) {
-        if pipeline_id == 0 || targets.is_empty() { return; }
-        self.brush_links.lock().unwrap().push((pipeline_id, targets));
+        if pipeline_id == 0 || targets.is_empty() {
+            return;
+        }
+        self.brush_links
+            .lock()
+            .unwrap()
+            .push((pipeline_id, targets));
     }
 
     /// Finalize the brush↔process linkage at box teardown, when the brush shell
@@ -520,28 +569,42 @@ impl BoxState {
     /// target is written by exactly that pipeline's process, no clock involved.
     pub fn finalize_brush_links(&self) {
         let bt = self.brush_host_tgid();
-        if bt == 0 { return; }
+        if bt == 0 {
+            return;
+        }
         let links = std::mem::take(&mut *self.brush_links.lock().unwrap());
-        if links.is_empty() { return; }
+        if links.is_empty() {
+            return;
+        }
         let conn = self.conn.lock().unwrap();
         // Forest map for the descendant guard.
         let mut by_id: HashMap<i64, (u32, Option<i64>)> = HashMap::new();
         if let Ok(mut st) = conn.prepare("SELECT id,tgid,parent_id FROM process") {
-            if let Ok(it) = st.query_map([], |r| Ok((
-                r.get::<_, i64>(0)?, r.get::<_, i64>(1)? as u32,
-                r.get::<_, Option<i64>>(2)?))) {
-                for (id, tg, par) in it.flatten() { by_id.insert(id, (tg, par)); }
+            if let Ok(it) = st.query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)? as u32,
+                    r.get::<_, Option<i64>>(2)?,
+                ))
+            }) {
+                for (id, tg, par) in it.flatten() {
+                    by_id.insert(id, (tg, par));
+                }
             }
         }
         let is_brush_descendant = |start: i64| -> bool {
             let mut cur = by_id.get(&start).and_then(|(_, p)| *p);
             let mut hops = 0;
             while let Some(p) = cur {
-                if hops > 128 { return false; }
+                if hops > 128 {
+                    return false;
+                }
                 hops += 1;
                 match by_id.get(&p) {
                     Some((ptg, ppar)) => {
-                        if *ptg == bt { return true; }
+                        if *ptg == bt {
+                            return true;
+                        }
                         cur = *ppar;
                     }
                     None => return false,
@@ -553,9 +616,12 @@ impl BoxState {
             for t in targets {
                 // Targets are box-absolute (/root/x); sqlar names are relative.
                 let rel = t.trim_start_matches('/');
-                let writer: Option<i64> = conn.query_row(
-                    "SELECT last_writer FROM sqlar WHERE name=?1", [rel],
-                    |r| r.get::<_, Option<i64>>(0)).ok().flatten();
+                let writer: Option<i64> = conn
+                    .query_row("SELECT last_writer FROM sqlar WHERE name=?1", [rel], |r| {
+                        r.get::<_, Option<i64>>(0)
+                    })
+                    .ok()
+                    .flatten();
                 let Some(w) = writer else { continue };
                 // The writer either IS the brush --inner process itself (an
                 // IN-PROCESS pipeline stage: a brush builtin or a bundled
@@ -566,11 +632,14 @@ impl BoxState {
                 // process" and was skipped — that no longer holds now that
                 // pipeline stages can run in-process.)
                 let writer_is_root = by_id.get(&w).map(|(tg, _)| *tg) == Some(bt);
-                if !writer_is_root && !is_brush_descendant(w) { continue; }
+                if !writer_is_root && !is_brush_descendant(w) {
+                    continue;
+                }
                 let _ = conn.execute(
                     "UPDATE process SET brush_pipeline_id=?2 \
                      WHERE id=?1 AND brush_pipeline_id IS NULL",
-                    params![w, pipeline_id]);
+                    params![w, pipeline_id],
+                );
             }
         }
     }
@@ -585,9 +654,12 @@ impl BoxState {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         env_json.hash(&mut h);
         let hash = format!("{:016x}", h.finish());
-        let _ = conn.execute("INSERT OR IGNORE INTO env(hash,env) VALUES(?1,?2)",
-                             params![hash, env_json]);
-        conn.query_row("SELECT id FROM env WHERE hash=?1", [hash], |r| r.get(0)).ok()
+        let _ = conn.execute(
+            "INSERT OR IGNORE INTO env(hash,env) VALUES(?1,?2)",
+            params![hash, env_json],
+        );
+        conn.query_row("SELECT id FROM env WHERE hash=?1", [hash], |r| r.get(0))
+            .ok()
     }
 
     /// Read /proc/<pid>/environ and return it as a stable JSON object string
@@ -598,7 +670,9 @@ impl BoxState {
         let raw = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
         let mut map = std::collections::BTreeMap::new();
         for kv in raw.split(|b| *b == 0) {
-            if kv.is_empty() { continue; }
+            if kv.is_empty() {
+                continue;
+            }
             let s = String::from_utf8_lossy(kv);
             if let Some((k, v)) = s.split_once('=') {
                 map.insert(k.to_string(), v.to_string());
@@ -639,7 +713,8 @@ impl BoxState {
              PRAGMA journal_size_limit=67108864; \
              PRAGMA wal_autocheckpoint=16384;",
         )?;
-        let schema_version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        let schema_version: i64 =
+            conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
         conn.execute_batch(SCHEMA)?;
         if schema_version < 2 {
             // Version 1 retained the pre-process-table path→argv duplicate.
@@ -701,29 +776,40 @@ impl BoxState {
         // no-host-fallback) from sqlar meta so a rerun reopens with the same
         // semantics. A missing/unset key means the default (off).
         let read_flag = |k: &str| -> bool {
-            conn.query_row("SELECT value FROM meta WHERE key=?1", [k],
-                           |r| r.get::<_, String>(0))
-                .ok().as_deref() == Some("1")
+            conn.query_row("SELECT value FROM meta WHERE key=?1", [k], |r| {
+                r.get::<_, String>(0)
+            })
+            .ok()
+            .as_deref()
+                == Some("1")
         };
-        if read_flag("readonly_parent") { self.set_readonly_parent(true); }
-        if read_flag("no_host_fallback") { self.set_no_host_fallback(true); }
+        if read_flag("readonly_parent") {
+            self.set_readonly_parent(true);
+        }
+        if read_flag("no_host_fallback") {
+            self.set_no_host_fallback(true);
+        }
         // Parent linkage: an at-rest sqlar carries parent_box_id in meta;
         // restore it so load-mirror-from-disk produces the same in-RAM
         // BoxState shape a register handshake would. Without this an
         // OCI-loaded layer hydrated into the overlay would look top-level
         // and its OWN parent chain would be invisible to resolve().
         if let Ok(s) = conn.query_row(
-            "SELECT value FROM meta WHERE key='parent_box_id'", [],
-            |r| r.get::<_, String>(0))
-        {
+            "SELECT value FROM meta WHERE key='parent_box_id'",
+            [],
+            |r| r.get::<_, String>(0),
+        ) {
             if let Ok(p) = s.parse::<i64>() {
-                if p > 0 { self.set_parent(Some(p)); }
+                if p > 0 {
+                    self.set_parent(Some(p));
+                }
             }
         }
         if let Ok(s) = conn.query_row(
-            "SELECT value FROM meta WHERE key='ro_attachments'", [],
-            |r| r.get::<_, String>(0))
-        {
+            "SELECT value FROM meta WHERE key='ro_attachments'",
+            [],
+            |r| r.get::<_, String>(0),
+        ) {
             if let Ok(rows) = serde_json::from_str::<Vec<RoAttachment>>(&s) {
                 *self.ro_attachments.lock().unwrap() = rows;
             }
@@ -732,8 +818,12 @@ impl BoxState {
         kinds.clear();
         if let Ok(mut st) = conn.prepare("SELECT name,mode,sz,data FROM sqlar") {
             let rows = st.query_map([], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u32,
-                    r.get::<_, i64>(2)?, r.get::<_, Option<Vec<u8>>>(3)?))
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)? as u32,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, Option<Vec<u8>>>(3)?,
+                ))
             });
             if let Ok(rows) = rows {
                 for row in rows.flatten() {
@@ -758,9 +848,10 @@ impl BoxState {
         owners.clear();
         if let Ok(mut st) = conn.prepare("SELECT name,uid,gid FROM ownership") {
             if let Ok(rows) = st.query_map([], |row| {
-                Ok((row.get::<_, String>(0)?,
-                    (row.get::<_, i64>(1)? as u32,
-                     row.get::<_, i64>(2)? as u32)))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    (row.get::<_, i64>(1)? as u32, row.get::<_, i64>(2)? as u32),
+                ))
             }) {
                 owners.extend(rows.flatten());
             }
@@ -772,16 +863,21 @@ impl BoxState {
         let mut cache = self.proc_cache.lock().unwrap();
         let mut current = self.proc_current.lock().unwrap();
         let mut roots = self.roots.lock().unwrap();
-        if let Ok(mut st) = conn.prepare(
-            "SELECT id,tgid,start,root FROM process ORDER BY id") {
+        if let Ok(mut st) = conn.prepare("SELECT id,tgid,start,root FROM process ORDER BY id") {
             if let Ok(rows) = st.query_map([], |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)? as u32,
-                    r.get::<_, Option<i64>>(2)?.unwrap_or(0), r.get::<_, i64>(3)?))
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)? as u32,
+                    r.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                    r.get::<_, i64>(3)?,
+                ))
             }) {
                 for (rid, tgid, start, root) in rows.flatten() {
                     cache.insert((tgid, start), rid);
                     current.insert(tgid, (start, rid));
-                    if root != 0 { roots.insert(tgid); }
+                    if root != 0 {
+                        roots.insert(tgid);
+                    }
                 }
             }
         }
@@ -802,7 +898,9 @@ impl BoxState {
         if let Ok(s) = std::fs::read_to_string(format!("/proc/{pid}/status")) {
             for line in s.lines() {
                 if let Some(rest) = line.strip_prefix("Tgid:") {
-                    if let Ok(t) = rest.trim().parse::<u32>() { return t; }
+                    if let Ok(t) = rest.trim().parse::<u32>() {
+                        return t;
+                    }
                 }
             }
         }
@@ -813,22 +911,44 @@ impl BoxState {
     /// may contain spaces and ')' so the split is anchored after the LAST ')',
     /// matching the Python `_parse_proc_stat`. Both 0 on any error.
     fn parse_stat(pid: u32) -> (u32, i64) {
-        let Ok(raw) = std::fs::read(format!("/proc/{pid}/stat")) else { return (0, 0) };
+        let Ok(raw) = std::fs::read(format!("/proc/{pid}/stat")) else {
+            return (0, 0);
+        };
         let s = String::from_utf8_lossy(&raw);
-        let Some(rp) = s.rfind(')') else { return (0, 0) };
+        let Some(rp) = s.rfind(')') else {
+            return (0, 0);
+        };
         // fields after ')': field 3 (state) is rest[0]; ppid is field 4 -> rest[1];
         // starttime is field 22 -> rest[19].
         let rest: Vec<&str> = s[rp + 1..].split_whitespace().collect();
         let ppid = rest.get(1).and_then(|x| x.parse::<u32>().ok()).unwrap_or(0);
-        let start = rest.get(19).and_then(|x| x.parse::<i64>().ok()).unwrap_or(0);
+        let start = rest
+            .get(19)
+            .and_then(|x| x.parse::<i64>().ok())
+            .unwrap_or(0);
         (ppid, start)
     }
 
-    fn start_time_of(pid: u32) -> i64 { Self::parse_stat(pid).1 }
+    fn start_time_of(pid: u32) -> i64 {
+        Self::parse_stat(pid).1
+    }
+
+    /// Lightweight identity check for a high-rate filesystem trace. It avoids
+    /// rereading cwd/cmdline on every open; callers take the full snapshot only
+    /// when this incarnation or executable has changed.
+    pub(crate) fn read_trace_identity(pid: u32) -> (u32, i64, u32, String) {
+        let tgid = Self::tgid_of(pid);
+        let ident = if tgid == 0 { pid } else { tgid };
+        let (ppid, start) = Self::parse_stat(ident);
+        let exe = std::fs::read_link(format!("/proc/{ident}/exe"))
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        (tgid, start, ppid, exe)
+    }
 
     /// Best-effort provenance of a process by host pid: (tgid, start, ppid, exe,
     /// cwd, argv). A vanished pid yields zeros/empties, never panics.
-    fn read_prov(pid: u32) -> (u32, i64, u32, String, String, Vec<String>) {
+    pub(crate) fn read_prov(pid: u32) -> (u32, i64, u32, String, String, Vec<String>) {
         let tgid = Self::tgid_of(pid);
         // Identify by the PROCESS (tgid), not the writing thread: FUSE reports the
         // writing thread's TID, and an in-process box runs many pipelines on
@@ -841,13 +961,17 @@ impl BoxState {
         let (ppid, start) = Self::parse_stat(ident);
         let proc_ = |f: &str| format!("/proc/{ident}/{f}");
         let exe = std::fs::read_link(proc_("exe"))
-            .map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
         let cwd = std::fs::read_link(proc_("cwd"))
-            .map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
         let argv: Vec<String> = std::fs::read(proc_("cmdline"))
-            .unwrap_or_default().split(|b| *b == 0)
+            .unwrap_or_default()
+            .split(|b| *b == 0)
             .filter(|s| !s.is_empty())
-            .map(|s| String::from_utf8_lossy(s).into_owned()).collect();
+            .map(|s| String::from_utf8_lossy(s).into_owned())
+            .collect();
         (tgid, start, ppid, exe, cwd, argv)
     }
 
@@ -874,10 +998,34 @@ impl BoxState {
         }
         // -e env capture: read /proc/<pid>/environ now (before any lock, before the
         // process can exit). The pid (thread id) shares the tgid's environ.
-        let env_json = if self.env_capture() { Self::read_environ_json(pid) }
-                       else { None };
+        let env_json = if self.env_capture() {
+            Self::read_environ_json(pid)
+        } else {
+            None
+        };
         self.record_proc(tgid, start, ppid, &exe, &cwd, &argv, env_json, false)
             .unwrap_or(tgid as i64)
+    }
+
+    /// Record one successful filesystem open against the exact live process
+    /// row. Repeated opens with the same mode collapse; the raw TRACE stream
+    /// remains the lossless event-order record.
+    pub(crate) fn record_file_access_for_process(
+        &self,
+        process_id: i64,
+        path: &str,
+        flags: u32,
+        ts_ns: i64,
+    ) {
+        if process_id <= 0 || path.is_empty() {
+            return;
+        }
+        let conn = self.recorder_conn.lock().unwrap();
+        let _ = conn.execute(
+            "INSERT OR IGNORE INTO file_access(process_id,path,flags,ts) \
+             VALUES(?1,?2,?3,?4)",
+            params![process_id, path, i64::from(flags), ts_ns as f64 / 1e9],
+        );
     }
 
     /// Resolve a virtio-fs request actor exclusively through guest identities
@@ -885,9 +1033,19 @@ impl BoxState {
     /// host PIDs; falling back to host `/proc` here can attribute a guest write
     /// to an unrelated host process with the same number.
     pub fn guest_writer_for(&self, pid: u32) -> i64 {
-        let tgid = self.guest_tgids.lock().unwrap().get(&pid).copied().unwrap_or(pid);
-        self.proc_current.lock().unwrap().get(&tgid)
-            .map(|(_, row)| *row).unwrap_or(0)
+        let tgid = self
+            .guest_tgids
+            .lock()
+            .unwrap()
+            .get(&pid)
+            .copied()
+            .unwrap_or(pid);
+        self.proc_current
+            .lock()
+            .unwrap()
+            .get(&tgid)
+            .map(|(_, row)| *row)
+            .unwrap_or(0)
     }
 
     /// Record one process/thread observation made inside the appliance's own
@@ -900,24 +1058,37 @@ impl BoxState {
         event: &crate::generated_wire::GuestProcessEvent,
     ) -> Result<i64, String> {
         let provenance = &event.provenance;
-        let start = i64::try_from(event.start)
-            .map_err(|_| "guest process start identity exceeds i64")?;
+        let start =
+            i64::try_from(event.start).map_err(|_| "guest process start identity exceeds i64")?;
         let text = |value: &[u8], field: &str| {
-            std::str::from_utf8(value).map(str::to_owned)
+            std::str::from_utf8(value)
+                .map(str::to_owned)
                 .map_err(|_| format!("guest process {field} is not UTF-8"))
         };
         let exe = text(provenance.executable.as_slice(), "executable")?;
         let cwd = text(provenance.cwd.as_slice(), "cwd")?;
-        let argv = provenance.argv.as_slice().iter()
+        let argv = provenance
+            .argv
+            .as_slice()
+            .iter()
             .map(|value| text(value.as_slice(), "argument"))
             .collect::<Result<Vec<_>, _>>()?;
         let argv_json = serde_json::to_string(&argv).map_err(|error| error.to_string())?;
-        self.guest_tgids.lock().unwrap().insert(event.pid, provenance.tgid);
+        self.guest_tgids
+            .lock()
+            .unwrap()
+            .insert(event.pid, provenance.tgid);
 
-        if let Some(row) = self.proc_cache.lock().unwrap()
-            .get(&(provenance.tgid, start)).copied()
+        if let Some(row) = self
+            .proc_cache
+            .lock()
+            .unwrap()
+            .get(&(provenance.tgid, start))
+            .copied()
         {
-            self.proc_current.lock().unwrap()
+            self.proc_current
+                .lock()
+                .unwrap()
                 .insert(provenance.tgid, (start, row));
             let conn = self.conn.lock().unwrap();
             let _ = conn.execute(
@@ -927,29 +1098,56 @@ impl BoxState {
             return Ok(row);
         }
 
-        let parent_id = u32::try_from(provenance.ppid).ok()
+        let parent_id = u32::try_from(provenance.ppid)
+            .ok()
             .filter(|parent| *parent > 1)
-            .and_then(|parent| self.proc_current.lock().unwrap()
-                .get(&parent).map(|(_, row)| *row));
+            .and_then(|parent| {
+                self.proc_current
+                    .lock()
+                    .unwrap()
+                    .get(&parent)
+                    .map(|(_, row)| *row)
+            });
         let conn = self.conn.lock().unwrap();
-        let root = conn.query_row(
-            "SELECT id FROM process WHERE root<>0 ORDER BY id DESC LIMIT 1",
-            [], |row| row.get::<_, i64>(0),
-        ).ok();
+        let root = conn
+            .query_row(
+                "SELECT id FROM process WHERE root<>0 ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .ok();
         let parent_id = parent_id.or(root);
-        let inserted = conn.execute(
-            "INSERT OR IGNORE INTO process(tgid,start,ppid,parent_id,exe,cwd,argv,root) \
+        let inserted = conn
+            .execute(
+                "INSERT OR IGNORE INTO process(tgid,start,ppid,parent_id,exe,cwd,argv,root) \
              VALUES(?1,?2,?3,?4,?5,?6,?7,0)",
-            params![provenance.tgid, start, provenance.ppid, parent_id,
-                    exe, cwd, argv_json],
-        ).map_err(|error| error.to_string())?;
-        let row = conn.query_row(
-            "SELECT id FROM process WHERE tgid=?1 AND start=?2",
-            params![provenance.tgid, start], |row| row.get::<_, i64>(0),
-        ).map_err(|error| error.to_string())?;
+                params![
+                    provenance.tgid,
+                    start,
+                    provenance.ppid,
+                    parent_id,
+                    exe,
+                    cwd,
+                    argv_json
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        let row = conn
+            .query_row(
+                "SELECT id FROM process WHERE tgid=?1 AND start=?2",
+                params![provenance.tgid, start],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| error.to_string())?;
         drop(conn);
-        self.proc_cache.lock().unwrap().insert((provenance.tgid, start), row);
-        self.proc_current.lock().unwrap().insert(provenance.tgid, (start, row));
+        self.proc_cache
+            .lock()
+            .unwrap()
+            .insert((provenance.tgid, start), row);
+        self.proc_current
+            .lock()
+            .unwrap()
+            .insert(provenance.tgid, (start, row));
         if inserted > 0 {
             self.push_event("", "process_added");
         }
@@ -962,18 +1160,25 @@ impl BoxState {
     /// latency, so the /proc snapshot in writer_for finds nothing and the
     /// row silently never exists). Identity start = the event timestamp:
     /// unique per exec, and no /proc is left to disagree with.
-    pub fn record_proc_event(&self, tgid: u32, ppid: u32, ts_ns: i64,
-                             exe: &str, cwd: &str, argv: &[String]) -> Option<i64> {
+    pub fn record_proc_event(
+        &self,
+        tgid: u32,
+        ppid: u32,
+        ts_ns: i64,
+        exe: &str,
+        cwd: &str,
+        argv: &[String],
+    ) -> Option<i64> {
         // If a live snapshot already recorded this tgid, refresh its image
         // instead (same semantics as exec_refresh's in-place update).
-        if let Some((start, rid)) = self.proc_current.lock().unwrap()
-                                        .get(&tgid).copied() {
+        if let Some((start, rid)) = self.proc_current.lock().unwrap().get(&tgid).copied() {
             let _ = start;
             let argv_json = serde_json::to_string(&argv).unwrap_or_default();
             let conn = self.conn.lock().unwrap();
             let _ = conn.execute(
                 "UPDATE process SET exe=?1, argv=?2 WHERE id=?3 AND exe<>?1",
-                params![exe, argv_json, rid]);
+                params![exe, argv_json, rid],
+            );
             return Some(rid);
         }
         self.record_proc(tgid, ts_ns, ppid, exe, cwd, argv, None, false)
@@ -1004,8 +1209,11 @@ impl BoxState {
             // Process already gone — nothing fresher to record.
             return None;
         }
-        let exe = if event_exe.is_empty() { exe }
-                  else { event_exe.to_string() };
+        let exe = if event_exe.is_empty() {
+            exe
+        } else {
+            event_exe.to_string()
+        };
         let cached = self.proc_cache.lock().unwrap().get(&(tgid, start)).copied();
         let Some(rid) = cached else {
             // First sighting of this incarnation: normal record path,
@@ -1015,20 +1223,25 @@ impl BoxState {
                 let conn = self.conn.lock().unwrap();
                 let _ = conn.execute(
                     "UPDATE process SET exe=?1 WHERE id=?2 AND exe<>?1",
-                    params![exe, rid]);
+                    params![exe, rid],
+                );
             }
             return Some(rid);
         };
         let argv_json = serde_json::to_string(&argv).unwrap_or_default();
         let conn = self.conn.lock().unwrap();
         let stale: bool = conn
-            .query_row("SELECT exe<>?1 OR argv<>?2 FROM process WHERE id=?3",
-                       params![exe, argv_json, rid], |r| r.get(0))
+            .query_row(
+                "SELECT exe<>?1 OR argv<>?2 FROM process WHERE id=?3",
+                params![exe, argv_json, rid],
+                |r| r.get(0),
+            )
             .unwrap_or(false);
         if stale {
             let _ = conn.execute(
                 "UPDATE process SET exe=?1, argv=?2, cwd=?3 WHERE id=?4",
-                params![exe, argv_json, cwd, rid]);
+                params![exe, argv_json, cwd, rid],
+            );
             drop(conn);
             self.push_event("", "process_added");
         }
@@ -1041,9 +1254,20 @@ impl BoxState {
     /// — this is what makes the table one connected forest. `root` marks an
     /// incarnation a hierarchy root (the bubbling boundary). Mirrors the Python
     /// `process_from_prov`. `tgid==0` yields None.
-    fn record_proc(&self, tgid: u32, start: i64, ppid: u32, exe: &str, cwd: &str,
-                   argv: &[String], env_json: Option<String>, root: bool) -> Option<i64> {
-        if tgid == 0 { return None; }
+    fn record_proc(
+        &self,
+        tgid: u32,
+        start: i64,
+        ppid: u32,
+        exe: &str,
+        cwd: &str,
+        argv: &[String],
+        env_json: Option<String>,
+        root: bool,
+    ) -> Option<i64> {
+        if tgid == 0 {
+            return None;
+        }
         if let Some(rid) = self.proc_cache.lock().unwrap().get(&(tgid, start)).copied() {
             self.proc_current.lock().unwrap().insert(tgid, (start, rid));
             if root {
@@ -1053,28 +1277,50 @@ impl BoxState {
             }
             return Some(rid);
         }
-        if root { self.roots.lock().unwrap().insert(tgid); }
+        if root {
+            self.roots.lock().unwrap().insert(tgid);
+        }
         // Resolve the parent to its CURRENT incarnation row id (NULL for a root or an
         // unreachable parent) by recording the parent FIRST. A root is its own
         // boundary: never walk above a launch into the runner's host ancestry.
-        let parent_id = if root { None }
-                        else { self.resolve_parent(ppid, 0, &mut std::collections::HashSet::new()) };
+        let parent_id = if root {
+            None
+        } else {
+            self.resolve_parent(ppid, 0, &mut std::collections::HashSet::new())
+        };
         let conn = self.conn.lock().unwrap();
         let eid: Option<i64> = env_json.and_then(|j| Self::ensure_env(&conn, &j));
         let argv_json = serde_json::to_string(&argv).unwrap_or_default();
-        let inserted = conn.execute(
-            "INSERT OR IGNORE INTO process(tgid,start,ppid,parent_id,exe,cwd,argv,env_id,root)
+        let inserted = conn
+            .execute(
+                "INSERT OR IGNORE INTO process(tgid,start,ppid,parent_id,exe,cwd,argv,env_id,root)
              VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
-            params![tgid, start, ppid, parent_id, exe, cwd, argv_json, eid,
-                    if root { 1 } else { 0 }],
-        ).unwrap_or(0);
+                params![
+                    tgid,
+                    start,
+                    ppid,
+                    parent_id,
+                    exe,
+                    cwd,
+                    argv_json,
+                    eid,
+                    if root { 1 } else { 0 }
+                ],
+            )
+            .unwrap_or(0);
         let rowid: i64 = conn
-            .query_row("SELECT id FROM process WHERE tgid=?1 AND start=?2",
-                       params![tgid, start], |r| r.get(0))
+            .query_row(
+                "SELECT id FROM process WHERE tgid=?1 AND start=?2",
+                params![tgid, start],
+                |r| r.get(0),
+            )
             .unwrap_or(0);
         drop(conn);
         self.proc_cache.lock().unwrap().insert((tgid, start), rowid);
-        self.proc_current.lock().unwrap().insert(tgid, (start, rowid));
+        self.proc_current
+            .lock()
+            .unwrap()
+            .insert(tgid, (start, rowid));
         // Notify the broadcaster about new process rows: push directly
         // into the shared event queue (set by overlay::add_box). The
         // broadcaster turns it into a type=process_added event. Direct
@@ -1092,45 +1338,83 @@ impl BoxState {
     /// never a tgid. Best-effort: a failed ancestor /proc read links a minimal row
     /// and stops. STOPS at: ppid<=1 (init), a box root (the launch boundary), a
     /// depth/cycle cap (64 levels / seen-set). Mirrors the Python `_resolve_parent`.
-    fn resolve_parent(&self, ppid: u32, depth: u32,
-                      seen: &mut std::collections::HashSet<u32>) -> Option<i64> {
-        if ppid <= 1 { return None; }
-        let ptgid = { let t = Self::tgid_of(ppid); if t == 0 { ppid } else { t } };
+    fn resolve_parent(
+        &self,
+        ppid: u32,
+        depth: u32,
+        seen: &mut std::collections::HashSet<u32>,
+    ) -> Option<i64> {
+        if ppid <= 1 {
+            return None;
+        }
+        let ptgid = {
+            let t = Self::tgid_of(ppid);
+            if t == 0 { ppid } else { t }
+        };
         // A box root is the bubbling boundary: its row is the top of the chain. The
         // parent's current incarnation row id is what we link to; do not walk above.
         if self.roots.lock().unwrap().contains(&ptgid) {
             return self.current_row(ptgid);
         }
-        if depth >= 64 { return self.current_row(ptgid); }
-        if seen.contains(&ptgid) { return self.current_row(ptgid); }
+        if depth >= 64 {
+            return self.current_row(ptgid);
+        }
+        if seen.contains(&ptgid) {
+            return self.current_row(ptgid);
+        }
         seen.insert(ptgid);
         // Key the parent on its LIVE (tgid,start): a reused pid is a new incarnation.
         let pstart = Self::start_time_of(ppid);
         if pstart != 0 {
-            if let Some(rid) = self.proc_cache.lock().unwrap().get(&(ptgid, pstart)).copied() {
-                self.proc_current.lock().unwrap().insert(ptgid, (pstart, rid));
+            if let Some(rid) = self
+                .proc_cache
+                .lock()
+                .unwrap()
+                .get(&(ptgid, pstart))
+                .copied()
+            {
+                self.proc_current
+                    .lock()
+                    .unwrap()
+                    .insert(ptgid, (pstart, rid));
                 return Some(rid);
             }
         }
         let (_t, gstart, gppid, exe, cwd, argv) = Self::read_prov(ppid);
         let start = if gstart != 0 { gstart } else { pstart };
         let gtgid = if gppid != 0 { Self::tgid_of(gppid) } else { 0 };
-        let env_json = if self.env_capture() { Self::read_environ_json(ppid) } else { None };
+        let env_json = if self.env_capture() {
+            Self::read_environ_json(ppid)
+        } else {
+            None
+        };
         // Record this ancestor (recurses up via its own ppid) and return its row id.
         // Inline the recursion through record_proc's parent resolution by recording
         // with the resolved grandparent chain.
-        self.record_proc_with_parent(ptgid, start, gtgid, gppid, &exe, &cwd, &argv,
-                                      env_json, depth, seen)
+        self.record_proc_with_parent(
+            ptgid, start, gtgid, gppid, &exe, &cwd, &argv, env_json, depth, seen,
+        )
     }
 
     /// record_proc variant used while bubbling: resolves the parent via the SAME
     /// depth/seen state so the cycle/depth caps span the whole walk.
     #[allow(clippy::too_many_arguments)]
-    fn record_proc_with_parent(&self, tgid: u32, start: i64, ppid_tgid: u32,
-                               parent_pid: u32, exe: &str, cwd: &str, argv: &[String],
-                               env_json: Option<String>, depth: u32,
-                               seen: &mut std::collections::HashSet<u32>) -> Option<i64> {
-        if tgid == 0 { return None; }
+    fn record_proc_with_parent(
+        &self,
+        tgid: u32,
+        start: i64,
+        ppid_tgid: u32,
+        parent_pid: u32,
+        exe: &str,
+        cwd: &str,
+        argv: &[String],
+        env_json: Option<String>,
+        depth: u32,
+        seen: &mut std::collections::HashSet<u32>,
+    ) -> Option<i64> {
+        if tgid == 0 {
+            return None;
+        }
         if let Some(rid) = self.proc_cache.lock().unwrap().get(&(tgid, start)).copied() {
             self.proc_current.lock().unwrap().insert(tgid, (start, rid));
             return Some(rid);
@@ -1156,71 +1440,91 @@ impl BoxState {
             params![tgid, start, ppid_tgid, parent_id, exe, cwd, argv_json, eid],
         );
         let rowid: i64 = conn
-            .query_row("SELECT id FROM process WHERE tgid=?1 AND start=?2",
-                       params![tgid, start], |r| r.get(0))
+            .query_row(
+                "SELECT id FROM process WHERE tgid=?1 AND start=?2",
+                params![tgid, start],
+                |r| r.get(0),
+            )
             .unwrap_or(0);
         drop(conn);
         self.proc_cache.lock().unwrap().insert((tgid, start), rowid);
-        self.proc_current.lock().unwrap().insert(tgid, (start, rowid));
+        self.proc_current
+            .lock()
+            .unwrap()
+            .insert(tgid, (start, rowid));
         Some(rowid)
     }
 
     /// The process-table ROW id of `tgid`'s latest-seen incarnation, or None.
     fn current_row(&self, tgid: u32) -> Option<i64> {
-        self.proc_current.lock().unwrap().get(&tgid).map(|(_, rid)| *rid)
+        self.proc_current
+            .lock()
+            .unwrap()
+            .get(&tgid)
+            .map(|(_, rid)| *rid)
     }
-
-
-
-
-
-
-
-
-
-
-
-
 
     /// Build the in-RAM `kinds` Entry for one sqlar row. The single mapping used
     /// both by the initial mirror load and by `reload_entry`.
-    pub(crate) fn entry_from_row(conn: &Connection, name: &str, mode: u32, sz: i64,
-                      data: Option<Vec<u8>>) -> Entry {
+    pub(crate) fn entry_from_row(
+        conn: &Connection,
+        name: &str,
+        mode: u32,
+        sz: i64,
+        data: Option<Vec<u8>>,
+    ) -> Entry {
         let ft = mode & 0o170000;
         // The `opaque` column is a bitfield: bit 0 = opaque-dir, bit 1 =
         // backdrop-anchored (§2 anchor axis). Python readers treat any
         // non-zero value as opaque-ish; additive.
-        let flags: i64 = conn.query_row(
-            "SELECT opaque FROM sqlar WHERE name=?1", [name],
-            |r| r.get(0)).unwrap_or(0);
+        let flags: i64 = conn
+            .query_row("SELECT opaque FROM sqlar WHERE name=?1", [name], |r| {
+                r.get(0)
+            })
+            .unwrap_or(0);
         if mode == S_IFCHR {
-            if flags & 2 != 0 { Entry::Hole } else { Entry::Whiteout }
+            if flags & 2 != 0 {
+                Entry::Hole
+            } else {
+                Entry::Whiteout
+            }
         } else if ft == 0o120000 {
             let bytes = data.unwrap_or_default();
             let t = String::from_utf8_lossy(&bytes).into_owned();
             let _ = sz;
-            Entry::Symlink { target: PathBuf::from(t) }
+            Entry::Symlink {
+                target: PathBuf::from(t),
+            }
         } else if ft == 0o040000 {
-            Entry::Dir { mode, mtime_ns: 0, opaque: flags & 1 != 0,
-                         rebased: flags & 2 != 0 }
+            Entry::Dir {
+                mode,
+                mtime_ns: 0,
+                opaque: flags & 1 != 0,
+                rebased: flags & 2 != 0,
+            }
         } else if ft == 0o010000 || ft == 0o060000 {
             Entry::Special { mode, rdev: 0 }
         } else {
-            let rowid: i64 = conn.query_row(
-                "SELECT rowid FROM sqlar WHERE name=?1", [name],
-                |r| r.get(0)).unwrap_or(0);
+            let rowid: i64 = conn
+                .query_row("SELECT rowid FROM sqlar WHERE name=?1", [name], |r| {
+                    r.get(0)
+                })
+                .unwrap_or(0);
             Entry::File { rowid, mode }
         }
     }
 
-
-
     /// Only the box-id rows — what the hydrate walk and the id-based
     /// chain hops consume. External rows are invisible here.
     pub fn ro_attachment_box_ids(&self) -> Vec<i64> {
-        self.ro_attachments.lock().unwrap().iter()
-            .filter_map(|r| match r { RoAttachment::Box(id) => Some(*id),
-                                      RoAttachment::Ext(_) => None })
+        self.ro_attachments
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|r| match r {
+                RoAttachment::Box(id) => Some(*id),
+                RoAttachment::Ext(_) => None,
+            })
             .collect()
     }
 
@@ -1238,7 +1542,8 @@ impl BoxState {
     }
 
     pub fn set_cur_brush_pipeline(&self, id: i64) {
-        self.cur_brush_pipeline.store(id, std::sync::atomic::Ordering::Relaxed);
+        self.cur_brush_pipeline
+            .store(id, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Append one captured stdout/stderr write to the outputs table, attributed
@@ -1254,16 +1559,29 @@ impl BoxState {
     }
 
     fn add_output_for_writer(&self, stream: i32, writer: i64, content: &[u8]) {
-        let pipeline = self.cur_brush_pipeline.load(std::sync::atomic::Ordering::Relaxed);
+        let pipeline = self
+            .cur_brush_pipeline
+            .load(std::sync::atomic::Ordering::Relaxed);
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs_f64()).unwrap_or(0.0);
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
         let conn = self.recorder_conn.lock().unwrap();
         let _ = conn.execute(
             "INSERT INTO outputs(ts,process_id,stream,content,brush_pipeline_id) \
              VALUES(?1,?2,?3,?4,?5)",
-            rusqlite::params![ts, writer, stream, content,
-                              if pipeline > 0 { Some(pipeline) } else { None::<i64> }]);
+            rusqlite::params![
+                ts,
+                writer,
+                stream,
+                content,
+                if pipeline > 0 {
+                    Some(pipeline)
+                } else {
+                    None::<i64>
+                }
+            ],
+        );
     }
 
     /// Retroactively fix brush_pipeline_id on stderr output rows captured by the
@@ -1276,7 +1594,8 @@ impl BoxState {
         let _ = conn.execute(
             "UPDATE outputs SET brush_pipeline_id=?1 \
              WHERE ts >= ?2 AND stream = 1 AND brush_pipeline_id IS NOT ?1",
-            rusqlite::params![pipeline_id, start_ts]);
+            rusqlite::params![pipeline_id, start_ts],
+        );
     }
 
     /// Look up the brushprov row id for a given uid. Returns 0 if not found.
@@ -1286,7 +1605,8 @@ impl BoxState {
             "SELECT id FROM brushprov WHERE uid=?1",
             params![uid],
             |row| row.get(0),
-        ).unwrap_or(0)
+        )
+        .unwrap_or(0)
     }
 
     /// Return the durable producer number for one exact Brush process
@@ -1302,18 +1622,21 @@ impl BoxState {
         }
         let created_ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs_f64()).unwrap_or(0.0);
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
         let conn = self.recorder_conn.lock().unwrap();
         let _ = conn.execute(
             "INSERT OR IGNORE INTO brushproducer(host_pid,host_start,created_ts) \
              VALUES(?1,?2,?3)",
             params![i64::from(host_pid), host_start, created_ts],
         );
-        let id = conn.query_row(
-            "SELECT id FROM brushproducer WHERE host_pid=?1 AND host_start=?2",
-            params![i64::from(host_pid), host_start],
-            |row| row.get(0),
-        ).unwrap_or(0);
+        let id = conn
+            .query_row(
+                "SELECT id FROM brushproducer WHERE host_pid=?1 AND host_start=?2",
+                params![i64::from(host_pid), host_start],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
         drop(conn);
         if id > 0 {
             self.brush_producers.lock().unwrap().insert(key, id);
@@ -1327,16 +1650,25 @@ impl BoxState {
     /// 0-based execution ordinal. The caller marks this id as the box's current
     /// pipeline (set_current_pipeline) so subsequently-recorded brush-descendant
     /// processes are stamped with it.
-    pub fn add_brushprov(&self, cmd: &str, record_json: &str, pipeline: i64,
-                         spawn_ts: f64, uid: i64, parent_uid: i64) -> i64 {
+    pub fn add_brushprov(
+        &self,
+        cmd: &str,
+        record_json: &str,
+        pipeline: i64,
+        spawn_ts: f64,
+        uid: i64,
+        parent_uid: i64,
+    ) -> i64 {
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs_f64()).unwrap_or(0.0);
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
         let conn = self.recorder_conn.lock().unwrap();
         let _ = conn.execute(
             "INSERT INTO brushprov(ts,cmd,record,pipeline,spawn_ts,uid,parent_uid) \
              VALUES(?1,?2,?3,?4,?5,?6,?7)",
-            params![ts, cmd, record_json, pipeline, spawn_ts, uid, parent_uid]);
+            params![ts, cmd, record_json, pipeline, spawn_ts, uid, parent_uid],
+        );
         conn.last_insert_rowid()
     }
 
@@ -1350,16 +1682,25 @@ impl BoxState {
     /// finalize_brush_links stamps the writer with this row's id under the
     /// forest-ancestry guard (the nested-shim's descendants chain up through
     /// the box's brush --inner, so the guard accepts them).
-    pub fn add_brushprov_nested(&self, cmd: &str, record_json: &str, pipeline: i64,
-                                spawn_ts: f64, uid: i64, parent_uid: i64) -> i64 {
+    pub fn add_brushprov_nested(
+        &self,
+        cmd: &str,
+        record_json: &str,
+        pipeline: i64,
+        spawn_ts: f64,
+        uid: i64,
+        parent_uid: i64,
+    ) -> i64 {
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs_f64()).unwrap_or(0.0);
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
         let conn = self.recorder_conn.lock().unwrap();
         let _ = conn.execute(
             "INSERT INTO brushprov(ts,cmd,record,pipeline,spawn_ts,nested,uid,parent_uid) \
              VALUES(?1,?2,?3,?4,?5,1,?6,?7)",
-            params![ts, cmd, record_json, pipeline, spawn_ts, uid, parent_uid]);
+            params![ts, cmd, record_json, pipeline, spawn_ts, uid, parent_uid],
+        );
         conn.last_insert_rowid()
     }
 
@@ -1367,13 +1708,16 @@ impl BoxState {
     /// with these uids (the pipelines of one just-finished complete-command).
     /// `uid` is the box-assigned per-pipeline id; matching is scoped to this box.
     pub fn mark_brushprov_done(&self, uids: &[i64], code: i64, done_ts: f64) {
-        if uids.is_empty() { return; }
+        if uids.is_empty() {
+            return;
+        }
         let mut conn = self.recorder_conn.lock().unwrap();
         let Ok(tx) = conn.transaction() else { return };
         for uid in uids {
             let _ = tx.execute(
                 "UPDATE brushprov SET done_ts=?1, exit_code=?2 WHERE uid=?3 AND uid!=0",
-                params![done_ts, code, uid]);
+                params![done_ts, code, uid],
+            );
         }
         let _ = tx.commit();
     }
@@ -1383,15 +1727,32 @@ impl BoxState {
     /// the call. `req`/`resp` are the FULL bytes (response is a SSE-frames
     /// reconstitution when `stream` is true). Best-effort: a stale connection
     /// drops the row silently.
-    pub fn add_api_log(&self, ts: f64, method: &str, path: &str,
-                       model: &str, status: i32, req: &[u8], resp: &[u8],
-                       stream: bool) -> i64 {
+    pub fn add_api_log(
+        &self,
+        ts: f64,
+        method: &str,
+        path: &str,
+        model: &str,
+        status: i32,
+        req: &[u8],
+        resp: &[u8],
+        stream: bool,
+    ) -> i64 {
         let conn = self.recorder_conn.lock().unwrap();
         let _ = conn.execute(
             "INSERT INTO api_log(ts,method,path,model,status,stream,req,resp) \
              VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
-            params![ts, method, path, model, status,
-                    if stream { 1 } else { 0 }, req, resp]);
+            params![
+                ts,
+                method,
+                path,
+                model,
+                status,
+                if stream { 1 } else { 0 },
+                req,
+                resp
+            ],
+        );
         conn.last_insert_rowid()
     }
 
@@ -1401,18 +1762,39 @@ impl BoxState {
     /// exceeded the capture cap and was stored header-only. Best-effort: a
     /// stale connection drops the row silently, exactly like `add_api_log`.
     #[allow(clippy::too_many_arguments)]
-    pub fn add_web_capture(&self, ts: f64, method: &str, url: &str, host: &str,
-                           status: i32, mime: &str, req_headers: &str,
-                           resp_headers: &str, req_body: &[u8],
-                           resp_body: &[u8], truncated: bool) -> i64 {
+    pub fn add_web_capture(
+        &self,
+        ts: f64,
+        method: &str,
+        url: &str,
+        host: &str,
+        status: i32,
+        mime: &str,
+        req_headers: &str,
+        resp_headers: &str,
+        req_body: &[u8],
+        resp_body: &[u8],
+        truncated: bool,
+    ) -> i64 {
         let conn = self.recorder_conn.lock().unwrap();
         let _ = conn.execute(
             "INSERT INTO webcap(ts,method,url,host,status,mime,\
              req_headers,resp_headers,req_body,resp_body,truncated) \
              VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
-            params![ts, method, url, host, status, mime,
-                    req_headers, resp_headers, req_body, resp_body,
-                    if truncated { 1 } else { 0 }]);
+            params![
+                ts,
+                method,
+                url,
+                host,
+                status,
+                mime,
+                req_headers,
+                resp_headers,
+                req_body,
+                resp_body,
+                if truncated { 1 } else { 0 }
+            ],
+        );
         conn.last_insert_rowid()
     }
 
@@ -1421,19 +1803,27 @@ impl BoxState {
     /// durable boundary instead of turning every edge into an autocommit.
     /// Returns the number of rows committed; failure commits no partial graph.
     pub fn add_build_edges(&self, edges: &[(String, String, Option<String>)]) -> usize {
-        if edges.is_empty() { return 0; }
+        if edges.is_empty() {
+            return 0;
+        }
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs_f64()).unwrap_or(0.0);
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
         let mut conn = self.recorder_conn.lock().unwrap();
         let Ok(tx) = conn.transaction() else { return 0 };
         let inserted = {
-            let Ok(mut insert) = tx.prepare_cached(
-                "INSERT INTO build_edges(ts,outs,ins,cmd) VALUES(?1,?2,?3,?4)",
-            ) else { return 0 };
+            let Ok(mut insert) =
+                tx.prepare_cached("INSERT INTO build_edges(ts,outs,ins,cmd) VALUES(?1,?2,?3,?4)")
+            else {
+                return 0;
+            };
             let mut inserted = 0;
             for (outputs, inputs, command) in edges {
-                if insert.execute(params![ts, outputs, inputs, command]).is_err() {
+                if insert
+                    .execute(params![ts, outputs, inputs, command])
+                    .is_err()
+                {
                     return 0;
                 }
                 inserted += 1;
@@ -1447,10 +1837,13 @@ impl BoxState {
     /// INSERT OR IGNORE: the unique key collapses identical repeats across
     /// sub-makes, keeping the table proportional to distinct assignments.
     pub fn add_makevars(&self, rows: &[crate::control::MakeVarRow]) {
-        if rows.is_empty() { return; }
+        if rows.is_empty() {
+            return;
+        }
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs_f64()).unwrap_or(0.0);
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
         let mut conn = self.recorder_conn.lock().unwrap();
         let Ok(tx) = conn.transaction() else { return };
         for r in rows {
@@ -1458,8 +1851,11 @@ impl BoxState {
                 "INSERT OR IGNORE INTO makevar\
                  (ts,name,loc,value,make_dir,edge_out,uid,rhs,refs,flags) \
                  VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
-                params![ts, r.name, r.loc, r.value, r.make_dir, r.edge_out,
-                        r.uid, r.rhs, r.refs, r.flags]);
+                params![
+                    ts, r.name, r.loc, r.value, r.make_dir, r.edge_out, r.uid, r.rhs, r.refs,
+                    r.flags
+                ],
+            );
         }
         let _ = tx.commit();
     }
@@ -1477,21 +1873,29 @@ impl BoxState {
                    SELECT id FROM build_edges \
                    WHERE json_extract(outs,'$[0]')=?2 AND started_ts IS NULL \
                    ORDER BY id DESC LIMIT 1)",
-                params![ts, out]);
+                params![ts, out],
+            );
         } else if let Some(cmd) = cmd {
             let _ = conn.execute(
                 "UPDATE build_edges SET started_ts=?1 WHERE id=(\
                    SELECT id FROM build_edges \
                    WHERE cmd=?2 AND started_ts IS NULL \
                    ORDER BY id DESC LIMIT 1)",
-                params![ts, cmd]);
+                params![ts, cmd],
+            );
         }
     }
 
     /// Mark a build edge as FINISHED (the first started-but-not-ended edge with
     /// this output/cmd key), stamping `ended_ts` + `exit_code`. Best-effort.
-    pub fn mark_build_edge_done(&self, out: Option<&str>, cmd: Option<&str>,
-                                code: i64, ts: f64, excerpt: Option<&str>) {
+    pub fn mark_build_edge_done(
+        &self,
+        out: Option<&str>,
+        cmd: Option<&str>,
+        code: i64,
+        ts: f64,
+        excerpt: Option<&str>,
+    ) {
         let conn = self.recorder_conn.lock().unwrap();
         if let Some(out) = out {
             let _ = conn.execute(
@@ -1501,7 +1905,8 @@ impl BoxState {
                    WHERE json_extract(outs,'$[0]')=?3 \
                      AND started_ts IS NOT NULL AND ended_ts IS NULL \
                    ORDER BY id DESC LIMIT 1)",
-                params![ts, code, out, excerpt]);
+                params![ts, code, out, excerpt],
+            );
         } else if let Some(cmd) = cmd {
             let _ = conn.execute(
                 "UPDATE build_edges SET ended_ts=?1, exit_code=?2, \
@@ -1510,7 +1915,8 @@ impl BoxState {
                    WHERE cmd=?3 \
                      AND started_ts IS NOT NULL AND ended_ts IS NULL \
                    ORDER BY id DESC LIMIT 1)",
-                params![ts, code, cmd, excerpt]);
+                params![ts, code, cmd, excerpt],
+            );
         }
     }
 
@@ -1523,7 +1929,7 @@ impl BoxState {
         );
     }
 
-    /// Store the box's raw sud TRACE stream (the bytes teed to
+    /// Store the box's raw TRACE v3 stream (the bytes teed to the legacy-named
     /// live/<id>/sud.trace) as the single-row `sudtrace` blob. DELETE + INSERT
     /// so a rerun of the box overwrites the prior run's trace rather than
     /// accumulating rows. Empty input still writes an (empty) row — callers
@@ -1531,23 +1937,26 @@ impl BoxState {
     pub fn set_sudtrace(&self, content: &[u8]) {
         let conn = self.conn.lock().unwrap();
         let _ = conn.execute("DELETE FROM sudtrace", []);
-        let _ = conn.execute("INSERT INTO sudtrace(content) VALUES(?1)",
-                             params![content]);
+        let _ = conn.execute("INSERT INTO sudtrace(content) VALUES(?1)", params![content]);
     }
 
-    /// The box's stored sud TRACE stream, or None if this box never captured
-    /// one (every FUSE box, and a sud box swept before this table existed).
+    /// The box's stored TRACE stream, or None if this box never captured one.
     pub fn get_sudtrace(&self) -> Option<Vec<u8>> {
         let conn = self.conn.lock().unwrap();
-        conn.query_row("SELECT content FROM sudtrace LIMIT 1", [],
-                       |r| r.get::<_, Option<Vec<u8>>>(0)).ok().flatten()
+        conn.query_row("SELECT content FROM sudtrace LIMIT 1", [], |r| {
+            r.get::<_, Option<Vec<u8>>>(0)
+        })
+        .ok()
+        .flatten()
     }
 
     /// Read one `meta` row by key. None if absent.
     pub fn get_meta(&self, key: &str) -> Option<String> {
         let conn = self.conn.lock().unwrap();
-        conn.query_row("SELECT value FROM meta WHERE key=?1", [key],
-                       |r| r.get::<_, String>(0)).ok()
+        conn.query_row("SELECT value FROM meta WHERE key=?1", [key], |r| {
+            r.get::<_, String>(0)
+        })
+        .ok()
     }
 
     /// The box's ROOT process row (root=1): the `sarun -- cmd` runner itself, the
@@ -1563,8 +1972,11 @@ impl BoxState {
         provenance: &crate::generated_wire::ProcessProvenance,
         host_pid: i64,
     ) -> Result<(), String> {
-        let text = |value: &[u8], field: &str| std::str::from_utf8(value)
-            .map(str::to_owned).map_err(|_| format!("root process {field} is not UTF-8"));
+        let text = |value: &[u8], field: &str| {
+            std::str::from_utf8(value)
+                .map(str::to_owned)
+                .map_err(|_| format!("root process {field} is not UTF-8"))
+        };
         // tgid: the real host pid when known (so /proc + the bubble chain agree),
         // else the runner's self-reported tgid/pid from prov.
         let tgid = if host_pid > 0 {
@@ -1575,9 +1987,17 @@ impl BoxState {
         let ppid = u32::try_from(provenance.ppid).map_err(|_| "negative root parent pid")?;
         // start_time identifies the incarnation; read the host pid's real start so the
         // (tgid,start) identity matches what writers see when they bubble up to it.
-        let start = if tgid > 0 { Self::start_time_of(tgid) } else { 0 };
-        let argv = provenance.argv.as_slice().iter().map(|value|
-            text(value.as_slice(), "argument")).collect::<Result<Vec<_>, _>>()?;
+        let start = if tgid > 0 {
+            Self::start_time_of(tgid)
+        } else {
+            0
+        };
+        let argv = provenance
+            .argv
+            .as_slice()
+            .iter()
+            .map(|value| text(value.as_slice(), "argument"))
+            .collect::<Result<Vec<_>, _>>()?;
         if argv.is_empty() {
             return Err("resolved root process has an empty argv".into());
         }
@@ -1586,26 +2006,45 @@ impl BoxState {
         // parent-namespace pid the engine can't /proc-read); else read the host
         // tgid's /proc/<tgid>/environ.
         let env_json = if self.env_capture() {
-            provenance.environment.as_ref().map(|environment| {
-                let values = environment.as_map().iter().map(|(key, value)| Ok((
-                    text(key.as_slice(), "environment key")?,
-                    text(value.as_slice(), "environment value")?,
-                ))).collect::<Result<std::collections::BTreeMap<_, _>, String>>()?;
-                serde_json::to_string(&values).map_err(|error| error.to_string())
-            }).transpose()?.or_else(|| if tgid > 0 { Self::read_environ_json(tgid) }
-                                     else { None })
-        } else { None };
-        self.record_proc(tgid, start, ppid,
-                         &text(provenance.executable.as_slice(), "executable")?,
-                         &text(provenance.cwd.as_slice(), "cwd")?, &argv,
-                         env_json, true);
+            provenance
+                .environment
+                .as_ref()
+                .map(|environment| {
+                    let values = environment
+                        .as_map()
+                        .iter()
+                        .map(|(key, value)| {
+                            Ok((
+                                text(key.as_slice(), "environment key")?,
+                                text(value.as_slice(), "environment value")?,
+                            ))
+                        })
+                        .collect::<Result<std::collections::BTreeMap<_, _>, String>>()?;
+                    serde_json::to_string(&values).map_err(|error| error.to_string())
+                })
+                .transpose()?
+                .or_else(|| {
+                    if tgid > 0 {
+                        Self::read_environ_json(tgid)
+                    } else {
+                        None
+                    }
+                })
+        } else {
+            None
+        };
+        self.record_proc(
+            tgid,
+            start,
+            ppid,
+            &text(provenance.executable.as_slice(), "executable")?,
+            &text(provenance.cwd.as_slice(), "cwd")?,
+            &argv,
+            env_json,
+            true,
+        );
         Ok(())
     }
-
-
-
-
-
 }
 
 #[cfg(test)]
@@ -1628,10 +2067,12 @@ mod ro_attachment_tests {
         std::fs::create_dir_all(&home).unwrap();
         let db = home.join("9841.sqlar");
         let legacy = rusqlite::Connection::open(&db).unwrap();
-        legacy.execute_batch(
-            "CREATE TABLE provenance(path TEXT PRIMARY KEY, pid INT, ppid INT, \
+        legacy
+            .execute_batch(
+                "CREATE TABLE provenance(path TEXT PRIMARY KEY, pid INT, ppid INT, \
              exe TEXT, argv TEXT); PRAGMA user_version=1;",
-        ).unwrap();
+            )
+            .unwrap();
         drop(legacy);
 
         let state = BoxState::create(9841).unwrap();
@@ -1639,12 +2080,14 @@ mod ro_attachment_tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        let duplicate: i64 = connection.query_row(
-            "SELECT count(*) FROM sqlite_master \
+        let duplicate: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_master \
              WHERE type='table' AND name='provenance'",
-            [],
-            |row| row.get(0),
-        ).unwrap();
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(version, 2);
         assert_eq!(duplicate, 0);
         drop(connection);
@@ -1658,7 +2101,10 @@ mod ro_attachment_tests {
     #[test]
     fn old_format_round_trips_byte_identical() {
         let rows: Vec<RoAttachment> = serde_json::from_str("[3,7]").unwrap();
-        assert!(matches!(rows[..], [RoAttachment::Box(3), RoAttachment::Box(7)]));
+        assert!(matches!(
+            rows[..],
+            [RoAttachment::Box(3), RoAttachment::Box(7)]
+        ));
         assert_eq!(serde_json::to_string(&rows).unwrap(), "[3,7]");
     }
 
@@ -1666,9 +2112,13 @@ mod ro_attachment_tests {
     fn mixed_list_round_trips() {
         let j = r#"[7,{"kind":"git","store":"/m/s","ref":"main","rev":"abc","prefix":"sdk","name":"git:x/main@abc"}]"#;
         let rows: Vec<RoAttachment> = serde_json::from_str(j).unwrap();
-        let RoAttachment::Ext(e) = &rows[1] else { panic!("ext row") };
-        assert_eq!((e.kind.as_str(), e.refname.as_str(), e.rev.as_str()),
-                   ("git", "main", "abc"));
+        let RoAttachment::Ext(e) = &rows[1] else {
+            panic!("ext row")
+        };
+        assert_eq!(
+            (e.kind.as_str(), e.refname.as_str(), e.rev.as_str()),
+            ("git", "main", "abc")
+        );
         let back: Vec<RoAttachment> =
             serde_json::from_str(&serde_json::to_string(&rows).unwrap()).unwrap();
         assert!(matches!(back[0], RoAttachment::Box(7)));

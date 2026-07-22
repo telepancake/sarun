@@ -46,7 +46,9 @@ pub struct Turn {
 }
 
 impl Turn {
-    pub fn role(&self) -> &str { &self.kind }
+    pub fn role(&self) -> &str {
+        &self.kind
+    }
 
     pub fn read(&self) -> io::Result<String> {
         fs::read_to_string(&self.path)
@@ -94,7 +96,10 @@ pub fn parse_turn(path: &Path) -> Option<Turn> {
         number,
         slug: caps.name("turnid").map(|m| m.as_str().to_string()),
         sender: caps.name("sender").map(|m| m.as_str().to_string()),
-        flags: caps.name("flags").map(|m| m.as_str().to_string()).unwrap_or_default(),
+        flags: caps
+            .name("flags")
+            .map(|m| m.as_str().to_string())
+            .unwrap_or_default(),
         kind: caps.name("kind").unwrap().as_str().to_string(),
         path: path.to_path_buf(),
     })
@@ -106,11 +111,16 @@ pub fn session_dir(name: &str) -> PathBuf {
 
 pub fn load_turns(name: &str) -> Vec<Turn> {
     let folder = session_dir(name);
-    let Ok(rd) = fs::read_dir(&folder) else { return Vec::new(); };
-    let mut entries: Vec<_> = rd.filter_map(|e| e.ok())
+    let Ok(rd) = fs::read_dir(&folder) else {
+        return Vec::new();
+    };
+    let mut entries: Vec<_> = rd
+        .filter_map(|e| e.ok())
         .filter_map(|e| {
             let p = e.path();
-            if !p.is_file() { return None; }
+            if !p.is_file() {
+                return None;
+            }
             parse_turn(&p)
         })
         .collect();
@@ -126,18 +136,37 @@ pub fn load_turns(name: &str) -> Vec<Turn> {
 }
 
 pub fn next_number(turns: &[Turn]) -> u32 {
-    turns.iter().map(|t| t.number).max().map(|m| m + NUM_STEP).unwrap_or(NUM_STEP)
+    turns
+        .iter()
+        .map(|t| t.number)
+        .max()
+        .map(|m| m + NUM_STEP)
+        .unwrap_or(NUM_STEP)
 }
 
-pub fn turn_filename(number: u32, kind: &str, slug: Option<&str>,
-                     sender: Option<&str>, flags: &str) -> String {
+pub fn turn_filename(
+    number: u32,
+    kind: &str,
+    slug: Option<&str>,
+    sender: Option<&str>,
+    flags: &str,
+) -> String {
     if sender.is_some() && slug.is_none() {
         panic!("turn_filename: sender requires slug");
     }
     let mut stem = format!("{:0width$}", number, width = NUM_WIDTH);
-    if let Some(s) = slug { stem.push('-'); stem.push_str(s); }
-    if let Some(f) = sender { stem.push('-'); stem.push_str(f); }
-    if !flags.is_empty() { stem.push('.'); stem.push_str(flags); }
+    if let Some(s) = slug {
+        stem.push('-');
+        stem.push_str(s);
+    }
+    if let Some(f) = sender {
+        stem.push('-');
+        stem.push_str(f);
+    }
+    if !flags.is_empty() {
+        stem.push('.');
+        stem.push_str(flags);
+    }
     format!("{stem}.{kind}")
 }
 
@@ -145,7 +174,9 @@ pub fn turn_filename(number: u32, kind: &str, slug: Option<&str>,
 /// spec like `a.b.c` must be unambiguous, never part of a name.
 pub fn validate_session_name(name: &str) -> Result<(), String> {
     if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric()) {
-        return Err(format!("invalid session name {name:?} — letters/digits only"));
+        return Err(format!(
+            "invalid session name {name:?} — letters/digits only"
+        ));
     }
     Ok(())
 }
@@ -155,7 +186,9 @@ pub fn validate_session_name(name: &str) -> Result<(), String> {
 /// Composition, not hierarchy — order may vary turn-to-turn.
 pub fn parse_stitch(spec: &str) -> Result<Vec<String>, String> {
     let segs: Vec<&str> = spec.split('.').collect();
-    for s in &segs { validate_session_name(s)?; }
+    for s in &segs {
+        validate_session_name(s)?;
+    }
     let mut seen = std::collections::HashSet::new();
     for s in &segs {
         if !seen.insert(*s) {
@@ -167,9 +200,10 @@ pub fn parse_stitch(spec: &str) -> Result<Vec<String>, String> {
 
 /// Walk a session's turns and assign slugs to any that lack one, renaming the
 /// files on disk in place. Returns the updated turn list.
-pub fn assign_slugs(turns: Vec<Turn>, existing: &mut std::collections::HashSet<String>)
-    -> io::Result<Vec<Turn>>
-{
+pub fn assign_slugs(
+    turns: Vec<Turn>,
+    existing: &mut std::collections::HashSet<String>,
+) -> io::Result<Vec<Turn>> {
     let mut out = Vec::with_capacity(turns.len());
     for t in turns {
         if let Some(s) = &t.slug {
@@ -179,29 +213,39 @@ pub fn assign_slugs(turns: Vec<Turn>, existing: &mut std::collections::HashSet<S
             let parent = t.path.parent().unwrap();
             let id = ids::new_turn_id(existing);
             existing.insert(id.clone());
-            let new_name = turn_filename(t.number, &t.kind, Some(&id),
-                                         None, &t.flags);
+            let new_name = turn_filename(t.number, &t.kind, Some(&id), None, &t.flags);
             let new_path = parent.join(new_name);
             fs::rename(&t.path, &new_path)?;
-            out.push(Turn { slug: Some(id), path: new_path, ..t });
+            out.push(Turn {
+                slug: Some(id),
+                path: new_path,
+                ..t
+            });
         }
     }
     Ok(out)
 }
 
 /// Append a NEW turn file with the given content; returns the path written.
-pub fn append_turn(name: &str, kind: &str, content: &str,
-                   slug: Option<String>, sender: Option<String>,
-                   flags: &str, number: Option<u32>) -> io::Result<PathBuf>
-{
+pub fn append_turn(
+    name: &str,
+    kind: &str,
+    content: &str,
+    slug: Option<String>,
+    sender: Option<String>,
+    flags: &str,
+    number: Option<u32>,
+) -> io::Result<PathBuf> {
     validate_session_name(name).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     let folder = session_dir(name);
     fs::create_dir_all(&folder)?;
     let turns = load_turns(name);
-    let mut existing: std::collections::HashSet<String> = turns.iter()
-        .filter_map(|t| t.slug.clone()).collect();
+    let mut existing: std::collections::HashSet<String> =
+        turns.iter().filter_map(|t| t.slug.clone()).collect();
     let slug = slug.or_else(|| Some(ids::new_turn_id(&existing)));
-    if let Some(s) = &slug { existing.insert(s.clone()); }
+    if let Some(s) = &slug {
+        existing.insert(s.clone());
+    }
     let n = number.unwrap_or_else(|| next_number(&turns));
     let name_file = turn_filename(n, kind, slug.as_deref(), sender.as_deref(), flags);
     let path = folder.join(name_file);
@@ -219,8 +263,7 @@ pub fn load_stitched(spec: &str) -> Result<Vec<Turn>, String> {
         // Ensure folder exists for later writes; loading the empty list is fine.
         let _ = fs::create_dir_all(session_dir(seg));
         let ts = load_turns(seg);
-        let ts = assign_slugs(ts, &mut slugs)
-            .map_err(|e| format!("assign slugs in {seg}: {e}"))?;
+        let ts = assign_slugs(ts, &mut slugs).map_err(|e| format!("assign slugs in {seg}: {e}"))?;
         all.extend(ts);
     }
     // Cross-context turn-id uniqueness check.
@@ -228,8 +271,11 @@ pub fn load_stitched(spec: &str) -> Result<Vec<Turn>, String> {
     for t in &all {
         if let Some(s) = &t.slug {
             if let Some(prev) = seen.get(s) {
-                return Err(format!("turn-id collision {s:?} — used by both \
-                    {prev:?} and {:?}", t.path));
+                return Err(format!(
+                    "turn-id collision {s:?} — used by both \
+                    {prev:?} and {:?}",
+                    t.path
+                ));
             }
             seen.insert(s.clone(), t.path.clone());
         }
@@ -244,7 +290,9 @@ pub fn target_segment(spec: &str) -> Result<String, String> {
 }
 
 pub fn cmp_path_name(a: &Path, b: &Path) -> Ordering {
-    a.file_name().and_then(|s| s.to_str()).unwrap_or("")
+    a.file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
         .cmp(b.file_name().and_then(|s| s.to_str()).unwrap_or(""))
 }
 
@@ -262,8 +310,11 @@ pub fn strip_emitted_turn_id(content: &str) -> (Option<String>, String) {
     let Some(m) = emitted_id_re().find(content) else {
         return (None, content.to_string());
     };
-    let id = emitted_id_re().captures(content).unwrap()
-        .name("id").map(|m| m.as_str().to_string());
+    let id = emitted_id_re()
+        .captures(content)
+        .unwrap()
+        .name("id")
+        .map(|m| m.as_str().to_string());
     (id, content[m.end()..].to_string())
 }
 
@@ -301,15 +352,15 @@ pub fn build_messages(turns: &[Turn]) -> Vec<serde_json::Value> {
             let mut tool_calls: Vec<serde_json::Value> = Vec::new();
             let mut call_ids: Vec<String> = Vec::new();
             let mut j = i;
-            while j < turns.len()
-                && turns[j].kind == "assistant"
-                && turns[j].flags.contains('c')
-            {
+            while j < turns.len() && turns[j].kind == "assistant" && turns[j].flags.contains('c') {
                 let body = turns[j].read().unwrap_or_default();
-                let env: serde_json::Value = serde_json::from_str(&body)
-                    .unwrap_or_else(|_| json!({}));
-                let name = env.get("tool").and_then(serde_json::Value::as_str)
-                    .unwrap_or("").to_string();
+                let env: serde_json::Value =
+                    serde_json::from_str(&body).unwrap_or_else(|_| json!({}));
+                let name = env
+                    .get("tool")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
                 let args = env.get("arguments").cloned().unwrap_or(json!({}));
                 // OpenAI wants arguments as a STRING (stringified JSON), not
                 // an inline object — that's the convention strict providers
@@ -318,7 +369,9 @@ pub fn build_messages(turns: &[Turn]) -> Vec<serde_json::Value> {
                     serde_json::Value::String(s) => s,
                     other => other.to_string(),
                 };
-                let call_id = turns[j].slug.clone()
+                let call_id = turns[j]
+                    .slug
+                    .clone()
                     .unwrap_or_else(|| format!("call_orphan_{}", j));
                 tool_calls.push(json!({
                     "id": call_id,
@@ -339,7 +392,8 @@ pub fn build_messages(turns: &[Turn]) -> Vec<serde_json::Value> {
             let mut k: usize = 0;
             while j < turns.len() && turns[j].kind == "tool" {
                 let raw = turns[j].read().unwrap_or_default();
-                let id = call_ids.get(k)
+                let id = call_ids
+                    .get(k)
                     .or_else(|| call_ids.last())
                     .cloned()
                     .unwrap_or_default();

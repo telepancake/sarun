@@ -30,8 +30,10 @@ pub struct Ask {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Verdict {
-    YesOnce, NoOnce,
-    AllowSave, DenySave,
+    YesOnce,
+    NoOnce,
+    AllowSave,
+    DenySave,
 }
 
 impl Verdict {
@@ -62,7 +64,9 @@ struct Inner {
 }
 
 impl PromptQueue {
-    pub fn new() -> Arc<Self> { Arc::new(Self::default()) }
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
 
     /// UI signals it's up. While this is true, asks block on a oneshot
     /// (up to 60 s); while false, asks deny-out immediately.
@@ -83,16 +87,31 @@ impl PromptQueue {
 
     /// Dispatcher side: enqueue an Ask, await a verdict (max 60 s).
     /// Returns NoOnce if the TUI isn't up or the user took too long.
-    pub async fn ask(self: &Arc<Self>, box_name: String, host: String,
-                     port: u16, scheme: String) -> Verdict {
-        if !self.ui_active.load(Ordering::Acquire) { return Verdict::NoOnce; }
+    pub async fn ask(
+        self: &Arc<Self>,
+        box_name: String,
+        host: String,
+        port: u16,
+        scheme: String,
+    ) -> Verdict {
+        if !self.ui_active.load(Ordering::Acquire) {
+            return Verdict::NoOnce;
+        }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
-        let ask = Ask { id, box_name, host, port, scheme };
+        let ask = Ask {
+            id,
+            box_name,
+            host,
+            port,
+            scheme,
+        };
         let (tx, rx) = oneshot::channel();
         {
             let mut g = self.inner.lock();
             g.queue.push_back(Pending {
-                ask, tx, deadline: Instant::now() + Duration::from_secs(60),
+                ask,
+                tx,
+                deadline: Instant::now() + Duration::from_secs(60),
             });
         }
         match tokio::time::timeout(Duration::from_secs(60), rx).await {
@@ -121,7 +140,9 @@ impl PromptQueue {
     /// delivered to the dispatcher waiter; false on stale id.
     pub fn answer(&self, id: u64, verdict: Verdict) -> bool {
         let mut g = self.inner.lock();
-        if g.queue.front().map(|p| p.ask.id) != Some(id) { return false; }
+        if g.queue.front().map(|p| p.ask.id) != Some(id) {
+            return false;
+        }
         let p = g.queue.pop_front().unwrap();
         // Fire-and-forget by design: if the dispatcher waiter already timed out
         // and dropped its receiver, the answer is simply moot. Safe to ignore.

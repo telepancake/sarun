@@ -7,7 +7,96 @@
  * accidental branch into any aligned instruction slot stops immediately.
  */
 
-#if defined(CONFIG_ARM64)
+#if defined(CONFIG_X86_64)
+
+#define VIROS_SCRATCH_PAGE_SIZE 4096
+
+	/* Use the canonical input section so Linux keeps this page before _etext. */
+	.pushsection .text,"ax"
+	.balign VIROS_SCRATCH_PAGE_SIZE
+	.globl __viros_scratch_code_start
+	.type __viros_scratch_code_start, @object
+__viros_scratch_code_start:
+	.fill VIROS_SCRATCH_PAGE_SIZE, 1, 0xcc /* int3 */
+	.globl __viros_scratch_code_end
+__viros_scratch_code_end:
+	.size __viros_scratch_code_start, \
+		__viros_scratch_code_end - __viros_scratch_code_start
+	.popsection
+
+	.pushsection .bss.viros_scratch_data,"aw",@nobits
+	.balign VIROS_SCRATCH_PAGE_SIZE
+	.globl __viros_scratch_data_start
+	.type __viros_scratch_data_start, @object
+__viros_scratch_data_start:
+	.skip VIROS_SCRATCH_PAGE_SIZE
+	.globl __viros_scratch_data_end
+__viros_scratch_data_end:
+	.size __viros_scratch_data_start, \
+		__viros_scratch_data_end - __viros_scratch_data_start
+	.popsection
+
+	.pushsection .bss.viros_scratch_stack,"aw",@nobits
+	.balign VIROS_SCRATCH_PAGE_SIZE
+	.globl __viros_scratch_stack_start
+	.type __viros_scratch_stack_start, @object
+__viros_scratch_stack_start:
+	.skip VIROS_SCRATCH_PAGE_SIZE
+	.globl __viros_scratch_stack_end
+__viros_scratch_stack_end:
+	.size __viros_scratch_stack_start, \
+		__viros_scratch_stack_end - __viros_scratch_stack_start
+	.popsection
+
+	.section .note.GNU-stack,"",@progbits
+
+#elif defined(CONFIG_ARM) && !defined(CONFIG_ARM64)
+
+#define VIROS_SCRATCH_PAGE_SIZE 4096
+
+	.arm
+	/* Use the canonical input section so Linux keeps this page before _etext. */
+	.pushsection .text,"ax",%progbits
+	.balign VIROS_SCRATCH_PAGE_SIZE
+	.globl __viros_scratch_code_start
+	.type __viros_scratch_code_start, %object
+__viros_scratch_code_start:
+	.rept VIROS_SCRATCH_PAGE_SIZE / 4
+	.word 0xe7f565f0 /* ARM UDF #0x5650 */
+	.endr
+	.globl __viros_scratch_code_end
+__viros_scratch_code_end:
+	.size __viros_scratch_code_start, \
+		__viros_scratch_code_end - __viros_scratch_code_start
+	.popsection
+
+	.pushsection .bss.viros_scratch_data,"aw",%nobits
+	.balign VIROS_SCRATCH_PAGE_SIZE
+	.globl __viros_scratch_data_start
+	.type __viros_scratch_data_start, %object
+__viros_scratch_data_start:
+	.skip VIROS_SCRATCH_PAGE_SIZE
+	.globl __viros_scratch_data_end
+__viros_scratch_data_end:
+	.size __viros_scratch_data_start, \
+		__viros_scratch_data_end - __viros_scratch_data_start
+	.popsection
+
+	.pushsection .bss.viros_scratch_stack,"aw",%nobits
+	.balign VIROS_SCRATCH_PAGE_SIZE
+	.globl __viros_scratch_stack_start
+	.type __viros_scratch_stack_start, %object
+__viros_scratch_stack_start:
+	.skip VIROS_SCRATCH_PAGE_SIZE
+	.globl __viros_scratch_stack_end
+__viros_scratch_stack_end:
+	.size __viros_scratch_stack_start, \
+		__viros_scratch_stack_end - __viros_scratch_stack_start
+	.popsection
+
+	.section .note.GNU-stack,"",%progbits
+
+#elif defined(CONFIG_ARM64)
 
 #if defined(CONFIG_ARM64_4K_PAGES)
 #define VIROS_SCRATCH_PAGE_SIZE 4096
@@ -19,7 +108,8 @@
 #error "viros scratch requires a supported AArch64 kernel page size"
 #endif
 
-	.pushsection .text.viros_scratch,"ax"
+	/* Use the canonical input section so Linux keeps this page before _etext. */
+	.pushsection .text,"ax"
 	.balign VIROS_SCRATCH_PAGE_SIZE
 	.globl __viros_scratch_code_start
 	.type __viros_scratch_code_start, %object
@@ -77,7 +167,8 @@ __viros_scratch_stack_end:
 	.set nomicromips
 	.set mips32
 
-	.pushsection .text.viros_scratch,"ax"
+	/* Use the canonical input section so Linux keeps this page before _etext. */
+	.pushsection .text,"ax"
 	.balign VIROS_SCRATCH_PAGE_SIZE
 	.globl __viros_scratch_code_start
 	.type __viros_scratch_code_start, %object
@@ -119,5 +210,5 @@ __viros_scratch_stack_end:
 	.section .note.GNU-stack,"",%progbits
 
 #else
-#error "viros scratch requires an AArch64 or MIPS kernel"
+#error "viros scratch requires an x86-64, ARM, AArch64, or MIPS kernel"
 #endif

@@ -22,13 +22,47 @@
 
 #include "viros_probe_abi.h"
 
-/* The launcher places this address in the architecture link register. */
+/* Retained completion boundary used by the architecture-specific call gate. */
 #if defined(CONFIG_ARM64)
 asm(".pushsection .text.viros_probe_complete,\"ax\"\n"
     ".global viros_probe_complete\n"
     ".type viros_probe_complete, %function\n"
     "viros_probe_complete:\n"
     "brk #0x5650\n"
+    ".size viros_probe_complete, .-viros_probe_complete\n"
+    ".popsection\n");
+#elif defined(CONFIG_X86_64)
+/*
+ * x86 has no link register.  Enter through a retained wrapper which makes a
+ * normal SysV call on the dedicated, 16-byte-aligned stack.  Returning from
+ * the C helper reaches the adjacent one-byte completion boundary.
+ */
+asm(".pushsection .text.viros_probe_entry,\"ax\"\n"
+    ".balign 16\n"
+    ".global viros_probe_entry\n"
+    ".type viros_probe_entry, @function\n"
+    "viros_probe_entry:\n"
+    "call viros_probe_main\n"
+    ".size viros_probe_entry, .-viros_probe_entry\n"
+    ".global viros_probe_complete\n"
+    ".type viros_probe_complete, @function\n"
+    "viros_probe_complete:\n"
+    "int3\n"
+    ".size viros_probe_complete, .-viros_probe_complete\n"
+    ".popsection\n");
+#elif defined(CONFIG_ARM)
+/*
+ * The published ARM kernel is built in the four-byte ARM instruction set.
+ * The call gate installs a hardware breakpoint on this symbol, so UDF is a
+ * deterministic fallback rather than the normal completion mechanism.
+ */
+asm(".pushsection .text.viros_probe_complete,\"ax\"\n"
+    ".arm\n"
+    ".balign 4\n"
+    ".global viros_probe_complete\n"
+    ".type viros_probe_complete, %function\n"
+    "viros_probe_complete:\n"
+    ".word 0xe7f565f0\n" /* ARM UDF #0x5650 */
     ".size viros_probe_complete, .-viros_probe_complete\n"
     ".popsection\n");
 #elif defined(CONFIG_MIPS)
@@ -66,6 +100,9 @@ static __always_inline vp_u16 viros_task_abi_bits(struct task_struct *task)
 {
 #if defined(CONFIG_ARM64) && defined(CONFIG_COMPAT) && defined(TIF_32BIT)
 	if (test_tsk_thread_flag(task, TIF_32BIT))
+		return 32;
+#elif defined(CONFIG_X86_64) && defined(TIF_ADDR32)
+	if (test_tsk_thread_flag(task, TIF_ADDR32))
 		return 32;
 #endif
 	return sizeof(void *) * 8;
@@ -192,6 +229,8 @@ static __always_inline void viros_init_response(
 	response->arch = VIROS_PROBE_ARCH_ARM;
 #elif defined(CONFIG_MIPS)
 	response->arch = VIROS_PROBE_ARCH_MIPS;
+#elif defined(CONFIG_X86_64)
+	response->arch = VIROS_PROBE_ARCH_X86;
 #else
 	response->arch = VIROS_PROBE_ARCH_UNKNOWN;
 #endif
@@ -459,12 +498,19 @@ static __always_inline long viros_saved_regs(
 #endif
 
 /*
- * The launcher supplies a dedicated stack and sets its return register to an
- * injected architecture trap.  The volatile output prevents the compiler
- * from replacing record stores with out-of-object memcpy/memset calls.
+ * The launcher supplies a dedicated stack and an architecture-specific return
+ * path to the retained completion boundary.  The volatile output prevents the
+ * compiler from replacing record stores with out-of-object memcpy/memset
+ * calls.
  */
+#if defined(CONFIG_X86_64)
+#define VIROS_PROBE_C_ENTRY viros_probe_main
+#else
+#define VIROS_PROBE_C_ENTRY viros_probe_entry
+#endif
+
 noinline __used notrace __no_sanitize_address
-long viros_probe_entry(const struct viros_probe_request_v1 *request,
+long VIROS_PROBE_C_ENTRY(const struct viros_probe_request_v1 *request,
 		       void *output, vp_u32 output_bytes)
 {
 	volatile struct viros_probe_response_v1 *response = output;

@@ -25,8 +25,9 @@ use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::socket::{tcp, udp};
 use smoltcp::time::Instant as SmolInstant;
-use smoltcp::wire::{EthernetAddress, IpAddress, IpCidr, IpEndpoint, IpListenEndpoint,
-                    Ipv4Address};
+use smoltcp::wire::{
+    EthernetAddress, IpAddress, IpCidr, IpEndpoint, IpListenEndpoint, Ipv4Address,
+};
 
 use super::dhcp::DhcpServer;
 use super::dns::DnsServer;
@@ -46,14 +47,11 @@ const UDP_BUF: usize = 32 * 1024;
 /// through smoltcp with no listener → RST to the box (which is a fine signal
 /// that the destination port isn't reachable through the proxy).
 const LISTEN_PORTS: &[u16] = &[
-    22, 25, 53, 80, 110, 143, 443, 465, 587, 993, 995,
-    1025, 1080, 1433, 1521, 1883, 2049, 2375, 2376, 3000, 3128,
-    3306, 4000, 4040, 4321, 5000, 5044, 5060, 5061, 5222, 5432,
-    5601, 5672, 5900, 5984, 6000, 6379, 6443, 7000, 7474,
-    7687, 8000, 8001, 8008, 8080, 8081, 8082, 8086, 8088,
-    8443, 8500, 8888, 9000, 9001, 9042, 9090, 9091, 9092,
-    9200, 9300, 9418, 10000, 10250, 11211, 15672, 25565, 27017,
-    50051, 50052,
+    22, 25, 53, 80, 110, 143, 443, 465, 587, 993, 995, 1025, 1080, 1433, 1521, 1883, 2049, 2375,
+    2376, 3000, 3128, 3306, 4000, 4040, 4321, 5000, 5044, 5060, 5061, 5222, 5432, 5601, 5672, 5900,
+    5984, 6000, 6379, 6443, 7000, 7474, 7687, 8000, 8001, 8008, 8080, 8081, 8082, 8086, 8088, 8443,
+    8500, 8888, 9000, 9001, 9042, 9090, 9091, 9092, 9200, 9300, 9418, 10000, 10250, 11211, 15672,
+    25565, 27017, 50051, 50052,
 ];
 
 /// A handle on an established TCP connection inside the stack, plus the
@@ -74,16 +72,29 @@ pub struct StackRuntime {
 }
 
 enum Cmd {
-    Write { handle: SocketHandle, data: Vec<u8> },
-    Close { handle: SocketHandle },
-    RegisterRx { handle: SocketHandle, tx: std::sync::mpsc::Sender<Vec<u8>> },
+    Write {
+        handle: SocketHandle,
+        data: Vec<u8>,
+    },
+    Close {
+        handle: SocketHandle,
+    },
+    RegisterRx {
+        handle: SocketHandle,
+        tx: std::sync::mpsc::Sender<Vec<u8>>,
+    },
     Stop,
 }
 
 impl StackRuntime {
-    pub fn start(box_id: u16, subnet: BoxSubnet, gateway_mac: [u8; 6],
-                 box_mac: [u8; 6], tap_fd: OwnedFd,
-                 flows: Arc<FlowsLog>) -> Arc<Self> {
+    pub fn start(
+        box_id: u16,
+        subnet: BoxSubnet,
+        gateway_mac: [u8; 6],
+        box_mac: [u8; 6],
+        tap_fd: OwnedFd,
+        flows: Arc<FlowsLog>,
+    ) -> Arc<Self> {
         let dns = Arc::new(DnsServer::new(subnet));
         let dhcp = DhcpServer { subnet };
         let (accept_tx, accept_rx) = std::sync::mpsc::channel();
@@ -98,20 +109,27 @@ impl StackRuntime {
         std::thread::Builder::new()
             .name(format!("sarun-net-box{box_id}"))
             .spawn(move || {
-                run_poll_loop(me2, tap_fd, gateway_mac, box_mac,
-                              dhcp, dns, flows, accept_tx, cmd_rx);
-            }).expect("spawn poll thread");
+                run_poll_loop(
+                    me2,
+                    tap_fd,
+                    gateway_mac,
+                    box_mac,
+                    dhcp,
+                    dns,
+                    flows,
+                    accept_tx,
+                    cmd_rx,
+                );
+            })
+            .expect("spawn poll thread");
         me
     }
 
-    pub fn take_accept_rx(&self)
-        -> Option<std::sync::mpsc::Receiver<AcceptedConn>>
-    {
+    pub fn take_accept_rx(&self) -> Option<std::sync::mpsc::Receiver<AcceptedConn>> {
         self.accept_rx.lock().take()
     }
 
-    pub fn register_rx(&self, handle: SocketHandle,
-                       tx: std::sync::mpsc::Sender<Vec<u8>>) {
+    pub fn register_rx(&self, handle: SocketHandle, tx: std::sync::mpsc::Sender<Vec<u8>>) {
         // A send failure means the poll thread is gone (box stack torn down);
         // surface it — silently dropping leaves a connection that never
         // receives bytes and mysteriously stalls.
@@ -159,33 +177,50 @@ impl Device for TapPhy {
         caps
     }
 
-    fn receive(&mut self, _ts: SmolInstant)
-               -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+    fn receive(&mut self, _ts: SmolInstant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         let mut buf = vec![0u8; self.mtu + 14];
-        let n = unsafe {
-            libc::read(self.fd, buf.as_mut_ptr().cast(), buf.len())
-        };
-        if n <= 0 { return None; }
+        let n = unsafe { libc::read(self.fd, buf.as_mut_ptr().cast(), buf.len()) };
+        if n <= 0 {
+            return None;
+        }
         buf.truncate(n as usize);
         // pcap capture is observability-only and must never break the
         // datapath; this is also the per-frame hot path, so logging here
         // would flood. A record error is intentionally dropped.
         let _ = self.flows.record(&buf);
-        Some((TapRx { buf },
-              TapTx { fd: self.fd, flows: &self.flows, mtu: self.mtu }))
+        Some((
+            TapRx { buf },
+            TapTx {
+                fd: self.fd,
+                flows: &self.flows,
+                mtu: self.mtu,
+            },
+        ))
     }
 
     fn transmit(&mut self, _ts: SmolInstant) -> Option<Self::TxToken<'_>> {
-        Some(TapTx { fd: self.fd, flows: &self.flows, mtu: self.mtu })
+        Some(TapTx {
+            fd: self.fd,
+            flows: &self.flows,
+            mtu: self.mtu,
+        })
     }
 }
 
-struct TapRx { buf: Vec<u8> }
+struct TapRx {
+    buf: Vec<u8>,
+}
 impl RxToken for TapRx {
-    fn consume<R, F: FnOnce(&[u8]) -> R>(self, f: F) -> R { f(&self.buf) }
+    fn consume<R, F: FnOnce(&[u8]) -> R>(self, f: F) -> R {
+        f(&self.buf)
+    }
 }
 
-struct TapTx<'a> { fd: RawFd, flows: &'a FlowsLog, mtu: usize }
+struct TapTx<'a> {
+    fd: RawFd,
+    flows: &'a FlowsLog,
+    mtu: usize,
+}
 impl<'a> TxToken for TapTx<'a> {
     fn consume<R, F: FnOnce(&mut [u8]) -> R>(self, len: usize, f: F) -> R {
         let len = len.min(self.mtu + 14);
@@ -198,23 +233,34 @@ impl<'a> TxToken for TapTx<'a> {
         // recover here (smoltcp owns retransmit), but it must not be invisible.
         let n = unsafe { libc::write(self.fd, buf.as_ptr().cast(), buf.len()) };
         if n < 0 {
-            eprintln!("sarun-engine: net: TAP write failed: {}",
-                      std::io::Error::last_os_error());
+            eprintln!(
+                "sarun-engine: net: TAP write failed: {}",
+                std::io::Error::last_os_error()
+            );
         } else if (n as usize) < buf.len() {
-            eprintln!("sarun-engine: net: short TAP write {}/{}",
-                      n, buf.len());
+            eprintln!("sarun-engine: net: short TAP write {}/{}", n, buf.len());
         }
         r
     }
 }
 
-fn run_poll_loop(rt: Arc<StackRuntime>, tap_fd: OwnedFd,
-                 gw_mac: [u8; 6], _box_mac: [u8; 6],
-                 dhcp: DhcpServer, dns: Arc<DnsServer>, flows: Arc<FlowsLog>,
-                 accept_tx: std::sync::mpsc::Sender<AcceptedConn>,
-                 cmd_rx: std::sync::mpsc::Receiver<Cmd>) {
+fn run_poll_loop(
+    rt: Arc<StackRuntime>,
+    tap_fd: OwnedFd,
+    gw_mac: [u8; 6],
+    _box_mac: [u8; 6],
+    dhcp: DhcpServer,
+    dns: Arc<DnsServer>,
+    flows: Arc<FlowsLog>,
+    accept_tx: std::sync::mpsc::Sender<AcceptedConn>,
+    cmd_rx: std::sync::mpsc::Receiver<Cmd>,
+) {
     let fd = tap_fd.as_raw_fd();
-    let mut phy = TapPhy { fd, flows, mtu: 1500 };
+    let mut phy = TapPhy {
+        fd,
+        flows,
+        mtu: 1500,
+    };
 
     let mut cfg = Config::new(EthernetAddress(gw_mac).into());
     cfg.random_seed = rand::random();
@@ -225,8 +271,13 @@ fn run_poll_loop(rt: Arc<StackRuntime>, tap_fd: OwnedFd,
         // One-time stack setup: if the gateway address won't bind, the whole
         // box network is dead — surface it instead of starting a silent
         // black-hole stack. (push fails only on a full fixed-capacity store.)
-        if addrs.push(IpCidr::new(
-            IpAddress::Ipv4(Ipv4Address::from(rt.gateway_ip)), 16)).is_err() {
+        if addrs
+            .push(IpCidr::new(
+                IpAddress::Ipv4(Ipv4Address::from(rt.gateway_ip)),
+                16,
+            ))
+            .is_err()
+        {
             eprintln!("sarun-engine: net: failed to assign gateway IP to iface");
         }
     });
@@ -239,8 +290,10 @@ fn run_poll_loop(rt: Arc<StackRuntime>, tap_fd: OwnedFd,
     iface.set_any_ip(true);
     // The default route is what makes the any_ip catch-all terminate locally;
     // without it every box SYN to a synth IP is dropped. Surface a failure.
-    if let Err(e) = iface.routes_mut().add_default_ipv4_route(
-        Ipv4Address::from(rt.gateway_ip)) {
+    if let Err(e) = iface
+        .routes_mut()
+        .add_default_ipv4_route(Ipv4Address::from(rt.gateway_ip))
+    {
         eprintln!("sarun-engine: net: add default route failed: {e}");
     }
 
@@ -250,14 +303,15 @@ fn run_poll_loop(rt: Arc<StackRuntime>, tap_fd: OwnedFd,
     // so the dst address is 255.255.255.255 — smoltcp accepts when the
     // bind is to an unspecified address.
     let dhcp_h = {
-        let rx = udp::PacketBuffer::new(
-            vec![udp::PacketMetadata::EMPTY; 8], vec![0u8; UDP_BUF]);
-        let tx = udp::PacketBuffer::new(
-            vec![udp::PacketMetadata::EMPTY; 8], vec![0u8; UDP_BUF]);
+        let rx = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 8], vec![0u8; UDP_BUF]);
+        let tx = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 8], vec![0u8; UDP_BUF]);
         let mut s = udp::Socket::new(rx, tx);
         // If the DHCP server can't bind :67 the box never gets a lease — fail
         // loudly rather than start a stack that silently can't hand out IPs.
-        if let Err(e) = s.bind(IpListenEndpoint { addr: None, port: 67 }) {
+        if let Err(e) = s.bind(IpListenEndpoint {
+            addr: None,
+            port: 67,
+        }) {
             eprintln!("sarun-engine: net: DHCP bind :67 failed: {e}");
         }
         sockets.add(s)
@@ -266,10 +320,8 @@ fn run_poll_loop(rt: Arc<StackRuntime>, tap_fd: OwnedFd,
     // DNS server: bound on the gateway IP. The box will dial it as its
     // only nameserver (via the resolv.conf the runner planted).
     let dns_h = {
-        let rx = udp::PacketBuffer::new(
-            vec![udp::PacketMetadata::EMPTY; 16], vec![0u8; UDP_BUF]);
-        let tx = udp::PacketBuffer::new(
-            vec![udp::PacketMetadata::EMPTY; 16], vec![0u8; UDP_BUF]);
+        let rx = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 16], vec![0u8; UDP_BUF]);
+        let tx = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 16], vec![0u8; UDP_BUF]);
         let mut s = udp::Socket::new(rx, tx);
         // If the synthetic DNS can't bind :53 the box can't resolve anything —
         // surface it rather than black-hole every lookup.
@@ -290,16 +342,15 @@ fn run_poll_loop(rt: Arc<StackRuntime>, tap_fd: OwnedFd,
         }
     }
     let mut claimed: HashSet<SocketHandle> = HashSet::new();
-    let mut rx_map: std::collections::HashMap<SocketHandle, std::sync::mpsc::Sender<Vec<u8>>>
-        = Default::default();
+    let mut rx_map: std::collections::HashMap<SocketHandle, std::sync::mpsc::Sender<Vec<u8>>> =
+        Default::default();
     // Box-bound bytes waiting for send-buffer room, per socket. smoltcp's
     // send_slice is a PARTIAL write (returns bytes enqueued) and can_send
     // goes false whenever the window/buffer is full — a large response
     // (model download, big file) WILL back up here. Anything not queued is
     // held and re-tried each tick; dropping it instead corrupts the stream
     // mid-flight (a TLS box sees "bad record mac" ~48 KiB in).
-    let mut tx_pending: std::collections::HashMap<SocketHandle, VecDeque<u8>>
-        = Default::default();
+    let mut tx_pending: std::collections::HashMap<SocketHandle, VecDeque<u8>> = Default::default();
     // Sockets whose writer closed while bytes were still pending: the FIN
     // must go out AFTER the tail bytes, so the close is deferred until the
     // pending buffer drains.
@@ -320,7 +371,9 @@ fn run_poll_loop(rt: Arc<StackRuntime>, tap_fd: OwnedFd,
                         s.close();
                     }
                 }
-                Cmd::RegisterRx { handle, tx } => { rx_map.insert(handle, tx); }
+                Cmd::RegisterRx { handle, tx } => {
+                    rx_map.insert(handle, tx);
+                }
                 Cmd::Stop => break 'poll,
             }
         }
@@ -338,10 +391,15 @@ fn run_poll_loop(rt: Arc<StackRuntime>, tap_fd: OwnedFd,
                 let chunk: &[u8] = if a.is_empty() { b } else { a };
                 match s.send_slice(chunk) {
                     Ok(0) => break,
-                    Ok(n) => { buf.drain(..n); }
+                    Ok(n) => {
+                        buf.drain(..n);
+                    }
                     Err(e) => {
-                        eprintln!("sarun-engine: net: tcp send_slice: {e} \
-                                   ({} box-bound bytes dropped)", buf.len());
+                        eprintln!(
+                            "sarun-engine: net: tcp send_slice: {e} \
+                                   ({} box-bound bytes dropped)",
+                            buf.len()
+                        );
                         buf.clear();
                         break;
                     }
@@ -376,8 +434,7 @@ fn run_poll_loop(rt: Arc<StackRuntime>, tap_fd: OwnedFd,
                         port: 68,
                     };
                     let mut out = udp::UdpMetadata::from(dst);
-                    out.local_address = Some(IpAddress::Ipv4(
-                        Ipv4Address::from(rt.gateway_ip)));
+                    out.local_address = Some(IpAddress::Ipv4(Ipv4Address::from(rt.gateway_ip)));
                     // A dropped DHCP reply leaves the box without a lease;
                     // surface it.
                     if let Err(e) = s.send_slice(&reply, out) {
@@ -413,14 +470,22 @@ fn run_poll_loop(rt: Arc<StackRuntime>, tap_fd: OwnedFd,
         // 5. Promote freshly-established TCP sockets to AcceptedConn.
         let mut to_claim: Vec<(SocketHandle, u16, AcceptedConn)> = vec![];
         for &(handle, port) in listen_pool.iter() {
-            if claimed.contains(&handle) { continue; }
+            if claimed.contains(&handle) {
+                continue;
+            }
             let s = sockets.get_mut::<tcp::Socket>(handle);
             if s.is_active() && s.state() == tcp::State::Established {
                 if let Some(l) = s.local_endpoint() {
                     let dst_ip = ip_octets(l.addr);
-                    to_claim.push((handle, port, AcceptedConn {
-                        handle, dst_ip, dst_port: l.port,
-                    }));
+                    to_claim.push((
+                        handle,
+                        port,
+                        AcceptedConn {
+                            handle,
+                            dst_ip,
+                            dst_port: l.port,
+                        },
+                    ));
                 }
             }
         }
@@ -429,8 +494,10 @@ fn run_poll_loop(rt: Arc<StackRuntime>, tap_fd: OwnedFd,
             // A send failure means the dispatcher receiver is gone, so this
             // accepted connection will never be serviced — surface it.
             if let Err(e) = accept_tx.send(acc) {
-                eprintln!("sarun-engine: net: accept handoff dropped \
-                           (dispatcher gone): {e}");
+                eprintln!(
+                    "sarun-engine: net: accept handoff dropped \
+                           (dispatcher gone): {e}"
+                );
             }
             listen_pool.push_back((add_listener(&mut sockets, port), port));
         }
@@ -438,7 +505,9 @@ fn run_poll_loop(rt: Arc<StackRuntime>, tap_fd: OwnedFd,
         let cap = LISTEN_PORTS.len() * LISTENERS_PER_PORT * 4;
         while listen_pool.len() > cap {
             if let Some((h, _)) = listen_pool.pop_front() {
-                if !claimed.contains(&h) { sockets.remove(h); }
+                if !claimed.contains(&h) {
+                    sockets.remove(h);
+                }
             }
         }
 
@@ -463,7 +532,9 @@ fn run_poll_loop(rt: Arc<StackRuntime>, tap_fd: OwnedFd,
                         break;
                     }
                 };
-                if chunk.is_empty() { break; }
+                if chunk.is_empty() {
+                    break;
+                }
                 // A send failure means the per-conn consumer (SmoltcpStream
                 // relay) is gone; drop the route so we stop trying.
                 if tx.send(chunk).is_err() {

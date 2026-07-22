@@ -13,8 +13,8 @@ pub(crate) mod synthetic;
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 

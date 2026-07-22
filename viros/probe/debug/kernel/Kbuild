@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: GPL-2.0
+# Built-in debugger support selected only by viros' exact debug-kernel build.
+ifeq ($(VIROS_SCRATCH),1)
+obj-y += viros_scratch.o
+endif
+
+ifeq ($(VIROS_EVENTS),1)
+obj-y += viros_event.o
+CFLAGS_viros_event.o += -fno-stack-protector -fno-pic -fno-pie
+KASAN_SANITIZE_viros_event.o := n
+KCSAN_SANITIZE_viros_event.o := n
+KCOV_INSTRUMENT_viros_event.o := n
+GCOV_PROFILE_viros_event.o := n
+UBSAN_SANITIZE_viros_event.o := n
+endif

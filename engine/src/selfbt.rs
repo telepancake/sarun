@@ -44,8 +44,13 @@ pub fn runner_setup(cmd: &mut std::process::Command, key: i32) {
     use std::os::unix::io::IntoRawFd;
     let path = sink_path(key);
     let f = match std::fs::OpenOptions::new()
-        .read(true).write(true).create(true).truncate(true)
-        .mode(0o600).open(&path) {
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&path)
+    {
         Ok(f) => f,
         Err(_) => return,
     };
@@ -69,7 +74,9 @@ use std::os::unix::fs::OpenOptionsExt;
 /// handler on `dump_signal()`. Idempotent-ish; call once at box startup.
 pub fn install() {
     let fd: i32 = match std::env::var("SARUN_STUCK_FD")
-        .ok().and_then(|s| s.parse().ok()) {
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
         Some(fd) => fd,
         None => return,
     };
@@ -104,14 +111,14 @@ const OFF_GREGS: usize = 40;
 /// memory reads + one write(2), NO other syscalls. Under sud any path-based
 /// syscall (e.g. reading /proc/self/maps) would re-enter the SIGSYS dispatcher
 /// from inside this handler and can wedge the thread — so we do none.
-extern "C" fn handler(_sig: i32, _info: *mut libc::siginfo_t,
-                      ctx: *mut libc::c_void) {
+extern "C" fn handler(_sig: i32, _info: *mut libc::siginfo_t, ctx: *mut libc::c_void) {
     let fd = DUMP_FD.load(Ordering::SeqCst);
-    if fd < 0 || ctx.is_null() { return; }
+    if fd < 0 || ctx.is_null() {
+        return;
+    }
     let tid = unsafe { libc::syscall(libc::SYS_gettid) } as i32;
-    let greg = |i: usize| -> u64 {
-        unsafe { *((ctx as *const u8).add(OFF_GREGS + i * 8) as *const u64) }
-    };
+    let greg =
+        |i: usize| -> u64 { unsafe { *((ctx as *const u8).add(OFF_GREGS + i * 8) as *const u64) } };
     let pc = greg(REG_RIP);
     let mut fp = greg(REG_RBP);
 
@@ -120,15 +127,23 @@ extern "C" fn handler(_sig: i32, _info: *mut libc::siginfo_t,
     // address. Forced frame pointers (see .cargo/config.toml) make this valid.
     let mut prev = fp;
     for _ in 0..64 {
-        if fp == 0 || (fp & 7) != 0 { break; }
+        if fp == 0 || (fp & 7) != 0 {
+            break;
+        }
         // Guard: don't dereference a frame pointer that isn't strictly above
         // the previous one (stack grows down; a good chain is monotonic).
-        if fp < prev { break; }
+        if fp < prev {
+            break;
+        }
         let saved = unsafe { *(fp as *const u64) };
         let ret = unsafe { *((fp + 8) as *const u64) };
-        if ret == 0 { break; }
+        if ret == 0 {
+            break;
+        }
         out.push_str(&format!("0x{ret:x}\n"));
-        if saved <= fp { break; }
+        if saved <= fp {
+            break;
+        }
         prev = fp;
         fp = saved;
     }
@@ -136,10 +151,10 @@ extern "C" fn handler(_sig: i32, _info: *mut libc::siginfo_t,
     let bytes = out.as_bytes();
     let mut off = 0usize;
     while off < bytes.len() {
-        let n = unsafe {
-            libc::write(fd, bytes[off..].as_ptr().cast(), bytes.len() - off)
-        };
-        if n <= 0 { break; }
+        let n = unsafe { libc::write(fd, bytes[off..].as_ptr().cast(), bytes.len() - off) };
+        if n <= 0 {
+            break;
+        }
         off += n as usize;
     }
 }

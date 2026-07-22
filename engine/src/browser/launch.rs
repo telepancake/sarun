@@ -15,9 +15,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 
-use super::cdp::{pipe_transport, Cdp};
+use super::cdp::{Cdp, pipe_transport};
 use super::render::{Grid, Rgb};
-use super::session::{grid_to_text, BrowserSession};
+use super::session::{BrowserSession, grid_to_text};
 
 /// Candidate Chromium binaries, in order. `$CELLULOSE_BROWSER` wins.
 fn find_browser() -> Result<String> {
@@ -134,7 +134,10 @@ pub fn spawn_host_chromium(spki: Option<&str>) -> Result<HostBrowser> {
         libc::close(child_w);
     }
     let (r, w) = pipe_transport(engine_read, engine_write);
-    Ok(HostBrowser { child, cdp: Cdp::new(r, w) })
+    Ok(HostBrowser {
+        child,
+        cdp: Cdp::new(r, w),
+    })
 }
 
 /// A raw pipe pair `(read_fd, write_fd)`.
@@ -159,11 +162,17 @@ pub fn grid_to_ansi(grid: &Grid) -> String {
                 continue; // wide continuation
             }
             if Some(cell.fg) != last_fg {
-                out.push_str(&format!("\x1b[38;2;{};{};{}m", cell.fg.0, cell.fg.1, cell.fg.2));
+                out.push_str(&format!(
+                    "\x1b[38;2;{};{};{}m",
+                    cell.fg.0, cell.fg.1, cell.fg.2
+                ));
                 last_fg = Some(cell.fg);
             }
             if Some(cell.bg) != last_bg {
-                out.push_str(&format!("\x1b[48;2;{};{};{}m", cell.bg.0, cell.bg.1, cell.bg.2));
+                out.push_str(&format!(
+                    "\x1b[48;2;{};{};{}m",
+                    cell.bg.0, cell.bg.1, cell.bg.2
+                ));
                 last_bg = Some(cell.bg);
             }
             out.push_str(&cell.ch);
@@ -182,11 +191,17 @@ fn row_to_ansi(row: &[crate::browser::render::Cell]) -> String {
             continue;
         }
         if Some(cell.fg) != lf {
-            out.push_str(&format!("\x1b[38;2;{};{};{}m", cell.fg.0, cell.fg.1, cell.fg.2));
+            out.push_str(&format!(
+                "\x1b[38;2;{};{};{}m",
+                cell.fg.0, cell.fg.1, cell.fg.2
+            ));
             lf = Some(cell.fg);
         }
         if Some(cell.bg) != lb {
-            out.push_str(&format!("\x1b[48;2;{};{};{}m", cell.bg.0, cell.bg.1, cell.bg.2));
+            out.push_str(&format!(
+                "\x1b[48;2;{};{};{}m",
+                cell.bg.0, cell.bg.1, cell.bg.2
+            ));
             lb = Some(cell.bg);
         }
         out.push_str(&cell.ch);
@@ -287,11 +302,19 @@ fn status_line(sess: &BrowserSession, url_edit: Option<&str>, mouse_grab: bool) 
             } else {
                 String::new()
             };
-            let page = if title.is_empty() { url } else { format!("{title} — {url}") };
+            let page = if title.is_empty() {
+                url
+            } else {
+                format!("{title} — {url}")
+            };
             format!(" {tabs}^L ^R ^T+ ^W- ^N▸ {sel} ^Q  │  {page}")
         }
     };
-    let s: String = s.chars().map(|c| if c < ' ' { ' ' } else { c }).take(sess.cols).collect();
+    let s: String = s
+        .chars()
+        .map(|c| if c < ' ' { ' ' } else { c })
+        .take(sess.cols)
+        .collect();
     format!("{s:<width$}", width = sess.cols)
 }
 
@@ -310,7 +333,10 @@ fn draw_page(
         None => sess.frame()?,
     };
     let mut lines: Vec<String> = grid.iter().map(|r| row_to_ansi(r)).collect();
-    lines.push(format!("\x1b[7m{}\x1b[0m", status_line(sess, url_edit, mouse_grab)));
+    lines.push(format!(
+        "\x1b[7m{}\x1b[0m",
+        status_line(sess, url_edit, mouse_grab)
+    ));
     for (i, line) in lines.iter().enumerate() {
         if prev.and_then(|p| p.get(i)) == Some(line) {
             continue;
@@ -392,8 +418,14 @@ pub fn interactive(sess: &mut BrowserSession) -> Result<()> {
             // Page render (text+pixels together) only when the page changed;
             // otherwise a cheap status-row rewrite. Never snapshot per keypress.
             if page_dirty {
-                prev = Some(draw_page(sess, &mut out, url_edit.as_deref(),
-                                      mouse_grab, frame_png.as_deref(), prev.as_ref())?);
+                prev = Some(draw_page(
+                    sess,
+                    &mut out,
+                    url_edit.as_deref(),
+                    mouse_grab,
+                    frame_png.as_deref(),
+                    prev.as_ref(),
+                )?);
                 page_dirty = false;
                 chrome_dirty = false;
             } else if chrome_dirty {
@@ -421,8 +453,7 @@ pub fn interactive(sess: &mut BrowserSession) -> Result<()> {
                             let sid = ev["params"]["sessionId"].as_i64().unwrap_or(0);
                             sess.ack_frame(sid);
                             if let Some(d) = ev["params"]["data"].as_str() {
-                                if let Ok(png) =
-                                    base64::engine::general_purpose::STANDARD.decode(d)
+                                if let Ok(png) = base64::engine::general_purpose::STANDARD.decode(d)
                                 {
                                     frame_png = Some(png);
                                     page_dirty = true;
@@ -463,8 +494,14 @@ pub fn interactive(sess: &mut BrowserSession) -> Result<()> {
                             url_edit = None;
                             chrome_dirty = true;
                         }
-                        b"\x1b" | b"\x11" => { url_edit = None; chrome_dirty = true; }
-                        b"\x7f" => { edit.pop(); chrome_dirty = true; }
+                        b"\x1b" | b"\x11" => {
+                            url_edit = None;
+                            chrome_dirty = true;
+                        }
+                        b"\x7f" => {
+                            edit.pop();
+                            chrome_dirty = true;
+                        }
                         t if t[0] >= 0x20 => {
                             edit.push_str(&String::from_utf8_lossy(t));
                             chrome_dirty = true;
@@ -474,8 +511,9 @@ pub fn interactive(sess: &mut BrowserSession) -> Result<()> {
                     continue;
                 }
                 match tok.as_slice() {
-                    b"\x11" => return Ok(()),                  // Ctrl-Q
-                    b"\x14" => {                                // Ctrl-T: new tab
+                    b"\x11" => return Ok(()), // Ctrl-Q
+                    b"\x14" => {
+                        // Ctrl-T: new tab
                         sess.stop_screencast();
                         if sess.new_tab("about:blank").is_ok() {
                             let _ = sess.start_screencast();
@@ -485,7 +523,8 @@ pub fn interactive(sess: &mut BrowserSession) -> Result<()> {
                         page_dirty = true;
                         chrome_dirty = true;
                     }
-                    b"\x17" => {                                // Ctrl-W: close tab
+                    b"\x17" => {
+                        // Ctrl-W: close tab
                         if !sess.close_tab() {
                             return Ok(()); // last tab → quit
                         }
@@ -493,36 +532,62 @@ pub fn interactive(sess: &mut BrowserSession) -> Result<()> {
                         frame_png = None;
                         page_dirty = true;
                     }
-                    b"\x0e" => {                                // Ctrl-N: next tab
+                    b"\x0e" => {
+                        // Ctrl-N: next tab
                         sess.stop_screencast();
                         sess.cycle_tab(1);
                         let _ = sess.start_screencast();
                         frame_png = None;
                         page_dirty = true;
                     }
-                    b"\x10" => {                                // Ctrl-P: prev tab
+                    b"\x10" => {
+                        // Ctrl-P: prev tab
                         sess.stop_screencast();
                         sess.cycle_tab(-1);
                         let _ = sess.start_screencast();
                         frame_png = None;
                         page_dirty = true;
                     }
-                    b"\x0c" => { url_edit = Some(String::new()); chrome_dirty = true; } // ^L
-                    b"\x18" => {                                // Ctrl-X: mouse mode
+                    b"\x0c" => {
+                        url_edit = Some(String::new());
+                        chrome_dirty = true;
+                    } // ^L
+                    b"\x18" => {
+                        // Ctrl-X: mouse mode
                         mouse_grab = !mouse_grab;
                         set_mouse_tracking(&mut out, mouse_grab);
                         chrome_dirty = true;
                     }
-                    b"\x12" => { let _ = sess.reload(); }       // Ctrl-R
-                    b"\x02" | b"\x1b[1;3D" | b"\x1b\x1b[D" => { let _ = sess.history_go(-1); }
-                    b"\x06" | b"\x1b[1;3C" | b"\x1b\x1b[C" => { let _ = sess.history_go(1); }
-                    b"\x1b[A" => { let _ = sess.scroll(-3); }
-                    b"\x1b[B" => { let _ = sess.scroll(3); }
-                    b"\x1b[5~" => { let _ = sess.scroll(-(sess.rows as i64 - 2)); }
-                    b"\x1b[6~" => { let _ = sess.scroll(sess.rows as i64 - 2); }
-                    b"\r" => { let _ = sess.key("Enter", "Enter", 13, "\r"); }
-                    b"\t" => { let _ = sess.key("Tab", "Tab", 9, ""); }
-                    b"\x7f" => { let _ = sess.key("Backspace", "Backspace", 8, ""); }
+                    b"\x12" => {
+                        let _ = sess.reload();
+                    } // Ctrl-R
+                    b"\x02" | b"\x1b[1;3D" | b"\x1b\x1b[D" => {
+                        let _ = sess.history_go(-1);
+                    }
+                    b"\x06" | b"\x1b[1;3C" | b"\x1b\x1b[C" => {
+                        let _ = sess.history_go(1);
+                    }
+                    b"\x1b[A" => {
+                        let _ = sess.scroll(-3);
+                    }
+                    b"\x1b[B" => {
+                        let _ = sess.scroll(3);
+                    }
+                    b"\x1b[5~" => {
+                        let _ = sess.scroll(-(sess.rows as i64 - 2));
+                    }
+                    b"\x1b[6~" => {
+                        let _ = sess.scroll(sess.rows as i64 - 2);
+                    }
+                    b"\r" => {
+                        let _ = sess.key("Enter", "Enter", 13, "\r");
+                    }
+                    b"\t" => {
+                        let _ = sess.key("Tab", "Tab", 9, "");
+                    }
+                    b"\x7f" => {
+                        let _ = sess.key("Backspace", "Backspace", 8, "");
+                    }
                     t if t.starts_with(b"\x1b[<") => {
                         // Only when we hold the mouse (in SELECT mode the
                         // terminal owns it and sends us nothing anyway).
@@ -544,7 +609,12 @@ pub fn interactive(sess: &mut BrowserSession) -> Result<()> {
     })();
 
     sess.cdp().set_wake_fd(-1);
-    if wake_r >= 0 { unsafe { libc::close(wake_r); libc::close(wake_w); } }
+    if wake_r >= 0 {
+        unsafe {
+            libc::close(wake_r);
+            libc::close(wake_w);
+        }
+    }
     set_mouse_tracking(&mut out, false);
     write!(out, "\x1b[?25h\x1b[?1049l")?;
     out.flush()?;
@@ -558,8 +628,16 @@ pub fn interactive(sess: &mut BrowserSession) -> Result<()> {
 /// Returns (stdin_readable, waker_readable).
 fn poll2(fd0: i32, wake: i32, ms: i32) -> (bool, bool) {
     let mut pfds = [
-        libc::pollfd { fd: fd0, events: libc::POLLIN, revents: 0 },
-        libc::pollfd { fd: wake, events: libc::POLLIN, revents: 0 },
+        libc::pollfd {
+            fd: fd0,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: wake,
+            events: libc::POLLIN,
+            revents: 0,
+        },
     ];
     let n = if wake >= 0 { 2 } else { 1 };
     let rc = unsafe { libc::poll(pfds.as_mut_ptr(), n as libc::nfds_t, ms) };
@@ -594,7 +672,11 @@ fn parse_sgr_mouse(t: &[u8]) -> Option<(usize, usize, bool)> {
     let b: i64 = it.next()?.parse().ok()?;
     let col: usize = it.next()?.parse().ok()?;
     let row: usize = it.next()?.parse().ok()?;
-    Some((col.saturating_sub(1), row.saturating_sub(1), press && b == 0))
+    Some((
+        col.saturating_sub(1),
+        row.saturating_sub(1),
+        press && b == 0,
+    ))
 }
 
 fn normalize_url(u: &str) -> String {
@@ -749,5 +831,4 @@ mod tests {
         assert_eq!(parse_size("100x36"), Some((100, 36)));
         assert_eq!(parse_size("bad"), None);
     }
-
 }

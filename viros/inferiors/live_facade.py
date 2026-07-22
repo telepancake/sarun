@@ -17,12 +17,15 @@ import argparse
 from dataclasses import dataclass
 import json
 from pathlib import Path
+import socket
 from typing import Callable, Mapping, Protocol
 import xml.etree.ElementTree as ET
 
 from callgate.architectures import (
     AARCH64,
+    ARMV7,
     MIPS32EL_MMIPS,
+    X86_64,
     ArchitectureDescriptor,
 )
 from callgate.manifest import ValidatedManifest, load_and_validate_manifest
@@ -30,18 +33,38 @@ from callgate.rsp_target import RspQemuTarget
 from callgate.transaction import CallGateError
 from probe.abi import (
     AARCH64_SNAPSHOT_ABI,
+    ARMV7LE_SNAPSHOT_ABI,
     MIPS32EL_SNAPSHOT_ABI,
+    X86_64_SNAPSHOT_ABI,
     ProbeDecodeError,
     SnapshotAbi,
 )
 from probe.memory_reader import ProbeMemoryReader
 from probe.register_reader import ProbeRegisterReader
 from probe.snapshot_runner import ProbeSnapshotRunner
+from probe.probe_tool import AuditError, ElfObject
 
+from .arm_events import (
+    AARCH64_EVENT_REGISTERS,
+    ARMV7_EVENT_REGISTERS,
+    Armv7PartialRegisterLayout,
+    encode_aarch64_event_registers,
+    encode_armv7_event_registers,
+)
+from .event_stop import KernelEventReadError, read_kernel_event_stop
+from .gdb_signals import mips_linux_signal_to_gdb, standard_linux_signal_to_gdb
+from .internal_breakpoints import (
+    InternalBreakpoint,
+    InternalBreakpointController,
+    InternalBreakpointState,
+)
+from .kernel_events import ARCH_AARCH64, ARCH_ARM, ARCH_MIPS, ARCH_X86
 from .linux_oracle import RegisterRead, Snapshot, TaskSnapshot
+from .mips_events import MIPS_EVENT_REGISTER_COUNT, encode_mips_event_registers
 from .partial_registers import (
     Aarch64PartialRegisterLayout,
     PartialRegisterError,
+    X86KernelEventRegisterLayout,
 )
 from .probe_oracle import ProbeOracle
 from .qemu_rsp import QemuRspClient, RspRemoteError, RspRestorationError
@@ -101,7 +124,20 @@ def load_target_descriptions(client: QemuRspClient) -> dict[bytes, bytes]:
             try:
                 root = ET.fromstring(document)
             except ET.ParseError as exc:
-                raise RspRemoteError(b"malformed target description") from exc
+                # QEMU generates ``xi:include`` elements but, in releases as
+                # recent as 11, relies on gdb-target.dtd to declare the prefix.
+                # ElementTree intentionally does not process that external DTD.
+                # Normalize only this exact generated element spelling; any
+                # other malformed XML or unbound prefix remains an error.
+                if b"<xi:include" not in document or b"xmlns:xi=" in document:
+                    raise RspRemoteError(b"malformed target description") from exc
+                normalized = document.replace(b"<xi:include", b"<include")
+                try:
+                    root = ET.fromstring(normalized)
+                except ET.ParseError as normalized_exc:
+                    raise RspRemoteError(
+                        b"malformed target description"
+                    ) from normalized_exc
             for element in root.iter():
                 if element.tag.rsplit("}", 1)[-1] != "include":
                     continue
@@ -196,8 +232,12 @@ def _legacy_mmips_descriptions(
 def _snapshot_abi(architecture: ArchitectureDescriptor) -> SnapshotAbi:
     if architecture is AARCH64:
         return AARCH64_SNAPSHOT_ABI
+    if architecture is ARMV7:
+        return ARMV7LE_SNAPSHOT_ABI
     if architecture is MIPS32EL_MMIPS:
         return MIPS32EL_SNAPSHOT_ABI
+    if architecture is X86_64:
+        return X86_64_SNAPSHOT_ABI
     raise ValueError(f"unsupported snapshot architecture {architecture.name!r}")
 
 
@@ -211,12 +251,14 @@ class CurrentCpuProbeOracle:
         cpu_threads: tuple[str, ...],
         partial_registers: Aarch64PartialRegisterLayout | None = None,
         qemu_current_memory_address_bits: int | None = None,
+        kernel_memory_address_bits: int | None = None,
     ) -> None:
         self.probe = probe
         self.qemu = qemu
         self.cpu_threads = cpu_threads
         self.partial_registers = partial_registers
         self.qemu_current_memory_address_bits = qemu_current_memory_address_bits
+        self.kernel_memory_address_bits = kernel_memory_address_bits
 
     def snapshot(self) -> Snapshot:
         return self.probe.snapshot()
@@ -250,6 +292,19 @@ class CurrentCpuProbeOracle:
         raise self._unsupported("Linux-task register writes")
 
     def read_memory(self, task: TaskSnapshot, address: int, length: int) -> bytes:
+        if task.state == "kernel-die" and task.current_cpu is not None:
+            cpu = task.current_cpu
+            if not 0 <= cpu < len(self.cpu_threads):
+                raise OSError(f"event reported nonexistent QEMU CPU {cpu}")
+            try:
+                return self.qemu.read_virtual_memory(
+                    self.cpu_threads[cpu],
+                    address,
+                    length,
+                    address_bits=self.kernel_memory_address_bits or 64,
+                )
+            except Exception as exc:
+                raise OSError("cannot read stopped kernel virtual memory") from exc
         try:
             return self.probe.read_memory(task, address, length)
         except NotImplementedError as exc:
@@ -292,9 +347,40 @@ class LiveFacade:
     facade: RspFacade
     server: UnixRspServer
     descriptions: Mapping[bytes, bytes]
+    internal_breakpoints: InternalBreakpointController | None = None
 
     def close(self) -> None:
-        self.qemu.close()
+        try:
+            if (
+                self.internal_breakpoints is not None
+                and self.internal_breakpoints.state
+                in {InternalBreakpointState.READY, InternalBreakpointState.STOPPED}
+            ):
+                self.internal_breakpoints.uninstall()
+        finally:
+            self.qemu.close()
+
+
+def _defined_kernel_symbol(kernel: Path, name: str) -> int | None:
+    """Return one exact defined vmlinux symbol, or None when it is absent."""
+
+    try:
+        records = [
+            item
+            for item in ElfObject(kernel).symbol_records()
+            if item["name"] == name and item["shndx"] != 0
+        ]
+    except (AuditError, OSError):
+        # Compatibility with sealed legacy/test manifests whose kernel file
+        # predates the optional built-in event observer.  Exact live kernels
+        # have already been independently identified by RspQemuTarget.
+        return None
+    if not records:
+        return None
+    values = {int(item["value"]) for item in records}
+    if len(values) != 1:
+        raise ValueError(f"kernel has conflicting definitions of {name}")
+    return values.pop()
 
 
 def _connect_client(path: str, timeout: float) -> QemuRspClient:
@@ -323,10 +409,12 @@ def _make_register_reader(
 
 def build_live_facade(
     *,
-    qemu_socket: str,
-    gdb_socket: str,
+    qemu_socket: str | None,
+    gdb_socket: str | None,
     manifest_path: str | Path,
     timeout: float = 5.0,
+    stop_on_connect: bool = False,
+    qemu_stream: socket.socket | None = None,
     client_factory: ClientFactory = _connect_client,
     runner_factory: RunnerFactory = _make_runner,
     memory_reader_factory: MemoryReaderFactory = _make_memory_reader,
@@ -336,10 +424,18 @@ def build_live_facade(
 
     if timeout <= 0:
         raise ValueError("timeout must be positive")
+    if (qemu_socket is None) == (qemu_stream is None):
+        raise ValueError("provide exactly one QEMU socket path or inherited stream")
     # Manifest/file validation intentionally precedes opening QEMU's socket.
     manifest = load_and_validate_manifest(manifest_path)
-    qemu = client_factory(str(qemu_socket), timeout)
+    qemu = (
+        QemuRspClient(qemu_stream, timeout)
+        if qemu_stream is not None
+        else client_factory(str(qemu_socket), timeout)
+    )
     try:
+        if stop_on_connect:
+            qemu.interrupt_and_wait_for_stop()
         target = RspQemuTarget(
             qemu,
             manifest.kernel_file,
@@ -391,9 +487,14 @@ def build_live_facade(
             partial_registers,
             qemu_current_memory_address_bits=(
                 manifest.architecture.address_bits
-                if manifest.architecture is MIPS32EL_MMIPS
+                if manifest.architecture in {
+                    ARMV7,
+                    MIPS32EL_MMIPS,
+                    X86_64,
+                }
                 else None
             ),
+            kernel_memory_address_bits=manifest.architecture.address_bits,
         )
         facade = RspFacade(
             oracle,
@@ -401,14 +502,132 @@ def build_live_facade(
             descriptions[b"target.xml"],
             target_descriptions=descriptions,
         )
+        internal_breakpoints = None
+        internal_stop = None
+        event_address = _defined_kernel_symbol(
+            manifest.kernel_file, "viros_event_stop"
+        )
+        if event_address is not None:
+            event_address &= (1 << manifest.architecture.address_bits) - 1
+            if manifest.architecture is MIPS32EL_MMIPS:
+                event_arch = ARCH_MIPS
+                event_register_count = MIPS_EVENT_REGISTER_COUNT
+                event_encoder = encode_mips_event_registers
+                event_signal_mapper = mips_linux_signal_to_gdb
+            elif manifest.architecture is AARCH64:
+                if partial_registers is None:
+                    if not cpu_threads:
+                        raise RspRemoteError(b"QEMU exposed no CPU register thread")
+                    partial_registers = (
+                        Aarch64PartialRegisterLayout.from_target_descriptions(
+                            descriptions,
+                            byte_order=manifest.architecture.target_byte_order,
+                            observed_g_bytes=len(
+                                qemu.read_register_block(cpu_threads[0])
+                            ),
+                        )
+                    )
+                event_arch = ARCH_AARCH64
+                event_register_count = len(AARCH64_EVENT_REGISTERS)
+                event_encoder = lambda event: encode_aarch64_event_registers(
+                    event, partial_registers
+                )
+                event_signal_mapper = standard_linux_signal_to_gdb
+            elif manifest.architecture is ARMV7:
+                if not cpu_threads:
+                    raise RspRemoteError(b"QEMU exposed no CPU register thread")
+                arm_event_layout = (
+                    Armv7PartialRegisterLayout.from_target_descriptions(
+                        descriptions,
+                        byte_order=manifest.architecture.target_byte_order,
+                        observed_g_bytes=len(
+                            qemu.read_register_block(cpu_threads[0])
+                        ),
+                    )
+                )
+                event_arch = ARCH_ARM
+                event_register_count = len(ARMV7_EVENT_REGISTERS)
+                event_encoder = lambda event: encode_armv7_event_registers(
+                    event, arm_event_layout
+                )
+                event_signal_mapper = standard_linux_signal_to_gdb
+            elif manifest.architecture is X86_64:
+                if not cpu_threads:
+                    raise RspRemoteError(b"QEMU exposed no CPU register thread")
+                x86_event_layout = (
+                    X86KernelEventRegisterLayout.from_target_descriptions(
+                        descriptions,
+                        byte_order="little",
+                        observed_g_bytes=len(
+                            qemu.read_register_block(cpu_threads[0])
+                        ),
+                    )
+                )
+                event_arch = ARCH_X86
+                event_register_count = 21
+                event_encoder = lambda event: RegisterRead(
+                    x86_event_layout.encode_kernel_event(event)
+                )
+                event_signal_mapper = standard_linux_signal_to_gdb
+            else:
+                raise ValueError(
+                    "kernel event observer is present, but this live facade does "
+                    f"not yet present {manifest.architecture.display_name} events"
+                )
+            internal_breakpoints = InternalBreakpointController(
+                qemu,
+                (
+                    InternalBreakpoint(
+                        event_address,
+                        manifest.architecture.breakpoint_size,
+                        # x86 TCG does not consistently advertise a hardware
+                        # breakpoint facility.  The other supported system
+                        # targets keep kernel text intact by using Z1.
+                        kind=0 if manifest.architecture is X86_64 else 1,
+                    ),
+                ),
+            )
+            internal_breakpoints.install()
+
+            def internal_stop(cpu: int, pc: int):
+                assert internal_breakpoints is not None
+                if not internal_breakpoints.note_stop(cpu_threads[cpu], pc):
+                    return None
+                try:
+                    return read_kernel_event_stop(
+                        qemu=qemu,
+                        target=target,
+                        cpu_threads=cpu_threads,
+                        cpu=cpu,
+                        architecture=manifest.architecture,
+                        event_arch=event_arch,
+                        event_register_count=event_register_count,
+                        encode_registers=event_encoder,
+                        map_signal=event_signal_mapper,
+                    )
+                except KernelEventReadError:
+                    # Keep the controller in STOPPED state.  Closing the
+                    # facade can then remove the owned breakpoint safely.
+                    raise
+
+            facade.internal_continue = internal_breakpoints
         server = UnixRspServer(
             str(gdb_socket),
             facade,
             qemu,
-            qemu_cpu_stop_resolver(qemu, target, cpu_threads),
+            qemu_cpu_stop_resolver(qemu, target, cpu_threads, internal_stop),
+            internal_breakpoints,
         )
         return LiveFacade(
-            manifest, qemu, target, runner, oracle, facade, server, descriptions
+            manifest,
+            qemu,
+            target,
+            runner,
+            oracle,
+            facade,
+            server,
+            descriptions,
+            internal_breakpoints,
         )
     except BaseException:
         qemu.close()
@@ -444,6 +663,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--timeout", type=float, default=5.0)
     parser.add_argument(
+        "--stop-on-connect",
+        action="store_true",
+        help="interrupt a running QEMU and validate its stop before setup",
+    )
+    parser.add_argument(
         "--snapshot-only",
         action="store_true",
         help="validate and print one task snapshot without opening a GDB listener",
@@ -455,6 +679,7 @@ def main(argv: list[str] | None = None) -> int:
         gdb_socket=args.gdb_socket,
         manifest_path=args.manifest,
         timeout=args.timeout,
+        stop_on_connect=args.stop_on_connect,
     )
     try:
         if args.snapshot_only:

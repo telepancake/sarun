@@ -15,7 +15,7 @@ carries the real path, the meta NAME changes), never shape-only. Run:
       --with "python-magic>=0.4" python test_cli_rs.py
 Skips (passes vacuously) if cargo/the binary are unavailable.
 """
-import os, shutil, socket, stat as stat_mod, subprocess, sys, tempfile, time
+import os, shutil, signal, socket, sqlite3, stat as stat_mod, subprocess, sys, tempfile, time
 from pathlib import Path
 from sarun_test_paths import ENGINE_BIN
 from importlib.machinery import SourceFileLoader
@@ -75,8 +75,20 @@ def main():
     m = SourceFileLoader("slopbox", SARUN).load_module()
     m.ensure_dirs()
     eng = None
-    aphost = Path("/root/cli_apply_proof.txt"); aphost.unlink(missing_ok=True)
+    host_tmp = None
+    old_sigterm = signal.getsignal(signal.SIGTERM)
+
+    def terminate(signum, _frame):
+        # Turn a normal harness termination into stack unwinding so the
+        # temporary host fixture and engine process are cleaned in `finally`.
+        raise SystemExit(128 + signum)
+
+    signal.signal(signal.SIGTERM, terminate)
     try:
+        # FUSE-backed boxes deliberately replace /tmp with a private tmpfs, so
+        # fixtures which must remain visible inside the box belong in /var/tmp.
+        host_tmp = Path(tempfile.mkdtemp(prefix="clirs-host-", dir="/var/tmp"))
+        aphost = host_tmp / "cli_apply_proof.txt"
         eng = subprocess.Popen([str(BIN), "serve"],
                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         sock = m.sock_path()
@@ -90,6 +102,79 @@ def main():
         check(r.returncode == 0, "cli-rs: -C run exits 0")
         check("/tmp" in r.stdout,
               f"cli-rs: -C set the box working dir (pwd echoed {r.stdout.strip()!r})")
+
+        # The ordinary shell contract does not require -C: a relative command
+        # is resolved from the caller's inherited cwd after the top-level FUSE
+        # runner joins the broker's user+mount namespaces.  This specifically
+        # guards the namespace transition from making getcwd() fail and the
+        # runner silently substituting `/`.
+        # Keep this outside the XDG fixture root: Sarun deliberately hides its
+        # own state/config/runtime trees from boxes.
+        relative = host_tmp / "relative-cwd"
+        relative.mkdir()
+        (relative / "values.mk").write_text("VALUE := from-provider\n")
+        (relative / "Makefile").write_text(
+            "include values.mk\n"
+            "all:\n"
+            "\t@printf 'direct-kati=<%s>\\n' '$(VALUE)'\n"
+        )
+        script = relative / "probe.sh"
+        script.write_text(
+            "#!/bin/sh\n"
+            "make -s -f Makefile\n"
+            "printf 'relative-script-ok argv1=<%s> argv2=<%s> cwd=<%s>\\n' "
+            '"$1" "$2" "$PWD"\n'
+        )
+        script.chmod(0o755)
+        r = subprocess.run(
+            [str(BIN), "run", "--fuse", "-b", "--", "./probe.sh",
+             "first argument", "second"],
+            cwd=relative, capture_output=True, text=True, timeout=60)
+        check(r.returncode == 0,
+              "cli-rs: inherited cwd resolves executable relative script "
+              f"(got {r.returncode}: {r.stderr[-300:]})")
+        check(
+            "relative-script-ok argv1=<first argument> argv2=<second> "
+            f"cwd=<{relative}>" in r.stdout,
+            "cli-rs: relative script preserves cwd and argv "
+            f"(stdout={r.stdout.strip()!r})")
+        check("direct-kati=<from-provider>" in r.stdout,
+              "cli-rs: embedded Kati reads Makefile and include through "
+              "the FUSE box provider")
+
+        # FUSE emits the same compact TRACE v3 stream as SUD. The first run
+        # above owns box 1 in this isolated namespace; this relative run is 2.
+        trace_box = "2"
+        trace_db = m.sqlar_path(trace_box)
+        with sqlite3.connect(f"file:{trace_db}?mode=ro", uri=True) as con:
+            row = con.execute("SELECT length(content) FROM sudtrace").fetchone()
+            access = con.execute(
+                "SELECT process_id,path,flags FROM file_access "
+                "WHERE path LIKE '%/probe.sh' OR path='probe.sh' "
+                "OR path LIKE '%/Makefile' OR path='Makefile' "
+                "OR path LIKE '%/values.mk' OR path='values.mk'"
+            ).fetchall()
+        trace_len = row[0] if row and row[0] is not None else 0
+        trace_reply = m.sync_request(m.sock_path(), type="sudtrace", sid=trace_box) or {}
+        trace_events = trace_reply.get("events", []) if trace_reply.get("ok") else []
+        check(trace_len > 0 and trace_reply.get("ok"),
+              f"cli-rs: FUSE run stores a decodable TRACE v3 stream "
+              f"(bytes={trace_len}, reply={trace_reply.get('error')!r})")
+        check(any(event.get("kind") == "OPEN"
+                  and event.get("text", "").endswith("/probe.sh")
+                  for event in trace_events),
+              "cli-rs: FUSE TRACE attributes the relative script open")
+        check(any(process_id > 0 and flags & 3 == 0
+                  for process_id, _path, flags in access),
+              f"cli-rs: FUSE read-open is indexed by process and path "
+              f"(rows={access!r})")
+        check(all(any(process_id > 0 and path.endswith(name) and flags & 3 == 0
+                      for process_id, path, flags in access)
+                  for name in ("/Makefile", "/values.mk")),
+              "cli-rs: embedded Kati reads are attributed to the normal "
+              f"FUSE trace (rows={access!r})")
+        check(not (m.live_home() / trace_box / "sud.trace").exists(),
+              "cli-rs: completed FUSE run removes its live TRACE spool")
 
         # ── CLI ops on a named box ──────────────────────────────────────────
         build_box(m, "9700", "CLIPATCH", "root/clip.txt", b"hello-cli\n")
@@ -111,7 +196,9 @@ def main():
               "cli-rs: NAME rename persists the new name to meta")
 
         # NAME apply → writes the change to the host, reaps the box
-        build_box(m, "9701", "CLIAPPLY", "root/cli_apply_proof.txt", b"applied-cli\n")
+        build_box(
+            m, "9701", "CLIAPPLY", aphost.as_posix().removeprefix("/"),
+            b"applied-cli\n")
         ra = subprocess.run([str(BIN), "CLIAPPLY", "apply"],
                             capture_output=True, text=True)
         check(ra.returncode == 0, "cli-rs: NAME apply exits 0")
@@ -121,8 +208,10 @@ def main():
               "cli-rs: NAME apply reaped the emptied box")
 
         # NAME discard → drops the change, host untouched, box reaped
-        dishost = Path("/root/cli_discard_proof.txt"); dishost.unlink(missing_ok=True)
-        build_box(m, "9702", "CLIDISCARD", "root/cli_discard_proof.txt", b"nope\n")
+        dishost = host_tmp / "cli_discard_proof.txt"
+        build_box(
+            m, "9702", "CLIDISCARD", dishost.as_posix().removeprefix("/"),
+            b"nope\n")
         rd = subprocess.run([str(BIN), "CLIDISCARD", "discard"],
                             capture_output=True, text=True)
         check(rd.returncode == 0, "cli-rs: NAME discard exits 0")
@@ -131,11 +220,13 @@ def main():
         check(not m.sqlar_path("9702").exists(),
               "cli-rs: NAME discard reaped the box")
     finally:
-        aphost.unlink(missing_ok=True)
+        if host_tmp is not None:
+            shutil.rmtree(host_tmp, ignore_errors=True)
         if eng is not None and eng.poll() is None:
             eng.terminate()
             try: eng.wait(timeout=10)
             except Exception: eng.kill()
+        signal.signal(signal.SIGTERM, old_sigterm)
         os.environ.pop("SLOPBOX_NS", None)
         shutil.rmtree(tmp, ignore_errors=True)
     print("\n" + ("CLI-RS PASS" if not _fails else f"{len(_fails)} FAILURE(S)"))

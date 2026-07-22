@@ -9,7 +9,7 @@
 
 use serde_json::Value;
 
-use super::font::{char_cells, CELL_H, CELL_W};
+use super::font::{CELL_H, CELL_W, char_cells};
 
 pub type Rgb = (u8, u8, u8);
 
@@ -83,7 +83,10 @@ pub fn snapshot_text(snapshot: &Value, cols: usize, rows: usize) -> Vec<Placemen
         if i < 0 {
             ""
         } else {
-            strings.get(i as usize).and_then(Value::as_str).unwrap_or("")
+            strings
+                .get(i as usize)
+                .and_then(Value::as_str)
+                .unwrap_or("")
         }
     };
     let Some(doc) = snapshot
@@ -104,8 +107,14 @@ pub fn snapshot_text(snapshot: &Value, cols: usize, rows: usize) -> Vec<Placemen
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let sx = doc.get("scrollOffsetX").and_then(Value::as_f64).unwrap_or(0.0);
-    let sy = doc.get("scrollOffsetY").and_then(Value::as_f64).unwrap_or(0.0);
+    let sx = doc
+        .get("scrollOffsetX")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    let sy = doc
+        .get("scrollOffsetY")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
 
     let tb = doc.get("textBoxes");
     let arr = |k: &str| -> Vec<Value> {
@@ -114,8 +123,12 @@ pub fn snapshot_text(snapshot: &Value, cols: usize, rows: usize) -> Vec<Placemen
             .cloned()
             .unwrap_or_default()
     };
-    let (layout_index, bounds, start, length) =
-        (arr("layoutIndex"), arr("bounds"), arr("start"), arr("length"));
+    let (layout_index, bounds, start, length) = (
+        arr("layoutIndex"),
+        arr("bounds"),
+        arr("start"),
+        arr("length"),
+    );
     let n = layout_index
         .len()
         .min(bounds.len())
@@ -399,7 +412,12 @@ mod tests {
     #[test]
     fn compose_overlays_text_on_pixels() {
         // all-white viewport, one red 'A' placed at (row 1, col 2)
-        let text = vec![Placement { row: 1, col: 2, ch: 'A', fg: (255, 0, 0) }];
+        let text = vec![Placement {
+            row: 1,
+            col: 2,
+            ch: 'A',
+            fg: (255, 0, 0),
+        }];
         let grid = compose(|_, _| (255, 255, 255), &text, 5, 3);
         assert_eq!(grid.len(), 3);
         assert_eq!(grid[1][2].ch, "A");

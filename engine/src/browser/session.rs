@@ -11,10 +11,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::cdp::Cdp;
-use super::font::{inject_js, CELL_H, CELL_W};
+use super::font::{CELL_H, CELL_W, inject_js};
 use super::render::{self, Grid, Rgb};
 
 const CALL: Duration = Duration::from_secs(20);
@@ -42,7 +42,10 @@ impl BrowserSession {
             .as_array()
             .and_then(|ts| ts.iter().find(|t| t["type"] == "page"))
             .context("no page target")?;
-        let target_id = page["targetId"].as_str().context("no targetId")?.to_string();
+        let target_id = page["targetId"]
+            .as_str()
+            .context("no targetId")?
+            .to_string();
         let attached = cdp.call(
             "Target.attachToTarget",
             json!({ "targetId": target_id, "flatten": true }),
@@ -56,7 +59,10 @@ impl BrowserSession {
 
         let me = Self {
             cdp,
-            tabs: vec![Tab { target_id, session_id: session_id.clone() }],
+            tabs: vec![Tab {
+                target_id,
+                session_id: session_id.clone(),
+            }],
             active: 0,
             cols,
             rows,
@@ -118,16 +124,25 @@ impl BrowserSession {
             None,
             CALL,
         )?;
-        let target_id = created["targetId"].as_str().context("createTarget: no id")?.to_string();
+        let target_id = created["targetId"]
+            .as_str()
+            .context("createTarget: no id")?
+            .to_string();
         let attached = self.cdp.call(
             "Target.attachToTarget",
             json!({ "targetId": target_id, "flatten": true }),
             None,
             CALL,
         )?;
-        let session_id = attached["sessionId"].as_str().context("no sessionId")?.to_string();
+        let session_id = attached["sessionId"]
+            .as_str()
+            .context("no sessionId")?
+            .to_string();
         self.setup_target(&session_id)?;
-        self.tabs.push(Tab { target_id, session_id });
+        self.tabs.push(Tab {
+            target_id,
+            session_id,
+        });
         self.active = self.tabs.len() - 1;
         self.navigate(url)?;
         Ok(())
@@ -235,7 +250,8 @@ impl BrowserSession {
             down["text"] = json!(text);
             down["unmodifiedText"] = json!(text);
         }
-        self.cdp.call("Input.dispatchKeyEvent", down, self.s(), CALL)?;
+        self.cdp
+            .call("Input.dispatchKeyEvent", down, self.s(), CALL)?;
         self.cdp.call(
             "Input.dispatchKeyEvent",
             json!({ "type": "keyUp", "key": key, "code": code,
@@ -303,7 +319,9 @@ impl BrowserSession {
     /// Stop the active tab's screencast (before switching away from it, so a
     /// background tab never keeps pushing frames).
     pub fn stop_screencast(&self) {
-        let _ = self.cdp.call("Page.stopScreencast", json!({}), self.s(), CALL);
+        let _ = self
+            .cdp
+            .call("Page.stopScreencast", json!({}), self.s(), CALL);
     }
 
     pub fn ack_frame(&self, frame_session: i64) {
@@ -326,9 +344,19 @@ impl BrowserSession {
     fn compose_png(&self, png: &[u8], text: &[render::Placement]) -> Grid {
         let img = match image::load_from_memory(png) {
             Ok(i) => i.to_rgb8(),
-            Err(_) => return vec![vec![render::Cell {
-                ch: " ".into(), fg: (0, 0, 0), bg: (0, 0, 0),
-            }; self.cols]; self.rows],
+            Err(_) => {
+                return vec![
+                    vec![
+                        render::Cell {
+                            ch: " ".into(),
+                            fg: (0, 0, 0),
+                            bg: (0, 0, 0),
+                        };
+                        self.cols
+                    ];
+                    self.rows
+                ];
+            }
         };
         let resized = image::imageops::resize(
             &img,

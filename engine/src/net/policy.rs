@@ -17,12 +17,12 @@ use crate::rules::Action;
 pub struct NetSubject {
     pub host: String,
     pub port: u16,
-    pub scheme: String,         // "http" | "https" | "tcp" | "udp"
-    pub sni: String,            // empty if not TLS
-    pub http_path: String,      // empty for non-HTTP gates
+    pub scheme: String,    // "http" | "https" | "tcp" | "udp"
+    pub sni: String,       // empty if not TLS
+    pub http_path: String, // empty for non-HTTP gates
     pub http_method: String,
     pub http_status: String,
-    pub proto: String,          // "tcp" | "udp"
+    pub proto: String, // "tcp" | "udp"
     pub box_name: String,
     pub exe: String,
     pub cwd: String,
@@ -40,14 +40,14 @@ pub fn decide(rules: &[crate::rules::FileRule], subj: &NetSubject) -> Action {
     for r in rules {
         if matches(r, subj) {
             return match r.action {
-                Action::Apply => Action::Apply,    // = Allow
+                Action::Apply => Action::Apply,     // = Allow
                 Action::Discard => Action::Discard, // = Deny
                 Action::Passthrough => Action::Apply,
-                Action::Ask => Action::Ask,         // banner-prompt the user
+                Action::Ask => Action::Ask, // banner-prompt the user
             };
         }
     }
-    Action::Apply  // default Allow
+    Action::Apply // default Allow
 }
 
 fn matches(rule: &crate::rules::FileRule, subj: &NetSubject) -> bool {
@@ -56,12 +56,23 @@ fn matches(rule: &crate::rules::FileRule, subj: &NetSubject) -> bool {
     let mut acc = true;
     let mut started = false;
     for c in &rule.clauses {
-        if !c.enabled { continue; }
+        if !c.enabled {
+            continue;
+        }
         let v = field(&c.m.kind, subj, &port_str);
         let mut m = glob_match(&c.m.pattern, v);
-        if c.negate { m = !m; }
-        if !started { acc = m; started = true; }
-        else { acc = match c.join { Join::And => acc && m, Join::Or => acc || m }; }
+        if c.negate {
+            m = !m;
+        }
+        if !started {
+            acc = m;
+            started = true;
+        } else {
+            acc = match c.join {
+                Join::And => acc && m,
+                Join::Or => acc || m,
+            };
+        }
     }
     started && acc
 }
@@ -88,13 +99,12 @@ mod tests {
 
     #[test]
     fn discard_by_host_blocks_match_allows_others() {
-        let rules = vec![
-            FileRule::parse("discard host:tracker.example").unwrap(),
-        ];
-        assert_eq!(decide(&rules, &subj_https("tracker.example")),
-                   Action::Discard);
-        assert_eq!(decide(&rules, &subj_https("example.com")),
-                   Action::Apply);
+        let rules = vec![FileRule::parse("discard host:tracker.example").unwrap()];
+        assert_eq!(
+            decide(&rules, &subj_https("tracker.example")),
+            Action::Discard
+        );
+        assert_eq!(decide(&rules, &subj_https("example.com")), Action::Apply);
     }
 
     #[test]
@@ -104,18 +114,18 @@ mod tests {
             FileRule::parse("apply host:safe.example").unwrap(),
             FileRule::parse("discard host:*").unwrap(),
         ];
-        assert_eq!(decide(&rules, &subj_https("safe.example")),
-                   Action::Apply);
-        assert_eq!(decide(&rules, &subj_https("other.example")),
-                   Action::Discard);
+        assert_eq!(decide(&rules, &subj_https("safe.example")), Action::Apply);
+        assert_eq!(
+            decide(&rules, &subj_https("other.example")),
+            Action::Discard
+        );
     }
 
     #[test]
     fn file_kinds_are_inert_for_net_subjects() {
         // A path-only rule shouldn't accidentally deny a net dial.
         let rules = vec![FileRule::parse("discard **/*.log").unwrap()];
-        assert_eq!(decide(&rules, &subj_https("example.com")),
-                   Action::Apply);
+        assert_eq!(decide(&rules, &subj_https("example.com")), Action::Apply);
     }
 }
 

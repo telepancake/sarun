@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: GPL-2.0
+# This observer is linked into the exact debug kernel; it is not a module.
+obj-y += viros_event.o
+
+ccflags-y += -I$(src)/../include
+CFLAGS_viros_event.o += -fno-stack-protector -fno-pic -fno-pie
+
+# Keep the observer and its retained debugger boundary free of compiler-added
+# callbacks.  The signal-delivery tracepoint itself remains enabled normally.
+KASAN_SANITIZE_viros_event.o := n
+KCSAN_SANITIZE_viros_event.o := n
+KCOV_INSTRUMENT_viros_event.o := n
+GCOV_PROFILE_viros_event.o := n
+UBSAN_SANITIZE_viros_event.o := n

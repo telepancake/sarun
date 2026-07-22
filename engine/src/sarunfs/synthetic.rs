@@ -248,9 +248,7 @@ impl SyntheticRuntime {
         stream: i32,
         data: &[u8],
     ) {
-        let record = !host_actor || self
-            .muted_owner(tgid)
-            .is_none_or(|owner| owner == box_id);
+        let record = !host_actor || self.muted_owner(tgid).is_none_or(|owner| owner == box_id);
         if record {
             if let Some(box_state) = box_state {
                 if host_actor {

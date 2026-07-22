@@ -24,6 +24,8 @@ from .architectures import AARCH64, ArchitectureDescriptor
 
 _GPA = re.compile(r"\bgpa:\s*(0x[0-9a-fA-F]+)\b")
 _CURRENT_HMP_CPU = re.compile(r"^\s*\*\s*CPU\s+#(\d+)\b", re.MULTILINE)
+_XML_ROOT = re.compile(rb"<(target|feature)(?=[\s>])")
+_XI_NAMESPACE = b' xmlns:xi="http://www.w3.org/2001/XInclude"'
 
 
 class RspTargetError(RuntimeError):
@@ -221,7 +223,23 @@ class RspQemuTarget:
             visiting.add(annex)
             try:
                 document = self.client.read_xfer("features", annex)
-                root = ET.fromstring(document)
+                try:
+                    root = ET.fromstring(document)
+                except ET.ParseError as first:
+                    # QEMU relies on gdb-target.dtd for this conventional
+                    # namespace declaration.  ElementTree does not load the
+                    # external DTD, so add only that fixed binding when needed.
+                    if b"xi:" not in document or b"xmlns:xi" in document:
+                        raise
+                    match = _XML_ROOT.search(document)
+                    if match is None:
+                        raise
+                    insertion = match.end()
+                    root = ET.fromstring(
+                        document[:insertion]
+                        + _XI_NAMESPACE
+                        + document[insertion:]
+                    )
             except RspTargetError:
                 raise
             except Exception as exc:

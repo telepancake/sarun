@@ -252,6 +252,17 @@ fn broker_executable() -> io::Result<PathBuf> {
 /// backend selection is FUSE.  The process remains the user's foreground
 /// runner; only its user and mount namespace membership changes.
 pub fn enter_runner_namespace() -> io::Result<()> {
+    // `setns(CLONE_NEWNS)` can leave cwd referring to a mount that is not
+    // reachable in the broker's mount namespace.  A later `getcwd(2)` then
+    // fails with ENOENT, and the runner used to silently replace the caller's
+    // working directory with `/`.  Preserve its pathname while it is still
+    // reachable and resolve it again after both namespace transitions.
+    let caller_cwd = std::env::current_dir().map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("cannot capture caller cwd before entering FUSE namespace: {error}"),
+        )
+    })?;
     let mut broker = UnixStream::connect(crate::paths::fuse_broker_socket())?;
     broker.write_all(&[REQUEST_NAMESPACES])?;
     let (reply, fds) = receive_exact_fds(&broker, 2, 2)?;
@@ -279,6 +290,15 @@ pub fn enter_runner_namespace() -> io::Result<()> {
             return Err(io::Error::last_os_error());
         }
     }
+    std::env::set_current_dir(&caller_cwd).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "cannot restore caller cwd {} inside FUSE namespace: {error}",
+                caller_cwd.display()
+            ),
+        )
+    })?;
     // A rootless Tap setup can deliberately self-exec after parser startup.
     // Namespace membership survives exec; this marker prevents that second
     // image from trying to setns from a child user namespace back to its

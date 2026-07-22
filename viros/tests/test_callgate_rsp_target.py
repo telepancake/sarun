@@ -188,6 +188,26 @@ class RspQemuTargetTests(unittest.TestCase):
         self.assertIn(("xfer", "features", "target.xml"), self.client.calls)
         self.assertIn(("xfer", "features", "aarch64-core.xml"), self.client.calls)
 
+    def test_register_description_accepts_qemus_dtd_declared_xinclude(self):
+        self.client.xml["target.xml"] = (
+            b'<?xml version="1.0"?><!DOCTYPE target SYSTEM "gdb-target.dtd">'
+            b"<target><architecture>aarch64</architecture>"
+            b'<xi:include href="aarch64-core.xml"/></target>'
+        )
+
+        self.assertEqual(
+            self.target.read_register(0, "pc"), AARCH64_REGISTERS.index("pc")
+        )
+
+    def test_register_description_rejects_other_unbound_prefixes(self):
+        self.client.xml["target.xml"] = (
+            b"<target><architecture>aarch64</architecture>"
+            b'<bad:include href="aarch64-core.xml"/></target>'
+        )
+
+        with self.assertRaisesRegex(RspTargetError, "unbound prefix"):
+            self.target.read_register(0, "pc")
+
     def test_constructor_default_and_explicit_descriptor_are_compatible(self):
         self.assertIs(self.target.architecture, AARCH64)
         explicit = RspQemuTarget(

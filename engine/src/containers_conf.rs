@@ -61,7 +61,8 @@ impl ContainersConf {
     /// registries) — the same precedence podman documents.
     pub fn load() -> ContainersConf {
         let mut files: Vec<PathBuf> = Vec::new();
-        let base = std::env::var("CONTAINERS_REGISTRIES_CONF").ok()
+        let base = std::env::var("CONTAINERS_REGISTRIES_CONF")
+            .ok()
             .map(PathBuf::from)
             .filter(|p| p.is_file())
             .or_else(|| {
@@ -70,9 +71,13 @@ impl ContainersConf {
                     .filter(|p| p.is_file())
             })
             .or_else(|| {
-                ["/etc/containers/registries.conf",
-                 "/usr/share/containers/registries.conf"]
-                    .iter().map(PathBuf::from).find(|p| p.is_file())
+                [
+                    "/etc/containers/registries.conf",
+                    "/usr/share/containers/registries.conf",
+                ]
+                .iter()
+                .map(PathBuf::from)
+                .find(|p| p.is_file())
             });
         files.extend(base);
         let mut dropin_dirs = vec![PathBuf::from("/etc/containers/registries.conf.d")];
@@ -80,8 +85,11 @@ impl ContainersConf {
             dropin_dirs.push(u.join("containers/registries.conf.d"));
         }
         for d in dropin_dirs {
-            let Ok(rd) = std::fs::read_dir(&d) else { continue };
-            let mut names: Vec<PathBuf> = rd.filter_map(|e| e.ok())
+            let Ok(rd) = std::fs::read_dir(&d) else {
+                continue;
+            };
+            let mut names: Vec<PathBuf> = rd
+                .filter_map(|e| e.ok())
                 .map(|e| e.path())
                 .filter(|p| p.extension().is_some_and(|x| x == "conf"))
                 .collect();
@@ -102,13 +110,18 @@ impl ContainersConf {
     /// Merge one TOML document into self. Returns false when the document
     /// doesn't parse (skipped, matching podman's tolerance of stray files).
     pub fn merge_toml(&mut self, text: &str) -> bool {
-        let Ok(v) = text.parse::<toml::Value>() else { return false };
+        let Ok(v) = text.parse::<toml::Value>() else {
+            return false;
+        };
         let Some(t) = v.as_table() else { return false };
-        if let Some(arr) = t.get("unqualified-search-registries")
+        if let Some(arr) = t
+            .get("unqualified-search-registries")
             .and_then(|v| v.as_array())
         {
-            self.search = arr.iter()
-                .filter_map(|s| s.as_str().map(str::to_string)).collect();
+            self.search = arr
+                .iter()
+                .filter_map(|s| s.as_str().map(str::to_string))
+                .collect();
         }
         if let Some(al) = t.get("aliases").and_then(|v| v.as_table()) {
             for (k, val) in al {
@@ -120,22 +133,36 @@ impl ContainersConf {
         if let Some(regs) = t.get("registry").and_then(|v| v.as_array()) {
             for r in regs {
                 let Some(rt) = r.as_table() else { continue };
-                let location = rt.get("location").and_then(|v| v.as_str())
-                    .unwrap_or("").to_string();
-                let prefix = rt.get("prefix").and_then(|v| v.as_str())
-                    .unwrap_or(&location).to_string();
-                if prefix.is_empty() { continue; }
-                let blocked = rt.get("blocked").and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                let mirrors = rt.get("mirror").and_then(|v| v.as_array())
-                    .map(|ms| ms.iter()
-                        .filter_map(|m| m.as_table())
-                        .filter_map(|m| m.get("location"))
-                        .filter_map(|l| l.as_str().map(str::to_string))
-                        .collect())
+                let location = rt
+                    .get("location")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let prefix = rt
+                    .get("prefix")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&location)
+                    .to_string();
+                if prefix.is_empty() {
+                    continue;
+                }
+                let blocked = rt.get("blocked").and_then(|v| v.as_bool()).unwrap_or(false);
+                let mirrors = rt
+                    .get("mirror")
+                    .and_then(|v| v.as_array())
+                    .map(|ms| {
+                        ms.iter()
+                            .filter_map(|m| m.as_table())
+                            .filter_map(|m| m.get("location"))
+                            .filter_map(|l| l.as_str().map(str::to_string))
+                            .collect()
+                    })
                     .unwrap_or_default();
                 self.registries.push(RegistryEntry {
-                    prefix, location, blocked, mirrors,
+                    prefix,
+                    location,
+                    blocked,
+                    mirrors,
                 });
             }
         }
@@ -172,35 +199,53 @@ impl ContainersConf {
                 Remap::Blocked(prefix) => {
                     out.blocked.get_or_insert(format!(
                         "'{full}' is blocked by registries.conf \
-                         ([[registry]] prefix \"{prefix}\")"));
+                         ([[registry]] prefix \"{prefix}\")"
+                    ));
                 }
                 Remap::Pass => out.push(full, via.clone()),
-                Remap::To(cands) => for (r, note) in cands {
-                    let via = if via.is_empty() { note }
-                              else if note.is_empty() { via.clone() }
-                              else { format!("{via} · {note}") };
-                    out.push(r, via);
+                Remap::To(cands) => {
+                    for (r, note) in cands {
+                        let via = if via.is_empty() {
+                            note
+                        } else if note.is_empty() {
+                            via.clone()
+                        } else {
+                            format!("{via} · {note}")
+                        };
+                        out.push(r, via);
+                    }
                 }
             }
         }
         // A block only matters when it left us with nothing to try.
-        if !out.candidates.is_empty() { out.blocked = None; }
+        if !out.candidates.is_empty() {
+            out.blocked = None;
+        }
         out
     }
 
     fn remap(&self, full: &str) -> Remap {
         // Longest matching prefix wins (spec: more specific wins).
-        let hit = self.registries.iter()
+        let hit = self
+            .registries
+            .iter()
             .filter(|e| prefix_matches(&e.prefix, full))
             .max_by_key(|e| e.prefix.len());
         let Some(e) = hit else { return Remap::Pass };
-        if e.blocked { return Remap::Blocked(e.prefix.clone()); }
+        if e.blocked {
+            return Remap::Blocked(e.prefix.clone());
+        }
         let rest = &full[e.prefix.len()..];
-        let mut cands: Vec<(String, String)> = e.mirrors.iter()
+        let mut cands: Vec<(String, String)> = e
+            .mirrors
+            .iter()
             .map(|m| (format!("{m}{rest}"), format!("mirror of {}", e.prefix)))
             .collect();
-        let primary = if e.location.is_empty() { full.to_string() }
-                      else { format!("{}{rest}", e.location) };
+        let primary = if e.location.is_empty() {
+            full.to_string()
+        } else {
+            format!("{}{rest}", e.location)
+        };
         let note = if e.location.is_empty() || e.location == e.prefix {
             String::new()
         } else {
@@ -219,15 +264,22 @@ enum Remap {
 
 impl Resolved {
     fn push(&mut self, reference: String, via: String) {
-        if self.candidates.iter().any(|c| c.reference == reference) { return; }
+        if self.candidates.iter().any(|c| c.reference == reference) {
+            return;
+        }
         self.candidates.push(Candidate { reference, via });
     }
 }
 
 fn user_config_dir() -> Option<PathBuf> {
-    std::env::var("XDG_CONFIG_HOME").ok().map(PathBuf::from)
-        .or_else(|| std::env::var("HOME").ok()
-            .map(|h| Path::new(&h).join(".config")))
+    std::env::var("XDG_CONFIG_HOME")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var("HOME")
+                .ok()
+                .map(|h| Path::new(&h).join(".config"))
+        })
 }
 
 /// Split `name[:tag][@digest]` into (name, ":tag@digest" suffix). The tag
@@ -250,16 +302,13 @@ fn split_ref(reference: &str) -> (&str, &str) {
 /// host: contains '.' or ':', or is exactly "localhost".
 fn is_qualified(name: &str) -> bool {
     let first = name.split('/').next().unwrap_or("");
-    name.contains('/') &&
-        (first.contains('.') || first.contains(':') || first == "localhost")
+    name.contains('/') && (first.contains('.') || first.contains(':') || first == "localhost")
 }
 
 /// Prepend a search registry; docker.io single-component names get the
 /// implicit `library/` namespace docker hub requires.
 fn qualify(registry: &str, name: &str) -> String {
-    if (registry == "docker.io" || registry.ends_with(".docker.io"))
-        && !name.contains('/')
-    {
+    if (registry == "docker.io" || registry.ends_with(".docker.io")) && !name.contains('/') {
         format!("{registry}/library/{name}")
     } else {
         format!("{registry}/{name}")
@@ -271,8 +320,7 @@ fn qualify(registry: &str, name: &str) -> String {
 /// `quay.io/foobar`).
 fn prefix_matches(prefix: &str, full: &str) -> bool {
     full.strip_prefix(prefix).is_some_and(|rest| {
-        rest.is_empty() || rest.starts_with('/')
-            || rest.starts_with(':') || rest.starts_with('@')
+        rest.is_empty() || rest.starts_with('/') || rest.starts_with(':') || rest.starts_with('@')
     })
 }
 
@@ -308,16 +356,20 @@ mod tests {
 
     #[test]
     fn alias_wins_over_search() {
-        let c = conf(r#"
+        let c = conf(
+            r#"
             unqualified-search-registries = ["quay.io", "docker.io"]
             [aliases]
             "ubuntu" = "docker.io/library/ubuntu"
             "fedora" = "registry.fedoraproject.org/fedora"
-        "#);
+        "#,
+        );
         let r = c.resolve("fedora:41");
         assert_eq!(r.candidates.len(), 1);
-        assert_eq!(r.candidates[0].reference,
-                   "registry.fedoraproject.org/fedora:41");
+        assert_eq!(
+            r.candidates[0].reference,
+            "registry.fedoraproject.org/fedora:41"
+        );
         assert_eq!(r.candidates[0].via, "short-name alias");
     }
 
@@ -331,47 +383,58 @@ mod tests {
 
     #[test]
     fn mirror_before_primary() {
-        let c = conf(r#"
+        let c = conf(
+            r#"
             [[registry]]
             prefix = "docker.io"
             location = "docker.io"
             [[registry.mirror]]
             location = "mirror.corp.example/dockerhub"
-        "#);
+        "#,
+        );
         let r = c.resolve("ubuntu:24.04");
-        assert_eq!(r.candidates[0].reference,
-                   "mirror.corp.example/dockerhub/library/ubuntu:24.04");
+        assert_eq!(
+            r.candidates[0].reference,
+            "mirror.corp.example/dockerhub/library/ubuntu:24.04"
+        );
         assert!(r.candidates[0].via.contains("mirror of docker.io"));
         assert_eq!(r.candidates[1].reference, "docker.io/library/ubuntu:24.04");
     }
 
     #[test]
     fn location_remap_and_longest_prefix() {
-        let c = conf(r#"
+        let c = conf(
+            r#"
             [[registry]]
             prefix = "quay.io"
             location = "internal.example/quay"
             [[registry]]
             prefix = "quay.io/special"
             location = "special.example"
-        "#);
+        "#,
+        );
         let r = c.resolve("quay.io/foo/bar:1");
         assert_eq!(r.candidates[0].reference, "internal.example/quay/foo/bar:1");
         let r = c.resolve("quay.io/special/x");
         assert_eq!(r.candidates[0].reference, "special.example/x");
         // component-wise: quay.io/specialx must NOT match quay.io/special
         let r = c.resolve("quay.io/specialx/x");
-        assert_eq!(r.candidates[0].reference, "internal.example/quay/specialx/x");
+        assert_eq!(
+            r.candidates[0].reference,
+            "internal.example/quay/specialx/x"
+        );
     }
 
     #[test]
     fn blocked_registry_fails_closed() {
-        let c = conf(r#"
+        let c = conf(
+            r#"
             unqualified-search-registries = ["docker.io"]
             [[registry]]
             prefix = "docker.io"
             blocked = true
-        "#);
+        "#,
+        );
         let r = c.resolve("ubuntu");
         assert!(r.candidates.is_empty());
         assert!(r.blocked.unwrap().contains("blocked"));
@@ -381,8 +444,10 @@ mod tests {
     fn digest_refs_keep_digest() {
         let c = ContainersConf::default();
         let r = c.resolve("ubuntu@sha256:abcd");
-        assert_eq!(r.candidates[0].reference,
-                   "docker.io/library/ubuntu@sha256:abcd");
+        assert_eq!(
+            r.candidates[0].reference,
+            "docker.io/library/ubuntu@sha256:abcd"
+        );
         let (n, s) = split_ref("host.io/img:tag@sha256:ff");
         assert_eq!(n, "host.io/img");
         assert_eq!(s, ":tag@sha256:ff");
@@ -390,18 +455,22 @@ mod tests {
 
     #[test]
     fn dropin_merge_overrides_aliases_appends_registries() {
-        let mut c = conf(r#"
+        let mut c = conf(
+            r#"
             unqualified-search-registries = ["docker.io"]
             [aliases]
             "app" = "docker.io/library/app"
-        "#);
-        c.merge_toml(r#"
+        "#,
+        );
+        c.merge_toml(
+            r#"
             [aliases]
             "app" = "quay.io/corp/app"
             [[registry]]
             prefix = "quay.io"
             location = "quay.io"
-        "#);
+        "#,
+        );
         assert_eq!(c.aliases["app"], "quay.io/corp/app");
         assert_eq!(c.search, vec!["docker.io"]);
         assert_eq!(c.registries.len(), 1);

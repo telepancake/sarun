@@ -10,8 +10,8 @@
 use std::io::Read;
 
 use crate::oaita::config::Config;
+use crate::oaita::driver::{Settings, evaluate_call, generate, run_to_completion};
 use crate::oaita::exec::build_executor;
-use crate::oaita::driver::{evaluate_call, generate, run_to_completion, Settings};
 use crate::oaita::turns::{append_turn, load_turns, target_segment};
 
 /// Default turn budget granted by `oaita run NAME` when the user
@@ -50,7 +50,10 @@ Configuration: {config_home}/oaita.toml — see `oaita where`.";
 
 pub fn main(argv: &[String]) -> i32 {
     let mut it = argv.iter();
-    let Some(cmd) = it.next() else { eprintln!("{USAGE}"); return 2; };
+    let Some(cmd) = it.next() else {
+        eprintln!("{USAGE}");
+        return 2;
+    };
     let rest: Vec<String> = it.cloned().collect();
     match cmd.as_str() {
         "gen" => cmd_gen(&rest),
@@ -60,8 +63,14 @@ pub fn main(argv: &[String]) -> i32 {
         "add" => cmd_add(&rest),
         "where" => cmd_where(),
         "local" => crate::oaita::local::cmd_local(&rest),
-        "-h" | "--help" => { println!("{USAGE}"); 0 }
-        other => { eprintln!("oaita: unknown subcommand {other:?}\n{USAGE}"); 2 }
+        "-h" | "--help" => {
+            println!("{USAGE}");
+            0
+        }
+        other => {
+            eprintln!("oaita: unknown subcommand {other:?}\n{USAGE}");
+            2
+        }
     }
 }
 
@@ -107,12 +116,19 @@ struct Parsed {
 fn parse(args: &[String]) -> Result<Parsed, String> {
     let mut p = Parsed {
         name: String::new(),
-        model: None, base_url: None, api_key: None,
-        capabilities: None, tool_context: None,
-        sarun: None, no_sandbox: false,
+        model: None,
+        base_url: None,
+        api_key: None,
+        capabilities: None,
+        tool_context: None,
+        sarun: None,
+        no_sandbox: false,
         max_steps: None,
         type_: "user".to_string(),
-        slug: None, sender: None, flags: String::new(), number: None,
+        slug: None,
+        sender: None,
+        flags: String::new(),
+        number: None,
         inbox: false,
         depth: None,
         on: None,
@@ -129,9 +145,14 @@ fn parse(args: &[String]) -> Result<Parsed, String> {
             "--tool-context" => p.tool_context = it.next().cloned(),
             "--sarun" => p.sarun = it.next().cloned(),
             "--no-sandbox" => p.no_sandbox = true,
-            "--max-steps" => p.max_steps = Some(it.next()
-                .ok_or_else(|| "missing N after --max-steps".to_string())?
-                .parse().map_err(|e| format!("--max-steps: {e}"))?),
+            "--max-steps" => {
+                p.max_steps = Some(
+                    it.next()
+                        .ok_or_else(|| "missing N after --max-steps".to_string())?
+                        .parse()
+                        .map_err(|e| format!("--max-steps: {e}"))?,
+                )
+            }
             "--inbox" => p.inbox = true,
             "--on" => p.on = it.next().cloned(),
             "--task" => p.task = it.next().cloned(),
@@ -140,17 +161,30 @@ fn parse(args: &[String]) -> Result<Parsed, String> {
                 Some(m) => return Err(format!("--net wants off|tap|host, got {m:?}")),
                 None => return Err("missing MODE after --net".to_string()),
             },
-            "--depth" => p.depth = Some(it.next()
-                .ok_or_else(|| "missing N after --depth".to_string())?
-                .parse().map_err(|e| format!("--depth: {e}"))?),
-            "--type" => p.type_ = it.next().cloned()
-                .ok_or_else(|| "missing ROLE after --type".to_string())?,
+            "--depth" => {
+                p.depth = Some(
+                    it.next()
+                        .ok_or_else(|| "missing N after --depth".to_string())?
+                        .parse()
+                        .map_err(|e| format!("--depth: {e}"))?,
+                )
+            }
+            "--type" => {
+                p.type_ = it
+                    .next()
+                    .cloned()
+                    .ok_or_else(|| "missing ROLE after --type".to_string())?
+            }
             "--id" => p.slug = it.next().cloned(),
             "--from" => p.sender = it.next().cloned(),
             "--flags" => p.flags = it.next().cloned().unwrap_or_default(),
-            "--number" => p.number = it.next()
-                .ok_or_else(|| "missing N after --number".to_string())?
-                .parse().ok(),
+            "--number" => {
+                p.number = it
+                    .next()
+                    .ok_or_else(|| "missing N after --number".to_string())?
+                    .parse()
+                    .ok()
+            }
             s if !s.starts_with("--") && p.name.is_empty() => p.name = s.to_string(),
             other => return Err(format!("unknown flag {other:?}")),
         }
@@ -159,41 +193,95 @@ fn parse(args: &[String]) -> Result<Parsed, String> {
 }
 
 fn cmd_gen(args: &[String]) -> i32 {
-    let p = match parse(args) { Ok(p) => p, Err(e) => { eprintln!("{e}"); return 2; } };
-    if p.name.is_empty() { eprintln!("gen: missing NAME"); return 2; }
-    let set = match Settings::resolve(p.model, p.base_url, p.api_key,
-                                       p.capabilities, p.tool_context.clone(),
-                                       p.sarun.clone(), p.no_sandbox,
-                                       p.depth)
-    { Ok(s) => s, Err(e) => { eprintln!("{e}"); return 1; } };
+    let p = match parse(args) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("{e}");
+            return 2;
+        }
+    };
+    if p.name.is_empty() {
+        eprintln!("gen: missing NAME");
+        return 2;
+    }
+    let set = match Settings::resolve(
+        p.model,
+        p.base_url,
+        p.api_key,
+        p.capabilities,
+        p.tool_context.clone(),
+        p.sarun.clone(),
+        p.no_sandbox,
+        p.depth,
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("{e}");
+            return 1;
+        }
+    };
     match generate(&p.name, &set) {
         Ok(_) => report(&p.name),
-        Err(e) => { eprintln!("oaita: gen: {e}"); 1 }
+        Err(e) => {
+            eprintln!("oaita: gen: {e}");
+            1
+        }
     }
 }
 
 fn cmd_call(args: &[String]) -> i32 {
-    let p = match parse(args) { Ok(p) => p, Err(e) => { eprintln!("{e}"); return 2; } };
-    if p.name.is_empty() { eprintln!("call: missing NAME"); return 2; }
-    let set = match Settings::resolve(p.model, p.base_url, p.api_key,
-                                       p.capabilities, p.tool_context.clone(),
-                                       p.sarun.clone(), p.no_sandbox,
-                                       p.depth)
-    { Ok(s) => s, Err(e) => { eprintln!("{e}"); return 1; } };
+    let p = match parse(args) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("{e}");
+            return 2;
+        }
+    };
+    if p.name.is_empty() {
+        eprintln!("call: missing NAME");
+        return 2;
+    }
+    let set = match Settings::resolve(
+        p.model,
+        p.base_url,
+        p.api_key,
+        p.capabilities,
+        p.tool_context.clone(),
+        p.sarun.clone(),
+        p.no_sandbox,
+        p.depth,
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("{e}");
+            return 1;
+        }
+    };
     let exe = build_executor(p.no_sandbox, p.sarun);
     let exe_ref: Option<&dyn crate::oaita::exec::Executor> = exe.as_deref();
     match evaluate_call(&p.name, &set, exe_ref) {
         Ok(_) => report(&p.name),
-        Err(e) => { eprintln!("oaita: call: {e}"); 1 }
+        Err(e) => {
+            eprintln!("oaita: call: {e}");
+            1
+        }
     }
 }
 
 fn cmd_run(args: &[String]) -> i32 {
-    let p = match parse(args) { Ok(p) => p, Err(e) => { eprintln!("{e}"); return 2; } };
+    let p = match parse(args) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("{e}");
+            return 2;
+        }
+    };
     if p.name.is_empty() {
-        eprintln!("run: missing NAME (the session/turn-folder to drive; \
+        eprintln!(
+            "run: missing NAME (the session/turn-folder to drive; \
                    e.g. `oaita run mytask` — scaffold it with `oaita gen` / \
-                   `oaita add`, or pass --task TEXT to seed it inline)");
+                   `oaita add`, or pass --task TEXT to seed it inline)"
+        );
         return 2;
     }
     // `--inbox` is the explicit marker that we're already running INSIDE
@@ -208,25 +296,41 @@ fn cmd_run(args: &[String]) -> i32 {
         // carries --task into the box but the --inbox guard skips re-adding.
         if let Some(task) = &p.task {
             let target = match target_segment(&p.name) {
-                Ok(t) => t, Err(e) => { eprintln!("{e}"); return 2; }
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("{e}");
+                    return 2;
+                }
             };
-            if let Err(e) = append_turn(&target, "user", task,
-                                        None, None, "", None) {
+            if let Err(e) = append_turn(&target, "user", task, None, None, "", None) {
                 eprintln!("oaita run: seed --task: {e}");
                 return 1;
             }
         }
         return spawn_in_box(&p, args);
     }
-    let set = match Settings::resolve(p.model, p.base_url, p.api_key,
-                                       p.capabilities, p.tool_context.clone(),
-                                       p.sarun.clone(), p.no_sandbox,
-                                       p.depth)
-    { Ok(s) => s, Err(e) => { eprintln!("{e}"); return 1; } };
+    let set = match Settings::resolve(
+        p.model,
+        p.base_url,
+        p.api_key,
+        p.capabilities,
+        p.tool_context.clone(),
+        p.sarun.clone(),
+        p.no_sandbox,
+        p.depth,
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("{e}");
+            return 1;
+        }
+    };
     // In-box driver: grant our pool from --max-steps (default
     // DEFAULT_CLI_MAX_STEPS). Empty box name → engine resolves identity
     // from the broker hint (THIS box).
-    let cli_grant = p.max_steps.map(|n| n as i64)
+    let cli_grant = p
+        .max_steps
+        .map(|n| n as i64)
         .unwrap_or(DEFAULT_CLI_MAX_STEPS as i64);
     if let Err(e) = budget_grant_via_engine("", cli_grant) {
         eprintln!("oaita: budget.grant: {e}");
@@ -236,7 +340,10 @@ fn cmd_run(args: &[String]) -> i32 {
     let exe_ref: Option<&dyn crate::oaita::exec::Executor> = exe.as_deref();
     match run_to_completion(&p.name, &set, exe_ref) {
         Ok(_) => report(&p.name),
-        Err(e) => { eprintln!("oaita: run: {e}"); 1 }
+        Err(e) => {
+            eprintln!("oaita: run: {e}");
+            1
+        }
     }
 }
 
@@ -249,14 +356,17 @@ fn cmd_run(args: &[String]) -> i32 {
 /// /usr/local in the box.
 fn spawn_in_box(p: &Parsed, original_args: &[String]) -> i32 {
     let target = match crate::oaita::turns::target_segment(&p.name) {
-        Ok(t) => t, Err(e) => { eprintln!("{e}"); return 2; }
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("{e}");
+            return 2;
+        }
     };
     // `--on BOX` parents the wrapper box onto an existing box via a dotted
     // session id (engine resolves the prefix as the parent — the same
     // stacking `oci run` uses on image layers).
     let target_box = match &p.on {
-        Some(parent) => format!("{parent}.{}",
-                                crate::oaita::exec::box_name(&target)),
+        Some(parent) => format!("{parent}.{}", crate::oaita::exec::box_name(&target)),
         None => crate::oaita::exec::box_name(&target),
     };
     // Outer `sarun run` runs in the CURRENT context (host, or a parent box):
@@ -274,13 +384,23 @@ fn spawn_in_box(p: &Parsed, original_args: &[String]) -> i32 {
     // Forward the network mode to the OUTER `sarun run` that builds the box
     // (the inner oaita, under --inbox, spawns nothing). Absent → sarun's own
     // default (tap).
-    if let Some(net) = &p.net { cmd.arg("--net").arg(net); }
+    if let Some(net) = &p.net {
+        cmd.arg("--net").arg(net);
+    }
     cmd.arg("--api").arg(&target_box).arg("--");
-    cmd.arg("/proc/self/exe").arg("oaita").arg("run").arg("--inbox");
-    for a in original_args { cmd.arg(a); }
+    cmd.arg("/proc/self/exe")
+        .arg("oaita")
+        .arg("run")
+        .arg("--inbox");
+    for a in original_args {
+        cmd.arg(a);
+    }
     match cmd.status() {
         Ok(s) => s.code().unwrap_or(1),
-        Err(e) => { eprintln!("oaita: spawn sarun: {e}"); 1 }
+        Err(e) => {
+            eprintln!("oaita: spawn sarun: {e}");
+            1
+        }
     }
 }
 
@@ -292,15 +412,12 @@ pub fn budget_grant_via_engine(box_name: &str, amount: i64) -> Result<(), String
     use std::os::unix::net::UnixStream;
     let mut s = if let Ok(name) = std::env::var("SARUN_BROKER") {
         if !name.is_empty() {
-            crate::runner::broker_dial(&name)
-                .map_err(|e| format!("broker dial: {e}"))?
+            crate::runner::broker_dial(&name).map_err(|e| format!("broker dial: {e}"))?
         } else {
-            UnixStream::connect(crate::paths::sock_path())
-                .map_err(|e| format!("connect: {e}"))?
+            UnixStream::connect(crate::paths::sock_path()).map_err(|e| format!("connect: {e}"))?
         }
     } else {
-        UnixStream::connect(crate::paths::sock_path())
-            .map_err(|e| format!("connect: {e}"))?
+        UnixStream::connect(crate::paths::sock_path()).map_err(|e| format!("connect: {e}"))?
     };
     // Empty box name → engine resolves to the conn's broker hint (the
     // box that dialed). Non-empty → engine looks it up by display path.
@@ -313,16 +430,24 @@ pub fn budget_grant_via_engine(box_name: &str, amount: i64) -> Result<(), String
         .map_err(|e| format!("write: {e}"))?;
     let mut line = String::new();
     use std::io::{BufRead, BufReader};
-    BufReader::new(&s).read_line(&mut line)
+    BufReader::new(&s)
+        .read_line(&mut line)
         .map_err(|e| format!("read: {e}"))?;
     Ok(())
 }
 
 fn cmd_tail(args: &[String]) -> i32 {
-    if args.is_empty() { eprintln!("tail: missing NAME"); return 2; }
+    if args.is_empty() {
+        eprintln!("tail: missing NAME");
+        return 2;
+    }
     let name = &args[0];
     let target = match target_segment(name) {
-        Ok(t) => t, Err(e) => { eprintln!("{e}"); return 2; }
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("{e}");
+            return 2;
+        }
     };
     let turns = load_turns(&target);
     let Some(last) = turns.last() else {
@@ -335,17 +460,34 @@ fn cmd_tail(args: &[String]) -> i32 {
 }
 
 fn cmd_add(args: &[String]) -> i32 {
-    let p = match parse(args) { Ok(p) => p, Err(e) => { eprintln!("{e}"); return 2; } };
-    if p.name.is_empty() { eprintln!("add: missing NAME"); return 2; }
+    let p = match parse(args) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("{e}");
+            return 2;
+        }
+    };
+    if p.name.is_empty() {
+        eprintln!("add: missing NAME");
+        return 2;
+    }
     let name = p.name;
     let mut content = String::new();
     if let Err(e) = std::io::stdin().read_to_string(&mut content) {
         eprintln!("oaita: read stdin: {e}");
         return 1;
     }
-    match append_turn(&name, &p.type_, &content, p.slug, p.sender, &p.flags, p.number) {
-        Ok(path) => { println!("{}", path.display()); 0 }
-        Err(e) => { eprintln!("oaita: add: {e}"); 1 }
+    match append_turn(
+        &name, &p.type_, &content, p.slug, p.sender, &p.flags, p.number,
+    ) {
+        Ok(path) => {
+            println!("{}", path.display());
+            0
+        }
+        Err(e) => {
+            eprintln!("oaita: add: {e}");
+            1
+        }
     }
 }
 
@@ -354,12 +496,25 @@ fn cmd_where() -> i32 {
     let sock = crate::paths::sock_path();
     let state = crate::paths::oaita_state_home();
     println!("config:        {}", cfg.display());
-    println!("control sock:  {} (also carries --api proxy via upgrade)", sock.display());
+    println!(
+        "control sock:  {} (also carries --api proxy via upgrade)",
+        sock.display()
+    );
     println!("sessions root: {}", state.display());
     let c = Config::load();
     println!("model:         {}", c.model.as_deref().unwrap_or("(unset)"));
-    println!("base_url:      {}", c.base_url.as_deref().unwrap_or("(unset)"));
-    println!("api_key:       {}", if c.api_key.as_deref().unwrap_or("").is_empty() { "(unset)" } else { "***" });
+    println!(
+        "base_url:      {}",
+        c.base_url.as_deref().unwrap_or("(unset)")
+    );
+    println!(
+        "api_key:       {}",
+        if c.api_key.as_deref().unwrap_or("").is_empty() {
+            "(unset)"
+        } else {
+            "***"
+        }
+    );
     0
 }
 
@@ -382,9 +537,12 @@ fn report(name: &str) -> i32 {
     let Some(last) = crate::oaita::turns::load_turns(name).into_iter().last() else {
         return 0;
     };
-    if last.kind != "assistant" { return 0; }
-    if last.flags.contains('p') || last.flags.contains('c')
-       || last.flags.contains('b') { return 0; }
+    if last.kind != "assistant" {
+        return 0;
+    }
+    if last.flags.contains('p') || last.flags.contains('c') || last.flags.contains('b') {
+        return 0;
+    }
     if let Ok(content) = last.read() {
         use std::io::Write;
         let _ = std::io::stdout().write_all(content.as_bytes());

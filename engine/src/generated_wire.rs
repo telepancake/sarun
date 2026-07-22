@@ -13,7 +13,7 @@
 // source-sha256 engine/pl/grammar_ir.pl 3e1a161ed64f26724368af009591cf1c131b693192b47cccf654f3246046fedc
 // source-sha256 engine/pl/relation_api.pl e87d850a3cfd6a511e49b00bc7497e0c2790a45cf91aa4aa7b833b4b75364f6c
 // source-sha256 engine/pl/context_relation.pl 9ea709548bfd0024a6f8000c0a5b8500fc8d3bc83cb27d8db840c4c6403147c4
-// source-sha256 engine/pl/transport_catalog.pl c2149253cfaf570c5f74db37d6753d6c85c205d606f44138b56181f9ae682e1c
+// source-sha256 engine/pl/transport_catalog.pl 294671bdf4709d54f31903c866cba4b80d350802d5d7100cea9d59a7e1f5d44c
 // source-sha256 engine/pl/wire_codegen.pl 64652e644954f2c801aaef1c96772a52da5f07792d27db006399e800ca58a3c9
 // source-sha256 scripts/wire_codegen.py cebd448fb51f20128aa3ea1f9041cf9c18e7908645e82543efbc5b80af8145fd
 
@@ -196,7 +196,7 @@ impl<T: RelationWireValue> RelationWireValue for Option<T> {
 
 pub const WIRE_PROTOCOL_VERSION: u64 = 1;
 pub const WIRE_SCHEMA_SHA256: &str =
-    "4fea08f27464d60d2127e5260c3337d5533a77ff6a0317b11338313c5848089f";
+    "a9cd498ad98decbdc12be2c2bff135cce578156758004929a8d37480a908ad82";
 pub const LIMIT_FRAME_BYTES: usize = 16777216;
 pub const LIMIT_BLOB_BYTES: usize = 16777216;
 pub const LIMIT_TEXT_BYTES: usize = 1048576;
@@ -317,6 +317,8 @@ impl RelationWireValue for RunBackend {
 pub enum QemuArchitecture {
     Aarch64,
     X8664,
+    Arm,
+    Mmips,
 }
 
 impl WireValue for QemuArchitecture {
@@ -324,6 +326,8 @@ impl WireValue for QemuArchitecture {
         let code = match self {
             Self::Aarch64 => 1,
             Self::X8664 => 2,
+            Self::Arm => 3,
+            Self::Mmips => 4,
         };
         put_u64(output, code);
         Ok(())
@@ -333,6 +337,8 @@ impl WireValue for QemuArchitecture {
         match get_u64(input)? {
             1 => Ok(Self::Aarch64),
             2 => Ok(Self::X8664),
+            3 => Ok(Self::Arm),
+            4 => Ok(Self::Mmips),
             _ => Err(DecodeError::InvalidValue),
         }
     }
@@ -343,8 +349,493 @@ impl RelationWireValue for QemuArchitecture {
         match relation_atom(value)? {
             "aarch64" => Ok(Self::Aarch64),
             "x86_64" => Ok(Self::X8664),
+            "arm" => Ok(Self::Arm),
+            "mmips" => Ok(Self::Mmips),
             case => Err(format!("unknown QemuArchitecture relation case {case}")),
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum DebugMode {
+    Off,
+    AttachBeforeCommand,
+}
+
+impl WireValue for DebugMode {
+    fn encode_atom(&self, output: &mut Vec<u8>) -> Result<(), DecodeError> {
+        let code = match self {
+            Self::Off => 1,
+            Self::AttachBeforeCommand => 2,
+        };
+        put_u64(output, code);
+        Ok(())
+    }
+
+    fn decode_atom(input: &mut &[u8]) -> Result<Self, DecodeError> {
+        match get_u64(input)? {
+            1 => Ok(Self::Off),
+            2 => Ok(Self::AttachBeforeCommand),
+            _ => Err(DecodeError::InvalidValue),
+        }
+    }
+}
+
+impl RelationWireValue for DebugMode {
+    fn from_relation(value: &RelationValue) -> Result<Self, String> {
+        match relation_atom(value)? {
+            "off" => Ok(Self::Off),
+            "attach_before_command" => Ok(Self::AttachBeforeCommand),
+            case => Err(format!("unknown DebugMode relation case {case}")),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum DebugImageProfile {
+    VirtInitramfsAarch64V1,
+    MicrovmInitramfsX8664V1,
+    VirtInitramfsArmV1,
+    MaltaInitramfsMipselV1,
+}
+
+impl WireValue for DebugImageProfile {
+    fn encode_atom(&self, output: &mut Vec<u8>) -> Result<(), DecodeError> {
+        let code = match self {
+            Self::VirtInitramfsAarch64V1 => 1,
+            Self::MicrovmInitramfsX8664V1 => 2,
+            Self::VirtInitramfsArmV1 => 3,
+            Self::MaltaInitramfsMipselV1 => 4,
+        };
+        put_u64(output, code);
+        Ok(())
+    }
+
+    fn decode_atom(input: &mut &[u8]) -> Result<Self, DecodeError> {
+        match get_u64(input)? {
+            1 => Ok(Self::VirtInitramfsAarch64V1),
+            2 => Ok(Self::MicrovmInitramfsX8664V1),
+            3 => Ok(Self::VirtInitramfsArmV1),
+            4 => Ok(Self::MaltaInitramfsMipselV1),
+            _ => Err(DecodeError::InvalidValue),
+        }
+    }
+}
+
+impl RelationWireValue for DebugImageProfile {
+    fn from_relation(value: &RelationValue) -> Result<Self, String> {
+        match relation_atom(value)? {
+            "virt_initramfs_aarch64_v1" => Ok(Self::VirtInitramfsAarch64V1),
+            "microvm_initramfs_x86_64_v1" => Ok(Self::MicrovmInitramfsX8664V1),
+            "virt_initramfs_arm_v1" => Ok(Self::VirtInitramfsArmV1),
+            "malta_initramfs_mipsel_v1" => Ok(Self::MaltaInitramfsMipselV1),
+            case => Err(format!("unknown DebugImageProfile relation case {case}")),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum DebugSourceView {
+    ProviderRoot,
+}
+
+impl WireValue for DebugSourceView {
+    fn encode_atom(&self, output: &mut Vec<u8>) -> Result<(), DecodeError> {
+        let code = match self {
+            Self::ProviderRoot => 1,
+        };
+        put_u64(output, code);
+        Ok(())
+    }
+
+    fn decode_atom(input: &mut &[u8]) -> Result<Self, DecodeError> {
+        match get_u64(input)? {
+            1 => Ok(Self::ProviderRoot),
+            _ => Err(DecodeError::InvalidValue),
+        }
+    }
+}
+
+impl RelationWireValue for DebugSourceView {
+    fn from_relation(value: &RelationValue) -> Result<Self, String> {
+        match relation_atom(value)? {
+            "provider_root" => Ok(Self::ProviderRoot),
+            case => Err(format!("unknown DebugSourceView relation case {case}")),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SelectedArtifact {
+    pub r#box: BoxSelector,
+    pub path: Path,
+}
+
+impl WireValue for SelectedArtifact {
+    fn encode_atom(&self, output: &mut Vec<u8>) -> Result<(), DecodeError> {
+        let mut fields = Vec::new();
+        self.r#box.encode_atom(&mut fields)?;
+        self.path.encode_atom(&mut fields)?;
+        put_compound_payload(output, &fields)
+    }
+
+    fn decode_atom(input: &mut &[u8]) -> Result<Self, DecodeError> {
+        let mut fields = get_atom(input, LIMIT_FRAME_BYTES)?;
+        let value = Self {
+            r#box: <BoxSelector as WireValue>::decode_atom(&mut fields)?,
+            path: <Path as WireValue>::decode_atom(&mut fields)?,
+        };
+        require_empty(fields)?;
+        Ok(value)
+    }
+}
+
+impl RelationWireValue for SelectedArtifact {
+    fn from_relation(value: &RelationValue) -> Result<Self, String> {
+        let fields = relation_compound(value, "record")?;
+        require_relation_arity(fields, 2)?;
+        let mut fields = fields.iter();
+        Ok(Self {
+            r#box: <BoxSelector as RelationWireValue>::from_relation(fields.next().unwrap())?,
+            path: <Path as RelationWireValue>::from_relation(fields.next().unwrap())?,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum SelectedBoot {
+    Image {
+        image: SelectedArtifact,
+    },
+    KernelInitramfs {
+        kernel: SelectedArtifact,
+        initramfs: SelectedArtifact,
+    },
+}
+
+impl SelectedBoot {
+    pub const fn code(&self) -> u64 {
+        match self {
+            Self::Image { .. } => 1,
+            Self::KernelInitramfs { .. } => 2,
+        }
+    }
+}
+
+impl WireValue for SelectedBoot {
+    fn encode_atom(&self, output: &mut Vec<u8>) -> Result<(), DecodeError> {
+        let mut fields = Vec::new();
+        put_u64(&mut fields, self.code());
+        match self {
+            Self::Image { image } => {
+                image.encode_atom(&mut fields)?;
+            }
+            Self::KernelInitramfs { kernel, initramfs } => {
+                kernel.encode_atom(&mut fields)?;
+                initramfs.encode_atom(&mut fields)?;
+            }
+        }
+        put_compound_payload(output, &fields)
+    }
+
+    fn decode_atom(input: &mut &[u8]) -> Result<Self, DecodeError> {
+        let mut fields = get_atom(input, LIMIT_FRAME_BYTES)?;
+        let value = match get_u64(&mut fields)? {
+            1 => Self::Image {
+                image: <SelectedArtifact as WireValue>::decode_atom(&mut fields)?,
+            },
+            2 => Self::KernelInitramfs {
+                kernel: <SelectedArtifact as WireValue>::decode_atom(&mut fields)?,
+                initramfs: <SelectedArtifact as WireValue>::decode_atom(&mut fields)?,
+            },
+            _ => return Err(DecodeError::InvalidValue),
+        };
+        require_empty(fields)?;
+        Ok(value)
+    }
+}
+
+impl RelationWireValue for SelectedBoot {
+    fn from_relation(value: &RelationValue) -> Result<Self, String> {
+        let (case, fields): (&str, &[RelationValue]) = match value {
+            RelationValue::Atom(case) => (case, &[]),
+            RelationValue::Compound(case, fields) => (case, fields),
+            _ => return Err("expected SelectedBoot relation choice".into()),
+        };
+        match case {
+            "image" => {
+                require_relation_arity(fields, 1)?;
+                let mut fields = fields.iter();
+                Ok(Self::Image {
+                    image: <SelectedArtifact as RelationWireValue>::from_relation(
+                        fields.next().unwrap(),
+                    )?,
+                })
+            }
+            "kernel_initramfs" => {
+                require_relation_arity(fields, 2)?;
+                let mut fields = fields.iter();
+                Ok(Self::KernelInitramfs {
+                    kernel: <SelectedArtifact as RelationWireValue>::from_relation(
+                        fields.next().unwrap(),
+                    )?,
+                    initramfs: <SelectedArtifact as RelationWireValue>::from_relation(
+                        fields.next().unwrap(),
+                    )?,
+                })
+            }
+            _ => Err(format!("unknown SelectedBoot relation choice {case}")),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DebugExecutable {
+    pub guest_path: Path,
+    pub build_id: BoundedBytes<LIMIT_SHORT_BYTES>,
+    pub runtime_sha256: FixedBytes<32>,
+    pub runtime_size: u64,
+    pub debug_elf: Path,
+    pub debug_sha256: FixedBytes<32>,
+    pub debug_size: u64,
+    pub elf_class: u16,
+    pub elf_machine: u16,
+    pub source_view: DebugSourceView,
+}
+
+impl WireValue for DebugExecutable {
+    fn encode_atom(&self, output: &mut Vec<u8>) -> Result<(), DecodeError> {
+        let mut fields = Vec::new();
+        self.guest_path.encode_atom(&mut fields)?;
+        self.build_id.encode_atom(&mut fields)?;
+        self.runtime_sha256.encode_atom(&mut fields)?;
+        self.runtime_size.encode_atom(&mut fields)?;
+        self.debug_elf.encode_atom(&mut fields)?;
+        self.debug_sha256.encode_atom(&mut fields)?;
+        self.debug_size.encode_atom(&mut fields)?;
+        self.elf_class.encode_atom(&mut fields)?;
+        self.elf_machine.encode_atom(&mut fields)?;
+        self.source_view.encode_atom(&mut fields)?;
+        put_compound_payload(output, &fields)
+    }
+
+    fn decode_atom(input: &mut &[u8]) -> Result<Self, DecodeError> {
+        let mut fields = get_atom(input, LIMIT_FRAME_BYTES)?;
+        let value = Self {
+            guest_path: <Path as WireValue>::decode_atom(&mut fields)?,
+            build_id: <BoundedBytes<LIMIT_SHORT_BYTES> as WireValue>::decode_atom(&mut fields)?,
+            runtime_sha256: <FixedBytes<32> as WireValue>::decode_atom(&mut fields)?,
+            runtime_size: <u64 as WireValue>::decode_atom(&mut fields)?,
+            debug_elf: <Path as WireValue>::decode_atom(&mut fields)?,
+            debug_sha256: <FixedBytes<32> as WireValue>::decode_atom(&mut fields)?,
+            debug_size: <u64 as WireValue>::decode_atom(&mut fields)?,
+            elf_class: <u16 as WireValue>::decode_atom(&mut fields)?,
+            elf_machine: <u16 as WireValue>::decode_atom(&mut fields)?,
+            source_view: <DebugSourceView as WireValue>::decode_atom(&mut fields)?,
+        };
+        require_empty(fields)?;
+        Ok(value)
+    }
+}
+
+impl RelationWireValue for DebugExecutable {
+    fn from_relation(value: &RelationValue) -> Result<Self, String> {
+        let fields = relation_compound(value, "record")?;
+        require_relation_arity(fields, 10)?;
+        let mut fields = fields.iter();
+        Ok(Self {
+            guest_path: <Path as RelationWireValue>::from_relation(fields.next().unwrap())?,
+            build_id: <BoundedBytes<LIMIT_SHORT_BYTES> as RelationWireValue>::from_relation(
+                fields.next().unwrap(),
+            )?,
+            runtime_sha256: <FixedBytes<32> as RelationWireValue>::from_relation(
+                fields.next().unwrap(),
+            )?,
+            runtime_size: <u64 as RelationWireValue>::from_relation(fields.next().unwrap())?,
+            debug_elf: <Path as RelationWireValue>::from_relation(fields.next().unwrap())?,
+            debug_sha256: <FixedBytes<32> as RelationWireValue>::from_relation(
+                fields.next().unwrap(),
+            )?,
+            debug_size: <u64 as RelationWireValue>::from_relation(fields.next().unwrap())?,
+            elf_class: <u16 as RelationWireValue>::from_relation(fields.next().unwrap())?,
+            elf_machine: <u16 as RelationWireValue>::from_relation(fields.next().unwrap())?,
+            source_view: <DebugSourceView as RelationWireValue>::from_relation(
+                fields.next().unwrap(),
+            )?,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DebugImageCatalog {
+    pub manifest: Path,
+    pub profile: DebugImageProfile,
+    pub init: Path,
+    pub executables: BoundedVec<DebugExecutable, 0, LIMIT_COLLECTION_ITEMS>,
+}
+
+impl WireValue for DebugImageCatalog {
+    fn encode_atom(&self, output: &mut Vec<u8>) -> Result<(), DecodeError> {
+        let mut fields = Vec::new();
+        self.manifest.encode_atom(&mut fields)?;
+        self.profile.encode_atom(&mut fields)?;
+        self.init.encode_atom(&mut fields)?;
+        self.executables.encode_atom(&mut fields)?;
+        put_compound_payload(output, &fields)
+    }
+
+    fn decode_atom(input: &mut &[u8]) -> Result<Self, DecodeError> {
+        let mut fields = get_atom(input, LIMIT_FRAME_BYTES)?;
+        let value = Self {
+            manifest: <Path as WireValue>::decode_atom(&mut fields)?,
+            profile: <DebugImageProfile as WireValue>::decode_atom(&mut fields)?,
+            init: <Path as WireValue>::decode_atom(&mut fields)?,
+            executables:
+                <BoundedVec<DebugExecutable, 0, LIMIT_COLLECTION_ITEMS> as WireValue>::decode_atom(
+                    &mut fields,
+                )?,
+        };
+        require_empty(fields)?;
+        Ok(value)
+    }
+}
+
+impl RelationWireValue for DebugImageCatalog {
+    fn from_relation(value: &RelationValue) -> Result<Self, String> {
+        let fields = relation_compound(value, "record")?;
+        require_relation_arity(fields, 4)?;
+        let mut fields = fields.iter();
+        Ok(Self {
+            manifest: <Path as RelationWireValue>::from_relation(fields.next().unwrap())?,
+            profile: <DebugImageProfile as RelationWireValue>::from_relation(fields.next().unwrap())?,
+            init: <Path as RelationWireValue>::from_relation(fields.next().unwrap())?,
+            executables: <BoundedVec<DebugExecutable, 0, LIMIT_COLLECTION_ITEMS> as RelationWireValue>::from_relation(fields.next().unwrap())?,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DebugGuestImageStart {
+    pub profile: DebugImageProfile,
+    pub init: Path,
+}
+
+impl WireValue for DebugGuestImageStart {
+    fn encode_atom(&self, output: &mut Vec<u8>) -> Result<(), DecodeError> {
+        let mut fields = Vec::new();
+        self.profile.encode_atom(&mut fields)?;
+        self.init.encode_atom(&mut fields)?;
+        put_compound_payload(output, &fields)
+    }
+
+    fn decode_atom(input: &mut &[u8]) -> Result<Self, DecodeError> {
+        let mut fields = get_atom(input, LIMIT_FRAME_BYTES)?;
+        let value = Self {
+            profile: <DebugImageProfile as WireValue>::decode_atom(&mut fields)?,
+            init: <Path as WireValue>::decode_atom(&mut fields)?,
+        };
+        require_empty(fields)?;
+        Ok(value)
+    }
+}
+
+impl RelationWireValue for DebugGuestImageStart {
+    fn from_relation(value: &RelationValue) -> Result<Self, String> {
+        let fields = relation_compound(value, "record")?;
+        require_relation_arity(fields, 2)?;
+        let mut fields = fields.iter();
+        Ok(Self {
+            profile: <DebugImageProfile as RelationWireValue>::from_relation(
+                fields.next().unwrap(),
+            )?,
+            init: <Path as RelationWireValue>::from_relation(fields.next().unwrap())?,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DebugProviderStart {
+    pub manifest: Path,
+    pub service: ServiceName,
+    pub image: Option<DebugImageCatalog>,
+}
+
+impl WireValue for DebugProviderStart {
+    fn encode_atom(&self, output: &mut Vec<u8>) -> Result<(), DecodeError> {
+        let mut fields = Vec::new();
+        self.manifest.encode_atom(&mut fields)?;
+        self.service.encode_atom(&mut fields)?;
+        self.image.encode_atom(&mut fields)?;
+        put_compound_payload(output, &fields)
+    }
+
+    fn decode_atom(input: &mut &[u8]) -> Result<Self, DecodeError> {
+        let mut fields = get_atom(input, LIMIT_FRAME_BYTES)?;
+        let value = Self {
+            manifest: <Path as WireValue>::decode_atom(&mut fields)?,
+            service: <ServiceName as WireValue>::decode_atom(&mut fields)?,
+            image: <Option<DebugImageCatalog> as WireValue>::decode_atom(&mut fields)?,
+        };
+        require_empty(fields)?;
+        Ok(value)
+    }
+}
+
+impl RelationWireValue for DebugProviderStart {
+    fn from_relation(value: &RelationValue) -> Result<Self, String> {
+        let fields = relation_compound(value, "record")?;
+        require_relation_arity(fields, 3)?;
+        let mut fields = fields.iter();
+        Ok(Self {
+            manifest: <Path as RelationWireValue>::from_relation(fields.next().unwrap())?,
+            service: <ServiceName as RelationWireValue>::from_relation(fields.next().unwrap())?,
+            image: <Option<DebugImageCatalog> as RelationWireValue>::from_relation(
+                fields.next().unwrap(),
+            )?,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DebugClientStart {
+    pub manifest: Path,
+    pub image: Option<DebugImageCatalog>,
+    pub service: ServiceName,
+}
+
+impl WireValue for DebugClientStart {
+    fn encode_atom(&self, output: &mut Vec<u8>) -> Result<(), DecodeError> {
+        let mut fields = Vec::new();
+        self.manifest.encode_atom(&mut fields)?;
+        self.image.encode_atom(&mut fields)?;
+        self.service.encode_atom(&mut fields)?;
+        put_compound_payload(output, &fields)
+    }
+
+    fn decode_atom(input: &mut &[u8]) -> Result<Self, DecodeError> {
+        let mut fields = get_atom(input, LIMIT_FRAME_BYTES)?;
+        let value = Self {
+            manifest: <Path as WireValue>::decode_atom(&mut fields)?,
+            image: <Option<DebugImageCatalog> as WireValue>::decode_atom(&mut fields)?,
+            service: <ServiceName as WireValue>::decode_atom(&mut fields)?,
+        };
+        require_empty(fields)?;
+        Ok(value)
+    }
+}
+
+impl RelationWireValue for DebugClientStart {
+    fn from_relation(value: &RelationValue) -> Result<Self, String> {
+        let fields = relation_compound(value, "record")?;
+        require_relation_arity(fields, 3)?;
+        let mut fields = fields.iter();
+        Ok(Self {
+            manifest: <Path as RelationWireValue>::from_relation(fields.next().unwrap())?,
+            image: <Option<DebugImageCatalog> as RelationWireValue>::from_relation(
+                fields.next().unwrap(),
+            )?,
+            service: <ServiceName as RelationWireValue>::from_relation(fields.next().unwrap())?,
+        })
     }
 }
 
@@ -796,6 +1287,7 @@ pub struct RegisterReply {
     pub no_host: bool,
     pub oci: Option<OciRuntime>,
     pub virtiofs_socket: Option<Path>,
+    pub debug_image: Option<DebugGuestImageStart>,
 }
 
 impl WireValue for RegisterReply {
@@ -813,6 +1305,7 @@ impl WireValue for RegisterReply {
         self.no_host.encode_atom(&mut fields)?;
         self.oci.encode_atom(&mut fields)?;
         self.virtiofs_socket.encode_atom(&mut fields)?;
+        self.debug_image.encode_atom(&mut fields)?;
         put_compound_payload(output, &fields)
     }
 
@@ -833,6 +1326,7 @@ impl WireValue for RegisterReply {
             no_host: <bool as WireValue>::decode_atom(&mut fields)?,
             oci: <Option<OciRuntime> as WireValue>::decode_atom(&mut fields)?,
             virtiofs_socket: <Option<Path> as WireValue>::decode_atom(&mut fields)?,
+            debug_image: <Option<DebugGuestImageStart> as WireValue>::decode_atom(&mut fields)?,
         };
         require_empty(fields)?;
         Ok(value)
@@ -842,7 +1336,7 @@ impl WireValue for RegisterReply {
 impl RelationWireValue for RegisterReply {
     fn from_relation(value: &RelationValue) -> Result<Self, String> {
         let fields = relation_compound(value, "record")?;
-        require_relation_arity(fields, 12)?;
+        require_relation_arity(fields, 13)?;
         let mut fields = fields.iter();
         Ok(Self {
             mount: <Path as RelationWireValue>::from_relation(fields.next().unwrap())?,
@@ -864,6 +1358,9 @@ impl RelationWireValue for RegisterReply {
             virtiofs_socket: <Option<Path> as RelationWireValue>::from_relation(
                 fields.next().unwrap(),
             )?,
+            debug_image: <Option<DebugGuestImageStart> as RelationWireValue>::from_relation(
+                fields.next().unwrap(),
+            )?,
         })
     }
 }
@@ -874,6 +1371,7 @@ pub struct ApplianceCommand {
     pub cwd: Option<Path>,
     pub environment: Environment,
     pub net_mode: NetMode,
+    pub debug_mode: DebugMode,
 }
 
 impl WireValue for ApplianceCommand {
@@ -883,6 +1381,7 @@ impl WireValue for ApplianceCommand {
         self.cwd.encode_atom(&mut fields)?;
         self.environment.encode_atom(&mut fields)?;
         self.net_mode.encode_atom(&mut fields)?;
+        self.debug_mode.encode_atom(&mut fields)?;
         put_compound_payload(output, &fields)
     }
 
@@ -895,6 +1394,7 @@ impl WireValue for ApplianceCommand {
             cwd: <Option<Path> as WireValue>::decode_atom(&mut fields)?,
             environment: <Environment as WireValue>::decode_atom(&mut fields)?,
             net_mode: <NetMode as WireValue>::decode_atom(&mut fields)?,
+            debug_mode: <DebugMode as WireValue>::decode_atom(&mut fields)?,
         };
         require_empty(fields)?;
         Ok(value)
@@ -904,7 +1404,7 @@ impl WireValue for ApplianceCommand {
 impl RelationWireValue for ApplianceCommand {
     fn from_relation(value: &RelationValue) -> Result<Self, String> {
         let fields = relation_compound(value, "record")?;
-        require_relation_arity(fields, 4)?;
+        require_relation_arity(fields, 5)?;
         let mut fields = fields.iter();
         Ok(Self {
             command:
@@ -914,6 +1414,7 @@ impl RelationWireValue for ApplianceCommand {
             cwd: <Option<Path> as RelationWireValue>::from_relation(fields.next().unwrap())?,
             environment: <Environment as RelationWireValue>::from_relation(fields.next().unwrap())?,
             net_mode: <NetMode as RelationWireValue>::from_relation(fields.next().unwrap())?,
+            debug_mode: <DebugMode as RelationWireValue>::from_relation(fields.next().unwrap())?,
         })
     }
 }
@@ -11402,6 +11903,8 @@ pub enum TransportRequest {
         name: RegistrationName,
         backend: RunBackend,
         architecture: Option<QemuArchitecture>,
+        debug_mode: DebugMode,
+        selected_boot: Option<SelectedBoot>,
         net_mode: NetMode,
         capture: bool,
         direct: bool,
@@ -11449,6 +11952,7 @@ pub enum TransportRequest {
     ServiceDeclare {
         name: ServiceName,
         argv: BoundedVec<OsString, 1, LIMIT_COMMAND_ITEMS>,
+        client_argv: BoundedVec<OsString, 0, LIMIT_COMMAND_ITEMS>,
         net_mode: Option<NetMode>,
     },
     ServiceAccept {
@@ -11497,6 +12001,8 @@ impl WireValue for TransportRequest {
                 name,
                 backend,
                 architecture,
+                debug_mode,
+                selected_boot,
                 net_mode,
                 capture,
                 direct,
@@ -11514,6 +12020,8 @@ impl WireValue for TransportRequest {
                 name.encode_atom(&mut fields)?;
                 backend.encode_atom(&mut fields)?;
                 architecture.encode_atom(&mut fields)?;
+                debug_mode.encode_atom(&mut fields)?;
+                selected_boot.encode_atom(&mut fields)?;
                 net_mode.encode_atom(&mut fields)?;
                 capture.encode_atom(&mut fields)?;
                 direct.encode_atom(&mut fields)?;
@@ -11574,10 +12082,12 @@ impl WireValue for TransportRequest {
             Self::ServiceDeclare {
                 name,
                 argv,
+                client_argv,
                 net_mode,
             } => {
                 name.encode_atom(&mut fields)?;
                 argv.encode_atom(&mut fields)?;
+                client_argv.encode_atom(&mut fields)?;
                 net_mode.encode_atom(&mut fields)?;
             }
             Self::ServiceAccept { name } => {
@@ -11604,6 +12114,8 @@ impl WireValue for TransportRequest {
                 name: <RegistrationName as WireValue>::decode_atom(&mut fields)?,
                 backend: <RunBackend as WireValue>::decode_atom(&mut fields)?,
                 architecture: <Option<QemuArchitecture> as WireValue>::decode_atom(&mut fields)?,
+                debug_mode: <DebugMode as WireValue>::decode_atom(&mut fields)?,
+                selected_boot: <Option<SelectedBoot> as WireValue>::decode_atom(&mut fields)?,
                 net_mode: <NetMode as WireValue>::decode_atom(&mut fields)?,
                 capture: <bool as WireValue>::decode_atom(&mut fields)?,
                 direct: <bool as WireValue>::decode_atom(&mut fields)?,
@@ -11651,6 +12163,7 @@ impl WireValue for TransportRequest {
             267 => Self::ServiceDeclare {
                 name: <ServiceName as WireValue>::decode_atom(&mut fields)?,
                 argv: <BoundedVec<OsString, 1, LIMIT_COMMAND_ITEMS> as WireValue>::decode_atom(&mut fields)?,
+                client_argv: <BoundedVec<OsString, 0, LIMIT_COMMAND_ITEMS> as WireValue>::decode_atom(&mut fields)?,
                 net_mode: <Option<NetMode> as WireValue>::decode_atom(&mut fields)?,
             },
             268 => Self::ServiceAccept {
@@ -11683,7 +12196,7 @@ impl RelationWireValue for TransportRequest {
                 Ok(Self::Subscribe)
             }
             "register" => {
-                require_relation_arity(fields, 16)?;
+                require_relation_arity(fields, 18)?;
                 let mut fields = fields.iter();
                 Ok(Self::Register {
                     command: <BoundedVec<OsString, 0, LIMIT_COMMAND_ITEMS> as RelationWireValue>::from_relation(fields.next().unwrap())?,
@@ -11691,6 +12204,8 @@ impl RelationWireValue for TransportRequest {
                     name: <RegistrationName as RelationWireValue>::from_relation(fields.next().unwrap())?,
                     backend: <RunBackend as RelationWireValue>::from_relation(fields.next().unwrap())?,
                     architecture: <Option<QemuArchitecture> as RelationWireValue>::from_relation(fields.next().unwrap())?,
+                    debug_mode: <DebugMode as RelationWireValue>::from_relation(fields.next().unwrap())?,
+                    selected_boot: <Option<SelectedBoot> as RelationWireValue>::from_relation(fields.next().unwrap())?,
                     net_mode: <NetMode as RelationWireValue>::from_relation(fields.next().unwrap())?,
                     capture: <bool as RelationWireValue>::from_relation(fields.next().unwrap())?,
                     direct: <bool as RelationWireValue>::from_relation(fields.next().unwrap())?,
@@ -11774,11 +12289,12 @@ impl RelationWireValue for TransportRequest {
                 Ok(Self::ApiProxy)
             }
             "service_declare" => {
-                require_relation_arity(fields, 3)?;
+                require_relation_arity(fields, 4)?;
                 let mut fields = fields.iter();
                 Ok(Self::ServiceDeclare {
                     name: <ServiceName as RelationWireValue>::from_relation(fields.next().unwrap())?,
                     argv: <BoundedVec<OsString, 1, LIMIT_COMMAND_ITEMS> as RelationWireValue>::from_relation(fields.next().unwrap())?,
+                    client_argv: <BoundedVec<OsString, 0, LIMIT_COMMAND_ITEMS> as RelationWireValue>::from_relation(fields.next().unwrap())?,
                     net_mode: <Option<NetMode> as RelationWireValue>::from_relation(fields.next().unwrap())?,
                 })
             }
@@ -12090,6 +12606,7 @@ pub const SUBSCRIPTION_EVENT_IDENTITIES: &[(&str, u64)] = &[
     ("api_log_added", 8),
     ("web_capture_added", 9),
     ("pong", 10),
+    ("debug_console_ready", 11),
 ];
 
 #[derive(Clone, Debug, PartialEq)]
@@ -12130,6 +12647,10 @@ pub enum SubscriptionEvent {
         r#box: BoxId,
     },
     Pong,
+    DebugConsoleReady {
+        r#box: BoxId,
+        service: ServiceName,
+    },
 }
 
 impl SubscriptionEvent {
@@ -12145,6 +12666,7 @@ impl SubscriptionEvent {
             Self::ApiLogAdded { .. } => 8,
             Self::WebCaptureAdded { .. } => 9,
             Self::Pong => 10,
+            Self::DebugConsoleReady { .. } => 11,
         }
     }
 }
@@ -12198,6 +12720,10 @@ impl WireValue for SubscriptionEvent {
                 r#box.encode_atom(&mut fields)?;
             }
             Self::Pong => {}
+            Self::DebugConsoleReady { r#box, service } => {
+                r#box.encode_atom(&mut fields)?;
+                service.encode_atom(&mut fields)?;
+            }
         }
         put_compound_payload(output, &fields)
     }
@@ -12243,6 +12769,10 @@ impl WireValue for SubscriptionEvent {
                 r#box: <BoxId as WireValue>::decode_atom(&mut fields)?,
             },
             10 => Self::Pong,
+            11 => Self::DebugConsoleReady {
+                r#box: <BoxId as WireValue>::decode_atom(&mut fields)?,
+                service: <ServiceName as WireValue>::decode_atom(&mut fields)?,
+            },
             _ => return Err(DecodeError::InvalidValue),
         };
         require_empty(fields)?;
@@ -12337,6 +12867,16 @@ impl RelationWireValue for SubscriptionEvent {
                 require_relation_arity(fields, 0)?;
                 Ok(Self::Pong)
             }
+            "debug_console_ready" => {
+                require_relation_arity(fields, 2)?;
+                let mut fields = fields.iter();
+                Ok(Self::DebugConsoleReady {
+                    r#box: <BoxId as RelationWireValue>::from_relation(fields.next().unwrap())?,
+                    service: <ServiceName as RelationWireValue>::from_relation(
+                        fields.next().unwrap(),
+                    )?,
+                })
+            }
             _ => Err(format!("unknown SubscriptionEvent relation choice {case}")),
         }
     }
@@ -12394,6 +12934,8 @@ pub const BOX_FRAME_IDENTITIES: &[(&str, u64)] = &[
     ("guest_process", 7),
     ("open_connection", 13),
     ("connection", 14),
+    ("debug_prepared", 18),
+    ("debug_start", 19),
 ];
 
 #[derive(Clone, Debug, PartialEq)]
@@ -12413,6 +12955,8 @@ pub enum BoxFrame {
     },
     OpenConnection,
     Connection,
+    DebugPrepared,
+    DebugStart,
 }
 
 impl BoxFrame {
@@ -12426,6 +12970,8 @@ impl BoxFrame {
             Self::GuestProcess { .. } => 7,
             Self::OpenConnection => 13,
             Self::Connection => 14,
+            Self::DebugPrepared => 18,
+            Self::DebugStart => 19,
         }
     }
 }
@@ -12450,6 +12996,8 @@ impl WireValue for BoxFrame {
             }
             Self::OpenConnection => {}
             Self::Connection => {}
+            Self::DebugPrepared => {}
+            Self::DebugStart => {}
         }
         put_compound_payload(output, &fields)
     }
@@ -12474,6 +13022,8 @@ impl WireValue for BoxFrame {
             },
             13 => Self::OpenConnection,
             14 => Self::Connection,
+            18 => Self::DebugPrepared,
+            19 => Self::DebugStart,
             _ => return Err(DecodeError::InvalidValue),
         };
         require_empty(fields)?;
@@ -12535,6 +13085,14 @@ impl RelationWireValue for BoxFrame {
                 require_relation_arity(fields, 0)?;
                 Ok(Self::Connection)
             }
+            "debug_prepared" => {
+                require_relation_arity(fields, 0)?;
+                Ok(Self::DebugPrepared)
+            }
+            "debug_start" => {
+                require_relation_arity(fields, 0)?;
+                Ok(Self::DebugStart)
+            }
             _ => Err(format!("unknown BoxFrame relation choice {case}")),
         }
     }
@@ -12550,6 +13108,8 @@ pub const APPLIANCE_FRAME_IDENTITIES: &[(&str, u64)] = &[
     ("result", 7),
     ("ready", 8),
     ("process", 9),
+    ("debug_prepared", 10),
+    ("debug_start", 11),
 ];
 
 #[derive(Clone, Debug, PartialEq)]
@@ -12584,6 +13144,8 @@ pub enum ApplianceFrame {
     Process {
         event: GuestProcessEvent,
     },
+    DebugPrepared,
+    DebugStart,
 }
 
 impl ApplianceFrame {
@@ -12598,6 +13160,8 @@ impl ApplianceFrame {
             Self::Result { .. } => 7,
             Self::Ready => 8,
             Self::Process { .. } => 9,
+            Self::DebugPrepared => 10,
+            Self::DebugStart => 11,
         }
     }
 }
@@ -12637,6 +13201,8 @@ impl WireValue for ApplianceFrame {
             Self::Process { event } => {
                 event.encode_atom(&mut fields)?;
             }
+            Self::DebugPrepared => {}
+            Self::DebugStart => {}
         }
         put_compound_payload(output, &fields)
     }
@@ -12678,6 +13244,8 @@ impl WireValue for ApplianceFrame {
             9 => Self::Process {
                 event: <GuestProcessEvent as WireValue>::decode_atom(&mut fields)?,
             },
+            10 => Self::DebugPrepared,
+            11 => Self::DebugStart,
             _ => return Err(DecodeError::InvalidValue),
         };
         require_empty(fields)?;
@@ -12761,6 +13329,14 @@ impl RelationWireValue for ApplianceFrame {
                         fields.next().unwrap(),
                     )?,
                 })
+            }
+            "debug_prepared" => {
+                require_relation_arity(fields, 0)?;
+                Ok(Self::DebugPrepared)
+            }
+            "debug_start" => {
+                require_relation_arity(fields, 0)?;
+                Ok(Self::DebugStart)
             }
             _ => Err(format!("unknown ApplianceFrame relation choice {case}")),
         }
@@ -12949,6 +13525,67 @@ mod generated_tests {
         roundtrip(RunBackend::Qemu);
         roundtrip(QemuArchitecture::Aarch64);
         roundtrip(QemuArchitecture::X8664);
+        roundtrip(QemuArchitecture::Arm);
+        roundtrip(QemuArchitecture::Mmips);
+        roundtrip(DebugMode::Off);
+        roundtrip(DebugMode::AttachBeforeCommand);
+        roundtrip(DebugImageProfile::VirtInitramfsAarch64V1);
+        roundtrip(DebugImageProfile::MicrovmInitramfsX8664V1);
+        roundtrip(DebugImageProfile::VirtInitramfsArmV1);
+        roundtrip(DebugImageProfile::MaltaInitramfsMipselV1);
+        roundtrip(DebugSourceView::ProviderRoot);
+        roundtrip::<SelectedArtifact>(SelectedArtifact {
+            r#box: BoundedText::new(String::new()).unwrap(),
+            path: BoundedBytes::new(Vec::new()).unwrap(),
+        });
+        roundtrip(SelectedBoot::Image {
+            image: SelectedArtifact {
+                r#box: BoundedText::new(String::new()).unwrap(),
+                path: BoundedBytes::new(Vec::new()).unwrap(),
+            },
+        });
+        roundtrip(SelectedBoot::KernelInitramfs {
+            kernel: SelectedArtifact {
+                r#box: BoundedText::new(String::new()).unwrap(),
+                path: BoundedBytes::new(Vec::new()).unwrap(),
+            },
+            initramfs: SelectedArtifact {
+                r#box: BoundedText::new(String::new()).unwrap(),
+                path: BoundedBytes::new(Vec::new()).unwrap(),
+            },
+        });
+        roundtrip::<DebugExecutable>(DebugExecutable {
+            guest_path: BoundedBytes::new(Vec::new()).unwrap(),
+            build_id: BoundedBytes::new(Vec::new()).unwrap(),
+            runtime_sha256: FixedBytes([0u8; 32]),
+            runtime_size: 0u64,
+            debug_elf: BoundedBytes::new(Vec::new()).unwrap(),
+            debug_sha256: FixedBytes([0u8; 32]),
+            debug_size: 0u64,
+            elf_class: 0u16,
+            elf_machine: 0u16,
+            source_view: DebugSourceView::ProviderRoot,
+        });
+        roundtrip::<DebugImageCatalog>(DebugImageCatalog {
+            manifest: BoundedBytes::new(Vec::new()).unwrap(),
+            profile: DebugImageProfile::VirtInitramfsAarch64V1,
+            init: BoundedBytes::new(Vec::new()).unwrap(),
+            executables: BoundedVec::new(vec![]).unwrap(),
+        });
+        roundtrip::<DebugGuestImageStart>(DebugGuestImageStart {
+            profile: DebugImageProfile::VirtInitramfsAarch64V1,
+            init: BoundedBytes::new(Vec::new()).unwrap(),
+        });
+        roundtrip::<DebugProviderStart>(DebugProviderStart {
+            manifest: BoundedBytes::new(Vec::new()).unwrap(),
+            service: BoundedText::new(String::new()).unwrap(),
+            image: None,
+        });
+        roundtrip::<DebugClientStart>(DebugClientStart {
+            manifest: BoundedBytes::new(Vec::new()).unwrap(),
+            image: None,
+            service: BoundedText::new(String::new()).unwrap(),
+        });
         roundtrip(ErrorCategory::InvalidRequest);
         roundtrip(ErrorCategory::NotFound);
         roundtrip(ErrorCategory::Conflict);
@@ -13011,12 +13648,14 @@ mod generated_tests {
             no_host: false,
             oci: None,
             virtiofs_socket: None,
+            debug_image: None,
         });
         roundtrip::<ApplianceCommand>(ApplianceCommand {
             command: BoundedVec::new(vec![BoundedBytes::new(Vec::new()).unwrap()]).unwrap(),
             cwd: None,
             environment: BoundedMap::new(BTreeMap::new()).unwrap(),
             net_mode: NetMode::Off,
+            debug_mode: DebugMode::Off,
         });
         roundtrip::<ApplianceRunRequest>(ApplianceRunRequest {
             architecture: QemuArchitecture::Aarch64,
@@ -14345,6 +14984,8 @@ mod generated_tests {
                 name: RegistrationName::Automatic,
                 backend: RunBackend::Fuse,
                 architecture: None,
+                debug_mode: DebugMode::Off,
+                selected_boot: None,
                 net_mode: NetMode::Off,
                 capture: false,
                 direct: false,
@@ -14432,6 +15073,7 @@ mod generated_tests {
             TransportRequest::ServiceDeclare {
                 name: BoundedText::new(String::new()).unwrap(),
                 argv: BoundedVec::new(vec![BoundedBytes::new(Vec::new()).unwrap()]).unwrap(),
+                client_argv: BoundedVec::new(vec![]).unwrap(),
                 net_mode: None,
             },
             TransportRequest::ServiceAccept {
@@ -14494,6 +15136,7 @@ mod generated_tests {
                     no_host: false,
                     oci: None,
                     virtiofs_socket: None,
+                    debug_image: None,
                 },
             },
             ConnectionMode::Pty,
@@ -14541,6 +15184,10 @@ mod generated_tests {
             SubscriptionEvent::ApiLogAdded { r#box: 0u64 },
             SubscriptionEvent::WebCaptureAdded { r#box: 0u64 },
             SubscriptionEvent::Pong,
+            SubscriptionEvent::DebugConsoleReady {
+                r#box: 0u64,
+                service: BoundedText::new(String::new()).unwrap(),
+            },
         ];
         assert_eq!(values.len(), SUBSCRIPTION_EVENT_IDENTITIES.len());
         for (value, (name, code)) in values.into_iter().zip(SUBSCRIPTION_EVENT_IDENTITIES) {
@@ -14593,6 +15240,8 @@ mod generated_tests {
             },
             BoxFrame::OpenConnection,
             BoxFrame::Connection,
+            BoxFrame::DebugPrepared,
+            BoxFrame::DebugStart,
         ];
         assert_eq!(values.len(), BOX_FRAME_IDENTITIES.len());
         for (value, (name, code)) in values.into_iter().zip(BOX_FRAME_IDENTITIES) {
@@ -14652,6 +15301,8 @@ mod generated_tests {
                     start: 0u64,
                 },
             },
+            ApplianceFrame::DebugPrepared,
+            ApplianceFrame::DebugStart,
         ];
         assert_eq!(values.len(), APPLIANCE_FRAME_IDENTITIES.len());
         for (value, (name, code)) in values.into_iter().zip(APPLIANCE_FRAME_IDENTITIES) {

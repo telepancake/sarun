@@ -24,7 +24,9 @@ use serde_json::json;
 pub fn is_ninja_invocation() -> bool {
     let arg0 = std::env::args().next().unwrap_or_default();
     let base = std::path::Path::new(&arg0)
-        .file_name().and_then(|s| s.to_str()).unwrap_or("");
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
     base == "ninja"
 }
 
@@ -44,7 +46,9 @@ fn resolve_build_file(argv: &[String]) -> String {
                 i += 2;
             }
             "-f" => {
-                if let Some(f) = argv.get(i + 1) { filename = f.clone(); }
+                if let Some(f) = argv.get(i + 1) {
+                    filename = f.clone();
+                }
                 i += 2;
             }
             _ => i += 1,
@@ -66,10 +70,16 @@ fn emit_build_edges(filename: &str) {
     let graph = &state.graph;
     let mut edges = vec![];
     for build in graph.builds.iter() {
-        let outs: Vec<String> = build.outs()
-            .iter().map(|&id| graph.file(id).name.clone()).collect();
-        let ins: Vec<String> = build.explicit_ins()
-            .iter().map(|&id| graph.file(id).name.clone()).collect();
+        let outs: Vec<String> = build
+            .outs()
+            .iter()
+            .map(|&id| graph.file(id).name.clone())
+            .collect();
+        let ins: Vec<String> = build
+            .explicit_ins()
+            .iter()
+            .map(|&id| graph.file(id).name.clone())
+            .collect();
         edges.push(json!({
             "outs": outs,
             "ins": ins,

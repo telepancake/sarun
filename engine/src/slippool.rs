@@ -70,7 +70,10 @@ fn pidfd_open(pid: i32) -> i32 {
 fn reaper() -> &'static Arc<Reaper> {
     REAPER.get_or_init(|| {
         let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
-        let r = Arc::new(Reaper { epfd, watched: Mutex::new(HashMap::new()) });
+        let r = Arc::new(Reaper {
+            epfd,
+            watched: Mutex::new(HashMap::new()),
+        });
         let r2 = r.clone();
         std::thread::Builder::new()
             .name("slip-reaper".into())
@@ -97,7 +100,12 @@ impl Reaper {
                 // Stop watching: DEL + close the pidfd before reaping.
                 if let Some(pidfd) = self.watched.lock().unwrap().remove(&pid) {
                     unsafe {
-                        libc::epoll_ctl(self.epfd, libc::EPOLL_CTL_DEL, pidfd, std::ptr::null_mut());
+                        libc::epoll_ctl(
+                            self.epfd,
+                            libc::EPOLL_CTL_DEL,
+                            pidfd,
+                            std::ptr::null_mut(),
+                        );
                         libc::close(pidfd);
                     }
                 }
@@ -193,7 +201,12 @@ pub struct Pool {
 impl Pool {
     pub fn new(total: usize) -> Pool {
         let total = total.max(1);
-        Pool { total, available: total, ledger: HashMap::new(), waiters: VecDeque::new() }
+        Pool {
+            total,
+            available: total,
+            ledger: HashMap::new(),
+            waiters: VecDeque::new(),
+        }
     }
 
     #[cfg(test)]
@@ -308,8 +321,8 @@ impl Pool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     // A mock reply that records whether it was granted or denied.
     struct MockReply {
@@ -325,7 +338,10 @@ mod tests {
         }
     }
     fn reply(g: &Arc<AtomicUsize>, d: &Arc<AtomicUsize>) -> Box<MockReply> {
-        Box::new(MockReply { granted: g.clone(), denied: d.clone() })
+        Box::new(MockReply {
+            granted: g.clone(),
+            denied: d.clone(),
+        })
     }
 
     #[test]

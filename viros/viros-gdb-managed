@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -euo pipefail
+root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+python="$root/tools/python/managed/bin/python3"
+[[ -x $python ]] || { printf 'viros-gdb-managed: named provider box is incomplete\n' >&2; exit 2; }
+exec env PYTHONPATH="$root" PYTHONNOUSERSITE=1 PYTHONSAFEPATH=1 \
+    "$python" -m inferiors.sarun_gdb_client

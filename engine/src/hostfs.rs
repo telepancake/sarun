@@ -169,7 +169,10 @@ pub fn remove_tree_at(parent: BorrowedFd, name: &CStr) -> Result<(), String> {
     // SAFETY: valid dirfd and C string.
     let dfd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags) };
     if dfd < 0 {
-        return Err(format!("open dir to remove: {}", std::io::Error::last_os_error()));
+        return Err(format!(
+            "open dir to remove: {}",
+            std::io::Error::last_os_error()
+        ));
     }
     // SAFETY: fresh owned fd.
     let dir = unsafe { OwnedFd::from_raw_fd(dfd) };
@@ -210,12 +213,19 @@ pub fn remove_tree_at(parent: BorrowedFd, name: &CStr) -> Result<(), String> {
 /// permissions, a newly-created one gets `0o666 & ~umask` (matching the old
 /// `std::fs::write`). Used by the per-hunk apply, which edits an existing host
 /// file in place and must not alter its mode.
-pub fn write_file_preserve_mode_at(parent: BorrowedFd, name: &CStr, bytes: &[u8]) -> Result<(), String> {
+pub fn write_file_preserve_mode_at(
+    parent: BorrowedFd,
+    name: &CStr,
+    bytes: &[u8],
+) -> Result<(), String> {
     let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_NOFOLLOW | libc::O_CLOEXEC;
     // SAFETY: valid dirfd and C string; variadic create mode for O_CREAT.
     let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags, 0o666) };
     if fd < 0 {
-        return Err(format!("open for write: {}", std::io::Error::last_os_error()));
+        return Err(format!(
+            "open for write: {}",
+            std::io::Error::last_os_error()
+        ));
     }
     // SAFETY: fresh owned fd; File closes it on drop.
     let mut f = unsafe { File::from_raw_fd(fd) };
@@ -314,7 +324,8 @@ mod tests {
     use std::os::fd::AsFd;
 
     fn tmpdir() -> std::path::PathBuf {
-        let p = std::env::temp_dir().join(format!("hostfs-test-{}", std::process::id()))
+        let p = std::env::temp_dir()
+            .join(format!("hostfs-test-{}", std::process::id()))
             .join(format!("{:?}", std::time::SystemTime::now()));
         std::fs::create_dir_all(&p).unwrap();
         p
@@ -330,7 +341,10 @@ mod tests {
         let rfd = open_dir(&root).unwrap();
         // create=false AND create=true must both refuse to traverse the symlink.
         let err = parent_beneath(rfd.as_fd(), "link/x", true).unwrap_err();
-        assert!(err.contains("open dir"), "expected symlink refusal, got: {err}");
+        assert!(
+            err.contains("open dir"),
+            "expected symlink refusal, got: {err}"
+        );
         assert!(!secret.join("x").exists(), "wrote through the symlink!");
         std::fs::remove_dir_all(&root).ok();
     }
@@ -359,7 +373,10 @@ mod tests {
         let leaf = CString::new("d").unwrap();
         remove_tree_at(rfd.as_fd(), &leaf).unwrap();
         assert!(!d.exists(), "d not removed");
-        assert!(outside.join("keep").exists(), "followed symlink and deleted outside content!");
+        assert!(
+            outside.join("keep").exists(),
+            "followed symlink and deleted outside content!"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 }

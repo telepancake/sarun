@@ -14,7 +14,7 @@ use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 
 /// Default model: Qwen3-0.6B, the smallest broadly-available instruct model
 /// with real tool-calling support in llama.cpp's chat templates (--jinja).
@@ -78,24 +78,38 @@ pub fn cmd_local(args: &[String]) -> i32 {
     let mut it = args.iter();
     while let Some(a) = it.next() {
         let mut val = |flag: &str| {
-            it.next().cloned().ok_or_else(|| anyhow!("{flag} needs a value"))
+            it.next()
+                .cloned()
+                .ok_or_else(|| anyhow!("{flag} needs a value"))
         };
         match a.as_str() {
             "--port" => match val("--port").and_then(|v| Ok(v.parse()?)) {
                 Ok(p) => port = p,
-                Err(e) => { eprintln!("oaita local: --port: {e}"); return 2; }
+                Err(e) => {
+                    eprintln!("oaita local: --port: {e}");
+                    return 2;
+                }
             },
             "--dir" => match val("--dir") {
                 Ok(v) => dir = Some(PathBuf::from(v)),
-                Err(e) => { eprintln!("oaita local: {e}"); return 2; }
+                Err(e) => {
+                    eprintln!("oaita local: {e}");
+                    return 2;
+                }
             },
             "--model-url" => match val("--model-url") {
                 Ok(v) => model_url = v,
-                Err(e) => { eprintln!("oaita local: {e}"); return 2; }
+                Err(e) => {
+                    eprintln!("oaita local: {e}");
+                    return 2;
+                }
             },
             "--runtime-url" => match val("--runtime-url") {
                 Ok(v) => runtime_url = Some(v),
-                Err(e) => { eprintln!("oaita local: {e}"); return 2; }
+                Err(e) => {
+                    eprintln!("oaita local: {e}");
+                    return 2;
+                }
             },
             "--setup-only" => setup_only = true,
             "--write-config" => write_config = true,
@@ -103,11 +117,20 @@ pub fn cmd_local(args: &[String]) -> i32 {
             "--no-box" => no_box = true,
             "--net" => match val("--net") {
                 Ok(v) if ["tap", "host", "off"].contains(&v.as_str()) => {
-                    net = v; net_explicit = true;
+                    net = v;
+                    net_explicit = true;
                 }
-                Ok(v) => { eprintln!("oaita local: --net wants tap|host, \
-                                      got {v:?}"); return 2; }
-                Err(e) => { eprintln!("oaita local: {e}"); return 2; }
+                Ok(v) => {
+                    eprintln!(
+                        "oaita local: --net wants tap|host, \
+                                      got {v:?}"
+                    );
+                    return 2;
+                }
+                Err(e) => {
+                    eprintln!("oaita local: {e}");
+                    return 2;
+                }
             },
             // Internal: set by the box re-exec below — we ARE the in-box
             // payload; do the work directly.
@@ -116,11 +139,19 @@ pub fn cmd_local(args: &[String]) -> i32 {
             // the engine (svc.serve slots) under this service name.
             "--svc" => match val("--svc") {
                 Ok(v) => svc = Some(v),
-                Err(e) => { eprintln!("oaita local: {e}"); return 2; }
+                Err(e) => {
+                    eprintln!("oaita local: {e}");
+                    return 2;
+                }
             },
-            "-h" | "--help" => { println!("{USAGE}"); return 0; }
-            other => { eprintln!("oaita local: unknown flag {other:?}\n{USAGE}");
-                       return 2; }
+            "-h" | "--help" => {
+                println!("{USAGE}");
+                return 0;
+            }
+            other => {
+                eprintln!("oaita local: unknown flag {other:?}\n{USAGE}");
+                return 2;
+            }
         }
     }
     let dir = dir.unwrap_or_else(crate::paths::oaita_local_dir);
@@ -140,18 +171,22 @@ pub fn cmd_local(args: &[String]) -> i32 {
     // captured.
     if !inbox && !no_box {
         if !engine_running() {
-            eprintln!("oaita local: no running engine (needed to run the \
+            eprintln!(
+                "oaita local: no running engine (needed to run the \
                        download in a box) — start `sarun` or `sarun serve`, \
-                       or pass --no-box to download onto the host directly");
+                       or pass --no-box to download onto the host directly"
+            );
             return 1;
         }
         // Don't spawn a tap box that can't start: on hosts without netns
         // privileges (unprivileged containers), unshare(CLONE_NEWNET) is
         // denied and the box dies with "tap setup failed".
-        let (chosen, note) = resolve_local_net(
-            &net, net_explicit, crate::net::tap::tap_available());
+        let (chosen, note) =
+            resolve_local_net(&net, net_explicit, crate::net::tap::tap_available());
         net = chosen;
-        if let Some(n) = note { eprintln!("oaita local: {n}"); }
+        if let Some(n) = note {
+            eprintln!("oaita local: {n}");
+        }
         // Endpoint is ALWAYS the engine-bridged svc socket — regardless of
         // the box's own network. The bridge rides the broker/engine sockets
         // (svc.serve/svc.dial), so it works whether the serve box is tap,
@@ -185,35 +220,72 @@ pub fn cmd_local(args: &[String]) -> i32 {
         // serve box reads them by parenting on OAITA-LOCAL).
         if force || !download_box_ready() {
             let mut cmd = std::process::Command::new(&this);
-            cmd.args(["run", "--net", &net, DOWNLOAD_BOX, "--",
-                      &this, "oaita", "local", "--inbox", "--setup-only",
-                      "--port", &port.to_string(),
-                      "--model-url", &model_url,
-                      "--dir"]).arg(&dir);
-            if let Some(u) = &runtime_url { cmd.args(["--runtime-url", u]); }
-            if force { cmd.arg("--force"); }
-            eprintln!("oaita local: downloading into box '{DOWNLOAD_BOX}' \
+            cmd.args([
+                "run",
+                "--net",
+                &net,
+                DOWNLOAD_BOX,
+                "--",
+                &this,
+                "oaita",
+                "local",
+                "--inbox",
+                "--setup-only",
+                "--port",
+                &port.to_string(),
+                "--model-url",
+                &model_url,
+                "--dir",
+            ])
+            .arg(&dir);
+            if let Some(u) = &runtime_url {
+                cmd.args(["--runtime-url", u]);
+            }
+            if force {
+                cmd.arg("--force");
+            }
+            eprintln!(
+                "oaita local: downloading into box '{DOWNLOAD_BOX}' \
                        (net={net}); the files stay captured in that box — \
-                       no host changes");
+                       no host changes"
+            );
             match cmd.status() {
                 Ok(st) if st.success() => {}
                 Ok(st) => return st.code().unwrap_or(1),
-                Err(e) => { eprintln!("oaita local: spawn box: {e}"); return 1; }
+                Err(e) => {
+                    eprintln!("oaita local: spawn box: {e}");
+                    return 1;
+                }
             }
         } else {
-            eprintln!("oaita local: model already downloaded (box \
-                       '{DOWNLOAD_BOX}')");
+            eprintln!(
+                "oaita local: model already downloaded (box \
+                       '{DOWNLOAD_BOX}')"
+            );
         }
-        eprintln!("oaita local: model ready — boxes reach it on demand at \
+        eprintln!(
+            "oaita local: model ready — boxes reach it on demand at \
                    {base_url} (the engine starts the server on the first \
-                   call and after restarts; no server left running).");
+                   call and after restarts; no server left running)."
+        );
         return 0;
     }
-    match run(&dir, port, &model_url, runtime_url.as_deref(),
-              setup_only, write_config && !inbox, force, inbox,
-              svc.as_deref()) {
+    match run(
+        &dir,
+        port,
+        &model_url,
+        runtime_url.as_deref(),
+        setup_only,
+        write_config && !inbox,
+        force,
+        inbox,
+        svc.as_deref(),
+    ) {
         Ok(()) => 0,
-        Err(e) => { eprintln!("oaita local: {e:#}"); 1 }
+        Err(e) => {
+            eprintln!("oaita local: {e:#}");
+            1
+        }
     }
 }
 
@@ -230,8 +302,9 @@ const SERVE_BOX: &str = "OAITA-SERVE";
 /// that box's overlay, not on the host). Absent box → need to download.
 fn download_box_ready() -> bool {
     let boxes = crate::discover::discover();
-    let Some((id, _)) = boxes.iter().find(|(_, b)| b.name == DOWNLOAD_BOX)
-        else { return false };
+    let Some((id, _)) = boxes.iter().find(|(_, b)| b.name == DOWNLOAD_BOX) else {
+        return false;
+    };
     // The box exists; trust that a successful --setup-only left the files.
     // (A partial download leaves the box too, but `--force` re-runs it.)
     let _ = id;
@@ -244,14 +317,17 @@ fn download_box_ready() -> bool {
 /// download is still captured, only network isolation is lost. An explicit
 /// choice is always respected (returned as-is, left to fail loudly if the
 /// user forced tap on a host that can't do it).
-fn resolve_local_net(net: &str, explicit: bool, tap_ok: bool)
-    -> (String, Option<String>)
-{
+fn resolve_local_net(net: &str, explicit: bool, tap_ok: bool) -> (String, Option<String>) {
     if net == "tap" && !explicit && !tap_ok {
-        return ("host".to_string(), Some(
-            "tap networking unavailable here (no CLONE_NEWNET) — using \
+        return (
+            "host".to_string(),
+            Some(
+                "tap networking unavailable here (no CLONE_NEWNET) — using \
              --net host for the box (writes are still captured; pass \
-             --net off to air-gap, or --net tap to force)".to_string()));
+             --net off to air-gap, or --net tap to force)"
+                    .to_string(),
+            ),
+        );
     }
     (net.to_string(), None)
 }
@@ -264,18 +340,23 @@ fn engine_running() -> bool {
 /// The first `*.gguf` model in `dir` (the serve path locates the model by
 /// scanning, so it needs no --model-url — the download named the file).
 fn find_gguf(dir: &Path) -> Option<PathBuf> {
-    std::fs::read_dir(dir).ok()?
-        .filter_map(|e| e.ok()).map(|e| e.path())
+    std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
         .find(|p| p.extension().is_some_and(|x| x == "gguf"))
 }
 
 /// Remove every `*.gguf` in `dir` EXCEPT `keep` — used on a `--force` model
 /// swap so a stale model file doesn't linger for find_gguf to pick up.
 fn clear_other_gguf(dir: &Path, keep: &str) {
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
     for p in rd.filter_map(|e| e.ok()).map(|e| e.path()) {
         if p.extension().is_some_and(|x| x == "gguf")
-            && p.file_name().and_then(|n| n.to_str()) != Some(keep) {
+            && p.file_name().and_then(|n| n.to_str()) != Some(keep)
+        {
             let _ = std::fs::remove_file(&p);
         }
     }
@@ -286,35 +367,54 @@ fn clear_other_gguf(dir: &Path, keep: &str) {
 /// this box's meta, so a later svc://oaita-local call starts the serve
 /// payload as a sub-box parented here. See control::ensure_service.
 fn declare_service(dir: &Path) {
-    let Ok(broker) = std::env::var("SARUN_BROKER") else { return };
-    if broker.is_empty() { return; }
+    let Ok(broker) = std::env::var("SARUN_BROKER") else {
+        return;
+    };
+    if broker.is_empty() {
+        return;
+    }
     // Payload run in the serve sub-box: serve THIS dir over the svc bridge.
     let argv = serde_json::json!([
-        "/proc/self/exe", "oaita", "local", "--inbox",
-        "--svc", SVC_NAME, "--dir", dir.to_string_lossy()]);
+        "/proc/self/exe",
+        "oaita",
+        "local",
+        "--inbox",
+        "--svc",
+        SVC_NAME,
+        "--dir",
+        dir.to_string_lossy()
+    ]);
     let msg = serde_json::json!({
         "type": "svc.declare", "name": SVC_NAME, "argv": argv, "net": ""});
     if let Ok(mut c) = crate::runner::broker_dial(&broker) {
         let _ = c.write_all(format!("{msg}\n").as_bytes());
         let mut line = String::new();
-        let _ = std::io::BufRead::read_line(
-            &mut std::io::BufReader::new(&c), &mut line);
+        let _ = std::io::BufRead::read_line(&mut std::io::BufReader::new(&c), &mut line);
     }
 }
 
-fn run(dir: &Path, port: u16, model_url: &str, runtime_url: Option<&str>,
-       setup_only: bool, write_config: bool, force: bool, inbox: bool,
-       svc: Option<&str>) -> Result<()> {
+fn run(
+    dir: &Path,
+    port: u16,
+    model_url: &str,
+    runtime_url: Option<&str>,
+    setup_only: bool,
+    write_config: bool,
+    force: bool,
+    inbox: bool,
+    svc: Option<&str>,
+) -> Result<()> {
     std::fs::create_dir_all(dir).with_context(|| format!("mkdir {dir:?}"))?;
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
         .context("tokio runtime")?;
     let server = dir.join("llama-server");
 
     // DOWNLOAD when setting up, or (host `--no-box`) when the files aren't
     // there yet. The SERVE path never downloads — it locates the existing
     // model by scanning, so it needs no URL.
-    let need_download = force || setup_only
-        || find_gguf(dir).is_none() || !server.is_file();
+    let need_download = force || setup_only || find_gguf(dir).is_none() || !server.is_file();
     if need_download {
         let model_name = url_filename(model_url)
             .ok_or_else(|| anyhow!("cannot derive a filename from {model_url}"))?;
@@ -323,7 +423,9 @@ fn run(dir: &Path, port: u16, model_url: &str, runtime_url: Option<&str>,
             // Clean swap: a --force download replaces the model, so drop any
             // OTHER *.gguf first — otherwise find_gguf (which scans by
             // extension at serve time) could keep serving the stale one.
-            if force { clear_other_gguf(dir, &model_name); }
+            if force {
+                clear_other_gguf(dir, &model_name);
+            }
             rt.block_on(fetch_to(model_url, &model_path, "model"))?;
         } else {
             eprintln!("model already present: {}", model_path.display());
@@ -333,17 +435,19 @@ fn run(dir: &Path, port: u16, model_url: &str, runtime_url: Option<&str>,
                 Some(u) => u.to_string(),
                 None => rt.block_on(latest_runtime_url())?,
             };
-            let arch_name = url_filename(&url)
-                .unwrap_or_else(|| "runtime.tar.gz".into());
+            let arch_name = url_filename(&url).unwrap_or_else(|| "runtime.tar.gz".into());
             let arch_path = dir.join(&arch_name);
             rt.block_on(fetch_to(&url, &arch_path, "runtime"))?;
             let n = extract_runtime(&arch_path, dir)?;
             let _ = std::fs::remove_file(&arch_path);
             if !server.is_file() {
-                bail!("archive extracted ({n} files) but no llama-server in \
+                bail!(
+                    "archive extracted ({n} files) but no llama-server in \
                        it — pass --runtime-url with a llama.cpp \
                        *bin-ubuntu-x64* archive, or drop a llama-server \
-                       binary into {}", dir.display());
+                       binary into {}",
+                    dir.display()
+                );
             }
             eprintln!("runtime ready: {} ({n} files)", server.display());
         }
@@ -358,18 +462,26 @@ fn run(dir: &Path, port: u16, model_url: &str, runtime_url: Option<&str>,
     if setup_only {
         // Advertise the on-demand service so the engine can start it later.
         declare_service(dir);
-        eprintln!("setup complete — model captured; the engine serves it on \
-                   demand");
+        eprintln!(
+            "setup complete — model captured; the engine serves it on \
+                   demand"
+        );
         return Ok(());
     }
 
     // SERVE: locate the model by scan (no URL needed) and run.
-    let model_path = find_gguf(dir)
-        .ok_or_else(|| anyhow!("no *.gguf model in {} — run `oaita local` \
-            ('m' menu) to download it first", dir.display()))?;
+    let model_path = find_gguf(dir).ok_or_else(|| {
+        anyhow!(
+            "no *.gguf model in {} — run `oaita local` \
+            ('m' menu) to download it first",
+            dir.display()
+        )
+    })?;
     if !server.is_file() {
-        bail!("no llama-server in {} — run `oaita local` to fetch the runtime",
-              dir.display());
+        bail!(
+            "no llama-server in {} — run `oaita local` to fetch the runtime",
+            dir.display()
+        );
     }
     serve(dir, &model_path, port, svc)
 }
@@ -388,12 +500,18 @@ fn http_client() -> Result<reqwest::Client> {
         "/etc/pki/tls/certs/ca-bundle.crt".into(),
     ];
     if let Ok(p) = std::env::var("SSL_CERT_FILE") {
-        if !p.is_empty() { bundles.insert(0, p.into()); }
+        if !p.is_empty() {
+            bundles.insert(0, p.into());
+        }
     }
     for p in bundles {
-        let Ok(bytes) = std::fs::read(&p) else { continue };
+        let Ok(bytes) = std::fs::read(&p) else {
+            continue;
+        };
         if let Ok(certs) = reqwest::Certificate::from_pem_bundle(&bytes) {
-            for c in certs { b = b.add_root_certificate(c); }
+            for c in certs {
+                b = b.add_root_certificate(c);
+            }
         }
         break; // first readable bundle wins (they're alternatives)
     }
@@ -403,14 +521,16 @@ fn http_client() -> Result<reqwest::Client> {
 async fn fetch_to(url: &str, dest: &Path, label: &str) -> Result<()> {
     eprintln!("downloading {label}: {url}");
     let client = http_client()?;
-    let mut resp = client.get(url).send().await
+    let mut resp = client
+        .get(url)
+        .send()
+        .await
         .with_context(|| format!("GET {url}"))?
         .error_for_status()
         .with_context(|| format!("GET {url}"))?;
     let total = resp.content_length();
     let part = dest.with_extension("part");
-    let mut out = std::fs::File::create(&part)
-        .with_context(|| format!("create {part:?}"))?;
+    let mut out = std::fs::File::create(&part).with_context(|| format!("create {part:?}"))?;
     let mut got: u64 = 0;
     let mut last_mark: u64 = 0;
     while let Some(chunk) = resp.chunk().await.context("read body")? {
@@ -419,8 +539,7 @@ async fn fetch_to(url: &str, dest: &Path, label: &str) -> Result<()> {
         if got - last_mark >= 64 * 1024 * 1024 {
             last_mark = got;
             match total {
-                Some(t) => eprintln!("  {label}: {} / {} MiB",
-                                     got >> 20, t >> 20),
+                Some(t) => eprintln!("  {label}: {} / {} MiB", got >> 20, t >> 20),
                 None => eprintln!("  {label}: {} MiB", got >> 20),
             }
         }
@@ -436,15 +555,23 @@ async fn fetch_to(url: &str, dest: &Path, label: &str) -> Result<()> {
 /// GitHub releases API.
 async fn latest_runtime_url() -> Result<String> {
     let client = http_client()?;
-    let body = client.get(RUNTIME_RELEASES_API).send().await
+    let body = client
+        .get(RUNTIME_RELEASES_API)
+        .send()
+        .await
         .context("GET releases")?
-        .error_for_status().context("GET releases")?
-        .text().await.context("read releases")?;
-    let v: serde_json::Value = serde_json::from_str(&body)
-        .context("parse releases JSON")?;
-    pick_runtime_asset(&v)
-        .ok_or_else(|| anyhow!("no CPU ubuntu-x64 asset in the latest \
-            llama.cpp release — pass --runtime-url explicitly"))
+        .error_for_status()
+        .context("GET releases")?
+        .text()
+        .await
+        .context("read releases")?;
+    let v: serde_json::Value = serde_json::from_str(&body).context("parse releases JSON")?;
+    pick_runtime_asset(&v).ok_or_else(|| {
+        anyhow!(
+            "no CPU ubuntu-x64 asset in the latest \
+            llama.cpp release — pass --runtime-url explicitly"
+        )
+    })
 }
 
 /// Pick the plain-CPU linux/x64 archive out of a llama.cpp release's asset
@@ -452,15 +579,30 @@ async fn latest_runtime_url() -> Result<String> {
 /// .zip; both are accepted) — skipping every accelerator/other-arch build.
 fn pick_runtime_asset(release: &serde_json::Value) -> Option<String> {
     let assets = release.get("assets")?.as_array()?;
-    let bad = ["cuda", "vulkan", "sycl", "hip", "rocm", "arm64", "s390x",
-               "musa", "kompute", "openvino", "opencl", "android", "win",
-               "macos", "xcframework", "cudart", "-ui."];
+    let bad = [
+        "cuda",
+        "vulkan",
+        "sycl",
+        "hip",
+        "rocm",
+        "arm64",
+        "s390x",
+        "musa",
+        "kompute",
+        "openvino",
+        "opencl",
+        "android",
+        "win",
+        "macos",
+        "xcframework",
+        "cudart",
+        "-ui.",
+    ];
     assets.iter().find_map(|a| {
         let name = a.get("name")?.as_str()?.to_ascii_lowercase();
         let linux_x64 = (name.contains("ubuntu") || name.contains("linux"))
             && name.contains("x64")
-            && (name.ends_with(".zip") || name.ends_with(".tar.gz")
-                || name.ends_with(".tgz"));
+            && (name.ends_with(".zip") || name.ends_with(".tar.gz") || name.ends_with(".tgz"));
         if linux_x64 && !bad.iter().any(|b| name.contains(b)) {
             a.get("browser_download_url")?.as_str().map(str::to_string)
         } else {
@@ -478,18 +620,21 @@ fn keep_runtime_file(name: &str) -> bool {
 fn install_runtime_file(dir: &Path, name: &str, bytes: &[u8]) -> Result<()> {
     let dest = dir.join(name);
     std::fs::write(&dest, bytes).with_context(|| format!("write {dest:?}"))?;
-    #[cfg(unix)] {
+    #[cfg(unix)]
+    {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&dest,
-            std::fs::Permissions::from_mode(0o755)).ok();
+        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755)).ok();
     }
     Ok(())
 }
 
 /// Basename of an archive path.
 fn base_of(p: &str) -> String {
-    Path::new(p).file_name().and_then(|s| s.to_str())
-        .unwrap_or("").to_string()
+    Path::new(p)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_string()
 }
 
 /// Recreate a (flattened) symlink `name -> target-basename` in `dir`. The
@@ -518,9 +663,13 @@ fn extract_runtime(archive: &Path, dir: &Path) -> Result<usize> {
         let mut z = zip::ZipArchive::new(f).context("read runtime zip")?;
         for i in 0..z.len() {
             let mut e = z.by_index(i).context("zip entry")?;
-            if e.is_dir() { continue; }
+            if e.is_dir() {
+                continue;
+            }
             let name = base_of(e.name());
-            if !keep_runtime_file(&name) { continue; }
+            if !keep_runtime_file(&name) {
+                continue;
+            }
             let is_link = e.unix_mode().is_some_and(|m| m & 0o170000 == 0o120000);
             let mut buf = Vec::new();
             e.read_to_end(&mut buf).context("read zip entry")?;
@@ -538,11 +687,14 @@ fn extract_runtime(archive: &Path, dir: &Path) -> Result<usize> {
         for e in t.entries().context("read runtime tar")? {
             let mut e = e.context("tar entry")?;
             let et = e.header().entry_type();
-            let name = e.path().ok()
-                .and_then(|p| p.file_name()
-                    .and_then(|s| s.to_str()).map(str::to_string))
+            let name = e
+                .path()
+                .ok()
+                .and_then(|p| p.file_name().and_then(|s| s.to_str()).map(str::to_string))
                 .unwrap_or_default();
-            if !keep_runtime_file(&name) { continue; }
+            if !keep_runtime_file(&name) {
+                continue;
+            }
             if et.is_symlink() {
                 if let Ok(Some(link)) = e.link_name() {
                     install_symlink(dir, &name, &link.to_string_lossy())?;
@@ -561,10 +713,12 @@ fn extract_runtime(archive: &Path, dir: &Path) -> Result<usize> {
 
 /// The oaita.toml contents pointing at the local server.
 fn local_config(base_url: &str) -> String {
-    format!("# written by `oaita local` — a llama.cpp server on this machine.\n\
+    format!(
+        "# written by `oaita local` — a llama.cpp server on this machine.\n\
              model = \"local\"\n\
              base_url = \"{base_url}\"\n\
-             api_key = \"sk-local\"\n")
+             api_key = \"sk-local\"\n"
+    )
 }
 
 /// Write oaita.toml for the local endpoint. An existing, USABLE config
@@ -576,14 +730,22 @@ fn ensure_config(base_url: &str, overwrite: bool) -> Result<()> {
     let p = crate::paths::oaita_config_path();
     if p.is_file() && !overwrite {
         let has_model = crate::oaita::config::Config::load_from(&p)
-            .model.map(|m| !m.trim().is_empty()).unwrap_or(false);
+            .model
+            .map(|m| !m.trim().is_empty())
+            .unwrap_or(false);
         if has_model {
-            eprintln!("keeping existing {} (use --write-config to point it \
-                       at the local server)", p.display());
+            eprintln!(
+                "keeping existing {} (use --write-config to point it \
+                       at the local server)",
+                p.display()
+            );
             return Ok(());
         }
-        eprintln!("existing {} sets no model — replacing it with the local \
-                   config (the old one is backed up)", p.display());
+        eprintln!(
+            "existing {} sets no model — replacing it with the local \
+                   config (the old one is backed up)",
+            p.display()
+        );
         // fall through to write (with backup)
     }
     if let Some(parent) = p.parent() {
@@ -594,8 +756,7 @@ fn ensure_config(base_url: &str, overwrite: bool) -> Result<()> {
         std::fs::copy(&p, &bak).with_context(|| format!("backup to {bak:?}"))?;
         eprintln!("backed up existing config to {}", bak.display());
     }
-    std::fs::write(&p, local_config(base_url))
-        .with_context(|| format!("write {p:?}"))?;
+    std::fs::write(&p, local_config(base_url)).with_context(|| format!("write {p:?}"))?;
     eprintln!("wrote {}", p.display());
     Ok(())
 }
@@ -610,9 +771,9 @@ fn svc_bridge_loop(broker: String, name: String, port: u16) {
             std::thread::sleep(std::time::Duration::from_secs(2));
             continue;
         };
-        if conn.write_all(
-            format!("{{\"type\":\"svc.serve\",\"name\":\"{name}\"}}\n")
-                .as_bytes()).is_err()
+        if conn
+            .write_all(format!("{{\"type\":\"svc.serve\",\"name\":\"{name}\"}}\n").as_bytes())
+            .is_err()
         {
             std::thread::sleep(std::time::Duration::from_secs(2));
             continue;
@@ -621,8 +782,12 @@ fn svc_bridge_loop(broker: String, name: String, port: u16) {
         // arrives. Byte-wise reads — anything after the second newline is
         // already the spliced stream's payload and must not be swallowed
         // by a buffered reader.
-        if read_line_bytewise(&mut conn).is_none() { continue; }
-        if read_line_bytewise(&mut conn).is_none() { continue; }
+        if read_line_bytewise(&mut conn).is_none() {
+            continue;
+        }
+        if read_line_bytewise(&mut conn).is_none() {
+            continue;
+        }
         let Ok(srv) = std::net::TcpStream::connect(("127.0.0.1", port)) else {
             // Server gone mid-flight; drop the paired stream (host client
             // sees EOF) and retry parking.
@@ -647,9 +812,10 @@ fn read_line_bytewise(s: &mut impl Read) -> Option<String> {
 
 /// Splice an engine (Unix) stream and the local TCP server stream both
 /// ways; returns when both directions are done so the slot can re-park.
-fn splice_streams(uds: std::os::unix::net::UnixStream,
-                  tcp: std::net::TcpStream) {
-    let (Ok(mut ur), Ok(mut tw)) = (uds.try_clone(), tcp.try_clone()) else { return };
+fn splice_streams(uds: std::os::unix::net::UnixStream, tcp: std::net::TcpStream) {
+    let (Ok(mut ur), Ok(mut tw)) = (uds.try_clone(), tcp.try_clone()) else {
+        return;
+    };
     let t = std::thread::spawn(move || {
         let _ = std::io::copy(&mut ur, &mut tw);
         let _ = tw.shutdown(std::net::Shutdown::Write);
@@ -668,36 +834,55 @@ fn serve(dir: &Path, model: &Path, port: u16, svc: Option<&str>) -> Result<()> {
     let server = dir.join("llama-server");
     eprintln!("starting {} on 127.0.0.1:{port} …", server.display());
     let mut child = std::process::Command::new(&server)
-        .arg("-m").arg(model)
+        .arg("-m")
+        .arg(model)
         // 32k context: the oaita agent harness prompt + tool schemas alone
         // is ~4k tokens, and tool-result turns accumulate — 8k overflowed
         // after a couple of steps (llama.cpp then errors mid-stream). Qwen3
         // handles 32k natively; the KV cache for a 0.6B model is modest.
-        .args(["--host", "127.0.0.1", "--port", &port.to_string(),
-               "--jinja", "-c", "32768"])
+        .args([
+            "--host",
+            "127.0.0.1",
+            "--port",
+            &port.to_string(),
+            "--jinja",
+            "-c",
+            "32768",
+        ])
         // extracted shared libs sit next to the binary
         .env("LD_LIBRARY_PATH", dir)
         .spawn()
-        .with_context(|| format!(
-            "spawn {} — if this is an exec/loader error the prebuilt \
+        .with_context(|| {
+            format!(
+                "spawn {} — if this is an exec/loader error the prebuilt \
              runtime doesn't run on this host (it links glibc); pass \
              --runtime-url with a build for your platform or drop your own \
-             llama-server into {}", server.display(), dir.display()))?;
+             llama-server into {}",
+                server.display(),
+                dir.display()
+            )
+        })?;
     // readiness probe: llama-server serves /health once the model is loaded.
     let url = format!("http://127.0.0.1:{port}/health");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
     loop {
         if let Some(st) = child.try_wait().context("child status")? {
-            bail!("llama-server exited during startup ({st}) — see its \
+            bail!(
+                "llama-server exited during startup ({st}) — see its \
                    output above; a loader/glibc error means the prebuilt \
-                   runtime doesn't run here (see --runtime-url)");
+                   runtime doesn't run here (see --runtime-url)"
+            );
         }
-        if std::time::Instant::now() > deadline { break; }
+        if std::time::Instant::now() > deadline {
+            break;
+        }
         if health_ok(&url) {
             if let Some(name) = svc {
                 let Ok(broker) = std::env::var("SARUN_BROKER") else {
-                    bail!("--svc given but SARUN_BROKER is not set — \
-                           the bridge only works from inside a box");
+                    bail!(
+                        "--svc given but SARUN_BROKER is not set — \
+                           the bridge only works from inside a box"
+                    );
                 };
                 for _ in 0..4 {
                     let (b, n) = (broker.clone(), name.to_string());
@@ -708,31 +893,47 @@ fn serve(dir: &Path, model: &Path, port: u16, svc: Option<&str>) -> Result<()> {
             match svc {
                 Some(name) => eprintln!(
                     "ready — endpoint bridged through the engine as \
-                     svc://{name} (this box's network stays isolated)"),
+                     svc://{name} (this box's network stays isolated)"
+                ),
                 None => eprintln!(
                     "ready — local OpenAI-compatible endpoint: \
-                     http://127.0.0.1:{port}/v1"),
+                     http://127.0.0.1:{port}/v1"
+                ),
             }
-            eprintln!("try:   sarun oaita gen demo   (then `sarun oaita add \
-                       demo`, `sarun oaita run demo`)");
-            eprintln!("the UI's Api pane shows the traffic; Ctrl-C here \
-                       stops the server.");
+            eprintln!(
+                "try:   sarun oaita gen demo   (then `sarun oaita add \
+                       demo`, `sarun oaita run demo`)"
+            );
+            eprintln!(
+                "the UI's Api pane shows the traffic; Ctrl-C here \
+                       stops the server."
+            );
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(500));
     }
     let st = child.wait().context("wait llama-server")?;
-    if !st.success() { bail!("llama-server exited: {st}"); }
+    if !st.success() {
+        bail!("llama-server exited: {st}");
+    }
     Ok(())
 }
 
 /// Plain blocking TCP one-liner so the poll loop needs no async plumbing.
 fn health_ok(url: &str) -> bool {
-    let Some(hostport) = url.strip_prefix("http://")
-        .and_then(|r| r.split('/').next()) else { return false };
-    let Ok(mut s) = std::net::TcpStream::connect(hostport) else { return false };
+    let Some(hostport) = url
+        .strip_prefix("http://")
+        .and_then(|r| r.split('/').next())
+    else {
+        return false;
+    };
+    let Ok(mut s) = std::net::TcpStream::connect(hostport) else {
+        return false;
+    };
     let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(2)));
-    if s.write_all(b"GET /health HTTP/1.0\r\n\r\n").is_err() { return false; }
+    if s.write_all(b"GET /health HTTP/1.0\r\n\r\n").is_err() {
+        return false;
+    }
     let mut buf = [0u8; 64];
     match s.read(&mut buf) {
         Ok(n) => String::from_utf8_lossy(&buf[..n]).contains(" 200"),
@@ -741,7 +942,8 @@ fn health_ok(url: &str) -> bool {
 }
 
 fn url_filename(url: &str) -> Option<String> {
-    url.split('/').next_back()
+    url.split('/')
+        .next_back()
         .map(|s| s.split('?').next().unwrap_or(s))
         .filter(|s| !s.is_empty())
         .map(str::to_string)
@@ -774,18 +976,26 @@ mod tests {
             "cudart-llama-bin-win-cuda-12.4-x64.zip",
             "llama-b9860-ui.tar.gz",
         ];
-        let assets: Vec<serde_json::Value> = names.iter().map(|n|
-            serde_json::json!({"name": n,
-                               "browser_download_url": format!("https://x/{n}")}))
+        let assets: Vec<serde_json::Value> = names
+            .iter()
+            .map(|n| {
+                serde_json::json!({"name": n,
+                               "browser_download_url": format!("https://x/{n}")})
+            })
             .collect();
         let rel = serde_json::json!({"assets": assets});
-        assert_eq!(pick_runtime_asset(&rel).as_deref(),
-                   Some("https://x/llama-b9860-bin-ubuntu-x64.tar.gz"));
+        assert_eq!(
+            pick_runtime_asset(&rel).as_deref(),
+            Some("https://x/llama-b9860-bin-ubuntu-x64.tar.gz")
+        );
         // older zip-era releases still resolve
         let rel = serde_json::json!({"assets": [
             {"name": "llama-b4000-bin-ubuntu-x64.zip",
              "browser_download_url": "https://x/cpu.zip"}]});
-        assert_eq!(pick_runtime_asset(&rel).as_deref(), Some("https://x/cpu.zip"));
+        assert_eq!(
+            pick_runtime_asset(&rel).as_deref(),
+            Some("https://x/cpu.zip")
+        );
         let none: serde_json::Value = serde_json::json!({"assets": []});
         assert!(pick_runtime_asset(&none).is_none());
     }
@@ -793,8 +1003,7 @@ mod tests {
     #[test]
     fn runtime_extraction_handles_tar_gz() {
         use std::io::Write as _;
-        let tmp = std::env::temp_dir()
-            .join(format!("oaita-local-tgz-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("oaita-local-tgz-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
         let tp = tmp.join("rt.tar.gz");
         {
@@ -820,8 +1029,12 @@ mod tests {
             hl.set_entry_type(tar::EntryType::Symlink);
             hl.set_size(0);
             hl.set_mode(0o777);
-            t.append_link(&mut hl, "build/bin/libllama-common.so.0",
-                          "libllama-common.so.0.1.2").unwrap();
+            t.append_link(
+                &mut hl,
+                "build/bin/libllama-common.so.0",
+                "libllama-common.so.0.1.2",
+            )
+            .unwrap();
             t.into_inner().unwrap().finish().unwrap().flush().unwrap();
         }
         let out = tmp.join("out");
@@ -834,18 +1047,21 @@ mod tests {
         // THE fix: the versioned SONAME symlink is preserved and resolves,
         // so the loader finds libllama-common.so.0.
         let link = out.join("libllama-common.so.0");
-        assert!(link.symlink_metadata().unwrap().file_type().is_symlink(),
-                "SONAME must be a symlink");
-        assert!(std::fs::read(&link).is_ok(),
-                "SONAME symlink must resolve to the real lib");
+        assert!(
+            link.symlink_metadata().unwrap().file_type().is_symlink(),
+            "SONAME must be a symlink"
+        );
+        assert!(
+            std::fs::read(&link).is_ok(),
+            "SONAME symlink must resolve to the real lib"
+        );
         std::fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]
     fn runtime_extraction_flattens_server_and_libs_only() {
         use std::io::Write as _;
-        let tmp = std::env::temp_dir()
-            .join(format!("oaita-local-zip-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("oaita-local-zip-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
         let zp = tmp.join("rt.zip");
         {
@@ -872,10 +1088,13 @@ mod tests {
         assert!(out.join("libllama.so").is_file());
         assert!(out.join("libggml.so.1").is_file());
         assert!(!out.join("llama-quantize").exists());
-        #[cfg(unix)] {
+        #[cfg(unix)]
+        {
             use std::os::unix::fs::PermissionsExt;
             let mode = std::fs::metadata(out.join("llama-server"))
-                .unwrap().permissions().mode();
+                .unwrap()
+                .permissions()
+                .mode();
             assert_eq!(mode & 0o111, 0o111, "server must be executable");
         }
         std::fs::remove_dir_all(&tmp).ok();
@@ -895,8 +1114,7 @@ mod tests {
         let v: toml::Value = c.parse().unwrap();
         let url = v.get("base_url").and_then(|x| x.as_str()).unwrap();
         match crate::oaita::client::Endpoint::parse_url(url).unwrap() {
-            crate::oaita::client::Endpoint::Svc { name } =>
-                assert_eq!(name, "oaita-local"),
+            crate::oaita::client::Endpoint::Svc { name } => assert_eq!(name, "oaita-local"),
             other => panic!("expected Svc endpoint, got {other:?}"),
         }
     }
@@ -913,14 +1131,19 @@ mod tests {
         // downgrade of an explicit choice)
         assert_eq!(resolve_local_net("tap", true, false), ("tap".into(), None));
         // explicit host / off pass through untouched
-        assert_eq!(resolve_local_net("host", true, false), ("host".into(), None));
+        assert_eq!(
+            resolve_local_net("host", true, false),
+            ("host".into(), None)
+        );
         assert_eq!(resolve_local_net("off", true, true), ("off".into(), None));
     }
 
     #[test]
     fn url_filename_strips_path_and_query() {
-        assert_eq!(url_filename("https://h/a/b/model.gguf?download=true")
-                       .as_deref(), Some("model.gguf"));
+        assert_eq!(
+            url_filename("https://h/a/b/model.gguf?download=true").as_deref(),
+            Some("model.gguf")
+        );
         assert_eq!(url_filename("https://h/"), None);
     }
 }

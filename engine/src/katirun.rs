@@ -32,6 +32,7 @@ use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
 use std::sync::Arc;
 
+use brush_core::vfs::BoxVfs;
 use bytes::{BufMut, BytesMut};
 use kati::dep::{NamedDepNode, make_dep};
 use kati::eval::{Evaluator, FrameType};
@@ -40,6 +41,139 @@ use kati::loc::Loc;
 use kati::symtab::{Symbol, intern, join_symbols};
 use kati::var::{VarOrigin, Variable};
 use parking_lot::Mutex;
+
+/// Absolute-path adapter from the inherited direct-FUSE client to Kati's
+/// provider. Kati historically has a few relative probes outside Evaluator;
+/// resolving them here makes the logical make cwd explicit and ensures the
+/// direct client never interprets a path against the engine process cwd.
+struct DirectKatiFileSystem {
+    client: Arc<crate::direct_fs::DirectFsClient>,
+    cwd: std::path::PathBuf,
+}
+
+impl DirectKatiFileSystem {
+    fn new(
+        client: Arc<crate::direct_fs::DirectFsClient>,
+        cwd: std::path::PathBuf,
+    ) -> std::io::Result<Self> {
+        if !cwd.is_absolute() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Kati direct filesystem cwd must be absolute",
+            ));
+        }
+        Ok(Self { client, cwd })
+    }
+
+    fn absolute(&self, path: &std::path::Path) -> std::path::PathBuf {
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.cwd.join(path)
+        }
+    }
+
+    fn mode_kind(mode: u32) -> kati::filesystem::FileKind {
+        match mode & libc::S_IFMT {
+            libc::S_IFREG => kati::filesystem::FileKind::Regular,
+            libc::S_IFDIR => kati::filesystem::FileKind::Directory,
+            libc::S_IFLNK => kati::filesystem::FileKind::Symlink,
+            libc::S_IFIFO => kati::filesystem::FileKind::Fifo,
+            libc::S_IFSOCK => kati::filesystem::FileKind::Socket,
+            libc::S_IFCHR => kati::filesystem::FileKind::CharDevice,
+            libc::S_IFBLK => kati::filesystem::FileKind::BlockDevice,
+            _ => kati::filesystem::FileKind::Unknown,
+        }
+    }
+
+    fn dirent_kind(file_type: u32) -> kati::filesystem::FileKind {
+        match file_type {
+            value if value == libc::DT_REG as u32 => kati::filesystem::FileKind::Regular,
+            value if value == libc::DT_DIR as u32 => kati::filesystem::FileKind::Directory,
+            value if value == libc::DT_LNK as u32 => kati::filesystem::FileKind::Symlink,
+            value if value == libc::DT_FIFO as u32 => kati::filesystem::FileKind::Fifo,
+            value if value == libc::DT_SOCK as u32 => kati::filesystem::FileKind::Socket,
+            value if value == libc::DT_CHR as u32 => kati::filesystem::FileKind::CharDevice,
+            value if value == libc::DT_BLK as u32 => kati::filesystem::FileKind::BlockDevice,
+            _ => kati::filesystem::FileKind::Unknown,
+        }
+    }
+
+    fn metadata(&self, metadata: crate::direct_fs::DirectFsMetadata) -> kati::filesystem::Metadata {
+        kati::filesystem::Metadata {
+            kind: Self::mode_kind(metadata.mode),
+            len: metadata.len,
+            modified: metadata.modified,
+        }
+    }
+}
+
+impl kati::filesystem::FileSystemProvider for DirectKatiFileSystem {
+    fn metadata(&self, path: &std::path::Path) -> std::io::Result<kati::filesystem::Metadata> {
+        self.client
+            .direct_metadata(&self.absolute(path))
+            .map(|metadata| self.metadata(metadata))
+    }
+
+    fn symlink_metadata(
+        &self,
+        path: &std::path::Path,
+    ) -> std::io::Result<kati::filesystem::Metadata> {
+        self.client
+            .direct_symlink_metadata(&self.absolute(path))
+            .map(|metadata| self.metadata(metadata))
+    }
+
+    fn modified(&self, path: &std::path::Path) -> std::io::Result<std::time::SystemTime> {
+        self.client
+            .direct_metadata(&self.absolute(path))
+            .map(|metadata| metadata.modified)
+    }
+
+    fn read(&self, path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+        self.client.read(&self.absolute(path))
+    }
+
+    fn read_link(&self, path: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+        self.client.read_link(&self.absolute(path))
+    }
+
+    fn read_dir(
+        &self,
+        path: &std::path::Path,
+    ) -> std::io::Result<Vec<std::io::Result<kati::filesystem::DirEntry>>> {
+        self.client
+            .direct_read_dir(&self.absolute(path))
+            .map(|entries| {
+                entries
+                    .into_iter()
+                    .map(|entry| {
+                        let mut kind = Self::dirent_kind(entry.file_type);
+                        if kind == kati::filesystem::FileKind::Unknown {
+                            kind = Self::mode_kind(
+                                self.client.direct_symlink_metadata(&entry.path)?.mode,
+                            );
+                        }
+                        Ok(kati::filesystem::DirEntry {
+                            file_name: entry.file_name,
+                            path: entry.path,
+                            kind,
+                        })
+                    })
+                    .collect()
+            })
+    }
+
+    fn canonicalize(&self, path: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+        self.client.canonicalize(&self.absolute(path))
+    }
+
+    fn glob(&self, pattern: &[u8]) -> std::io::Result<Vec<Vec<u8>>> {
+        let pattern = std::path::Path::new(std::ffi::OsStr::from_bytes(pattern));
+        let absolute = self.absolute(pattern);
+        self.client.glob(absolute.as_os_str().as_bytes())
+    }
+}
 
 /// True when this engine invocation carries a projected `make`/`gmake` identity.
 /// Program identity, not inherited environment, selects the multicall role;
@@ -64,7 +198,9 @@ pub fn is_make_invocation() -> bool {
 fn kati_argv(argv: &[String]) -> Result<Vec<OsString>, String> {
     let mut out: Vec<OsString> = Vec::new();
     // argv0 — kati needs *some* program name; its basename is irrelevant here.
-    out.push(OsString::from(argv.first().cloned().unwrap_or_else(|| "make".into())));
+    out.push(OsString::from(
+        argv.first().cloned().unwrap_or_else(|| "make".into()),
+    ));
     // Inert in our direct-execute path (see fn doc); kept for argv parity.
     out.push(OsString::from("--ninja"));
 
@@ -105,8 +241,7 @@ fn kati_argv(argv: &[String]) -> Result<Vec<OsString>, String> {
                 i += 1;
             }
             // -lN attached load limit: advisory; kati accepts and ignores.
-            _ if a.starts_with("-l")
-                && a[2..].chars().all(|c| c.is_ascii_digit() || c == '.') => {
+            _ if a.starts_with("-l") && a[2..].chars().all(|c| c.is_ascii_digit() || c == '.') => {
                 out.push(OsString::from(a));
                 i += 1;
             }
@@ -114,8 +249,7 @@ fn kati_argv(argv: &[String]) -> Result<Vec<OsString>, String> {
             // -s silent, -r no-builtin-rules, -R no-builtin-variables,
             // -w print-directory, -k keep-going, -n dry-run (GNU: print,
             // don't execute), -i ignore-errors (GNU). Refuse anything else.
-            "-s" | "-r" | "-R" | "-w" | "-k" | "-n" | "-i" | "-B" | "-q" | "-t"
-            | "-l" => {
+            "-s" | "-r" | "-R" | "-w" | "-k" | "-n" | "-i" | "-B" | "-q" | "-t" | "-l" => {
                 out.push(OsString::from(a));
                 i += 1;
             }
@@ -189,8 +323,7 @@ fn read_bootstrap_makefile(
     // those includes resolve to nothing and whole prerequisite lists vanish
     // SILENTLY (`-include mk/.mk` is not an error). `?=` mirrors GNU
     // origin precedence: an env-seeded value wins over this default.
-    bootstrap.put_slice(
-        format!("MAKE_HOST?={}-pc-linux-gnu\n", std::env::consts::ARCH).as_bytes());
+    bootstrap.put_slice(format!("MAKE_HOST?={}-pc-linux-gnu\n", std::env::consts::ARCH).as_bytes());
     // sarun: MAKELEVEL tracks recursion across sub-makes. The caller passes
     // the level from the make's OWN inherited environment (seed_env) — many
     // in-process makes share one process env, so reading std::env here gave
@@ -258,7 +391,10 @@ fn read_bootstrap_makefile(
     bootstrap.put_u8(b'\n');
     kati::parser::parse_buf(
         &bootstrap.freeze(),
-        Loc { filename: intern("*bootstrap*"), line: 0 },
+        Loc {
+            filename: intern("*bootstrap*"),
+            line: 0,
+        },
     )
 }
 
@@ -332,18 +468,27 @@ fn run_kati(
     if trace {
         kati::exec::emit_recipe_err(&format!(
             "--trace: make in {} (makefile {:?}), goals {:?}",
-            working_dir.display(), makefile,
-            targets.iter().map(|t| t.to_string()).collect::<Vec<_>>()));
+            working_dir.display(),
+            makefile,
+            targets.iter().map(|t| t.to_string()).collect::<Vec<_>>()
+        ));
     }
     // sarun: the Evaluator seeds working_dir from the process cwd; override it
     // with the caller's logical working dir. For the shadow path this equals the
     // process cwd; for the in-process builtin it's the make's dir resolved from
     // -C against the brush context's cwd (no process chdir).
     ev.working_dir = working_dir.to_path_buf();
-    ev.include_dirs = include_dirs.iter().map(|d| {
-        let p = std::path::Path::new(d);
-        if p.is_absolute() { p.to_path_buf() } else { working_dir.join(p) }
-    }).collect();
+    ev.include_dirs = include_dirs
+        .iter()
+        .map(|d| {
+            let p = std::path::Path::new(d);
+            if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                working_dir.join(p)
+            }
+        })
+        .collect();
     ev.start()?;
 
     // sarun: GNU make's MAKEFILE_LIST has no leading space — the main
@@ -368,7 +513,13 @@ fn run_kati(
         let val = Arc::new(Value::Literal(None, v.clone()));
         ev.set_global_var(
             intern(k.as_bytes().to_vec()),
-            Variable::new_recursive(val, VarOrigin::Environment, Some(ev.current_frame()), None, v),
+            Variable::new_recursive(
+                val,
+                VarOrigin::Environment,
+                Some(ev.current_frame()),
+                None,
+                v,
+            ),
             false,
             None,
         )?;
@@ -520,7 +671,13 @@ fn run_kati(
             let val = Arc::new(Value::Literal(None, v.clone()));
             ev.set_global_var(
                 intern(b"MAKEFLAGS".to_vec()),
-                Variable::new_recursive(val, VarOrigin::Environment, Some(ev.current_frame()), None, v),
+                Variable::new_recursive(
+                    val,
+                    VarOrigin::Environment,
+                    Some(ev.current_frame()),
+                    None,
+                    v,
+                ),
                 false,
                 None,
             )?;
@@ -549,24 +706,52 @@ fn run_kati(
     // expansion, so earlier export/unexport directives and assignments are
     // reflected at their exact point in the makefile.
     ev.refresh_box_export_prefix()?;
-    let bootstrap_asts = read_bootstrap_makefile(targets, working_dir, no_builtin_rules, no_builtin_variables, makelevel)?;
+    let bootstrap_asts = read_bootstrap_makefile(
+        targets,
+        working_dir,
+        no_builtin_rules,
+        no_builtin_variables,
+        makelevel,
+    )?;
     {
-        let _frame = ev.enter(FrameType::Phase, bytes::Bytes::from_static(b"*bootstrap*"), Loc::default());
+        let _frame = ev.enter(
+            FrameType::Phase,
+            bytes::Bytes::from_static(b"*bootstrap*"),
+            Loc::default(),
+        );
         ev.in_bootstrap();
         ev.eval_stmts(&bootstrap_asts)?;
     }
     {
-        let _frame = ev.enter(FrameType::Phase, bytes::Bytes::from_static(b"*command line*"), Loc::default());
+        let _frame = ev.enter(
+            FrameType::Phase,
+            bytes::Bytes::from_static(b"*command line*"),
+            Loc::default(),
+        );
         ev.in_command_line();
         for l in cl_vars {
-            let asts = kati::parser::parse_buf(l, Loc { filename: intern("*bootstrap*"), line: 0 })?;
+            let asts = kati::parser::parse_buf(
+                l,
+                Loc {
+                    filename: intern("*bootstrap*"),
+                    line: 0,
+                },
+            )?;
             ev.eval_stmts(&asts)?;
         }
     }
     ev.in_toplevel_makefile();
     {
-        let _eval_frame = ev.enter(FrameType::Phase, bytes::Bytes::from_static(b"*parse*"), Loc::default());
-        let _file_frame = ev.enter(FrameType::Parse, bytes::Bytes::from(makefile.as_bytes().to_vec()), Loc::default());
+        let _eval_frame = ev.enter(
+            FrameType::Phase,
+            bytes::Bytes::from_static(b"*parse*"),
+            Loc::default(),
+        );
+        let _file_frame = ev.enter(
+            FrameType::Parse,
+            bytes::Bytes::from(makefile.as_bytes().to_vec()),
+            Loc::default(),
+        );
         let Some(mk) = kati::file_cache::get_makefile(makefile, &ev.working_dir)? else {
             anyhow::bail!("makefile not found");
         };
@@ -635,17 +820,15 @@ fn run_kati(
             let producible = ev.rules.iter().any(|r| {
                 r.outputs.contains(&sym)
                     || r.output_patterns.iter().any(|p| {
-                        kati::strutil::Pattern::new(bytes::Bytes::from(
-                            p.as_bytes().to_vec(),
-                        ))
-                        .matches(&name.as_bytes())
+                        kati::strutil::Pattern::new(bytes::Bytes::from(p.as_bytes().to_vec()))
+                            .matches(&name.as_bytes())
                     })
             });
             let path = std::path::Path::new(name);
             let exists = if path.is_absolute() {
-                path.exists()
+                kati::filesystem::exists(path).unwrap_or(false)
             } else {
-                working_dir.join(path).exists()
+                kati::filesystem::exists(working_dir.join(path)).unwrap_or(false)
             };
             if producible && (*required || !noremake.contains(name.as_bytes())) {
                 remake_targets.push((sym, *required));
@@ -685,8 +868,8 @@ fn run_kati(
         } else {
             working_dir.join(path)
         };
-        let meta = std::fs::metadata(abs).ok()?;
-        Some((meta.modified().ok()?, meta.len()))
+        let meta = kati::filesystem::metadata(&abs).ok()?;
+        Some((kati::filesystem::modified(&abs).ok()?, meta.len))
     }
 
     let before_stamps: std::collections::HashMap<Symbol, _> = remake_targets
@@ -713,7 +896,10 @@ fn run_kati(
             Loc::default(),
         );
         let required: std::collections::HashSet<Symbol> = remake_targets
-            .iter().filter(|(_, req)| *req).map(|(s, _)| *s).collect();
+            .iter()
+            .filter(|(_, req)| *req)
+            .map(|(s, _)| *s)
+            .collect();
         let (req_nodes, opt_nodes): (Vec<_>, Vec<_>) = remake_nodes
             .into_iter()
             .partition(|(s, _)| required.contains(s));
@@ -729,9 +915,9 @@ fn run_kati(
             }
         }
     }
-    let remake_active = successfully_checked.into_iter().any(|sym| {
-        before_stamps.get(&sym).copied().flatten() != include_stamp(working_dir, sym)
-    });
+    let remake_active = successfully_checked
+        .into_iter()
+        .any(|sym| before_stamps.get(&sym).copied().flatten() != include_stamp(working_dir, sym));
     // Optional remake targets that did not materialize are reported back so
     // the re-run skips them (otherwise a permanently-unmakeable -include
     // would re-queue every pass until the depth cap).
@@ -743,9 +929,12 @@ fn run_kati(
             }
             let b = sym.as_bytes();
             let p = std::path::Path::new(std::ffi::OsStr::from_bytes(&b));
-            let abs = if p.is_absolute() { p.to_path_buf() }
-                      else { working_dir.join(p) };
-            !abs.exists()
+            let abs = if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                working_dir.join(p)
+            };
+            !kati::filesystem::exists(abs).unwrap_or(false)
         })
         .map(|(sym, _)| sym.as_bytes().to_vec())
         .collect();
@@ -828,11 +1017,7 @@ fn emit_build_edges_kati(roots: &[NamedDepNode]) {
         let outs: Vec<String> = std::iter::once(guard.output.to_string())
             .chain(guard.implicit_outputs.iter().map(|s| s.to_string()))
             .collect();
-        let ins: Vec<String> = guard
-            .actual_inputs
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let ins: Vec<String> = guard.actual_inputs.iter().map(|s| s.to_string()).collect();
         // Recipe text. Evaluating cmds at frame-emit time would re-run
         // `$(shell …)` and other macro side effects, so we reconstruct the
         // make-SOURCE form statically instead (Value::static_string: literal
@@ -878,7 +1063,11 @@ fn emit_build_edges_kati(roots: &[NamedDepNode]) {
 /// reads the caller's real argv, not the synthesized kati_argv() (which
 /// injects `--ninja`, a sarun-internal detail no Makefile should observe).
 fn extract_long_flags(argv: &[String]) -> Vec<OsString> {
-    argv.iter().skip(1).filter(|a| a.starts_with("--")).map(OsString::from).collect()
+    argv.iter()
+        .skip(1)
+        .filter(|a| a.starts_with("--"))
+        .map(OsString::from)
+        .collect()
 }
 
 /// Install brush as kati's in-process recipe runner so kati::exec::exec runs
@@ -924,20 +1113,49 @@ pub(crate) fn flush_makevars() {
 /// for a feature it didn't ask for.
 pub(crate) fn vartrace_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var_os("SARUN_TRACE_VARS").is_some_and(|v| v == "1")
-    })
+    *ON.get_or_init(|| std::env::var_os("SARUN_TRACE_VARS").is_some_and(|v| v == "1"))
 }
 
 /// Make functions whose `$(name …)` head is NOT a variable dereference. The
 /// first argument of `call`/`value` IS one, so those record it.
 const MAKE_FUNCS: &[&str] = &[
-    "subst", "patsubst", "strip", "findstring", "filter", "filter-out",
-    "sort", "word", "wordlist", "words", "firstword", "lastword", "dir",
-    "notdir", "suffix", "basename", "addsuffix", "addprefix", "join",
-    "wildcard", "realpath", "abspath", "if", "or", "and", "intcmp",
-    "foreach", "file", "eval", "origin", "flavor", "shell", "guile",
-    "error", "warning", "info", "let",
+    "subst",
+    "patsubst",
+    "strip",
+    "findstring",
+    "filter",
+    "filter-out",
+    "sort",
+    "word",
+    "wordlist",
+    "words",
+    "firstword",
+    "lastword",
+    "dir",
+    "notdir",
+    "suffix",
+    "basename",
+    "addsuffix",
+    "addprefix",
+    "join",
+    "wildcard",
+    "realpath",
+    "abspath",
+    "if",
+    "or",
+    "and",
+    "intcmp",
+    "foreach",
+    "file",
+    "eval",
+    "origin",
+    "flavor",
+    "shell",
+    "guile",
+    "error",
+    "warning",
+    "info",
+    "let",
 ];
 
 /// Best-effort text scan of an UNEXPANDED rhs for the variables it
@@ -950,9 +1168,7 @@ const MAKE_FUNCS: &[&str] = &[
 pub(crate) fn extract_var_refs(rhs: &str) -> String {
     fn name_at(b: &[u8], i: usize) -> usize {
         let mut j = i;
-        while j < b.len()
-            && (b[j].is_ascii_alphanumeric() || matches!(b[j], b'_' | b'.' | b'-'))
-        {
+        while j < b.len() && (b[j].is_ascii_alphanumeric() || matches!(b[j], b'_' | b'.' | b'-')) {
             j += 1;
         }
         j
@@ -960,9 +1176,7 @@ pub(crate) fn extract_var_refs(rhs: &str) -> String {
     let b = rhs.as_bytes();
     let mut refs: Vec<String> = vec![];
     let mut push = |s: &str| {
-        if s.bytes().any(|c| c.is_ascii_alphabetic() || c == b'_')
-            && !refs.iter().any(|r| r == s)
-        {
+        if s.bytes().any(|c| c.is_ascii_alphabetic() || c == b'_') && !refs.iter().any(|r| r == s) {
             refs.push(s.to_string());
         }
     };
@@ -1067,25 +1281,30 @@ pub(crate) fn start_activity_reporting() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         kati::fileutil::start_stall_watchdog(
-            std::env::var("SARUN_STALL_SECS").ok()
-                .and_then(|s| s.parse().ok()).unwrap_or(300),
+            std::env::var("SARUN_STALL_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(300),
             Arc::new(|line| eprintln!("{line}")),
         );
-        std::thread::Builder::new().name("box-activity-feed".into()).spawn(|| {
-            loop {
-                std::thread::sleep(std::time::Duration::from_secs(30));
-                let snap = kati::fileutil::activity_snapshot();
-                if snap.is_empty() {
-                    continue;
+        std::thread::Builder::new()
+            .name("box-activity-feed".into())
+            .spawn(|| {
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(30));
+                    let snap = kati::fileutil::activity_snapshot();
+                    if snap.is_empty() {
+                        continue;
+                    }
+                    let items: Vec<serde_json::Value> = snap
+                        .into_iter()
+                        .map(|(d, age)| serde_json::json!([d, age]))
+                        .collect();
+                    let msg = serde_json::json!({"type": "box_activity", "items": items});
+                    crate::runner::send_nested_prov(format!("{msg}\n").as_bytes());
                 }
-                let items: Vec<serde_json::Value> = snap
-                    .into_iter()
-                    .map(|(d, age)| serde_json::json!([d, age]))
-                    .collect();
-                let msg = serde_json::json!({"type": "box_activity", "items": items});
-                crate::runner::send_nested_prov(format!("{msg}\n").as_bytes());
-            }
-        }).ok();
+            })
+            .ok();
     });
 }
 
@@ -1094,9 +1313,7 @@ pub(crate) fn start_activity_reporting() {
 /// Spool it to a private temp file and hand kati that path; the caller
 /// passes the LOGICAL stdin (the builtin's fd 0) or the process stdin
 /// (shadow path). Returns the temp path to use as the makefile.
-fn spool_stdin_makefile(
-    stdin: &mut dyn std::io::Read,
-) -> std::io::Result<std::ffi::OsString> {
+fn spool_stdin_makefile(stdin: &mut dyn std::io::Read) -> std::io::Result<std::ffi::OsString> {
     use std::io::Write as _;
     static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1114,58 +1331,67 @@ fn spool_stdin_makefile(
 fn install_make_recipe_runner() {
     install_var_recorder();
     start_activity_reporting();
-    kati::fileutil::install_recipe_runner(Arc::new(|shell, _shellflag, prefix, cmd, cwd, stdin, redirect_stderr, output_cb| {
-        use kati::fileutil::RecipeRunnerDecision;
-        let posix_shell = kati::fileutil::is_posix_shell_command(shell);
-        if !posix_shell {
-            return RecipeRunnerDecision::Passthrough;
-        }
-        let s = std::str::from_utf8(cmd)
-            .map(std::borrow::Cow::Borrowed)
-            .unwrap_or_else(|_| String::from_utf8_lossy(cmd));
-        let p = String::from_utf8_lossy(prefix);
-        // The recipe cwd is threaded EXPLICITLY from kati (the make's working_dir)
-        // rather than read from a make-thread thread-local — under -j the recipe
-        // runs on a worker thread that wouldn't see it. Set it for THIS worker
-        // thread around the run (save/restore so nested makes nest cleanly).
-        let cwd_path = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(cwd));
-        let prev = crate::brush::set_box_recipe_cwd(Some(cwd_path));
-        // Map kati's stderr disposition to brush's fd-2 handling: recipes
-        // (RedirectStderr::Stdout) merge stderr into the captured output; a
-        // $(shell ...) (RedirectStderr::None) keeps stderr on the box's real
-        // fd 2 (terminal/sink) and captures only stdout; DevNull discards it.
-        let stderr_mode = match redirect_stderr {
-            kati::fileutil::RedirectStderr::Stdout => crate::brush::RecipeStderr::Merge,
-            kati::fileutil::RedirectStderr::None => crate::brush::RecipeStderr::Inherit,
-            kati::fileutil::RedirectStderr::DevNull => crate::brush::RecipeStderr::Null,
-        };
-        let stdin = stdin.and_then(|fd| fd.try_clone().ok());
-        let code = crate::brush::run_recipe_in_process_prefixed(
-            &p, &s, output_cb, stderr_mode, stdin);
-        crate::brush::set_box_recipe_cwd(prev);
-        RecipeRunnerDecision::Ran { code }
-    }));
+    kati::fileutil::install_recipe_runner(Arc::new(
+        |shell, _shellflag, prefix, cmd, cwd, stdin, redirect_stderr, output_cb| {
+            use kati::fileutil::RecipeRunnerDecision;
+            let posix_shell = kati::fileutil::is_posix_shell_command(shell);
+            if !posix_shell {
+                return RecipeRunnerDecision::Passthrough;
+            }
+            let s = std::str::from_utf8(cmd)
+                .map(std::borrow::Cow::Borrowed)
+                .unwrap_or_else(|_| String::from_utf8_lossy(cmd));
+            let p = String::from_utf8_lossy(prefix);
+            // The recipe cwd is threaded EXPLICITLY from kati (the make's working_dir)
+            // rather than read from a make-thread thread-local — under -j the recipe
+            // runs on a worker thread that wouldn't see it. Set it for THIS worker
+            // thread around the run (save/restore so nested makes nest cleanly).
+            let cwd_path = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(cwd));
+            let prev = crate::brush::set_box_recipe_cwd(Some(cwd_path));
+            // Map kati's stderr disposition to brush's fd-2 handling: recipes
+            // (RedirectStderr::Stdout) merge stderr into the captured output; a
+            // $(shell ...) (RedirectStderr::None) keeps stderr on the box's real
+            // fd 2 (terminal/sink) and captures only stdout; DevNull discards it.
+            let stderr_mode = match redirect_stderr {
+                kati::fileutil::RedirectStderr::Stdout => crate::brush::RecipeStderr::Merge,
+                kati::fileutil::RedirectStderr::None => crate::brush::RecipeStderr::Inherit,
+                kati::fileutil::RedirectStderr::DevNull => crate::brush::RecipeStderr::Null,
+            };
+            let stdin = stdin.and_then(|fd| fd.try_clone().ok());
+            let code =
+                crate::brush::run_recipe_in_process_prefixed(&p, &s, output_cb, stderr_mode, stdin);
+            crate::brush::set_box_recipe_cwd(prev);
+            RecipeRunnerDecision::Ran { code }
+        },
+    ));
     // Report each node's recipe run-state to the engine, keyed by the node's
     // primary output (== the build_edges row's outs[0]), so the targets pane
     // shows only the targets currently building and their wall time.
-    kati::fileutil::install_edge_reporter(Arc::new(|output: &[u8], phase, code, excerpt: &[u8]| {
-        let out = String::from_utf8_lossy(output);
-        let p = match phase {
-            kati::fileutil::EdgePhase::Start => "start",
-            kati::fileutil::EdgePhase::Done => "done",
-        };
-        // Tag this worker thread with the edge whose recipe is about to run
-        // (cleared on Done): every pipeline the recipe spawns records
-        // `edge_out`, the exact edge → pipeline causal link the UI's
-        // cross-navigation follows.
-        crate::brush::set_box_recipe_edge(match phase {
-            kati::fileutil::EdgePhase::Start => Some(out.to_string()),
-            kati::fileutil::EdgePhase::Done => None,
-        });
-        let ex = String::from_utf8_lossy(excerpt);
-        crate::brush::send_build_edge_state(Some(&out), None, p, code,
-                                            if ex.is_empty() { None } else { Some(&ex) });
-    }));
+    kati::fileutil::install_edge_reporter(Arc::new(
+        |output: &[u8], phase, code, excerpt: &[u8]| {
+            let out = String::from_utf8_lossy(output);
+            let p = match phase {
+                kati::fileutil::EdgePhase::Start => "start",
+                kati::fileutil::EdgePhase::Done => "done",
+            };
+            // Tag this worker thread with the edge whose recipe is about to run
+            // (cleared on Done): every pipeline the recipe spawns records
+            // `edge_out`, the exact edge → pipeline causal link the UI's
+            // cross-navigation follows.
+            crate::brush::set_box_recipe_edge(match phase {
+                kati::fileutil::EdgePhase::Start => Some(out.to_string()),
+                kati::fileutil::EdgePhase::Done => None,
+            });
+            let ex = String::from_utf8_lossy(excerpt);
+            crate::brush::send_build_edge_state(
+                Some(&out),
+                None,
+                p,
+                code,
+                if ex.is_empty() { None } else { Some(&ex) },
+            );
+        },
+    ));
 }
 
 /// GNU-shaped `make --help` text for the embedded make: the options the
@@ -1220,7 +1446,9 @@ pub fn make_main(argv: &[String]) -> i32 {
             println!("GNU Make 4.3");
             println!("Built for {}-pc-linux-gnu", std::env::consts::ARCH);
             println!("Copyright (C) 1988-2020 Free Software Foundation, Inc.");
-            println!("License GPLv3+: GNU GPL version 3 or later <http://gnu.org/licenses/gpl.html>");
+            println!(
+                "License GPLv3+: GNU GPL version 3 or later <http://gnu.org/licenses/gpl.html>"
+            );
             println!("This is free software: you are free to change and redistribute it.");
             println!("There is NO WARRANTY, to the extent permitted by law.");
             return 0;
@@ -1238,12 +1466,18 @@ pub fn make_main(argv: &[String]) -> i32 {
         let mut i = 1;
         while i < argv.len() {
             if argv[i] == "-C" {
-                if let Some(d) = argv.get(i + 1) { let _ = std::env::set_current_dir(d); }
+                if let Some(d) = argv.get(i + 1) {
+                    let _ = std::env::set_current_dir(d);
+                }
                 i += 2;
             } else if let Some(d) = argv[i].strip_prefix("-C") {
-                if !d.is_empty() { let _ = std::env::set_current_dir(d); }
+                if !d.is_empty() {
+                    let _ = std::env::set_current_dir(d);
+                }
                 i += 1;
-            } else { i += 1; }
+            } else {
+                i += 1;
+            }
         }
     }
 
@@ -1256,7 +1490,10 @@ pub fn make_main(argv: &[String]) -> i32 {
     //    A refused flag is a visible error, no fallback.
     let kargv = match kati_argv(argv) {
         Ok(v) => v,
-        Err(msg) => { eprintln!("{msg}"); return 2; }
+        Err(msg) => {
+            eprintln!("{msg}");
+            return 2;
+        }
     };
     let _ = kati::flags::install_args(kargv.clone());
     let flags = kati::flags::Flags::from_args(kargv);
@@ -1276,7 +1513,7 @@ pub fn make_main(argv: &[String]) -> i32 {
         None => {
             let mut found = None;
             for cand in ["GNUmakefile", "makefile", "Makefile"] {
-                if std::fs::metadata(cand).is_ok() {
+                if kati::filesystem::metadata(cand).is_ok() {
                     found = Some(OsString::from(cand));
                     break;
                 }
@@ -1306,7 +1543,7 @@ pub fn make_main(argv: &[String]) -> i32 {
     //     target" pair is what survives the corpus runner's make[N]:
     //     Entering/Leaving strip anyway.
     {
-        if std::fs::metadata(&makefile).is_err() {
+        if kati::filesystem::metadata(&makefile).is_err() {
             let display = makefile.to_string_lossy();
             // No " Stop." suffix: rkati standalone doesn't emit it, so
             // kati_norms doesn't strip it; gnu does emit it but make_norms
@@ -1333,24 +1570,38 @@ pub fn make_main(argv: &[String]) -> i32 {
     // chdir'd for -C above), so this matches the Evaluator's own default.
     let shadow_cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
     // Shadow/main() path is one OS process per make — seed from the process env.
-    let seed_env: Vec<(std::ffi::OsString, std::ffi::OsString)> =
-        std::env::vars_os().collect();
+    let seed_env: Vec<(std::ffi::OsString, std::ffi::OsString)> = std::env::vars_os().collect();
     let cmdline_flags = extract_long_flags(argv);
     // Optional includes a previous remake pass could not build (colon-joined,
     // via the re-exec env) — skip re-queueing them this pass.
-    let noremake: std::collections::HashSet<Vec<u8>> =
-        std::env::var_os("SARUN_KATI_NOREMAKE")
-            .map(|v| std::os::unix::ffi::OsStrExt::as_bytes(v.as_os_str())
+    let noremake: std::collections::HashSet<Vec<u8>> = std::env::var_os("SARUN_KATI_NOREMAKE")
+        .map(|v| {
+            std::os::unix::ffi::OsStrExt::as_bytes(v.as_os_str())
                 .split(|&b| b == b':')
                 .filter(|s| !s.is_empty())
                 .map(|s| s.to_vec())
-                .collect())
-            .unwrap_or_default();
-    let run_result = match run_kati(&targets, &cl_vars, &makefile, &shadow_cwd,
-        &seed_env, recipe_stdin, &include_dirs, flags.no_builtin_rules,
-        flags.no_builtin_variables, &cmdline_flags, flags.is_dry_run,
-        flags.is_ignore_errors, flags.is_trace, flags.is_always_make,
-        flags.is_question, flags.is_touch, &noremake) {
+                .collect()
+        })
+        .unwrap_or_default();
+    let run_result = match run_kati(
+        &targets,
+        &cl_vars,
+        &makefile,
+        &shadow_cwd,
+        &seed_env,
+        recipe_stdin,
+        &include_dirs,
+        flags.no_builtin_rules,
+        flags.no_builtin_variables,
+        &cmdline_flags,
+        flags.is_dry_run,
+        flags.is_ignore_errors,
+        flags.is_trace,
+        flags.is_always_make,
+        flags.is_question,
+        flags.is_touch,
+        &noremake,
+    ) {
         Ok(r) => r,
         Err(e) => {
             // Recipe failure already printed its `*** [target] Error N`; just
@@ -1402,8 +1653,7 @@ pub fn make_main(argv: &[String]) -> i32 {
                 }
             }
             let joined = all.join(&b':');
-            cmd.env("SARUN_KATI_NOREMAKE",
-                    std::ffi::OsStr::from_bytes(&joined));
+            cmd.env("SARUN_KATI_NOREMAKE", std::ffi::OsStr::from_bytes(&joined));
         }
         let err = std::os::unix::process::CommandExt::exec(&mut cmd);
         eprintln!("*** kati: failed to re-exec for remake: {err}");
@@ -1439,9 +1689,10 @@ pub fn make_builtin(
 ) -> i32 {
     install_make_recipe_runner();
 
-    let recipe_stdin = stdin.as_ref().and_then(|input| {
-        input.try_borrow_as_fd().ok()?.try_clone_to_owned().ok()
-    }).map(std::sync::Arc::new);
+    let recipe_stdin = stdin
+        .as_ref()
+        .and_then(|input| input.try_borrow_as_fd().ok()?.try_clone_to_owned().ok())
+        .map(std::sync::Arc::new);
 
     // make pseudo-actions handled before kati's flag parser (which panics on
     // unknown flags). --version short-circuits to the gnu-shaped banner.
@@ -1449,9 +1700,18 @@ pub fn make_builtin(
         if a == "--version" || a == "-v" {
             let _ = writeln!(out, "GNU Make 4.3");
             let _ = writeln!(out, "Built for {}-pc-linux-gnu", std::env::consts::ARCH);
-            let _ = writeln!(out, "Copyright (C) 1988-2020 Free Software Foundation, Inc.");
-            let _ = writeln!(out, "License GPLv3+: GNU GPL version 3 or later <http://gnu.org/licenses/gpl.html>");
-            let _ = writeln!(out, "This is free software: you are free to change and redistribute it.");
+            let _ = writeln!(
+                out,
+                "Copyright (C) 1988-2020 Free Software Foundation, Inc."
+            );
+            let _ = writeln!(
+                out,
+                "License GPLv3+: GNU GPL version 3 or later <http://gnu.org/licenses/gpl.html>"
+            );
+            let _ = writeln!(
+                out,
+                "This is free software: you are free to change and redistribute it."
+            );
             let _ = writeln!(out, "There is NO WARRANTY, to the extent permitted by law.");
             return 0;
         }
@@ -1489,18 +1749,42 @@ pub fn make_builtin(
         .iter()
         .find(|(k, _)| k == "MAKEFLAGS")
         .map(|(_, value)| value.as_bytes());
-    let flags = kati::flags::Flags::from_args_with_makeflags(
-        kargv,
-        inherited_makeflags,
-    );
+    let flags = kati::flags::Flags::from_args_with_makeflags(kargv, inherited_makeflags);
 
     // Resolve -C against the context cwd (NO process chdir). flags.working_dir
     // is kati's parsed -C value.
     let mut working_dir = base_cwd.to_path_buf();
     if let Some(c) = &flags.working_dir {
         let p = std::path::Path::new(c);
-        working_dir = if p.is_absolute() { p.to_path_buf() } else { working_dir.join(p) };
+        working_dir = if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            working_dir.join(p)
+        };
     }
+
+    // A Brush make is a box operation: every read for makefile discovery,
+    // parse/eval, dependency analysis and post-recipe freshness stays on the
+    // inherited direct-FUSE capability. Absence is a hard integration error;
+    // silently reading the engine namespace would violate the box boundary.
+    let direct_fs = match crate::direct_fs::current() {
+        Some(client) => client,
+        None => {
+            let _ = writeln!(
+                err,
+                "sarun-engine make: direct filesystem capability is unavailable"
+            );
+            return 2;
+        }
+    };
+    let provider = match DirectKatiFileSystem::new(direct_fs, working_dir.clone()) {
+        Ok(provider) => provider,
+        Err(error) => {
+            let _ = writeln!(err, "sarun-engine make: direct filesystem: {error}");
+            return 2;
+        }
+    };
+    let _filesystem = kati::filesystem::install_file_system_provider(Arc::new(provider));
 
     // Makefile: explicit -f, else discover GNUmakefile/makefile/Makefile in the
     // working dir. Stored as the name kati interns (relative); the fs read
@@ -1517,7 +1801,8 @@ pub fn make_builtin(
                 Err(e) => {
                     let _ = writeln!(
                         err,
-                        "sarun-engine make: cannot read makefile from stdin: {e}");
+                        "sarun-engine make: cannot read makefile from stdin: {e}"
+                    );
                     return 2;
                 }
             }
@@ -1526,7 +1811,7 @@ pub fn make_builtin(
         None => {
             let mut found = None;
             for cand in ["GNUmakefile", "makefile", "Makefile"] {
-                if std::fs::metadata(working_dir.join(cand)).is_ok() {
+                if kati::filesystem::metadata(working_dir.join(cand)).is_ok() {
                     found = Some(OsString::from(cand));
                     break;
                 }
@@ -1543,7 +1828,7 @@ pub fn make_builtin(
             }
         }
     };
-    if std::fs::metadata(working_dir.join(&makefile)).is_err() {
+    if kati::filesystem::metadata(working_dir.join(&makefile)).is_err() {
         let display = makefile.to_string_lossy();
         let _ = writeln!(err, "make: {display}: No such file or directory");
         let _ = writeln!(err, "make: *** No rule to make target '{display}'.");
@@ -1587,11 +1872,25 @@ pub fn make_builtin(
     // and re-run kati, up to a small cap — matching SARUN_KATI_REMAKE_DEPTH.
     let cmdline_flags = extract_long_flags(argv);
     let mut noremake: std::collections::HashSet<Vec<u8>> = Default::default();
-    let mut result = run_kati(&targets, &cl_vars, &makefile, &working_dir,
-        seed_env, recipe_stdin.clone(), &include_dirs, flags.no_builtin_rules,
-        flags.no_builtin_variables, &cmdline_flags, flags.is_dry_run,
-        flags.is_ignore_errors, flags.is_trace, flags.is_always_make,
-        flags.is_question, flags.is_touch, &noremake);
+    let mut result = run_kati(
+        &targets,
+        &cl_vars,
+        &makefile,
+        &working_dir,
+        seed_env,
+        recipe_stdin.clone(),
+        &include_dirs,
+        flags.no_builtin_rules,
+        flags.no_builtin_variables,
+        &cmdline_flags,
+        flags.is_dry_run,
+        flags.is_ignore_errors,
+        flags.is_trace,
+        flags.is_always_make,
+        flags.is_question,
+        flags.is_touch,
+        &noremake,
+    );
     let mut remake_depth = 0u32;
     while matches!(&result, Ok(r) if r.remake_active) && remake_depth < 5 {
         remake_depth += 1;
@@ -1607,12 +1906,25 @@ pub fn make_builtin(
         // forever).
         kati::file_cache::clear();
         kati::fileutil::clear_glob_cache();
-        result = run_kati(&targets, &cl_vars, &makefile, &working_dir,
-            seed_env, recipe_stdin.clone(), &include_dirs,
-            flags.no_builtin_rules, flags.no_builtin_variables,
-            &cmdline_flags, flags.is_dry_run, flags.is_ignore_errors,
-            flags.is_trace, flags.is_always_make, flags.is_question,
-            flags.is_touch, &noremake);
+        result = run_kati(
+            &targets,
+            &cl_vars,
+            &makefile,
+            &working_dir,
+            seed_env,
+            recipe_stdin.clone(),
+            &include_dirs,
+            flags.no_builtin_rules,
+            flags.no_builtin_variables,
+            &cmdline_flags,
+            flags.is_dry_run,
+            flags.is_ignore_errors,
+            flags.is_trace,
+            flags.is_always_make,
+            flags.is_question,
+            flags.is_touch,
+            &noremake,
+        );
     }
 
     kati::exec::set_recipe_out(prev_out);
@@ -1623,12 +1935,19 @@ pub fn make_builtin(
     match result {
         Ok(r) => {
             if r.remake_active {
-                let _ = writeln!(err, "*** kati: remake-the-makefile loop exceeded 5 iterations");
+                let _ = writeln!(
+                    err,
+                    "*** kati: remake-the-makefile loop exceeded 5 iterations"
+                );
                 return 2;
             }
             let _ = out.flush();
             // GNU -q: silent probe — exit 1 when something would be rebuilt.
-            if flags.is_question && r.would_run { 1 } else { 0 }
+            if flags.is_question && r.would_run {
+                1
+            } else {
+                0
+            }
         }
         Err(e) => {
             // A recipe failure already emitted its `*** [target] Error N` line

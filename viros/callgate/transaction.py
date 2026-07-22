@@ -61,6 +61,12 @@ def plan(manifest: ValidatedManifest) -> tuple[str, ...]:
         f"{register}=entry {manifest.entry_address:#x}, "
         for register in architecture.entry_address_registers
     )
+    completion_setup = (
+        f"{architecture.link_register}=completion "
+        f"{manifest.completion_address:#x}"
+        if architecture.link_register is not None
+        else f"internal completion={manifest.completion_address:#x}"
+    )
     return (
         f"verify stopped {architecture.display_name} target against {manifest.kernel_file}",
         f"verify {len(manifest.regions)} virtual-to-physical mappings on CPU {manifest.cpu}",
@@ -72,12 +78,12 @@ def plan(manifest: ValidatedManifest) -> tuple[str, ...]:
         f"{arguments[0]}=request {manifest.request_address:#x}, "
         f"{arguments[1]}=result {manifest.result_address:#x}, "
         f"{arguments[2]}={manifest.result_size:#x}, "
-        f"{entry_aliases}"
-        f"{architecture.link_register}=completion {manifest.completion_address:#x}",
+        f"{entry_aliases}" + completion_setup,
         f"resume only CPU {manifest.cpu} synchronously to {manifest.completion_address:#x}; "
         "host timeout is not yet enforceable through the stock QEMU packet set",
         "read and validate the mailbox result",
-        "restore pages, registers, and breakpoint in finally; then byte-audit state",
+        "restore pages, registers, and breakpoint in finally; then audit restored "
+        "state using architecture register policies",
     )
 
 
@@ -226,8 +232,29 @@ class CallGateTransaction:
             if target.read_physical(region.physical_address, region.size) != pages[region.name]:
                 raise CallGateError(f"post-restore audit failed for region {region.name}")
             audit.append(f"region {region.name}: restored")
+        masked_registers: list[tuple[int, str, int]] = []
         for key, before in registers.items():
-            if target.read_register(*key) != before:
-                raise CallGateError(f"post-restore audit failed for CPU {key[0]} register {key[1]}")
-        audit.append(f"{len(registers)} register values: restored")
+            after = target.read_register(*key)
+            mask = architecture.restoration_audit_mask(key[1])
+            if (after ^ before) & mask:
+                raise CallGateError(
+                    f"post-restore audit failed for CPU {key[0]} register {key[1]}: "
+                    f"expected {before:#x}, got {after:#x}, audit mask {mask:#x}"
+                )
+            full_mask = (1 << architecture.register_bits(key[1])) - 1
+            if mask != full_mask:
+                masked_registers.append((key[0], key[1], mask))
+        if masked_registers:
+            for cpu, register, mask in masked_registers:
+                audit.append(
+                    f"CPU {cpu} register {register}: writable fields restored "
+                    f"(mask {mask:#x}; volatile/read-only fields excluded)"
+                )
+            exact_count = len(registers) - len(masked_registers)
+            audit.append(
+                f"{len(registers)} register values: restoration audited "
+                f"({exact_count} exact, {len(masked_registers)} writable-field masked)"
+            )
+        else:
+            audit.append(f"{len(registers)} register values: restored")
         return CallGateResult(result=result, audit=tuple(audit))

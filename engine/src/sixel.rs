@@ -34,8 +34,7 @@ pub fn da1_reports_sixel(reply: &str) -> bool {
 /// PXxPY pixels per cell, return the pixel dimensions to scale the image to so
 /// it fits inside the box while preserving aspect ratio (never upscaling past
 /// the source, so a tiny favicon stays crisp rather than blowing up blurry).
-pub fn fit_pixels(img_w: u32, img_h: u32, cols: u16, rows: u16,
-                  px: u16, py: u16) -> (u32, u32) {
+pub fn fit_pixels(img_w: u32, img_h: u32, cols: u16, rows: u16, px: u16, py: u16) -> (u32, u32) {
     let box_w = (cols as u32) * (px.max(1) as u32);
     let box_h = (rows as u32) * (py.max(1) as u32);
     if img_w == 0 || img_h == 0 || box_w == 0 || box_h == 0 {
@@ -52,13 +51,18 @@ pub fn fit_pixels(img_w: u32, img_h: u32, cols: u16, rows: u16,
         ((box_h as u64 * img_w as u64 / img_h as u64) as u32, box_h)
     };
     // Never upscale beyond the source.
-    if w > img_w || h > img_h { w = img_w; h = img_h; }
+    if w > img_w || h > img_h {
+        w = img_w;
+        h = img_h;
+    }
     (w.max(1), h.max(1))
 }
 
 /// Quantize an 8-bit channel to the 0..=5 rung of a 6×6×6 color cube.
 #[inline]
-fn rung(c: u8) -> u8 { ((c as u16 * 5 + 127) / 255) as u8 }
+fn rung(c: u8) -> u8 {
+    ((c as u16 * 5 + 127) / 255) as u8
+}
 
 /// Palette index (0..216) for an RGB pixel in the fixed 6×6×6 cube.
 #[inline]
@@ -68,7 +72,9 @@ fn pal_index(r: u8, g: u8, b: u8) -> u8 {
 
 /// The 0..=100 percent value a cube rung maps to (rung 0→0, 5→100).
 #[inline]
-fn rung_pct(rung: u8) -> u8 { (rung as u16 * 100 / 5) as u8 }
+fn rung_pct(rung: u8) -> u8 {
+    (rung as u16 * 100 / 5) as u8
+}
 
 /// Encode a tightly-packed RGB8 buffer (`w*h*3` bytes, row-major) as a
 /// self-contained DECSIXEL sequence over a fixed 6×6×6 palette. The palette is
@@ -97,13 +103,15 @@ pub fn encode_rgb(rgb: &[u8], w: usize, h: usize) -> Vec<u8> {
     }
     // Palette definitions (percent RGB).
     for (i, u) in used.iter().enumerate() {
-        if !u { continue; }
+        if !u {
+            continue;
+        }
         let ri = (i / 36) as u8;
         let gi = ((i / 6) % 6) as u8;
         let bi = (i % 6) as u8;
         out.extend_from_slice(
-            format!("#{i};2;{};{};{}", rung_pct(ri), rung_pct(gi), rung_pct(bi))
-                .as_bytes());
+            format!("#{i};2;{};{};{}", rung_pct(ri), rung_pct(gi), rung_pct(bi)).as_bytes(),
+        );
     }
 
     // Bands of 6 rows.
@@ -114,12 +122,18 @@ pub fn encode_rgb(rgb: &[u8], w: usize, h: usize) -> Vec<u8> {
         let mut band_used = [false; 216];
         for y in band_top..band_top + band_h {
             let row = &idx[y * w..y * w + w];
-            for &c in row { band_used[c as usize] = true; }
+            for &c in row {
+                band_used[c as usize] = true;
+            }
         }
         let mut first = true;
         for c in 0..216u16 {
-            if !band_used[c as usize] { continue; }
-            if !first { out.push(b'$'); } // CR: overlay this color on the band
+            if !band_used[c as usize] {
+                continue;
+            }
+            if !first {
+                out.push(b'$');
+            } // CR: overlay this color on the band
             first = false;
             out.extend_from_slice(format!("#{c}").as_bytes());
             // Build this color's sixel bytes across the row, then RLE.
@@ -128,12 +142,21 @@ pub fn encode_rgb(rgb: &[u8], w: usize, h: usize) -> Vec<u8> {
             for x in 0..w {
                 let mut bits: u8 = 0;
                 for (i, y) in (band_top..band_top + band_h).enumerate() {
-                    if idx[y * w + x] == c as u8 { bits |= 1 << i; }
+                    if idx[y * w + x] == c as u8 {
+                        bits |= 1 << i;
+                    }
                 }
                 let ch = 0x3F + bits;
-                if x == 0 { prev = ch; run = 1; }
-                else if ch == prev { run += 1; }
-                else { emit_run(&mut out, prev, run); prev = ch; run = 1; }
+                if x == 0 {
+                    prev = ch;
+                    run = 1;
+                } else if ch == prev {
+                    run += 1;
+                } else {
+                    emit_run(&mut out, prev, run);
+                    prev = ch;
+                    run = 1;
+                }
             }
             emit_run(&mut out, prev, run);
         }
@@ -147,12 +170,16 @@ pub fn encode_rgb(rgb: &[u8], w: usize, h: usize) -> Vec<u8> {
 /// Emit one sixel byte `ch` repeated `run` times, run-length-compressed
 /// (`!<n><ch>`) when that's shorter than the literal repetition.
 fn emit_run(out: &mut Vec<u8>, ch: u8, run: u32) {
-    if run == 0 { return; }
+    if run == 0 {
+        return;
+    }
     if run >= 4 {
         out.extend_from_slice(format!("!{run}").as_bytes());
         out.push(ch);
     } else {
-        for _ in 0..run { out.push(ch); }
+        for _ in 0..run {
+            out.push(ch);
+        }
     }
 }
 
@@ -178,14 +205,19 @@ mod tests {
         assert_eq!(fit_pixels(8, 8, 40, 40, 10, 20), (8, 8));
         // Tall image is height-bound.
         let (w, h) = fit_pixels(50, 100, 10, 5, 10, 20);
-        assert!(h <= 100 && w <= 100 && h >= w, "tall → height-bound: {w}x{h}");
+        assert!(
+            h <= 100 && w <= 100 && h >= w,
+            "tall → height-bound: {w}x{h}"
+        );
     }
 
     #[test]
     fn encode_is_well_formed_dcs() {
         // 2×6 solid red image.
-        let rgb: Vec<u8> = std::iter::repeat([255u8, 0, 0]).take(12)
-            .flatten().collect();
+        let rgb: Vec<u8> = std::iter::repeat([255u8, 0, 0])
+            .take(12)
+            .flatten()
+            .collect();
         let s = encode_rgb(&rgb, 2, 6);
         assert!(s.starts_with(b"\x1bPq"), "DCS introducer");
         assert!(s.ends_with(b"\x1b\\"), "String Terminator");
@@ -200,8 +232,10 @@ mod tests {
     #[test]
     fn encode_runs_are_length_compressed() {
         // 10×6 solid → a run of 10 identical '~' columns → RLE "!10~".
-        let rgb: Vec<u8> = std::iter::repeat([0u8, 255, 0]).take(60)
-            .flatten().collect();
+        let rgb: Vec<u8> = std::iter::repeat([0u8, 255, 0])
+            .take(60)
+            .flatten()
+            .collect();
         let s = String::from_utf8(encode_rgb(&rgb, 10, 6)).unwrap();
         assert!(s.contains("!10~"), "run-length compressed: {s}");
     }

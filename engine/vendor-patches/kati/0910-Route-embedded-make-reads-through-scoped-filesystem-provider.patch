@@ -1,0 +1,1176 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Wed, 22 Jul 2026 16:39:01 +0000
+Subject: [PATCH] Route embedded make reads through scoped filesystem provider
+
+---
+diff --git a/src-rs/dep.rs b/src-rs/dep.rs
+index b877251..3885272 100644
+--- a/src-rs/dep.rs
++++ b/src-rs/dep.rs
+@@ -29,6 +29,7 @@ use crate::{
+     error, error_loc,
+     eval::{Evaluator, FrameType},
+     expr::{Evaluable, Value},
++    filesystem,
+     flags::FLAGS,
+     loc::Loc,
+     log,
+@@ -752,7 +753,7 @@ impl<'a> DepBuilder<'a> {
+         } else {
+             self.ev.working_dir.join(p)
+         };
+-        std::fs::exists(&path).is_ok_and(|v| v)
++        filesystem::exists(&path).is_ok_and(|v| v)
+     }
+ 
+     /// GNU make directory search: a relative prerequisite that has no rule of
+@@ -796,7 +797,9 @@ impl<'a> DepBuilder<'a> {
+             cand.extend_from_slice(&pat[pct + 1..]);
+             let cand_str = OsStr::from_bytes(&cand);
+             // 1. the make's working directory
+-            if self.ev.working_dir.join(cand_str).is_file() {
++            if filesystem::metadata(self.ev.working_dir.join(cand_str))
++                .is_ok_and(|metadata| metadata.is_file())
++            {
+                 return Some(intern(cand));
+             }
+             // 2. the VPATH / vpath search path
+@@ -807,7 +810,7 @@ impl<'a> DepBuilder<'a> {
+             // 3. GNU's default library directories
+             for dir in ["/lib", "/usr/lib", "/usr/local/lib"] {
+                 let p = std::path::Path::new(dir).join(cand_str);
+-                if p.is_file() {
++                if filesystem::metadata(&p).is_ok_and(|metadata| metadata.is_file()) {
+                     let mut full = dir.as_bytes().to_vec();
+                     full.push(b'/');
+                     full.extend_from_slice(&cand);
+@@ -830,7 +833,7 @@ impl<'a> DepBuilder<'a> {
+             return None;
+         }
+         let rel = std::path::Path::new(OsStr::from_bytes(&bytes));
+-        if std::fs::exists(self.ev.working_dir.join(rel)).is_ok_and(|v| v) {
++        if filesystem::exists(self.ev.working_dir.join(rel)).is_ok_and(|v| v) {
+             return None;
+         }
+         // Search order: the VPATH variable's directories, then matching
+@@ -855,7 +858,7 @@ impl<'a> DepBuilder<'a> {
+             } else {
+                 self.ev.working_dir.join(p)
+             };
+-            if std::fs::exists(&abs).is_ok_and(|v| v) {
++            if filesystem::exists(&abs).is_ok_and(|v| v) {
+                 return Some(intern(cand));
+             }
+         }
+diff --git a/src-rs/eval.rs b/src-rs/eval.rs
+index f0427e8..27411e1 100644
+--- a/src-rs/eval.rs
++++ b/src-rs/eval.rs
+@@ -1299,7 +1299,7 @@ impl Evaluator {
+                 continue;
+             }
+             let f = String::from_utf8_lossy(name);
+-            let exists = self.working_dir.join(&*f).exists();
++            let exists = crate::filesystem::exists(self.working_dir.join(&*f)).unwrap_or(false);
+             if !exists {
+                 warn_loc!(
+                     self.loc.as_ref(),
+diff --git a/src-rs/exec.rs b/src-rs/exec.rs
+index 05bd208..0f5debe 100644
+--- a/src-rs/exec.rs
++++ b/src-rs/exec.rs
+@@ -504,7 +504,7 @@ impl<'a> Executor<'a> {
+             } else {
+                 self.ce.ev.working_dir.join(dpath)
+             };
+-            if std::fs::exists(&dpath).unwrap_or(false) {
++            if crate::filesystem::exists(&dpath).unwrap_or(false) {
+                 continue;
+             }
+             if visiting.contains(&dout) {
+@@ -866,6 +866,7 @@ list of the rule for '{output}' at {loc}"));
+                 let shellflag = self.shellflag;
+                 let recipe_stdin = self.recipe_stdin.clone();
+                 let txc = tx.clone();
++                let filesystem = crate::filesystem::capture_file_system_provider();
+                 // Large stack: a recipe may be a recursive sub-make whose kati
+                 // parse/eval recurses deeply on big Makefiles (busybox/kernel).
+                 // The default 2 MiB spawned-thread stack overflows there; ckati
+@@ -873,6 +874,8 @@ list of the rule for '{output}' at {loc}"));
+                 std::thread::Builder::new()
+                     .stack_size(64 * 1024 * 1024)
+                     .spawn(move || {
++                        let _filesystem =
++                            filesystem.map(crate::filesystem::install_file_system_provider);
+                         // Stream each output chunk to the main thread LIVE (it owns
+                         // the RECIPE_OUT sink); then the final result.
+                         let mut emit = |b: &[u8]| { let _ = txc.send(RunMsg::Chunk(b.to_vec())); };
+diff --git a/src-rs/file.rs b/src-rs/file.rs
+index 63a0cfc..3e4fd48 100644
+--- a/src-rs/file.rs
++++ b/src-rs/file.rs
+@@ -21,6 +21,7 @@ use bytes::Bytes;
+ use parking_lot::Mutex;
+ 
+ use crate::{
++    filesystem,
+     parser::parse_file,
+     stmt::Stmt,
+     symtab::{Symbol, intern},
+@@ -40,11 +41,11 @@ impl Makefile {
+     /// process cwd, while keeping path strings in output unchanged. With
+     /// `working_dir == process cwd` the two name the same file.
+     pub fn from_file(display_name: &OsStr, open_path: &Path) -> Result<Option<Arc<Makefile>>> {
+-        if !std::fs::exists(open_path)? {
++        if !filesystem::exists(open_path)? {
+             return Ok(None);
+         }
+ 
+-        let buf = Bytes::from(std::fs::read(open_path)?);
++        let buf = Bytes::from(filesystem::read(open_path)?);
+ 
+         let filename = intern(display_name.as_bytes().to_vec());
+         let stmts = parse_file(&buf, filename)?;
+diff --git a/src-rs/filesystem.rs b/src-rs/filesystem.rs
+new file mode 100644
+index 0000000..3db3474
+--- /dev/null
++++ b/src-rs/filesystem.rs
+@@ -0,0 +1,474 @@
++/*
++Copyright 2025 Google LLC
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++     https://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++//! Read-only filesystem capability used by kati's evaluator.
++//!
++//! Standalone rkati uses the native implementation. Embedders may install a
++//! provider backed by the box filesystem so parsing and dependency discovery
++//! do not escape through raw host filesystem calls. Mutations deliberately
++//! remain outside this interface until they have a cache-coherent protocol.
++
++use std::{
++    cell::RefCell,
++    ffi::{CStr, CString, OsString},
++    io,
++    marker::PhantomData,
++    os::unix::fs::FileTypeExt,
++    path::{Path, PathBuf},
++    rc::Rc,
++    slice,
++    sync::Arc,
++    time::SystemTime,
++};
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum FileKind {
++    Regular,
++    Directory,
++    Symlink,
++    Fifo,
++    Socket,
++    CharDevice,
++    BlockDevice,
++    Unknown,
++}
++
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct Metadata {
++    pub kind: FileKind,
++    pub len: u64,
++    pub modified: SystemTime,
++}
++
++impl Metadata {
++    pub fn is_file(&self) -> bool {
++        self.kind == FileKind::Regular
++    }
++
++    pub fn is_dir(&self) -> bool {
++        self.kind == FileKind::Directory
++    }
++
++    pub fn is_symlink(&self) -> bool {
++        self.kind == FileKind::Symlink
++    }
++}
++
++#[derive(Debug)]
++pub struct DirEntry {
++    pub file_name: OsString,
++    pub path: PathBuf,
++    pub kind: FileKind,
++}
++
++/// Transport-neutral read-only view of the filesystem visible to kati.
++///
++/// Paths are already resolved against kati's logical make working directory.
++/// Providers must not reinterpret relative paths against the engine cwd.
++pub trait FileSystemProvider: Send + Sync + 'static {
++    fn metadata(&self, path: &Path) -> io::Result<Metadata>;
++    fn symlink_metadata(&self, path: &Path) -> io::Result<Metadata>;
++    fn modified(&self, path: &Path) -> io::Result<SystemTime> {
++        self.metadata(path).map(|metadata| metadata.modified)
++    }
++    fn read(&self, path: &Path) -> io::Result<Vec<u8>>;
++    fn read_link(&self, path: &Path) -> io::Result<PathBuf>;
++    fn read_dir(&self, path: &Path) -> io::Result<Vec<io::Result<DirEntry>>>;
++    fn canonicalize(&self, path: &Path) -> io::Result<PathBuf>;
++    fn glob(&self, pattern: &[u8]) -> io::Result<Vec<Vec<u8>>>;
++
++    fn exists(&self, path: &Path) -> io::Result<bool> {
++        match self.metadata(path) {
++            Ok(_) => Ok(true),
++            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
++            Err(err) => Err(err),
++        }
++    }
++}
++
++#[derive(Default)]
++pub struct NativeFileSystem;
++
++fn kind(file_type: std::fs::FileType) -> FileKind {
++    if file_type.is_file() {
++        FileKind::Regular
++    } else if file_type.is_dir() {
++        FileKind::Directory
++    } else if file_type.is_symlink() {
++        FileKind::Symlink
++    } else if file_type.is_fifo() {
++        FileKind::Fifo
++    } else if file_type.is_socket() {
++        FileKind::Socket
++    } else if file_type.is_char_device() {
++        FileKind::CharDevice
++    } else if file_type.is_block_device() {
++        FileKind::BlockDevice
++    } else {
++        FileKind::Unknown
++    }
++}
++
++fn from_native(metadata: std::fs::Metadata) -> io::Result<Metadata> {
++    Ok(Metadata {
++        kind: kind(metadata.file_type()),
++        len: metadata.len(),
++        modified: metadata.modified()?,
++    })
++}
++
++impl FileSystemProvider for NativeFileSystem {
++    fn metadata(&self, path: &Path) -> io::Result<Metadata> {
++        from_native(std::fs::metadata(path)?)
++    }
++
++    fn symlink_metadata(&self, path: &Path) -> io::Result<Metadata> {
++        from_native(std::fs::symlink_metadata(path)?)
++    }
++
++    fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
++        std::fs::read(path)
++    }
++
++    fn read_link(&self, path: &Path) -> io::Result<PathBuf> {
++        std::fs::read_link(path)
++    }
++
++    fn read_dir(&self, path: &Path) -> io::Result<Vec<io::Result<DirEntry>>> {
++        Ok(std::fs::read_dir(path)?
++            .map(|entry| {
++                let entry = entry?;
++                Ok(DirEntry {
++                    file_name: entry.file_name(),
++                    path: entry.path(),
++                    kind: kind(entry.file_type()?),
++                })
++            })
++            .collect())
++    }
++
++    fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
++        std::fs::canonicalize(path)
++    }
++
++    fn glob(&self, pattern: &[u8]) -> io::Result<Vec<Vec<u8>>> {
++        native_glob(pattern)
++    }
++}
++
++thread_local! {
++    /// Provider scope follows the evaluator thread. Embedded makes can nest on
++    /// recipe worker threads and unrelated makes can overlap; a process-global
++    /// swap would let one invocation restore native I/O underneath another.
++    static FILE_SYSTEM: RefCell<Option<Arc<dyn FileSystemProvider>>> = const { RefCell::new(None) };
++}
++
++/// Restores the previously installed provider when an embedded evaluation
++/// ends, including during unwinding or an early return.
++#[must_use = "dropping the guard immediately restores the previous filesystem provider"]
++pub struct FileSystemProviderGuard {
++    previous: Option<Arc<dyn FileSystemProvider>>,
++    // A provider guard must be dropped on the thread where it was installed.
++    // This also prevents an async caller from moving the scope across workers.
++    _not_send: PhantomData<Rc<()>>,
++}
++
++impl Drop for FileSystemProviderGuard {
++    fn drop(&mut self) {
++        let previous = self.previous.take();
++        FILE_SYSTEM.with(|slot| *slot.borrow_mut() = previous);
++    }
++}
++
++/// Install kati's process-wide read-only filesystem capability for the
++/// lifetime of the returned guard. Embedders retain the guard for the complete
++/// evaluation, so panic and early-return paths cannot leak provider state.
++pub fn install_file_system_provider(
++    provider: Arc<dyn FileSystemProvider>,
++) -> FileSystemProviderGuard {
++    let previous = FILE_SYSTEM.with(|slot| slot.borrow_mut().replace(provider));
++    FileSystemProviderGuard {
++        previous,
++        _not_send: PhantomData,
++    }
++}
++
++fn provider() -> Arc<dyn FileSystemProvider> {
++    FILE_SYSTEM
++        .with(|slot| slot.borrow().clone())
++        .unwrap_or_else(|| Arc::new(NativeFileSystem))
++}
++
++/// Snapshot the current thread's explicit provider for a Kati-owned worker.
++/// Callers install the returned capability at the worker entry point; `None`
++/// deliberately means the standalone/native default.
++pub fn capture_file_system_provider() -> Option<Arc<dyn FileSystemProvider>> {
++    FILE_SYSTEM.with(|slot| slot.borrow().clone())
++}
++
++pub fn exists(path: impl AsRef<Path>) -> io::Result<bool> {
++    provider().exists(path.as_ref())
++}
++
++pub fn metadata(path: impl AsRef<Path>) -> io::Result<Metadata> {
++    provider().metadata(path.as_ref())
++}
++
++pub fn symlink_metadata(path: impl AsRef<Path>) -> io::Result<Metadata> {
++    provider().symlink_metadata(path.as_ref())
++}
++
++pub fn modified(path: impl AsRef<Path>) -> io::Result<SystemTime> {
++    provider().modified(path.as_ref())
++}
++
++pub fn read(path: impl AsRef<Path>) -> io::Result<Vec<u8>> {
++    provider().read(path.as_ref())
++}
++
++pub fn read_link(path: impl AsRef<Path>) -> io::Result<PathBuf> {
++    provider().read_link(path.as_ref())
++}
++
++pub fn read_dir(path: impl AsRef<Path>) -> io::Result<Vec<io::Result<DirEntry>>> {
++    provider().read_dir(path.as_ref())
++}
++
++pub fn canonicalize(path: impl AsRef<Path>) -> io::Result<PathBuf> {
++    provider().canonicalize(path.as_ref())
++}
++
++pub fn glob(pattern: &[u8]) -> io::Result<Vec<Vec<u8>>> {
++    provider().glob(pattern)
++}
++
++fn native_glob(pattern: &[u8]) -> io::Result<Vec<Vec<u8>>> {
++    let pattern = CString::new(pattern)
++        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in glob pattern"))?;
++    let mut result = Vec::new();
++    // SAFETY: all fields in glob_t permit zero initialization.
++    let mut state: libc::glob_t = unsafe { std::mem::zeroed() };
++    // SAFETY: pattern is a valid C string; state is initialized and freed below.
++    let status = unsafe { libc::glob(pattern.as_ptr(), 0, None, &mut state) };
++    if status == 0 && state.gl_pathc > 0 && !state.gl_pathv.is_null() {
++        // SAFETY: successful glob returns gl_pathc valid pointers in gl_pathv.
++        let paths = unsafe { slice::from_raw_parts(state.gl_pathv, state.gl_pathc) };
++        result.reserve_exact(state.gl_pathc);
++        for path in paths {
++            if !path.is_null() {
++                // SAFETY: libc glob returns NUL-terminated path strings.
++                let path = unsafe { CStr::from_ptr(*path) };
++                result.push(path.to_bytes().to_vec());
++            }
++        }
++    }
++    // SAFETY: state was initialized above and is no longer accessed afterwards.
++    unsafe { libc::globfree(&mut state) };
++    // Preserve kati's historical behavior: glob errors and no matches both
++    // produce an empty result; only invalid byte input fails before libc.
++    Ok(result)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::{
++        ffi::OsStr,
++        sync::{Barrier, Mutex},
++        time::UNIX_EPOCH,
++    };
++
++    static TEST_LOCK: Mutex<()> = Mutex::new(());
++    const MOCK_PATH: &str = "/__kati_mock__/Makefile";
++
++    struct MockFileSystem;
++
++    impl FileSystemProvider for MockFileSystem {
++        fn metadata(&self, path: &Path) -> io::Result<Metadata> {
++            if path == Path::new(MOCK_PATH) {
++                return Ok(Metadata {
++                    kind: FileKind::Regular,
++                    len: 7,
++                    modified: UNIX_EPOCH,
++                });
++            }
++            panic!("unexpected native metadata access: {path:?}")
++        }
++
++        fn modified(&self, path: &Path) -> io::Result<SystemTime> {
++            if path == Path::new(MOCK_PATH) {
++                return Ok(UNIX_EPOCH);
++            }
++            panic!("unexpected native modified access: {path:?}")
++        }
++
++        fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
++            if path == Path::new(MOCK_PATH) {
++                return Ok(b"all: ;\n".to_vec());
++            }
++            panic!("unexpected native read access: {path:?}")
++        }
++
++        fn symlink_metadata(&self, path: &Path) -> io::Result<Metadata> {
++            if path == Path::new("/__kati_mock__/link") {
++                return Ok(Metadata {
++                    kind: FileKind::Symlink,
++                    len: 8,
++                    modified: UNIX_EPOCH,
++                });
++            }
++            panic!("unexpected native symlink_metadata access: {path:?}")
++        }
++
++        fn read_link(&self, path: &Path) -> io::Result<PathBuf> {
++            if path == Path::new("/__kati_mock__/link") {
++                return Ok(PathBuf::from("Makefile"));
++            }
++            panic!("unexpected native read_link access: {path:?}")
++        }
++
++        fn read_dir(&self, path: &Path) -> io::Result<Vec<io::Result<DirEntry>>> {
++            if path == Path::new("/__kati_mock__") {
++                return Ok(vec![Ok(DirEntry {
++                    file_name: OsString::from("Makefile"),
++                    path: PathBuf::from(MOCK_PATH),
++                    kind: FileKind::Regular,
++                })]);
++            }
++            panic!("unexpected native read_dir access: {path:?}")
++        }
++
++        fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
++            if path == Path::new("/__kati_mock__/./Makefile") {
++                return Ok(PathBuf::from(MOCK_PATH));
++            }
++            panic!("unexpected native canonicalize access: {path:?}")
++        }
++
++        fn glob(&self, pattern: &[u8]) -> io::Result<Vec<Vec<u8>>> {
++            if pattern == b"/__kati_mock__/*" {
++                return Ok(vec![MOCK_PATH.as_bytes().to_vec()]);
++            }
++            panic!("unexpected native glob access: {pattern:?}")
++        }
++    }
++
++    #[test]
++    fn makefile_and_timestamp_stay_behind_installed_provider() {
++        let _guard = TEST_LOCK.lock().unwrap();
++        let _provider = install_file_system_provider(Arc::new(MockFileSystem));
++        let path = Path::new(MOCK_PATH);
++
++        let makefile = crate::file::Makefile::from_file(OsStr::new("Makefile"), path).unwrap();
++        assert!(makefile.is_some());
++        assert_eq!(
++            crate::fileutil::get_timestamp(MOCK_PATH.as_bytes(), Path::new("/")).unwrap(),
++            Some(UNIX_EPOCH)
++        );
++        assert!(
++            symlink_metadata("/__kati_mock__/link")
++                .unwrap()
++                .is_symlink()
++        );
++        assert_eq!(
++            read_link("/__kati_mock__/link").unwrap(),
++            Path::new("Makefile")
++        );
++        let entries = read_dir("/__kati_mock__").unwrap();
++        assert_eq!(entries.len(), 1);
++        assert_eq!(entries.into_iter().next().unwrap().unwrap().path, path);
++        assert_eq!(canonicalize("/__kati_mock__/./Makefile").unwrap(), path);
++        crate::fileutil::clear_glob_cache();
++        let matches = crate::fileutil::glob(
++            bytes::Bytes::from_static(b"/__kati_mock__/*"),
++            Path::new("/"),
++        );
++        assert_eq!(
++            matches.as_ref().as_ref().unwrap(),
++            &[bytes::Bytes::from_static(MOCK_PATH.as_bytes())]
++        );
++        crate::fileutil::clear_glob_cache();
++    }
++
++    struct ThreadFileSystem(&'static str);
++
++    impl FileSystemProvider for ThreadFileSystem {
++        fn metadata(&self, path: &Path) -> io::Result<Metadata> {
++            assert_eq!(path, Path::new(self.0));
++            Ok(Metadata {
++                kind: FileKind::Regular,
++                len: self.0.len() as u64,
++                modified: UNIX_EPOCH,
++            })
++        }
++        fn symlink_metadata(&self, path: &Path) -> io::Result<Metadata> {
++            self.metadata(path)
++        }
++        fn modified(&self, path: &Path) -> io::Result<SystemTime> {
++            assert_eq!(path, Path::new(self.0));
++            Ok(UNIX_EPOCH)
++        }
++        fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
++            assert_eq!(path, Path::new(self.0));
++            Ok(self.0.as_bytes().to_vec())
++        }
++        fn read_link(&self, path: &Path) -> io::Result<PathBuf> {
++            panic!("unexpected read_link: {path:?}")
++        }
++        fn read_dir(&self, path: &Path) -> io::Result<Vec<io::Result<DirEntry>>> {
++            panic!("unexpected read_dir: {path:?}")
++        }
++        fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
++            assert_eq!(path, Path::new(self.0));
++            Ok(path.to_path_buf())
++        }
++        fn glob(&self, pattern: &[u8]) -> io::Result<Vec<Vec<u8>>> {
++            assert_eq!(pattern, self.0.as_bytes());
++            Ok(vec![pattern.to_vec()])
++        }
++    }
++
++    #[test]
++    fn provider_scopes_are_nested_and_thread_isolated() {
++        let barrier = Arc::new(Barrier::new(2));
++        let threads: Vec<_> = ["/__kati_thread_a__", "/__kati_thread_b__"]
++            .into_iter()
++            .map(|path| {
++                let barrier = barrier.clone();
++                std::thread::spawn(move || {
++                    let outer = install_file_system_provider(Arc::new(ThreadFileSystem(path)));
++                    barrier.wait();
++                    assert_eq!(read(path).unwrap(), path.as_bytes());
++                    {
++                        let nested_path = if path.ends_with("a__") {
++                            "/__nested_a__"
++                        } else {
++                            "/__nested_b__"
++                        };
++                        let _nested =
++                            install_file_system_provider(Arc::new(ThreadFileSystem(nested_path)));
++                        assert_eq!(read(nested_path).unwrap(), nested_path.as_bytes());
++                    }
++                    assert_eq!(read(path).unwrap(), path.as_bytes());
++                    drop(outer);
++                })
++            })
++            .collect();
++        for thread in threads {
++            thread.join().unwrap();
++        }
++    }
++}
+diff --git a/src-rs/fileutil.rs b/src-rs/fileutil.rs
+index 5cf8416..176ad44 100644
+--- a/src-rs/fileutil.rs
++++ b/src-rs/fileutil.rs
+@@ -19,10 +19,9 @@ use std::os::unix::ffi::OsStrExt;
+ use std::os::unix::process::ExitStatusExt;
+ use std::{
+     collections::HashMap,
+-    ffi::{CStr, CString, OsStr},
++    ffi::{CString, OsStr},
+     path::Path,
+     process::{Command, ExitStatus},
+-    slice,
+     sync::{Arc, LazyLock},
+     time::SystemTime,
+ };
+@@ -189,6 +188,7 @@ pub fn report_edge(output: &[u8], phase: EdgePhase, code: i32, excerpt: &[u8]) {
+ }
+ use parking_lot::Mutex;
+ 
++use crate::filesystem;
+ use crate::log;
+ 
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+@@ -205,11 +205,10 @@ pub enum RedirectStderr {
+ pub fn get_timestamp(filename: &[u8], base: &Path) -> Result<Option<SystemTime>> {
+     let p = Path::new(<OsStr as OsStrExt>::from_bytes(filename));
+     let path = if p.is_absolute() { p.to_path_buf() } else { base.join(p) };
+-    if !std::fs::exists(&path)? {
++    if !filesystem::exists(&path)? {
+         return Ok(None);
+     }
+-    let metadata = std::fs::metadata(&path)?;
+-    Ok(Some(metadata.modified()?))
++    Ok(Some(filesystem::modified(&path)?))
+ }
+ 
+ pub fn run_command(
+@@ -366,8 +365,9 @@ pub fn glob(pat: Bytes, base: &Path) -> GlobResults {
+             || resolved.contains(&b'[')
+             || resolved.contains(&b'\\')
+         {
+-            libc_glob(&resolved).map(|files| files.into_iter().map(strip).collect())
+-        } else if let Err(err) = std::fs::metadata(<OsStr as OsStrExt>::from_bytes(&resolved)) {
++            filesystem::glob(&resolved)
++                .map(|files| files.into_iter().map(Bytes::from).map(strip).collect())
++        } else if let Err(err) = filesystem::metadata(<OsStr as OsStrExt>::from_bytes(&resolved)) {
+             Err(err)
+         } else {
+             Ok(vec![pat.clone()])
+@@ -377,46 +377,6 @@ pub fn glob(pat: Bytes, base: &Path) -> GlobResults {
+     glob
+ }
+ 
+-// Use libc glob over the `glob` crate, to maintain compatibility.
+-// The glob crate ends up normalizing the paths too much:
+-//   ./src/*_test.cc -> src/find_test.cc
+-// This breaks makefiles that do further string manipulation.
+-fn libc_glob(pattern: &[u8]) -> Result<Vec<Bytes>, std::io::Error> {
+-    let pat = CString::new(pattern).unwrap();
+-    let mut ret = Vec::new();
+-    // SAFETY: All of the types in glob_t are safe to be zero'd.
+-    let mut gl: libc::glob_t = unsafe { std::mem::zeroed() };
+-    // SAFETY: gl has been zero'd above, and pat is used as an input.
+-    // We'll free any allocated memory with globfree below.
+-    let r = unsafe { libc::glob(pat.as_ptr(), 0, None, &mut gl) };
+-    if r == 0 && gl.gl_pathc > 0 && !gl.gl_pathv.is_null() {
+-        // SAFETY: We've verified that glob succeeded, and the
+-        // gl_pathv is not null.
+-        //
+-        // We assume that the pointers are properly aligned.
+-        //
+-        // We can't guarantee that these came from the same allocated
+-        // object, but this is also only temporary, and will not be
+-        // used past the globfree which will deallocate any memory.
+-        let paths = unsafe { slice::from_raw_parts(gl.gl_pathv, gl.gl_pathc) };
+-        ret.reserve_exact(gl.gl_pathc);
+-        for ptr in paths {
+-            if !ptr.is_null() {
+-                // SAFETY: This is a non-null pointer, and we assume
+-                // glob created valid C strings. We're immediately
+-                // copying out of this string, so mutability and
+-                // lifetimes aren't issues.
+-                let s = unsafe { CStr::from_ptr(*ptr) };
+-                ret.push(Bytes::from(s.to_bytes().to_owned()));
+-            }
+-        }
+-    }
+-    // SAFETY: we're no longer using anything from gl, and this will
+-    // only free things allocated by libc::glob.
+-    unsafe { libc::globfree(&mut gl) };
+-    Ok(ret)
+-}
+-
+ pub fn fnmatch(pattern: &CString, string: &[u8], flags: i32) -> bool {
+     let string = CString::new(string).unwrap();
+     // SAFETY: This is a relatively simple C func, both CStrings are inputs
+diff --git a/src-rs/find.rs b/src-rs/find.rs
+index 74d65da..7fb1144 100644
+--- a/src-rs/find.rs
++++ b/src-rs/find.rs
+@@ -17,7 +17,7 @@ limitations under the License.
+ use std::{
+     collections::{HashMap, HashSet},
+     ffi::{CString, OsStr, OsString},
+-    os::unix::{ffi::OsStrExt, fs::FileTypeExt},
++    os::unix::ffi::OsStrExt,
+     path::PathBuf,
+     sync::{Arc, LazyLock, OnceLock, Weak, atomic::AtomicUsize},
+ };
+@@ -30,6 +30,7 @@ use parking_lot::Mutex;
+ 
+ use crate::{
+     collect_stats, error,
++    filesystem::{self, FileKind},
+     fileutil::fnmatch,
+     flags::FLAGS,
+     loc::Loc,
+@@ -68,26 +69,19 @@ enum FileType {
+     Socket,
+ }
+ 
+-impl TryFrom<std::fs::FileType> for FileType {
++impl TryFrom<FileKind> for FileType {
+     type Error = anyhow::Error;
+ 
+-    fn try_from(ft: std::fs::FileType) -> Result<Self, Self::Error> {
+-        if ft.is_file() {
+-            Ok(FileType::Regular)
+-        } else if ft.is_dir() {
+-            Ok(FileType::Dir)
+-        } else if ft.is_symlink() {
+-            Ok(FileType::Symlink)
+-        } else if ft.is_fifo() {
+-            Ok(FileType::Fifo)
+-        } else if ft.is_socket() {
+-            Ok(FileType::Socket)
+-        } else if ft.is_char_device() {
+-            Ok(FileType::CharDevice)
+-        } else if ft.is_block_device() {
+-            Ok(FileType::BlockDevice)
+-        } else {
+-            anyhow::bail!("Unsupported file type: {ft:?}")
++    fn try_from(kind: FileKind) -> Result<Self, Self::Error> {
++        match kind {
++            FileKind::Regular => Ok(FileType::Regular),
++            FileKind::Directory => Ok(FileType::Dir),
++            FileKind::Symlink => Ok(FileType::Symlink),
++            FileKind::Fifo => Ok(FileType::Fifo),
++            FileKind::Socket => Ok(FileType::Socket),
++            FileKind::CharDevice => Ok(FileType::CharDevice),
++            FileKind::BlockDevice => Ok(FileType::BlockDevice),
++            FileKind::Unknown => anyhow::bail!("Unsupported file type: {kind:?}"),
+         }
+     }
+ }
+@@ -519,7 +513,7 @@ impl DirentNode {
+     }
+     fn initialize_symlink(name: PathBuf, parent: Weak<DirentNode>) -> NodeType {
+         collect_stats!("init find emulator Dirent NodeType::Symlink initialize");
+-        let dest = match std::fs::read_link(&name) {
++        let dest = match filesystem::read_link(&name) {
+             Err(err) => {
+                 warn!("readlink failed: {:?}", err);
+                 return NodeType::SymlinkError { err };
+@@ -527,7 +521,7 @@ impl DirentNode {
+             Ok(path) => path,
+         };
+ 
+-        if let Err(err) = std::fs::metadata(&name) {
++        if let Err(err) = filesystem::metadata(&name) {
+             log!("stat failed: {:?}: {:?}", name, err);
+             return NodeType::SymlinkError { err };
+         }
+@@ -558,7 +552,7 @@ impl DirentNode {
+     ) -> NodeType {
+         collect_stats!("init find emulator Dirent NodeType::Dir initialize");
+ 
+-        let entries = match std::fs::read_dir(&name) {
++        let entries = match filesystem::read_dir(&name) {
+             Ok(entries) => entries,
+             Err(err) => {
+                 warn!("opendir({:?}) failed: {:?}", name, err);
+@@ -578,23 +572,20 @@ impl DirentNode {
+                     continue;
+                 }
+             };
+-            if entry.file_name() == "."
+-                || entry.file_name() == ".."
+-                || entry.file_name() == ".repo"
+-                || entry.file_name() == ".git"
++            if entry.file_name == "."
++                || entry.file_name == ".."
++                || entry.file_name == ".repo"
++                || entry.file_name == ".git"
+             {
+                 continue;
+             }
+ 
+-            let Some(typ) = entry.file_type().ok() else {
+-                warn!("stat failed: {:?}", entry.path());
+-                continue;
+-            };
+-            let path = entry.path();
++            let typ = entry.kind;
++            let path = entry.path;
+             let base = OsStr::from_bytes(basename(path.as_os_str().as_bytes())).to_os_string();
+             children.push((
+                 base.clone(),
+-                Arc::new(if typ.is_dir() {
++                Arc::new(if typ == FileKind::Directory {
+                     DirentNode {
+                         base,
+                         inner: OnceLock::new(),
+@@ -603,7 +594,7 @@ impl DirentNode {
+                             parent: Some(Arc::downgrade(self)),
+                         })),
+                     }
+-                } else if typ.is_symlink() {
++                } else if typ == FileKind::Symlink {
+                     DirentNode {
+                         base,
+                         inner: OnceLock::new(),
+@@ -1143,7 +1134,7 @@ impl FindEmulator {
+     fn find_dir(&self, d: &[u8], should_fallback: &mut bool) -> Option<Arc<DirentNode>> {
+         let r = self.root.find_dir(d);
+         if r.is_none() {
+-            *should_fallback = std::fs::exists(OsStr::from_bytes(d)).unwrap_or(false);
++            *should_fallback = filesystem::exists(OsStr::from_bytes(d)).unwrap_or(false);
+         }
+         r
+     }
+@@ -1183,7 +1174,7 @@ impl FindEmulator {
+                 return Ok(false);
+             }
+             let Some(new_root) = root.find_dir(chdir) else {
+-                if std::fs::exists(OsStr::from_bytes(chdir)).unwrap_or(false) {
++                if filesystem::exists(OsStr::from_bytes(chdir)).unwrap_or(false) {
+                     return Ok(false);
+                 }
+                 if !fc.redirect_to_devnull {
+@@ -1213,7 +1204,7 @@ impl FindEmulator {
+                 return Ok(false);
+             }
+             if bases.is_empty() {
+-                if std::fs::exists(OsStr::from_bytes(&fullpath)).unwrap_or(false) {
++                if filesystem::exists(OsStr::from_bytes(&fullpath)).unwrap_or(false) {
+                     return Ok(false);
+                 }
+                 if !fc.redirect_to_devnull {
+diff --git a/src-rs/func.rs b/src-rs/func.rs
+index 5b890ce..590e00e 100644
+--- a/src-rs/func.rs
++++ b/src-rs/func.rs
+@@ -33,6 +33,7 @@ use crate::{
+     eval::{Evaluator, ExportAllowed, FrameType},
+     expr::{Evaluable, Value},
+     file_cache::add_extra_file_dep,
++    filesystem,
+     fileutil::{RedirectStderr, run_command_prefixed},
+     find::FindCommand,
+     flags::FLAGS,
+@@ -467,7 +468,7 @@ fn realpath_func(args: &[Arc<Value>], ev: &mut Evaluator, out: &mut dyn BufMut)
+         } else {
+             ev.working_dir.join(tok)
+         };
+-        if let Ok(path) = std::fs::canonicalize(&probe) {
++        if let Ok(path) = filesystem::canonicalize(&probe) {
+             ww.write(path.as_os_str().as_bytes());
+         }
+     }
+@@ -931,7 +932,7 @@ fn file_read_func(
+     } else {
+         ev.working_dir.join(filename)
+     };
+-    if !std::fs::exists(&open_path)? {
++    if !filesystem::exists(&open_path)? {
+         if should_store_command_result(filename.as_bytes()) {
+             COMMAND_RESULTS.lock().push(CommandResult {
+                 op: CommandOp::ReadMissing,
+@@ -946,7 +947,7 @@ fn file_read_func(
+         return Ok(());
+     }
+ 
+-    let mut buf = std::fs::read(&open_path)?;
++    let mut buf = filesystem::read(&open_path)?;
+     if buf.ends_with(b"\n") {
+         buf.pop();
+     }
+@@ -1251,7 +1252,12 @@ fn extra_file_deps_func(
+         let files = arg.eval_to_buf(ev)?;
+         for file in word_scanner(&files) {
+             let fname = <OsStr as OsStrExt>::from_bytes(file);
+-            if !std::fs::exists(fname)? {
++            let path = if std::path::Path::new(fname).is_absolute() {
++                std::path::PathBuf::from(fname)
++            } else {
++                ev.working_dir.join(fname)
++            };
++            if !filesystem::exists(&path)? {
+                 error_loc!(
+                     ev.loc.as_ref(),
+                     "*** file does not exist: {}",
+diff --git a/src-rs/lib.rs b/src-rs/lib.rs
+index 3478cdc..05372a4 100644
+--- a/src-rs/lib.rs
++++ b/src-rs/lib.rs
+@@ -31,6 +31,7 @@ pub mod exec;
+ pub mod expr;
+ pub mod file;
+ pub mod file_cache;
++pub mod filesystem;
+ pub mod fileutil;
+ pub mod find;
+ pub mod flags;
+diff --git a/src-rs/main.rs b/src-rs/main.rs
+index ca6ad9d..00d1c4e 100644
+--- a/src-rs/main.rs
++++ b/src-rs/main.rs
+@@ -294,9 +294,9 @@ fn run(targets: &[Symbol], cl_vars: &Vec<Bytes>, orig_args: OsString) -> Result<
+                     .unwrap_or(false);
+             let path = std::path::Path::new(&name);
+             let exists = if path.is_absolute() {
+-                path.exists()
++                kati::filesystem::exists(path).unwrap_or(false)
+             } else {
+-                ev.working_dir.join(path).exists()
++                kati::filesystem::exists(ev.working_dir.join(path)).unwrap_or(false)
+             };
+             if producible && !noremake_skip {
+                 remake_targets.push((sym, *required));
+@@ -384,7 +384,7 @@ fn run(targets: &[Symbol], cl_vars: &Vec<Bytes>, orig_args: OsString) -> Result<
+                 let abs = if p.is_absolute() { p.to_path_buf() }
+                           else { ev.working_dir.join(p) };
+                 let name = String::from_utf8_lossy(&b).into_owned();
+-                if !abs.exists() && !failed.contains(&name) {
++                if !kati::filesystem::exists(&abs).unwrap_or(false) && !failed.contains(&name) {
+                     failed.push(name);
+                 }
+             }
+@@ -533,18 +533,18 @@ fn find_first_makefile() {
+     if makefile.is_some() {
+         return;
+     }
+-    if std::fs::exists("GNUMakefile").unwrap_or(false) {
++    if kati::filesystem::exists("GNUMakefile").unwrap_or(false) {
+         *makefile = Some(OsString::from("GNUMakefile"));
+-    } else if !cfg!(target_os = "macos") && std::fs::exists("makefile").unwrap_or(false) {
++    } else if !cfg!(target_os = "macos") && kati::filesystem::exists("makefile").unwrap_or(false) {
+         *makefile = Some(OsString::from("makefile"));
+-    } else if std::fs::exists("Makefile").unwrap_or(false) {
++    } else if kati::filesystem::exists("Makefile").unwrap_or(false) {
+         *makefile = Some(OsString::from("Makefile"));
+     }
+ }
+ 
+ fn handle_realpath(args: Vec<String>) {
+     for arg in args {
+-        if let Ok(path) = std::fs::canonicalize(&arg) {
++        if let Ok(path) = kati::filesystem::canonicalize(&arg) {
+             let _ = stdout().write_all(path.as_os_str().as_bytes());
+             println!();
+         }
+diff --git a/src-rs/ninja.rs b/src-rs/ninja.rs
+index fe15eb2..3924e03 100644
+--- a/src-rs/ninja.rs
++++ b/src-rs/ninja.rs
+@@ -905,7 +905,7 @@ impl<'a> NinjaGenerator<'a> {
+                     let mut missing_dirs = Vec::new();
+                     for fd in &fc.finddirs {
+                         let d = concat_dir(&chdir, fd);
+-                        if !std::fs::exists(OsStr::from_bytes(&d)).unwrap_or(false) {
++                        if !crate::filesystem::exists(OsStr::from_bytes(&d)).unwrap_or(false) {
+                             missing_dirs.push(d);
+                         }
+                     }
+diff --git a/src-rs/regen.rs b/src-rs/regen.rs
+index 13527bd..254a120 100644
+--- a/src-rs/regen.rs
++++ b/src-rs/regen.rs
+@@ -29,7 +29,7 @@ use parking_lot::Mutex;
+ use std::{
+     ffi::{OsStr, OsString},
+     fs::OpenOptions,
+-    io::{BufReader, Write},
++    io::{Cursor, Write},
+     os::unix::ffi::{OsStrExt, OsStringExt},
+     time::SystemTime,
+ };
+@@ -116,12 +116,12 @@ impl StampChecker {
+ 
+     fn is_missing_outputs() -> bool {
+         let f = get_ninja_filename();
+-        if !std::fs::exists(&f).is_ok_and(|b| b) {
++        if !crate::filesystem::exists(&f).is_ok_and(|b| b) {
+             eprintln!("{} is missing, regenerating...", f.to_string_lossy());
+             return true;
+         }
+         let f = get_ninja_shell_script_filename();
+-        if !std::fs::exists(&f).is_ok_and(|b| b) {
++        if !crate::filesystem::exists(&f).is_ok_and(|b| b) {
+             eprintln!("{} is missing, regenerating...", f.to_string_lossy());
+             return true;
+         }
+@@ -130,8 +130,8 @@ impl StampChecker {
+ 
+     fn check_step1(&mut self, orig_args: &OsStr) -> bool {
+         let stamp_filename = get_ninja_stamp_filename();
+-        let fp = match std::fs::File::open(&stamp_filename) {
+-            Ok(fp) => fp,
++        let fp = match crate::filesystem::read(&stamp_filename) {
++            Ok(bytes) => bytes,
+             Err(err) => {
+                 if FLAGS.regen_debug {
+                     println!("{stamp_filename:?}: {err}")
+@@ -139,7 +139,7 @@ impl StampChecker {
+                 return true;
+             }
+         };
+-        let mut fp = BufReader::new(fp);
++        let mut fp = Cursor::new(fp);
+         let fp = &mut fp;
+ 
+         let gen_time = load!(load_systemtime(fp));
+@@ -150,7 +150,7 @@ impl StampChecker {
+ 
+         let files = load!(load_vec_string(fp));
+         for s in files {
+-            let ts = std::fs::metadata(&s).and_then(|m| m.modified());
++            let ts = crate::filesystem::modified(&s);
+             if ts.as_ref().is_ok_and(|ts| gen_time >= *ts) {
+                 if FLAGS.dump_kati_stamp {
+                     println!("file {s:?}: clean ({:?})", ts.unwrap())
+@@ -304,12 +304,12 @@ impl StampChecker {
+ 
+         collect_stats!("stat time (regen)");
+         for dir in &sr.missing_dirs {
+-            if std::fs::exists(dir).unwrap_or(false) {
++            if crate::filesystem::exists(dir).unwrap_or(false) {
+                 return true;
+             }
+         }
+         for file in &sr.files {
+-            if !std::fs::exists(file).unwrap_or(false) {
++            if !crate::filesystem::exists(file).unwrap_or(false) {
+                 return true;
+             }
+         }
+@@ -320,17 +320,15 @@ impl StampChecker {
+                 continue;
+             }
+ 
+-            let Ok(md) = std::fs::symlink_metadata(dir) else {
+-                return true;
+-            };
+-            let Ok(ts) = md.modified() else {
++            let Ok(md) = crate::filesystem::symlink_metadata(dir) else {
+                 return true;
+             };
++            let ts = md.modified;
+             if gen_time < ts {
+                 return true;
+             }
+             if md.is_symlink() {
+-                let Ok(ts) = std::fs::metadata(dir).and_then(|md| md.modified()) else {
++                let Ok(ts) = crate::filesystem::modified(dir) else {
+                     return true;
+                 };
+                 if gen_time < ts {
+@@ -347,7 +345,7 @@ impl StampChecker {
+         err: &mut String,
+     ) -> Result<bool> {
+         if sr.op == CommandOp::ReadMissing {
+-            if std::fs::exists(&sr.cmd).unwrap_or(false) {
++            if crate::filesystem::exists(&sr.cmd).unwrap_or(false) {
+                 if FLAGS.dump_kati_stamp {
+                     println!("file {:?}: dirty", sr.cmd);
+                 } else {
+@@ -365,7 +363,7 @@ impl StampChecker {
+         }
+ 
+         if sr.op == CommandOp::Read {
+-            let ts = std::fs::metadata(&sr.cmd).and_then(|md| md.modified());
++            let ts = crate::filesystem::modified(&sr.cmd);
+             if ts.is_ok_and(|ts| gen_time < ts) {
+                 if FLAGS.dump_kati_stamp {
+                     println!("file {:?}: dirty", sr.cmd);
+@@ -446,13 +444,19 @@ impl StampChecker {
+ 
+     fn check_step2(&mut self) -> Result<bool> {
+         let needs_regen: Mutex<Result<bool>> = Mutex::new(Ok(false));
++        let checker: &StampChecker = self;
++        let glob_filesystem = crate::filesystem::capture_file_system_provider();
++        let command_filesystem = glob_filesystem.clone();
++        let needs_regen_ref = &needs_regen;
+ 
+         std::thread::scope(|s| {
+-            s.spawn(|| {
++            s.spawn(move || {
++                let _filesystem =
++                    glob_filesystem.map(crate::filesystem::install_file_system_provider);
+                 let mut err = String::new();
+-                for gr in &self.globs {
++                for gr in &checker.globs {
+                     if Self::check_glob_result(gr, &mut err) {
+-                        let mut needs_regen = needs_regen.lock();
++                        let mut needs_regen = needs_regen_ref.lock();
+                         if let Ok(false) = *needs_regen {
+                             *needs_regen = Ok(true);
+                             eprintln!("{err}");
+@@ -461,12 +465,14 @@ impl StampChecker {
+                     }
+                 }
+             });
+-            s.spawn(|| {
++            s.spawn(move || {
++                let _filesystem =
++                    command_filesystem.map(crate::filesystem::install_file_system_provider);
+                 let mut err = String::new();
+-                for sr in &self.commands {
+-                    match Self::check_shell_result(sr, self.gen_time.unwrap(), &mut err) {
++                for sr in &checker.commands {
++                    match Self::check_shell_result(sr, checker.gen_time.unwrap(), &mut err) {
+                         Ok(true) => {
+-                            let mut needs_regen = needs_regen.lock();
++                            let mut needs_regen = needs_regen_ref.lock();
+                             if let Ok(false) = *needs_regen {
+                                 *needs_regen = Ok(true);
+                                 eprintln!("{err}");
+@@ -475,7 +481,7 @@ impl StampChecker {
+                         }
+                         Ok(false) => {}
+                         Err(e) => {
+-                            let mut needs_regen = needs_regen.lock();
++                            let mut needs_regen = needs_regen_ref.lock();
+                             if let Ok(false) = *needs_regen {
+                                 *needs_regen = Err(e);
+                             }
+diff --git a/src-rs/regen_dump.rs b/src-rs/regen_dump.rs
+index 81a3b5b..3f28d55 100644
+--- a/src-rs/regen_dump.rs
++++ b/src-rs/regen_dump.rs
+@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
+ limitations under the License.
+ */
+ 
+-use std::{io::BufReader, os::unix::ffi::OsStrExt};
++use std::{io::Cursor, os::unix::ffi::OsStrExt};
+ 
+ use anyhow::{Context, Result};
+ 
+@@ -59,8 +59,8 @@ pub fn stamp_dump_main() -> Result<()> {
+         dump_files = true;
+     }
+ 
+-    let fp = std::fs::File::open(&args[args.len() - 1])?;
+-    let mut fp = BufReader::new(fp);
++    let fp = crate::filesystem::read(&args[args.len() - 1])?;
++    let mut fp = Cursor::new(fp);
+ 
+     inner(
+         &mut fp, dump_files, dump_env, dump_globs, dump_cmds, dump_finds,

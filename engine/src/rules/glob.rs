@@ -33,8 +33,10 @@ pub fn globmatch(pat: &str, s: &str) -> bool {
 /// while keeping literal `/` in a pattern matching literal `/` in the text.
 pub fn textmatch(pat: &str, s: &str) -> bool {
     const SENTINEL: char = '\u{1f}';
-    globmatch(&pat.replace('/', &SENTINEL.to_string()),
-              &s.replace('/', &SENTINEL.to_string()))
+    globmatch(
+        &pat.replace('/', &SENTINEL.to_string()),
+        &s.replace('/', &SENTINEL.to_string()),
+    )
 }
 
 // ── brace expansion ──────────────────────────────────────────────────────────
@@ -46,7 +48,10 @@ fn expand_braces(pat: &str) -> Vec<String> {
     // Find the first top-level brace group with a comma.
     let mut i = 0;
     while i < chars.len() {
-        if chars[i] == '\\' { i += 2; continue; }
+        if chars[i] == '\\' {
+            i += 2;
+            continue;
+        }
         if chars[i] == '{' {
             if let Some((close, parts, has_comma)) = scan_group(&chars, i) {
                 if has_comma {
@@ -83,11 +88,16 @@ fn scan_group(chars: &[char], open: usize) -> Option<(usize, Vec<String>, bool)>
         match c {
             '\\' => {
                 cur.push(c);
-                if i + 1 < chars.len() { cur.push(chars[i + 1]); i += 1; }
+                if i + 1 < chars.len() {
+                    cur.push(chars[i + 1]);
+                    i += 1;
+                }
             }
             '{' => {
                 depth_brace += 1;
-                if depth_brace > 1 { cur.push(c); }
+                if depth_brace > 1 {
+                    cur.push(c);
+                }
             }
             '}' => {
                 depth_brace -= 1;
@@ -97,8 +107,16 @@ fn scan_group(chars: &[char], open: usize) -> Option<(usize, Vec<String>, bool)>
                 }
                 cur.push(c);
             }
-            '(' => { depth_paren += 1; cur.push(c); }
-            ')' => { if depth_paren > 0 { depth_paren -= 1; } cur.push(c); }
+            '(' => {
+                depth_paren += 1;
+                cur.push(c);
+            }
+            ')' => {
+                if depth_paren > 0 {
+                    depth_paren -= 1;
+                }
+                cur.push(c);
+            }
             ',' if depth_brace == 1 && depth_paren == 0 => {
                 had_comma = true;
                 parts.push(std::mem::take(&mut cur));
@@ -128,17 +146,19 @@ fn m(p: &[char], pi: usize, t: &[char], ti: usize) -> bool {
         }
         let c = p[pi];
         // ── globstar: `**` occupying a whole segment crosses `/`. ──
-        if c == '*' && pi + 1 < p.len() && p[pi + 1] == '*'
-            && is_segment_globstar(p, pi)
-        {
+        if c == '*' && pi + 1 < p.len() && p[pi + 1] == '*' && is_segment_globstar(p, pi) {
             // Determine the rest after the globstar, skipping a following `/`.
             let mut rest = pi + 2;
             let ate_slash = rest < p.len() && p[rest] == '/';
-            if ate_slash { rest += 1; }
+            if ate_slash {
+                rest += 1;
+            }
             // `**` (or `**/`) matches zero or more whole path segments.
             // Try consuming 0..=remaining segments of `t` from `ti`.
             // Case A: matches zero segments — rest matches from ti directly.
-            if m(p, rest, t, ti) { return true; }
+            if m(p, rest, t, ti) {
+                return true;
+            }
             // Case B: matches one-or-more segments: advance ti over segment
             // boundaries. `**` can also match within the current partial segment
             // start; emulate by trying every position that is either ti..end or
@@ -147,7 +167,9 @@ fn m(p: &[char], pi: usize, t: &[char], ti: usize) -> bool {
             while k < t.len() {
                 if t[k] == '/' {
                     // after this slash, try matching the rest
-                    if m(p, rest, t, k + 1) { return true; }
+                    if m(p, rest, t, k + 1) {
+                        return true;
+                    }
                     // also (for `**` not followed by `/`) allow rest to start
                     // mid-next-segment is handled by '*' logic; here only
                     // segment-aligned positions.
@@ -160,8 +182,12 @@ fn m(p: &[char], pi: usize, t: &[char], ti: usize) -> bool {
             if !ate_slash {
                 let mut k = ti;
                 loop {
-                    if m(p, rest, t, k) { return true; }
-                    if k >= t.len() { break; }
+                    if m(p, rest, t, k) {
+                        return true;
+                    }
+                    if k >= t.len() {
+                        break;
+                    }
                     k += 1;
                 }
             }
@@ -169,7 +195,8 @@ fn m(p: &[char], pi: usize, t: &[char], ti: usize) -> bool {
         }
         // ── extglob group: X(...) where X in @ ! + * ? ──
         if (c == '@' || c == '!' || c == '+' || c == '*' || c == '?')
-            && pi + 1 < p.len() && p[pi + 1] == '('
+            && pi + 1 < p.len()
+            && p[pi + 1] == '('
         {
             if let Some((alts, after)) = parse_extglob(p, pi) {
                 return match_extglob(c, &alts, p, after, t, ti);
@@ -182,33 +209,52 @@ fn m(p: &[char], pi: usize, t: &[char], ti: usize) -> bool {
                 // try zero-length first then extend up to the next '/'.
                 let mut k = ti;
                 loop {
-                    if m(p, pi + 1, t, k) { return true; }
-                    if k >= t.len() || t[k] == '/' { return false; }
+                    if m(p, pi + 1, t, k) {
+                        return true;
+                    }
+                    if k >= t.len() || t[k] == '/' {
+                        return false;
+                    }
                     k += 1;
                 }
             }
             '?' => {
-                if ti >= t.len() || t[ti] == '/' { return false; }
-                pi += 1; ti += 1;
+                if ti >= t.len() || t[ti] == '/' {
+                    return false;
+                }
+                pi += 1;
+                ti += 1;
             }
             '[' => {
                 if let Some((matched, len, ok)) = match_class(p, pi, t, ti) {
-                    if !ok || !matched { return false; }
-                    pi += len; ti += 1;
+                    if !ok || !matched {
+                        return false;
+                    }
+                    pi += len;
+                    ti += 1;
                 } else {
                     // unbalanced '[' → literal
-                    if ti >= t.len() || t[ti] != '[' { return false; }
-                    pi += 1; ti += 1;
+                    if ti >= t.len() || t[ti] != '[' {
+                        return false;
+                    }
+                    pi += 1;
+                    ti += 1;
                 }
             }
             '\\' => {
                 let lit = if pi + 1 < p.len() { p[pi + 1] } else { '\\' };
-                if ti >= t.len() || t[ti] != lit { return false; }
-                pi += 2; ti += 1;
+                if ti >= t.len() || t[ti] != lit {
+                    return false;
+                }
+                pi += 2;
+                ti += 1;
             }
             _ => {
-                if ti >= t.len() || t[ti] != c { return false; }
-                pi += 1; ti += 1;
+                if ti >= t.len() || t[ti] != c {
+                    return false;
+                }
+                pi += 1;
+                ti += 1;
             }
         }
     }
@@ -236,9 +282,17 @@ fn parse_extglob(p: &[char], pi: usize) -> Option<(Vec<String>, usize)> {
         match c {
             '\\' => {
                 cur.push(c);
-                if i + 1 < p.len() { cur.push(p[i + 1]); i += 1; }
+                if i + 1 < p.len() {
+                    cur.push(p[i + 1]);
+                    i += 1;
+                }
             }
-            '(' => { depth += 1; if depth > 1 { cur.push(c); } }
+            '(' => {
+                depth += 1;
+                if depth > 1 {
+                    cur.push(c);
+                }
+            }
             ')' => {
                 depth -= 1;
                 if depth == 0 {
@@ -257,14 +311,22 @@ fn parse_extglob(p: &[char], pi: usize) -> Option<(Vec<String>, usize)> {
 
 /// Match an extglob `op(alts)` at the front of `t[ti..]`, then continue with the
 /// pattern tail `p[after..]`. `op` ∈ @ ! + * ?.
-fn match_extglob(op: char, alts: &[String], p: &[char], after: usize,
-                 t: &[char], ti: usize) -> bool {
+fn match_extglob(
+    op: char,
+    alts: &[String],
+    p: &[char],
+    after: usize,
+    t: &[char],
+    ti: usize,
+) -> bool {
     // Helper: does an alternative pattern match exactly `t[ti..end]` for some
     // `end`, returning all such ends? We brute-force end positions within the
     // current segment (extglob, like *, does not cross '/').
     let seg_end = {
         let mut e = ti;
-        while e < t.len() && t[e] != '/' { e += 1; }
+        while e < t.len() && t[e] != '/' {
+            e += 1;
+        }
         e
     };
     // alt_ends(start): set of positions `e` (start<=e<=seg_end) such that one of
@@ -286,15 +348,21 @@ fn match_extglob(op: char, alts: &[String], p: &[char], after: usize,
     match op {
         '@' => {
             for e in alt_ends(ti) {
-                if m(p, after, t, e) { return true; }
+                if m(p, after, t, e) {
+                    return true;
+                }
             }
             false
         }
         '?' => {
             // zero or one
-            if m(p, after, t, ti) { return true; }
+            if m(p, after, t, ti) {
+                return true;
+            }
             for e in alt_ends(ti) {
-                if m(p, after, t, e) { return true; }
+                if m(p, after, t, e) {
+                    return true;
+                }
             }
             false
         }
@@ -302,17 +370,23 @@ fn match_extglob(op: char, alts: &[String], p: &[char], after: usize,
             // one-or-more (+) / zero-or-more (*) repetitions. BFS over reachable
             // positions within the segment.
             let mut reachable = std::collections::BTreeSet::new();
-            if op == '*' { reachable.insert(ti); }
+            if op == '*' {
+                reachable.insert(ti);
+            }
             let mut frontier = vec![ti];
             // seed first repetition
             let mut seen = std::collections::BTreeSet::new();
             seen.insert(ti);
             // We want all positions reachable by >=1 (or >=0) reps.
             let mut positions = std::collections::BTreeSet::new();
-            if op == '*' { positions.insert(ti); }
+            if op == '*' {
+                positions.insert(ti);
+            }
             while let Some(pos) = frontier.pop() {
                 for e in alt_ends(pos) {
-                    if e == pos { continue; } // avoid empty-match infinite loop
+                    if e == pos {
+                        continue;
+                    } // avoid empty-match infinite loop
                     positions.insert(e);
                     if seen.insert(e) {
                         frontier.push(e);
@@ -321,7 +395,9 @@ fn match_extglob(op: char, alts: &[String], p: &[char], after: usize,
             }
             let _ = reachable;
             for pos in positions {
-                if m(p, after, t, pos) { return true; }
+                if m(p, after, t, pos) {
+                    return true;
+                }
             }
             false
         }
@@ -334,9 +410,14 @@ fn match_extglob(op: char, alts: &[String], p: &[char], after: usize,
                 let mut neg_matches = false;
                 for a in alts {
                     let ap: Vec<char> = a.chars().collect();
-                    if m(&ap, 0, span, 0) { neg_matches = true; break; }
+                    if m(&ap, 0, span, 0) {
+                        neg_matches = true;
+                        break;
+                    }
                 }
-                if !neg_matches && m(p, after, t, e) { return true; }
+                if !neg_matches && m(p, after, t, e) {
+                    return true;
+                }
             }
             false
         }
@@ -346,18 +427,24 @@ fn match_extglob(op: char, alts: &[String], p: &[char], after: usize,
 
 /// Match a `[...]` bracket class at `p[pi]` against `t[ti]`. Returns
 /// (matched, pattern_len_consumed, ok) or None if the class is unterminated.
-fn match_class(p: &[char], pi: usize, t: &[char], ti: usize)
-    -> Option<(bool, usize, bool)>
-{
+fn match_class(p: &[char], pi: usize, t: &[char], ti: usize) -> Option<(bool, usize, bool)> {
     // find closing ']'
     let mut j = pi + 1;
     let negate = j < p.len() && (p[j] == '!' || p[j] == '^');
-    if negate { j += 1; }
+    if negate {
+        j += 1;
+    }
     // a ']' immediately after the (optional) negation is a literal member.
     let body_start = j;
-    if j < p.len() && p[j] == ']' { j += 1; }
-    while j < p.len() && p[j] != ']' { j += 1; }
-    if j >= p.len() { return None; } // unterminated
+    if j < p.len() && p[j] == ']' {
+        j += 1;
+    }
+    while j < p.len() && p[j] != ']' {
+        j += 1;
+    }
+    if j >= p.len() {
+        return None;
+    } // unterminated
     let close = j;
     if ti >= t.len() || t[ti] == '/' {
         return Some((false, close - pi + 1, true));
@@ -368,14 +455,21 @@ fn match_class(p: &[char], pi: usize, t: &[char], ti: usize)
     while k < close {
         // range a-z
         if k + 2 < close && p[k + 1] == '-' {
-            let lo = p[k]; let hi = p[k + 2];
-            if lo <= ch && ch <= hi { matched = true; }
+            let lo = p[k];
+            let hi = p[k + 2];
+            if lo <= ch && ch <= hi {
+                matched = true;
+            }
             k += 3;
         } else {
-            if p[k] == ch { matched = true; }
+            if p[k] == ch {
+                matched = true;
+            }
             k += 1;
         }
     }
-    if negate { matched = !matched; }
+    if negate {
+        matched = !matched;
+    }
     Some((matched, close - pi + 1, true))
 }

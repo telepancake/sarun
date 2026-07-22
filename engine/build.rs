@@ -95,8 +95,7 @@ fn require_generated_wire(manifest: &Path) {
         })
         .collect();
     let expected_sources: std::collections::BTreeSet<_> = SOURCES.iter().copied().collect();
-    let recorded_sources: std::collections::BTreeSet<_> =
-        recorded.keys().copied().collect();
+    let recorded_sources: std::collections::BTreeSet<_> = recorded.keys().copied().collect();
     assert_eq!(
         recorded_sources, expected_sources,
         "generated wire source set changed; run `make wire-codegen`"
@@ -125,9 +124,9 @@ fn main() {
     let swipl_target = match target.as_str() {
         "x86_64-unknown-linux-musl" => "x86_64-linux-musl",
         "aarch64-unknown-linux-musl" => "aarch64-linux-musl",
-        _ => panic!(
-            "sarun's embedded Prolog runtime supports x86_64 and aarch64 musl, not {target}"
-        ),
+        _ => {
+            panic!("sarun's embedded Prolog runtime supports x86_64 and aarch64 musl, not {target}")
+        }
     };
 
     let manifest = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
@@ -196,11 +195,7 @@ fn main() {
     require_value(&info, "grammar_ir_sha256", &sha256(&grammar_ir));
     require_value(&info, "relation_api_sha256", &sha256(&relation_api));
     require_value(&info, "action_catalog_sha256", &sha256(&catalog));
-    require_value(
-        &info,
-        "context_relation_sha256",
-        &sha256(&context_relation),
-    );
+    require_value(&info, "context_relation_sha256", &sha256(&context_relation));
     require_value(
         &info,
         "transport_catalog_sha256",

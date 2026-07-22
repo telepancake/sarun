@@ -23,11 +23,17 @@ const HF_LIST: &str = "https://huggingface.co/api/models\
 /// Repo id looks like an instruct/chat model (vs a base, embedding, vision…).
 fn instruct_like(id: &str) -> bool {
     let l = id.to_ascii_lowercase();
-    let bad = ["embed", "rerank", "vision", "-vl", "audio", "ocr", "tts",
-               "whisper", "base", "reward"];
-    if bad.iter().any(|b| l.contains(b)) { return false; }
-    ["instruct", "-it", "-it-", "chat", "thinking", "coder", "-r1", "reason"]
-        .iter().any(|k| l.contains(k))
+    let bad = [
+        "embed", "rerank", "vision", "-vl", "audio", "ocr", "tts", "whisper", "base", "reward",
+    ];
+    if bad.iter().any(|b| l.contains(b)) {
+        return false;
+    }
+    [
+        "instruct", "-it", "-it-", "chat", "thinking", "coder", "-r1", "reason",
+    ]
+    .iter()
+    .any(|k| l.contains(k))
 }
 
 /// The catalog + a one-line note on where it came from. Order: user config,
@@ -37,7 +43,9 @@ pub fn catalog() -> (Vec<ModelEntry>, String) {
     let mut sources = Vec::new();
 
     let cfg = config_models();
-    if !cfg.is_empty() { sources.push("config".to_string()); }
+    if !cfg.is_empty() {
+        sources.push("config".to_string());
+    }
     out.extend(cfg);
 
     match crate::oaita::client::block_on(fetch_hf()) {
@@ -45,7 +53,9 @@ pub fn catalog() -> (Vec<ModelEntry>, String) {
             sources.push(format!("HuggingFace ({} live)", live.len()));
             // de-dup by url against config entries
             for e in live {
-                if !out.iter().any(|o| o.url == e.url) { out.push(e); }
+                if !out.iter().any(|o| o.url == e.url) {
+                    out.push(e);
+                }
             }
         }
         _ => {}
@@ -61,17 +71,29 @@ pub fn catalog() -> (Vec<ModelEntry>, String) {
 /// `{config_home}/oaita-models.toml` — `[[model]] name / url / note`.
 fn config_models() -> Vec<ModelEntry> {
     let p = crate::paths::config_home().join("oaita-models.toml");
-    let Ok(text) = std::fs::read_to_string(&p) else { return vec![]; };
-    let Ok(v) = text.parse::<toml::Value>() else { return vec![]; };
-    v.get("model").and_then(|m| m.as_array())
-        .map(|arr| arr.iter().filter_map(|m| {
-            Some(ModelEntry {
-                name: m.get("name")?.as_str()?.to_string(),
-                url: m.get("url")?.as_str()?.to_string(),
-                note: m.get("note").and_then(|n| n.as_str())
-                    .unwrap_or("").to_string(),
-            })
-        }).collect())
+    let Ok(text) = std::fs::read_to_string(&p) else {
+        return vec![];
+    };
+    let Ok(v) = text.parse::<toml::Value>() else {
+        return vec![];
+    };
+    v.get("model")
+        .and_then(|m| m.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|m| {
+                    Some(ModelEntry {
+                        name: m.get("name")?.as_str()?.to_string(),
+                        url: m.get("url")?.as_str()?.to_string(),
+                        note: m
+                            .get("note")
+                            .and_then(|n| n.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                    })
+                })
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -80,19 +102,29 @@ async fn fetch_hf() -> anyhow::Result<Vec<ModelEntry>> {
         .user_agent("sarun-oaita")
         .timeout(std::time::Duration::from_secs(8))
         .build()?;
-    let list: Vec<Value> = client.get(HF_LIST).send().await?
-        .error_for_status()?.json().await?;
+    let list: Vec<Value> = client
+        .get(HF_LIST)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
     let mut out = Vec::new();
     for m in &list {
-        if out.len() >= 10 { break; }
-        let Some(id) = m.get("id").and_then(Value::as_str) else { continue };
-        if !instruct_like(id) { continue; }
+        if out.len() >= 10 {
+            break;
+        }
+        let Some(id) = m.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        if !instruct_like(id) {
+            continue;
+        }
         if let Some((file, size)) = resolve_q4(&client, id).await {
             out.push(ModelEntry {
                 name: id.to_string(),
                 url: format!("https://huggingface.co/{id}/resolve/main/{file}"),
-                note: format!("{} · Q4 · {} GiB",
-                              short_id(id), size / (1 << 30)),
+                note: format!("{} · Q4 · {} GiB", short_id(id), size / (1 << 30)),
             });
         }
     }
@@ -103,18 +135,35 @@ async fn fetch_hf() -> anyhow::Result<Vec<ModelEntry>> {
 /// its size. Skips multi-part shards (too big / awkward to serve).
 async fn resolve_q4(client: &reqwest::Client, id: &str) -> Option<(String, u64)> {
     let url = format!("https://huggingface.co/api/models/{id}/tree/main");
-    let tree: Vec<Value> = client.get(&url).send().await.ok()?
-        .error_for_status().ok()?.json().await.ok()?;
-    let path_of = |f: &Value| f.get("path").and_then(Value::as_str)
-        .map(str::to_string).unwrap_or_default();
-    let ggufs: Vec<&Value> = tree.iter()
+    let tree: Vec<Value> = client
+        .get(&url)
+        .send()
+        .await
+        .ok()?
+        .error_for_status()
+        .ok()?
+        .json()
+        .await
+        .ok()?;
+    let path_of = |f: &Value| {
+        f.get("path")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_default()
+    };
+    let ggufs: Vec<&Value> = tree
+        .iter()
         .filter(|f| path_of(f).to_ascii_lowercase().ends_with(".gguf"))
         .filter(|f| !path_of(f).contains("-of-")) // no shards
         .collect();
-    let pick = ggufs.iter()
+    let pick = ggufs
+        .iter()
         .find(|f| path_of(f).to_ascii_lowercase().contains("q4_k_m"))
-        .or_else(|| ggufs.iter()
-            .find(|f| path_of(f).to_ascii_lowercase().contains("q4")))
+        .or_else(|| {
+            ggufs
+                .iter()
+                .find(|f| path_of(f).to_ascii_lowercase().contains("q4"))
+        })
         .copied()?;
     let path = pick.get("path").and_then(Value::as_str)?.to_string();
     let size = pick.get("size").and_then(Value::as_u64).unwrap_or(0);
@@ -122,7 +171,9 @@ async fn resolve_q4(client: &reqwest::Client, id: &str) -> Option<(String, u64)>
 }
 
 /// The short model name from a `owner/repo` id.
-fn short_id(id: &str) -> &str { id.rsplit('/').next().unwrap_or(id) }
+fn short_id(id: &str) -> &str {
+    id.rsplit('/').next().unwrap_or(id)
+}
 
 /// Offline fallback — a Jan-2026 snapshot, LABELLED as such (see catalog()).
 /// Not a recommendation of "current best"; just something that resolves when
@@ -130,8 +181,10 @@ fn short_id(id: &str) -> &str { id.rsplit('/').next().unwrap_or(id) }
 fn fallback() -> Vec<ModelEntry> {
     let m = |repo: &str, note: &str| ModelEntry {
         name: repo.to_string(),
-        url: format!("https://huggingface.co/unsloth/{repo}-GGUF/\
-                      resolve/main/{repo}-Q4_K_M.gguf"),
+        url: format!(
+            "https://huggingface.co/unsloth/{repo}-GGUF/\
+                      resolve/main/{repo}-Q4_K_M.gguf"
+        ),
         note: format!("Q4 · {note} · offline snapshot"),
     };
     vec![

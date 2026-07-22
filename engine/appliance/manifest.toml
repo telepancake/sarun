@@ -5,7 +5,7 @@
 version = "11.0.2"
 url = "https://download.qemu.org/qemu-11.0.2.tar.xz"
 sha256 = "3745f6ea88e2e87fe0dc838b2b1d4e0a770bf48e01a1d5a186842a1fff76ccf5"
-targets = ["aarch64-softmmu", "x86_64-softmmu"]
+targets = ["aarch64-softmmu", "x86_64-softmmu", "arm-softmmu", "mipsel-softmmu"]
 
 [linux]
 series = "6.18"
@@ -18,3 +18,12 @@ protocol = 1
 virtiofs_tag = "sarun-root"
 control_port = "sarun-control"
 architectures = ["aarch64", "x86_64"]
+
+[debug_images]
+# These architectures boot complete named ViroS images, not Sarun's own
+# virtio-fs/PID-1 appliance. The MMIPS entry is specifically the standard
+# OpenWrt Malta/24Kc profile; RouterBoard kernels need their matching ViroS
+# hardware profile and are not silently treated as Malta images.
+architectures = ["arm", "mmips"]
+arm_profile = "virt-initramfs-arm-v1"
+mmips_profile = "malta-initramfs-mipsel-v1"

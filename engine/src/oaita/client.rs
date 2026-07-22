@@ -17,7 +17,7 @@ use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpStream, UnixStream};
 
@@ -33,7 +33,11 @@ pub enum Endpoint {
     /// `SARUN_BROKER`.
     Broker(String),
     /// Real http(s) URL. The port defaults to 80/443 by scheme.
-    Tcp { scheme: String, host: String, port: u16 },
+    Tcp {
+        scheme: String,
+        host: String,
+        port: u16,
+    },
     /// HTTP over an engine-bridged in-box service: `svc://<name>[#<base>]`.
     /// Dials the engine's own control socket, tags the conn `svc.dial`,
     /// and the engine splices it onto the named service's parked
@@ -62,24 +66,36 @@ impl Endpoint {
     pub fn parse_url(url: &str) -> Result<Self, String> {
         // Just the SCHEME://HOST[:PORT] head — the per-request path is added
         // at send time. We don't need a full URL parser for this.
-        let (scheme, rest) = url.split_once("://")
+        let (scheme, rest) = url
+            .split_once("://")
             .ok_or_else(|| format!("base_url missing scheme: {url:?}"))?;
         if scheme.eq_ignore_ascii_case("svc") {
             let name = rest.split('#').next().unwrap_or(rest);
             if name.is_empty() {
                 return Err(format!("svc base_url missing service name: {url:?}"));
             }
-            return Ok(Endpoint::Svc { name: name.to_string() });
+            return Ok(Endpoint::Svc {
+                name: name.to_string(),
+            });
         }
         let host_port = rest.split('/').next().unwrap_or("");
         let (host, port) = match host_port.rsplit_once(':') {
             Some((h, p)) => (h.to_string(), p.parse::<u16>().map_err(|e| e.to_string())?),
-            None => (host_port.to_string(),
-                     if scheme.eq_ignore_ascii_case("https") { 443 } else { 80 }),
+            None => (
+                host_port.to_string(),
+                if scheme.eq_ignore_ascii_case("https") {
+                    443
+                } else {
+                    80
+                },
+            ),
         };
-        Ok(Endpoint::Tcp { scheme: scheme.to_lowercase(), host, port })
+        Ok(Endpoint::Tcp {
+            scheme: scheme.to_lowercase(),
+            host,
+            port,
+        })
     }
-
 }
 
 /// The path portion of a request URL: everything after the host. For TCP
@@ -95,12 +111,10 @@ fn base_path(url: &str) -> &str {
         };
     }
     match url.split_once("://") {
-        Some((_, rest)) => {
-            match rest.find('/') {
-                Some(i) => &rest[i..],
-                None => "/",
-            }
-        }
+        Some((_, rest)) => match rest.find('/') {
+            Some(i) => &rest[i..],
+            None => "/",
+        },
         None => "/",
     }
 }
@@ -120,7 +134,12 @@ impl Client {
             }
             _ => None,
         };
-        Client { endpoint, api_key, base_path, tls }
+        Client {
+            endpoint,
+            api_key,
+            base_path,
+            tls,
+        }
     }
 
     pub fn from_resolved(base_url: &str, api_key: &str) -> Result<Self, String> {
@@ -143,8 +162,12 @@ impl Client {
         // upstream 4xx/5xx) as Err so the driver loop can react instead
         // of treating an error body as a model response.
         let status = resp.status();
-        let body = resp.body_mut().collect().await
-            .map(|c| c.to_bytes()).unwrap_or_default();
+        let body = resp
+            .body_mut()
+            .collect()
+            .await
+            .map(|c| c.to_bytes())
+            .unwrap_or_default();
         if !status.is_success() {
             let preview = String::from_utf8_lossy(&body[..body.len().min(2048)]);
             return Err(format!("upstream {status}: {preview}"));
@@ -154,9 +177,9 @@ impl Client {
 
     /// Stream Server-Sent-Events from `path`. The callback gets each `data:`
     /// payload (without the prefix); a sentinel "[DONE]" causes us to stop.
-    pub async fn post_stream<F>(&self, path: &str, body: Value, on_event: F)
-        -> Result<(), String>
-    where F: FnMut(&str)
+    pub async fn post_stream<F>(&self, path: &str, body: Value, on_event: F) -> Result<(), String>
+    where
+        F: FnMut(&str),
     {
         let resp = self.open_stream(path, body).await?;
         pump_stream(resp, on_event).await
@@ -168,9 +191,11 @@ impl Client {
     /// an unreachable / refused / non-2xx upstream as a clean error BEFORE
     /// committing to a 200 stream, instead of the opaque mid-stream "error
     /// reading a body from connection" the box otherwise sees.
-    pub async fn open_stream(&self, path: &str, mut body: Value)
-        -> Result<Response<Incoming>, String>
-    {
+    pub async fn open_stream(
+        &self,
+        path: &str,
+        mut body: Value,
+    ) -> Result<Response<Incoming>, String> {
         if let Some(obj) = body.as_object_mut() {
             obj.insert("stream".into(), json!(true));
         }
@@ -181,31 +206,36 @@ impl Client {
         // empty assistant turn with no idea why.
         let status = resp.status();
         if !status.is_success() {
-            let body = resp.body_mut().collect().await
-                .map(|c| c.to_bytes()).unwrap_or_default();
+            let body = resp
+                .body_mut()
+                .collect()
+                .await
+                .map(|c| c.to_bytes())
+                .unwrap_or_default();
             let preview = String::from_utf8_lossy(&body[..body.len().min(2048)]);
             return Err(format!("upstream {status}: {preview}"));
         }
         Ok(resp)
     }
 
-    async fn send(&self, path: &str, body: Value)
-        -> Result<Response<Incoming>, String>
-    {
+    async fn send(&self, path: &str, body: Value) -> Result<Response<Incoming>, String> {
         let full_path = if path.starts_with('/') {
             format!("{}{path}", self.base_path.trim_end_matches('/'))
         } else {
             format!("{}/{path}", self.base_path.trim_end_matches('/'))
         };
-        let body_bytes = serde_json::to_vec(&body)
-            .map_err(|e| format!("encode body: {e}"))?;
+        let body_bytes = serde_json::to_vec(&body).map_err(|e| format!("encode body: {e}"))?;
         let host_header = match &self.endpoint {
             Endpoint::Broker(_) => "oaita-proxy".to_string(),
             Endpoint::Svc { .. } => "localhost".to_string(),
             Endpoint::Tcp { host, port, scheme } => {
-                let default = (scheme == "https" && *port == 443)
-                           || (scheme == "http" && *port == 80);
-                if default { host.clone() } else { format!("{host}:{port}") }
+                let default =
+                    (scheme == "https" && *port == 443) || (scheme == "http" && *port == 80);
+                if default {
+                    host.clone()
+                } else {
+                    format!("{host}:{port}")
+                }
             }
         };
         let mut req = Request::builder()
@@ -218,7 +248,8 @@ impl Client {
         if !self.api_key.is_empty() {
             req = req.header("Authorization", format!("Bearer {}", self.api_key));
         }
-        let req = req.body(Full::new(Bytes::from(body_bytes)))
+        let req = req
+            .body(Full::new(Bytes::from(body_bytes)))
             .map_err(|e| format!("build req: {e}"))?;
 
         match &self.endpoint {
@@ -230,67 +261,100 @@ impl Client {
                 // proxies to the configured upstream. One conn per call;
                 // no demux on the box-channel.
                 let name_owned = name.clone();
-                let std_stream = tokio::task::spawn_blocking(move ||
-                    crate::runner::broker_dial(&name_owned))
-                    .await
-                    .map_err(|e| format!("broker join: {e}"))?
-                    .map_err(|e| format!("broker dial: {e}"))?;
-                std_stream.set_nonblocking(true)
+                let std_stream =
+                    tokio::task::spawn_blocking(move || crate::runner::broker_dial(&name_owned))
+                        .await
+                        .map_err(|e| format!("broker join: {e}"))?
+                        .map_err(|e| format!("broker dial: {e}"))?;
+                std_stream
+                    .set_nonblocking(true)
                     .map_err(|e| format!("set_nonblocking: {e}"))?;
-                let mut stream = UnixStream::from_std(std_stream)
-                    .map_err(|e| format!("from_std: {e}"))?;
+                let mut stream =
+                    UnixStream::from_std(std_stream).map_err(|e| format!("from_std: {e}"))?;
                 // Engine derives the box id from the broker handshake
                 // (FD broker hands out conns with a hint_box_id = THIS
                 // box). No session field on the wire — budget identity
                 // is intrinsic to the broker, not client-supplied.
-                stream.write_all(b"{\"type\":\"api.proxy\"}\n").await
+                stream
+                    .write_all(b"{\"type\":\"api.proxy\"}\n")
+                    .await
                     .map_err(|e| format!("api.proxy header: {e}"))?;
-                let (mut sender, conn) = hyper::client::conn::http1::handshake(
-                    TokioIo::new(stream)).await
-                    .map_err(|e| format!("handshake: {e}"))?;
-                tokio::spawn(async move { let _ = conn.await; });
-                sender.send_request(req).await.map_err(|e| format!("send: {e}"))
+                let (mut sender, conn) =
+                    hyper::client::conn::http1::handshake(TokioIo::new(stream))
+                        .await
+                        .map_err(|e| format!("handshake: {e}"))?;
+                tokio::spawn(async move {
+                    let _ = conn.await;
+                });
+                sender
+                    .send_request(req)
+                    .await
+                    .map_err(|e| format!("send: {e}"))
             }
             Endpoint::Svc { name } => {
                 // The engine's own control socket, conn tagged svc.dial —
                 // the engine splices us onto the service's parked slot.
                 let sock = crate::paths::sock_path();
-                let mut stream = UnixStream::connect(&sock).await
+                let mut stream = UnixStream::connect(&sock)
+                    .await
                     .map_err(|e| format!("dial engine {}: {e}", sock.display()))?;
-                stream.write_all(
-                    format!("{{\"type\":\"svc.dial\",\"name\":\"{name}\"}}\n")
-                        .as_bytes()).await
+                stream
+                    .write_all(
+                        format!("{{\"type\":\"svc.dial\",\"name\":\"{name}\"}}\n").as_bytes(),
+                    )
+                    .await
                     .map_err(|e| format!("svc.dial header: {e}"))?;
                 let line = read_line_async(&mut stream).await?;
                 if !line.contains("\"ok\":true") {
                     return Err(format!("svc.dial {name}: {line}"));
                 }
-                let (mut sender, conn) = hyper::client::conn::http1::handshake(
-                    TokioIo::new(stream)).await
-                    .map_err(|e| format!("handshake: {e}"))?;
-                tokio::spawn(async move { let _ = conn.await; });
-                sender.send_request(req).await.map_err(|e| format!("send: {e}"))
+                let (mut sender, conn) =
+                    hyper::client::conn::http1::handshake(TokioIo::new(stream))
+                        .await
+                        .map_err(|e| format!("handshake: {e}"))?;
+                tokio::spawn(async move {
+                    let _ = conn.await;
+                });
+                sender
+                    .send_request(req)
+                    .await
+                    .map_err(|e| format!("send: {e}"))
             }
             Endpoint::Tcp { scheme, host, port } => {
-                let tcp = TcpStream::connect((host.as_str(), *port)).await
+                let tcp = TcpStream::connect((host.as_str(), *port))
+                    .await
                     .map_err(|e| format!("dial {host}:{port}: {e}"))?;
                 if scheme == "https" {
                     let tls = self.tls.as_ref().unwrap().clone();
                     let server_name = rustls::pki_types::ServerName::try_from(host.clone())
                         .map_err(|e| format!("server name {host:?}: {e}"))?;
-                    let tls_stream = tls.connect(server_name, tcp).await
+                    let tls_stream = tls
+                        .connect(server_name, tcp)
+                        .await
                         .map_err(|e| format!("tls: {e}"))?;
-                    let (mut sender, conn) = hyper::client::conn::http1::handshake(
-                        TokioIo::new(tls_stream)).await
-                        .map_err(|e| format!("handshake: {e}"))?;
-                    tokio::spawn(async move { let _ = conn.await; });
-                    sender.send_request(req).await.map_err(|e| format!("send: {e}"))
+                    let (mut sender, conn) =
+                        hyper::client::conn::http1::handshake(TokioIo::new(tls_stream))
+                            .await
+                            .map_err(|e| format!("handshake: {e}"))?;
+                    tokio::spawn(async move {
+                        let _ = conn.await;
+                    });
+                    sender
+                        .send_request(req)
+                        .await
+                        .map_err(|e| format!("send: {e}"))
                 } else {
-                    let (mut sender, conn) = hyper::client::conn::http1::handshake(
-                        TokioIo::new(tcp)).await
-                        .map_err(|e| format!("handshake: {e}"))?;
-                    tokio::spawn(async move { let _ = conn.await; });
-                    sender.send_request(req).await.map_err(|e| format!("send: {e}"))
+                    let (mut sender, conn) =
+                        hyper::client::conn::http1::handshake(TokioIo::new(tcp))
+                            .await
+                            .map_err(|e| format!("handshake: {e}"))?;
+                    tokio::spawn(async move {
+                        let _ = conn.await;
+                    });
+                    sender
+                        .send_request(req)
+                        .await
+                        .map_err(|e| format!("send: {e}"))
                 }
             }
         }
@@ -315,7 +379,8 @@ async fn read_line_async(s: &mut UnixStream) -> Result<String, String> {
 }
 
 fn find_double_newline(buf: &[u8]) -> Option<usize> {
-    buf.windows(2).position(|w| w == b"\n\n")
+    buf.windows(2)
+        .position(|w| w == b"\n\n")
         .or_else(|| buf.windows(4).position(|w| w == b"\r\n\r\n"))
 }
 
@@ -341,7 +406,9 @@ fn default_tls_connector() -> tokio_rustls::TlsConnector {
         loop {
             match rustls_pemfile::read_one(&mut cursor) {
                 Ok(Some(rustls_pemfile::Item::X509Certificate(der))) => {
-                    if root_store.add(der).is_ok() { count += 1; }
+                    if root_store.add(der).is_ok() {
+                        count += 1;
+                    }
                 }
                 Ok(Some(_)) => {}
                 Ok(None) | Err(_) => break,
@@ -367,7 +434,10 @@ fn err_chain(e: &dyn std::error::Error) -> String {
     let mut src = e.source();
     while let Some(inner) = src {
         let msg = inner.to_string();
-        if !s.ends_with(&msg) { s.push_str(": "); s.push_str(&msg); }
+        if !s.ends_with(&msg) {
+            s.push_str(": ");
+            s.push_str(&msg);
+        }
         src = inner.source();
     }
     s
@@ -375,25 +445,30 @@ fn err_chain(e: &dyn std::error::Error) -> String {
 
 /// Pump SSE frames from an already-opened streaming response, invoking
 /// `on_event` with each `data:` payload until `[DONE]` or end of body.
-pub async fn pump_stream<F>(mut resp: Response<Incoming>, mut on_event: F)
-    -> Result<(), String>
-where F: FnMut(&str)
+pub async fn pump_stream<F>(mut resp: Response<Incoming>, mut on_event: F) -> Result<(), String>
+where
+    F: FnMut(&str),
 {
     let mut buf = Vec::<u8>::new();
     while let Some(frame) = resp.body_mut().frame().await {
-        let frame = frame.map_err(|e| format!("stream frame: {}",
-            err_chain(&e)))?;
-        let Some(data) = frame.data_ref() else { continue; };
+        let frame = frame.map_err(|e| format!("stream frame: {}", err_chain(&e)))?;
+        let Some(data) = frame.data_ref() else {
+            continue;
+        };
         buf.extend_from_slice(data);
         // Split on \n\n — SSE event delimiter.
         loop {
-            let Some(pos) = find_double_newline(&buf) else { break; };
+            let Some(pos) = find_double_newline(&buf) else {
+                break;
+            };
             let event_bytes = buf.drain(..pos + 2).collect::<Vec<u8>>();
             let event = String::from_utf8_lossy(&event_bytes);
             for line in event.lines() {
                 if let Some(rest) = line.strip_prefix("data:") {
                     let payload = rest.trim_start();
-                    if payload == "[DONE]" { return Ok(()); }
+                    if payload == "[DONE]" {
+                        return Ok(());
+                    }
                     on_event(payload);
                 }
             }
@@ -403,29 +478,37 @@ where F: FnMut(&str)
 }
 
 /// One-shot helper for callers that just want to dial and stream.
-pub async fn stream_text(client: &Client, path: &str, body: Value,
-                         mut on_delta: impl FnMut(&str))
-    -> Result<(), String>
-{
-    client.post_stream(path, body, |payload| {
-        let Ok(v) = serde_json::from_str::<Value>(payload) else { return; };
-        if let Some(choices) = v.get("choices").and_then(Value::as_array) {
-            for choice in choices {
-                if let Some(d) = choice.get("delta").and_then(Value::as_object) {
-                    if let Some(content) = d.get("content").and_then(Value::as_str) {
-                        on_delta(content);
+pub async fn stream_text(
+    client: &Client,
+    path: &str,
+    body: Value,
+    mut on_delta: impl FnMut(&str),
+) -> Result<(), String> {
+    client
+        .post_stream(path, body, |payload| {
+            let Ok(v) = serde_json::from_str::<Value>(payload) else {
+                return;
+            };
+            if let Some(choices) = v.get("choices").and_then(Value::as_array) {
+                for choice in choices {
+                    if let Some(d) = choice.get("delta").and_then(Value::as_object) {
+                        if let Some(content) = d.get("content").and_then(Value::as_str) {
+                            on_delta(content);
+                        }
                     }
                 }
             }
-        }
-    }).await
+        })
+        .await
 }
 
 /// Async tokio runtime accessor — oaita CLI commands spin a current-thread
 /// runtime; the engine proxy uses the existing multi-thread one.
 pub fn block_on<F: std::future::Future>(f: F) -> F::Output {
     let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all().build().expect("tokio runtime");
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
     rt.block_on(f)
 }
 

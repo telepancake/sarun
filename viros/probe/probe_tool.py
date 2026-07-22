@@ -26,6 +26,8 @@ from callgate.manifest import ManifestError, load_and_validate_manifest
 ET_REL = 1
 ET_EXEC = 2
 EM_MIPS = 8
+EM_ARM = 40
+EM_X86_64 = 62
 EM_AARCH64 = 183
 SHN_UNDEF = 0
 SHT_SYMTAB = 2
@@ -58,6 +60,10 @@ AFL_REG_NONE = 0
 AFL_REG_32 = 1
 VAL_GNU_MIPS_ABI_FP_SOFT = 3
 MIPS_AFL_FLAGS1_ODDSPREG = 0x1
+
+EF_ARM_EABIMASK = 0xFF000000
+EF_ARM_EABI_VER5 = 0x05000000
+EF_ARM_ABI_FLOAT_HARD = 0x00000400
 
 # Relocations which obtain addresses through the ABI global pointer or GOT are
 # incompatible with a flat image injected without the normal MIPS loader.
@@ -371,7 +377,12 @@ def gnu_build_id(path: Path, arch: str = "aarch64") -> str:
     """Return the GNU build ID embedded in an ELF image for ``arch``."""
 
     elf = ElfObject(path)
-    machines = {"aarch64": EM_AARCH64, "mmips": EM_MIPS}
+    machines = {
+        "aarch64": EM_AARCH64,
+        "arm": EM_ARM,
+        "mmips": EM_MIPS,
+        "x86_64": EM_X86_64,
+    }
     if arch not in machines:
         raise AuditError(f"build-ID support is not implemented for {arch}")
     if elf.machine != machines[arch]:
@@ -425,8 +436,8 @@ def load_probe_build(path: Path) -> tuple[dict, Path]:
         raise AuditError("probe build manifest must be a JSON object")
     if document.get("schema") != PROBE_BUILD_SCHEMA:
         raise AuditError(f"probe build schema must be {PROBE_BUILD_SCHEMA!r}")
-    if document.get("arch") not in ("aarch64", "mmips"):
-        raise AuditError("probe build arch must be aarch64 or mmips")
+    if document.get("arch") not in ("aarch64", "arm", "mmips", "x86_64"):
+        raise AuditError("probe build arch must be aarch64, arm, mmips, or x86_64")
     probe_object = _package_file(build_path, document.get("object"), "build.object")
     expected = _sha256_string(document.get("object_sha256"), "build.object_sha256")
     actual = _sha256_file(probe_object)
@@ -455,8 +466,8 @@ def load_probe_package(path: Path) -> tuple[dict, Path]:
     if document.get("schema") != PROBE_PACKAGE_SCHEMA:
         raise AuditError(f"probe package schema must be {PROBE_PACKAGE_SCHEMA!r}")
     arch = document.get("arch")
-    if arch not in ("aarch64", "mmips"):
-        raise AuditError("probe package arch must be aarch64 or mmips")
+    if arch not in ("aarch64", "arm", "mmips", "x86_64"):
+        raise AuditError("probe package arch must be aarch64, arm, mmips, or x86_64")
     minor = document.get("abi_minor")
     if document.get("abi_major") != PROBE_ABI_MAJOR or minor not in (0, 1, PROBE_ABI_MINOR):
         raise AuditError("probe package ABI is not a supported viros probe ABI 1.x")
@@ -488,7 +499,7 @@ def load_probe_package(path: Path) -> tuple[dict, Path]:
         "target_byte_order": "little",
     }
     capabilities = document.get("capabilities")
-    mmips_layout = layout == {
+    snapshot_layout = layout == {
         "version": 1,
         "request_v1_bytes": PROBE_REQUEST_SIZE,
         "response_v1_header_bytes": PROBE_RESPONSE_SIZE,
@@ -509,16 +520,27 @@ def load_probe_package(path: Path) -> tuple[dict, Path]:
             raise AuditError("probe package has an incompatible ABI layout")
     elif (
         minor != PROBE_ABI_MINOR
-        or not mmips_layout
+        or not snapshot_layout
         or capabilities != ["snapshot-v1"]
     ):
-        raise AuditError("mmips probe package must advertise only snapshot-v1")
+        raise AuditError(f"{arch} probe package must advertise only snapshot-v1")
     if arch == "mmips" and document.get("elf_abi") != {
         "class": 32, "byte_order": "little", "machine": "EM_MIPS",
         "isa": "mips32r2", "abi": "o32", "float": "soft",
         "pic": False, "mips16": False, "micromips": False,
     }:
         raise AuditError("mmips probe package has incompatible ELF ABI metadata")
+    if arch == "arm" and document.get("elf_abi") != {
+        "class": 32, "byte_order": "little", "machine": "EM_ARM",
+        "isa": "armv7-a", "abi": "aapcs32", "float": "soft",
+        "pic": False, "thumb": False,
+    }:
+        raise AuditError("arm probe package has incompatible ELF ABI metadata")
+    if arch == "x86_64" and document.get("elf_abi") != {
+        "class": 64, "byte_order": "little", "machine": "EM_X86_64",
+        "abi": "sysv-kernel", "pic": False, "red_zone": False,
+    }:
+        raise AuditError("x86_64 probe package has incompatible ELF ABI metadata")
     call_abi = document.get("call_abi")
     if arch == "aarch64":
         valid_call_abi = (
@@ -529,6 +551,29 @@ def load_probe_package(path: Path) -> tuple[dict, Path]:
             and call_abi.get("stack_alignment") == 16
         )
         error = "probe package has an incompatible AArch64 call ABI"
+    elif arch == "arm":
+        valid_call_abi = (
+            isinstance(call_abi, dict)
+            and call_abi.get("name") == "aapcs32"
+            and call_abi.get("argument_registers") == ["r0", "r1", "r2"]
+            and call_abi.get("result_register") == "r0"
+            and call_abi.get("link_register") == "lr"
+            and call_abi.get("stack_alignment") == 8
+            and call_abi.get("completion_trap") == "udf-0x5650"
+        )
+        error = "probe package has an incompatible ARM AAPCS32 call ABI"
+    elif arch == "x86_64":
+        valid_call_abi = (
+            isinstance(call_abi, dict)
+            and call_abi.get("name") == "sysv-x86-64-kernel"
+            and call_abi.get("argument_registers") == ["rdi", "rsi", "rdx"]
+            and call_abi.get("result_register") == "rax"
+            and "link_register" not in call_abi
+            and call_abi.get("return_path") == "internal-call-fallthrough"
+            and call_abi.get("stack_alignment") == 16
+            and call_abi.get("completion_trap") == "int3"
+        )
+        error = "probe package has an incompatible x86-64 kernel SysV call ABI"
     else:
         valid_call_abi = (
             isinstance(call_abi, dict)
@@ -561,22 +606,29 @@ def load_probe_package(path: Path) -> tuple[dict, Path]:
     completion_offset = _manifest_integer(
         document.get("completion_offset"), "package.completion_offset"
     )
-    address_limit = UINT64_LIMIT if arch == "aarch64" else 1 << 32
-    alignment = 16 if arch == "aarch64" else 4
+    address_bits = 64 if arch in {"aarch64", "x86_64"} else 32
+    address_limit = 1 << address_bits
+    alignment = 16 if address_bits == 64 else 4
     if load_address >= address_limit or load_address & (alignment - 1):
         raise AuditError(
             f"package.load_address must be an aligned "
-            f"{64 if arch == 'aarch64' else 32}-bit {arch} address"
+            f"{address_bits}-bit {arch} address"
         )
     if image_start >= address_limit or image_end > address_limit:
         raise AuditError(
             f"probe package linked image bounds do not fit in "
-            f"{64 if arch == 'aarch64' else 32} bits"
+            f"{address_bits} bits"
         )
     if image_start != load_address or image_end != image_start + size:
         raise AuditError("probe package linked image bounds are inconsistent")
-    if any(offset >= size or offset & 3 for offset in (entry_offset, completion_offset)):
+    if any(offset >= size for offset in (entry_offset, completion_offset)) or (
+        arch != "x86_64" and any(
+            offset & 3 for offset in (entry_offset, completion_offset)
+        )
+    ):
         raise AuditError("probe package entry and completion offsets must select instructions")
+    if arch == "x86_64" and load_address < 0xFFFF800000000000:
+        raise AuditError("x86_64 probe load address must be in canonical kernel space")
     kernel = document.get("kernel")
     if not isinstance(kernel, dict):
         raise AuditError("package.kernel must be an object")
@@ -671,7 +723,7 @@ def _load_scratch_regions(
             raise AuditError(f"scratch region {name} must be an object")
         gva = _manifest_integer(raw.get("gva"), f"scratch.regions.{name}.gva")
         size = _manifest_integer(raw.get("size"), f"scratch.regions.{name}.size")
-        address_bits = 64 if expected_arch == "aarch64" else 32
+        address_bits = 64 if expected_arch in {"aarch64", "x86_64"} else 32
         address_limit = 1 << address_bits
         if gva >= address_limit or size <= 0 or gva + size > address_limit:
             raise AuditError(
@@ -701,7 +753,7 @@ def create_callgate_manifest(args):
     package_path = Path(args.package).resolve()
     package, binary = load_probe_package(package_path)
     arch = package["arch"]
-    address_bits = 64 if arch == "aarch64" else 32
+    address_bits = 64 if arch in {"aarch64", "x86_64"} else 32
     if (
         not isinstance(args.init_task, int) or isinstance(args.init_task, bool)
         or args.init_task <= 0 or args.init_task >= 1 << address_bits
@@ -760,7 +812,7 @@ def create_callgate_manifest(args):
             f"--{name}-gpa" for name, values in region_arguments.items()
             if values["gpa"] is None
         ]
-        if arch == "aarch64" and missing_gpas:
+        if arch in {"aarch64", "arm", "x86_64"} and missing_gpas:
             raise AuditError(
                 "--scratch-regions requires all three physical mappings: "
                 + ", ".join(missing_gpas)
@@ -965,9 +1017,50 @@ def _audit_mmips_alloc_sections(elf: ElfObject, *, linked: bool) -> None:
             raise AuditError(f"{elf.path}: .reginfo contains a nonzero GP value")
 
 
+def _audit_arm_identity(elf: ElfObject) -> None:
+    """Require the exact little-endian ARM-state ABI used by Linux 5.6.3."""
+
+    if elf.elf_class != 32 or elf.endian != "<":
+        raise AuditError(f"{elf.path}: arm requires ELF32 little-endian")
+    if elf.machine != EM_ARM:
+        raise AuditError(f"{elf.path}: expected arm machine {EM_ARM}, got {elf.machine}")
+    if (elf.flags & EF_ARM_EABIMASK) != EF_ARM_EABI_VER5:
+        raise AuditError(f"{elf.path}: arm probe must use EABI version 5")
+    if elf.flags & EF_ARM_ABI_FLOAT_HARD:
+        raise AuditError(f"{elf.path}: arm probe must not use the hard-float ABI")
+    thumb = sorted({
+        item["name"]
+        for item in elf.symbol_records()
+        if 0 < item["shndx"] < len(elf.sections)
+        and elf.sections[item["shndx"]]["flags"] & SHF_EXECINSTR
+        and (item["name"].startswith("$t") or item["value"] & 1)
+    })
+    if thumb:
+        raise AuditError(
+            f"{elf.path}: Thumb code/symbols are not supported: "
+            + ", ".join(thumb)
+        )
+
+
+def _audit_x86_64_identity(elf: ElfObject) -> None:
+    """Require the ELF64 little-endian identity of an x86-64 kernel image."""
+
+    if elf.elf_class != 64 or elf.endian != "<":
+        raise AuditError(f"{elf.path}: x86_64 requires ELF64 little-endian")
+    if elf.machine != EM_X86_64:
+        raise AuditError(
+            f"{elf.path}: expected x86_64 machine {EM_X86_64}, got {elf.machine}"
+        )
+
+
 def audit_object(path: Path, arch: str = "aarch64", max_alloc: int = 65536):
     elf = ElfObject(path)
-    machines = {"aarch64": EM_AARCH64, "mmips": EM_MIPS}
+    machines = {
+        "aarch64": EM_AARCH64,
+        "arm": EM_ARM,
+        "mmips": EM_MIPS,
+        "x86_64": EM_X86_64,
+    }
     if arch not in machines:
         raise AuditError(f"audit support is not implemented for {arch}")
     if elf.elf_type != ET_REL:
@@ -976,6 +1069,10 @@ def audit_object(path: Path, arch: str = "aarch64", max_alloc: int = 65536):
         raise AuditError(f"{path}: expected {arch} machine {machines[arch]}, got {elf.machine}")
     if arch == "mmips":
         _audit_mmips_identity(elf, require_abi_flags=True)
+    elif arch == "arm":
+        _audit_arm_identity(elf)
+    elif arch == "x86_64":
+        _audit_x86_64_identity(elf)
 
     symbols = elf.symbols()
     undefined = sorted(name for name, shndx in symbols if name and shndx == SHN_UNDEF)
@@ -1068,6 +1165,50 @@ SECTIONS
   /DISCARD/ : {{ *(.MIPS.abiflags) *(.reginfo) *(.pdr) *(.mdebug.*) *(.gnu.attributes) *(.comment) *(.note*) *(.eh_frame*) *(.debug*) *(.discard.*) }}
 }}
 """
+    if arch == "arm":
+        if load_address < 0 or load_address > 0xffffffff:
+            raise AuditError("load address does not fit a 32-bit ARM address")
+        if load_address & 3:
+            raise AuditError("ARM probe load address must be 4-byte aligned")
+        return f"""/* Generated by probe_tool.py; do not edit. */
+ENTRY(viros_probe_entry)
+SECTIONS
+{{
+  . = 0x{load_address:x};
+  __viros_image_start = .;
+  .text : ALIGN(4) {{ *(.text .text.*) }}
+  .rodata : ALIGN(4) {{ *(.rodata .rodata.*) }}
+  .data : ALIGN(4) {{ *(.data .data.*) }}
+  .bss (NOLOAD) : ALIGN(4) {{ *(.bss .bss.* COMMON) }}
+  __viros_image_end = .;
+  ASSERT(SIZEOF(.data) == 0, "viros probe must not contain writable data")
+  ASSERT(SIZEOF(.bss) == 0, "viros probe must not contain bss")
+  /DISCARD/ : {{ *(.ARM.attributes) *(.ARM.exidx*) *(.ARM.extab*) *(.comment) *(.note*) *(.eh_frame*) *(.debug*) *(.discard.*) }}
+}}
+"""
+    if arch == "x86_64":
+        if not 0xFFFF800000000000 <= load_address <= 0xFFFFFFFFFFFFFFFF:
+            raise AuditError(
+                "x86_64 probe load address must fit canonical kernel space"
+            )
+        if load_address & 0xf:
+            raise AuditError("x86_64 probe load address must be 16-byte aligned")
+        return f"""/* Generated by probe_tool.py; do not edit. */
+ENTRY(viros_probe_entry)
+SECTIONS
+{{
+  . = 0x{load_address:x};
+  __viros_image_start = .;
+  .text : ALIGN(16) {{ *(.text .text.*) }}
+  .rodata : ALIGN(16) {{ *(.rodata .rodata.*) }}
+  .data : ALIGN(16) {{ *(.data .data.*) }}
+  .bss (NOLOAD) : ALIGN(16) {{ *(.bss .bss.* COMMON) }}
+  __viros_image_end = .;
+  ASSERT(SIZEOF(.data) == 0, "viros probe must not contain writable data")
+  ASSERT(SIZEOF(.bss) == 0, "viros probe must not contain bss")
+  /DISCARD/ : {{ *(.comment) *(.note*) *(.eh_frame*) *(.debug*) *(.discard.*) }}
+}}
+"""
     if arch != "aarch64":
         raise AuditError(f"link support is not implemented for {arch}")
     if load_address < 0 or load_address > 0xffffffffffffffff:
@@ -1099,13 +1240,22 @@ def audit_linked_image(
     elf = ElfObject(path)
     if elf.elf_type != ET_EXEC:
         raise AuditError(f"{path}: expected linked ET_EXEC, got ELF type {elf.elf_type}")
-    machines = {"aarch64": EM_AARCH64, "mmips": EM_MIPS}
+    machines = {
+        "aarch64": EM_AARCH64,
+        "arm": EM_ARM,
+        "mmips": EM_MIPS,
+        "x86_64": EM_X86_64,
+    }
     if arch not in machines:
         raise AuditError(f"linked-image audit support is not implemented for {arch}")
     if elf.machine != machines[arch]:
         raise AuditError(f"{path}: expected {arch} machine {machines[arch]}, got {elf.machine}")
     if arch == "mmips":
         _audit_mmips_identity(elf, require_abi_flags=False)
+    elif arch == "arm":
+        _audit_arm_identity(elf)
+    elif arch == "x86_64":
+        _audit_x86_64_identity(elf)
     symbols = elf.symbol_records()
     undefined = sorted(item["name"] for item in symbols
                        if item["name"] and item["shndx"] == SHN_UNDEF)
@@ -1146,9 +1296,11 @@ def audit_linked_image(
     for name, value in addresses.items():
         if not image_start <= value < image_end:
             raise AuditError(f"{path}: {name} at {value:#x} is outside the flat image")
-        if arch == "mmips" and value & 3:
+        if arch in {"arm", "mmips"} and value & 3:
             raise AuditError(f"{path}: {name} does not select a 4-byte instruction")
-    if arch == "mmips" and elf.entry != addresses["viros_probe_entry"]:
+    if arch in {"arm", "mmips", "x86_64"} and (
+        elf.entry != addresses["viros_probe_entry"]
+    ):
         raise AuditError(f"{path}: ELF entry does not match viros_probe_entry")
     return {
         "image_start": image_start, "image_end": image_end,
@@ -1173,6 +1325,10 @@ def package_object(args):
     linker_command = [args.cross_ld]
     if arch == "mmips":
         linker_command.extend(["-m", "elf32ltsmip"])
+    elif arch == "arm":
+        linker_command.extend(["-m", "armelf_linux_eabi"])
+    elif arch == "x86_64":
+        linker_command.extend(["-m", "elf_x86_64"])
     linker_command.extend([
         "-nostdlib", "-static", "--build-id=none", "-T", str(script_path),
         "-o", str(elf_path), str(source),
@@ -1207,6 +1363,49 @@ def package_object(args):
         }
         architecture_metadata = {
             "pgd_address_kind": "kernel-virtual-address",
+        }
+    elif arch == "arm":
+        abi_layout = {
+            "version": 1,
+            "request_v1_bytes": 64, "response_v1_header_bytes": 64,
+            "task_v1_bytes": 192,
+            "target_byte_order": "little",
+        }
+        capabilities = ["snapshot-v1"]
+        call_abi = {
+            "name": "aapcs32", "argument_registers": ["r0", "r1", "r2"],
+            "result_register": "r0", "link_register": "lr",
+            "stack_alignment": 8, "completion_trap": "udf-0x5650",
+        }
+        architecture_metadata = {
+            "elf_abi": {
+                "class": 32, "byte_order": "little", "machine": "EM_ARM",
+                "isa": "armv7-a", "abi": "aapcs32", "float": "soft",
+                "pic": False, "thumb": False,
+            },
+        }
+    elif arch == "x86_64":
+        abi_layout = {
+            "version": 1,
+            "request_v1_bytes": 64, "response_v1_header_bytes": 64,
+            "task_v1_bytes": 192,
+            "target_byte_order": "little",
+        }
+        capabilities = ["snapshot-v1"]
+        call_abi = {
+            "name": "sysv-x86-64-kernel",
+            "argument_registers": ["rdi", "rsi", "rdx"],
+            "result_register": "rax",
+            "return_path": "internal-call-fallthrough",
+            "stack_alignment": 16,
+            "completion_trap": "int3",
+        }
+        architecture_metadata = {
+            "elf_abi": {
+                "class": 64, "byte_order": "little",
+                "machine": "EM_X86_64", "abi": "sysv-kernel",
+                "pic": False, "red_zone": False,
+            },
         }
     else:
         abi_layout = {
@@ -1291,15 +1490,25 @@ def build_object(args):
     shutil.copy2(root / "include" / "viros_probe_abi.h", source / "include" / "viros_probe_abi.h")
 
     env = os.environ.copy()
-    env["ARCH"] = {"aarch64": "arm64", "mmips": "mips"}[args.arch]
+    env["ARCH"] = {
+        "aarch64": "arm64", "arm": "arm", "mmips": "mips",
+        "x86_64": "x86_64",
+    }[args.arch]
     env["CROSS_COMPILE"] = args.cross_compile
+    make_args = tuple(getattr(args, "make_arg", ()) or ())
+    for assignment in make_args:
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=[^\x00\r\n]*", assignment):
+            raise AuditError(
+                "--make-arg must be one make variable assignment without newlines"
+            )
     command = [args.make, "-C", str(linux_dir),
-               f"M={kernel_source}", "viros_probe.o"]
+               *make_args, f"M={kernel_source}", "viros_probe.o"]
     subprocess.run(command, check=True, env=env)
     object_path = kernel_source / "viros_probe.o"
     result = audit_object(object_path, args.arch, args.max_alloc)
     result["linux_dir"] = str(linux_dir)
     result["cross_compile"] = args.cross_compile
+    result["make_args"] = list(make_args)
     result["schema"] = PROBE_BUILD_SCHEMA
     result["object"] = _relative_file(object_path, output)
     result["object_sha256"] = result.pop("sha256")
@@ -1319,13 +1528,28 @@ def main(argv=None):
     subparsers = parser.add_subparsers(dest="command", required=True)
     audit = subparsers.add_parser("audit", help="validate a compiled ET_REL probe")
     audit.add_argument("object", type=Path)
-    audit.add_argument("--arch", choices=("aarch64", "mmips"), default="aarch64")
+    audit.add_argument(
+        "--arch", choices=("aarch64", "arm", "mmips", "x86_64"),
+        default="aarch64"
+    )
     audit.add_argument("--max-alloc", type=int, default=65536)
     build = subparsers.add_parser("build", help="compile through an exact kernel Kbuild")
     build.add_argument("--linux-dir", required=True)
     build.add_argument("--output-dir", required=True)
-    build.add_argument("--arch", choices=("aarch64", "mmips"), default="aarch64")
+    build.add_argument(
+        "--arch", choices=("aarch64", "arm", "mmips", "x86_64"),
+        default="aarch64"
+    )
     build.add_argument("--cross-compile", required=True)
+    build.add_argument(
+        "--make-arg",
+        action="append",
+        default=[],
+        help=(
+            "additional exact Kbuild variable assignment; repeat for settings "
+            "such as LLVM=-21"
+        ),
+    )
     build.add_argument("--vmlinux", required=True)
     build.add_argument("--make", default="make")
     build.add_argument("--max-alloc", type=int, default=65536)

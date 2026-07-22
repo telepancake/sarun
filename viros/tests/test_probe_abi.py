@@ -476,6 +476,80 @@ class ProbeAbiTests(unittest.TestCase):
             with self.assertRaisesRegex(PROBE_TOOL.AuditError, "not produced"):
                 PROBE_TOOL.build_object(args)
 
+    def test_exact_kbuild_accepts_and_records_explicit_make_assignments(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            linux_dir = directory / "kernel-build"
+            linux_dir.mkdir()
+            vmlinux = linux_dir / "vmlinux"
+            vmlinux.write_bytes(b"matching exact kernel")
+            output = directory / "probe"
+            commands = []
+
+            def fake_run(command, check, env):
+                self.assertTrue(check)
+                commands.append((command, env))
+                (output / "src/kernel/viros_probe.o").write_bytes(b"object")
+                return SimpleNamespace(returncode=0)
+
+            args = SimpleNamespace(
+                output_dir=output,
+                linux_dir=linux_dir,
+                vmlinux=vmlinux,
+                arch="aarch64",
+                cross_compile="",
+                make="make",
+                make_arg=["LLVM=-21", "LLVM_IAS=1"],
+                max_alloc=65536,
+            )
+            audit = {
+                "path": str(output / "src/kernel/viros_probe.o"),
+                "arch": "aarch64",
+                "elf_class": 64,
+                "byte_order": "little",
+                "alloc_bytes": 16,
+                "sha256": hashlib.sha256(b"object").hexdigest(),
+                "entry_symbol": "viros_probe_entry",
+            }
+            with (
+                mock.patch.object(PROBE_TOOL.subprocess, "run", side_effect=fake_run),
+                mock.patch.object(PROBE_TOOL, "audit_object", return_value=audit),
+                mock.patch.object(
+                    PROBE_TOOL, "_kernel_release_provenance", return_value={}
+                ),
+                mock.patch.object(PROBE_TOOL, "gnu_build_id", return_value="abcd"),
+            ):
+                manifest = PROBE_TOOL.build_object(args)
+
+            self.assertEqual(
+                commands[0][0][3:5], ["LLVM=-21", "LLVM_IAS=1"]
+            )
+            self.assertEqual(commands[0][1]["CROSS_COMPILE"], "")
+            self.assertEqual(manifest["make_args"], ["LLVM=-21", "LLVM_IAS=1"])
+
+    def test_exact_kbuild_rejects_non_assignment_make_argument(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            linux_dir = directory / "kernel-build"
+            linux_dir.mkdir()
+            vmlinux = linux_dir / "vmlinux"
+            vmlinux.write_bytes(b"matching exact kernel")
+            args = SimpleNamespace(
+                output_dir=directory / "probe",
+                linux_dir=linux_dir,
+                vmlinux=vmlinux,
+                arch="aarch64",
+                cross_compile="",
+                make="make",
+                make_arg=["-C=/different/tree"],
+                max_alloc=65536,
+            )
+            with mock.patch.object(
+                PROBE_TOOL, "_kernel_release_provenance", return_value={}
+            ):
+                with self.assertRaisesRegex(PROBE_TOOL.AuditError, "make variable"):
+                    PROBE_TOOL.build_object(args)
+
     def test_exact_kbuild_rejects_different_kernel_release(self):
         with tempfile.TemporaryDirectory() as directory:
             directory = Path(directory)

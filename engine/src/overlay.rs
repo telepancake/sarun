@@ -11,7 +11,6 @@
 // truncate/mkdir/unlink/rmdir/symlink/rename.
 
 use crate::depot::BoxDepot;
-use virtiofsd::soft_idmap::Id as _;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::ffi::CStr;
@@ -19,11 +18,11 @@ use std::ffi::CString;
 use std::ffi::OsStr;
 use std::fs::File;
 use std::fs::OpenOptions;
-use std::os::unix::fs::FileExt;
-use std::os::unix::fs::MetadataExt;
-use std::os::unix::ffi::OsStrExt;
 use std::os::fd::AsRawFd;
 use std::os::fd::FromRawFd;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::FileExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -35,7 +34,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
-
+use virtiofsd::soft_idmap::Id as _;
 
 use crate::capture::BoxState;
 use crate::capture::Entry;
@@ -145,7 +144,7 @@ struct Inner {
     // state_home()/cache — is_engine_path already hides the whole
     // state_home subtree from boxes. None = open failed (served EIO).
     cache: std::sync::OnceLock<Option<depot_cache::Cache>>,
-    rules: RwLock<crate::rules::Rules>,  // passthrough decisions (reload verb)
+    rules: RwLock<crate::rules::Rules>, // passthrough decisions (reload verb)
     /// Lazy shadowing for -b boxes: at lookup/open time, if the
     /// box-relative path matches one of the compiled glob patterns,
     /// the FUSE layer serves `self_exe` (the engine binary) instead
@@ -196,40 +195,56 @@ struct LockTable {
 
 impl LockTable {
     fn new() -> Self {
-        Self { state: Mutex::new(HashMap::new()), changed: Condvar::new() }
+        Self {
+            state: Mutex::new(HashMap::new()),
+            changed: Condvar::new(),
+        }
     }
 
-    fn conflict(records: &[RecordLock], owner: u64,
-                requested: &virtiofsd::fuse::FileLock) -> Option<RecordLock> {
+    fn conflict(
+        records: &[RecordLock],
+        owner: u64,
+        requested: &virtiofsd::fuse::FileLock,
+    ) -> Option<RecordLock> {
         records.iter().copied().find(|record| {
             record.owner != owner
                 && record.start <= requested.end
                 && requested.start <= record.end
-                && (record.type_ == libc::F_WRLCK as u32
-                    || requested.type_ == libc::F_WRLCK as u32)
+                && (record.type_ == libc::F_WRLCK as u32 || requested.type_ == libc::F_WRLCK as u32)
         })
     }
 
-    fn get(&self, key: LockKey, owner: u64,
-           requested: virtiofsd::fuse::FileLock) -> virtiofsd::fuse::FileLock {
+    fn get(
+        &self,
+        key: LockKey,
+        owner: u64,
+        requested: virtiofsd::fuse::FileLock,
+    ) -> virtiofsd::fuse::FileLock {
         let state = self.state.lock().unwrap();
-        Self::conflict(state.get(&key).map(Vec::as_slice).unwrap_or(&[]),
-                       owner, &requested)
-            .map(|record| virtiofsd::fuse::FileLock {
-                start: record.start,
-                end: record.end,
-                type_: record.type_,
-                pid: record.pid,
-            })
-            .unwrap_or(virtiofsd::fuse::FileLock {
-                type_: libc::F_UNLCK as u32,
-                ..requested
-            })
+        Self::conflict(
+            state.get(&key).map(Vec::as_slice).unwrap_or(&[]),
+            owner,
+            &requested,
+        )
+        .map(|record| virtiofsd::fuse::FileLock {
+            start: record.start,
+            end: record.end,
+            type_: record.type_,
+            pid: record.pid,
+        })
+        .unwrap_or(virtiofsd::fuse::FileLock {
+            type_: libc::F_UNLCK as u32,
+            ..requested
+        })
     }
 
-    fn set(&self, key: LockKey, owner: u64,
-           requested: virtiofsd::fuse::FileLock, blocking: bool)
-           -> Result<(), Errno> {
+    fn set(
+        &self,
+        key: LockKey,
+        owner: u64,
+        requested: virtiofsd::fuse::FileLock,
+        blocking: bool,
+    ) -> Result<(), Errno> {
         if requested.start > requested.end
             || !matches!(requested.type_, x if x == libc::F_RDLCK as u32
                                       || x == libc::F_WRLCK as u32
@@ -239,17 +254,22 @@ impl LockTable {
         }
         let mut state = self.state.lock().unwrap();
         while requested.type_ != libc::F_UNLCK as u32
-            && Self::conflict(state.get(&key).map(Vec::as_slice).unwrap_or(&[]),
-                              owner, &requested).is_some()
+            && Self::conflict(
+                state.get(&key).map(Vec::as_slice).unwrap_or(&[]),
+                owner,
+                &requested,
+            )
+            .is_some()
         {
-            if !blocking { return Err(Errno::EAGAIN); }
+            if !blocking {
+                return Err(Errno::EAGAIN);
+            }
             state = self.changed.wait(state).unwrap();
         }
         let records = state.entry(key).or_default();
         let mut replacement = Vec::with_capacity(records.len() + 2);
         for record in records.drain(..) {
-            if record.owner != owner
-                || record.end < requested.start || requested.end < record.start
+            if record.owner != owner || record.end < requested.start || requested.end < record.start
             {
                 replacement.push(record);
                 continue;
@@ -277,7 +297,9 @@ impl LockTable {
             });
         }
         *records = replacement;
-        if records.is_empty() { state.remove(&key); }
+        if records.is_empty() {
+            state.remove(&key);
+        }
         drop(state);
         self.changed.notify_all();
         Ok(())
@@ -287,7 +309,9 @@ impl LockTable {
         let mut state = self.state.lock().unwrap();
         if let Some(records) = state.get_mut(&key) {
             records.retain(|record| record.owner != owner);
-            if records.is_empty() { state.remove(&key); }
+            if records.is_empty() {
+                state.remove(&key);
+            }
         }
         drop(state);
         self.changed.notify_all();
@@ -301,9 +325,15 @@ mod lock_tests {
     #[test]
     fn record_locks_conflict_split_and_release_by_owner() {
         let table = LockTable::new();
-        let key = LockKey { file: LockIdentity::Synthetic(1), flock: false };
+        let key = LockKey {
+            file: LockIdentity::Synthetic(1),
+            flock: false,
+        };
         let write = virtiofsd::fuse::FileLock {
-            start: 10, end: 19, type_: libc::F_WRLCK as u32, pid: 123,
+            start: 10,
+            end: 19,
+            type_: libc::F_WRLCK as u32,
+            pid: 123,
         };
         table.set(key, 100, write, false).unwrap();
         let conflict = table.get(key, 200, write);
@@ -311,12 +341,29 @@ mod lock_tests {
         assert_eq!((conflict.start, conflict.end, conflict.pid), (10, 19, 123));
         assert_eq!(table.set(key, 200, write, false), Err(Errno::EAGAIN));
 
-        table.set(key, 100, virtiofsd::fuse::FileLock {
-            start: 13, end: 16, type_: libc::F_UNLCK as u32, pid: 123,
-        }, false).unwrap();
-        let middle = table.get(key, 200, virtiofsd::fuse::FileLock {
-            start: 13, end: 16, type_: libc::F_WRLCK as u32, pid: 200,
-        });
+        table
+            .set(
+                key,
+                100,
+                virtiofsd::fuse::FileLock {
+                    start: 13,
+                    end: 16,
+                    type_: libc::F_UNLCK as u32,
+                    pid: 123,
+                },
+                false,
+            )
+            .unwrap();
+        let middle = table.get(
+            key,
+            200,
+            virtiofsd::fuse::FileLock {
+                start: 13,
+                end: 16,
+                type_: libc::F_WRLCK as u32,
+                pid: 200,
+            },
+        );
         assert_eq!(middle.type_, libc::F_UNLCK as u32);
         assert_eq!(table.get(key, 200, write).start, 10);
 
@@ -379,9 +426,18 @@ struct OpenedNode {
 }
 
 enum WriteTarget {
-    Jobserver { box_id: i64 },
-    Sink { box_id: i64, stream: i32 },
-    File { file: File, box_id: i64, rel: Option<String> },
+    Jobserver {
+        box_id: i64,
+    },
+    Sink {
+        box_id: i64,
+        stream: i32,
+    },
+    File {
+        file: File,
+        box_id: i64,
+        rel: Option<String>,
+    },
 }
 
 struct NodeSetattr {
@@ -399,7 +455,9 @@ fn tgid_of(pid: u32) -> u32 {
     if let Ok(s) = std::fs::read_to_string(format!("/proc/{pid}/status")) {
         for line in s.lines() {
             if let Some(rest) = line.strip_prefix("Tgid:") {
-                if let Ok(v) = rest.trim().parse() { return v; }
+                if let Ok(v) = rest.trim().parse() {
+                    return v;
+                }
             }
         }
     }
@@ -410,13 +468,22 @@ fn tgid_of(pid: u32) -> u32 {
 /// scoped file rule (exe:/cwd:/arg:) matches against. Empty fields on any read
 /// failure (a never-matching facet, mirroring the Python empty-Subject default).
 fn proc_facets(pid: u32) -> (String, String, Vec<String>) {
-    let rl = |which: &str| std::fs::read_link(format!("/proc/{pid}/{which}"))
-        .ok().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+    let rl = |which: &str| {
+        std::fs::read_link(format!("/proc/{pid}/{which}"))
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    };
     let exe = rl("exe");
     let cwd = rl("cwd");
-    let argv = std::fs::read(format!("/proc/{pid}/cmdline")).ok()
-        .map(|b| b.split(|&c| c == 0).filter(|s| !s.is_empty())
-                  .map(|s| String::from_utf8_lossy(s).into_owned()).collect())
+    let argv = std::fs::read(format!("/proc/{pid}/cmdline"))
+        .ok()
+        .map(|b| {
+            b.split(|&c| c == 0)
+                .filter(|s| !s.is_empty())
+                .map(|s| String::from_utf8_lossy(s).into_owned())
+                .collect()
+        })
         .unwrap_or_default();
     (exe, cwd, argv)
 }
@@ -455,24 +522,30 @@ fn shadow_glob_strings() -> (Vec<String>, Vec<String>, Vec<String>) {
     (
         load_glob_strings(
             &crate::paths::shadow_sh_glob_path(),
-            &["/bin/sh", "/usr/bin/sh",
-              "/bin/bash", "/usr/bin/bash",
-              "/bin/dash", "/usr/bin/dash"]),
+            &[
+                "/bin/sh",
+                "/usr/bin/sh",
+                "/bin/bash",
+                "/usr/bin/bash",
+                "/bin/dash",
+                "/usr/bin/dash",
+            ],
+        ),
         load_glob_strings(
             &crate::paths::shadow_make_glob_path(),
-            &["/bin/make", "/usr/bin/make",
-              "/bin/gmake", "/usr/bin/gmake"]),
+            &["/bin/make", "/usr/bin/make", "/bin/gmake", "/usr/bin/gmake"],
+        ),
         load_glob_strings(
             &crate::paths::shadow_ninja_glob_path(),
-            &["/bin/ninja", "/usr/bin/ninja"]),
+            &["/bin/ninja", "/usr/bin/ninja"],
+        ),
     )
 }
 
-fn load_glob_strings(file: &std::path::Path, defaults: &[&str])
-    -> Vec<String>
-{
+fn load_glob_strings(file: &std::path::Path, defaults: &[&str]) -> Vec<String> {
     match std::fs::read_to_string(file) {
-        Ok(s) => s.lines()
+        Ok(s) => s
+            .lines()
             .map(str::trim)
             .filter(|l| !l.is_empty() && !l.starts_with('#'))
             .map(String::from)
@@ -482,25 +555,31 @@ fn load_glob_strings(file: &std::path::Path, defaults: &[&str])
 }
 
 fn compile_globs(raw: &[String]) -> Vec<glob::Pattern> {
-    raw.iter().filter_map(|p| {
-        // Patterns SHOULD be absolute (the FUSE matcher prepends '/'
-        // to the box-relative path). Relative patterns would silently
-        // not match anything; loudly skip with a hint instead.
-        if !p.starts_with('/') {
-            eprintln!("sarun-engine: shadow glob {p:?} ignored \
+    raw.iter()
+        .filter_map(|p| {
+            // Patterns SHOULD be absolute (the FUSE matcher prepends '/'
+            // to the box-relative path). Relative patterns would silently
+            // not match anything; loudly skip with a hint instead.
+            if !p.starts_with('/') {
+                eprintln!(
+                    "sarun-engine: shadow glob {p:?} ignored \
                        (must be an absolute path; e.g. /bin/sh, \
-                       /opt/**/bin/make)");
-            return None;
-        }
-        match glob::Pattern::new(p) {
-            Ok(c) => Some(c),
-            Err(e) => {
-                eprintln!("sarun-engine: shadow glob {p:?} is not a \
-                           valid pattern: {e}");
-                None
+                       /opt/**/bin/make)"
+                );
+                return None;
             }
-        }
-    }).collect()
+            match glob::Pattern::new(p) {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    eprintln!(
+                        "sarun-engine: shadow glob {p:?} is not a \
+                           valid pattern: {e}"
+                    );
+                    None
+                }
+            }
+        })
+        .collect()
 }
 
 /// The cellulose browser box writes its Chromium profile here (a fixed
@@ -543,15 +622,24 @@ pub fn file_groups() -> Vec<FileGroup> {
             {
                 let patterns = compile_globs(&load_glob_strings(&e.path(), &[]));
                 if !patterns.is_empty() {
-                    groups.push(FileGroup { name: stub.replace('_', " "), patterns });
+                    groups.push(FileGroup {
+                        name: stub.replace('_', " "),
+                        patterns,
+                    });
                 }
             }
         }
     }
     groups.sort_by(|a, b| a.name.cmp(&b.name));
     if !groups.iter().any(|g| g.name == "browser session") {
-        let raw: Vec<String> = BROWSER_SESSION_GLOBS.iter().map(|s| s.to_string()).collect();
-        groups.push(FileGroup { name: "browser session".into(), patterns: compile_globs(&raw) });
+        let raw: Vec<String> = BROWSER_SESSION_GLOBS
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        groups.push(FileGroup {
+            name: "browser session".into(),
+            patterns: compile_globs(&raw),
+        });
     }
     groups
 }
@@ -576,8 +664,10 @@ mod file_group_tests {
         // With no user files_*.glob in a scratch config home, the built-in
         // group is still offered.
         let groups = file_groups();
-        assert!(groups.iter().any(|g| g.name == "browser session"),
-                "built-in 'browser session' group must always be available");
+        assert!(
+            groups.iter().any(|g| g.name == "browser session"),
+            "built-in 'browser session' group must always be available"
+        );
     }
 }
 
@@ -596,9 +686,12 @@ impl SarunFs {
     }
 
     pub fn new(lower: PathBuf) -> Self {
-        let backing = crate::sarunfs::backing::BackingStore::new(lower.clone())
-            .unwrap_or_else(|error| {
-                panic!("cannot initialize upstream backing {}: {error}", lower.display())
+        let backing =
+            crate::sarunfs::backing::BackingStore::new(lower.clone()).unwrap_or_else(|error| {
+                panic!(
+                    "cannot initialize upstream backing {}: {error}",
+                    lower.display()
+                )
             });
         let ov = SarunFs {
             inner: Arc::new(Inner {
@@ -634,12 +727,16 @@ impl SarunFs {
         // _exit teardown, which skips destroy()). No-op when unset.
         if let Ok(path) = std::env::var("SARUN_STATS_FILE") {
             let inner = ov.inner.clone();
-            std::thread::spawn(move || loop {
-                let line = format!("passthrough={} daemon_reads={}\n",
-                    inner.passthrough_ok.load(Ordering::Relaxed) as u8,
-                    inner.daemon_reads.load(Ordering::Relaxed));
-                let _ = std::fs::write(&path, line);
-                std::thread::sleep(Duration::from_millis(100));
+            std::thread::spawn(move || {
+                loop {
+                    let line = format!(
+                        "passthrough={} daemon_reads={}\n",
+                        inner.passthrough_ok.load(Ordering::Relaxed) as u8,
+                        inner.daemon_reads.load(Ordering::Relaxed)
+                    );
+                    let _ = std::fs::write(&path, line);
+                    std::thread::sleep(Duration::from_millis(100));
+                }
             });
         }
         ov
@@ -649,13 +746,29 @@ impl SarunFs {
     /// The view shares all filesystem policy, handles, capture state, and inode
     /// allocation with the host FUSE view; only the protocol root is scoped.
     pub fn export_box(&self, box_id: i64) -> std::io::Result<Self> {
+        self.export_box_with_request_identity(box_id, false)
+    }
+
+    /// Scoped view for a trusted consumer running as an ordinary host process.
+    /// Unlike guest/SUD exports, request PIDs have been authenticated and
+    /// translated to the host namespace before dispatch, so capture and read
+    /// provenance must treat them the same way as the kernel FUSE transport.
+    pub(crate) fn export_box_for_host_consumer(&self, box_id: i64) -> std::io::Result<Self> {
+        self.export_box_with_request_identity(box_id, true)
+    }
+
+    fn export_box_with_request_identity(
+        &self,
+        box_id: i64,
+        host_request_pids: bool,
+    ) -> std::io::Result<Self> {
         self.box_of(box_id)
             .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
         Ok(Self {
             inner: self.inner.clone(),
             root: (box_id, String::new()),
             kernel_passthrough: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            host_request_pids: false,
+            host_request_pids,
             protocol_has_single_identity: false,
         })
     }
@@ -672,14 +785,21 @@ impl SarunFs {
         caller_pid: u32,
     ) -> std::io::Result<File> {
         if writable {
-            return match self.prepare_write_node(caller_pid, handle).map_err(virtio_error)? {
+            return match self
+                .prepare_write_node(caller_pid, handle)
+                .map_err(virtio_error)?
+            {
                 WriteTarget::File { file, .. } => Ok(file),
-                WriteTarget::Jobserver { .. } | WriteTarget::Sink { .. } =>
-                    Err(std::io::Error::from_raw_os_error(libc::ENODEV)),
+                WriteTarget::Jobserver { .. } | WriteTarget::Sink { .. } => {
+                    Err(std::io::Error::from_raw_os_error(libc::ENODEV))
+                }
             };
         }
 
-        let handle = self.inner.handles.get(handle)
+        let handle = self
+            .inner
+            .handles
+            .get(handle)
             .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EBADF))?;
         let Handle::File(handle) = &*handle else {
             return Err(std::io::Error::from_raw_os_error(libc::EBADF));
@@ -693,15 +813,18 @@ impl SarunFs {
                 let mut buffer = vec![0u8; 1024 * 1024];
                 loop {
                     let read = lower.read_at(&mut buffer, offset)?;
-                    if read == 0 { break; }
+                    if read == 0 {
+                        break;
+                    }
                     let mut written = 0;
                     while written < read {
-                        let count = staging.write_at(&buffer[written..read],
-                                                     offset + written as u64)?;
+                        let count =
+                            staging.write_at(&buffer[written..read], offset + written as u64)?;
                         if count == 0 {
                             return Err(std::io::Error::new(
                                 std::io::ErrorKind::WriteZero,
-                                "cannot materialize SUD backing object"));
+                                "cannot materialize SUD backing object",
+                            ));
                         }
                         written += count;
                     }
@@ -712,7 +835,6 @@ impl SarunFs {
             FileData::Sink(_) => Err(std::io::Error::from_raw_os_error(libc::ENODEV)),
         }
     }
-
 
     /// Reload the shadow_sh / shadow_make / shadow_ninja globs from
     /// disk. Called by the `reload_rules` control verb (so the user
@@ -728,8 +850,11 @@ impl SarunFs {
     /// access. Used by both lookup/getattr and open to decide whether
     /// to serve the engine binary in place of the host file.
     fn shadow_matches(&self, rel: &str) -> bool {
-        let full = if rel.starts_with('/') { rel.to_string() }
-                   else { format!("/{rel}") };
+        let full = if rel.starts_with('/') {
+            rel.to_string()
+        } else {
+            format!("/{rel}")
+        };
         let p = std::path::Path::new(&full);
         let s = self.inner.shadows.read().unwrap();
         s.sh.iter().any(|pat| pat.matches_path(p))
@@ -773,7 +898,9 @@ impl SarunFs {
     fn matches_api_box_ca_target(rel: &str) -> bool {
         for tgt in crate::runner::CA_BUNDLE_TARGETS {
             let s = tgt.strip_prefix('/').unwrap_or(tgt);
-            if rel == s { return true; }
+            if rel == s {
+                return true;
+            }
         }
         false
     }
@@ -786,7 +913,9 @@ impl SarunFs {
         let host = crate::paths::oaita_config_path();
         let s = host.to_string_lossy();
         let stripped = s.strip_prefix('/').unwrap_or(&s);
-        if rel == stripped { return true; }
+        if rel == stripped {
+            return true;
+        }
         // rel is a strict directory ancestor of the safe toml path.
         // Compare component-wise: `stripped` starts with `rel/`.
         stripped.starts_with(&format!("{rel}/"))
@@ -804,9 +933,13 @@ impl SarunFs {
         let host = crate::paths::oaita_state_home();
         let s = host.to_string_lossy();
         let stripped = s.strip_prefix('/').unwrap_or(&s);
-        if rel == stripped { return true; }
+        if rel == stripped {
+            return true;
+        }
         // ancestor of the dir
-        if stripped.starts_with(&format!("{rel}/")) { return true; }
+        if stripped.starts_with(&format!("{rel}/")) {
+            return true;
+        }
         // descendant of the dir
         rel.starts_with(&format!("{stripped}/"))
     }
@@ -834,25 +967,26 @@ impl SarunFs {
         use std::sync::OnceLock;
         static ROOTS: OnceLock<Vec<String>> = OnceLock::new();
         let roots = ROOTS.get_or_init(|| {
-            [crate::paths::data_home(),
-             crate::paths::config_home(),
-             crate::paths::state_home(),
-             crate::paths::runtime_home()]
-                .iter()
-                .map(|p| {
-                    let s = p.to_string_lossy().into_owned();
-                    s.strip_prefix('/').unwrap_or(&s).to_string()
-                })
-                .filter(|s| !s.is_empty())
-                .collect()
+            [
+                crate::paths::data_home(),
+                crate::paths::config_home(),
+                crate::paths::state_home(),
+                crate::paths::runtime_home(),
+            ]
+            .iter()
+            .map(|p| {
+                let s = p.to_string_lossy().into_owned();
+                s.strip_prefix('/').unwrap_or(&s).to_string()
+            })
+            .filter(|s| !s.is_empty())
+            .collect()
         });
         for r in roots {
-            if rel == r { return true; }
+            if rel == r {
+                return true;
+            }
             // subtree match — `rel` starts with `r/`
-            if rel.len() > r.len() + 1
-                && rel.starts_with(r)
-                && rel.as_bytes()[r.len()] == b'/'
-            {
+            if rel.len() > r.len() + 1 && rel.starts_with(r) && rel.as_bytes()[r.len()] == b'/' {
                 return true;
             }
         }
@@ -870,8 +1004,7 @@ impl SarunFs {
     // ── echo mux + mute (called from control's box-channel thread) ──
     /// Attach the box's muxed connection as its echo writer (the sink-write
     /// handler frames ECHO onto it). Replaces any prior writer for the box.
-    pub fn set_echo(&self, id: i64,
-                    conn: std::sync::Arc<Mutex<std::os::unix::net::UnixStream>>) {
+    pub fn set_echo(&self, id: i64, conn: std::sync::Arc<Mutex<std::os::unix::net::UnixStream>>) {
         self.inner.synthetic.set_echo(id, conn);
     }
     /// Drop the box's echo writer (box channel closing / teardown).
@@ -881,9 +1014,10 @@ impl SarunFs {
     /// The box-channel writer stored under id (set by control::handle as the
     /// echo conn). Reused by the oaita API mux to frame FRAME_API_DATA
     /// responses back over the same channel — no second control conn.
-    pub fn echo_writer(&self, id: i64)
-        -> Option<std::sync::Arc<Mutex<std::os::unix::net::UnixStream>>>
-    {
+    pub fn echo_writer(
+        &self,
+        id: i64,
+    ) -> Option<std::sync::Arc<Mutex<std::os::unix::net::UnixStream>>> {
         self.inner.synthetic.echo_writer(id)
     }
     pub fn mute_add(&self, host_pid: i32, box_id: i64) {
@@ -903,13 +1037,16 @@ impl SarunFs {
         let rules = self.inner.rules.read().unwrap();
         if !rules.needs_box() && !rules.needs_proc() {
             // common case: no box/proc clauses → path-only Subject suffices.
-            return matches!(rules.decide(rel, &crate::rules::Subject::default()),
-                            Some(crate::rules::Action::Passthrough));
+            return matches!(
+                rules.decide(rel, &crate::rules::Subject::default()),
+                Some(crate::rules::Action::Passthrough)
+            );
         }
-        let subject = self.writer_subject(bid, pid, rules.needs_box(),
-                                          rules.needs_proc());
-        matches!(rules.decide(rel, &subject),
-                 Some(crate::rules::Action::Passthrough))
+        let subject = self.writer_subject(bid, pid, rules.needs_box(), rules.needs_proc());
+        matches!(
+            rules.decide(rel, &subject),
+            Some(crate::rules::Action::Passthrough)
+        )
     }
 
     /// D5 kernel-READ-passthrough gate: PATH-ONLY passthrough match only, so a
@@ -923,16 +1060,22 @@ impl SarunFs {
     /// box display name (when a rule needs it) and the live process's exe/cwd/
     /// argv read from /proc (when a rule needs them). Self-contained — no box
     /// state required beyond the id.
-    fn writer_subject(&self, bid: i64, pid: u32, want_box: bool, want_proc: bool)
-        -> crate::rules::Subject
-    {
+    fn writer_subject(
+        &self,
+        bid: i64,
+        pid: u32,
+        want_box: bool,
+        want_proc: bool,
+    ) -> crate::rules::Subject {
         let mut s = crate::rules::Subject::default();
         if want_box {
             s.box_name = crate::discover::display_path(&crate::discover::discover(), bid);
         }
         if want_proc {
             let (exe, cwd, argv) = proc_facets(pid);
-            s.exe = exe; s.cwd = cwd; s.argv = argv;
+            s.exe = exe;
+            s.cwd = cwd;
+            s.argv = argv;
         }
         s
     }
@@ -950,7 +1093,9 @@ impl SarunFs {
         // fall through to host (or Absent under no_host_fallback), missing
         // every layer below. Idempotent — already-loaded ancestors are kept.
         self.hydrate_chain(parent);
-        for ro in self.box_of(bid_of_added).map(|b| b.ro_attachment_box_ids())
+        for ro in self
+            .box_of(bid_of_added)
+            .map(|b| b.ro_attachment_box_ids())
             .unwrap_or_default()
         {
             self.hydrate_chain(Some(ro));
@@ -966,7 +1111,9 @@ impl SarunFs {
         let mut hops = 0;
         while let Some(id) = work.pop() {
             hops += 1;
-            if hops > 64 || !seen.insert(id) { continue; }
+            if hops > 64 || !seen.insert(id) {
+                continue;
+            }
             if let Some(b) = self.inner.boxes.read().unwrap().get(&id) {
                 // already live — but its parents/attachments may need work.
                 work.extend(b.parent());
@@ -983,7 +1130,10 @@ impl SarunFs {
                     pb.load_mirror();
                     work.extend(pb.parent());
                     work.extend(pb.ro_attachment_box_ids());
-                    self.inner.boxes.write().unwrap()
+                    self.inner
+                        .boxes
+                        .write()
+                        .unwrap()
                         .insert(pb.id, Arc::new(pb));
                 }
                 Err(_) => continue,
@@ -994,21 +1144,25 @@ impl SarunFs {
     /// The live ExtAttachment list for `owner`'s RoAttachment::Ext rows,
     /// constructed on first ask (no store I/O — see attach.rs). Shared
     /// Arc so repeated chain walks reuse the same memos/opens.
-    pub(crate) fn ext_attachments(&self, owner: i64)
-        -> Arc<Vec<Arc<crate::attach::ExtAttachment>>>
-    {
+    pub(crate) fn ext_attachments(
+        &self,
+        owner: i64,
+    ) -> Arc<Vec<Arc<crate::attach::ExtAttachment>>> {
         if let Some(v) = self.inner.ext.read().unwrap().get(&owner) {
             return v.clone();
         }
-        let built: Vec<Arc<crate::attach::ExtAttachment>> =
-            self.box_of(owner).map(|b| b.ro_attachment_list()).unwrap_or_default()
-                .into_iter()
-                .filter_map(|r| match r {
-                    crate::capture::RoAttachment::Ext(e) =>
-                        Some(Arc::new(crate::attach::ExtAttachment::new(e))),
-                    crate::capture::RoAttachment::Box(_) => None,
-                })
-                .collect();
+        let built: Vec<Arc<crate::attach::ExtAttachment>> = self
+            .box_of(owner)
+            .map(|b| b.ro_attachment_list())
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|r| match r {
+                crate::capture::RoAttachment::Ext(e) => {
+                    Some(Arc::new(crate::attach::ExtAttachment::new(e)))
+                }
+                crate::capture::RoAttachment::Box(_) => None,
+            })
+            .collect();
         let built = Arc::new(built);
         self.inner.ext.write().unwrap().insert(owner, built.clone());
         built
@@ -1018,28 +1172,35 @@ impl SarunFs {
     /// one-time log line) when the root can't be created; blob-backed
     /// attachment opens then fail with EIO rather than bricking the box.
     fn cache(&self) -> Option<&depot_cache::Cache> {
-        self.inner.cache.get_or_init(|| {
-            let root = crate::paths::state_home().join("cache");
-            match depot_cache::Cache::open(root) {
-                Ok(c) => Some(c),
-                Err(e) => {
-                    eprintln!("sarun-engine: depot cache unavailable: {e}");
-                    None
+        self.inner
+            .cache
+            .get_or_init(|| {
+                let root = crate::paths::state_home().join("cache");
+                match depot_cache::Cache::open(root) {
+                    Ok(c) => Some(c),
+                    Err(e) => {
+                        eprintln!("sarun-engine: depot cache unavailable: {e}");
+                        None
+                    }
                 }
-            }
-        }).as_ref()
+            })
+            .as_ref()
     }
 
     /// Open errors of `owner`'s LIVE ext attachments, keyed by name.
     /// Reads only what is already built/opened — never triggers a
     /// build or a store open (the session list must stay lazy).
-    pub(crate) fn ext_errors(&self, owner: i64)
-        -> HashMap<String, String>
-    {
-        self.inner.ext.read().unwrap().get(&owner)
-            .map(|v| v.iter()
-                .filter_map(|a| a.error().map(|e| (a.ext.name.clone(), e)))
-                .collect())
+    pub(crate) fn ext_errors(&self, owner: i64) -> HashMap<String, String> {
+        self.inner
+            .ext
+            .read()
+            .unwrap()
+            .get(&owner)
+            .map(|v| {
+                v.iter()
+                    .filter_map(|a| a.error().map(|e| (a.ext.name.clone(), e)))
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -1057,9 +1218,7 @@ impl SarunFs {
     /// Project a host file read-only at `rel` in one live box. Projections are
     /// filesystem presentation state, not overlay mutations, and disappear
     /// with the box.
-    pub fn project_file(&self, id: i64, rel: &str, source: PathBuf)
-        -> std::io::Result<()>
-    {
+    pub fn project_file(&self, id: i64, rel: &str, source: PathBuf) -> std::io::Result<()> {
         if !source.is_file() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -1082,6 +1241,26 @@ impl SarunFs {
 
     pub fn box_ids(&self) -> Vec<i64> {
         self.inner.boxes.read().unwrap().keys().copied().collect()
+    }
+
+    /// Snapshot the box-ID portion of the existing merged lookup order for a
+    /// recorded-resource resolver. External attachments are intentionally
+    /// absent: they have no Sarun box identity and cannot be addressed through
+    /// `box_read_file(provider_box, relative_path)`.
+    pub(crate) fn debug_provider_chain(&self, bid: i64) -> Result<Vec<i64>, String> {
+        self.hydrate_chain(Some(bid));
+        if self.box_of(bid).is_none() {
+            return Err(format!("debug consumer box {bid} is unavailable"));
+        }
+        let mut seen = std::collections::HashSet::new();
+        Ok(self
+            .chain_of(bid)
+            .into_iter()
+            .filter_map(|link| match link {
+                ChainLink::Box(provider) if seen.insert(provider.id) => Some(provider.id),
+                ChainLink::Box(_) | ChainLink::Ext(_) => None,
+            })
+            .collect())
     }
 
     // ── in-engine file ops, served via control verbs ────────────────────────
@@ -1115,16 +1294,25 @@ impl SarunFs {
                 // Resolved entry but no blob: the store went away between
                 // getattr and read (§8 failure mode) — EIO, never a panic.
                 None => Err(std::io::Error::new(
-                    std::io::ErrorKind::Other, "attachment blob unavailable")),
+                    std::io::ErrorKind::Other,
+                    "attachment blob unavailable",
+                )),
             },
-            Layer::UpperSymlink { target } =>
-                Ok(target.to_string_lossy().into_owned().into_bytes()),
+            Layer::UpperSymlink { target } => {
+                Ok(target.to_string_lossy().into_owned().into_bytes())
+            }
             Layer::UpperDir { .. } => Err(std::io::Error::new(
-                std::io::ErrorKind::Other, "is a directory")),
+                std::io::ErrorKind::Other,
+                "is a directory",
+            )),
             Layer::UpperSpecial { .. } => Err(std::io::Error::new(
-                std::io::ErrorKind::Other, "special file")),
+                std::io::ErrorKind::Other,
+                "special file",
+            )),
             Layer::Absent => Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound, "not found")),
+                std::io::ErrorKind::NotFound,
+                "not found",
+            )),
         }
     }
 
@@ -1135,13 +1323,17 @@ impl SarunFs {
         use std::os::unix::fs::PermissionsExt;
         self.hydrate_chain(Some(bid));
         if let Some(path) = self.projected_file(bid, rel) {
-            return std::fs::metadata(path).ok()
+            return std::fs::metadata(path)
+                .ok()
                 .map(|metadata| metadata.permissions().mode() & 0o7777);
         }
         match self.resolve(bid, rel) {
-            Layer::UpperFile { mode, .. } | Layer::ExtFile { mode, .. } =>
-                Some(mode & 0o7777),
-            Layer::Lower => self.inner.backing.attr(rel).ok()
+            Layer::UpperFile { mode, .. } | Layer::ExtFile { mode, .. } => Some(mode & 0o7777),
+            Layer::Lower => self
+                .inner
+                .backing
+                .attr(rel)
+                .ok()
                 .map(|attr| attr.mode & 0o7777),
             _ => None,
         }
@@ -1151,17 +1343,17 @@ impl SarunFs {
     /// the write exactly as a FUSE write would (copy_up → truncate → write →
     /// finalize_file). If the file doesn't exist anywhere, this creates it
     /// in the box's upper; the host is never touched.
-    pub fn box_write_file(&self, bid: i64, rel: &str, bytes: &[u8])
-        -> std::io::Result<()>
-    {
+    pub fn box_write_file(&self, bid: i64, rel: &str, bytes: &[u8]) -> std::io::Result<()> {
         use std::io::{Seek, SeekFrom, Write};
         self.hydrate_chain(Some(bid));
         if self.ro_denied(bid, rel) {
             return Err(std::io::Error::from_raw_os_error(libc::EROFS));
         }
         let Some(b) = self.box_of(bid) else {
-            return Err(std::io::Error::new(std::io::ErrorKind::NotFound,
-                                           format!("box {bid} not registered")));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("box {bid} not registered"),
+            ));
         };
         // pid=0 — control-RPC writes have no host writer; provenance just
         // records the synthetic 0.
@@ -1171,8 +1363,10 @@ impl SarunFs {
         f.write_all(bytes)?;
         f.flush()?;
         let sz = bytes.len() as i64;
-        let mtime_ns = SystemTime::now().duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos() as i64).unwrap_or(0);
+        let mtime_ns = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as i64)
+            .unwrap_or(0);
         self.inner
             .mutations
             .writer(&b, 0, self.host_request_pids)
@@ -1183,24 +1377,27 @@ impl SarunFs {
     /// Merged listing of `rel` in box `bid`. Returns (name, kind_char)
     /// where kind_char ∈ 'f' (file), 'd' (dir), 'l' (symlink), 's' (special),
     /// '?' (unknown).
-    pub fn box_list_dir(&self, bid: i64, rel: &str)
-        -> std::io::Result<Vec<(String, char)>>
-    {
+    pub fn box_list_dir(&self, bid: i64, rel: &str) -> std::io::Result<Vec<(String, char)>> {
         self.hydrate_chain(Some(bid));
         let Some(b) = self.box_of(bid) else {
-            return Err(std::io::Error::new(std::io::ErrorKind::NotFound,
-                                           format!("box {bid} not registered")));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("box {bid} not registered"),
+            ));
         };
-        let entries = self.scan_dir(&b, rel, /*plus=*/false);
-        Ok(entries.into_iter().map(|(name, kind, _, _)| {
-            let c = match kind {
-                NodeKind::RegularFile => 'f',
-                NodeKind::Directory => 'd',
-                NodeKind::Symlink => 'l',
-                _ => 's',
-            };
-            (name, c)
-        }).collect())
+        let entries = self.scan_dir(&b, rel, /*plus=*/ false);
+        Ok(entries
+            .into_iter()
+            .map(|(name, kind, _, _)| {
+                let c = match kind {
+                    NodeKind::RegularFile => 'f',
+                    NodeKind::Directory => 'd',
+                    NodeKind::Symlink => 'l',
+                    _ => 's',
+                };
+                (name, c)
+            })
+            .collect())
     }
 
     /// Kind of `rel` in box `bid` (or '?' when absent). Like a single stat.
@@ -1272,11 +1469,7 @@ impl SarunFs {
     /// WRITE paths, which operate on the box's own overlay. UpperFile.owner is
     /// the box itself.
     fn layer(&self, b: &BoxState, rel: &str) -> Layer {
-        crate::sarunfs::layers::own_layer(
-            b,
-            rel,
-            self.inner.backing.exists(rel),
-        )
+        crate::sarunfs::layers::own_layer(b, rel, self.inner.backing.exists(rel))
     }
 
     /// `b`'s RO attachments as chain links, in LIST order — Box and Ext
@@ -1322,7 +1515,9 @@ impl SarunFs {
         let mut out = Vec::new();
         let mut cur = Some(bid);
         while let Some(id) = cur {
-            if out.len() >= 64 { break; }
+            if out.len() >= 64 {
+                break;
+            }
             let Some(b) = self.box_of(id) else { break };
             cur = b.parent();
             out.push(ChainLink::Box(b.clone()));
@@ -1344,7 +1539,9 @@ impl SarunFs {
         let mut seen = 0;
         while let Some(id) = cur {
             seen += 1;
-            if seen > 64 { break; }
+            if seen > 64 {
+                break;
+            }
             let Some(b) = self.box_of(id) else { break };
             let mut links = Vec::new();
             self.attachment_links(&b, &mut links);
@@ -1353,7 +1550,9 @@ impl SarunFs {
                     ChainLink::Box(rb) => rb.entry(rel).is_some(),
                     ChainLink::Ext(att) => att.entry(rel).is_some(),
                 };
-                if hit { return true; }
+                if hit {
+                    return true;
+                }
             }
             cur = b.parent();
         }
@@ -1382,9 +1581,7 @@ impl SarunFs {
     /// both the merge decision and the lower metadata; passing the result of
     /// that single metadata probe here avoids walking every path component
     /// once for `exists()` and then a second time for `attr()`.
-    fn resolve_with_lower_presence(
-        &self, bid: i64, rel: &str, lower_exists: bool,
-    ) -> Layer {
+    fn resolve_with_lower_presence(&self, bid: i64, rel: &str, lower_exists: bool) -> Layer {
         let chain = self.chain_of(bid);
         crate::sarunfs::layers::resolve(
             bid,
@@ -1416,29 +1613,58 @@ impl SarunFs {
 
     fn synth_dir_attr(&self, ino: u64, mode: u32, mtime_ns: i64) -> NodeAttr {
         NodeAttr {
-            inode: ino, size: 0, blocks: 0,
-            atime: ns_ts(mtime_ns), mtime: ns_ts(mtime_ns), ctime: ns_ts(mtime_ns),
+            inode: ino,
+            size: 0,
+            blocks: 0,
+            atime: ns_ts(mtime_ns),
+            mtime: ns_ts(mtime_ns),
+            ctime: ns_ts(mtime_ns),
             kind: NodeKind::Directory,
-            perm: (mode & 0o7777) as u16, nlink: 2, uid: 0, gid: 0, rdev: 0,
-            blksize: 512, flags: 0,
+            perm: (mode & 0o7777) as u16,
+            nlink: 2,
+            uid: 0,
+            gid: 0,
+            rdev: 0,
+            blksize: 512,
+            flags: 0,
         }
     }
 
     fn synth_file_attr(&self, ino: u64) -> NodeAttr {
         NodeAttr {
-            inode: ino, size: 0, blocks: 0,
-            atime: UNIX_EPOCH, mtime: UNIX_EPOCH, ctime: UNIX_EPOCH,
+            inode: ino,
+            size: 0,
+            blocks: 0,
+            atime: UNIX_EPOCH,
+            mtime: UNIX_EPOCH,
+            ctime: UNIX_EPOCH,
             kind: NodeKind::RegularFile,
-            perm: 0o666, nlink: 1, uid: 0, gid: 0, rdev: 0, blksize: 512, flags: 0,
+            perm: 0o666,
+            nlink: 1,
+            uid: 0,
+            gid: 0,
+            rdev: 0,
+            blksize: 512,
+            flags: 0,
         }
     }
 
     fn synth_link_attr(&self, ino: u64, len: u64) -> NodeAttr {
         NodeAttr {
-            inode: ino, size: len, blocks: 0,
-            atime: UNIX_EPOCH, mtime: UNIX_EPOCH, ctime: UNIX_EPOCH,
+            inode: ino,
+            size: len,
+            blocks: 0,
+            atime: UNIX_EPOCH,
+            mtime: UNIX_EPOCH,
+            ctime: UNIX_EPOCH,
             kind: NodeKind::Symlink,
-            perm: 0o777, nlink: 1, uid: 0, gid: 0, rdev: 0, blksize: 512, flags: 0,
+            perm: 0o777,
+            nlink: 1,
+            uid: 0,
+            gid: 0,
+            rdev: 0,
+            blksize: 512,
+            flags: 0,
         }
     }
 
@@ -1461,8 +1687,7 @@ impl SarunFs {
         // Only when the box was launched with --api AND the rel is the host
         // oaita config's path AND the lower (host) is what would otherwise
         // serve — a box that wrote into this path keeps its own write.
-        if matches!(layer, Layer::Lower) && b.is_api()
-            && Self::matches_host_oaita_config(rel) {
+        if matches!(layer, Layer::Lower) && b.is_api() && Self::matches_host_oaita_config(rel) {
             let safe = crate::paths::api_box_oaita_toml_path();
             if let Ok(md) = std::fs::metadata(&safe) {
                 let mut a = self.attr_from_md(ino, &md);
@@ -1482,8 +1707,7 @@ impl SarunFs {
         // Gated on the box's OWN upper having no entry (not on Layer::Lower):
         // an OCI image layer baking its own bundle/resolv.conf must not
         // bypass the shadow — only this box's own write (or delete) wins.
-        if b.entry(rel).is_none() && b.is_tap()
-            && Self::matches_api_box_ca_target(rel) {
+        if b.entry(rel).is_none() && b.is_tap() && Self::matches_api_box_ca_target(rel) {
             let safe = crate::paths::api_box_ca_pem_path();
             if let Ok(md) = std::fs::metadata(&safe) {
                 let mut a = self.attr_from_md(ino, &md);
@@ -1539,11 +1763,10 @@ impl SarunFs {
                 a.perm = (mode & 0o7777) as u16;
                 Some(a)
             }
-            Layer::UpperDir { mode, mtime_ns } =>
-                Some(self.synth_dir_attr(ino, mode, mtime_ns)),
-            Layer::UpperSymlink { target } =>
-                Some(self.synth_link_attr(
-                    ino, target.as_os_str().as_encoded_bytes().len() as u64)),
+            Layer::UpperDir { mode, mtime_ns } => Some(self.synth_dir_attr(ino, mode, mtime_ns)),
+            Layer::UpperSymlink { target } => {
+                Some(self.synth_link_attr(ino, target.as_os_str().as_encoded_bytes().len() as u64))
+            }
             Layer::UpperSpecial { mode, rdev } => {
                 let mut a = self.synth_file_attr(ino);
                 a.kind = kind_of_mode(mode);
@@ -1582,11 +1805,11 @@ impl SarunFs {
                 SyntheticNode::Children.attr(ino)
             } else if prel == SyntheticNode::Children.name() {
                 let cid = name.parse::<i64>().map_err(|_| Errno::ENOENT)?;
-                if !self.inner.synthetic.is_child(
-                    &self.inner.boxes.read().unwrap(),
-                    bid,
-                    cid,
-                ) {
+                if !self
+                    .inner
+                    .synthetic
+                    .is_child(&self.inner.boxes.read().unwrap(), bid, cid)
+                {
                     return Err(Errno::ENOENT);
                 }
                 let ino = self.ino_for(&(cid, String::new()));
@@ -1598,9 +1821,7 @@ impl SarunFs {
                     format!("{prel}/{name}")
                 };
                 let ino = self.ino_for(&(bid, rel.clone()));
-                if prel.is_empty()
-                    && SyntheticNode::at(&rel).is_some_and(SyntheticNode::is_file)
-                {
+                if prel.is_empty() && SyntheticNode::at(&rel).is_some_and(SyntheticNode::is_file) {
                     SyntheticNode::at(&rel).unwrap().attr(ino)
                 } else {
                     if !(b.is_api()
@@ -1623,7 +1844,14 @@ impl SarunFs {
         // as a replacement now occupying that pathname. Its saved identity
         // must win; consulting the live namespace first would make an open
         // overwritten fd appear to become the replacement file.
-        if let Some(attr) = self.inner.detached_attrs.read().unwrap().get(&inode).copied() {
+        if let Some(attr) = self
+            .inner
+            .detached_attrs
+            .read()
+            .unwrap()
+            .get(&inode)
+            .copied()
+        {
             return Ok(attr);
         }
         let (bid, rel) = self.key_of(inode).ok_or(Errno::ENOENT)?;
@@ -1641,9 +1869,11 @@ impl SarunFs {
         let (bid, rel) = self.key_of(inode).ok_or(Errno::ENOENT)?;
         self.box_of(bid).ok_or(Errno::ENOENT)?;
         match self.resolve(bid, &rel) {
-            Layer::UpperSymlink { target } =>
-                Ok(target.as_os_str().as_encoded_bytes().to_vec()),
-            Layer::Lower => self.inner.backing.node(&rel)
+            Layer::UpperSymlink { target } => Ok(target.as_os_str().as_encoded_bytes().to_vec()),
+            Layer::Lower => self
+                .inner
+                .backing
+                .node(&rel)
                 .and_then(|node| node.readlink())
                 .map_err(|_| Errno::EINVAL),
             _ => Err(Errno::EINVAL),
@@ -1667,9 +1897,7 @@ impl SarunFs {
         let exists = b.get_xattr(&rel, name).is_some();
         let create = libc::XATTR_CREATE as u32;
         let replace = libc::XATTR_REPLACE as u32;
-        if flags & !(create | replace) != 0
-            || flags & create != 0 && flags & replace != 0
-        {
+        if flags & !(create | replace) != 0 || flags & create != 0 && flags & replace != 0 {
             return Err(Errno::EINVAL);
         }
         if flags & create != 0 && exists {
@@ -1728,7 +1956,9 @@ impl SarunFs {
         let b = self.box_of(bid).ok_or(Errno::ENOENT)?;
         let want_write = flags & libc::O_ACCMODE as u32 != libc::O_RDONLY as u32;
         if let Some(path) = self.projected_file(bid, &rel) {
-            if want_write { return Err(Errno::EROFS); }
+            if want_write {
+                return Err(Errno::EROFS);
+            }
             let file = File::open(path).map_err(Errno::from)?;
             let handle = self.reg_fh(FhInner {
                 box_id: bid,
@@ -1755,10 +1985,10 @@ impl SarunFs {
         }
         if SyntheticNode::at(&rel) == Some(SyntheticNode::Jobserver) {
             let nonblock = flags & libc::O_NONBLOCK as u32 != 0;
-            let handle = self
-                .inner
-                .handles
-                .insert(Handle::Jobserver { box_id: bid, nonblock });
+            let handle = self.inner.handles.insert(Handle::Jobserver {
+                box_id: bid,
+                nonblock,
+            });
             return Ok(OpenedNode {
                 handle,
                 direct_io: true,
@@ -1879,12 +2109,13 @@ impl SarunFs {
                     None
                 };
                 if let Some(path) = projected {
-                    (FileData::Native(File::open(path).map_err(|_| Errno::EACCES)?), false)
+                    (
+                        FileData::Native(File::open(path).map_err(|_| Errno::EACCES)?),
+                        false,
+                    )
                 } else if backing_candidate {
                     (
-                        FileData::Native(
-                            File::open(self.host(&rel)).map_err(|_| Errno::EACCES)?
-                        ),
+                        FileData::Native(File::open(self.host(&rel)).map_err(|_| Errno::EACCES)?),
                         false,
                     )
                 } else {
@@ -1914,9 +2145,7 @@ impl SarunFs {
         let truncated = want_write && flags & libc::O_TRUNC as u32 != 0;
         if truncated {
             if !upper {
-                data = FileData::Native(
-                    self.copy_up(&b, &rel, pid).map_err(Errno::from)?,
-                );
+                data = FileData::Native(self.copy_up(&b, &rel, pid).map_err(Errno::from)?);
                 upper = true;
             }
             let FileData::Native(file) = &data else {
@@ -2068,10 +2297,15 @@ impl SarunFs {
         Ok((box_id, rel))
     }
 
-    fn mkdir_node(&self, pid: u32, uid: u32, gid: u32,
-                  parent: u64, name: &OsStr, mode: u32)
-        -> Result<NodeAttr, Errno>
-    {
+    fn mkdir_node(
+        &self,
+        pid: u32,
+        uid: u32,
+        gid: u32,
+        parent: u64,
+        name: &OsStr,
+        mode: u32,
+    ) -> Result<NodeAttr, Errno> {
         let (box_id, rel) = self.child_path(parent, name)?;
         let b = self.box_of(box_id).ok_or(Errno::ENOENT)?;
         if self.ro_denied(box_id, &rel) {
@@ -2111,10 +2345,8 @@ impl SarunFs {
         capture.set_owner(&rel, uid, gid);
         let inode = self.ino_for(&(box_id, rel.clone()));
         self.inner.mutations.record(box_id, rel, "symlink");
-        let mut attr = self.synth_link_attr(
-            inode,
-            target.as_os_str().as_encoded_bytes().len() as u64,
-        );
+        let mut attr =
+            self.synth_link_attr(inode, target.as_os_str().as_encoded_bytes().len() as u64);
         attr.uid = uid;
         attr.gid = gid;
         self.inner.inodes.acquire(inode, 1);
@@ -2129,18 +2361,16 @@ impl SarunFs {
     fn detach_open_handles(&self, box_id: i64, rel: &str, pid: u32) -> Result<(), Errno> {
         let b = self.box_of(box_id).ok_or(Errno::ENOENT)?;
         for handle in self.inner.handles.values() {
-            let Handle::File(handle) = &*handle else { continue };
+            let Handle::File(handle) = &*handle else {
+                continue;
+            };
             let mut handle = handle.lock().unwrap();
-            if handle.inner.box_id != box_id
-                || handle.inner.rel != rel
-                || !handle.inner.linked
-            {
+            if handle.inner.box_id != box_id || handle.inner.rel != rel || !handle.inner.linked {
                 continue;
             }
             if matches!(handle.inner.data, FileData::Lower(_)) {
-                handle.inner.data = FileData::Native(
-                    self.copy_up(&b, rel, pid).map_err(Errno::from)?,
-                );
+                handle.inner.data =
+                    FileData::Native(self.copy_up(&b, rel, pid).map_err(Errno::from)?);
                 handle.inner.upper = true;
                 handle.inner.backing_candidate = false;
             }
@@ -2152,7 +2382,9 @@ impl SarunFs {
     fn remap_open_handle_subtree(&self, box_id: i64, old: &str, new: &str) {
         let prefix = format!("{old}/");
         for handle in self.inner.handles.values() {
-            let Handle::File(handle) = &*handle else { continue };
+            let Handle::File(handle) = &*handle else {
+                continue;
+            };
             let mut handle = handle.lock().unwrap();
             if handle.inner.box_id != box_id || !handle.inner.linked {
                 continue;
@@ -2174,9 +2406,15 @@ impl SarunFs {
 
     fn detach_inode_name(&self, b: &BoxState, rel: &str) {
         let key = (b.id, rel.to_owned());
-        let Some(inode) = self.inner.inodes.inode(&key) else { return };
+        let Some(inode) = self.inner.inodes.inode(&key) else {
+            return;
+        };
         if let Some(attr) = self.attr_of(b, inode, rel) {
-            self.inner.detached_attrs.write().unwrap().insert(inode, attr);
+            self.inner
+                .detached_attrs
+                .write()
+                .unwrap()
+                .insert(inode, attr);
         }
         self.inner.inodes.detach(&key);
     }
@@ -2194,8 +2432,15 @@ impl SarunFs {
         }
         self.detach_open_handles(box_id, &rel, pid)?;
         self.inner.inodes.detach(&(box_id, rel.clone()));
-        self.inner.detached_attrs.write().unwrap().insert(inode, attr);
-        self.inner.mutations.writer(&b, pid, self.host_request_pids).delete(&rel);
+        self.inner
+            .detached_attrs
+            .write()
+            .unwrap()
+            .insert(inode, attr);
+        self.inner
+            .mutations
+            .writer(&b, pid, self.host_request_pids)
+            .delete(&rel);
         self.inner.mutations.record(box_id, rel, "unlink");
         Ok(())
     }
@@ -2215,8 +2460,15 @@ impl SarunFs {
             return Err(Errno::ENOTEMPTY);
         }
         self.inner.inodes.detach(&(box_id, rel.clone()));
-        self.inner.detached_attrs.write().unwrap().insert(inode, attr);
-        self.inner.mutations.writer(&b, pid, self.host_request_pids).delete(&rel);
+        self.inner
+            .detached_attrs
+            .write()
+            .unwrap()
+            .insert(inode, attr);
+        self.inner
+            .mutations
+            .writer(&b, pid, self.host_request_pids)
+            .delete(&rel);
         self.inner.mutations.record(box_id, rel, "rmdir");
         Ok(())
     }
@@ -2231,9 +2483,7 @@ impl SarunFs {
         flags: u32,
     ) -> Result<(), Errno> {
         let (box_id, old_parent) = self.key_of(parent).ok_or(Errno::EACCES)?;
-        let (new_box_id, new_parent) = self
-            .key_of(new_parent)
-            .ok_or(Errno::EACCES)?;
+        let (new_box_id, new_parent) = self.key_of(new_parent).ok_or(Errno::EACCES)?;
         if box_id == 0 || new_box_id == 0 || box_id != new_box_id {
             return Err(Errno::EXDEV);
         }
@@ -2246,7 +2496,11 @@ impl SarunFs {
         let name = name.to_str().ok_or(Errno::EINVAL)?;
         let new_name = new_name.to_str().ok_or(Errno::EINVAL)?;
         let join = |parent: &str, name: &str| {
-            if parent.is_empty() { name.to_owned() } else { format!("{parent}/{name}") }
+            if parent.is_empty() {
+                name.to_owned()
+            } else {
+                format!("{parent}/{name}")
+            }
         };
         let old_rel = join(&old_parent, name);
         let new_rel = join(&new_parent, new_name);
@@ -2282,9 +2536,7 @@ impl SarunFs {
                 capture.rename(&old_rel, &new_rel);
                 capture.whiteout(&old_rel);
             }
-            Layer::UpperFile { .. }
-            | Layer::UpperSymlink { .. }
-            | Layer::UpperSpecial { .. } => {
+            Layer::UpperFile { .. } | Layer::UpperSymlink { .. } | Layer::UpperSpecial { .. } => {
                 capture.rename(&old_rel, &new_rel);
                 if lower_old {
                     capture.whiteout(&old_rel);
@@ -2374,8 +2626,7 @@ impl SarunFs {
         if let Some(parent) = destination.parent() {
             std::fs::create_dir_all(parent).map_err(Errno::from)?;
         }
-        std::fs::hard_link(blob_path(box_id, source_rowid), &destination)
-            .map_err(Errno::from)?;
+        std::fs::hard_link(blob_path(box_id, source_rowid), &destination).map_err(Errno::from)?;
         let new_inode = self.ino_for(&(box_id, new_rel.clone()));
         let attr = self.attr_of(&b, new_inode, &new_rel).ok_or(Errno::EIO)?;
         self.inner.inodes.acquire(new_inode, 1);
@@ -2404,12 +2655,7 @@ impl SarunFs {
         Ok(())
     }
 
-    fn setattr_node(
-        &self,
-        pid: u32,
-        inode: u64,
-        request: NodeSetattr,
-    ) -> Result<NodeAttr, Errno> {
+    fn setattr_node(&self, pid: u32, inode: u64, request: NodeSetattr) -> Result<NodeAttr, Errno> {
         let (box_id, rel) = self.key_of(inode).ok_or(Errno::ENOENT)?;
         let b = self.box_of(box_id).ok_or(Errno::ENOENT)?;
         if self.ro_denied(box_id, &rel) {
@@ -2417,8 +2663,8 @@ impl SarunFs {
         }
         if b.direct() || self.is_passthrough(&rel, box_id, pid) {
             let host = self.host(&rel);
-            let path = CString::new(host.as_os_str().as_encoded_bytes())
-                .map_err(|_| Errno::EINVAL)?;
+            let path =
+                CString::new(host.as_os_str().as_encoded_bytes()).map_err(|_| Errno::EINVAL)?;
             if let Some(size) = request.size {
                 OpenOptions::new()
                     .write(true)
@@ -2452,7 +2698,10 @@ impl SarunFs {
                         tv_nsec: duration.subsec_nanos() as _,
                     }
                 };
-                let omit = libc::timespec { tv_sec: 0, tv_nsec: libc::UTIME_OMIT };
+                let omit = libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: libc::UTIME_OMIT,
+                };
                 let times = [
                     request.atime.map_or(omit, &to_timespec),
                     request.mtime.map_or(omit, &to_timespec),
@@ -2475,7 +2724,10 @@ impl SarunFs {
             let file = match self.layer(&b, &rel) {
                 Layer::UpperFile { rowid, .. } => {
                     self.ensure_upper_blob(box_id, rowid, &rel);
-                    OpenOptions::new().write(true).open(blob_path(box_id, rowid)).ok()
+                    OpenOptions::new()
+                        .write(true)
+                        .open(blob_path(box_id, rowid))
+                        .ok()
                 }
                 Layer::Lower => self.copy_up(&b, &rel, pid).ok(),
                 _ => None,
@@ -2499,9 +2751,15 @@ impl SarunFs {
                 Layer::UpperFile { .. } => capture.set_mode(&rel, libc::S_IFREG | permissions),
                 Layer::UpperDir { .. } => capture.set_mode(&rel, libc::S_IFDIR | permissions),
                 Layer::UpperSymlink { .. } => {}
-                Layer::Lower if self.inner.backing.attr(&rel).is_ok_and(|attr| {
-                    attr.kind == NodeKind::Directory
-                }) => capture.set_dir(&rel, permissions),
+                Layer::Lower
+                    if self
+                        .inner
+                        .backing
+                        .attr(&rel)
+                        .is_ok_and(|attr| attr.kind == NodeKind::Directory) =>
+                {
+                    capture.set_dir(&rel, permissions)
+                }
                 Layer::Lower => {
                     self.copy_up(&b, &rel, pid).map_err(|_| Errno::EIO)?;
                     capture.set_mode(&rel, libc::S_IFREG | permissions);
@@ -2518,9 +2776,11 @@ impl SarunFs {
             let uid = request.uid.unwrap_or(current.0);
             let gid = request.gid.unwrap_or(current.1);
             if matches!(self.layer(&b, &rel), Layer::Lower)
-                && !self.inner.backing.attr(&rel).is_ok_and(|attr| {
-                    attr.kind == NodeKind::Directory
-                })
+                && !self
+                    .inner
+                    .backing
+                    .attr(&rel)
+                    .is_ok_and(|attr| attr.kind == NodeKind::Directory)
             {
                 self.copy_up(&b, &rel, pid).map_err(|_| Errno::EIO)?;
             }
@@ -2538,38 +2798,47 @@ impl SarunFs {
                 .set_owner(&rel, uid, gid);
         }
         if request.atime.is_some() || request.mtime.is_some() {
-            if matches!(self.layer(&b, &rel), Layer::Lower)
-            {
-                if self.inner.backing.attr(&rel).is_ok_and(|attr| {
-                    attr.kind == NodeKind::Directory
-                }) {
+            if matches!(self.layer(&b, &rel), Layer::Lower) {
+                if self
+                    .inner
+                    .backing
+                    .attr(&rel)
+                    .is_ok_and(|attr| attr.kind == NodeKind::Directory)
+                {
                     self.inner
                         .mutations
                         .writer(&b, pid, self.host_request_pids)
-                        .set_dir(&rel, self.inner.backing.attr(&rel)
-                            .map(|attr| attr.mode)
-                            .unwrap_or(libc::S_IFDIR | 0o755));
+                        .set_dir(
+                            &rel,
+                            self.inner
+                                .backing
+                                .attr(&rel)
+                                .map(|attr| attr.mode)
+                                .unwrap_or(libc::S_IFDIR | 0o755),
+                        );
                 } else {
                     self.copy_up(&b, &rel, pid).map_err(|_| Errno::EIO)?;
                 }
             }
             let capture = self.inner.mutations.writer(&b, pid, self.host_request_pids);
             if let Some(atime) = request.atime {
-                let nanos = atime.duration_since(UNIX_EPOCH)
+                let nanos = atime
+                    .duration_since(UNIX_EPOCH)
                     .map(|duration| duration.as_nanos() as i64)
                     .unwrap_or(0);
                 capture.set_atime(&rel, nanos);
             }
             if let Some(mtime) = request.mtime {
-                let nanos = mtime.duration_since(UNIX_EPOCH)
+                let nanos = mtime
+                    .duration_since(UNIX_EPOCH)
                     .map(|duration| duration.as_nanos() as i64)
                     .unwrap_or(0);
                 capture.set_mtime(&rel, nanos);
             }
             if let Layer::UpperFile { rowid, .. } = self.layer(&b, &rel) {
                 self.ensure_upper_blob(box_id, rowid, &rel);
-                let path = CString::new(blob_path(box_id, rowid)
-                    .as_os_str().as_encoded_bytes()).map_err(|_| Errno::EINVAL)?;
+                let path = CString::new(blob_path(box_id, rowid).as_os_str().as_encoded_bytes())
+                    .map_err(|_| Errno::EINVAL)?;
                 let to_timespec = |time: SystemTime| {
                     let duration = time.duration_since(UNIX_EPOCH).unwrap_or_default();
                     libc::timespec {
@@ -2577,13 +2846,16 @@ impl SarunFs {
                         tv_nsec: duration.subsec_nanos() as _,
                     }
                 };
-                let omit = libc::timespec { tv_sec: 0, tv_nsec: libc::UTIME_OMIT };
+                let omit = libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: libc::UTIME_OMIT,
+                };
                 let times = [
                     request.atime.map_or(omit, &to_timespec),
                     request.mtime.map_or(omit, &to_timespec),
                 ];
-                if unsafe { libc::utimensat(libc::AT_FDCWD, path.as_ptr(),
-                                             times.as_ptr(), 0) } != 0 {
+                if unsafe { libc::utimensat(libc::AT_FDCWD, path.as_ptr(), times.as_ptr(), 0) } != 0
+                {
                     return Err(Errno::from(std::io::Error::last_os_error()));
                 }
             }
@@ -2620,9 +2892,7 @@ impl SarunFs {
         };
         let handle = handle.lock().unwrap();
         match &handle.inner.data {
-            FileData::Native(file) => {
-                writer.read_from_file_at(file, size as usize, offset, None)
-            }
+            FileData::Native(file) => writer.read_from_file_at(file, size as usize, offset, None),
             FileData::Lower(lower) => lower.read_to(writer, size, offset),
             FileData::Sink(_) => Err(virtio_error(Errno::EBADF)),
         }
@@ -2659,11 +2929,17 @@ impl SarunFs {
         }
         handle.inner.dirty = true;
         if pid != handle.inner.last_pid || handle.inner.last_tgid == 0 {
-            handle.inner.last_tgid = if self.host_request_pids { tgid_of(pid) } else { pid };
+            handle.inner.last_tgid = if self.host_request_pids {
+                tgid_of(pid)
+            } else {
+                pid
+            };
             if let Some(b) = self.box_of(handle.inner.box_id) {
-                self.inner
-                    .mutations
-                    .observe_writer(&b, handle.inner.last_tgid, self.host_request_pids);
+                self.inner.mutations.observe_writer(
+                    &b,
+                    handle.inner.last_tgid,
+                    self.host_request_pids,
+                );
             }
         }
         handle.inner.last_pid = pid;
@@ -2688,21 +2964,26 @@ impl SarunFs {
         let box_state = self.box_of(box_id);
         self.inner.synthetic.write_sink(
             pid,
-            if self.host_request_pids { tgid_of(pid) as i32 } else { pid as i32 },
+            if self.host_request_pids {
+                tgid_of(pid) as i32
+            } else {
+                pid as i32
+            },
             self.host_request_pids,
             box_state.as_deref(),
             box_id,
             stream,
             data,
         );
+        if self.host_request_pids {
+            if let Some(box_state) = box_state.as_deref() {
+                crate::sud::record_fuse_output(box_state, pid, stream, data);
+            }
+        }
     }
 
     fn release_node(&self, handle: u64) -> Result<(), Errno> {
-        let handle = self
-            .inner
-            .handles
-            .remove(handle)
-            .ok_or(Errno::EBADF)?;
+        let handle = self.inner.handles.remove(handle).ok_or(Errno::EBADF)?;
         if matches!(&*handle, Handle::Jobserver { .. }) {
             return Ok(());
         }
@@ -2818,24 +3099,31 @@ impl SarunFs {
         })
     }
 
-    fn get_lock_node(&self, handle: u64, owner: u64,
-                     lock: virtiofsd::fuse::FileLock, flags: u32)
-                     -> Result<virtiofsd::fuse::FileLock, Errno> {
+    fn get_lock_node(
+        &self,
+        handle: u64,
+        owner: u64,
+        lock: virtiofsd::fuse::FileLock,
+        flags: u32,
+    ) -> Result<virtiofsd::fuse::FileLock, Errno> {
         let key = self.lock_key(handle, flags)?;
         Ok(self.inner.locks.get(key, owner, lock))
     }
 
-    fn set_lock_node(&self, handle: u64, owner: u64,
-                     lock: virtiofsd::fuse::FileLock, flags: u32,
-                     blocking: bool) -> Result<(), Errno> {
+    fn set_lock_node(
+        &self,
+        handle: u64,
+        owner: u64,
+        lock: virtiofsd::fuse::FileLock,
+        flags: u32,
+        blocking: bool,
+    ) -> Result<(), Errno> {
         let key = self.lock_key(handle, flags)?;
         self.inner.locks.set(key, owner, lock, blocking)
     }
 
     fn release_lock_owner(&self, handle: u64, owner: u64, flock: bool) {
-        if let Ok(key) = self.lock_key(handle, if flock {
-            virtiofsd::fuse::LK_FLOCK
-        } else { 0 }) {
+        if let Ok(key) = self.lock_key(handle, if flock { virtiofsd::fuse::LK_FLOCK } else { 0 }) {
             self.inner.locks.release(key, owner);
         }
     }
@@ -2871,8 +3159,8 @@ impl SarunFs {
         }
         let capture = self.inner.mutations.writer(b, pid, self.host_request_pids);
         // Source the lower bytes + mode from the parent-chain resolution.
-        let (src, mode, lower_source): (Option<PathBuf>, u32, bool) =
-            match self.resolve(b.id, rel) {
+        let (src, mode, lower_source): (Option<PathBuf>, u32, bool) = match self.resolve(b.id, rel)
+        {
             Layer::UpperFile { owner, rowid, mode } => {
                 // Re-materialize an inline (discard-reverted) row to its blob
                 // so the copy below — and the box's own re-run write — has a
@@ -2881,15 +3169,17 @@ impl SarunFs {
                 (Some(blob_path(owner, rowid)), mode, false)
             }
             Layer::Lower => {
-                let mode = self.inner.backing.attr(rel)
+                let mode = self
+                    .inner
+                    .backing
+                    .attr(rel)
                     .map(|attr| attr.mode)
                     .unwrap_or(0o100644);
                 (None, mode, true)
             }
             // Unreachable: every mutation path EROFS'd at ro_denied
             // before copy_up could see an attachment-resolved key.
-            Layer::ExtFile { .. } =>
-                return Err(std::io::Error::from_raw_os_error(libc::EROFS)),
+            Layer::ExtFile { .. } => return Err(std::io::Error::from_raw_os_error(libc::EROFS)),
             _ => (None, 0o100644, false),
         };
         let rowid = capture.ensure_file(rel, mode);
@@ -2903,8 +3193,12 @@ impl SarunFs {
                 self.inner.backing.copy_to(rel, &destination)?;
             } else {
                 match src {
-                    Some(s) => { std::fs::copy(&s, &bp)?; }
-                    None => { File::create(&bp)?; }
+                    Some(s) => {
+                        std::fs::copy(&s, &bp)?;
+                    }
+                    None => {
+                        File::create(&bp)?;
+                    }
                 }
             }
         }
@@ -2913,23 +3207,30 @@ impl SarunFs {
 
     fn reg_fh(&self, fh: FhInner) -> u64 {
         let lock_identity = match &fh.data {
-            FileData::Native(file) => file.metadata().ok()
+            FileData::Native(file) => file
+                .metadata()
+                .ok()
                 .map(|metadata| LockIdentity::Native(metadata.dev(), metadata.ino()))
                 .unwrap_or(LockIdentity::Synthetic(u64::MAX)),
             FileData::Lower(lower) => LockIdentity::Lower(lower.identity()),
             FileData::Sink(stream) => LockIdentity::Synthetic(*stream as u64),
         };
-        self.inner
-            .handles
-            .insert(Handle::File(Mutex::new(Fh { inner: fh, lock_identity })))
+        self.inner.handles.insert(Handle::File(Mutex::new(Fh {
+            inner: fh,
+            lock_identity,
+        })))
     }
 
     /// Merged listing of (box, rel) through the FULL chain: host entries, then
     /// each box from ROOT down to the child applied in order (so a deeper box's
     /// whiteouts hide and its entries override shallower layers). (name, kind,
     /// child-ino, Option<attr>).
-    fn scan_dir(&self, b: &BoxState, rel: &str, plus: bool)
-                -> Vec<(String, NodeKind, u64, Option<NodeAttr>)> {
+    fn scan_dir(
+        &self,
+        b: &BoxState,
+        rel: &str,
+        plus: bool,
+    ) -> Vec<(String, NodeKind, u64, Option<NodeAttr>)> {
         let mut names: BTreeMap<String, ()> = BTreeMap::new();
         // chain of links, root-first (incl. RO attachments).
         let mut chain = self.chain_of(b.id);
@@ -2937,13 +3238,20 @@ impl SarunFs {
         // D-parent: skip host seeding when any box in the chain disables it
         // (matches resolve()'s no_host_fallback semantics — the box stack is
         // closed at the bottom, no /etc-from-host bleed-through).
-        let no_host = chain.iter().any(|l| matches!(l,
-            ChainLink::Box(bx) if bx.no_host_fallback()));
+        let no_host = chain.iter().any(|l| {
+            matches!(l,
+            ChainLink::Box(bx) if bx.no_host_fallback())
+        });
         if !no_host {
-            if let Ok(backing_names) = self.inner.backing.node(rel)
+            if let Ok(backing_names) = self
+                .inner
+                .backing
+                .node(rel)
                 .and_then(|node| node.read_dir())
             {
-                for name in backing_names { names.insert(name, ()); }
+                for name in backing_names {
+                    names.insert(name, ());
+                }
             }
         }
         for link in chain {
@@ -2952,7 +3260,9 @@ impl SarunFs {
                 // Attachment entries are plain present names — no
                 // whiteouts/holes/opacity; kinds come from attr_of below.
                 ChainLink::Ext(att) => {
-                    for n in att.children(rel) { names.insert(n, ()); }
+                    for n in att.children(rel) {
+                        names.insert(n, ());
+                    }
                     continue;
                 }
             };
@@ -2965,42 +3275,51 @@ impl SarunFs {
                 // an opaque `etc` must also drop earlier-layer `replace/*`
                 // entries. Without the ancestor check, `etc/replace/old`
                 // would survive a layer that opacified `etc`.
-                if bx.is_opaque(rel)
-                    || crate::sarunfs::layers::has_opaque_ancestor(&bx, rel)
-                {
+                if bx.is_opaque(rel) || crate::sarunfs::layers::has_opaque_ancestor(&bx, rel) {
                     names.clear();
                 }
                 // REBASED here (this dir, or an ancestor): everything the
                 // chain recorded so far is erased for this subtree; the
                 // backdrop (host) still shows through — re-seed it.
-                if matches!(bx.entry(rel),
-                            Some(Entry::Dir { rebased: true, .. }))
+                if matches!(bx.entry(rel), Some(Entry::Dir { rebased: true, .. }))
                     || crate::sarunfs::layers::has_rebased_ancestor(&bx, rel)
                 {
                     names.clear();
                     if !no_host {
-                        if let Ok(backing_names) = self.inner.backing.node(rel)
+                        if let Ok(backing_names) = self
+                            .inner
+                            .backing
+                            .node(rel)
                             .and_then(|node| node.read_dir())
                         {
-                            for name in backing_names { names.insert(name, ()); }
+                            for name in backing_names {
+                                names.insert(name, ());
+                            }
                         }
                     }
                 }
                 let (white, present, holes) = bx.children_of(rel);
-                for w in &white { names.remove(w); }
+                for w in &white {
+                    names.remove(w);
+                }
                 for h in &holes {
                     // A hole un-occludes the name: recorded contributions
                     // vanish; the LIVE backdrop decides.
                     names.remove(h);
                     if !no_host {
-                        let hp = if rel.is_empty() { h.clone() }
-                                 else { format!("{rel}/{h}") };
+                        let hp = if rel.is_empty() {
+                            h.clone()
+                        } else {
+                            format!("{rel}/{h}")
+                        };
                         if self.inner.backing.exists(&hp) {
                             names.insert(h.clone(), ());
                         }
                     }
                 }
-                for p in present { names.insert(p, ()); }
+                for p in present {
+                    names.insert(p, ());
+                }
             }
         }
         for name in self.inner.synthetic.projected_children(b.id, rel) {
@@ -3008,13 +3327,20 @@ impl SarunFs {
         }
         let mut out = vec![];
         for name in names.keys() {
-            let crel = if rel.is_empty() { name.clone() }
-                       else { format!("{rel}/{name}") };
+            let crel = if rel.is_empty() {
+                name.clone()
+            } else {
+                format!("{rel}/{name}")
+            };
             let cino = self.ino_for(&(b.id, crel.clone()));
             let attr = self.attr_of(b, cino, &crel);
             let Some(attr) = attr else { continue };
-            out.push((name.clone(), attr.kind, cino,
-                      if plus { Some(attr) } else { None }));
+            out.push((
+                name.clone(),
+                attr.kind,
+                cino,
+                if plus { Some(attr) } else { None },
+            ));
         }
         out
     }
@@ -3119,9 +3445,12 @@ impl virtiofsd::filesystem::FileSystem for SarunFs {
         capable: virtiofsd::filesystem::FsOptions,
     ) -> std::io::Result<virtiofsd::filesystem::FsOptions> {
         let passthrough = capable.contains(virtiofsd::filesystem::FsOptions::PASSTHROUGH);
-        self.kernel_passthrough.store(passthrough, Ordering::Relaxed);
+        self.kernel_passthrough
+            .store(passthrough, Ordering::Relaxed);
         if self.root.0 == 0 {
-            self.inner.passthrough_ok.store(passthrough, Ordering::Relaxed);
+            self.inner
+                .passthrough_ok
+                .store(passthrough, Ordering::Relaxed);
         }
         let mut wanted = virtiofsd::filesystem::FsOptions::POSIX_LOCKS
             | virtiofsd::filesystem::FsOptions::FLOCK_LOCKS;
@@ -3239,6 +3568,13 @@ impl virtiofsd::filesystem::FileSystem for SarunFs {
                 self.kernel_passthrough.load(Ordering::Relaxed),
             )
             .map_err(virtio_error)?;
+        if self.host_request_pids {
+            if let Some((box_id, rel)) = self.key_of(inode) {
+                if let Some(box_state) = self.box_of(box_id) {
+                    crate::sud::record_fuse_open(&box_state, ctx.pid as u32, flags, inode, &rel);
+                }
+            }
+        }
         let mut options = virtiofsd::filesystem::OpenOptions::empty();
         if opened.direct_io {
             options |= virtiofsd::filesystem::OpenOptions::DIRECT_IO;
@@ -3281,7 +3617,7 @@ impl virtiofsd::filesystem::FileSystem for SarunFs {
         name: &CStr,
         mode: u32,
         _kill_priv: bool,
-        _flags: u32,
+        flags: u32,
         _umask: u32,
         _extensions: virtiofsd::filesystem::Extensions,
     ) -> std::io::Result<(
@@ -3299,6 +3635,19 @@ impl virtiofsd::filesystem::FileSystem for SarunFs {
                 mode,
             )
             .map_err(virtio_error)?;
+        if self.host_request_pids {
+            if let Some((box_id, rel)) = self.key_of(attr.inode) {
+                if let Some(box_state) = self.box_of(box_id) {
+                    crate::sud::record_fuse_open(
+                        &box_state,
+                        ctx.pid as u32,
+                        flags | libc::O_CREAT as u32,
+                        attr.inode,
+                        &rel,
+                    );
+                }
+            }
+        }
         Ok((
             virtiofsd::filesystem::Entry {
                 inode: attr.inode,
@@ -3403,12 +3752,8 @@ impl virtiofsd::filesystem::FileSystem for SarunFs {
         parent: u64,
         name: &CStr,
     ) -> std::io::Result<()> {
-        self.unlink_node(
-            ctx.pid as u32,
-            parent,
-            OsStr::from_bytes(name.to_bytes()),
-        )
-        .map_err(virtio_error)
+        self.unlink_node(ctx.pid as u32, parent, OsStr::from_bytes(name.to_bytes()))
+            .map_err(virtio_error)
     }
 
     fn rmdir(
@@ -3417,12 +3762,8 @@ impl virtiofsd::filesystem::FileSystem for SarunFs {
         parent: u64,
         name: &CStr,
     ) -> std::io::Result<()> {
-        self.rmdir_node(
-            ctx.pid as u32,
-            parent,
-            OsStr::from_bytes(name.to_bytes()),
-        )
-        .map_err(virtio_error)
+        self.rmdir_node(ctx.pid as u32, parent, OsStr::from_bytes(name.to_bytes()))
+            .map_err(virtio_error)
     }
 
     fn rename(
@@ -3485,10 +3826,9 @@ impl virtiofsd::filesystem::FileSystem for SarunFs {
         }
         if let Some((box_id, nonblocking)) = self.jobserver_handle(handle) {
             let slip = if self.host_request_pids {
-                self.inner.synthetic.acquire_host_jobserver_blocking(
-                    tgid_of(ctx.pid as u32) as i32,
-                    nonblocking,
-                )?
+                self.inner
+                    .synthetic
+                    .acquire_host_jobserver_blocking(tgid_of(ctx.pid as u32) as i32, nonblocking)?
             } else {
                 self.inner.synthetic.acquire_guest_jobserver_blocking(
                     box_id,
@@ -3534,12 +3874,7 @@ impl virtiofsd::filesystem::FileSystem for SarunFs {
             }
             WriteTarget::Sink { box_id, stream } => {
                 let staging = staging_file()?;
-                let written = reader.write_to_file_at(
-                    &staging,
-                    size as usize,
-                    0,
-                    None,
-                )?;
+                let written = reader.write_to_file_at(&staging, size as usize, 0, None)?;
                 let mut data = vec![0; written];
                 let read = staging.read_at(&mut data, 0)?;
                 data.truncate(read);
@@ -3547,12 +3882,7 @@ impl virtiofsd::filesystem::FileSystem for SarunFs {
                 Ok(read)
             }
             WriteTarget::File { file, box_id, rel } => {
-                let written = reader.write_to_file_at(
-                    &file,
-                    size as usize,
-                    offset,
-                    None,
-                )?;
+                let written = reader.write_to_file_at(&file, size as usize, offset, None)?;
                 self.finish_file_write(box_id, rel);
                 Ok(written)
             }
@@ -3629,7 +3959,8 @@ impl virtiofsd::filesystem::FileSystem for SarunFs {
         offset: u64,
         whence: u32,
     ) -> std::io::Result<u64> {
-        self.lseek_node(handle, offset, whence).map_err(virtio_error)
+        self.lseek_node(handle, offset, whence)
+            .map_err(virtio_error)
     }
 
     fn getlk(
@@ -3641,7 +3972,8 @@ impl virtiofsd::filesystem::FileSystem for SarunFs {
         lock: virtiofsd::fuse::FileLock,
         flags: u32,
     ) -> std::io::Result<virtiofsd::fuse::FileLock> {
-        self.get_lock_node(handle, owner, lock, flags).map_err(virtio_error)
+        self.get_lock_node(handle, owner, lock, flags)
+            .map_err(virtio_error)
     }
 
     fn setlk(
@@ -3653,7 +3985,8 @@ impl virtiofsd::filesystem::FileSystem for SarunFs {
         lock: virtiofsd::fuse::FileLock,
         flags: u32,
     ) -> std::io::Result<()> {
-        self.set_lock_node(handle, owner, lock, flags, false).map_err(virtio_error)
+        self.set_lock_node(handle, owner, lock, flags, false)
+            .map_err(virtio_error)
     }
 
     fn setlkw(
@@ -3665,7 +3998,8 @@ impl virtiofsd::filesystem::FileSystem for SarunFs {
         lock: virtiofsd::fuse::FileLock,
         flags: u32,
     ) -> std::io::Result<()> {
-        self.set_lock_node(handle, owner, lock, flags, true).map_err(virtio_error)
+        self.set_lock_node(handle, owner, lock, flags, true)
+            .map_err(virtio_error)
     }
 
     fn access(
@@ -3686,13 +4020,8 @@ impl virtiofsd::filesystem::FileSystem for SarunFs {
         flags: u32,
         _extra_flags: virtiofsd::filesystem::SetxattrFlags,
     ) -> std::io::Result<()> {
-        self.set_xattr_node(
-            inode,
-            OsStr::from_bytes(name.to_bytes()),
-            value,
-            flags,
-        )
-        .map_err(virtio_error)
+        self.set_xattr_node(inode, OsStr::from_bytes(name.to_bytes()), value, flags)
+            .map_err(virtio_error)
     }
 
     fn getxattr(
@@ -3706,7 +4035,9 @@ impl virtiofsd::filesystem::FileSystem for SarunFs {
             .get_xattr_node(inode, OsStr::from_bytes(name.to_bytes()))
             .map_err(virtio_error)?;
         if size == 0 {
-            Ok(virtiofsd::filesystem::GetxattrReply::Count(value.len() as u32))
+            Ok(virtiofsd::filesystem::GetxattrReply::Count(
+                value.len() as u32
+            ))
         } else if (size as usize) < value.len() {
             Err(std::io::Error::from_raw_os_error(libc::ERANGE))
         } else {
@@ -3722,7 +4053,9 @@ impl virtiofsd::filesystem::FileSystem for SarunFs {
     ) -> std::io::Result<virtiofsd::filesystem::ListxattrReply> {
         let names = self.list_xattr_node(inode).map_err(virtio_error)?;
         if size == 0 {
-            Ok(virtiofsd::filesystem::ListxattrReply::Count(names.len() as u32))
+            Ok(virtiofsd::filesystem::ListxattrReply::Count(
+                names.len() as u32
+            ))
         } else if (size as usize) < names.len() {
             Err(std::io::Error::from_raw_os_error(libc::ERANGE))
         } else {
@@ -3742,11 +4075,24 @@ impl virtiofsd::filesystem::FileSystem for SarunFs {
 
     fn opendir(
         &self,
-        _ctx: virtiofsd::filesystem::Context,
+        ctx: virtiofsd::filesystem::Context,
         inode: u64,
-        _flags: u32,
+        flags: u32,
     ) -> std::io::Result<(Option<u64>, virtiofsd::filesystem::OpenOptions)> {
         let handle = self.open_directory(inode).map_err(virtio_error)?;
+        if self.host_request_pids {
+            if let Some((box_id, rel)) = self.key_of(inode) {
+                if let Some(box_state) = self.box_of(box_id) {
+                    crate::sud::record_fuse_open(
+                        &box_state,
+                        ctx.pid as u32,
+                        flags | libc::O_DIRECTORY as u32,
+                        inode,
+                        &rel,
+                    );
+                }
+            }
+        }
         Ok((Some(handle), virtiofsd::filesystem::OpenOptions::empty()))
     }
 
@@ -3838,14 +4184,20 @@ mod chain_tests {
     }
 
     fn ext_ref(prefix: &str) -> ExtRef {
-        ExtRef { kind: "git".into(), store: "/nonexistent".into(),
-                 refname: "main".into(), rev: "abc".into(),
-                 prefix: prefix.into(), name: "t".into() }
+        ExtRef {
+            kind: "git".into(),
+            store: "/nonexistent".into(),
+            refname: "main".into(),
+            rev: "abc".into(),
+            prefix: prefix.into(),
+            name: "t".into(),
+        }
     }
 
     // chain_of must honor the FULL interleaved ro_attachments order —
     // Box and Ext rows at their list positions, never grouped by kind
-    // (resolve precedence is the list order the attach verbs recorded).
+    // (resolve precedence is the list order the attach verbs recorded), and
+    // all attachments precede the parent/provider layer.
     // The Ext link's synthesized prefix chain must then show through
     // resolve/ro_denied/chain_has_children WITHOUT the store (here
     // nonexistent) ever opening.
@@ -3853,20 +4205,25 @@ mod chain_tests {
     fn chain_interleaves_box_and_ext_rows_in_list_order() {
         let _g = crate::depot::TEST_STATE_HOME_LOCK.lock().unwrap();
         let tmp = std::env::temp_dir().join(format!(
-            "sarun-chain-{}-{:?}", std::process::id(),
-            std::time::SystemTime::now()));
+            "sarun-chain-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+        ));
         std::fs::create_dir_all(&tmp).unwrap();
         // SAFETY: same discipline as review.rs's promote test — the lock
         // serializes every state_home-reading test in this binary.
-        unsafe { std::env::set_var("XDG_STATE_HOME", &tmp); }
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", &tmp);
+        }
         std::fs::create_dir_all(crate::paths::state_home()).unwrap();
 
         let ov = Overlay::new(tmp.clone());
-        let (owner, a, c) = (9101i64, 9102i64, 9103i64);
-        for id in [a, c] {
+        let (owner, a, c, provider) = (9101i64, 9102i64, 9103i64, 9104i64);
+        for id in [a, c, provider] {
             ov.add_box(Arc::new(BoxState::create(id).unwrap()));
         }
         let ob = BoxState::create(owner).unwrap();
+        ob.set_parent(Some(provider));
         ob.set_ro_attachments(vec![
             RoAttachment::Box(a),
             RoAttachment::Ext(ext_ref("deep/sdk")),
@@ -3874,12 +4231,24 @@ mod chain_tests {
         ]);
         ov.add_box(Arc::new(ob));
 
-        let tags: Vec<String> = ov.chain_of(owner).iter().map(|l| match l {
-            ChainLink::Box(b) => format!("box:{}", b.id),
-            ChainLink::Ext(att) => format!("ext:{}", att.ext.prefix),
-        }).collect();
-        assert_eq!(tags, ["box:9101", "box:9102", "ext:deep/sdk",
-                          "box:9103"]);
+        let tags: Vec<String> = ov
+            .chain_of(owner)
+            .iter()
+            .map(|l| match l {
+                ChainLink::Box(b) => format!("box:{}", b.id),
+                ChainLink::Ext(att) => format!("ext:{}", att.ext.prefix),
+            })
+            .collect();
+        assert_eq!(
+            tags,
+            [
+                "box:9101",
+                "box:9102",
+                "ext:deep/sdk",
+                "box:9103",
+                "box:9104",
+            ],
+        );
 
         assert!(matches!(ov.resolve(owner, "deep"), Layer::UpperDir { .. }));
         assert!(ov.ro_denied(owner, "deep"));
@@ -3904,7 +4273,9 @@ mod chain_tests {
         std::fs::write(tmp.join("hello"), b"canonical bytes").unwrap();
         std::fs::write(tmp.join("truncate-open"), b"tail must disappear").unwrap();
         // SAFETY: TEST_STATE_HOME_LOCK serializes state-home tests.
-        unsafe { std::env::set_var("XDG_STATE_HOME", &tmp); }
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", &tmp);
+        }
         std::fs::create_dir_all(crate::paths::state_home()).unwrap();
 
         let fs = SarunFs::new(tmp.clone());
@@ -3916,11 +4287,13 @@ mod chain_tests {
             pid: 1,
         };
         let export = fs.export_box(id).unwrap();
+        let host_export = fs.export_box_for_host_consumer(id).unwrap();
+        assert!(!export.host_request_pids);
+        assert!(host_export.host_request_pids);
+        assert_eq!(host_export.root, export.root);
+        assert!(Arc::ptr_eq(&host_export.inner, &export.inner));
         let (export_root, _) =
-            <SarunFs as virtiofsd::filesystem::FileSystem>::getattr(
-                &export, ctx, 1, None,
-            )
-            .unwrap();
+            <SarunFs as virtiofsd::filesystem::FileSystem>::getattr(&export, ctx, 1, None).unwrap();
         assert_eq!(export_root.ino, 1);
         let export_filename = CString::new("hello").unwrap();
         let export_file = <SarunFs as virtiofsd::filesystem::FileSystem>::lookup(
@@ -3932,13 +4305,8 @@ mod chain_tests {
         .unwrap();
         assert_ne!(export_file.inode, 1);
         let name = CString::new(id.to_string()).unwrap();
-        let entry = <SarunFs as virtiofsd::filesystem::FileSystem>::lookup(
-            &fs,
-            ctx,
-            1,
-            &name,
-        )
-        .unwrap();
+        let entry =
+            <SarunFs as virtiofsd::filesystem::FileSystem>::lookup(&fs, ctx, 1, &name).unwrap();
         assert_eq!(entry.attr.mode & libc::S_IFMT, libc::S_IFDIR);
         assert_eq!(fs.inner.inodes.lookup_count(entry.inode), 1);
 
@@ -3974,20 +4342,27 @@ mod chain_tests {
         )
         .unwrap()
         {
-            virtiofsd::filesystem::GetxattrReply::Value(value) =>
-                assert_eq!(value, b"value"),
+            virtiofsd::filesystem::GetxattrReply::Value(value) => assert_eq!(value, b"value"),
             virtiofsd::filesystem::GetxattrReply::Count(_) => panic!("expected value"),
         }
         assert!(matches!(
             <SarunFs as virtiofsd::filesystem::FileSystem>::getxattr(
-                &fs, ctx, entry.inode, &xattr, 0,
+                &fs,
+                ctx,
+                entry.inode,
+                &xattr,
+                0,
             )
             .unwrap(),
             virtiofsd::filesystem::GetxattrReply::Count(5),
         ));
         assert_eq!(
             <SarunFs as virtiofsd::filesystem::FileSystem>::getxattr(
-                &fs, ctx, entry.inode, &xattr, 1,
+                &fs,
+                ctx,
+                entry.inode,
+                &xattr,
+                1,
             )
             .err()
             .unwrap()
@@ -4011,17 +4386,18 @@ mod chain_tests {
         )
         .unwrap()
         {
-            virtiofsd::filesystem::ListxattrReply::Names(names) =>
-                assert_eq!(names, xattr_bytes),
+            virtiofsd::filesystem::ListxattrReply::Names(names) => assert_eq!(names, xattr_bytes),
             virtiofsd::filesystem::ListxattrReply::Count(_) => panic!("expected names"),
         }
-        <SarunFs as virtiofsd::filesystem::FileSystem>::removexattr(
-            &fs, ctx, entry.inode, &xattr,
-        )
-        .unwrap();
+        <SarunFs as virtiofsd::filesystem::FileSystem>::removexattr(&fs, ctx, entry.inode, &xattr)
+            .unwrap();
         assert_eq!(
             <SarunFs as virtiofsd::filesystem::FileSystem>::getxattr(
-                &fs, ctx, entry.inode, &xattr, 32,
+                &fs,
+                ctx,
+                entry.inode,
+                &xattr,
+                32,
             )
             .err()
             .unwrap()
@@ -4034,7 +4410,10 @@ mod chain_tests {
         // core must implement the open flag itself so transports agree.
         let truncate_name = CString::new("truncate-open").unwrap();
         let truncate_entry = <SarunFs as virtiofsd::filesystem::FileSystem>::lookup(
-            &fs, ctx, entry.inode, &truncate_name,
+            &fs,
+            ctx,
+            entry.inode,
+            &truncate_name,
         )
         .unwrap();
         let (truncate_handle, _) = <SarunFs as virtiofsd::filesystem::FileSystem>::open(
@@ -4058,7 +4437,10 @@ mod chain_tests {
         .unwrap();
         assert_eq!(
             <SarunFs as virtiofsd::filesystem::FileSystem>::getattr(
-                &fs, ctx, truncate_entry.inode, None,
+                &fs,
+                ctx,
+                truncate_entry.inode,
+                None,
             )
             .unwrap()
             .0
@@ -4106,7 +4488,9 @@ mod chain_tests {
         .unwrap();
         assert_eq!(read, b"canonical bytes".len());
         assert_eq!(&*captured.lock().unwrap(), b"canonical bytes");
-        let exported = fs.export_handle(file_handle, false, ctx.pid as u32).unwrap();
+        let exported = fs
+            .export_handle(file_handle, false, ctx.pid as u32)
+            .unwrap();
         let mut exported_bytes = [0u8; 32];
         let exported_len = exported.read_at(&mut exported_bytes, 0).unwrap();
         assert_eq!(&exported_bytes[..exported_len], b"canonical bytes");
@@ -4131,7 +4515,9 @@ mod chain_tests {
         )
         .unwrap();
         let write_handle = write_handle.unwrap();
-        let mapped = fs.export_handle(write_handle, true, ctx.pid as u32).unwrap();
+        let mapped = fs
+            .export_handle(write_handle, true, ctx.pid as u32)
+            .unwrap();
         assert_eq!(mapped.write_at(b"MAP", 0).unwrap(), 3);
         let written = <SarunFs as virtiofsd::filesystem::FileSystem>::write(
             &fs,
@@ -4159,27 +4545,32 @@ mod chain_tests {
             None,
         )
         .unwrap();
-        assert_eq!(std::fs::read(tmp.join("hello")).unwrap(), b"canonical bytes");
+        assert_eq!(
+            std::fs::read(tmp.join("hello")).unwrap(),
+            b"canonical bytes"
+        );
         let layer = fs.resolve(id, "hello");
         let Layer::UpperFile { owner, rowid, .. } = layer else {
             panic!("write did not copy up");
         };
-        assert_eq!(std::fs::read(blob_path(owner, rowid)).unwrap(), b"changedal bytes");
+        assert_eq!(
+            std::fs::read(blob_path(owner, rowid)).unwrap(),
+            b"changedal bytes"
+        );
 
         let created_name = CString::new("created").unwrap();
-        let (created, created_handle, _) =
-            <SarunFs as virtiofsd::filesystem::FileSystem>::create(
-                &fs,
-                ctx,
-                entry.inode,
-                &created_name,
-                0o640,
-                false,
-                libc::O_RDWR as u32,
-                0,
-                virtiofsd::filesystem::Extensions::default(),
-            )
-            .unwrap();
+        let (created, created_handle, _) = <SarunFs as virtiofsd::filesystem::FileSystem>::create(
+            &fs,
+            ctx,
+            entry.inode,
+            &created_name,
+            0o640,
+            false,
+            libc::O_RDWR as u32,
+            0,
+            virtiofsd::filesystem::Extensions::default(),
+        )
+        .unwrap();
         assert_eq!(created.attr.mode & 0o7777, 0o640);
         assert_eq!(created.attr.uid.into_inner(), 1234);
         assert_eq!(created.attr.gid.into_inner(), 2345);
@@ -4214,12 +4605,7 @@ mod chain_tests {
             panic!("create did not materialize upper file");
         };
         assert_eq!(std::fs::read(blob_path(owner, rowid)).unwrap(), b"new file");
-        <SarunFs as virtiofsd::filesystem::FileSystem>::forget(
-            &fs,
-            ctx,
-            created.inode,
-            1,
-        );
+        <SarunFs as virtiofsd::filesystem::FileSystem>::forget(&fs, ctx, created.inode, 1);
         let allocated_name = CString::new("allocated").unwrap();
         let (allocated, allocated_handle, _) =
             <SarunFs as virtiofsd::filesystem::FileSystem>::create(
@@ -4271,7 +4657,10 @@ mod chain_tests {
             libc::SEEK_HOLE as u32,
         )
         .unwrap();
-        assert!(hole <= 8192, "hole must precede the distant data byte: {hole}");
+        assert!(
+            hole <= 8192,
+            "hole must precede the distant data byte: {hole}"
+        );
         assert_eq!(
             <SarunFs as virtiofsd::filesystem::FileSystem>::lseek(
                 &fs,
@@ -4300,17 +4689,35 @@ mod chain_tests {
             pid: 123,
         };
         <SarunFs as virtiofsd::filesystem::FileSystem>::setlk(
-            &fs, ctx, allocated.inode, allocated_handle, 100, lock, 0,
+            &fs,
+            ctx,
+            allocated.inode,
+            allocated_handle,
+            100,
+            lock,
+            0,
         )
         .unwrap();
         let conflict = <SarunFs as virtiofsd::filesystem::FileSystem>::getlk(
-            &fs, ctx, allocated.inode, lock_handle, 200, lock, 0,
+            &fs,
+            ctx,
+            allocated.inode,
+            lock_handle,
+            200,
+            lock,
+            0,
         )
         .unwrap();
         assert_eq!((conflict.type_, conflict.pid), (libc::F_WRLCK as u32, 123));
         assert_eq!(
             <SarunFs as virtiofsd::filesystem::FileSystem>::setlk(
-                &fs, ctx, allocated.inode, lock_handle, 200, lock, 0,
+                &fs,
+                ctx,
+                allocated.inode,
+                lock_handle,
+                200,
+                lock,
+                0,
             )
             .err()
             .unwrap()
@@ -4318,19 +4725,40 @@ mod chain_tests {
             Some(libc::EAGAIN),
         );
         <SarunFs as virtiofsd::filesystem::FileSystem>::fsync(
-            &fs, ctx, allocated.inode, true, allocated_handle,
+            &fs,
+            ctx,
+            allocated.inode,
+            true,
+            allocated_handle,
         )
         .unwrap();
         <SarunFs as virtiofsd::filesystem::FileSystem>::flush(
-            &fs, ctx, allocated.inode, allocated_handle, 100,
+            &fs,
+            ctx,
+            allocated.inode,
+            allocated_handle,
+            100,
         )
         .unwrap();
         <SarunFs as virtiofsd::filesystem::FileSystem>::setlk(
-            &fs, ctx, allocated.inode, lock_handle, 200, lock, 0,
+            &fs,
+            ctx,
+            allocated.inode,
+            lock_handle,
+            200,
+            lock,
+            0,
         )
         .unwrap();
         <SarunFs as virtiofsd::filesystem::FileSystem>::release(
-            &fs, ctx, allocated.inode, 0, lock_handle, false, false, None,
+            &fs,
+            ctx,
+            allocated.inode,
+            0,
+            lock_handle,
+            false,
+            false,
+            None,
         )
         .unwrap();
         <SarunFs as virtiofsd::filesystem::FileSystem>::release(
@@ -4357,21 +4785,20 @@ mod chain_tests {
         setattr.mtimensec = 12;
         setattr.uid = unsafe { libc::geteuid() }.into();
         setattr.gid = unsafe { libc::getegid() }.into();
-        let (allocated_attr, _) =
-            <SarunFs as virtiofsd::filesystem::FileSystem>::setattr(
-                &fs,
-                ctx,
-                allocated.inode,
-                setattr,
-                None,
-                virtiofsd::filesystem::SetattrValid::SIZE
-                    | virtiofsd::filesystem::SetattrValid::MODE
-                    | virtiofsd::filesystem::SetattrValid::UID
-                    | virtiofsd::filesystem::SetattrValid::GID
-                    | virtiofsd::filesystem::SetattrValid::ATIME
-                    | virtiofsd::filesystem::SetattrValid::MTIME,
-            )
-            .unwrap();
+        let (allocated_attr, _) = <SarunFs as virtiofsd::filesystem::FileSystem>::setattr(
+            &fs,
+            ctx,
+            allocated.inode,
+            setattr,
+            None,
+            virtiofsd::filesystem::SetattrValid::SIZE
+                | virtiofsd::filesystem::SetattrValid::MODE
+                | virtiofsd::filesystem::SetattrValid::UID
+                | virtiofsd::filesystem::SetattrValid::GID
+                | virtiofsd::filesystem::SetattrValid::ATIME
+                | virtiofsd::filesystem::SetattrValid::MTIME,
+        )
+        .unwrap();
         assert_eq!(allocated_attr.size, 128);
         assert_eq!(allocated_attr.mode & 0o7777, 0o640);
         assert_eq!(allocated_attr.atime, 123);
@@ -4387,11 +4814,9 @@ mod chain_tests {
             .conn
             .lock()
             .unwrap()
-            .query_row(
-                "SELECT sz FROM sqlar WHERE name='allocated'",
-                [],
-                |row| row.get(0),
-            )
+            .query_row("SELECT sz FROM sqlar WHERE name='allocated'", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(allocated_sqlar_size, 128);
         let directory_name = CString::new("directory").unwrap();
@@ -4437,21 +4862,21 @@ mod chain_tests {
         assert_eq!(link.attr.uid.into_inner(), 1234);
         assert_eq!(link.attr.gid.into_inner(), 2345);
         assert_eq!(
-            <SarunFs as virtiofsd::filesystem::FileSystem>::readlink(
-                &fs, ctx, link.inode,
-            )
-            .unwrap(),
+            <SarunFs as virtiofsd::filesystem::FileSystem>::readlink(&fs, ctx, link.inode,)
+                .unwrap(),
             b"created",
         );
         let hardlink_name = CString::new("hardlink").unwrap();
         // The create lookup was explicitly forgotten above. A FUSE client
         // must reacquire the name before using its inode in a later LINK;
         // passing a forgotten numeric id tests stale-id use, not hard links.
-        let created_for_link =
-            <SarunFs as virtiofsd::filesystem::FileSystem>::lookup(
-                &fs, ctx, entry.inode, &created_name,
-            )
-            .unwrap();
+        let created_for_link = <SarunFs as virtiofsd::filesystem::FileSystem>::lookup(
+            &fs,
+            ctx,
+            entry.inode,
+            &created_name,
+        )
+        .unwrap();
         let hardlink = <SarunFs as virtiofsd::filesystem::FileSystem>::link(
             &fs,
             ctx,
@@ -4461,10 +4886,18 @@ mod chain_tests {
         )
         .unwrap();
         assert_eq!(hardlink.attr.nlink, 2);
-        let Layer::UpperFile { rowid: source_rowid, .. } = fs.resolve(id, "created") else {
+        let Layer::UpperFile {
+            rowid: source_rowid,
+            ..
+        } = fs.resolve(id, "created")
+        else {
             panic!("hardlink source missing");
         };
-        let Layer::UpperFile { rowid: linked_rowid, .. } = fs.resolve(id, "hardlink") else {
+        let Layer::UpperFile {
+            rowid: linked_rowid,
+            ..
+        } = fs.resolve(id, "hardlink")
+        else {
             panic!("hardlink destination missing");
         };
         assert_eq!(
@@ -4483,58 +4916,58 @@ mod chain_tests {
         )
         .unwrap();
         let renamed = <SarunFs as virtiofsd::filesystem::FileSystem>::lookup(
-            &fs, ctx, entry.inode, &renamed_name,
+            &fs,
+            ctx,
+            entry.inode,
+            &renamed_name,
         )
         .unwrap();
         assert_eq!(renamed.inode, created_for_link.inode);
+        <SarunFs as virtiofsd::filesystem::FileSystem>::unlink(&fs, ctx, entry.inode, &link_name)
+            .unwrap();
         <SarunFs as virtiofsd::filesystem::FileSystem>::unlink(
-            &fs, ctx, entry.inode, &link_name,
-        )
-        .unwrap();
-        <SarunFs as virtiofsd::filesystem::FileSystem>::unlink(
-            &fs, ctx, entry.inode, &hardlink_name,
+            &fs,
+            ctx,
+            entry.inode,
+            &hardlink_name,
         )
         .unwrap();
         let renamed_after_unlink =
-            <SarunFs as virtiofsd::filesystem::FileSystem>::getattr(
-                &fs, ctx, renamed.inode, None,
-            )
-            .unwrap()
-            .0;
+            <SarunFs as virtiofsd::filesystem::FileSystem>::getattr(&fs, ctx, renamed.inode, None)
+                .unwrap()
+                .0;
         assert_eq!(renamed_after_unlink.nlink, 1);
+        <SarunFs as virtiofsd::filesystem::FileSystem>::unlink(&fs, ctx, entry.inode, &fifo_name)
+            .unwrap();
         <SarunFs as virtiofsd::filesystem::FileSystem>::unlink(
-            &fs, ctx, entry.inode, &fifo_name,
-        )
-        .unwrap();
-        <SarunFs as virtiofsd::filesystem::FileSystem>::unlink(
-            &fs, ctx, entry.inode, &renamed_name,
+            &fs,
+            ctx,
+            entry.inode,
+            &renamed_name,
         )
         .unwrap();
         <SarunFs as virtiofsd::filesystem::FileSystem>::rmdir(
-            &fs, ctx, entry.inode, &directory_name,
+            &fs,
+            ctx,
+            entry.inode,
+            &directory_name,
         )
         .unwrap();
         let missing = <SarunFs as virtiofsd::filesystem::FileSystem>::lookup(
-            &fs, ctx, entry.inode, &renamed_name,
+            &fs,
+            ctx,
+            entry.inode,
+            &renamed_name,
         )
         .err()
         .unwrap();
         assert_eq!(missing.raw_os_error(), Some(libc::ENOENT));
 
-        let (attr, _) = <SarunFs as virtiofsd::filesystem::FileSystem>::getattr(
-            &fs,
-            ctx,
-            entry.inode,
-            None,
-        )
-        .unwrap();
+        let (attr, _) =
+            <SarunFs as virtiofsd::filesystem::FileSystem>::getattr(&fs, ctx, entry.inode, None)
+                .unwrap();
         assert_eq!(attr.ino, entry.inode);
-        <SarunFs as virtiofsd::filesystem::FileSystem>::forget(
-            &fs,
-            ctx,
-            entry.inode,
-            1,
-        );
+        <SarunFs as virtiofsd::filesystem::FileSystem>::forget(&fs, ctx, entry.inode, 1);
         assert_eq!(fs.inner.inodes.lookup_count(entry.inode), 0);
 
         // Independent canonical requests may be served by different FUSE,
@@ -4542,33 +4975,36 @@ mod chain_tests {
         // capture, and SQLite boundaries concurrently rather than only their
         // private unit-level locks.
         const PARALLEL_BYTES: [&[u8]; 8] = [
-            b"worker-0", b"worker-1", b"worker-2", b"worker-3",
-            b"worker-4", b"worker-5", b"worker-6", b"worker-7",
+            b"worker-0",
+            b"worker-1",
+            b"worker-2",
+            b"worker-3",
+            b"worker-4",
+            b"worker-5",
+            b"worker-6",
+            b"worker-7",
         ];
         let mut workers = Vec::new();
         let canonical_root =
-            <SarunFs as virtiofsd::filesystem::FileSystem>::lookup(
-                &fs, ctx, 1, &name,
-            )
-            .unwrap()
-            .inode;
+            <SarunFs as virtiofsd::filesystem::FileSystem>::lookup(&fs, ctx, 1, &name)
+                .unwrap()
+                .inode;
         for index in 0..8 {
             let fs = fs.clone();
             workers.push(std::thread::spawn(move || {
                 let name = CString::new(format!("parallel-{index}")).unwrap();
-                let (file, handle, _) =
-                    <SarunFs as virtiofsd::filesystem::FileSystem>::create(
-                        &fs,
-                        ctx,
-                        canonical_root,
-                        &name,
-                        0o600,
-                        false,
-                        libc::O_RDWR as u32,
-                        0,
-                        virtiofsd::filesystem::Extensions::default(),
-                    )
-                    .unwrap();
+                let (file, handle, _) = <SarunFs as virtiofsd::filesystem::FileSystem>::create(
+                    &fs,
+                    ctx,
+                    canonical_root,
+                    &name,
+                    0o600,
+                    false,
+                    libc::O_RDWR as u32,
+                    0,
+                    virtiofsd::filesystem::Extensions::default(),
+                )
+                .unwrap();
                 let handle = handle.unwrap();
                 let bytes = PARALLEL_BYTES[index];
                 <SarunFs as virtiofsd::filesystem::FileSystem>::write(
@@ -4601,41 +5037,34 @@ mod chain_tests {
             );
         }
 
-        let stat = <SarunFs as virtiofsd::filesystem::FileSystem>::statfs(
-            &fs, ctx, canonical_root,
-        )
-        .unwrap();
+        let stat = <SarunFs as virtiofsd::filesystem::FileSystem>::statfs(&fs, ctx, canonical_root)
+            .unwrap();
         assert!(stat.f_bsize > 0);
         assert!(stat.f_blocks >= stat.f_bfree);
 
         fs.add_box(Arc::new(BoxState::create(id + 2).unwrap()));
-        let (handle, _) = <SarunFs as virtiofsd::filesystem::FileSystem>::opendir(
-            &fs, ctx, 1, 0,
-        )
-        .unwrap();
+        let (handle, _) =
+            <SarunFs as virtiofsd::filesystem::FileSystem>::opendir(&fs, ctx, 1, 0).unwrap();
         let handle = handle.unwrap();
         fs.add_box(Arc::new(BoxState::create(id + 1).unwrap()));
-        let mut entries = <SarunFs as virtiofsd::filesystem::FileSystem>::readdir(
-            &fs, ctx, 1, handle, 4096, 0,
-        )
-        .unwrap();
+        let mut entries =
+            <SarunFs as virtiofsd::filesystem::FileSystem>::readdir(&fs, ctx, 1, handle, 4096, 0)
+                .unwrap();
         let first = virtiofsd::filesystem::DirectoryIterator::next(&mut entries).unwrap();
         assert_eq!(first.name.to_bytes(), id.to_string().as_bytes());
-        let snapshot_second =
-            virtiofsd::filesystem::DirectoryIterator::next(&mut entries).unwrap();
-        assert_eq!(snapshot_second.name.to_bytes(), (id + 2).to_string().as_bytes());
+        let snapshot_second = virtiofsd::filesystem::DirectoryIterator::next(&mut entries).unwrap();
+        assert_eq!(
+            snapshot_second.name.to_bytes(),
+            (id + 2).to_string().as_bytes()
+        );
         assert!(virtiofsd::filesystem::DirectoryIterator::next(&mut entries).is_none());
-        let mut resumed = <SarunFs as virtiofsd::filesystem::FileSystem>::readdir(
-            &fs, ctx, 1, handle, 4096, 1,
-        )
-        .unwrap();
+        let mut resumed =
+            <SarunFs as virtiofsd::filesystem::FileSystem>::readdir(&fs, ctx, 1, handle, 4096, 1)
+                .unwrap();
         let second = virtiofsd::filesystem::DirectoryIterator::next(&mut resumed).unwrap();
         assert_eq!(second.name.to_bytes(), (id + 2).to_string().as_bytes());
         assert!(virtiofsd::filesystem::DirectoryIterator::next(&mut resumed).is_none());
-        <SarunFs as virtiofsd::filesystem::FileSystem>::releasedir(
-            &fs, ctx, 1, 0, handle,
-        )
-        .unwrap();
+        <SarunFs as virtiofsd::filesystem::FileSystem>::releasedir(&fs, ctx, 1, 0, handle).unwrap();
 
         let _ = std::fs::remove_dir_all(tmp);
     }
@@ -4651,7 +5080,9 @@ mod chain_tests {
         std::fs::create_dir_all(&tmp).unwrap();
         std::fs::write(tmp.join("lower-victim"), b"lower-old").unwrap();
         // SAFETY: TEST_STATE_HOME_LOCK serializes state-home tests.
-        unsafe { std::env::set_var("XDG_STATE_HOME", &tmp); }
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", &tmp);
+        }
         std::fs::create_dir_all(crate::paths::state_home()).unwrap();
 
         let fs = SarunFs::new(tmp.clone());
@@ -4663,31 +5094,37 @@ mod chain_tests {
             pid: std::process::id() as i32,
         };
         let box_name = CString::new(id.to_string()).unwrap();
-        let root = <SarunFs as virtiofsd::filesystem::FileSystem>::lookup(
-            &fs, ctx, 1, &box_name,
-        )
-        .unwrap();
+        let root =
+            <SarunFs as virtiofsd::filesystem::FileSystem>::lookup(&fs, ctx, 1, &box_name).unwrap();
 
         // A lazy lower handle is privately materialized before unlink. Later
         // writes remain readable through the fd but neither touch the host nor
         // recreate the deleted namespace entry.
         let victim_name = CString::new("lower-victim").unwrap();
         let victim = <SarunFs as virtiofsd::filesystem::FileSystem>::lookup(
-            &fs, ctx, root.inode, &victim_name,
+            &fs,
+            ctx,
+            root.inode,
+            &victim_name,
         )
         .unwrap();
         let (victim_handle, _) = <SarunFs as virtiofsd::filesystem::FileSystem>::open(
-            &fs, ctx, victim.inode, false, libc::O_RDWR as u32,
+            &fs,
+            ctx,
+            victim.inode,
+            false,
+            libc::O_RDWR as u32,
         )
         .unwrap();
         let victim_handle = victim_handle.unwrap();
-        <SarunFs as virtiofsd::filesystem::FileSystem>::unlink(
-            &fs, ctx, root.inode, &victim_name,
-        )
-        .unwrap();
+        <SarunFs as virtiofsd::filesystem::FileSystem>::unlink(&fs, ctx, root.inode, &victim_name)
+            .unwrap();
         assert_eq!(
             <SarunFs as virtiofsd::filesystem::FileSystem>::lookup(
-                &fs, ctx, root.inode, &victim_name,
+                &fs,
+                ctx,
+                root.inode,
+                &victim_name,
             )
             .err()
             .unwrap()
@@ -4722,9 +5159,19 @@ mod chain_tests {
         )
         .unwrap();
         assert_eq!(&*detached_bytes.lock().unwrap(), b"PRIVATEld");
-        assert_eq!(std::fs::read(tmp.join("lower-victim")).unwrap(), b"lower-old");
+        assert_eq!(
+            std::fs::read(tmp.join("lower-victim")).unwrap(),
+            b"lower-old"
+        );
         <SarunFs as virtiofsd::filesystem::FileSystem>::release(
-            &fs, ctx, victim.inode, 0, victim_handle, false, false, None,
+            &fs,
+            ctx,
+            victim.inode,
+            0,
+            victim_handle,
+            false,
+            false,
+            None,
         )
         .unwrap();
         assert!(matches!(fs.resolve(id, "lower-victim"), Layer::Absent));
@@ -4789,13 +5236,19 @@ mod chain_tests {
         )
         .unwrap();
         let visible = <SarunFs as virtiofsd::filesystem::FileSystem>::lookup(
-            &fs, ctx, root.inode, &destination_name,
+            &fs,
+            ctx,
+            root.inode,
+            &destination_name,
         )
         .unwrap();
         assert_eq!(visible.inode, source.inode);
         assert_eq!(
             <SarunFs as virtiofsd::filesystem::FileSystem>::getattr(
-                &fs, ctx, destination.inode, Some(destination_handle),
+                &fs,
+                ctx,
+                destination.inode,
+                Some(destination_handle),
             )
             .unwrap()
             .0
@@ -4849,7 +5302,14 @@ mod chain_tests {
         )
         .unwrap();
         <SarunFs as virtiofsd::filesystem::FileSystem>::release(
-            &fs, ctx, source.inode, 0, source_handle, false, false, None,
+            &fs,
+            ctx,
+            source.inode,
+            0,
+            source_handle,
+            false,
+            false,
+            None,
         )
         .unwrap();
         assert_eq!(fs.box_read_file(id, "destination").unwrap(), b"RENAMED");
@@ -4872,7 +5332,9 @@ mod chain_tests {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o755)).unwrap();
         // SAFETY: TEST_STATE_HOME_LOCK serializes state-home tests.
-        unsafe { std::env::set_var("XDG_STATE_HOME", &tmp); }
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", &tmp);
+        }
         std::fs::create_dir_all(crate::paths::state_home()).unwrap();
 
         let fs = SarunFs::new(tmp.clone());
@@ -4883,8 +5345,12 @@ mod chain_tests {
 
         assert_eq!(fs.box_read_file(id, "init").unwrap(), b"target init");
         assert_eq!(fs.box_file_mode(id, "init"), Some(0o755));
-        assert!(fs.box_list_dir(id, "").unwrap().iter()
-            .any(|(name, kind)| name == "init" && *kind == 'f'));
+        assert!(
+            fs.box_list_dir(id, "")
+                .unwrap()
+                .iter()
+                .any(|(name, kind)| name == "init" && *kind == 'f')
+        );
         let error = fs.box_write_file(id, "init", b"overwrite").unwrap_err();
         assert_eq!(error.raw_os_error(), Some(libc::EROFS));
         assert!(state.kinds.read().unwrap().get("init").is_none());

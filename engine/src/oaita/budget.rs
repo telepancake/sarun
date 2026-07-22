@@ -35,7 +35,11 @@ const TURN_BUDGET_KEY: &str = "turn_budget";
 /// has no entry (= uncapped). `Some(n)` means it's been granted at
 /// some point and has `n` turns left. Live-or-at-rest aware.
 pub fn remaining(state: &crate::control::State, box_id: i64) -> Option<i64> {
-    let live = state.lock().unwrap().overlay.clone()
+    let live = state
+        .lock()
+        .unwrap()
+        .overlay
+        .clone()
         .and_then(|o| o.live_box(box_id));
     if let Some(b) = live {
         return b.get_meta(TURN_BUDGET_KEY).and_then(|s| s.parse().ok());
@@ -44,13 +48,21 @@ pub fn remaining(state: &crate::control::State, box_id: i64) -> Option<i64> {
     // uses elsewhere for at-rest meta writes (e.g. rename).
     let p = crate::paths::state_home().join(format!("{box_id}.sqlar"));
     let conn = rusqlite::Connection::open(&p).ok()?;
-    conn.query_row("SELECT value FROM meta WHERE key=?1", [TURN_BUDGET_KEY],
-                   |r| r.get::<_, String>(0)).ok()
-        .and_then(|s| s.parse().ok())
+    conn.query_row(
+        "SELECT value FROM meta WHERE key=?1",
+        [TURN_BUDGET_KEY],
+        |r| r.get::<_, String>(0),
+    )
+    .ok()
+    .and_then(|s| s.parse().ok())
 }
 
 fn write(state: &crate::control::State, box_id: i64, value: i64) {
-    let live = state.lock().unwrap().overlay.clone()
+    let live = state
+        .lock()
+        .unwrap()
+        .overlay
+        .clone()
         .and_then(|o| o.live_box(box_id));
     let s = value.to_string();
     if let Some(b) = live {
@@ -62,7 +74,8 @@ fn write(state: &crate::control::State, box_id: i64, value: i64) {
         let _ = c.execute(
             "INSERT INTO meta(key,value) VALUES(?1,?2)
              ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            params![TURN_BUDGET_KEY, s]);
+            params![TURN_BUDGET_KEY, s],
+        );
     }
 }
 
@@ -76,8 +89,12 @@ fn chain_of(state: &crate::control::State, box_id: i64) -> Vec<i64> {
     seen.insert(cur);
     for _ in 0..64 {
         let parent = parent_of(state, cur);
-        let Some(p) = parent else { break; };
-        if !seen.insert(p) { break; }
+        let Some(p) = parent else {
+            break;
+        };
+        if !seen.insert(p) {
+            break;
+        }
         chain.push(p);
         cur = p;
     }
@@ -85,16 +102,24 @@ fn chain_of(state: &crate::control::State, box_id: i64) -> Vec<i64> {
 }
 
 fn parent_of(state: &crate::control::State, box_id: i64) -> Option<i64> {
-    let live = state.lock().unwrap().overlay.clone()
+    let live = state
+        .lock()
+        .unwrap()
+        .overlay
+        .clone()
         .and_then(|o| o.live_box(box_id));
     if let Some(b) = live {
         return b.parent();
     }
     let p = crate::paths::state_home().join(format!("{box_id}.sqlar"));
     let conn = rusqlite::Connection::open(&p).ok()?;
-    conn.query_row("SELECT value FROM meta WHERE key='parent_box_id'", [],
-                   |r| r.get::<_, String>(0)).ok()
-        .and_then(|s| s.parse().ok())
+    conn.query_row(
+        "SELECT value FROM meta WHERE key='parent_box_id'",
+        [],
+        |r| r.get::<_, String>(0),
+    )
+    .ok()
+    .and_then(|s| s.parse().ok())
 }
 
 /// Grant `amount` more turns to `box_id`. Additive — resuming via
@@ -116,7 +141,9 @@ pub fn take_chain(state: &crate::control::State, box_id: i64) -> Result<(), i64>
     // hint, which is the one worth granting more to.
     for &b in chain.iter().rev() {
         if let Some(v) = remaining(state, b) {
-            if v <= 0 { return Err(b); }
+            if v <= 0 {
+                return Err(b);
+            }
         }
     }
     for &b in &chain {

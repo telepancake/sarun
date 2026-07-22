@@ -61,6 +61,7 @@ enum viros_probe_arch {
 	VIROS_PROBE_ARCH_AARCH64 = 1,
 	VIROS_PROBE_ARCH_ARM = 2,
 	VIROS_PROBE_ARCH_MIPS = 3,
+	VIROS_PROBE_ARCH_X86 = 4,
 };
 
 enum viros_probe_endian {
