@@ -1,11 +1,12 @@
 # ViroS integration with Sarun
 
 Sarun can run captured Linux firmware boot artifacts as a managed QEMU
-debugging session. Select either one combined image:
+debugging session. Select one captured initramfs or supported combined firmware
+artifact:
 
 ```sh
 sarun run --net off --qemu aarch64 --debug \
-  --image OPENWRT-BUILD bin/targets/.../firmware.img
+  --image OPENWRT-BUILD bin/targets/.../rootfs.cpio.gz
 ```
 
 or select the exact two files accepted by QEMU's direct Linux boot form:
@@ -22,11 +23,23 @@ host-path, debugger, Python, symbol, source, socket, sysroot, toolchain, or raw
 QEMU-argument options. The kernel and initramfs form is a closed pair: neither
 half is accepted alone or together with `--image`.
 
-Sarun resolves the files from their owning captured layers, follows their
-recorded build ancestry for matching debugger resources and source, and uses
-the named `viros-debug` provider from `VIROS-DEBUG`. It rechecks size and
-SHA-256 immediately before sealing the selected files and passing their file
-descriptors to QEMU. The selected initramfs is not repacked or substituted.
+Sarun resolves the files from their owning captured layers and uses the
+matching prevalidated kernel debugger bundle and source already published in
+that captured context, together with the named `viros-debug` provider from
+`VIROS-DEBUG`. It rechecks size and SHA-256 immediately before handoff. If the
+single selected file already matches a published image-bundle initramfs, that
+bundle is used directly. Otherwise the engine sends the exact selected
+identity, its finite build-record ancestry, and the resolved kernel bundle to
+the provider through a private service-box capsule. The provider extracts the
+selected initramfs, constructs the userspace catalog, and atomically publishes
+the generated bundle back into that child box. No host path or environment
+selector participates in this exchange.
+
+A combined image that carries a kernel is accepted only when that kernel's
+SHA-256 matches the boot image associated with the resolved `vmlinux`.
+Currently the generated boot form must yield an executable newc initramfs;
+recognized firmware containers that contain only a disk/rootfs remain
+unsuitable for these fixed direct-kernel profiles.
 
 Run the command from the Sarun TUI. When the provider is ready, the engine
 opens its already-running GDB PTY in the TUI; F11 embeds that terminal in the
@@ -39,10 +52,9 @@ initramfs…**, then choose the fixed machine architecture.
 
 The selected kernel must match the boot-image SHA-256 in the kernel debugger
 bundle visible from the captured build context; this is what prevents GDB from
-loading a different `vmlinux`. A separate image bundle is not required merely
-to boot the pair and debug the kernel. When an image bundle whose initramfs hash
-also matches is present, its build-ID catalog supplies the automatic userspace
-inferiors and symbols; a nonmatching catalog is deliberately not loaded.
+loading a different `vmlinux`. A separately published image bundle is not
+required: when no exact one exists, the same transactional provider path
+derives it from the selected initramfs and finite provenance catalog.
 
 ## Install the provider box
 
@@ -110,26 +122,33 @@ manual `directory` or `set substitute-path` step.
 
 The engine performs this sequence:
 
-1. Resolve and validate the unique named provider, kernel bundle, image
-   manifest, boot image, initramfs, call-gate manifest, GDB loader, and
-   userspace catalog.
-2. Re-read immutable artifacts from their owning boxes and verify size and
-   SHA-256 before converting the boot artifacts to sealed descriptors.
-3. Start the ViroS facade with an inherited QEMU RSP stream and attach the
-   selected build box read-only.
-4. Start GDB in an engine-owned PTY and pass it a typed, terminal-safe start
+1. Resolve and validate the unique named provider and architecture-matching
+   kernel bundle.
+2. Re-read the selected boot artifact and its finite build ancestry from their
+   owning boxes and verify their identities.
+3. Reuse an exact image bundle when present; otherwise prepare and commit one
+   in an ephemeral provider child, then validate every returned manifest and
+   artifact again through the ordinary engine bundle validators.
+4. Start the ViroS facade with the inherited QEMU RSP stream and attach the
+   selected build context read-only.
+5. Start GDB in an engine-owned PTY and pass it a typed, terminal-safe start
    record. The client revalidates each debug ELF's size, SHA-256, ELF
    class/machine, and GNU build ID.
-5. Connect GDB through the engine-issued raw service. Only after the facade
+6. Connect GDB through the engine-issued raw service. Only after the facade
    and managed client are ready does Sarun release the debug barrier.
-6. Associate each observed Linux process inferior with its cataloged guest
+7. Associate each observed Linux process inferior with its cataloged guest
    executable and exact debug ELF. Kernel symbols remain available as a
    separate GDB inferior.
 
 For Sarun's ordinary x86-64 and AArch64 appliance mode, PID 1 waits before it
-spawns the requested command. For a published firmware initramfs, QEMU starts
-at its reset stop and GDB's first continue boots the manifest's declared
-`rdinit`.
+spawns the requested command. For a published firmware initramfs, the provider
+owns the reset-stopped QEMU long enough to reach an exact first-userspace
+boundary from the matching `vmlinux` (`start_thread`, `compat_start_thread`,
+or `ret_to_user`). It then removes its bootstrap breakpoints, discovers the
+initial tasks, and publishes the GDB service. GDB therefore opens with the
+declared `rdinit` stopped at that boundary rather than with the CPU at reset.
+The fixed boot profiles pass `nokaslr`, so the published kernel symbols remain
+valid throughout this handoff.
 
 ## Fixed machine profiles
 
@@ -150,7 +169,9 @@ different board shape needs another explicit, fixed ViroS profile.
 
 Kernel and Linux processes are presented through GDB's multiprocess model.
 Fatal userspace signals and kernel-die stops require the matching built-in
-ViroS event support from the exact kernel bundle.
+ViroS event support from the exact kernel bundle. New bundles fail construction
+unless that event boundary and the architecture's first-userspace boundary are
+present.
 
 Automatic association currently covers the main executable of each process
 whose rootfs build ID has one unique unstripped match in the captured build

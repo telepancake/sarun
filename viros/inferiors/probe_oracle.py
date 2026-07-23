@@ -96,6 +96,7 @@ class ProbeOracle:
                 # Probe v1 reports a kernel VA for mm->pgd.  Do not present it
                 # as a usable physical page-table root before translation.
                 page_table_root=None,
+                address_space_cookie=record.mm,
             ))
         self._generation += 1
         self._pgd_kernel_va = pgds

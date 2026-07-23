@@ -43,13 +43,16 @@ mod action_help;
 mod appliance;
 mod attach;
 mod browser;
+mod debug_provider_handshake;
 mod debug_resources;
 mod debug_session;
 #[allow(dead_code)]
 mod dockerfile;
 mod editor;
 mod frames;
+#[cfg(target_os = "linux")]
 mod fuse_broker;
+#[cfg(target_os = "linux")]
 mod fuse_transport;
 #[allow(dead_code)]
 mod generated_wire;
@@ -74,11 +77,19 @@ mod review;
 mod rules;
 mod runner;
 mod sarunfs;
+#[cfg(target_os = "linux")]
+mod selfbt;
+#[cfg(target_os = "macos")]
+#[path = "selfbt_macos.rs"]
 mod selfbt;
 mod sixel;
 mod slippool;
 mod socket_wire;
 mod sud;
+#[cfg(target_os = "linux")]
+mod sud_ring;
+#[cfg(target_os = "macos")]
+#[path = "sud_ring_macos.rs"]
 mod sud_ring;
 mod sudwire;
 mod ui;
@@ -197,6 +208,7 @@ fn serve() -> i32 {
             return 1;
         }
     };
+    #[cfg(target_os = "linux")]
     if let Err(e) = paths::recover_legacy_host_visible_fuse_mount() {
         eprintln!("sarun-engine: cannot recover legacy FUSE mount: {e}");
         return 1;
@@ -211,9 +223,11 @@ fn serve() -> i32 {
     // workers or the control accept loop start.
     let mnt = paths::mnt_point();
     let ov = sarunfs::SarunFs::new(PathBuf::from("/"));
+    #[cfg(target_os = "linux")]
     let n = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
+    #[cfg(target_os = "linux")]
     let session = match fuse_broker::BrokeredFuseSession::mount_sarun(ov.clone(), &mnt, n) {
         Ok(s) => s,
         Err(e) => {
@@ -401,6 +415,7 @@ fn serve() -> i32 {
     };
     LISTENER_FOR_SIGNAL.store(-1, Ordering::Release);
     control::terminate_runners(&state);
+    #[cfg(target_os = "linux")]
     if let Err(error) = session.unmount() {
         eprintln!("sarun-engine: overlay unmount failed: {error}");
     }
@@ -531,12 +546,14 @@ fn driver_invocation() -> Option<i32> {
 fn main() {
     // The target-architecture build is also the appliance's /init.  PID 1 is
     // an unambiguous role selector and must not initialize the Prolog runtime.
+    #[cfg(target_os = "linux")]
     if unsafe { libc::getpid() } == 1 {
         std::process::exit(appliance::init_main());
     }
     let argv: Vec<String> = std::env::args().skip(1).collect();
     // The mount-owner is a deliberately tiny role that must unshare while it
     // is still single-threaded and must never initialize Prolog.
+    #[cfg(target_os = "linux")]
     if fuse_broker::is_child_command(&argv) {
         std::process::exit(fuse_broker::child_main());
     }
@@ -544,6 +561,7 @@ fn main() {
     // single-threaded process.  Ordinary invocations do nothing here; a runner
     // that discovered it lacked CAP_NET_ADMIN self-execs once with the private
     // marker consumed by this call.
+    #[cfg(target_os = "linux")]
     if let Err(error) = net::tap::prepare_early_tap() {
         eprintln!("sarun-engine: early Tap setup failed: {error}");
         std::process::exit(1);
@@ -552,6 +570,7 @@ fn main() {
     // then its mount namespace before the parser can start a worker. This
     // preserves the runner process, foreground group, stdio and signal path;
     // bwrap later creates the required child user namespace in the usual way.
+    #[cfg(target_os = "linux")]
     if fuse_broker::is_top_level_fuse_run(&argv) {
         if let Err(error) = fuse_broker::enter_runner_namespace() {
             eprintln!("sarun-engine: cannot enter private FUSE namespace: {error}");

@@ -1,0 +1,10 @@
+--- a/arch/x86/Kconfig
++++ b/arch/x86/Kconfig
+@@ -269,5 +269,6 @@ config X86
+ 	select HAVE_NOINSTR_HACK		if HAVE_OBJTOOL
+ 	select HAVE_NMI
+ 	select HAVE_NOINSTR_VALIDATION		if HAVE_OBJTOOL
+-	select HAVE_OBJTOOL			if X86_64
++	# Darwin host builds lack Linux libelf; objtool is build-time validation.
++	# Linux-hosted appliance builds retain the upstream selection unchanged.
+ 	select HAVE_OPTPROBES

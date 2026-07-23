@@ -70,22 +70,37 @@ pub struct Shared {
 
 /// Open a pidfd for `pid` (>=0 on success). A live `pid` yields a valid fd; a
 /// dead one fails (ESRCH). The caller closes it. Reused as a liveness probe.
+#[cfg(target_os = "linux")]
 pub(crate) fn pidfd_open(pid: i32) -> i32 {
     unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) as i32 }
 }
 
+#[cfg(target_os = "macos")]
+pub(crate) fn pidfd_open(_pid: i32) -> i32 {
+    -1
+}
+
 /// True if `pid` (a HOST pid/tgid) is currently alive — a pidfd probe.
 pub(crate) fn pid_alive(pid: i32) -> bool {
-    let fd = pidfd_open(pid);
-    if fd >= 0 {
-        unsafe {
-            libc::close(fd);
+    #[cfg(target_os = "linux")]
+    {
+        let fd = pidfd_open(pid);
+        if fd >= 0 {
+            unsafe {
+                libc::close(fd);
+            }
+            true
+        } else {
+            false
         }
-        true
-    } else {
-        false
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let result = unsafe { libc::kill(pid, 0) };
+        result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
     }
 }
+#[cfg(target_os = "linux")]
 fn pidfd_signal(pidfd: i32, sig: i32) {
     unsafe {
         libc::syscall(
@@ -101,6 +116,7 @@ fn pidfd_signal(pidfd: i32, sig: i32) {
 /// Stop every live runner before the engine tears down shared transports.
 /// Waiting on pidfds is namespace-safe and also gives bubblewrap's
 /// `--die-with-parent` children time to release the broker mount namespace.
+#[cfg(target_os = "linux")]
 pub fn terminate_runners(state: &State) {
     let fds: Vec<i32> = lock(state).box_pids.values().copied().collect();
     for &fd in &fds {
@@ -112,6 +128,55 @@ pub fn terminate_runners(state: &State) {
         pidfd_signal(fd, libc::SIGKILL);
     }
     wait_pidfds(&remaining, 3000);
+}
+
+#[cfg(target_os = "macos")]
+pub fn terminate_runners(state: &State) {
+    let pids: Vec<i32> = lock(state).box_runpids.values().copied().collect();
+    for &pid in &pids {
+        unsafe { libc::kill(pid, libc::SIGTERM) };
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while pids.iter().copied().any(pid_alive) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    for pid in pids.into_iter().filter(|pid| pid_alive(*pid)) {
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+    }
+}
+
+fn signal_box(state: &State, box_id: i64, signal: i32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let Some(handle) = lock(state).box_pids.get(&box_id).copied() else {
+            return false;
+        };
+        pidfd_signal(handle, signal);
+        true
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let Some(pid) = lock(state).box_runpids.get(&box_id).copied() else {
+            return false;
+        };
+        unsafe { libc::kill(pid, signal) == 0 }
+    }
+}
+
+fn signal_all_boxes(state: &State, signal: i32) {
+    #[cfg(target_os = "linux")]
+    for handle in lock(state).box_pids.values().copied().collect::<Vec<_>>() {
+        pidfd_signal(handle, signal);
+    }
+    #[cfg(target_os = "macos")]
+    for pid in lock(state)
+        .box_runpids
+        .values()
+        .copied()
+        .collect::<Vec<_>>()
+    {
+        unsafe { libc::kill(pid, signal) };
+    }
 }
 
 fn pidfd_exited(fd: i32) -> bool {
@@ -156,6 +221,7 @@ fn wait_pidfds(fds: &[i32], timeout_ms: i32) {
 /// ("Pid:" line; its FIRST field is the pid in our (init) namespace). 0 on any
 /// failure. This is the wrap-immune identity path — the pidfd names one exact
 /// process incarnation, so a reused pid can never alias a finished runner.
+#[cfg(target_os = "linux")]
 pub(crate) fn host_pid_from_pidfd(pidfd: i32) -> i32 {
     let Ok(s) = std::fs::read_to_string(format!("/proc/self/fdinfo/{pidfd}")) else {
         return 0;
@@ -169,6 +235,13 @@ pub(crate) fn host_pid_from_pidfd(pidfd: i32) -> i32 {
                 .unwrap_or(0);
         }
     }
+    0
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn host_pid_from_pidfd(_liveness_fd: i32) -> i32 {
+    // macOS has no PID namespaces. Registration falls back to the runner's
+    // getpid while retaining this descriptor as its race-free exit watch.
     0
 }
 
@@ -303,6 +376,7 @@ fn thread_backtraces(pids: &[i32], depth: usize) -> std::collections::HashMap<i3
 /// the runner opened) and parse the blocks back. `rp` is the box's runner host
 /// pid (the sink-file key); `box_pids` its process set. Empty map when the box
 /// predates this mechanism (no sink) or nothing on-CPU answered.
+#[cfg(target_os = "linux")]
 fn selfbt_backtraces(rp: i32, box_pids: &[i32]) -> std::collections::HashMap<i32, Vec<String>> {
     let mut out = std::collections::HashMap::new();
     let path = crate::selfbt::sink_path(rp);
@@ -388,6 +462,11 @@ fn selfbt_backtraces(rp: i32, box_pids: &[i32]) -> std::collections::HashMap<i32
         }
     }
     out
+}
+
+#[cfg(target_os = "macos")]
+fn selfbt_backtraces(_rp: i32, _box_pids: &[i32]) -> std::collections::HashMap<i32, Vec<String>> {
+    std::collections::HashMap::new()
 }
 
 /// Symbolize a captured chain of absolute return addresses against the engine's
@@ -528,6 +607,7 @@ fn box_text_range(pid: i32) -> (u64, u64) {
 /// read its registers and stack memory from outside, walk the frame pointers,
 /// and symbolize offline. Reads absolute addresses; sarun is ET_EXEC so those
 /// are ELF vaddrs. Best-effort: a thread we can't seize is simply skipped.
+#[cfg(target_os = "linux")]
 fn ptrace_backtraces(box_pids: &[i32]) -> std::collections::HashMap<i32, Vec<String>> {
     use std::os::unix::fs::FileExt;
     const PTRACE_SEIZE: i32 = 0x4206;
@@ -639,6 +719,11 @@ fn ptrace_backtraces(box_pids: &[i32]) -> std::collections::HashMap<i32, Vec<Str
         }
     }
     out
+}
+
+#[cfg(target_os = "macos")]
+fn ptrace_backtraces(_box_pids: &[i32]) -> std::collections::HashMap<i32, Vec<String>> {
+    std::collections::HashMap::new()
 }
 
 /// PPid of `pid` from /proc/<pid>/status (host namespace); 0 if unreadable.
@@ -1499,12 +1584,11 @@ pub fn broadcast(state: &State, event: &crate::generated_wire::SubscriptionEvent
     });
 }
 
-/// Peek the SCM_RIGHTS fds sent with the connection's first bytes (the register
-/// handshake carries the runner's pidfd, and for a `tap` box ALSO the runner's
-/// optional transport descriptors after it). Keep the first five in order and
-/// close any extras.
-/// MSG_PEEK leaves the data bytes queued for the BufReader, and the real
-/// (no-ancillary) read later discards the duplicate fd delivery.
+/// Receive the SCM_RIGHTS fds attached to a registration. Descriptor-bearing
+/// registrations begin with a sacrificial marker byte. Peek only that data byte
+/// to distinguish them from ordinary requests, then consume the marker and its
+/// descriptors with one real recvmsg. The actual request remains queued for the
+/// existing parser on every supported host.
 fn recv_first_fd(
     conn: &UnixStream,
 ) -> (
@@ -1514,10 +1598,9 @@ fn recv_first_fd(
     Option<i32>,
     Option<i32>,
 ) {
-    // Wait (bounded) for the first bytes to arrive before peeking: the runner's
+    // Wait (bounded) for the first byte to arrive before peeking: the runner's
     // sendmsg may still be in flight when we accept, and a non-blocking peek
-    // that races ahead of it would miss the pidfd — dropping a nested box's
-    // only correct host-pid source. poll for readability, then a blocking peek.
+    // that races ahead of it would miss the registration marker.
     let fd = conn.as_raw_fd();
     let mut pfd = libc::pollfd {
         fd,
@@ -1528,8 +1611,13 @@ fn recv_first_fd(
     if pr <= 0 {
         return (None, None, None, None, None);
     }
-    let mut fdbuf = [0i32; 8];
     let mut io = [0u8; 1];
+    let peeked = unsafe { libc::recv(fd, io.as_mut_ptr().cast(), io.len(), libc::MSG_PEEK) };
+    if peeked != 1 || io[0] != crate::frames::REGISTER_FD_MARKER {
+        return (None, None, None, None, None);
+    }
+
+    let mut fdbuf = [0i32; 8];
     let mut iov = libc::iovec {
         iov_base: io.as_mut_ptr().cast(),
         iov_len: 1,
@@ -1542,8 +1630,8 @@ fn recv_first_fd(
     // msg_controllen is socklen_t (u32) on glibc but size_t (usize) on musl;
     // `as _` picks the field's type on each target.
     msg.msg_controllen = cmsg.len() as _;
-    let n = unsafe { libc::recvmsg(fd, &mut msg, libc::MSG_PEEK) };
-    if n < 0 {
+    let n = unsafe { libc::recvmsg(fd, &mut msg, 0) };
+    if n != 1 || io[0] != crate::frames::REGISTER_FD_MARKER {
         return (None, None, None, None, None);
     }
     // Keep up to FIVE fds in order: [pidfd, then optionally a TAP fd, then
@@ -1588,6 +1676,46 @@ fn recv_first_fd(
         }
     }
     (first, second, third, fourth, fifth)
+}
+
+#[cfg(test)]
+mod registration_descriptor_tests {
+    use super::*;
+    use std::io::Read;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::net::UnixDatagram;
+
+    #[test]
+    fn descriptor_marker_is_consumed_and_request_bytes_remain() {
+        let (sender, mut receiver) = UnixStream::pair().unwrap();
+        let (liveness_sent, _liveness_peer) = UnixDatagram::pair().unwrap();
+        let (packet_sent, packet_peer) = UnixDatagram::pair().unwrap();
+        let request = b"registration-request";
+
+        assert!(crate::runner::send_register_fds(
+            &sender,
+            request,
+            liveness_sent.as_raw_fd(),
+            Some(packet_sent.as_raw_fd()),
+            None,
+            None,
+            None,
+        ));
+
+        let (liveness, packet, third, fourth, fifth) = recv_first_fd(&receiver);
+        assert!(liveness.is_some());
+        assert!(third.is_none() && fourth.is_none() && fifth.is_none());
+        let packet = unsafe { UnixDatagram::from_raw_fd(packet.unwrap()) };
+        packet_peer.send(b"ethernet-frame").unwrap();
+        let mut frame = [0u8; 32];
+        let length = packet.recv(&mut frame).unwrap();
+        assert_eq!(&frame[..length], b"ethernet-frame");
+
+        let mut received = vec![0u8; request.len()];
+        receiver.read_exact(&mut received).unwrap();
+        assert_eq!(received, request);
+        unsafe { libc::close(liveness.unwrap()) };
+    }
 }
 
 fn first_data_byte(conn: &UnixStream) -> Option<u8> {
@@ -1728,7 +1856,7 @@ fn handle_binary_request(
             return;
         }
     };
-    let selected_pair = match selected_kernel_initramfs_payload(&state, &request, id) {
+    let selected_payload = match selected_boot_payload(&state, &request, id) {
         Ok(value) => value,
         Err(error) => {
             if let Some(overlay) = lock(&state).overlay.clone() {
@@ -1753,7 +1881,7 @@ fn handle_binary_request(
         }
     };
     let mut debug_launch = match debug_resources {
-        Some(resources) => match prepare_debug_launch(&state, id, resources, selected_pair) {
+        Some(resources) => match prepare_debug_launch(&state, id, resources, selected_payload) {
             Ok(value) => Some(value),
             Err(error) => {
                 if let Some(overlay) = lock(&state).overlay.clone() {
@@ -2866,12 +2994,9 @@ fn dispatch_action(
         }
         ActionRequest::Kill { sid } => {
             let id = existing_box_id(sid)?;
-            let pidfd = lock(state)
-                .box_pids
-                .get(&id)
-                .copied()
-                .ok_or("box not running")?;
-            pidfd_signal(pidfd, libc::SIGTERM);
+            if !signal_box(state, id, libc::SIGTERM) {
+                return Err("box not running".into());
+            }
             Ok(ActionSuccess::Kill { value: () })
         }
         ActionRequest::Rotate { sid } => {
@@ -3387,10 +3512,7 @@ fn dispatch_action(
             Ok(ActionSuccess::ViewClose { value: () })
         }
         ActionRequest::Quit => {
-            let fds: Vec<i32> = lock(state).box_pids.values().copied().collect();
-            for fd in fds {
-                pidfd_signal(fd, libc::SIGTERM);
-            }
+            signal_all_boxes(state, libc::SIGTERM);
             unsafe {
                 libc::kill(libc::getpid(), libc::SIGTERM);
             }
@@ -5259,7 +5381,6 @@ fn resolve_debug_service_launch(
     let TransportRequest::Register {
         architecture,
         debug_mode,
-        selected_boot,
         ..
     } = request
     else {
@@ -5276,23 +5397,6 @@ fn resolve_debug_service_launch(
             let resources =
                 crate::debug_resources::resolve_debug_resources(&overlay, box_id, architecture)
                     .map_err(|error| error.to_string())?;
-            let has_selected_pair = matches!(
-                selected_boot,
-                Some(crate::generated_wire::SelectedBoot::KernelInitramfs { .. })
-            );
-            if !has_selected_pair
-                && matches!(
-                    architecture,
-                    crate::generated_wire::QemuArchitecture::Arm
-                        | crate::generated_wire::QemuArchitecture::Mmips
-                )
-                && resources.image.is_none()
-            {
-                return Err(format!(
-                    "qemu {} debugging requires a matching image bundle or selected kernel/initramfs pair",
-                    crate::appliance::architecture_name(architecture)
-                ));
-            }
             Ok(Some(resources))
         }
     }
@@ -5317,16 +5421,27 @@ struct PreparedGuestImage {
     start: crate::generated_wire::DebugGuestImageStart,
 }
 
-struct SelectedKernelInitramfsPayload {
-    kernel: Vec<u8>,
-    initramfs: Vec<u8>,
+enum SelectedBootPayload {
+    Image(SelectedArtifactPayload),
+    KernelInitramfs {
+        kernel: SelectedArtifactPayload,
+        initramfs: SelectedArtifactPayload,
+    },
+}
+
+#[derive(Clone)]
+struct SelectedArtifactPayload {
+    source_box: i64,
+    path: String,
+    bytes: Vec<u8>,
+    sha256: [u8; 32],
 }
 
 fn read_registered_boot_artifact(
     overlay: &crate::overlay::Overlay,
     consumer_box: i64,
     role: &str,
-) -> Result<Vec<u8>, String> {
+) -> Result<SelectedArtifactPayload, String> {
     let consumer = overlay
         .box_of(consumer_box)
         .ok_or_else(|| format!("selected boot box {consumer_box} is unavailable"))?;
@@ -5349,35 +5464,45 @@ fn read_registered_boot_artifact(
     if contents.len() as u64 != expected_size {
         return Err(format!("selected {role} changed size before QEMU handoff"));
     }
-    if format!("{:x}", sha2::Sha256::digest(&contents)) != expected_sha256 {
+    let digest = sha2::Sha256::digest(&contents);
+    if format!("{digest:x}") != expected_sha256 {
         return Err(format!(
             "selected {role} changed content before QEMU handoff"
         ));
     }
-    Ok(contents)
+    Ok(SelectedArtifactPayload {
+        source_box,
+        path,
+        bytes: contents,
+        sha256: digest.into(),
+    })
 }
 
-fn selected_kernel_initramfs_payload(
+fn selected_boot_payload(
     state: &State,
     request: &crate::generated_wire::TransportRequest,
     consumer_box: i64,
-) -> Result<Option<SelectedKernelInitramfsPayload>, String> {
+) -> Result<Option<SelectedBootPayload>, String> {
     let crate::generated_wire::TransportRequest::Register { selected_boot, .. } = request else {
         return Err("selected boot payload requires a register request".into());
     };
-    if !matches!(
-        selected_boot,
-        Some(crate::generated_wire::SelectedBoot::KernelInitramfs { .. })
-    ) {
+    let Some(selected_boot) = selected_boot else {
         return Ok(None);
-    }
+    };
     let overlay = lock(state)
         .overlay
         .clone()
         .ok_or("overlay is unavailable")?;
-    Ok(Some(SelectedKernelInitramfsPayload {
-        kernel: read_registered_boot_artifact(&overlay, consumer_box, "kernel")?,
-        initramfs: read_registered_boot_artifact(&overlay, consumer_box, "initramfs")?,
+    Ok(Some(match selected_boot {
+        crate::generated_wire::SelectedBoot::Image { .. } => SelectedBootPayload::Image(
+            read_registered_boot_artifact(&overlay, consumer_box, "image")?,
+        ),
+        crate::generated_wire::SelectedBoot::KernelInitramfs { .. } => {
+            SelectedBootPayload::KernelInitramfs {
+                kernel: read_registered_boot_artifact(&overlay, consumer_box, "kernel")?,
+                initramfs: read_registered_boot_artifact(&overlay, consumer_box, "initramfs")?,
+            }
+        }
     }))
 }
 
@@ -5414,74 +5539,578 @@ impl Drop for OwnedManagedDebugClient {
 }
 
 fn sealed_debug_artifact(bytes: &[u8]) -> Result<std::fs::File, String> {
-    let name = std::ffi::CStr::from_bytes_with_nul(b"sarun-debug-artifact\0").unwrap();
-    let fd =
-        unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING) };
-    if fd < 0 {
-        return Err(format!(
-            "create debug artifact descriptor: {}",
-            std::io::Error::last_os_error()
-        ));
+    #[cfg(target_os = "linux")]
+    {
+        let name = std::ffi::CStr::from_bytes_with_nul(b"sarun-debug-artifact\0").unwrap();
+        let fd = unsafe {
+            libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING)
+        };
+        if fd < 0 {
+            return Err(format!(
+                "create debug artifact descriptor: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+        file.write_all(bytes)
+            .map_err(|error| format!("write debug artifact descriptor: {error}"))?;
+        file.seek(SeekFrom::Start(0))
+            .map_err(|error| format!("rewind debug artifact descriptor: {error}"))?;
+        let seals =
+            libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
+        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_ADD_SEALS, seals) } < 0 {
+            return Err(format!(
+                "seal debug artifact descriptor: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(file)
     }
-    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
-    file.write_all(bytes)
-        .map_err(|error| format!("write debug artifact descriptor: {error}"))?;
-    file.seek(SeekFrom::Start(0))
-        .map_err(|error| format!("rewind debug artifact descriptor: {error}"))?;
-    let seals = libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
-    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_ADD_SEALS, seals) } < 0 {
-        return Err(format!(
-            "seal debug artifact descriptor: {}",
-            std::io::Error::last_os_error()
-        ));
+
+    #[cfg(target_os = "macos")]
+    {
+        let live = crate::paths::live_home();
+        std::fs::create_dir_all(&live)
+            .map_err(|error| format!("create debug artifact store: {error}"))?;
+        let mut template = live
+            .join(".debug-artifact.XXXXXX")
+            .as_os_str()
+            .as_bytes()
+            .to_vec();
+        template.push(0);
+        let fd = unsafe { libc::mkstemp(template.as_mut_ptr().cast()) };
+        if fd < 0 {
+            return Err(format!(
+                "create debug artifact descriptor: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        unsafe {
+            libc::unlink(template.as_ptr().cast());
+            let flags = libc::fcntl(fd, libc::F_GETFD);
+            if flags >= 0 {
+                libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+            }
+        }
+        let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+        file.write_all(bytes)
+            .map_err(|error| format!("write debug artifact descriptor: {error}"))?;
+        file.seek(SeekFrom::Start(0))
+            .map_err(|error| format!("rewind debug artifact descriptor: {error}"))?;
+        Ok(file)
     }
-    Ok(file)
+}
+
+fn send_debug_provider_start(
+    qemu_endpoint: &mut UnixStream,
+    start: &crate::generated_wire::DebugProviderStart,
+) -> Result<(), String> {
+    // `qemu_endpoint` is the endpoint retained for QEMU. Bytes written here
+    // are readable only from the opposite endpoint inherited by the provider.
+    // Writing the prelude to the provider endpoint itself would instead put
+    // it in QEMU's receive queue and leave the provider waiting forever.
+    crate::socket_wire::write_versioned(qemu_endpoint, start)
+        .and_then(|()| qemu_endpoint.flush())
+        .map_err(|error| format!("send debug provider start: {error}"))
+}
+
+fn artifact_matches_selected_bytes(
+    artifact: &crate::debug_resources::ArtifactDescriptor,
+    selected: Option<&[u8]>,
+) -> bool {
+    selected.is_none_or(|contents| {
+        contents.len() as u64 == artifact.size
+            && <[u8; 32]>::from(sha2::Sha256::digest(contents)) == artifact.sha256
+    })
+}
+
+fn debug_architecture_name(architecture: crate::generated_wire::QemuArchitecture) -> &'static str {
+    match architecture {
+        crate::generated_wire::QemuArchitecture::Aarch64 => "aarch64",
+        crate::generated_wire::QemuArchitecture::X8664 => "x86_64",
+        crate::generated_wire::QemuArchitecture::Arm => "arm",
+        crate::generated_wire::QemuArchitecture::Mmips => "mmips",
+    }
+}
+
+fn preparation_artifact(
+    overlay: &crate::overlay::Overlay,
+    box_id: i64,
+    path: &str,
+    roles: Vec<String>,
+    architecture: Option<&str>,
+) -> Result<
+    (
+        crate::debug_provider_handshake::CapturedArtifact,
+        ComposedServiceFile,
+    ),
+    String,
+> {
+    let box_id_wire =
+        u64::try_from(box_id).map_err(|_| format!("artifact box id {box_id} is invalid"))?;
+    let bytes = overlay
+        .box_read_file(box_id, path)
+        .map_err(|error| format!("read preparation artifact box {box_id}:{path}: {error}"))?;
+    let sha256: [u8; 32] = sha2::Sha256::digest(&bytes).into();
+    let digest = format!("{:x}", sha2::Sha256::digest(&bytes));
+    let artifact = crate::debug_provider_handshake::CapturedArtifact {
+        box_id: box_id_wire,
+        path: path.to_owned(),
+        size: bytes.len() as u64,
+        sha256,
+        record_id: format!("box:{box_id}:{path}:{digest}"),
+        roles,
+        architecture: architecture.map(str::to_owned),
+    };
+    let file = ComposedServiceFile::new(format!(".viros-input/boxes/{box_id}/{path}"), bytes)?;
+    Ok((artifact, file))
+}
+
+fn selected_preparation_artifact(
+    selected: &SelectedArtifactPayload,
+    role: &str,
+    architecture: &str,
+) -> Result<
+    (
+        crate::debug_provider_handshake::CapturedArtifact,
+        ComposedServiceFile,
+    ),
+    String,
+> {
+    let box_id = u64::try_from(selected.source_box).map_err(|_| {
+        format!(
+            "selected artifact box id {} is invalid",
+            selected.source_box
+        )
+    })?;
+    let digest = format!("{:x}", sha2::Sha256::digest(&selected.bytes));
+    let artifact = crate::debug_provider_handshake::CapturedArtifact {
+        box_id,
+        path: selected.path.clone(),
+        size: selected.bytes.len() as u64,
+        sha256: selected.sha256,
+        record_id: format!("box:{}:{}:{digest}", selected.source_box, selected.path),
+        roles: vec![role.to_owned()],
+        architecture: Some(architecture.to_owned()),
+    };
+    let file = ComposedServiceFile::new(
+        format!(
+            ".viros-input/boxes/{}/{}",
+            selected.source_box, selected.path
+        ),
+        selected.bytes.clone(),
+    )?;
+    Ok((artifact, file))
+}
+
+fn selected_preparation_inputs(
+    overlay: &crate::overlay::Overlay,
+    selected: &SelectedBootPayload,
+    architecture: crate::generated_wire::QemuArchitecture,
+    kernel_bundle: &crate::debug_resources::ResolvedKernelBundle,
+) -> Result<
+    (
+        crate::debug_provider_handshake::PrepareRequest,
+        Vec<ComposedServiceFile>,
+        Vec<i64>,
+    ),
+    String,
+> {
+    use crate::debug_provider_handshake::SelectedBoot;
+    use crate::image_provenance::ArtifactKind;
+
+    let architecture_name = debug_architecture_name(architecture);
+    let mut files = std::collections::BTreeMap::<String, ComposedServiceFile>::new();
+    let mut attachments = Vec::<i64>::new();
+    let add_attachment = |attachments: &mut Vec<i64>, box_id| {
+        if !attachments.contains(&box_id) {
+            attachments.push(box_id);
+        }
+    };
+    let mut catalog = std::collections::BTreeMap::<
+        (u64, String),
+        crate::debug_provider_handshake::CapturedArtifact,
+    >::new();
+
+    let selected_wire = match selected {
+        SelectedBootPayload::Image(image) => {
+            let (artifact, file) =
+                selected_preparation_artifact(image, "firmware", architecture_name)?;
+            add_attachment(&mut attachments, image.source_box);
+            files.insert(file.path.clone(), file);
+            SelectedBoot::Image(artifact)
+        }
+        SelectedBootPayload::KernelInitramfs { kernel, initramfs } => {
+            let (kernel_artifact, kernel_file) =
+                selected_preparation_artifact(kernel, "kernel", architecture_name)?;
+            let (initramfs_artifact, initramfs_file) =
+                selected_preparation_artifact(initramfs, "initramfs", architecture_name)?;
+            add_attachment(&mut attachments, kernel.source_box);
+            add_attachment(&mut attachments, initramfs.source_box);
+            files.insert(kernel_file.path.clone(), kernel_file);
+            files.insert(initramfs_file.path.clone(), initramfs_file);
+            SelectedBoot::KernelInitramfs {
+                kernel: kernel_artifact,
+                initramfs: initramfs_artifact,
+            }
+        }
+    };
+
+    let selected_rows = match selected {
+        SelectedBootPayload::Image(image) => vec![image],
+        SelectedBootPayload::KernelInitramfs { kernel, initramfs } => {
+            vec![kernel, initramfs]
+        }
+    };
+    for selected_row in selected_rows {
+        let provenance = crate::image_provenance::resolve_selected_image_from_engine(
+            overlay,
+            selected_row.source_box,
+            &selected_row.path,
+        )
+        .map_err(|error| error.to_string())?;
+        if provenance.artifacts_truncated {
+            return Err(format!(
+                "selected artifact ancestry exceeds {} entries",
+                crate::image_provenance::MAX_ANCESTRY_ARTIFACTS
+            ));
+        }
+        for row in &provenance.build_context {
+            add_attachment(&mut attachments, row.box_id);
+        }
+        for row in provenance.artifacts {
+            let (roles, tagged_architecture) = match row.kind {
+                ArtifactKind::KernelSymbols => {
+                    (vec!["vmlinux".to_owned()], Some(architecture_name))
+                }
+                ArtifactKind::KernelBootImage => {
+                    (vec!["kernel-boot".to_owned()], Some(architecture_name))
+                }
+                ArtifactKind::RootFilesystem => (vec!["rootfs".to_owned()], None),
+                ArtifactKind::BuildTool | ArtifactKind::SourceInput => (Vec::new(), None),
+            };
+            let (artifact, file) = preparation_artifact(
+                overlay,
+                row.provider_box,
+                &row.relative_path,
+                roles,
+                tagged_architecture,
+            )?;
+            let key = (artifact.box_id, artifact.path.clone());
+            if let Some(prior) = catalog.get(&key)
+                && (prior.size != artifact.size || prior.sha256 != artifact.sha256)
+            {
+                return Err(format!(
+                    "selected provenance identifies conflicting contents for box {}:{}",
+                    row.provider_box, row.relative_path
+                ));
+            }
+            catalog.insert(key, artifact);
+            add_attachment(&mut attachments, row.provider_box);
+            files.entry(file.path.clone()).or_insert(file);
+        }
+    }
+
+    let manifest_bytes = overlay
+        .box_read_file(kernel_bundle.provider_box, &kernel_bundle.manifest_path)
+        .map_err(|error| format!("read resolved kernel bundle manifest: {error}"))?;
+    files.insert(
+        ".viros-input/kernel-bundle/bundle.json".into(),
+        ComposedServiceFile::new(
+            ".viros-input/kernel-bundle/bundle.json".into(),
+            manifest_bytes,
+        )?,
+    );
+    let manifest_parent = std::path::Path::new(&kernel_bundle.manifest_path)
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new(""));
+    for artifact in &kernel_bundle.artifacts {
+        let relative = std::path::Path::new(&artifact.path)
+            .strip_prefix(manifest_parent)
+            .map_err(|_| {
+                format!(
+                    "kernel bundle artifact {:?} leaves its manifest directory",
+                    artifact.path
+                )
+            })?
+            .to_str()
+            .ok_or_else(|| "kernel bundle artifact path is not UTF-8".to_string())?;
+        if relative.is_empty() {
+            return Err("kernel bundle artifact has an empty relative path".into());
+        }
+        let bytes = crate::debug_resources::read_resolved_artifact(
+            overlay,
+            kernel_bundle.provider_box,
+            artifact,
+        )
+        .map_err(|error| error.to_string())?;
+        let file =
+            ComposedServiceFile::new(format!(".viros-input/kernel-bundle/{relative}"), bytes)?;
+        files.insert(file.path.clone(), file);
+    }
+
+    Ok((
+        crate::debug_provider_handshake::PrepareRequest {
+            architecture,
+            selected: selected_wire,
+            catalog: catalog.into_values().collect(),
+        },
+        files.into_values().collect(),
+        attachments,
+    ))
+}
+
+fn prepared_identity_matches(
+    prepared: &crate::debug_provider_handshake::ResourceIdentity,
+    path: &str,
+    size: u64,
+    sha256: [u8; 32],
+) -> bool {
+    prepared.path == path && prepared.size == size && prepared.sha256 == sha256
+}
+
+fn generated_file_identity(
+    overlay: &crate::overlay::Overlay,
+    box_id: i64,
+    path: &str,
+) -> Result<(u64, [u8; 32]), String> {
+    let bytes = overlay
+        .box_read_file(box_id, path)
+        .map_err(|error| format!("read generated provider resource {path}: {error}"))?;
+    Ok((bytes.len() as u64, sha2::Sha256::digest(bytes).into()))
+}
+
+fn prepare_selected_debug_launch(
+    state: &State,
+    box_id: i64,
+    base: crate::debug_resources::ResolvedDebugResources,
+    selected: SelectedBootPayload,
+) -> Result<PreparedDebugLaunch, String> {
+    use crate::debug_provider_handshake::Outcome;
+
+    let overlay = lock(state)
+        .overlay
+        .clone()
+        .ok_or("overlay is unavailable")?;
+    let (request, files, mut attachment_ids) =
+        selected_preparation_inputs(&overlay, &selected, base.bundle.architecture, &base.bundle)?;
+    if !attachment_ids.contains(&base.bundle.provider_box) {
+        attachment_ids.push(base.bundle.provider_box);
+    }
+    let (mut qemu_rsp, provider_rsp) =
+        UnixStream::pair().map_err(|error| format!("create debug RSP stream: {error}"))?;
+    qemu_rsp
+        .set_read_timeout(Some(std::time::Duration::from_secs(120)))
+        .map_err(|error| format!("set provider preparation timeout: {error}"))?;
+    crate::debug_provider_handshake::write_prepare(&mut qemu_rsp, &request)
+        .map_err(|error| format!("send provider preparation request: {error}"))?;
+    let service = OwnedComposedService::prepare_resolved_with_files(
+        state,
+        base.service.name,
+        base.service.provider_box,
+        &attachment_ids,
+        &files,
+        ComposedServiceStreams::bidirectional(provider_rsp),
+    )?;
+    let prepared = match crate::debug_provider_handshake::read_outcome(&mut qemu_rsp)
+        .map_err(|error| format!("read provider preparation outcome: {error}"))?
+    {
+        Outcome::Prepared(prepared) => prepared,
+        Outcome::Rejected { code, detail } => {
+            return Err(format!(
+                "provider rejected selected image ({code}): {detail}"
+            ));
+        }
+        _ => return Err("provider returned an invalid preparation transition".into()),
+    };
+    let output_prefix = ".viros-generated/bundle/";
+    if [
+        &prepared.kernel_manifest.path,
+        &prepared.image_manifest.path,
+        &prepared.kernel.path,
+        &prepared.initramfs.path,
+    ]
+    .iter()
+    .any(|path| !path.starts_with(output_prefix))
+    {
+        let _ =
+            crate::debug_provider_handshake::write_decision(&mut qemu_rsp, false, &prepared.token);
+        return Err("provider prepared resources outside its generated bundle".into());
+    }
+    crate::debug_provider_handshake::write_decision(&mut qemu_rsp, true, &prepared.token)
+        .map_err(|error| format!("commit provider preparation: {error}"))?;
+    match crate::debug_provider_handshake::read_outcome(&mut qemu_rsp)
+        .map_err(|error| format!("read provider commit outcome: {error}"))?
+    {
+        Outcome::Committed(token) if token == prepared.token => {}
+        _ => return Err("provider did not acknowledge the preparation commit".into()),
+    }
+    qemu_rsp
+        .set_read_timeout(None)
+        .map_err(|error| format!("clear provider preparation timeout: {error}"))?;
+
+    let resources = crate::debug_resources::resolve_exact_debug_resources(
+        &overlay,
+        service.box_id(),
+        &prepared.kernel_manifest.path,
+        &prepared.image_manifest.path,
+        base.bundle.architecture,
+    )
+    .map_err(|error| error.to_string())?;
+    let image = resources
+        .image
+        .as_ref()
+        .ok_or("provider returned no selected image bundle")?;
+    let kernel_manifest_identity =
+        generated_file_identity(&overlay, service.box_id(), &resources.bundle.manifest_path)?;
+    let image_manifest_identity =
+        generated_file_identity(&overlay, service.box_id(), &image.manifest_path)?;
+    if !prepared_identity_matches(
+        &prepared.kernel_manifest,
+        &resources.bundle.manifest_path,
+        kernel_manifest_identity.0,
+        kernel_manifest_identity.1,
+    ) || !prepared_identity_matches(
+        &prepared.image_manifest,
+        &image.manifest_path,
+        image_manifest_identity.0,
+        image_manifest_identity.1,
+    ) || !prepared_identity_matches(
+        &prepared.kernel,
+        &resources.bundle.kernel.boot_image.path,
+        resources.bundle.kernel.boot_image.size,
+        resources.bundle.kernel.boot_image.sha256,
+    ) || !prepared_identity_matches(
+        &prepared.initramfs,
+        &image.initramfs.path,
+        image.initramfs.size,
+        image.initramfs.sha256,
+    ) || prepared.kernel_init != image.init
+    {
+        return Err("provider committed resources different from its prepared identities".into());
+    }
+
+    let kernel_bytes = crate::debug_resources::read_resolved_artifact(
+        &overlay,
+        service.box_id(),
+        &resources.bundle.kernel.boot_image,
+    )
+    .map_err(|error| error.to_string())?;
+    let initramfs_bytes = crate::debug_resources::read_resolved_artifact(
+        &overlay,
+        service.box_id(),
+        &image.initramfs,
+    )
+    .map_err(|error| error.to_string())?;
+    let session_service = debug_session_service_name(box_id);
+    let image_catalog = Some(crate::debug_resources::wire_image_catalog(image)?);
+    let manifest_path = resources.bundle.entrypoints.callgate.path.clone();
+    let manifest = crate::wire::BoundedBytes::new(manifest_path.as_bytes().to_vec())
+        .map_err(|_| "debug callgate manifest path exceeds protocol bound".to_string())?;
+    let service_name = crate::wire::BoundedText::new(session_service.clone())
+        .map_err(|_| "generated debug service name exceeds protocol bound".to_string())?;
+    send_debug_provider_start(
+        &mut qemu_rsp,
+        &crate::generated_wire::DebugProviderStart {
+            manifest,
+            service: service_name,
+            image: image_catalog.clone(),
+        },
+    )?;
+    let client_argv = declared_service_client_argv(base.service.name, base.service.provider_box)?;
+    Ok(PreparedDebugLaunch {
+        kernel: sealed_debug_artifact(&kernel_bytes)?,
+        qemu_rsp,
+        image: Some(PreparedGuestImage {
+            initramfs: sealed_debug_artifact(&initramfs_bytes)?,
+            start: crate::generated_wire::DebugGuestImageStart {
+                profile: crate::debug_resources::wire_image_profile(image.architecture),
+                init: crate::wire::BoundedBytes::new(image.init.as_bytes().to_vec())
+                    .map_err(|_| "image init path exceeds protocol bound".to_string())?,
+            },
+        }),
+        session_service,
+        manifest: manifest_path,
+        image_catalog,
+        service_provider_box: base.service.provider_box,
+        bundle_provider_box: service.box_id(),
+        client_argv,
+        client: None,
+        _service: service,
+    })
 }
 
 fn prepare_debug_launch(
     state: &State,
     box_id: i64,
     resources: crate::debug_resources::ResolvedDebugResources,
-    selected_pair: Option<SelectedKernelInitramfsPayload>,
+    selected_payload: Option<SelectedBootPayload>,
 ) -> Result<PreparedDebugLaunch, String> {
     let overlay = lock(state)
         .overlay
         .clone()
         .ok_or("overlay is unavailable")?;
-    let selected_initramfs = selected_pair.as_ref().map(|pair| pair.initramfs.as_slice());
-    let kernel_bytes = match selected_pair.as_ref() {
-        Some(pair) => {
-            let actual: [u8; 32] = sha2::Sha256::digest(&pair.kernel).into();
-            if actual != resources.bundle.kernel.boot_image.sha256 {
+    let selected_initramfs = selected_payload.as_ref().map(|payload| match payload {
+        SelectedBootPayload::Image(image) => image.bytes.as_slice(),
+        SelectedBootPayload::KernelInitramfs { initramfs, .. } => initramfs.bytes.as_slice(),
+    });
+    let kernel_bytes = match selected_payload.as_ref() {
+        Some(SelectedBootPayload::KernelInitramfs { kernel, .. }) => {
+            if kernel.sha256 != resources.bundle.kernel.boot_image.sha256 {
                 return Err(
                     "selected kernel does not match the boot image associated with the resolved vmlinux"
                         .into(),
                 );
             }
-            pair.kernel.clone()
+            kernel.bytes.clone()
         }
-        None => crate::debug_resources::read_resolved_artifact(
-            &overlay,
-            resources.bundle.provider_box,
-            &resources.bundle.kernel.boot_image,
-        )
-        .map_err(|error| error.to_string())?,
+        Some(SelectedBootPayload::Image(_)) | None => {
+            crate::debug_resources::read_resolved_artifact(
+                &overlay,
+                resources.bundle.provider_box,
+                &resources.bundle.kernel.boot_image,
+            )
+            .map_err(|error| error.to_string())?
+        }
     };
     let kernel = sealed_debug_artifact(&kernel_bytes)?;
-    let matching_image = resources.image.as_ref().filter(|image| {
-        selected_initramfs.is_none_or(|contents| {
-            <[u8; 32]>::from(sha2::Sha256::digest(contents)) == image.initramfs.sha256
-        })
-    });
-    let image = match selected_pair {
-        Some(pair) => Some(PreparedGuestImage {
-            initramfs: sealed_debug_artifact(&pair.initramfs)?,
+    let matching_image = resources
+        .image
+        .as_ref()
+        .filter(|image| artifact_matches_selected_bytes(&image.initramfs, selected_initramfs));
+    if selected_payload.is_some() && matching_image.is_none() {
+        return prepare_selected_debug_launch(
+            state,
+            box_id,
+            resources,
+            selected_payload.expect("selected payload was checked"),
+        );
+    }
+    let image = match selected_payload {
+        Some(SelectedBootPayload::KernelInitramfs { initramfs, .. }) => Some(PreparedGuestImage {
+            initramfs: sealed_debug_artifact(&initramfs.bytes)?,
             start: crate::generated_wire::DebugGuestImageStart {
                 profile: crate::debug_resources::wire_image_profile(resources.bundle.architecture),
                 init: crate::wire::BoundedBytes::new(b"/init".to_vec())
                     .expect("/init fits the generated path bound"),
             },
         }),
+        Some(SelectedBootPayload::Image(image)) => {
+            let catalog = matching_image.ok_or_else(|| {
+                "selected image does not exactly match the initramfs in the resolved image bundle; select its kernel/initramfs pair or publish a matching derived image bundle"
+                    .to_string()
+            })?;
+            Some(PreparedGuestImage {
+                initramfs: sealed_debug_artifact(&image.bytes)?,
+                start: crate::generated_wire::DebugGuestImageStart {
+                    profile: crate::debug_resources::wire_image_profile(catalog.architecture),
+                    init: crate::wire::BoundedBytes::new(catalog.init.as_bytes().to_vec())
+                        .map_err(|error| {
+                            format!("image init path exceeds protocol bound: {error:?}")
+                        })?,
+                },
+            })
+        }
         None => matching_image
             .map(|image| {
                 let bytes = crate::debug_resources::read_resolved_artifact(
@@ -5503,7 +6132,7 @@ fn prepare_debug_launch(
             })
             .transpose()?,
     };
-    let (qemu_rsp, mut provider_rsp) =
+    let (mut qemu_rsp, provider_rsp) =
         UnixStream::pair().map_err(|error| format!("create debug RSP stream: {error}"))?;
     let session_service = debug_session_service_name(box_id);
     let manifest_path = resources.bundle.entrypoints.callgate.path.clone();
@@ -5522,16 +6151,14 @@ fn prepare_debug_launch(
     .map_err(|_| "debug callgate manifest path exceeds protocol bound".to_string())?;
     let service_name = crate::wire::BoundedText::new(session_service.clone())
         .map_err(|_| "generated debug service name exceeds protocol bound".to_string())?;
-    crate::socket_wire::write_versioned(
-        &mut provider_rsp,
+    send_debug_provider_start(
+        &mut qemu_rsp,
         &crate::generated_wire::DebugProviderStart {
             manifest,
             service: service_name,
             image: image_catalog.clone(),
         },
-    )
-    .and_then(|()| provider_rsp.flush())
-    .map_err(|error| format!("send debug provider start: {error}"))?;
+    )?;
     let mut attachment_ids = vec![resources.bundle.provider_box];
     if let Some(image) = matching_image {
         if !attachment_ids.contains(&image.provider_box) {
@@ -6448,6 +7075,37 @@ fn register(
                     "QEMU host-network resolver {}: {error}",
                     resolver.display()
                 ));
+            }
+        } else if *net_mode == NetMode::Tap {
+            // A QEMU appliance reads the same SarunFs tree as a FUSE box but
+            // has no bwrap setup phase.  Project the engine-owned resolver
+            // and trust bundle explicitly so a Darwin host's resolv.conf and
+            // Keychain-oriented TLS configuration never leak into the Linux
+            // guest.  These are presentation-only files, just like /init.
+            let resolver = crate::paths::api_box_resolv_conf_path();
+            let ca = crate::paths::api_box_ca_pem_path();
+            let mut projections = vec![("etc/resolv.conf", resolver.clone())];
+            projections.extend(
+                crate::runner::CA_BUNDLE_TARGETS
+                    .iter()
+                    .map(|target| (target.trim_start_matches('/'), ca.clone())),
+            );
+            for (target, source) in projections {
+                if let Err(error) = ov.project_file(id, target, source.clone()) {
+                    ov.remove_box(id);
+                    let mut shared = lock(state);
+                    if let Some(fd) = shared.box_pids.remove(&id) {
+                        unsafe {
+                            libc::close(fd);
+                        }
+                    }
+                    shared.box_runpids.remove(&id);
+                    return Err(format!(
+                        "QEMU tap-network projection {} -> {}: {error}",
+                        target,
+                        source.display()
+                    ));
+                }
             }
         }
     }
@@ -9724,6 +10382,26 @@ impl ComposedServiceStreams {
     }
 }
 
+pub(crate) struct ComposedServiceFile {
+    path: String,
+    bytes: Vec<u8>,
+}
+
+impl ComposedServiceFile {
+    pub(crate) fn new(path: String, bytes: Vec<u8>) -> Result<Self, String> {
+        if path.is_empty()
+            || path.starts_with('/')
+            || path.contains('\\')
+            || path
+                .split('/')
+                .any(|component| component.is_empty() || matches!(component, "." | ".."))
+        {
+            return Err(format!("invalid composed-service file path {path:?}"));
+        }
+        Ok(Self { path, bytes })
+    }
+}
+
 /// A normal Sarun runner whose filesystem is a declared provider plus an
 /// ordered list of read-only box attachments.  The owner is the stream: peer
 /// EOF, explicit drop, runner exit, or launch failure all reap the process and
@@ -9733,6 +10411,7 @@ impl ComposedServiceStreams {
 /// pass validated box-owned descriptors, not reopen a path through this view.
 pub(crate) struct OwnedComposedService {
     state: State,
+    box_id: i64,
     stop: UnixStream,
     exited: Arc<std::sync::atomic::AtomicBool>,
     worker: Option<std::thread::JoinHandle<()>>,
@@ -9746,6 +10425,24 @@ impl OwnedComposedService {
         attachment_ids: &[i64],
         streams: ComposedServiceStreams,
     ) -> Result<Self, String> {
+        Self::prepare_resolved_with_files(
+            state,
+            declared_service_name,
+            provider_box,
+            attachment_ids,
+            &[],
+            streams,
+        )
+    }
+
+    pub(crate) fn prepare_resolved_with_files(
+        state: &State,
+        declared_service_name: &str,
+        provider_box: i64,
+        attachment_ids: &[i64],
+        files: &[ComposedServiceFile],
+        streams: ComposedServiceStreams,
+    ) -> Result<Self, String> {
         let boxes = discover::discover();
         let resolved = declared_service_provider(&boxes, declared_service_name)?;
         if resolved != provider_box {
@@ -9753,7 +10450,7 @@ impl OwnedComposedService {
                 "service '{declared_service_name}' provider changed during resolution"
             ));
         }
-        Self::prepare(state, declared_service_name, attachment_ids, streams)
+        Self::prepare_with_files(state, declared_service_name, attachment_ids, files, streams)
     }
 
     pub(crate) fn prepare(
@@ -9762,8 +10459,25 @@ impl OwnedComposedService {
         attachment_ids: &[i64],
         streams: ComposedServiceStreams,
     ) -> Result<Self, String> {
+        Self::prepare_with_files(state, declared_service_name, attachment_ids, &[], streams)
+    }
+
+    pub(crate) fn prepare_with_files(
+        state: &State,
+        declared_service_name: &str,
+        attachment_ids: &[i64],
+        files: &[ComposedServiceFile],
+        streams: ComposedServiceStreams,
+    ) -> Result<Self, String> {
         if !svc_name_ok(declared_service_name) {
             return Err("service name is invalid".into());
+        }
+        let mut file_paths = std::collections::BTreeSet::new();
+        if files
+            .iter()
+            .any(|file| !file_paths.insert(file.path.as_str()))
+        {
+            return Err("composed-service files contain a duplicate path".into());
         }
         let _create = COMPOSED_SERVICE_CREATE.lock().unwrap();
         let boxes = discover::discover();
@@ -9812,6 +10526,12 @@ impl OwnedComposedService {
         child.set_meta("ephemeral_service", declared_service_name);
         child.set_ro_attachments(service_attachment_rows(attachment_ids));
         overlay.add_box(std::sync::Arc::new(child));
+        for file in files {
+            if let Err(error) = overlay.box_write_file(id, &file.path, &file.bytes) {
+                reap(state, id);
+                return Err(format!("populate service box {id}:{}: {error}", file.path));
+            }
+        }
         if let (Ok(r#box), Ok(name)) = (
             u64::try_from(id),
             crate::wire::BoundedText::new(child_name.clone()),
@@ -9884,10 +10604,15 @@ impl OwnedComposedService {
         });
         Ok(Self {
             state: state.clone(),
+            box_id: id,
             stop,
             exited,
             worker: Some(worker),
         })
+    }
+
+    pub(crate) fn box_id(&self) -> i64 {
+        self.box_id
     }
 }
 
@@ -10754,6 +11479,12 @@ pub fn serve(state: State, listener: UnixListener) -> std::io::Result<()> {
                 let st = state.clone();
                 std::thread::spawn(move || handle(st, conn));
             }
+            Err(error)
+                if error.kind() == std::io::ErrorKind::Interrupted
+                    && crate::TERMINATING.load(std::sync::atomic::Ordering::Acquire) =>
+            {
+                return Err(error);
+            }
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(error) => return Err(error),
         }
@@ -11475,6 +12206,23 @@ mod verb_tests {
     }
 
     #[test]
+    fn composed_service_files_are_normalized_provider_relative_paths() {
+        assert!(
+            ComposedServiceFile::new(
+                ".viros-input/boxes/17/build/vmlinux".into(),
+                b"kernel".to_vec()
+            )
+            .is_ok()
+        );
+        for path in ["", "/host/path", "../escape", "a/../escape", "a//b", "a\\b"] {
+            assert!(
+                ComposedServiceFile::new(path.into(), Vec::new()).is_err(),
+                "accepted {path:?}"
+            );
+        }
+    }
+
+    #[test]
     fn composed_service_peer_eof_reaps_owned_child() {
         use std::os::unix::process::CommandExt;
         let (lifetime, peer) = UnixStream::pair().unwrap();
@@ -11506,6 +12254,7 @@ mod verb_tests {
         });
         let service = OwnedComposedService {
             state: state.clone(),
+            box_id: 1,
             stop,
             exited: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             worker: Some(worker),
@@ -11532,6 +12281,54 @@ mod verb_tests {
         assert!(svc_name_ok(&third));
         assert_ne!(first, second);
         assert_ne!(second, third);
+    }
+
+    #[test]
+    fn debug_provider_prelude_flows_to_provider_not_qemu() {
+        use std::io::Read;
+
+        let start = crate::generated_wire::DebugProviderStart {
+            manifest: crate::wire::BoundedBytes::new(b"debug/callgate.json".to_vec()).unwrap(),
+            service: crate::wire::BoundedText::new("viros-session-1".to_owned()).unwrap(),
+            image: None,
+        };
+        let (mut qemu_endpoint, mut provider_endpoint) = UnixStream::pair().unwrap();
+        send_debug_provider_start(&mut qemu_endpoint, &start).unwrap();
+
+        let received: crate::generated_wire::DebugProviderStart =
+            crate::socket_wire::read_versioned(&mut provider_endpoint).unwrap();
+        assert_eq!(received, start);
+
+        qemu_endpoint.set_nonblocking(true).unwrap();
+        let error = qemu_endpoint.read(&mut [0u8; 1]).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn selected_image_must_be_the_exact_cataloged_initramfs() {
+        use sha2::Digest as _;
+
+        let selected = b"exact selected initramfs";
+        let artifact = crate::debug_resources::ArtifactDescriptor {
+            path: "images/rootfs.cpio".into(),
+            size: selected.len() as u64,
+            sha256: sha2::Sha256::digest(selected).into(),
+        };
+        assert!(artifact_matches_selected_bytes(&artifact, None));
+        assert!(artifact_matches_selected_bytes(&artifact, Some(selected)));
+        assert!(!artifact_matches_selected_bytes(
+            &artifact,
+            Some(b"different selected image")
+        ));
+
+        let wrong_size = crate::debug_resources::ArtifactDescriptor {
+            size: artifact.size + 1,
+            ..artifact
+        };
+        assert!(!artifact_matches_selected_bytes(
+            &wrong_size,
+            Some(selected)
+        ));
     }
 
     #[test]

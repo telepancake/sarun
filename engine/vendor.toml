@@ -216,3 +216,13 @@ sha256 = "07d779636d827cde4100f0e65ff3fd23b0b1f1195055475c6e6813d425f30c8e"
 source = "crates.io"
 version = "1.14.0"
 sha256 = "7051accc9cf2816e25945c8216e6d4be2b4e75fc5e77559cd7eed5e400245cc1"
+
+[crates.vhost]
+source = "crates.io"
+version = "0.16.0"
+sha256 = "ee90657203a8644e9a0860a0db6a7887d8ef0c7bc09fc22dfa4ae75df65bac86"
+
+[crates.vhost-user-backend]
+source = "crates.io"
+version = "0.22.0"
+sha256 = "d5925983d8fb537752ad3e26604c0a17abfa5de77cb6773a096c8a959c9eca0f"

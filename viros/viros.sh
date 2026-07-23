@@ -4,7 +4,7 @@ set -Eeuo pipefail
 # Everything created by this script stays below the directory from which it is
 # invoked.  Override only when an explicit separate work area is desired.
 WORKDIR=${VIROS_WORKDIR:-"$PWD"}
-SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" && pwd)
 DOWNLOADS="$WORKDIR/downloads"
 SOURCES="$WORKDIR/sources"
 BUILD="$WORKDIR/build"

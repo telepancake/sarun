@@ -22,7 +22,9 @@ import time
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
-from sarun_test_paths import ENGINE_BIN, HOST_ARCH, LIBTESTSARUN, REPO_ROOT
+from sarun_test_paths import (
+    ENGINE_BIN, HOST_ARCH, LIBTESTSARUN, QEMU_HOST_DIR, REPO_ROOT,
+)
 
 
 _fails = []
@@ -803,7 +805,7 @@ def main():
         print("  (native SUD needs an x86_64 Syscall User Dispatch kernel)")
     appliance_root = Path.home() / ".cache/sarun/appliances/v1"
     appliance = appliance_root / HOST_ARCH / "kernel"
-    qemu = appliance_root / f"host-{HOST_ARCH}" / f"qemu-system-{HOST_ARCH}"
+    qemu = appliance_root / QEMU_HOST_DIR / f"qemu-system-{HOST_ARCH}"
     if appliance.exists() and qemu.exists():
         backends.append("qemu")
     else:
@@ -927,7 +929,7 @@ def main():
     other_architecture = "x86_64" if HOST_ARCH == "aarch64" else "aarch64"
     other_kernel = appliance_root / other_architecture / "kernel"
     other_init = appliance_root / other_architecture / "init"
-    other_qemu = appliance_root / f"host-{HOST_ARCH}" / (
+    other_qemu = appliance_root / QEMU_HOST_DIR / (
         f"qemu-system-{other_architecture}"
     )
     if other_kernel.exists() and other_init.exists() and other_qemu.exists():

@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum, auto
 from html import escape
-from typing import Protocol
+from typing import Callable, Protocol
 
 from .linux_oracle import LinuxOracle, RegisterRead, Snapshot, TaskId, TaskSnapshot
 
@@ -25,6 +25,14 @@ class QemuBackend(Protocol):
 
 class InternalContinueController(Protocol):
     def begin_continue(self) -> bool: ...
+
+
+class ExecutableResolver(Protocol):
+    def resolve(
+        self,
+        task: TaskSnapshot,
+        read_memory: Callable[[TaskSnapshot, int, int], bytes],
+    ) -> str: ...
 
 
 class FacadeState(Enum):
@@ -60,6 +68,7 @@ class RspFacade:
         packet_size: int = 4096,
         target_descriptions: dict[bytes, bytes] | None = None,
         internal_continue: InternalContinueController | None = None,
+        executable_resolver: ExecutableResolver | None = None,
     ) -> None:
         self.oracle = oracle
         self.qemu = qemu
@@ -68,6 +77,7 @@ class RspFacade:
         self.target_descriptions.setdefault(b"target.xml", target_xml)
         self.packet_size = packet_size
         self.internal_continue = internal_continue
+        self.executable_resolver = executable_resolver
         self.state = FacadeState.STOPPED
         self.snapshot = self._snapshot()
         # GDB commonly reads registers immediately after connecting.  Prefer a
@@ -85,7 +95,44 @@ class RspFacade:
 
     def _snapshot(self) -> Snapshot:
         snapshot = self.oracle.snapshot()
-        ordered = tuple(sorted(snapshot.tasks, key=lambda task: task.identity))
+        tasks = snapshot.tasks
+        if self.executable_resolver is not None:
+            resolved: list[TaskSnapshot] = []
+            paths: dict[int, str] = {}
+            processes: dict[int, list[TaskSnapshot]] = {}
+            for task in tasks:
+                processes.setdefault(task.identity.tgid, []).append(task)
+            for tgid, members in processes.items():
+                existing = {task.executable for task in members if task.executable}
+                if len(existing) == 1:
+                    paths[tgid] = next(iter(existing))
+                    continue
+                # A current thread gives architectures without a sleeping-task
+                # page-table reader the same process address space.  Auxv must
+                # still be present; an event-only record cannot supply identity.
+                candidates = sorted(
+                    (task for task in members if task.auxv),
+                    key=lambda task: (
+                        task.current_cpu is None,
+                        task.identity.tid,
+                    ),
+                )
+                for candidate in candidates:
+                    path = self.executable_resolver.resolve(
+                        candidate, self.oracle.read_memory
+                    )
+                    if path:
+                        paths[tgid] = path
+                        break
+            for task in tasks:
+                path = paths.get(task.identity.tgid, "")
+                resolved.append(
+                    replace(task, executable=path)
+                    if path and not task.executable
+                    else task
+                )
+            tasks = tuple(resolved)
+        ordered = tuple(sorted(tasks, key=lambda task: task.identity))
         return Snapshot(snapshot.generation, ordered)
 
     def refresh(self) -> Snapshot:

@@ -292,6 +292,44 @@ def defined_symbol(vmlinux: Path, name: str) -> int:
     return next(iter(values))
 
 
+def validate_debug_runtime_symbols(vmlinux: Path, architecture: str) -> None:
+    """Require the fixed kernel entry points used by the managed facade."""
+
+    records = ElfObject(vmlinux).symbol_records()
+    values: dict[str, set[int]] = {}
+    for record in records:
+        if record["name"] and record["shndx"] != 0:
+            values.setdefault(record["name"], set()).add(record["value"])
+
+    def require(name: str) -> None:
+        addresses = values.get(name, set())
+        if len(addresses) != 1:
+            raise BundleError(
+                f"matching vmlinux does not define exactly one required debugger symbol {name}"
+            )
+
+    require("viros_event_stop")
+    if architecture in {"aarch64", "arm"}:
+        require("ret_to_user")
+    elif architecture == "mmips":
+        require("start_thread")
+    elif architecture == "x86_64":
+        accepted = ("start_thread", "compat_start_thread")
+        conflicts = [name for name in accepted if len(values.get(name, set())) > 1]
+        if conflicts:
+            raise BundleError(
+                "matching vmlinux has conflicting definitions of required debugger symbol(s): "
+                + ", ".join(conflicts)
+            )
+        if not any(len(values.get(name, set())) == 1 for name in accepted):
+            raise BundleError(
+                "matching vmlinux does not define a required debugger userspace boundary: "
+                + " or ".join(accepted)
+            )
+    else:  # pragma: no cover - argparse and callers enforce the closed set.
+        raise BundleError(f"no managed debugger runtime-symbol profile for {architecture}")
+
+
 def copy_file(source: Path, destination: Path, label: str) -> None:
     if not source.is_file():
         raise BundleError(f"{label} is not a regular file: {source}")
@@ -448,6 +486,8 @@ def build_bundle(args: argparse.Namespace) -> Path:
         copy_file(config, staging / "kernel.config", "kernel configuration")
         copy_file(loader, staging / "vmlinux-gdb.py", "Linux GDB loader")
         shutil.copytree(scripts, staging / "scripts" / "gdb", symlinks=False)
+
+        validate_debug_runtime_symbols(staging / "vmlinux", architecture)
 
         run_checked([
             sys.executable, str(SCRATCH_TOOL), str(staging / "vmlinux"),

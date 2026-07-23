@@ -58,13 +58,13 @@ fn ns_ts(ns: i64) -> SystemTime {
 }
 
 fn kind_of_mode(mode: u32) -> NodeKind {
-    match mode & libc::S_IFMT {
-        libc::S_IFDIR => NodeKind::Directory,
-        libc::S_IFLNK => NodeKind::Symlink,
-        libc::S_IFCHR => NodeKind::CharDevice,
-        libc::S_IFBLK => NodeKind::BlockDevice,
-        libc::S_IFIFO => NodeKind::NamedPipe,
-        libc::S_IFSOCK => NodeKind::Socket,
+    match mode & libc::S_IFMT as u32 {
+        value if value == libc::S_IFDIR as u32 => NodeKind::Directory,
+        value if value == libc::S_IFLNK as u32 => NodeKind::Symlink,
+        value if value == libc::S_IFCHR as u32 => NodeKind::CharDevice,
+        value if value == libc::S_IFBLK as u32 => NodeKind::BlockDevice,
+        value if value == libc::S_IFIFO as u32 => NodeKind::NamedPipe,
+        value if value == libc::S_IFSOCK as u32 => NodeKind::Socket,
         _ => NodeKind::RegularFile,
     }
 }
@@ -1231,12 +1231,80 @@ impl SarunFs {
                 format!("box {id} not registered"),
             ));
         }
-        self.inner.synthetic.project(id, rel, source);
+        self.inner.synthetic.project(id, rel, source.clone());
+        for alias in self.projection_aliases(rel) {
+            self.inner.synthetic.project(id, &alias, source.clone());
+        }
+        if rel == "etc/resolv.conf" {
+            eprintln!("sarun-engine: projection registered box={id} rel={rel}");
+        }
         Ok(())
     }
 
+    /// A host symlink in an ancestor changes the path the guest subsequently
+    /// asks us to resolve. Darwin's `/etc -> private/etc` is the important
+    /// example: a projection at `etc/resolv.conf` must also be visible at
+    /// `private/etc/resolv.conf`. Preserve the logical projection and add each
+    /// in-root, symlink-resolved spelling as an implementation detail.
+    fn projection_aliases(&self, rel: &str) -> Vec<String> {
+        let root = self.inner.backing.direct_path("");
+        let Ok(canonical_root) = std::fs::canonicalize(&root) else {
+            return Vec::new();
+        };
+        let mut current = rel.to_owned();
+        let mut aliases = Vec::new();
+        for _ in 0..16 {
+            let components = current
+                .split('/')
+                .filter(|component| !component.is_empty())
+                .collect::<Vec<_>>();
+            let mut replacement = None;
+            for count in 1..components.len() {
+                let ancestor = components[..count].join("/");
+                let host = root.join(&ancestor);
+                if !std::fs::symlink_metadata(&host).is_ok_and(|meta| meta.file_type().is_symlink())
+                {
+                    continue;
+                }
+                let Ok(target) = std::fs::canonicalize(&host) else {
+                    continue;
+                };
+                let Ok(target) = target.strip_prefix(&canonical_root) else {
+                    continue;
+                };
+                let Some(target) = target.to_str() else {
+                    continue;
+                };
+                let tail = components[count..].join("/");
+                replacement = Some(if target.is_empty() {
+                    tail
+                } else {
+                    format!("{target}/{tail}")
+                });
+                break;
+            }
+            let Some(next) = replacement else { break };
+            if next == current || aliases.iter().any(|alias| alias == &next) {
+                break;
+            }
+            aliases.push(next.clone());
+            current = next;
+        }
+        aliases
+    }
+
     fn projected_file(&self, id: i64, rel: &str) -> Option<PathBuf> {
-        self.inner.synthetic.projected(id, rel)
+        let projected = self.inner.synthetic.projected(id, rel);
+        if rel.ends_with("etc/resolv.conf") {
+            eprintln!(
+                "sarun-engine: projection probe root={} box={id} rel={rel} source={}",
+                self.root.0,
+                projected
+                    .as_deref()
+                    .map_or_else(|| "<none>".into(), |path| path.display().to_string())
+            );
+        }
+        projected
     }
 
     pub fn box_ids(&self) -> Vec<i64> {
@@ -1681,6 +1749,9 @@ impl SarunFs {
         // the overwhelmingly common lower case does not repeat a root-to-leaf
         // PassthroughFsRo traversal after resolving the layer.
         let lower_attr = self.inner.backing.attr(rel).ok();
+        if lower_attr.is_none() && self.inner.synthetic.has_projected_descendant(b.id, rel) {
+            return Some(self.synth_dir_attr(ino, 0o40755, 0));
+        }
         let layer = self.resolve_with_lower_presence(b.id, rel, lower_attr.is_some());
         // --api substitute: same FUSE-shadow trick as brush, but the target
         // is the safe-for-box oaita.toml the engine pre-wrote at startup.
@@ -2232,7 +2303,7 @@ impl SarunFs {
             (attr, handle)
         } else {
             let capture = self.inner.mutations.writer(&b, pid, self.host_request_pids);
-            let rowid = capture.ensure_file(&rel, mode | libc::S_IFREG);
+            let rowid = capture.ensure_file(&rel, mode | libc::S_IFREG as u32);
             capture.set_owner(&rel, uid, gid);
             let path = blob_path(bid, rowid);
             if let Some(parent) = path.parent() {
@@ -2319,7 +2390,7 @@ impl SarunFs {
         capture.set_owner(&rel, uid, gid);
         let inode = self.ino_for(&(box_id, rel.clone()));
         self.inner.mutations.record(box_id, rel, "mkdir");
-        let mut attr = self.synth_dir_attr(inode, mode | libc::S_IFDIR, 0);
+        let mut attr = self.synth_dir_attr(inode, mode | libc::S_IFDIR as u32, 0);
         attr.uid = uid;
         attr.gid = gid;
         self.inner.inodes.acquire(inode, 1);
@@ -2487,10 +2558,12 @@ impl SarunFs {
         if box_id == 0 || new_box_id == 0 || box_id != new_box_id {
             return Err(Errno::EXDEV);
         }
-        if flags & libc::RENAME_EXCHANGE != 0 {
+        const RENAME_NOREPLACE: u32 = 1;
+        const RENAME_EXCHANGE: u32 = 2;
+        if flags & RENAME_EXCHANGE != 0 {
             return Err(Errno::ENOSYS);
         }
-        if flags & !(libc::RENAME_NOREPLACE | libc::RENAME_EXCHANGE) != 0 {
+        if flags & !(RENAME_NOREPLACE | RENAME_EXCHANGE) != 0 {
             return Err(Errno::EINVAL);
         }
         let name = name.to_str().ok_or(Errno::EINVAL)?;
@@ -2511,8 +2584,7 @@ impl SarunFs {
         if self.ro_denied(box_id, &old_rel) || self.ro_denied(box_id, &new_rel) {
             return Err(Errno::EROFS);
         }
-        if flags & libc::RENAME_NOREPLACE != 0
-            && !matches!(self.resolve(box_id, &new_rel), Layer::Absent)
+        if flags & RENAME_NOREPLACE != 0 && !matches!(self.resolve(box_id, &new_rel), Layer::Absent)
         {
             return Err(Errno::EEXIST);
         }
@@ -2566,8 +2638,8 @@ impl SarunFs {
         if self.ro_denied(box_id, &rel) {
             return Err(Errno::EROFS);
         }
-        match mode & libc::S_IFMT {
-            libc::S_IFREG => {
+        match mode & libc::S_IFMT as u32 {
+            value if value == libc::S_IFREG as u32 => {
                 let capture = self.inner.mutations.writer(&b, pid, self.host_request_pids);
                 let rowid = capture.ensure_file(&rel, mode);
                 capture.set_owner(&rel, uid, gid);
@@ -2577,7 +2649,12 @@ impl SarunFs {
                 }
                 File::create(path).map_err(Errno::from)?;
             }
-            libc::S_IFIFO | libc::S_IFCHR | libc::S_IFBLK | libc::S_IFSOCK => {
+            value
+                if value == libc::S_IFIFO as u32
+                    || value == libc::S_IFCHR as u32
+                    || value == libc::S_IFBLK as u32
+                    || value == libc::S_IFSOCK as u32 =>
+            {
                 let capture = self.inner.mutations.writer(&b, pid, self.host_request_pids);
                 capture.set_special(&rel, mode, rdev as u64);
                 capture.set_owner(&rel, uid, gid);
@@ -2647,7 +2724,10 @@ impl SarunFs {
         };
         let offset = i64::try_from(offset).map_err(|_| Errno::EFBIG)?;
         let length = i64::try_from(length).map_err(|_| Errno::EFBIG)?;
+        #[cfg(target_os = "linux")]
         let result = unsafe { libc::fallocate64(file.as_raw_fd(), mode as i32, offset, length) };
+        #[cfg(target_os = "macos")]
+        let result = darwin_fallocate(file.as_raw_fd(), mode, offset, length);
         if result != 0 {
             return Err(Errno::from(std::io::Error::last_os_error()));
         }
@@ -2674,7 +2754,7 @@ impl SarunFs {
                     .map_err(Errno::from)?;
             }
             if let Some(mode) = request.mode {
-                if unsafe { libc::chmod(path.as_ptr(), mode & 0o7777) } != 0 {
+                if unsafe { libc::chmod(path.as_ptr(), (mode & 0o7777) as libc::mode_t) } != 0 {
                     return Err(Errno::from(std::io::Error::last_os_error()));
                 }
             }
@@ -2748,8 +2828,12 @@ impl SarunFs {
             let permissions = mode & 0o7777;
             let capture = self.inner.mutations.writer(&b, pid, self.host_request_pids);
             match self.layer(&b, &rel) {
-                Layer::UpperFile { .. } => capture.set_mode(&rel, libc::S_IFREG | permissions),
-                Layer::UpperDir { .. } => capture.set_mode(&rel, libc::S_IFDIR | permissions),
+                Layer::UpperFile { .. } => {
+                    capture.set_mode(&rel, libc::S_IFREG as u32 | permissions)
+                }
+                Layer::UpperDir { .. } => {
+                    capture.set_mode(&rel, libc::S_IFDIR as u32 | permissions)
+                }
                 Layer::UpperSymlink { .. } => {}
                 Layer::Lower
                     if self
@@ -2762,11 +2846,11 @@ impl SarunFs {
                 }
                 Layer::Lower => {
                     self.copy_up(&b, &rel, pid).map_err(|_| Errno::EIO)?;
-                    capture.set_mode(&rel, libc::S_IFREG | permissions);
+                    capture.set_mode(&rel, libc::S_IFREG as u32 | permissions);
                 }
                 Layer::Absent => return Err(Errno::ENOENT),
                 Layer::UpperSpecial { mode, .. } => {
-                    capture.set_mode(&rel, (mode & libc::S_IFMT) | permissions)
+                    capture.set_mode(&rel, (mode & libc::S_IFMT as u32) | permissions)
                 }
                 Layer::ExtFile { .. } => return Err(Errno::EROFS),
             }
@@ -2814,7 +2898,7 @@ impl SarunFs {
                                 .backing
                                 .attr(&rel)
                                 .map(|attr| attr.mode)
-                                .unwrap_or(libc::S_IFDIR | 0o755),
+                                .unwrap_or(libc::S_IFDIR as u32 | 0o755),
                         );
                 } else {
                     self.copy_up(&b, &rel, pid).map_err(|_| Errno::EIO)?;
@@ -3072,7 +3156,7 @@ impl SarunFs {
         match &handle.inner.data {
             FileData::Native(file) => {
                 let offset = i64::try_from(offset).map_err(|_| Errno::EOVERFLOW)?;
-                let result = unsafe { libc::lseek64(file.as_raw_fd(), offset, whence as i32) };
+                let result = unsafe { libc::lseek(file.as_raw_fd(), offset, whence as i32) };
                 if result < 0 {
                     Err(Errno::from(std::io::Error::last_os_error()))
                 } else {
@@ -3128,7 +3212,7 @@ impl SarunFs {
         }
     }
 
-    fn statfs_node(&self) -> Result<libc::statvfs64, Errno> {
+    fn statfs_node(&self) -> Result<virtiofsd::Statvfs, Errno> {
         self.inner.backing.statfs().map_err(Errno::from)
     }
 
@@ -3423,14 +3507,106 @@ fn virtio_error(error: Errno) -> std::io::Error {
 }
 
 fn staging_file() -> std::io::Result<File> {
-    let name = CStr::from_bytes_with_nul(b"sarun-virtio-write\0").unwrap();
-    let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
-    if fd < 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        // SAFETY: memfd_create returned a new owned descriptor.
+    #[cfg(target_os = "linux")]
+    {
+        let name = CStr::from_bytes_with_nul(b"sarun-virtio-write\0").unwrap();
+        let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+        if fd < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            // SAFETY: memfd_create returned a new owned descriptor.
+            Ok(unsafe { File::from_raw_fd(fd) })
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let live = crate::paths::live_home();
+        std::fs::create_dir_all(&live)?;
+        let mut template = live
+            .join(".virtio-write.XXXXXX")
+            .as_os_str()
+            .as_bytes()
+            .to_vec();
+        template.push(0);
+        let fd = unsafe { libc::mkstemp(template.as_mut_ptr().cast()) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        unsafe {
+            libc::unlink(template.as_ptr().cast());
+            let flags = libc::fcntl(fd, libc::F_GETFD);
+            if flags >= 0 {
+                libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+            }
+        }
         Ok(unsafe { File::from_raw_fd(fd) })
     }
+}
+
+#[cfg(target_os = "macos")]
+fn darwin_fallocate(fd: i32, mode: u32, offset: i64, length: i64) -> i32 {
+    const KEEP_SIZE: u32 = 0x01;
+    const PUNCH_HOLE: u32 = 0x02;
+    const ZERO_RANGE: u32 = 0x10;
+    if offset < 0 || length < 0 {
+        unsafe { *libc::__error() = libc::EINVAL };
+        return -1;
+    }
+    if mode == KEEP_SIZE | PUNCH_HOLE {
+        let mut punch = libc::fpunchhole_t {
+            fp_flags: 0,
+            reserved: 0,
+            fp_offset: offset,
+            fp_length: length,
+        };
+        return unsafe { libc::fcntl(fd, libc::F_PUNCHHOLE, &mut punch) };
+    }
+    if mode & !(KEEP_SIZE | ZERO_RANGE) != 0 {
+        unsafe { *libc::__error() = libc::EOPNOTSUPP };
+        return -1;
+    }
+    let end = match offset.checked_add(length) {
+        Some(end) => end,
+        None => {
+            unsafe { *libc::__error() = libc::EFBIG };
+            return -1;
+        }
+    };
+    if mode & ZERO_RANGE != 0 {
+        let original_len = unsafe {
+            let mut stat: libc::stat = std::mem::zeroed();
+            if libc::fstat(fd, &mut stat) < 0 {
+                return -1;
+            }
+            stat.st_size
+        };
+        let write_end = if mode & KEEP_SIZE != 0 {
+            end.min(original_len)
+        } else {
+            end
+        };
+        let zeros = [0u8; 64 * 1024];
+        let mut position = offset;
+        while position < write_end {
+            let count = (write_end - position).min(zeros.len() as i64) as usize;
+            let wrote = unsafe { libc::pwrite(fd, zeros.as_ptr().cast(), count, position) };
+            if wrote <= 0 {
+                return -1;
+            }
+            position += wrote as i64;
+        }
+    }
+    if mode & KEEP_SIZE == 0 {
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(fd, &mut stat) } < 0 {
+            return -1;
+        }
+        if end > stat.st_size && unsafe { libc::ftruncate(fd, end) } < 0 {
+            return -1;
+        }
+    }
+    0
 }
 
 /// Canonical filesystem protocol implementation. Raw kernel FUSE,
@@ -3444,7 +3620,13 @@ impl virtiofsd::filesystem::FileSystem for SarunFs {
         &self,
         capable: virtiofsd::filesystem::FsOptions,
     ) -> std::io::Result<virtiofsd::filesystem::FsOptions> {
-        let passthrough = capable.contains(virtiofsd::filesystem::FsOptions::PASSTHROUGH);
+        // QEMU's Darwin vhost-user path can walk below a passed-through lower
+        // directory without returning to this policy implementation. That
+        // exposes host children in place of synthetic projections (notably
+        // /etc/resolv.conf and CA bundles). Linux's in-kernel FUSE passthrough
+        // preserves the normal lookup/open policy boundary and remains enabled.
+        let passthrough = cfg!(target_os = "linux")
+            && capable.contains(virtiofsd::filesystem::FsOptions::PASSTHROUGH);
         self.kernel_passthrough
             .store(passthrough, Ordering::Relaxed);
         if self.root.0 == 0 {
@@ -3947,7 +4129,7 @@ impl virtiofsd::filesystem::FileSystem for SarunFs {
         &self,
         _ctx: virtiofsd::filesystem::Context,
         _inode: u64,
-    ) -> std::io::Result<libc::statvfs64> {
+    ) -> std::io::Result<virtiofsd::Statvfs> {
         self.statfs_node().map_err(virtio_error)
     }
 
@@ -4307,7 +4489,7 @@ mod chain_tests {
         let name = CString::new(id.to_string()).unwrap();
         let entry =
             <SarunFs as virtiofsd::filesystem::FileSystem>::lookup(&fs, ctx, 1, &name).unwrap();
-        assert_eq!(entry.attr.mode & libc::S_IFMT, libc::S_IFDIR);
+        assert_eq!(entry.attr.mode & libc::S_IFMT as u32, libc::S_IFDIR as u32);
         assert_eq!(fs.inner.inodes.lookup_count(entry.inode), 1);
 
         let xattr = CString::new("user.sarun-test").unwrap();
@@ -4830,7 +5012,10 @@ mod chain_tests {
             virtiofsd::filesystem::Extensions::default(),
         )
         .unwrap();
-        assert_eq!(directory.attr.mode & libc::S_IFMT, libc::S_IFDIR);
+        assert_eq!(
+            directory.attr.mode & libc::S_IFMT as u32,
+            libc::S_IFDIR as u32
+        );
         assert_eq!(directory.attr.uid.into_inner(), 1234);
         assert_eq!(directory.attr.gid.into_inner(), 2345);
         let fifo_name = CString::new("fifo").unwrap();
@@ -4839,13 +5024,13 @@ mod chain_tests {
             ctx,
             entry.inode,
             &fifo_name,
-            libc::S_IFIFO | 0o600,
+            libc::S_IFIFO as u32 | 0o600,
             0,
             0,
             virtiofsd::filesystem::Extensions::default(),
         )
         .unwrap();
-        assert_eq!(fifo.attr.mode & libc::S_IFMT, libc::S_IFIFO);
+        assert_eq!(fifo.attr.mode & libc::S_IFMT as u32, libc::S_IFIFO as u32);
         assert_eq!(fifo.attr.uid.into_inner(), 1234);
         assert_eq!(fifo.attr.gid.into_inner(), 2345);
         let link_name = CString::new("link").unwrap();
@@ -5329,6 +5514,12 @@ mod chain_tests {
         std::fs::create_dir_all(&tmp).unwrap();
         let source = tmp.join("appliance-init");
         std::fs::write(&source, b"target init").unwrap();
+        std::fs::create_dir_all(tmp.join("etc")).unwrap();
+        std::fs::write(tmp.join("etc/resolv.conf"), b"nameserver 192.0.2.1\n").unwrap();
+        std::fs::create_dir_all(tmp.join("private/etc")).unwrap();
+        std::os::unix::fs::symlink("private/etc", tmp.join("darwin-etc")).unwrap();
+        let resolver = tmp.join("projected-resolv.conf");
+        std::fs::write(&resolver, b"nameserver 240.1.0.1\n").unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o755)).unwrap();
         // SAFETY: TEST_STATE_HOME_LOCK serializes state-home tests.
@@ -5342,6 +5533,13 @@ mod chain_tests {
         let state = Arc::new(BoxState::create(id).unwrap());
         fs.add_box(state.clone());
         fs.project_file(id, "init", source).unwrap();
+        fs.project_file(id, "etc/resolv.conf", resolver).unwrap();
+        fs.project_file(
+            id,
+            "darwin-etc/pki/ca.pem",
+            tmp.join("projected-resolv.conf"),
+        )
+        .unwrap();
 
         assert_eq!(fs.box_read_file(id, "init").unwrap(), b"target init");
         assert_eq!(fs.box_file_mode(id, "init"), Some(0o755));
@@ -5354,6 +5552,86 @@ mod chain_tests {
         let error = fs.box_write_file(id, "init", b"overwrite").unwrap_err();
         assert_eq!(error.raw_os_error(), Some(libc::EROFS));
         assert!(state.kinds.read().unwrap().get("init").is_none());
+
+        // Exercise the same nested lookup/open/read entry points used by a
+        // virtio-fs guest. A host lower file at the projected path must never
+        // be returned merely because its parent directory came from lower.
+        let export = fs.export_box(id).unwrap();
+        let negotiated = <SarunFs as virtiofsd::filesystem::FileSystem>::init(
+            &export,
+            virtiofsd::filesystem::FsOptions::PASSTHROUGH,
+        )
+        .unwrap();
+        assert_eq!(
+            negotiated.contains(virtiofsd::filesystem::FsOptions::PASSTHROUGH),
+            cfg!(target_os = "linux")
+        );
+        let ctx = virtiofsd::filesystem::Context {
+            uid: 0.into(),
+            gid: 0.into(),
+            pid: 1,
+        };
+        let etc = <SarunFs as virtiofsd::filesystem::FileSystem>::lookup(
+            &export,
+            ctx,
+            1,
+            &CString::new("etc").unwrap(),
+        )
+        .unwrap();
+        let projected = <SarunFs as virtiofsd::filesystem::FileSystem>::lookup(
+            &export,
+            ctx,
+            etc.inode,
+            &CString::new("resolv.conf").unwrap(),
+        )
+        .unwrap();
+        let (handle, open_options) = <SarunFs as virtiofsd::filesystem::FileSystem>::open(
+            &export,
+            ctx,
+            projected.inode,
+            false,
+            libc::O_RDONLY as u32,
+        )
+        .unwrap();
+        assert_eq!(
+            open_options.contains(virtiofsd::filesystem::OpenOptions::PASSTHROUGH),
+            cfg!(target_os = "linux")
+        );
+        let handle = handle.unwrap();
+        if cfg!(target_os = "linux") {
+            let backing =
+                <SarunFs as virtiofsd::filesystem::FileSystem>::backing_file(&export, handle)
+                    .unwrap()
+                    .unwrap();
+            let mut backing_bytes = [0u8; 64];
+            let backing_read = backing.read_at(&mut backing_bytes, 0).unwrap();
+            assert_eq!(&backing_bytes[..backing_read], b"nameserver 240.1.0.1\n");
+        }
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let read = <SarunFs as virtiofsd::filesystem::FileSystem>::read(
+            &export,
+            ctx,
+            projected.inode,
+            handle,
+            CollectWriter(bytes.clone()),
+            64,
+            0,
+            None,
+            0,
+        )
+        .unwrap();
+        assert_eq!(read, b"nameserver 240.1.0.1\n".len());
+        assert_eq!(&*bytes.lock().unwrap(), b"nameserver 240.1.0.1\n");
+        assert_eq!(
+            fs.box_read_file(id, "private/etc/pki/ca.pem").unwrap(),
+            b"nameserver 240.1.0.1\n"
+        );
+        assert!(
+            fs.box_list_dir(id, "private/etc")
+                .unwrap()
+                .iter()
+                .any(|(name, kind)| name == "pki" && *kind == 'd')
+        );
 
         fs.remove_box(id);
         assert_eq!(fs.inner.synthetic.projection_count(), 0);

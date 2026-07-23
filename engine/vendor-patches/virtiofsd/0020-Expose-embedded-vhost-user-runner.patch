@@ -8,18 +8,17 @@ diff --git a/src/vhost_user.rs b/src/vhost_user.rs
 index e1b5e1e..19fae6c 100644
 --- a/src/vhost_user.rs
 +++ b/src/vhost_user.rs
-@@ -14,8 +14,9 @@ use log::*;
+@@ -14,8 +14,8 @@ use log::*;
  
  use vhost::vhost_user::message::*;
  use vhost::vhost_user::Backend;
-+use vhost::vhost_user::Listener;
  use vhost_user_backend::bitmap::BitmapMmapRegion;
 -use vhost_user_backend::{VhostUserBackend, VringMutex, VringState, VringT};
 +use vhost_user_backend::{VhostUserBackend, VhostUserDaemon, VringMutex, VringState, VringT};
  use virtio_bindings::bindings::virtio_config::*;
  use virtio_bindings::bindings::virtio_ring::{
      VIRTIO_RING_F_EVENT_IDX, VIRTIO_RING_F_INDIRECT_DESC,
-@@ -447,6 +448,41 @@ impl<F: FileSystem + SerializableFileSystem + Send + Sync + 'static> VhostUserFs
+@@ -447,6 +447,36 @@ impl<F: FileSystem + SerializableFileSystem + Send + Sync + 'static> VhostUserFs
      }
  }
  
@@ -35,8 +34,6 @@ index e1b5e1e..19fae6c 100644
 +where
 +    F: FileSystem + SerializableFileSystem + Send + Sync + 'static,
 +{
-+    let mut listener = Listener::new(socket, true)
-+        .map_err(|error| io::Error::other(format!("create vhost-user listener: {error}")))?;
 +    let backend = Arc::new(
 +        VhostUserFsBackendBuilder::default()
 +            .set_thread_pool_size(thread_pool_size)
@@ -51,11 +48,8 @@ index e1b5e1e..19fae6c 100644
 +    )
 +    .map_err(|error| io::Error::other(format!("create vhost-user daemon: {error}")))?;
 +    daemon
-+        .start(&mut listener)
-+        .map_err(|error| io::Error::other(format!("start vhost-user daemon: {error}")))?;
-+    daemon
-+        .wait()
-+        .map_err(|error| io::Error::other(format!("wait for vhost-user daemon: {error}")))
++        .serve(socket)
++        .map_err(|error| io::Error::other(format!("serve vhost-user daemon: {error}")))
 +}
 +
  impl<F: FileSystem + SerializableFileSystem + Send + Sync + 'static> VhostUserBackend

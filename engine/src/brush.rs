@@ -3922,12 +3922,18 @@ mod builtin_boundary_tests {
     #[tokio::test]
     async fn subshell_umask_is_local_and_reaches_builtins_and_external_children() {
         let dir = scratch_dir();
+        #[cfg(target_os = "linux")]
+        let stat_mode = "stat -c %a";
+        #[cfg(target_os = "macos")]
+        let stat_mode = "stat -f %Lp";
         let out = run_capture(
-            "umask 022; \
+            &format!(
+                "umask 022; \
              (umask 077; mkdir private; /usr/bin/touch private/external; \
-              printf '%s %s\n' \"$(stat -c %a private)\" \
-                                 \"$(stat -c %a private/external)\"); \
-             printf 'parent=%s' \"$(umask)\"",
+              printf '%s %s\n' \"$({stat_mode} private)\" \
+                                 \"$({stat_mode} private/external)\"); \
+             printf 'parent=%s' \"$(umask)\""
+            ),
             &dir,
         )
         .await;

@@ -103,6 +103,85 @@ pub fn architecture_name(architecture: QemuArchitecture) -> &'static str {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HostPlatform {
+    Linux,
+    Macos,
+}
+
+impl HostPlatform {
+    fn current() -> Self {
+        if cfg!(target_os = "macos") {
+            Self::Macos
+        } else {
+            Self::Linux
+        }
+    }
+
+    fn artifact_component(self) -> Option<&'static str> {
+        match self {
+            // Preserve the established Linux cache layout. Existing appliance
+            // caches and release bundles must remain valid after adding the
+            // first non-Linux host.
+            Self::Linux => None,
+            Self::Macos => Some("macos"),
+        }
+    }
+
+    fn artifact_directory(self, host_architecture: &str) -> String {
+        self.artifact_component().map_or_else(
+            || format!("host-{host_architecture}"),
+            |os| format!("host-{os}-{host_architecture}"),
+        )
+    }
+
+    fn shared_memory_object(self, memory: &str) -> OsString {
+        match self {
+            Self::Linux => format!("memory-backend-memfd,id=mem,size={memory},share=on").into(),
+            Self::Macos => format!("memory-backend-shm,id=mem,size={memory},share=on").into(),
+        }
+    }
+
+    fn inherited_fd_path(self, fd: RawFd) -> OsString {
+        match self {
+            Self::Linux => format!("/proc/self/fd/{fd}").into(),
+            Self::Macos => format!("/dev/fd/{fd}").into(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Accelerator {
+    Kvm,
+    Hvf,
+    Tcg,
+}
+
+impl Accelerator {
+    fn qemu_name(self) -> &'static str {
+        match self {
+            Self::Kvm => "kvm",
+            Self::Hvf => "hvf",
+            Self::Tcg => "tcg",
+        }
+    }
+
+    fn argument(self) -> &'static str {
+        match self {
+            Self::Kvm => "kvm",
+            Self::Hvf => "hvf",
+            Self::Tcg => "tcg,thread=multi",
+        }
+    }
+
+    fn cpu(self) -> &'static str {
+        match self {
+            Self::Kvm | Self::Hvf => "host",
+            Self::Tcg => "max",
+        }
+    }
+}
+
 fn cache_root() -> PathBuf {
     if let Some(root) = std::env::var_os("SARUN_APPLIANCE_ROOT") {
         return PathBuf::from(root);
@@ -132,8 +211,9 @@ fn qemu_binary(architecture: QemuArchitecture) -> PathBuf {
         QemuArchitecture::Mmips => "mipsel",
         other => architecture_name(other),
     };
+    let host = HostPlatform::current().artifact_directory(std::env::consts::ARCH);
     cache_root()
-        .join(format!("host-{}", std::env::consts::ARCH))
+        .join(host)
         .join(format!("qemu-system-{executable_architecture}"))
 }
 
@@ -162,13 +242,61 @@ fn host_supports_compat32(architecture: QemuArchitecture) -> bool {
     }
 }
 
+fn kvm_device_available(architecture: QemuArchitecture) -> bool {
+    cfg!(target_os = "linux")
+        && architecture_name(architecture) == std::env::consts::ARCH
+        && std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/kvm")
+            .is_ok()
+}
+
+fn select_accelerator(
+    platform: HostPlatform,
+    architecture: QemuArchitecture,
+    host_architecture: &str,
+    kvm_device: bool,
+    host_compat32: bool,
+) -> Accelerator {
+    if architecture_name(architecture) != host_architecture {
+        return Accelerator::Tcg;
+    }
+    if platform == HostPlatform::Macos {
+        // Hypervisor.framework accelerates a matching 64-bit guest on macOS.
+        // Unlike the Linux KVM policy below, this intentionally does not gate
+        // HVF on AArch32 EL0: Apple Silicon does not expose that optional CPU
+        // mode. A caller needing the aarch64 appliance's compat32 ABI must use
+        // TCG explicitly once the accelerator override reaches the CLI.
+        return Accelerator::Hvf;
+    }
+
+    if kvm_device && host_compat32 {
+        Accelerator::Kvm
+    } else {
+        Accelerator::Tcg
+    }
+}
+
+fn accelerator(architecture: QemuArchitecture) -> Accelerator {
+    let kvm_device = kvm_device_available(architecture);
+    select_accelerator(
+        HostPlatform::current(),
+        architecture,
+        std::env::consts::ARCH,
+        kvm_device,
+        kvm_device && host_supports_compat32(architecture),
+    )
+}
+
 fn qemu_args(
     architecture: QemuArchitecture,
     kernel: &OsStr,
     virtiofs_fd: RawFd,
     control_fd: RawFd,
     data_dir: &Path,
-    kvm: bool,
+    accelerator: Accelerator,
+    platform: HostPlatform,
     net_mode: NetMode,
     network_fd: Option<RawFd>,
     debug_fd: Option<RawFd>,
@@ -191,7 +319,7 @@ fn qemu_args(
     args.extend([
         memory.clone().into(),
         "-object".into(),
-        format!("memory-backend-memfd,id=mem,size={memory},share=on").into(),
+        platform.shared_memory_object(&memory),
         "-numa".into(),
         "node,memdev=mem".into(),
         "-smp".into(),
@@ -227,11 +355,8 @@ fn qemu_args(
     if architecture == QemuArchitecture::X8664 {
         args.extend(["-L".into(), data_dir.as_os_str().to_owned()]);
     }
-    args.extend([
-        "-accel".into(),
-        if kvm { "kvm" } else { "tcg,thread=multi" }.into(),
-    ]);
-    args.extend(["-cpu".into(), if kvm { "host" } else { "max" }.into()]);
+    args.extend(["-accel".into(), accelerator.argument().into()]);
+    args.extend(["-cpu".into(), accelerator.cpu().into()]);
     args.extend([
         "-append".into(),
         format!(
@@ -292,7 +417,8 @@ fn qemu_image_args(
     initramfs: &OsStr,
     init: &str,
     data_dir: &Path,
-    kvm: bool,
+    accelerator: Accelerator,
+    platform: HostPlatform,
     debug_fd: RawFd,
 ) -> io::Result<Vec<OsString>> {
     use crate::generated_wire::DebugImageProfile;
@@ -346,7 +472,7 @@ fn qemu_image_args(
     if fixed_resources.is_none() {
         args.extend([
             "-object".into(),
-            format!("memory-backend-memfd,id=mem,size={memory},share=on").into(),
+            platform.shared_memory_object(&memory),
             "-numa".into(),
             "node,memdev=mem".into(),
         ]);
@@ -366,11 +492,11 @@ fn qemu_image_args(
     }
     args.extend([
         "-accel".into(),
-        if kvm { "kvm" } else { "tcg,thread=multi" }.into(),
+        accelerator.argument().into(),
         "-cpu".into(),
-        fixed_cpu.unwrap_or(if kvm { "host" } else { "max" }).into(),
+        fixed_cpu.unwrap_or(accelerator.cpu()).into(),
         "-append".into(),
-        format!("console={console} rdinit={init} panic=-1{shutdown}").into(),
+        format!("console={console} rdinit={init} panic=-1 nokaslr{shutdown}").into(),
         "-chardev".into(),
         format!("socket,id=viros-rsp,fd={debug_fd}").into(),
         "-gdb".into(),
@@ -401,14 +527,8 @@ fn run_opaque_image(
     let qemu_kernel = inherit(kernel.as_raw_fd())?;
     let qemu_initramfs = inherit(initramfs.as_raw_fd())?;
     let qemu_rsp = inherit(rsp.as_raw_fd())?;
-    let matching_host = architecture_name(architecture) == std::env::consts::ARCH;
-    let kvm_device = matching_host
-        && std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open("/dev/kvm")
-            .is_ok();
-    let kvm = kvm_device && host_supports_compat32(architecture);
+    let platform = HostPlatform::current();
+    let selected_accelerator = accelerator(architecture);
     let data_dir = qemu
         .parent()
         .unwrap_or_else(|| Path::new("."))
@@ -416,17 +536,18 @@ fn run_opaque_image(
     let args = qemu_image_args(
         architecture,
         profile,
-        &OsString::from(format!("/proc/self/fd/{}", qemu_kernel.as_raw_fd())),
-        &OsString::from(format!("/proc/self/fd/{}", qemu_initramfs.as_raw_fd())),
+        &platform.inherited_fd_path(qemu_kernel.as_raw_fd()),
+        &platform.inherited_fd_path(qemu_initramfs.as_raw_fd()),
         &init,
         &data_dir,
-        kvm,
+        selected_accelerator,
+        platform,
         qemu_rsp.as_raw_fd(),
     )?;
     eprintln!(
         "sarun-engine: qemu {} opaque image accelerator {}",
         architecture_name(architecture),
-        if kvm { "kvm" } else { "tcg" },
+        selected_accelerator.qemu_name(),
     );
     let mut child = ChildGuard::new(
         Command::new(qemu)
@@ -457,16 +578,20 @@ fn run_opaque_image(
 /// filesystem or network-policy implementation.
 pub fn packet_socket_pair() -> io::Result<(OwnedFd, OwnedFd)> {
     let mut fds = [-1; 2];
-    let result = unsafe {
-        libc::socketpair(
-            libc::AF_UNIX,
-            libc::SOCK_DGRAM | libc::SOCK_NONBLOCK,
-            0,
-            fds.as_mut_ptr(),
-        )
-    };
+    let result = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_DGRAM, 0, fds.as_mut_ptr()) };
     if result != 0 {
         return Err(io::Error::last_os_error());
+    }
+    for fd in fds {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            let error = io::Error::last_os_error();
+            unsafe {
+                libc::close(fds[0]);
+                libc::close(fds[1]);
+            }
+            return Err(error);
+        }
     }
     Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
 }
@@ -544,9 +669,10 @@ pub fn run(
         }
         None => (None, None),
     };
+    let platform = HostPlatform::current();
     let kernel_argument = qemu_debug_kernel
         .as_ref()
-        .map(|kernel| OsString::from(format!("/proc/self/fd/{}", kernel.as_raw_fd())))
+        .map(|kernel| platform.inherited_fd_path(kernel.as_raw_fd()))
         .unwrap_or_else(|| {
             stock_kernel
                 .as_ref()
@@ -554,43 +680,58 @@ pub fn run(
                 .as_os_str()
                 .to_owned()
         });
-    let matching_host = architecture_name(architecture) == std::env::consts::ARCH;
-    let kvm_device = matching_host
-        && std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open("/dev/kvm")
-            .is_ok();
-    let kvm = kvm_device && host_supports_compat32(architecture);
-    if kvm_device && !kvm {
+    let selected_accelerator = accelerator(architecture);
+    if kvm_device_available(architecture) && selected_accelerator != Accelerator::Kvm {
         eprintln!(
             "sarun-engine: qemu {} retaining tcg because host KVM lacks the 32-bit process ABI",
             architecture_name(architecture),
         );
     }
-    let args = qemu_args(
+    let mut args = qemu_args(
         architecture,
         &kernel_argument,
         qemu_virtiofs.as_raw_fd(),
         qemu_control.as_raw_fd(),
         &data_dir,
-        kvm,
+        selected_accelerator,
+        platform,
         command.net_mode,
         qemu_network.as_ref().map(AsRawFd::as_raw_fd),
         qemu_rsp.as_ref().map(AsRawFd::as_raw_fd),
     );
+    if let Some(path) = std::env::var_os("SARUN_APPLIANCE_PACKET_DUMP") {
+        if command.net_mode == NetMode::Off {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "SARUN_APPLIANCE_PACKET_DUMP requires appliance networking",
+            ));
+        }
+        args.extend([
+            "-object".into(),
+            format!(
+                "filter-dump,id=sarun-packet-dump,netdev=network,file={}",
+                path.to_string_lossy()
+            )
+            .into(),
+        ]);
+    }
     eprintln!(
         "sarun-engine: qemu {} accelerator {}",
         architecture_name(architecture),
-        if kvm { "kvm" } else { "tcg" },
+        selected_accelerator.qemu_name(),
     );
+    let console = std::env::var_os("SARUN_APPLIANCE_CONSOLE").is_some();
     let child = Command::new(&qemu)
         .args(&args)
         .stdin(Stdio::piped())
         // User stdout returns through the recorded virtio-fs sink. The serial
-        // console is an implementation diagnostic and must not corrupt a
-        // pipeline consuming Sarun's stdout.
-        .stdout(Stdio::null())
+        // console is normally diagnostic-only and must not corrupt a pipeline.
+        // An explicit troubleshooting switch exposes early kernel failures.
+        .stdout(if console {
+            Stdio::inherit()
+        } else {
+            Stdio::null()
+        })
         .stderr(Stdio::inherit())
         .spawn()?;
     let mut child = ChildGuard::new(child);
@@ -1116,6 +1257,26 @@ pub fn wire_command(
                 .expect("fixed environment value is bounded"),
         );
     }
+    if net_mode == crate::net::NetMode::Tap {
+        // QEMU appliances do not pass through bwrap's environment setup.
+        // Point common TLS clients at the engine-owned CA projection that
+        // accompanies Sarun's policy/capture network transport.
+        let ca_path = b"/etc/ssl/certs/ca-certificates.crt";
+        for name in [
+            b"SSL_CERT_FILE".as_slice(),
+            b"CURL_CA_BUNDLE".as_slice(),
+            b"NODE_EXTRA_CA_CERTS".as_slice(),
+            b"REQUESTS_CA_BUNDLE".as_slice(),
+            b"GIT_SSL_CAINFO".as_slice(),
+        ] {
+            environment.insert(
+                crate::wire::BoundedBytes::new(name.to_vec())
+                    .expect("fixed environment name is bounded"),
+                crate::wire::BoundedBytes::new(ca_path.to_vec())
+                    .expect("fixed environment value is bounded"),
+            );
+        }
+    }
     let environment = crate::wire::BoundedMap::new(environment)
         .map_err(|error| format!("environment size violates relation bound: {error:?}"))?;
     Ok(ApplianceCommand {
@@ -1206,6 +1367,7 @@ extern "C" fn record_nested_signal(signal: i32) {
 /// Guest-side endpoint for `run --qemu` inside an appliance. It asks PID 1 to
 /// relay one semantic launch operation to the host outer runner; the caller
 /// sees an ordinary full-duplex process channel, never an engine socket.
+#[cfg(target_os = "linux")]
 pub fn nested_run(request: ApplianceRunRequest, broker: &str) -> io::Result<i32> {
     use std::os::linux::net::SocketAddrExt;
     let address = std::os::unix::net::SocketAddr::from_abstract_name(broker.as_bytes())?;
@@ -1295,6 +1457,14 @@ pub fn nested_run(request: ApplianceRunRequest, broker: &str) -> io::Result<i32>
     }
 }
 
+#[cfg(not(target_os = "linux"))]
+pub fn nested_run(_request: ApplianceRunRequest, _broker: &str) -> io::Result<i32> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "nested appliance launch is a Linux guest operation",
+    ))
+}
+
 static GUEST_CHILD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
 extern "C" fn forward_guest_signal(signal: i32) {
@@ -1306,6 +1476,7 @@ extern "C" fn forward_guest_signal(signal: i32) {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn mount_one(source: &str, target: &str, kind: &str, flags: libc::c_ulong) -> io::Result<()> {
     std::fs::create_dir_all(target)?;
     let source = std::ffi::CString::new(source).unwrap();
@@ -1656,6 +1827,7 @@ fn write_appliance_file_frame(writer: &Arc<Mutex<std::fs::File>>, frame: &Applia
     }
 }
 
+#[cfg(target_os = "linux")]
 fn start_guest_nested_broker(control: &std::fs::File) -> io::Result<Arc<Mutex<std::fs::File>>> {
     use std::os::linux::net::SocketAddrExt;
     let address = std::os::unix::net::SocketAddr::from_abstract_name(NESTED_BROKER.as_bytes())?;
@@ -1736,6 +1908,7 @@ fn start_guest_nested_broker(control: &std::fs::File) -> io::Result<Arc<Mutex<st
 }
 
 /// PID-1 entry. Called before Prolog or ordinary CLI initialization.
+#[cfg(target_os = "linux")]
 pub fn init_main() -> i32 {
     if let Err(error) = mount_one("devtmpfs", "/dev", "devtmpfs", 0) {
         eprintln!("sarun init: mount /dev: {error}");
@@ -1822,7 +1995,8 @@ mod tests {
             11,
             12,
             Path::new("D"),
-            false,
+            Accelerator::Tcg,
+            HostPlatform::Linux,
             NetMode::Off,
             None,
             None,
@@ -1846,7 +2020,8 @@ mod tests {
             11,
             12,
             Path::new("D"),
-            false,
+            Accelerator::Tcg,
+            HostPlatform::Linux,
             NetMode::Tap,
             Some(17),
             None,
@@ -1869,7 +2044,8 @@ mod tests {
             11,
             12,
             Path::new("D"),
-            false,
+            Accelerator::Tcg,
+            HostPlatform::Linux,
             NetMode::Host,
             None,
             None,
@@ -1891,7 +2067,8 @@ mod tests {
             11,
             12,
             Path::new("D"),
-            false,
+            Accelerator::Tcg,
+            HostPlatform::Linux,
             NetMode::Off,
             None,
             Some(23),
@@ -1909,6 +2086,96 @@ mod tests {
     }
 
     #[test]
+    fn macos_qemu_arguments_use_hvf_and_posix_shared_memory() {
+        let args = qemu_args(
+            QemuArchitecture::Aarch64,
+            OsStr::new("/dev/fd/19"),
+            11,
+            12,
+            Path::new("D"),
+            Accelerator::Hvf,
+            HostPlatform::Macos,
+            NetMode::Off,
+            None,
+            None,
+        )
+        .iter()
+        .map(|value| value.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join(" ");
+
+        assert!(args.contains("-accel hvf"));
+        assert!(args.contains("-cpu host"));
+        assert!(args.contains("memory-backend-shm,id=mem"));
+        assert!(!args.contains("memory-backend-memfd"));
+        assert!(args.contains("-kernel /dev/fd/19"));
+    }
+
+    #[test]
+    fn macos_accelerates_only_the_matching_guest_architecture() {
+        assert_eq!(
+            select_accelerator(
+                HostPlatform::Macos,
+                QemuArchitecture::Aarch64,
+                "aarch64",
+                false,
+                false,
+            ),
+            Accelerator::Hvf
+        );
+        assert_eq!(
+            select_accelerator(
+                HostPlatform::Macos,
+                QemuArchitecture::X8664,
+                "aarch64",
+                false,
+                false,
+            ),
+            Accelerator::Tcg
+        );
+        assert_eq!(
+            select_accelerator(
+                HostPlatform::Macos,
+                QemuArchitecture::Arm,
+                "aarch64",
+                false,
+                false,
+            ),
+            Accelerator::Tcg
+        );
+        assert_eq!(
+            select_accelerator(
+                HostPlatform::Macos,
+                QemuArchitecture::Mmips,
+                "aarch64",
+                false,
+                false,
+            ),
+            Accelerator::Tcg
+        );
+    }
+
+    #[test]
+    fn host_paths_are_platform_specific_without_changing_linux_cache_layout() {
+        assert_eq!(
+            HostPlatform::Linux.artifact_directory("aarch64"),
+            "host-aarch64"
+        );
+        assert_eq!(
+            HostPlatform::Macos.artifact_directory("aarch64"),
+            "host-macos-aarch64"
+        );
+        assert_eq!(
+            HostPlatform::Linux.inherited_fd_path(19),
+            OsString::from("/proc/self/fd/19")
+        );
+        assert_eq!(
+            HostPlatform::Macos.inherited_fd_path(19),
+            OsString::from("/dev/fd/19")
+        );
+    }
+
+    #[test]
     fn opaque_image_profiles_are_fixed_and_begin_stopped() {
         use crate::generated_wire::DebugImageProfile;
         let aarch64 = qemu_image_args(
@@ -1918,7 +2185,8 @@ mod tests {
             OsStr::new("/proc/self/fd/20"),
             "/sbin/init",
             Path::new("D"),
-            false,
+            Accelerator::Tcg,
+            HostPlatform::Linux,
             23,
         )
         .unwrap()
@@ -1940,7 +2208,8 @@ mod tests {
             OsStr::new("I"),
             "/sbin/init",
             Path::new("D"),
-            false,
+            Accelerator::Tcg,
+            HostPlatform::Linux,
             23,
         )
         .unwrap()
@@ -1958,7 +2227,8 @@ mod tests {
             OsStr::new("I"),
             "/init",
             Path::new("D"),
-            false,
+            Accelerator::Tcg,
+            HostPlatform::Linux,
             23,
         )
         .unwrap()
@@ -1980,7 +2250,8 @@ mod tests {
             OsStr::new("I"),
             "/init",
             Path::new("D"),
-            false,
+            Accelerator::Tcg,
+            HostPlatform::Linux,
             23,
         )
         .unwrap()
@@ -1995,6 +2266,11 @@ mod tests {
         assert!(mmips.contains("console=ttyS0,115200 rdinit=/init"));
         assert!(!mmips.contains("memory-backend-memfd"));
         assert!(
+            [&aarch64, &x86, &arm, &mmips]
+                .into_iter()
+                .all(|command| command.contains(" nokaslr"))
+        );
+        assert!(
             qemu_image_args(
                 QemuArchitecture::Aarch64,
                 DebugImageProfile::MicrovmInitramfsX8664V1,
@@ -2002,7 +2278,8 @@ mod tests {
                 OsStr::new("I"),
                 "/sbin/init",
                 Path::new("D"),
-                false,
+                Accelerator::Tcg,
+                HostPlatform::Linux,
                 23,
             )
             .is_err()
@@ -2059,6 +2336,35 @@ mod tests {
             command.cwd.as_ref().map(|value| value.as_slice()),
             Some(b"/work".as_slice())
         );
+    }
+
+    #[test]
+    fn tap_appliance_command_points_tls_clients_at_projected_ca() {
+        let command = wire_command(
+            &["/probe".into()],
+            None,
+            crate::net::NetMode::Tap,
+            false,
+            DebugMode::Off,
+        )
+        .unwrap();
+        let environment = command.environment.as_map();
+        for name in [
+            b"SSL_CERT_FILE".as_slice(),
+            b"CURL_CA_BUNDLE".as_slice(),
+            b"NODE_EXTRA_CA_CERTS".as_slice(),
+            b"REQUESTS_CA_BUNDLE".as_slice(),
+            b"GIT_SSL_CAINFO".as_slice(),
+        ] {
+            let value = environment
+                .iter()
+                .find(|(key, _)| key.as_slice() == name)
+                .map(|(_, value)| value.as_slice());
+            assert_eq!(
+                value,
+                Some(b"/etc/ssl/certs/ca-certificates.crt".as_slice())
+            );
+        }
     }
 
     #[test]

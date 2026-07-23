@@ -37,9 +37,10 @@ deps: ## Install system packages (FUSE, bubblewrap; iproute2 + tshark for net te
 
 # ---- Build ----------------------------------------------------------------
 #
-# The only build: a fully-static musl binary via cargo-zigbuild + ziglang (no
-# apt toolchain). The `engine` target below selects the host-architecture musl
-# target explicitly; Cargo configuration must remain architecture-neutral.
+# Linux releases remain fully-static musl binaries built through cargo-zigbuild.
+# macOS releases are native Mach-O binaries so they can use Hypervisor.framework
+# and the Darwin host primitives; the Linux appliance init is still cross-built
+# separately by `make appliances`.
 
 .PHONY: vendor
 vendor: ## Assemble engine/vendor/ from pinned upstreams + vendor-patches/ series
@@ -50,26 +51,33 @@ tools: ## Bootstrap repository-local uv/rustup fallbacks and cargo-zigbuild
 	$(TOOLS_RUN) uv tool install --with ziglang cargo-zigbuild
 
 # The addin set the sarun runner requires of the sud wrappers.
-HOST_ARCH := $(shell uname -m)
+HOST_OS := $(shell uname -s)
+HOST_ARCH_RAW := $(shell uname -m)
+HOST_ARCH := $(if $(filter arm64,$(HOST_ARCH_RAW)),aarch64,$(HOST_ARCH_RAW))
+ifeq ($(HOST_OS),Darwin)
+ENGINE_TARGET ?= $(HOST_ARCH)-apple-darwin
+SWIPL_TARGET := $(ENGINE_TARGET)
+else
 ENGINE_TARGET ?= $(HOST_ARCH)-unknown-linux-musl
 SWIPL_TARGET := $(subst -unknown,,$(ENGINE_TARGET))
+endif
 ENGINE_RELEASE := engine/target/$(ENGINE_TARGET)/release
 
 .PHONY: engine
-engine: vendor wire-codegen tools ## Build the engine (fully-static musl binary; cargo-zigbuild + zig)
+engine: vendor wire-codegen tools ## Build the host engine (native on macOS; static musl on Linux)
 	$(TOOLS_RUN) rustup target add $(ENGINE_TARGET)
+ifeq ($(HOST_OS),Darwin)
+	$(TOOLS_RUN) cargo build --release --target $(ENGINE_TARGET) \
+	  --manifest-path engine/Cargo.toml
+else
 	$(TOOLS_RUN) bash -c 'cd engine && \
 	  cargo zigbuild --release --target $(ENGINE_TARGET)'
-	@ln -sfn $(ENGINE_RELEASE)/sarun sarun
-	@# SUD is a first-class run backend: both wrappers must sit next to the
-	@# engine binary (runner::sud_wrapper_paths resolves the sibling).
-	@# sud64 and sud32 are both required: the wrappers hand off to each
-	@# other on cross-class execs, so they MUST come from the same build.
-	@# tv/Makefile uses zig's bundled musl+UAPI headers, so no host -m32
-	@# toolchain is required; fail visibly instead of leaving stale/missing
-	@# wrapper siblings in the release directory.
+	@# SUD is Linux-only. Both wrappers must sit next to the Linux engine and
+	@# must come from the same build because they hand off on cross-class execs.
 	$(TOOLS_RUN) $(MAKE) -C tv sud64 sud32
 	cp tv/sud64 tv/sud32 $(ENGINE_RELEASE)/
+endif
+	@ln -sfn $(ENGINE_RELEASE)/sarun sarun
 	$(TOOLS_RUN) python3 scripts/release_licenses.py --target $(ENGINE_TARGET) \
 	  --output $(ENGINE_RELEASE)/LICENSES
 	@# The mirror drivers are compiled INTO sarun (multi-call dispatch on

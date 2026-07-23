@@ -25,18 +25,30 @@ fn sha256(path: &Path) -> String {
         .arg("--binary")
         .arg(path)
         .output()
-        .unwrap_or_else(|error| panic!("failed to run sha256sum for {}: {error}", path.display()));
+        .or_else(|_| {
+            Command::new("shasum")
+                .arg("-a")
+                .arg("256")
+                .arg(path)
+                .output()
+        })
+        .unwrap_or_else(|error| {
+            panic!(
+                "failed to run sha256sum or shasum for {}: {error}",
+                path.display()
+            )
+        });
     assert!(
         output.status.success(),
-        "sha256sum failed for {}: {}",
+        "SHA-256 command failed for {}: {}",
         path.display(),
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8(output.stdout)
-        .expect("sha256sum emitted non-UTF-8 output")
+        .expect("SHA-256 command emitted non-UTF-8 output")
         .split_whitespace()
         .next()
-        .expect("sha256sum emitted no digest")
+        .expect("SHA-256 command emitted no digest")
         .to_owned()
 }
 
@@ -124,8 +136,12 @@ fn main() {
     let swipl_target = match target.as_str() {
         "x86_64-unknown-linux-musl" => "x86_64-linux-musl",
         "aarch64-unknown-linux-musl" => "aarch64-linux-musl",
+        "aarch64-apple-darwin" => "aarch64-apple-darwin",
+        "x86_64-apple-darwin" => "x86_64-apple-darwin",
         _ => {
-            panic!("sarun's embedded Prolog runtime supports x86_64 and aarch64 musl, not {target}")
+            panic!(
+                "sarun's embedded Prolog runtime supports x86_64/aarch64 Linux-musl and macOS, not {target}"
+            )
         }
     };
 
@@ -245,7 +261,9 @@ fn main() {
     println!("cargo:rustc-link-lib=static=swipl");
     println!("cargo:rustc-link-lib=static=z");
     println!("cargo:rustc-link-lib=m");
-    println!("cargo:rustc-link-lib=rt");
+    if target.ends_with("-linux-musl") {
+        println!("cargo:rustc-link-lib=rt");
+    }
 
     let embedded_resource = PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("sarun.prc");
     fs::copy(artifacts.join("sarun.prc"), &embedded_resource).unwrap_or_else(|error| {

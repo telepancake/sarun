@@ -19590,6 +19590,7 @@ mod tests {
 
     /// Boot a private engine instance. Returns None (skip) if the binary is
     /// missing or the control socket never appears (no FUSE/permissions here).
+    #[cfg(target_os = "linux")]
     fn boot() -> Option<Engine> {
         let bin = engine_bin()?;
         // unique NS per test (pid + atomic) so parallel cargo tests don't collide.
@@ -19641,6 +19642,14 @@ mod tests {
             _tmp: tmp,
         };
         let _ = e.child.kill();
+        None
+    }
+
+    /// The historical UI integration fixture writes through a host FUSE mount.
+    /// macOS deliberately has no host-FUSE backend: its equivalent integration
+    /// coverage boots a QEMU box and is exercised by the macOS appliance suite.
+    #[cfg(target_os = "macos")]
+    fn boot() -> Option<Engine> {
         None
     }
 

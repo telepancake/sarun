@@ -17,7 +17,7 @@ import subprocess
 import sys
 from typing import BinaryIO, Callable
 
-from .live_facade import LiveFacade, build_live_facade
+from .live_facade import RESET_BOOT_TIMEOUT_SECONDS, LiveFacade, build_live_facade
 
 
 PROTOCOL_VERSION = 1
@@ -336,18 +336,13 @@ def run_provider(
         start = _read_provider_start_after_version(stdin_fd)
     elif version == 2:
         from .provider_handshake import (
-            SelectedBundleError,
+            sarun_selected_bundle_preparer,
             serve_pre_rsp_handshake_after_version,
         )
 
-        def unavailable(_execution):
-            raise SelectedBundleError(
-                "selected-boot preparation is unavailable in this provider composition"
-            )
-
         if not serve_pre_rsp_handshake_after_version(
             stdin_fd,
-            pre_rsp_prepare or unavailable,
+            pre_rsp_prepare or sarun_selected_bundle_preparer,
             write_fd=handshake_write_fd,
         ):
             return
@@ -364,6 +359,9 @@ def run_provider(
             gdb_socket=None,
             manifest_path=os.path.join("/", os.fsdecode(start.manifest)),
             qemu_stream=qemu_stream,
+            image_catalog=start.image,
+            bootstrap_from_reset=True,
+            timeout=RESET_BOOT_TIMEOUT_SECONDS,
         )
     except BaseException:
         qemu_stream.close()

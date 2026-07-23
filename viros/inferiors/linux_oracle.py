@@ -57,6 +57,9 @@ class TaskSnapshot:
     state: str = "stopped"
     current_cpu: int | None = None
     page_table_root: int | None = None
+    # Opaque kernel ``mm`` identity. Unlike the task/start cookie, this
+    # changes across exec and therefore bounds reuse of executable metadata.
+    address_space_cookie: int | None = None
 
 
 @dataclass(frozen=True)

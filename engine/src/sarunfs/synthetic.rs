@@ -124,7 +124,13 @@ impl SyntheticRuntime {
     }
 
     pub(crate) fn projected_children(&self, box_id: i64, parent: &str) -> Vec<String> {
-        self.projections
+        let prefix = if parent.is_empty() {
+            String::new()
+        } else {
+            format!("{parent}/")
+        };
+        let mut children = self
+            .projections
             .read()
             .unwrap()
             .iter()
@@ -132,12 +138,31 @@ impl SyntheticRuntime {
                 if *owner != box_id {
                     return None;
                 }
-                let (projected_parent, name) = projected
-                    .rsplit_once('/')
-                    .unwrap_or(("", projected.as_str()));
-                (projected_parent == parent).then(|| name.to_owned())
+                projected
+                    .strip_prefix(&prefix)
+                    .filter(|remainder| !remainder.is_empty())
+                    .and_then(|remainder| remainder.split('/').next())
+                    .map(str::to_owned)
             })
-            .collect()
+            .collect::<Vec<_>>();
+        children.sort_unstable();
+        children.dedup();
+        children
+    }
+
+    pub(crate) fn has_projected_descendant(&self, box_id: i64, parent: &str) -> bool {
+        let prefix = if parent.is_empty() {
+            String::new()
+        } else {
+            format!("{parent}/")
+        };
+        self.projections
+            .read()
+            .unwrap()
+            .keys()
+            .any(|(owner, projected)| {
+                *owner == box_id && projected.starts_with(&prefix) && projected.len() > prefix.len()
+            })
     }
 
     pub(crate) fn remove_box(&self, box_id: i64) {

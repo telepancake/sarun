@@ -645,15 +645,19 @@ pub(crate) fn resolve_selected_image(
         if !visited.insert(path.clone()) {
             continue;
         }
-        if let Some(kind) = artifact_kind(&path) {
-            let provider_box = provider_for_path(catalog, &chain, &path)?.unwrap_or(source_box);
+        let provider_box = provider_for_path(catalog, &chain, &path)?;
+        if let Some(provider_box) = provider_box {
             add_artifact(
                 &mut artifacts,
                 &mut artifacts_truncated,
                 AncestryArtifact {
                     provider_box,
                     relative_path: path.clone(),
-                    kind,
+                    // Intermediate regular outputs are part of the finite
+                    // build ancestry too. Retaining them is what lets the
+                    // debugger associate an installed stripped ELF with the
+                    // unstripped ELF that fed the strip/copy step.
+                    kind: artifact_kind(&path).unwrap_or(ArtifactKind::SourceInput),
                 },
             );
         }
@@ -688,17 +692,6 @@ pub(crate) fn resolve_selected_image(
                 }
             }
             pending.extend(inputs.iter().cloned());
-        } else {
-            let provider_box = provider_for_path(catalog, &chain, &path)?.unwrap_or(source_box);
-            add_artifact(
-                &mut artifacts,
-                &mut artifacts_truncated,
-                AncestryArtifact {
-                    provider_box,
-                    relative_path: path,
-                    kind: ArtifactKind::SourceInput,
-                },
-            );
         }
     }
     if let Some(writer) = &writer {
@@ -993,11 +986,46 @@ mod tests {
     }
 
     #[test]
+    fn intermediate_outputs_retain_the_unstripped_elf_ancestry() {
+        let mut fixture = fixture();
+        fixture
+            .files
+            .insert((30, "work/usr/sbin/quagga".into()), file(Some(50), 500));
+        fixture
+            .files
+            .insert((30, "work/build/quagga.debug".into()), file(Some(51), 900));
+        fixture.edges.get_mut(&30).unwrap()[0]
+            .inputs
+            .push("usr/sbin/quagga".into());
+        fixture.edges.get_mut(&30).unwrap().push(BuildEdgeRecord {
+            row_id: 50,
+            outputs: vec!["usr/sbin/quagga".into()],
+            inputs: vec!["build/quagga.debug".into()],
+            command: Some("strip -o usr/sbin/quagga build/quagga.debug".into()),
+            exit_code: Some(0),
+        });
+
+        let result = resolve_selected_image(&fixture, 30, "work/out/fw.img").unwrap();
+        for path in ["work/usr/sbin/quagga", "work/build/quagga.debug"] {
+            assert!(result.artifacts.contains(&AncestryArtifact {
+                provider_box: 30,
+                relative_path: path.into(),
+                kind: ArtifactKind::SourceInput,
+            }));
+        }
+    }
+
+    #[test]
     fn ancestry_output_is_finite_and_marks_truncation() {
         let mut fixture = fixture();
         let inputs = (0..MAX_ANCESTRY_ARTIFACTS + 20)
             .map(|index| format!("input-{index}.c"))
-            .collect();
+            .collect::<Vec<_>>();
+        for path in &inputs {
+            fixture
+                .files
+                .insert((30, format!("work/{path}")), file(None, 1));
+        }
         fixture.edges.get_mut(&30).unwrap()[0].inputs = inputs;
         let result = resolve_selected_image(&fixture, 30, "work/out/fw.img").unwrap();
         assert_eq!(result.artifacts.len(), MAX_ANCESTRY_ARTIFACTS);

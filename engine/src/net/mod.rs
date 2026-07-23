@@ -85,6 +85,10 @@ pub mod mitm;
 pub mod policy;
 pub mod prompt;
 pub mod stack;
+#[cfg(target_os = "linux")]
+pub mod tap;
+#[cfg(not(target_os = "linux"))]
+#[path = "tap_macos.rs"]
 pub mod tap;
 pub mod webcap;
 

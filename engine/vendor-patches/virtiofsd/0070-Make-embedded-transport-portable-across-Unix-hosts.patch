@@ -1,0 +1,594 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Thu, 23 Jul 2026 14:25:40 +0000
+Subject: [PATCH] Make embedded transport portable across Unix hosts
+
+Keep the standalone passthrough daemon Linux-only while exposing the shared filesystem transport on Darwin, including portable vectored I/O, host-independent Statvfs, Linux FUSE errno encoding, and shared event readiness types.
+
+---
+diff --git a/src/capabilities.rs b/src/capabilities.rs
+index 1a91928..d6c364c 100644
+--- a/src/capabilities.rs
++++ b/src/capabilities.rs
+@@ -62,13 +62,8 @@ fn write(data: &[Data; 2]) -> io::Result<()> {
+         version: LINUX_CAPABILITY_VERSION_3,
+         pid: 0,
+     };
+-    let result = unsafe {
+-        libc::syscall(
+-            libc::SYS_capset,
+-            &mut header as *mut Header,
+-            data.as_ptr(),
+-        )
+-    };
++    let result =
++        unsafe { libc::syscall(libc::SYS_capset, &mut header as *mut Header, data.as_ptr()) };
+     if result < 0 {
+         Err(io::Error::last_os_error())
+     } else {
+diff --git a/src/filesystem.rs b/src/filesystem.rs
+index 28bddf9..9e1a143 100644
+--- a/src/filesystem.rs
++++ b/src/filesystem.rs
+@@ -63,7 +63,7 @@ pub struct DirEntry<'a> {
+     /// The inode number for this entry. This does NOT have to be the same as the `Inode` for this
+     /// directory entry. However, it must be the same as the `attr.st_ino` field of the `Entry` that
+     /// would be returned by a `lookup` request in the parent directory for `name`.
+-    pub ino: libc::ino64_t,
++    pub ino: u64,
+ 
+     /// Any non-zero value that the kernel can use to identify the current point in the directory
+     /// entry stream. It does not need to be the actual physical position. A value of `0` is
+@@ -752,9 +752,9 @@ pub trait FileSystem {
+     }
+ 
+     /// Get information about the file system.
+-    fn statfs(&self, ctx: Context, inode: Self::Inode) -> io::Result<libc::statvfs64> {
++    fn statfs(&self, ctx: Context, inode: Self::Inode) -> io::Result<crate::Statvfs> {
+         // Safe because we are zero-initializing a struct with only POD fields.
+-        let mut st: libc::statvfs64 = unsafe { mem::zeroed() };
++        let mut st: crate::Statvfs = unsafe { mem::zeroed() };
+ 
+         // This matches the behavior of libfuse as it returns these values if the
+         // filesystem doesn't implement this method.
+diff --git a/src/fuse.rs b/src/fuse.rs
+index 4463921..54a145a 100644
+--- a/src/fuse.rs
++++ b/src/fuse.rs
+@@ -3,10 +3,13 @@
+ // found in the LICENSE file.
+ 
+ use std::convert::TryFrom;
++#[cfg(target_os = "linux")]
+ use std::io;
+ 
+ use crate::macros::enum_value;
+-use crate::soft_idmap::{GuestGid, GuestUid, HostGid, HostUid};
++use crate::soft_idmap::{GuestGid, GuestUid};
++#[cfg(target_os = "linux")]
++use crate::soft_idmap::{HostGid, HostUid};
+ use bitflags::bitflags;
+ use vm_memory::ByteValued;
+ 
+@@ -621,6 +624,7 @@ impl Attr {
+      *
+      * Maps UID and GID from host to guest according to the mappings provided.
+      */
++    #[cfg(target_os = "linux")]
+     pub fn try_from_stat64<
+         UidMap: FnOnce(HostUid) -> io::Result<GuestUid>,
+         GidMap: FnOnce(HostGid) -> io::Result<GuestGid>,
+@@ -637,6 +641,7 @@ impl Attr {
+      *
+      * Maps UID and GID from host to guest according to the mappings provided.
+      */
++    #[cfg(target_os = "linux")]
+     pub fn try_with_flags<
+         UidMap: FnOnce(HostUid) -> io::Result<GuestUid>,
+         GidMap: FnOnce(HostGid) -> io::Result<GuestGid>,
+@@ -686,14 +691,14 @@ pub struct Kstatfs {
+ }
+ unsafe impl ByteValued for Kstatfs {}
+ 
+-impl From<libc::statvfs64> for Kstatfs {
+-    fn from(st: libc::statvfs64) -> Self {
++impl From<crate::Statvfs> for Kstatfs {
++    fn from(st: crate::Statvfs) -> Self {
+         Kstatfs {
+-            blocks: st.f_blocks,
+-            bfree: st.f_bfree,
+-            bavail: st.f_bavail,
+-            files: st.f_files,
+-            ffree: st.f_ffree,
++            blocks: st.f_blocks.into(),
++            bfree: st.f_bfree.into(),
++            bavail: st.f_bavail.into(),
++            files: st.f_files.into(),
++            ffree: st.f_ffree.into(),
+             bsize: st.f_bsize as u32,
+             namelen: st.f_namemax as u32,
+             frsize: st.f_frsize as u32,
+diff --git a/src/lib.rs b/src/lib.rs
+index 8263f1b..1f259d1 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -5,25 +5,44 @@
+ #[macro_use]
+ extern crate log;
+ 
++#[cfg(target_os = "linux")]
+ pub mod capabilities;
+ pub mod descriptor_utils;
+ pub mod file_traits;
+ pub mod filesystem;
+ pub mod fuse;
++#[cfg(target_os = "linux")]
+ pub mod idmap;
++#[cfg(target_os = "linux")]
+ pub mod limits;
+ pub mod macros;
++#[cfg(target_os = "linux")]
+ pub mod oslib;
++#[cfg(not(target_os = "linux"))]
++#[path = "oslib_portable.rs"]
++pub mod oslib;
++#[cfg(target_os = "linux")]
+ pub mod passthrough;
++#[cfg(target_os = "linux")]
+ pub mod read_dir;
++#[cfg(target_os = "linux")]
+ pub mod sandbox;
+ #[cfg(feature = "seccomp")]
+ pub mod seccomp;
+ pub mod server;
+ pub mod soft_idmap;
++#[cfg(target_os = "linux")]
++pub mod util;
++#[cfg(not(target_os = "linux"))]
++#[path = "util_portable.rs"]
+ pub mod util;
+ pub mod vhost_user;
+ 
++#[cfg(target_os = "linux")]
++pub type Statvfs = libc::statvfs64;
++#[cfg(not(target_os = "linux"))]
++pub type Statvfs = libc::statvfs;
++
+ use std::ffi::{FromBytesWithNulError, FromVecWithNulError};
+ use std::{error, fmt, io};
+ 
+diff --git a/src/oslib_portable.rs b/src/oslib_portable.rs
+new file mode 100644
+index 0000000..4d4c6e4
+--- /dev/null
++++ b/src/oslib_portable.rs
+@@ -0,0 +1,87 @@
++// SPDX-License-Identifier: BSD-3-Clause
++
++//! Transport-core OS helpers for non-Linux Unix hosts.
++//!
++//! The standalone passthrough daemon remains Linux-only. Sarun's own
++//! filesystem only needs positional vectored I/O and the protocol flag types.
++
++use bitflags::bitflags;
++use std::io;
++use std::os::fd::{AsRawFd, BorrowedFd};
++
++bitflags! {
++    /// Linux-compatible per-write flags carried by the FUSE protocol.
++    pub struct WritevFlags: i32 {
++        const RWF_HIPRI = 0x0000_0001;
++        const RWF_DSYNC = 0x0000_0002;
++        const RWF_SYNC = 0x0000_0004;
++        const RWF_APPEND = 0x0000_0010;
++        const RWF_NOAPPEND = 0x0000_0020;
++        const RWF_ATOMIC = 0x0000_0040;
++        const RWF_DONTCACHE = 0x0000_0080;
++    }
++}
++
++bitflags! {
++    /// Linux-compatible per-read flags carried by the FUSE protocol.
++    pub struct ReadvFlags: i32 {
++        const RWF_HIPRI = 0x0000_0001;
++        const RWF_NOWAIT = 0x0000_0008;
++        const RWF_DONTCACHE = 0x0000_0080;
++    }
++}
++
++/// Darwin counterpart of Linux `pwritev2` for the flag-free transport path.
++///
++/// macOS has `pwritev` but no per-call RWF flags. Refuse non-empty flags so a
++/// guest cannot mistake silently weakened semantics for success.
++pub unsafe fn writev_at(
++    fd: BorrowedFd<'_>,
++    iovecs: &[libc::iovec],
++    offset: i64,
++    flags: Option<WritevFlags>,
++) -> io::Result<usize> {
++    if flags.is_some_and(|value| !value.is_empty()) {
++        return Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP));
++    }
++    // SAFETY: the caller guarantees every iovec points to readable memory.
++    let result = unsafe {
++        libc::pwritev(
++            fd.as_raw_fd(),
++            iovecs.as_ptr(),
++            iovecs.len() as libc::c_int,
++            offset as libc::off_t,
++        )
++    };
++    if result < 0 {
++        Err(io::Error::last_os_error())
++    } else {
++        Ok(result as usize)
++    }
++}
++
++/// Darwin counterpart of Linux `preadv2` for the flag-free transport path.
++pub unsafe fn readv_at(
++    fd: BorrowedFd<'_>,
++    iovecs: &[libc::iovec],
++    offset: i64,
++    flags: Option<ReadvFlags>,
++) -> io::Result<usize> {
++    if flags.is_some_and(|value| !value.is_empty()) {
++        return Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP));
++    }
++    // SAFETY: the caller guarantees every iovec points to writable memory.
++    let result = unsafe {
++        libc::preadv(
++            fd.as_raw_fd(),
++            iovecs.as_ptr(),
++            iovecs.len() as libc::c_int,
++            offset as libc::off_t,
++        )
++    };
++    if result < 0 {
++        Err(io::Error::last_os_error())
++    } else {
++        Ok(result as usize)
++    }
++}
+diff --git a/src/server.rs b/src/server.rs
+index 7b9809e..20192f2 100644
+--- a/src/server.rs
++++ b/src/server.rs
+@@ -8,7 +8,6 @@ use crate::filesystem::{
+     ListxattrReply, SecContext, SerializableFileSystem, ZeroCopyReader, ZeroCopyWriter,
+ };
+ use crate::fuse::*;
+-use crate::passthrough::util::einval;
+ use crate::soft_idmap::GuestGid;
+ use crate::{oslib, Error, Result};
+ use std::convert::{TryFrom, TryInto};
+@@ -29,6 +28,10 @@ const DIRENT_PADDING: [u8; 8] = [0; 8];
+ const CURRENT_DIR_CSTR: &[u8] = b".";
+ const PARENT_DIR_CSTR: &[u8] = b"..";
+ 
++fn einval() -> io::Error {
++    io::Error::from_raw_os_error(libc::EINVAL)
++}
++
+ enum MessageReader<'a> {
+     Virtio(Reader<'a>),
+     Fuse(std::io::Cursor<&'a [u8]>),
+@@ -741,8 +744,11 @@ impl<F: FileSystem + Sync> Server<F> {
+     ) -> Result<usize> {
+         let Rename2In { newdir, flags, .. } = r.read_obj().map_err(Error::DecodeMessage)?;
+ 
+-        let flags =
+-            flags & (libc::RENAME_EXCHANGE | libc::RENAME_NOREPLACE | libc::RENAME_WHITEOUT);
++        // These are Linux FUSE wire values, independent of the host libc.
++        const RENAME_NOREPLACE: u32 = 1;
++        const RENAME_EXCHANGE: u32 = 2;
++        const RENAME_WHITEOUT: u32 = 4;
++        let flags = flags & (RENAME_EXCHANGE | RENAME_NOREPLACE | RENAME_WHITEOUT);
+ 
+         self.do_rename(in_header, size_of::<Rename2In>(), newdir, flags, r, w)
+     }
+@@ -1541,35 +1547,63 @@ impl<F: FileSystem + Sync> Server<F> {
+     }
+ 
+     fn getlk(&self, in_header: InHeader, mut r: MessageReader, w: MessageWriter) -> Result<usize> {
+-        let LkIn { fh, owner, lk, lk_flags, .. } =
+-            r.read_obj().map_err(Error::DecodeMessage)?;
+-        match self.fs.getlk(Context::from(in_header), in_header.nodeid.into(),
+-                            fh.into(), owner, lk, lk_flags) {
++        let LkIn {
++            fh,
++            owner,
++            lk,
++            lk_flags,
++            ..
++        } = r.read_obj().map_err(Error::DecodeMessage)?;
++        match self.fs.getlk(
++            Context::from(in_header),
++            in_header.nodeid.into(),
++            fh.into(),
++            owner,
++            lk,
++            lk_flags,
++        ) {
+             Ok(lk) => reply_ok(Some(LkOut { lk }), None, in_header.unique, w),
+             Err(e) => reply_error(e, in_header.unique, w),
+         }
+     }
+ 
+     fn setlk(&self, in_header: InHeader, mut r: MessageReader, w: MessageWriter) -> Result<usize> {
+-        let LkIn { fh, owner, lk, lk_flags, .. } =
+-            r.read_obj().map_err(Error::DecodeMessage)?;
+-        match self.fs.setlk(Context::from(in_header), in_header.nodeid.into(),
+-                            fh.into(), owner, lk, lk_flags) {
++        let LkIn {
++            fh,
++            owner,
++            lk,
++            lk_flags,
++            ..
++        } = r.read_obj().map_err(Error::DecodeMessage)?;
++        match self.fs.setlk(
++            Context::from(in_header),
++            in_header.nodeid.into(),
++            fh.into(),
++            owner,
++            lk,
++            lk_flags,
++        ) {
+             Ok(()) => reply_ok(None::<u8>, None, in_header.unique, w),
+             Err(e) => reply_error(e, in_header.unique, w),
+         }
+     }
+ 
+-    fn setlkw(
+-        &self,
+-        in_header: InHeader,
+-        mut r: MessageReader,
+-        w: MessageWriter,
+-    ) -> Result<usize> {
+-        let LkIn { fh, owner, lk, lk_flags, .. } =
+-            r.read_obj().map_err(Error::DecodeMessage)?;
+-        match self.fs.setlkw(Context::from(in_header), in_header.nodeid.into(),
+-                             fh.into(), owner, lk, lk_flags) {
++    fn setlkw(&self, in_header: InHeader, mut r: MessageReader, w: MessageWriter) -> Result<usize> {
++        let LkIn {
++            fh,
++            owner,
++            lk,
++            lk_flags,
++            ..
++        } = r.read_obj().map_err(Error::DecodeMessage)?;
++        match self.fs.setlkw(
++            Context::from(in_header),
++            in_header.nodeid.into(),
++            fh.into(),
++            owner,
++            lk,
++            lk_flags,
++        ) {
+             Ok(()) => reply_ok(None::<u8>, None, in_header.unique, w),
+             Err(e) => reply_error(e, in_header.unique, w),
+         }
+@@ -1922,10 +1956,92 @@ fn strerror(error: i32) -> String {
+     String::from_utf8(err_desc.to_vec()).unwrap_or_else(|_| "".to_owned())
+ }
+ 
++#[cfg(not(target_os = "macos"))]
++fn fuse_errno(host_errno: i32) -> i32 {
++    host_errno
++}
++
++/// FUSE is a Linux protocol, so its error field contains Linux errno values
++/// even when the server itself runs on another Unix.  Darwin diverges at
++/// EDEADLK and most values after ERANGE; forwarding its numeric errno would,
++/// for example, turn ENODATA (96) into Linux EPFNOSUPPORT and make execve(2)
++/// reject an otherwise valid binary after probing its security xattrs.
++#[cfg(target_os = "macos")]
++fn fuse_errno(host_errno: i32) -> i32 {
++    match host_errno {
++        1..=10 | 12..=34 => host_errno,
++        11 => 35,          // EDEADLK
++        35 => 11,          // EAGAIN
++        36 => 115,         // EINPROGRESS
++        37 => 114,         // EALREADY
++        38 => 88,          // ENOTSOCK
++        39 => 89,          // EDESTADDRREQ
++        40 => 90,          // EMSGSIZE
++        41 => 91,          // EPROTOTYPE
++        42 => 92,          // ENOPROTOOPT
++        43 => 93,          // EPROTONOSUPPORT
++        44 => 94,          // ESOCKTNOSUPPORT
++        45 | 102 => 95,    // ENOTSUP / EOPNOTSUPP
++        46 => 96,          // EPFNOSUPPORT
++        47 => 97,          // EAFNOSUPPORT
++        48 => 98,          // EADDRINUSE
++        49 => 99,          // EADDRNOTAVAIL
++        50 => 100,         // ENETDOWN
++        51 => 101,         // ENETUNREACH
++        52 => 102,         // ENETRESET
++        53 => 103,         // ECONNABORTED
++        54 => 104,         // ECONNRESET
++        55 => 105,         // ENOBUFS
++        56 => 106,         // EISCONN
++        57 => 107,         // ENOTCONN
++        58 => 108,         // ESHUTDOWN
++        59 => 109,         // ETOOMANYREFS
++        60 => 110,         // ETIMEDOUT
++        61 => 111,         // ECONNREFUSED
++        62 => 40,          // ELOOP
++        63 => 36,          // ENAMETOOLONG
++        64 => 112,         // EHOSTDOWN
++        65 => 113,         // EHOSTUNREACH
++        66 => 39,          // ENOTEMPTY
++        67 => 11,          // EPROCLIM (closest Linux equivalent: EAGAIN)
++        68 => 87,          // EUSERS
++        69 => 122,         // EDQUOT
++        70 => 116,         // ESTALE
++        71 => 66,          // EREMOTE
++        72..=76 => 71,     // BSD RPC errors (closest Linux equivalent: EPROTO)
++        77 => 37,          // ENOLCK
++        78 => 38,          // ENOSYS
++        79 => 22,          // EFTYPE (closest Linux equivalent: EINVAL)
++        80 | 81 => 13,     // EAUTH / ENEEDAUTH
++        82 | 83 => 5,      // EPWROFF / EDEVERR
++        84 => 75,          // EOVERFLOW
++        85 | 86 | 88 => 8, // EBADEXEC / EBADARCH / EBADMACHO
++        87 => 80,          // ESHLIBVERS (closest Linux equivalent: ELIBBAD)
++        89 => 125,         // ECANCELED
++        90 => 43,          // EIDRM
++        91 => 42,          // ENOMSG
++        92 => 84,          // EILSEQ
++        93 | 96 => 61,     // ENOATTR / ENODATA
++        94 => 74,          // EBADMSG
++        95 => 72,          // EMULTIHOP
++        97 => 67,          // ENOLINK
++        98 => 63,          // ENOSR
++        99 => 60,          // ENOSTR
++        100 => 71,         // EPROTO
++        101 => 62,         // ETIME
++        103 => 1,          // ENOPOLICY (closest Linux equivalent: EPERM)
++        104 => 131,        // ENOTRECOVERABLE
++        105 => 130,        // EOWNERDEAD
++        106 => 28,         // EQFULL (closest Linux equivalent: ENOSPC)
++        _ => 5,            // Unknown Darwin errors must not masquerade as another Linux errno.
++    }
++}
++
+ fn reply_error(e: io::Error, unique: u64, mut w: MessageWriter) -> Result<usize> {
++    let errno = fuse_errno(e.raw_os_error().unwrap_or(libc::EIO));
+     let header = OutHeader {
+         len: size_of::<OutHeader>() as u32,
+-        error: -e.raw_os_error().unwrap_or(libc::EIO),
++        error: -errno,
+         unique,
+     };
+ 
+@@ -2188,7 +2304,7 @@ mod tests {
+                 generation: 4,
+                 attr: Attr {
+                     ino: 9,
+-                    mode: libc::S_IFREG | 0o644,
++                    mode: u32::from(libc::S_IFREG) | 0o644,
+                     ..Default::default()
+                 },
+                 attr_timeout: Duration::from_secs(2),
+@@ -2347,4 +2463,16 @@ mod tests {
+             other => panic!("unexpected error: {:?}", other),
+         }
+     }
++
++    #[cfg(target_os = "macos")]
++    #[test]
++    fn darwin_errnos_are_encoded_as_linux_fuse_errnos() {
++        assert_eq!(fuse_errno(libc::ENOENT), 2);
++        assert_eq!(fuse_errno(libc::EAGAIN), 11);
++        assert_eq!(fuse_errno(libc::ENOTEMPTY), 39);
++        assert_eq!(fuse_errno(libc::ENOSYS), 38);
++        assert_eq!(fuse_errno(libc::EOVERFLOW), 75);
++        assert_eq!(fuse_errno(libc::ENOATTR), 61);
++        assert_eq!(fuse_errno(libc::ENODATA), 61);
++    }
+ }
+diff --git a/src/util_portable.rs b/src/util_portable.rs
+new file mode 100644
+index 0000000..34b20cf
+--- /dev/null
++++ b/src/util_portable.rs
+@@ -0,0 +1,29 @@
++// SPDX-License-Identifier: BSD-3-Clause
++
++//! Error helpers shared by the transport core on non-Linux hosts.
++
++use std::io;
++
++pub fn other_io_error<E: Into<Box<dyn std::error::Error + Send + Sync>>>(err: E) -> io::Error {
++    io::Error::other(err)
++}
++
++pub trait ErrorContext {
++    fn context<C: std::fmt::Display>(self, context: C) -> Self;
++}
++
++impl ErrorContext for io::Error {
++    fn context<C: std::fmt::Display>(self, context: C) -> Self {
++        io::Error::new(self.kind(), format!("{context}: {self}"))
++    }
++}
++
++pub trait ResultErrorContext {
++    fn err_context<C: std::fmt::Display, F: FnOnce() -> C>(self, context: F) -> Self;
++}
++
++impl<V, E: ErrorContext> ResultErrorContext for Result<V, E> {
++    fn err_context<C: std::fmt::Display, F: FnOnce() -> C>(self, context: F) -> Self {
++        self.map_err(|error| error.context(context()))
++    }
++}
+diff --git a/src/vhost_user.rs b/src/vhost_user.rs
+index a041eb4..627f0dd 100644
+--- a/src/vhost_user.rs
++++ b/src/vhost_user.rs
+@@ -15,7 +15,9 @@ use log::*;
+ use vhost::vhost_user::message::*;
+ use vhost::vhost_user::Backend;
+ use vhost_user_backend::bitmap::BitmapMmapRegion;
+-use vhost_user_backend::{VhostUserBackend, VhostUserDaemon, VringMutex, VringState, VringT};
++use vhost_user_backend::{
++    EventSet, VhostUserBackend, VhostUserDaemon, VringMutex, VringState, VringT,
++};
+ use virtio_bindings::bindings::virtio_config::*;
+ use virtio_bindings::bindings::virtio_ring::{
+     VIRTIO_RING_F_EVENT_IDX, VIRTIO_RING_F_INDIRECT_DESC,
+@@ -24,7 +26,6 @@ use virtio_queue::{DescriptorChain, QueueOwnedT};
+ use vm_memory::{
+     ByteValued, GuestAddressSpace, GuestMemoryAtomic, GuestMemoryLoadGuard, GuestMemoryMmap, Le32,
+ };
+-use vmm_sys_util::epoll::EventSet;
+ use vmm_sys_util::event::{
+     new_event_consumer_and_notifier, EventConsumer, EventFlag, EventNotifier,
+ };
+@@ -129,24 +130,29 @@ struct VhostUserFsThread<F: FileSystem + Send + Sync + 'static> {
+ impl<F: FileSystem + SerializableFileSystem + Send + Sync + 'static> VhostUserFsThread<F> {
+     fn new(fs: F, thread_pool_size: usize) -> Result<Self> {
+         let pool = if thread_pool_size > 0 {
+-            // Test that unshare(CLONE_FS) works, it will be called for each thread.
+-            // It's an unprivileged system call but some Docker/Moby versions are
+-            // known to reject it via seccomp when CAP_SYS_ADMIN is not given.
+-            //
+-            // Note that the program is single-threaded here so this syscall has no
+-            // visible effect and is safe to make.
+-            let ret = unsafe { libc::unshare(libc::CLONE_FS) };
+-            if ret == -1 {
+-                return Err(Error::UnshareCloneFs(std::io::Error::last_os_error()));
++            #[cfg(target_os = "linux")]
++            {
++                // Test that unshare(CLONE_FS) works, it will be called for each thread.
++                // It's an unprivileged system call but some Docker/Moby versions are
++                // known to reject it via seccomp when CAP_SYS_ADMIN is not given.
++                //
++                // Note that the program is single-threaded here so this syscall has no
++                // visible effect and is safe to make.
++                let ret = unsafe { libc::unshare(libc::CLONE_FS) };
++                if ret == -1 {
++                    return Err(Error::UnshareCloneFs(std::io::Error::last_os_error()));
++                }
+             }
+ 
++            let mut builder = ThreadPoolBuilder::new();
++            #[cfg(target_os = "linux")]
++            builder.after_start(|_| {
++                // unshare FS for xattr operation
++                let ret = unsafe { libc::unshare(libc::CLONE_FS) };
++                assert_eq!(ret, 0); // Should not fail
++            });
+             Some(
+-                ThreadPoolBuilder::new()
+-                    .after_start(|_| {
+-                        // unshare FS for xattr operation
+-                        let ret = unsafe { libc::unshare(libc::CLONE_FS) };
+-                        assert_eq!(ret, 0); // Should not fail
+-                    })
++                builder
+                     .pool_size(thread_pool_size)
+                     .create()
+                     .map_err(Error::CreateThreadPool)?,

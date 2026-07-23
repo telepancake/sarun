@@ -619,6 +619,31 @@ class LiveFacadeTests(unittest.TestCase):
                 live.close()
             self.assertTrue(client.closed)
 
+    def test_managed_provider_bootstraps_reset_qemu_before_first_snapshot(self):
+        with tempfile.TemporaryDirectory(dir=".") as directory_text:
+            directory = Path(directory_text)
+            manifest = _manifest(directory)
+            client = FakeClient()
+            with mock.patch(
+                "inferiors.live_facade.reach_userspace_boundary"
+            ) as bootstrap:
+                live = build_live_facade(
+                    qemu_socket=str(directory / "qemu.sock"),
+                    gdb_socket=str(directory / "gdb.sock"),
+                    manifest_path=manifest,
+                    client_factory=lambda path, timeout: client,
+                    runner_factory=lambda target, sealed: FrozenRunner(),
+                    bootstrap_from_reset=True,
+                )
+            try:
+                bootstrap.assert_called_once_with(
+                    live.target,
+                    timeout_seconds=120.0,
+                )
+                self.assertEqual(live.facade.handle(b"qC"), b"QCp2a.2a")
+            finally:
+                live.close()
+
     def test_mmips_default_runner_uses_little_endian_32_bit_snapshot_abi(self):
         with tempfile.TemporaryDirectory(dir=".") as directory_text:
             manifest = load_and_validate_manifest(

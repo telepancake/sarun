@@ -74,14 +74,14 @@ impl DirectKatiFileSystem {
     }
 
     fn mode_kind(mode: u32) -> kati::filesystem::FileKind {
-        match mode & libc::S_IFMT {
-            libc::S_IFREG => kati::filesystem::FileKind::Regular,
-            libc::S_IFDIR => kati::filesystem::FileKind::Directory,
-            libc::S_IFLNK => kati::filesystem::FileKind::Symlink,
-            libc::S_IFIFO => kati::filesystem::FileKind::Fifo,
-            libc::S_IFSOCK => kati::filesystem::FileKind::Socket,
-            libc::S_IFCHR => kati::filesystem::FileKind::CharDevice,
-            libc::S_IFBLK => kati::filesystem::FileKind::BlockDevice,
+        match mode & libc::S_IFMT as u32 {
+            value if value == libc::S_IFREG as u32 => kati::filesystem::FileKind::Regular,
+            value if value == libc::S_IFDIR as u32 => kati::filesystem::FileKind::Directory,
+            value if value == libc::S_IFLNK as u32 => kati::filesystem::FileKind::Symlink,
+            value if value == libc::S_IFIFO as u32 => kati::filesystem::FileKind::Fifo,
+            value if value == libc::S_IFSOCK as u32 => kati::filesystem::FileKind::Socket,
+            value if value == libc::S_IFCHR as u32 => kati::filesystem::FileKind::CharDevice,
+            value if value == libc::S_IFBLK as u32 => kati::filesystem::FileKind::BlockDevice,
             _ => kati::filesystem::FileKind::Unknown,
         }
     }

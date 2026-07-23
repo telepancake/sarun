@@ -18,7 +18,115 @@ qemu_sha=3745f6ea88e2e87fe0dc838b2b1d4e0a770bf48e01a1d5a186842a1fff76ccf5
 linux_sha=ac26e508abd56e9f8b89872b6e10c49fc823bcc70d8068a5d8504c1a7c4ff045
 slirp_sha=abd190c8213f259ab9fc1a411b8dd87c54b7aeba329d3f87f4f4aa82d921bbc9
 
+host_os=$(uname -s)
+host_arch=$(uname -m)
+[[ $host_arch == arm64 ]] && host_arch=aarch64
+kernel_make=${SARUN_KERNEL_MAKE:-make}
+kernel_llvm=${SARUN_KERNEL_LLVM:--21}
+kernel_path=$PATH
+kernel_host_args=()
+case $host_os in
+    Linux)
+        host_output=host-$host_arch
+        qemu_build_host=$host_arch-host
+        qemu_accelerator_args=(--enable-kvm)
+        qemu_pie_args=(--enable-pie)
+        ;;
+    Darwin)
+        host_output=host-macos-$host_arch
+        qemu_build_host=$host_arch-macos-host
+        qemu_accelerator_args=(--enable-hvf)
+        # QEMU's configure probe passes the ELF linker option `-pie`, which
+        # Apple clang diagnoses as an unused argument under the probe's
+        # `-Werror`. Mach-O executables are PIE by platform default; suppress
+        # the inapplicable ELF probe instead of weakening compiler warnings.
+        qemu_pie_args=(--disable-pie)
+        # Homebrew keeps LLVM keg-only on macOS and may package lld
+        # separately. Use their unversioned driver names (`LLVM=1`) without
+        # changing Linux's established clang-21 selection. Both variables
+        # remain overridable for builders with a pinned toolchain elsewhere.
+        if [[ -z ${SARUN_KERNEL_LLVM:-} ]]; then
+            llvm_prefix=$(brew --prefix llvm 2>/dev/null || true)
+            gnu_sed_prefix=$(brew --prefix gnu-sed 2>/dev/null || true)
+            coreutils_prefix=$(brew --prefix coreutils 2>/dev/null || true)
+            lld_prefix=
+            for lld_formula in lld lld@21 lld@20 lld@19; do
+                candidate=$(brew --prefix "$lld_formula" 2>/dev/null || true)
+                if [[ -x $candidate/bin/ld.lld ]]; then
+                    lld_prefix=$candidate
+                    break
+                fi
+            done
+            if [[ ! -x $llvm_prefix/bin/clang || ! -x $lld_prefix/bin/ld.lld \
+                    || ! -x $gnu_sed_prefix/libexec/gnubin/sed \
+                    || ! -x $coreutils_prefix/libexec/gnubin/readlink ]]; then
+                echo "Darwin appliance builds need Homebrew llvm, lld, gnu-sed, and coreutils" >&2
+                exit 2
+            fi
+            kernel_llvm=1
+            kernel_path=$gnu_sed_prefix/libexec/gnubin:$coreutils_prefix/libexec/gnubin:$llvm_prefix/bin:$lld_prefix/bin:$kernel_path
+        fi
+        # Kbuild also compiles small utilities that run on the build host.
+        # Keep those on Apple clang (and its matching active macOS SDK) while
+        # Homebrew clang/LLD produce the Linux target objects. macOS does not
+        # ship <elf.h>; the already-pinned Zig distribution does. `-idirafter`
+        # makes that one ABI header available without shadowing Apple SDK
+        # headers such as stdint.h.
+        zig_python=$(dirname "$(command -v python-zig)")/python
+        zig_lib=$($zig_python -c \
+            'import pathlib, ziglang; print(pathlib.Path(ziglang.__file__).parent / "lib")')
+        zig_elf_header=$zig_lib/libc/musl/include/elf.h
+        if [[ ! -f $zig_elf_header ]]; then
+            echo "pinned Zig installation does not contain libc/musl/include/elf.h" >&2
+            exit 2
+        fi
+        darwin_host_include=$build/darwin-host-include
+        mkdir -p "$darwin_host_include/asm"
+        install -m644 "$zig_elf_header" "$darwin_host_include/elf.h"
+        install -m644 "$repo/engine/appliance/darwin-host-include/byteswap.h" \
+            "$repo/engine/appliance/darwin-host-include/endian.h" \
+            "$darwin_host_include/"
+        install -m644 "$repo/engine/appliance/darwin-host-include/asm/types.h" \
+            "$repo/engine/appliance/darwin-host-include/asm/posix_types.h" \
+            "$darwin_host_include/asm/"
+        kernel_host_args=(
+            HOSTCC=/usr/bin/clang
+            HOSTCXX=/usr/bin/clang++
+            "HOSTCFLAGS=-idirafter $darwin_host_include"
+        )
+        if [[ -z ${SARUN_KERNEL_MAKE:-} ]] && command -v gmake >/dev/null 2>&1; then
+            kernel_make=gmake
+        fi
+        ;;
+    *)
+        echo "unsupported appliance build host: $host_os" >&2
+        exit 2
+        ;;
+esac
+
 mkdir -p "$sources" "$trees" "$build" "$out"
+
+verify_sha256() {
+    local file=$1 expected=$2 actual
+    if command -v sha256sum >/dev/null 2>&1; then
+        actual=$(sha256sum "$file")
+    else
+        actual=$(shasum -a 256 "$file")
+    fi
+    actual=${actual%% *}
+    if [[ $actual != "$expected" ]]; then
+        echo "SHA-256 mismatch for $file: expected $expected, got $actual" >&2
+        return 1
+    fi
+}
+
+build_jobs() {
+    if command -v nproc >/dev/null 2>&1; then
+        nproc
+    else
+        sysctl -n hw.logicalcpu
+    fi
+}
 
 fetch() {
     local url=$1 file=$2 sha=$3
@@ -26,7 +134,7 @@ fetch() {
         curl -fL --retry 3 -o "$file.part" "$url"
         mv "$file.part" "$file"
     fi
-    printf '%s  %s\n' "$sha" "$file" | sha256sum -c -
+    verify_sha256 "$file" "$sha"
 }
 
 extract() {
@@ -53,9 +161,8 @@ build_qemu() {
         patch -d "$trees/qemu-$qemu_version" -p1 \
             < "$repo/engine/appliance/qemu-sarun.patch"
     fi
-    local host_arch qbuild python
-    host_arch=$(uname -m)
-    qbuild=$build/qemu-$qemu_version-$host_arch-host-sarun
+    local qbuild python
+    qbuild=$build/qemu-$qemu_version-$qemu_build_host-sarun
     python=$(uv python find 3.12 2>/dev/null || true)
     if [[ -z $python ]]; then
         uv python install 3.12
@@ -77,37 +184,59 @@ build_qemu() {
         --python="$python" \
         --target-list=aarch64-softmmu,x86_64-softmmu,arm-softmmu,mipsel-softmmu \
         --without-default-features --enable-system --enable-tcg \
-        --enable-kvm --enable-vhost-user --enable-slirp --enable-pie \
+        "${qemu_accelerator_args[@]}" \
+        --enable-vhost-user --enable-slirp "${qemu_pie_args[@]}" \
         --without-default-devices \
         --with-devices-aarch64=sarun --with-devices-x86_64=sarun \
         --with-devices-arm=sarun --with-devices-mipsel=sarun)
     ninja -C "$qbuild" \
         qemu-system-aarch64 qemu-system-x86_64 qemu-system-arm qemu-system-mipsel
-    mkdir -p "$out/host-$host_arch"
-    install -m755 "$qbuild/qemu-system-aarch64" "$out/host-$host_arch/"
-    install -m755 "$qbuild/qemu-system-x86_64" "$out/host-$host_arch/"
-    install -m755 "$qbuild/qemu-system-arm" "$out/host-$host_arch/"
-    install -m755 "$qbuild/qemu-system-mipsel" "$out/host-$host_arch/"
-    mkdir -p "$out/host-$host_arch/LICENSES"
+    mkdir -p "$out/$host_output"
+    install -m755 "$qbuild/qemu-system-aarch64" "$out/$host_output/"
+    install -m755 "$qbuild/qemu-system-x86_64" "$out/$host_output/"
+    install -m755 "$qbuild/qemu-system-arm" "$out/$host_output/"
+    install -m755 "$qbuild/qemu-system-mipsel" "$out/$host_output/"
+    if [[ $host_os == Darwin ]]; then
+        # Meson's in-tree libslirp fallback is a dylib on Darwin. QEMU records
+        # @loader_path/subprojects/slirp as its first rpath, so preserve that
+        # relative layout and keep the cached appliance runnable without
+        # mutating the binary's load commands.
+        mkdir -p "$out/$host_output/subprojects/slirp"
+        install -m755 "$qbuild/subprojects/slirp/libslirp.0.dylib" \
+            "$out/$host_output/subprojects/slirp/"
+    fi
+    mkdir -p "$out/$host_output/LICENSES"
     install -m644 "$trees/qemu-$qemu_version/COPYING" \
-        "$out/host-$host_arch/LICENSES/QEMU-GPL-2.0.txt"
+        "$out/$host_output/LICENSES/QEMU-GPL-2.0.txt"
     install -m644 "$trees/qemu-$qemu_version/COPYING.LIB" \
-        "$out/host-$host_arch/LICENSES/QEMU-LGPL-2.1.txt"
+        "$out/$host_output/LICENSES/QEMU-LGPL-2.1.txt"
     install -m644 "$trees/qemu-$qemu_version/LICENSE" \
-        "$out/host-$host_arch/LICENSES/QEMU-LICENSE.txt"
+        "$out/$host_output/LICENSES/QEMU-LICENSE.txt"
     install -m644 "$trees/qemu-$qemu_version/subprojects/slirp/COPYRIGHT" \
-        "$out/host-$host_arch/LICENSES/libslirp-COPYRIGHT.txt"
-    mkdir -p "$out/host-$host_arch/share/qemu"
+        "$out/$host_output/LICENSES/libslirp-COPYRIGHT.txt"
+    mkdir -p "$out/$host_output/share/qemu"
     install -m644 "$trees/qemu-$qemu_version/pc-bios/bios-microvm.bin" \
         "$trees/qemu-$qemu_version/pc-bios/qboot.rom" \
         "$trees/qemu-$qemu_version/pc-bios/linuxboot_dma.bin" \
-        "$out/host-$host_arch/share/qemu/"
+        "$out/$host_output/share/qemu/"
 }
 
 build_kernel() {
     fetch "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-$linux_version.tar.xz" \
         "$sources/linux-$linux_version.tar.xz" "$linux_sha"
     extract "$sources/linux-$linux_version.tar.xz" "$trees/linux-$linux_version"
+    if [[ $host_os == Darwin ]]; then
+        if ! grep -q "macOS SDK owns uuid_t" \
+            "$trees/linux-$linux_version/scripts/mod/file2alias.c"; then
+            patch -d "$trees/linux-$linux_version" -p1 \
+                < "$repo/engine/appliance/linux-darwin-file2alias.patch"
+        fi
+        if ! grep -q "Darwin host builds lack Linux libelf" \
+            "$trees/linux-$linux_version/arch/x86/Kconfig"; then
+            patch -d "$trees/linux-$linux_version" -p1 \
+                < "$repo/engine/appliance/linux-darwin-x86.patch"
+        fi
+    fi
     for arch in aarch64 x86_64; do
         local karch target image kbuild
         case $arch in
@@ -115,13 +244,20 @@ build_kernel() {
             x86_64)  karch=x86_64; target=bzImage; image=arch/x86/boot/bzImage ;;
         esac
         kbuild=$build/linux-$linux_version-$arch
-        make -C "$trees/linux-$linux_version" O="$kbuild" ARCH="$karch" LLVM=-21 tinyconfig
-        "$trees/linux-$linux_version/scripts/kconfig/merge_config.sh" -m -O "$kbuild" \
+        PATH="$kernel_path" "$kernel_make" -C "$trees/linux-$linux_version" \
+            O="$kbuild" ARCH="$karch" LLVM="$kernel_llvm" \
+            "${kernel_host_args[@]}" tinyconfig
+        PATH="$kernel_path" "$trees/linux-$linux_version/scripts/kconfig/merge_config.sh" \
+            -m -O "$kbuild" \
             "$kbuild/.config" \
             "$repo/engine/appliance/kernel-common.config" \
             "$repo/engine/appliance/kernel-$arch.config"
-        make -C "$trees/linux-$linux_version" O="$kbuild" ARCH="$karch" LLVM=-21 olddefconfig
-        make -C "$trees/linux-$linux_version" O="$kbuild" ARCH="$karch" LLVM=-21 -j"$(nproc)" "$target"
+        PATH="$kernel_path" "$kernel_make" -C "$trees/linux-$linux_version" \
+            O="$kbuild" ARCH="$karch" LLVM="$kernel_llvm" \
+            "${kernel_host_args[@]}" olddefconfig
+        PATH="$kernel_path" "$kernel_make" -C "$trees/linux-$linux_version" \
+            O="$kbuild" ARCH="$karch" LLVM="$kernel_llvm" \
+            "${kernel_host_args[@]}" -j"$(build_jobs)" "$target"
         mkdir -p "$out/$arch"
         install -m644 "$kbuild/$image" "$out/$arch/kernel"
         install -m644 "$kbuild/.config" "$out/$arch/kernel.config"

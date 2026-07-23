@@ -997,3 +997,114 @@ def execute_selected_initramfs(
         raise SelectedBundleError(str(exc)) from exc
     finally:
         shutil.rmtree(transaction, ignore_errors=True)
+
+
+def _selected_kernel_digest(plan: SelectedBundlePlan) -> str | None:
+    """Return a selected/container kernel identity when the image carries one."""
+
+    if plan.selected_derivation.get("layout") == "selected-kernel-initramfs":
+        kernel = plan.selected_derivation.get("kernel")
+        if isinstance(kernel, Mapping):
+            digest = kernel.get("sha256")
+            return digest if isinstance(digest, str) else None
+        return None
+    components = plan.selected_derivation.get("components")
+    if not isinstance(components, list):
+        return None
+    kernels = []
+    for component in components:
+        if not isinstance(component, Mapping) or component.get("role") != "kernel":
+            continue
+        artifact = component.get("artifact")
+        if isinstance(artifact, Mapping) and isinstance(artifact.get("sha256"), str):
+            kernels.append(str(artifact["sha256"]))
+    unique = set(kernels)
+    if len(unique) > 1:
+        raise SelectedBundleError(
+            "selected image contains multiple different kernel components"
+        )
+    return next(iter(unique)) if unique else None
+
+
+def execute_selected_with_prebuilt_kernel(
+    execution: SelectedBundleExecutionRequest,
+    source: ArtifactSource,
+    output_root: Path,
+    prebuilt_kernel_root: Path,
+) -> SelectedBundleResult:
+    """Publish a selected image around one exact prevalidated kernel bundle.
+
+    Sarun supplies the kernel bundle through the provider's private input
+    capsule. The selected image is still derived solely from its finite
+    captured-artifact catalog; this adapter merely avoids recompiling debugger
+    support which the engine has already resolved and validated.
+    """
+
+    output_root = Path(output_root)
+    prebuilt_kernel_root = Path(prebuilt_kernel_root).resolve(strict=True)
+    if not prebuilt_kernel_root.is_dir():
+        raise SelectedBundleError("prebuilt kernel bundle root is unavailable")
+    try:
+        document = json.loads(
+            (prebuilt_kernel_root / "bundle.json").read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError) as exc:
+        raise SelectedBundleError("prebuilt kernel bundle manifest is unavailable") from exc
+    if not isinstance(document, Mapping) or document.get("format") != BUNDLE_FORMAT:
+        raise SelectedBundleError("prebuilt kernel bundle has the wrong format")
+
+    completed = False
+    try:
+        derived = orchestrate_selected_initramfs(
+            execution.selected_boot,
+            source,
+            output_root,
+            fixed_profile=execution.fixed_profile,
+        )
+        if document.get("architecture") != derived.plan.fixed_profile.architecture:
+            raise SelectedBundleError(
+                "prebuilt kernel bundle architecture does not match the selected image"
+            )
+        kernel = document.get("kernel")
+        if not isinstance(kernel, Mapping):
+            raise SelectedBundleError("prebuilt kernel bundle has no kernel identity")
+        boot_digest = kernel.get("boot_image_sha256")
+        if not isinstance(boot_digest, str):
+            raise SelectedBundleError("prebuilt kernel bundle has no boot-image digest")
+        selected_digest = _selected_kernel_digest(derived.plan)
+        if selected_digest is not None and selected_digest != boot_digest:
+            raise SelectedBundleError(
+                "selected image kernel does not match the resolved debugger kernel bundle"
+            )
+
+        kernel_output = output_root / "kernel-bundle"
+        shutil.copytree(prebuilt_kernel_root, kernel_output, symlinks=False)
+        _write_internal_image_bundle(
+            output_root / "image-bundle",
+            kernel_output,
+            output_root / "selected-image",
+            derived.plan,
+            execution.selected_boot,
+            source,
+        )
+        completed_plan = SelectedBundlePlan(
+            fixed_profile=derived.plan.fixed_profile,
+            selected_derivation=derived.plan.selected_derivation,
+            initramfs=derived.plan.initramfs,
+            kernel_init=derived.plan.kernel_init,
+            userspace=derived.plan.userspace,
+            kernel_inputs=derived.plan.kernel_inputs,
+            recorded_tools=derived.plan.recorded_tools,
+            missing_requirements=(),
+        )
+        (output_root / "bundle-plan.json").write_text(
+            json.dumps(completed_plan.descriptor(), indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        completed = True
+        return SelectedBundleResult(output_root, completed_plan)
+    except (OSError, image_bundle.ImageBundleError) as exc:
+        raise SelectedBundleError(str(exc)) from exc
+    finally:
+        if not completed:
+            shutil.rmtree(output_root, ignore_errors=True)

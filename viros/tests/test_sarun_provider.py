@@ -5,6 +5,7 @@ import subprocess
 import unittest
 from unittest import mock
 
+from inferiors.live_facade import RESET_BOOT_TIMEOUT_SECONDS
 from inferiors.sarun_provider import (
     DebugExecutable,
     DebugImageCatalog,
@@ -235,7 +236,15 @@ class SarunProviderProtocolTests(unittest.TestCase):
 
     def test_run_provider_uses_inherited_rsp_and_service_stream(self):
         provider, runner = os.pipe()
-        os.write(runner, start_frame(b"bundle/exact.json", "debug-44") + b"raw-rsp")
+        os.write(
+            runner,
+            start_frame(
+                b"bundle/exact.json",
+                "debug-44",
+                image=image_catalog(),
+            )
+            + b"raw-rsp",
+        )
         calls = []
 
         class InheritedStream:
@@ -267,6 +276,13 @@ class SarunProviderProtocolTests(unittest.TestCase):
             self.assertIsNone(kwargs["qemu_socket"])
             self.assertIsNone(kwargs["gdb_socket"])
             self.assertEqual(kwargs["manifest_path"], "/bundle/exact.json")
+            self.assertIsInstance(kwargs["image_catalog"], DebugImageCatalog)
+            self.assertIs(kwargs["bootstrap_from_reset"], True)
+            self.assertEqual(kwargs["timeout"], RESET_BOOT_TIMEOUT_SECONDS)
+            self.assertEqual(
+                kwargs["image_catalog"].executables[0].guest_path,
+                b"/usr/sbin/quagga",
+            )
             self.assertEqual(kwargs["qemu_stream"].recv(7), b"raw-rsp")
             live.qemu = kwargs["qemu_stream"]
             return live

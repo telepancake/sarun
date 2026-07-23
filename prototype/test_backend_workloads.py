@@ -19,7 +19,9 @@ import time
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
-from sarun_test_paths import ENGINE_BIN, HOST_ARCH, LIBTESTSARUN, REPO_ROOT
+from sarun_test_paths import (
+    ENGINE_BIN, HOST_ARCH, LIBTESTSARUN, QEMU_HOST_DIR, REPO_ROOT,
+)
 from test_backend_equiv_rs import backend_selector
 
 
@@ -95,9 +97,8 @@ def available_backends():
     if HOST_ARCH == "x86_64" and (REPO_ROOT / "tv/sud64").exists():
         backends.append("sud")
     appliance = Path.home() / f".cache/sarun/appliances/v1/{HOST_ARCH}/kernel"
-    qemu = Path.home() / (
-        f".cache/sarun/appliances/v1/host-{HOST_ARCH}/qemu-system-{HOST_ARCH}"
-    )
+    qemu = (Path.home() / ".cache/sarun/appliances/v1" / QEMU_HOST_DIR
+            / f"qemu-system-{HOST_ARCH}")
     if appliance.exists() and qemu.exists():
         backends.append("qemu")
     return backends

@@ -71,12 +71,7 @@ impl BrokeredFuseSession {
         Self::serve(broker, device, filesystem, workers)
     }
 
-    fn serve<F>(
-        broker: FuseBroker,
-        device: File,
-        filesystem: F,
-        workers: usize,
-    ) -> io::Result<Self>
+    fn serve<F>(broker: FuseBroker, device: File, filesystem: F, workers: usize) -> io::Result<Self>
     where
         F: FileSystem + Send + Sync + 'static,
     {
@@ -284,9 +279,7 @@ pub fn enter_runner_namespace() -> io::Result<()> {
         // namespace. newgidmap requires setgroups=deny, so the inherited
         // supplementary groups cannot be rewritten; their unmapped IDs confer
         // no authority here.
-        if unsafe { libc::setresgid(0, 0, 0) } != 0
-            || unsafe { libc::setresuid(0, 0, 0) } != 0
-        {
+        if unsafe { libc::setresgid(0, 0, 0) } != 0 || unsafe { libc::setresuid(0, 0, 0) } != 0 {
             return Err(io::Error::last_os_error());
         }
     }
@@ -501,10 +494,14 @@ fn configure_id_maps(pid: u32) -> io::Result<IdMapKind> {
     let uid = unsafe { libc::getuid() };
     let gid = unsafe { libc::getgid() };
     if unsafe { libc::geteuid() } == 0 {
-        std::fs::write(format!("/proc/{pid}/uid_map"),
-                       format!("0 0 {CANONICAL_ID_COUNT}\n"))?;
-        std::fs::write(format!("/proc/{pid}/gid_map"),
-                       format!("0 0 {CANONICAL_ID_COUNT}\n"))?;
+        std::fs::write(
+            format!("/proc/{pid}/uid_map"),
+            format!("0 0 {CANONICAL_ID_COUNT}\n"),
+        )?;
+        std::fs::write(
+            format!("/proc/{pid}/gid_map"),
+            format!("0 0 {CANONICAL_ID_COUNT}\n"),
+        )?;
         return Ok(IdMapKind::Canonical);
     }
     let (uid_range, gid_range) = match (
@@ -513,7 +510,8 @@ fn configure_id_maps(pid: u32) -> io::Result<IdMapKind> {
     ) {
         (Ok(uid_range), Ok(gid_range)) => (uid_range, gid_range),
         (uid_result, gid_result) => {
-            let detail = uid_result.err()
+            let detail = uid_result
+                .err()
                 .or_else(|| gid_result.err())
                 .map(|error| error.to_string())
                 .unwrap_or_else(|| "subordinate ID lookup failed".into());
@@ -537,27 +535,42 @@ fn write_caller_id_map(pid: u32, uid: u32, gid: u32) -> io::Result<()> {
 
 fn subordinate_range(path: &str, id: u32) -> io::Result<u32> {
     let numeric = id.to_string();
-    let user = std::fs::read_to_string("/etc/passwd").ok()
-        .and_then(|passwd| passwd.lines().find_map(|line| {
-            let fields: Vec<_> = line.split(':').collect();
-            (fields.len() > 2 && fields[2] == numeric).then(|| fields[0].to_owned())
-        }))
+    let user = std::fs::read_to_string("/etc/passwd")
+        .ok()
+        .and_then(|passwd| {
+            passwd.lines().find_map(|line| {
+                let fields: Vec<_> = line.split(':').collect();
+                (fields.len() > 2 && fields[2] == numeric).then(|| fields[0].to_owned())
+            })
+        })
         .unwrap_or_else(|| numeric.clone());
     let contents = std::fs::read_to_string(path).map_err(|error| {
-        io::Error::new(error.kind(), format!(
-            "cannot read {path}; install `uidmap` and provision at least \
-             {CANONICAL_ID_COUNT} subordinate IDs for {user}: {error}"))
+        io::Error::new(
+            error.kind(),
+            format!(
+                "cannot read {path}; install `uidmap` and provision at least \
+             {CANONICAL_ID_COUNT} subordinate IDs for {user}: {error}"
+            ),
+        )
     })?;
-    contents.lines().find_map(|line| {
-        let mut fields = line.split(':');
-        let owner = fields.next()?;
-        let start = fields.next()?.parse::<u32>().ok()?;
-        let count = fields.next()?.parse::<u32>().ok()?;
-        ((owner == user || owner == numeric) && count >= CANONICAL_ID_COUNT)
-            .then_some(start)
-    }).ok_or_else(|| io::Error::new(io::ErrorKind::PermissionDenied, format!(
-        "{path} has no {CANONICAL_ID_COUNT}-ID range for {user}; \
-         canonical FUSE ownership requires subordinate IDs")))
+    contents
+        .lines()
+        .find_map(|line| {
+            let mut fields = line.split(':');
+            let owner = fields.next()?;
+            let start = fields.next()?.parse::<u32>().ok()?;
+            let count = fields.next()?.parse::<u32>().ok()?;
+            ((owner == user || owner == numeric) && count >= CANONICAL_ID_COUNT).then_some(start)
+        })
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "{path} has no {CANONICAL_ID_COUNT}-ID range for {user}; \
+         canonical FUSE ownership requires subordinate IDs"
+                ),
+            )
+        })
 }
 
 fn mapping_arguments(identity: u32, subordinate: u32) -> Vec<String> {
@@ -569,7 +582,9 @@ fn mapping_arguments(identity: u32, subordinate: u32) -> Vec<String> {
         // as overlapping.
         result.extend([identity.to_string(), identity.to_string(), "1".into()]);
         result.extend([
-            "0".into(), subordinate.to_string(), CANONICAL_ID_COUNT.to_string(),
+            "0".into(),
+            subordinate.to_string(),
+            CANONICAL_ID_COUNT.to_string(),
         ]);
         return result;
     }
@@ -590,14 +605,23 @@ fn mapping_arguments(identity: u32, subordinate: u32) -> Vec<String> {
 }
 
 fn run_id_mapper(program: &str, pid: u32, arguments: Vec<String>) -> io::Result<()> {
-    let output = Command::new(program).arg(pid.to_string()).args(arguments).output()
-        .map_err(|error| io::Error::new(error.kind(), format!(
-            "cannot run {program}; install the `uidmap` package: {error}")))?;
+    let output = Command::new(program)
+        .arg(pid.to_string())
+        .args(arguments)
+        .output()
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("cannot run {program}; install the `uidmap` package: {error}"),
+            )
+        })?;
     if output.status.success() {
         Ok(())
     } else {
-        Err(io::Error::other(format!("{program} failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim())))
+        Err(io::Error::other(format!(
+            "{program} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )))
     }
 }
 
@@ -606,16 +630,19 @@ fn run_id_mapper(program: &str, pid: u32, arguments: Vec<String>) -> io::Result<
 /// the parent therefore establishes its subordinate map before this call and
 /// receives only the connection descriptor afterward.
 fn mount_direct(mountpoint: &Path) -> io::Result<File> {
-    let device = OpenOptions::new().read(true).write(true).open("/dev/fuse")?;
+    let device = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/fuse")?;
     let target = CString::new(mountpoint.as_os_str().as_bytes())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput,
-                                    "FUSE mountpoint contains NUL"))?;
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "FUSE mountpoint contains NUL"))?;
     let uid = unsafe { libc::getuid() };
     let gid = unsafe { libc::getgid() };
     let options = CString::new(format!(
         "fd={},rootmode=40000,user_id={uid},group_id={gid},allow_other",
         device.as_raw_fd(),
-    )).unwrap();
+    ))
+    .unwrap();
     let result = unsafe {
         libc::mount(
             c"sarun-rs".as_ptr(),
@@ -844,9 +871,7 @@ fn decode_namespace_handoff(reply: &[u8], descriptors: usize) -> io::Result<IdMa
     if reply.len() != 2 || reply[0] != REPLY_READY || descriptors != 2 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!(
-                "invalid FUSE namespace handoff {reply:?} with {descriptors} descriptors"
-            ),
+            format!("invalid FUSE namespace handoff {reply:?} with {descriptors} descriptors"),
         ));
     }
     IdMapKind::from_reply(reply[1]).ok_or_else(|| {
@@ -863,19 +888,20 @@ mod tests {
 
     #[test]
     fn subordinate_map_preserves_canonical_ids_and_the_calling_identity() {
-        assert_eq!(mapping_arguments(501, 100_000), vec![
-            "0", "100000", "501",
-            "501", "501", "1",
-            "502", "100502", "65034",
-        ]);
+        assert_eq!(
+            mapping_arguments(501, 100_000),
+            vec![
+                "0", "100000", "501", "501", "501", "1", "502", "100502", "65034",
+            ]
+        );
     }
 
     #[test]
     fn identity_outside_canonical_range_uses_a_separate_extent() {
-        assert_eq!(mapping_arguments(70_000, 100_000), vec![
-            "70000", "70000", "1",
-            "0", "100000", "65536",
-        ]);
+        assert_eq!(
+            mapping_arguments(70_000, 100_000),
+            vec!["70000", "70000", "1", "0", "100000", "65536",]
+        );
     }
 
     #[test]

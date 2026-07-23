@@ -1,0 +1,26 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Thu, 23 Jul 2026 14:20:35 +0000
+Subject: [PATCH] Support portable backend notifications
+
+Use the portable EventNotifier descriptor on non-Linux Unix hosts while retaining eventfd on Linux and Android.
+
+---
+diff --git a/src/backend.rs b/src/backend.rs
+index bd4a83b..c7ea7fb 100644
+--- a/src/backend.rs
++++ b/src/backend.rs
+@@ -15,7 +15,13 @@ use std::os::unix::io::RawFd;
+ use std::sync::RwLock;
+ 
+ use vm_memory::{bitmap::Bitmap, Address, GuestMemoryRegion, GuestRegionMmap};
++#[cfg(any(target_os = "linux", target_os = "android"))]
+ use vmm_sys_util::eventfd::EventFd;
++// The common backend traits only need an owned, writable descriptor here.
++// Linux supplies an eventfd; QEMU supplies the write end of a notification
++// pipe on other Unix hosts.
++#[cfg(not(any(target_os = "linux", target_os = "android")))]
++use vmm_sys_util::event::EventNotifier as EventFd;
+ 
+ #[cfg(feature = "vhost-user")]
+ use super::vhost_user::message::{VhostUserMemoryRegion, VhostUserSingleMemoryRegion};

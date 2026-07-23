@@ -5,6 +5,10 @@
 //! reference counts live here and are shared by every frontend.
 
 pub use crate::overlay::SarunFs;
+#[cfg(target_os = "linux")]
+pub(crate) mod backing;
+#[cfg(not(target_os = "linux"))]
+#[path = "sarunfs/backing_macos.rs"]
 pub(crate) mod backing;
 pub(crate) mod layers;
 pub(crate) mod mutation;
@@ -285,13 +289,13 @@ pub(crate) fn virtio_attr(
     let (mtime, mtimensec) = timestamp(attr.mtime);
     let (ctime, ctimensec) = timestamp(attr.ctime);
     let kind = match attr.kind {
-        NodeKind::NamedPipe => libc::S_IFIFO,
-        NodeKind::CharDevice => libc::S_IFCHR,
-        NodeKind::BlockDevice => libc::S_IFBLK,
-        NodeKind::Directory => libc::S_IFDIR,
-        NodeKind::RegularFile => libc::S_IFREG,
-        NodeKind::Symlink => libc::S_IFLNK,
-        NodeKind::Socket => libc::S_IFSOCK,
+        NodeKind::NamedPipe => libc::S_IFIFO as u32,
+        NodeKind::CharDevice => libc::S_IFCHR as u32,
+        NodeKind::BlockDevice => libc::S_IFBLK as u32,
+        NodeKind::Directory => libc::S_IFDIR as u32,
+        NodeKind::RegularFile => libc::S_IFREG as u32,
+        NodeKind::Symlink => libc::S_IFLNK as u32,
+        NodeKind::Socket => libc::S_IFSOCK as u32,
     };
     virtiofsd::fuse::Attr {
         ino: attr.inode,
@@ -400,7 +404,7 @@ mod tests {
         assert_eq!(canonical.perm, (virtio.mode & 0o7777) as u16);
         assert_eq!(canonical.uid, virtio.uid.into_inner());
         assert_eq!(canonical.gid, virtio.gid.into_inner());
-        assert_eq!(virtio.mode & libc::S_IFMT, libc::S_IFREG);
+        assert_eq!(virtio.mode & libc::S_IFMT as u32, libc::S_IFREG as u32);
     }
 
     #[test]
@@ -428,16 +432,19 @@ mod tests {
     #[test]
     fn every_canonical_kind_has_a_protocol_encoding() {
         let cases = [
-            (NodeKind::NamedPipe, libc::S_IFIFO),
-            (NodeKind::CharDevice, libc::S_IFCHR),
-            (NodeKind::BlockDevice, libc::S_IFBLK),
-            (NodeKind::Directory, libc::S_IFDIR),
-            (NodeKind::RegularFile, libc::S_IFREG),
-            (NodeKind::Symlink, libc::S_IFLNK),
-            (NodeKind::Socket, libc::S_IFSOCK),
+            (NodeKind::NamedPipe, libc::S_IFIFO as u32),
+            (NodeKind::CharDevice, libc::S_IFCHR as u32),
+            (NodeKind::BlockDevice, libc::S_IFBLK as u32),
+            (NodeKind::Directory, libc::S_IFDIR as u32),
+            (NodeKind::RegularFile, libc::S_IFREG as u32),
+            (NodeKind::Symlink, libc::S_IFLNK as u32),
+            (NodeKind::Socket, libc::S_IFSOCK as u32),
         ];
         for (kind, mode) in cases {
-            assert_eq!(virtio_attr(attr(kind), false).mode & libc::S_IFMT, mode);
+            assert_eq!(
+                virtio_attr(attr(kind), false).mode & libc::S_IFMT as u32,
+                mode
+            );
         }
     }
 

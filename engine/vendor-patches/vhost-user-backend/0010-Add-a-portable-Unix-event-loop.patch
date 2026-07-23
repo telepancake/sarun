@@ -1,0 +1,405 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Thu, 23 Jul 2026 14:20:43 +0000
+Subject: [PATCH] Add a portable Unix event loop
+
+Retain epoll on Linux and Android, and provide an equivalent poll-based worker plus shared readiness flags for Darwin hosts.
+
+---
+diff --git a/Cargo.toml b/Cargo.toml
+index f3f3df8..0f3578f 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -60,6 +60,9 @@ path = "tests/vhost-user-server.rs"
+ [dependencies.libc]
+ version = "0.2.39"
+ 
++[dependencies.bitflags]
++version = "2.4"
++
+ [dependencies.log]
+ version = "0.4.17"
+ 
+diff --git a/src/backend.rs b/src/backend.rs
+index cc7232c..39ca925 100644
+--- a/src/backend.rs
++++ b/src/backend.rs
+@@ -29,11 +29,11 @@ use vhost::vhost_user::message::{
+ };
+ use vhost::vhost_user::Backend;
+ use vm_memory::bitmap::Bitmap;
+-use vmm_sys_util::epoll::EventSet;
+ use vmm_sys_util::event::{EventConsumer, EventNotifier};
+ 
+ use vhost::vhost_user::GpuBackend;
+ 
++use super::event_loop::EventSet;
+ use super::vring::VringT;
+ use super::GM;
+ 
+diff --git a/src/event_loop.rs b/src/event_loop.rs
+index 09e9104..b1a2c37 100644
+--- a/src/event_loop.rs
++++ b/src/event_loop.rs
+@@ -9,7 +9,8 @@ use std::marker::PhantomData;
+ use std::os::fd::IntoRawFd;
+ use std::os::unix::io::{AsRawFd, RawFd};
+ 
+-use vmm_sys_util::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
++pub use vmm_sys_util::epoll::EventSet;
++use vmm_sys_util::epoll::{ControlOperation, Epoll, EpollEvent};
+ use vmm_sys_util::event::EventNotifier;
+ 
+ use super::backend::VhostUserBackend;
+diff --git a/src/event_loop_poll.rs b/src/event_loop_poll.rs
+new file mode 100644
+index 0000000..9f46021
+--- /dev/null
++++ b/src/event_loop_poll.rs
+@@ -0,0 +1,303 @@
++// Copyright 2019 Intel Corporation. All Rights Reserved.
++// Copyright 2019-2021 Alibaba Cloud. All rights reserved.
++//
++// SPDX-License-Identifier: Apache-2.0
++
++//! Portable vhost-user worker loop for Unix hosts without epoll.
++//!
++//! QEMU uses an `eventfd` for vhost notifications on Linux and a pipe on
++//! Darwin. `vmm-sys-util` presents both as `EventConsumer`/`EventNotifier`;
++//! this module supplies the remaining portable wait primitive with `poll(2)`.
++
++use std::fmt::{Display, Formatter};
++use std::io::{self, Result};
++use std::marker::PhantomData;
++use std::os::fd::{AsRawFd, RawFd};
++use std::sync::Mutex;
++
++use vmm_sys_util::event::{
++    new_event_consumer_and_notifier, EventConsumer, EventFlag, EventNotifier,
++};
++
++use super::backend::VhostUserBackend;
++use super::vring::VringT;
++
++bitflags::bitflags! {
++    /// Readiness flags passed to a vhost-user backend's event handler.
++    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
++    pub struct EventSet: u32 {
++        /// Data can be read.
++        const IN = 0x001;
++        /// Urgent data can be read.
++        const PRIORITY = 0x002;
++        /// Data can be written.
++        const OUT = 0x004;
++        /// An error occurred.
++        const ERROR = 0x008;
++        /// The peer hung up.
++        const HANG_UP = 0x010;
++        /// The peer half-closed the connection.
++        const READ_HANG_UP = 0x2000;
++        /// Compatibility flag; `poll(2)` itself is level-triggered.
++        const EDGE_TRIGGERED = 0x8000_0000;
++    }
++}
++
++/// Errors related to vring event handling.
++#[derive(Debug)]
++pub enum VringEpollError {
++    /// Failed to create the poll-loop wake pipe.
++    EpollCreateFd(io::Error),
++    /// Failed while waiting for events.
++    EpollWait(io::Error),
++    /// Could not register the backend exit event.
++    RegisterExitEvent(io::Error),
++    /// Failed to read the event from the kick descriptor.
++    HandleEventReadKick(io::Error),
++    /// Failed to handle the event in the backend.
++    HandleEventBackendHandling(io::Error),
++}
++
++impl Display for VringEpollError {
++    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
++        match self {
++            Self::EpollCreateFd(e) => write!(f, "cannot create poll wake pipe: {e}"),
++            Self::EpollWait(e) => write!(f, "failed to wait for events: {e}"),
++            Self::RegisterExitEvent(e) => write!(f, "cannot register exit event: {e}"),
++            Self::HandleEventReadKick(e) => write!(f, "cannot read vring kick event: {e}"),
++            Self::HandleEventBackendHandling(e) => write!(f, "failed to handle event: {e}"),
++        }
++    }
++}
++
++impl std::error::Error for VringEpollError {}
++
++/// Result of vring event-loop operations.
++pub type VringEpollResult<T> = std::result::Result<T, VringEpollError>;
++
++#[derive(Clone, Copy)]
++struct Registration {
++    fd: RawFd,
++    events: EventSet,
++    data: u64,
++}
++
++/// The portable counterpart of the Linux `VringEpollHandler`.
++///
++/// The public name is retained so downstream backends do not need a separate
++/// API for Darwin. Registration changes wake the blocked worker immediately.
++pub struct VringEpollHandler<T: VhostUserBackend> {
++    backend: T,
++    vrings: Vec<T::Vring>,
++    thread_id: usize,
++    registrations: Mutex<Vec<Registration>>,
++    wake_consumer: EventConsumer,
++    wake_notifier: EventNotifier,
++    exit_event_fd: Option<EventNotifier>,
++    phantom: PhantomData<T::Bitmap>,
++}
++
++impl<T: VhostUserBackend> VringEpollHandler<T> {
++    /// Send the backend exit event to break the worker loop.
++    pub fn send_exit_event(&self) {
++        if let Some(eventfd) = self.exit_event_fd.as_ref() {
++            let _ = eventfd.notify();
++        }
++    }
++}
++
++impl<T> VringEpollHandler<T>
++where
++    T: VhostUserBackend,
++{
++    pub(crate) fn new(
++        backend: T,
++        vrings: Vec<T::Vring>,
++        thread_id: usize,
++    ) -> VringEpollResult<Self> {
++        let (wake_consumer, wake_notifier) =
++            new_event_consumer_and_notifier(EventFlag::NONBLOCK | EventFlag::CLOEXEC)
++                .map_err(VringEpollError::EpollCreateFd)?;
++        let exit_event_fd = backend.exit_event(thread_id);
++        let mut registrations = Vec::new();
++        let exit_event_fd = if let Some((consumer, notifier)) = exit_event_fd {
++            registrations.push(Registration {
++                fd: consumer.as_raw_fd(),
++                events: EventSet::IN,
++                data: backend.num_queues() as u64,
++            });
++            // The registration borrows the descriptor for the worker's whole
++            // lifetime, so retain ownership alongside the notifier.
++            std::mem::forget(consumer);
++            Some(notifier)
++        } else {
++            None
++        };
++
++        Ok(Self {
++            backend,
++            vrings,
++            thread_id,
++            registrations: Mutex::new(registrations),
++            wake_consumer,
++            wake_notifier,
++            exit_event_fd,
++            phantom: PhantomData,
++        })
++    }
++
++    /// Register a descriptor for backend-specific events.
++    pub fn register_listener(&self, fd: RawFd, ev_type: EventSet, data: u64) -> Result<()> {
++        if data <= self.backend.num_queues() as u64 {
++            Err(io::Error::from_raw_os_error(libc::EINVAL))
++        } else {
++            self.register_event(fd, ev_type, data)
++        }
++    }
++
++    /// Unregister a descriptor used for backend-specific events.
++    pub fn unregister_listener(&self, fd: RawFd, ev_type: EventSet, data: u64) -> Result<()> {
++        if data <= self.backend.num_queues() as u64 {
++            Err(io::Error::from_raw_os_error(libc::EINVAL))
++        } else {
++            self.unregister_event(fd, ev_type, data)
++        }
++    }
++
++    pub(crate) fn register_event(&self, fd: RawFd, ev_type: EventSet, data: u64) -> Result<()> {
++        let mut registrations = self.registrations.lock().unwrap();
++        if registrations.iter().any(|entry| entry.fd == fd) {
++            return Err(io::Error::from_raw_os_error(libc::EEXIST));
++        }
++        registrations.push(Registration {
++            fd,
++            events: ev_type,
++            data,
++        });
++        drop(registrations);
++        let _ = self.wake_notifier.notify();
++        Ok(())
++    }
++
++    pub(crate) fn unregister_event(&self, fd: RawFd, _ev_type: EventSet, _data: u64) -> Result<()> {
++        let mut registrations = self.registrations.lock().unwrap();
++        let Some(index) = registrations.iter().position(|entry| entry.fd == fd) else {
++            return Err(io::Error::from_raw_os_error(libc::ENOENT));
++        };
++        registrations.swap_remove(index);
++        drop(registrations);
++        let _ = self.wake_notifier.notify();
++        Ok(())
++    }
++
++    pub(crate) fn run(&self) -> VringEpollResult<()> {
++        loop {
++            let registrations = self.registrations.lock().unwrap().clone();
++            let mut pollfds = Vec::with_capacity(registrations.len() + 1);
++            pollfds.push(libc::pollfd {
++                fd: self.wake_consumer.as_raw_fd(),
++                events: libc::POLLIN,
++                revents: 0,
++            });
++            pollfds.extend(registrations.iter().map(|entry| libc::pollfd {
++                fd: entry.fd,
++                events: poll_events(entry.events),
++                revents: 0,
++            }));
++
++            // SAFETY: `pollfds` is a valid mutable array for the duration of
++            // this blocking call and no other thread accesses it.
++            let ready = unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as _, -1) };
++            if ready < 0 {
++                let error = io::Error::last_os_error();
++                if error.kind() == io::ErrorKind::Interrupted {
++                    continue;
++                }
++                return Err(VringEpollError::EpollWait(error));
++            }
++
++            if pollfds[0].revents != 0 {
++                while self.wake_consumer.consume().is_ok() {}
++            }
++
++            for (entry, pollfd) in registrations.iter().zip(pollfds.iter().skip(1)) {
++                if pollfd.revents == 0 {
++                    continue;
++                }
++                // An event returned alongside an unregister wakeup may refer
++                // to the old snapshot. Match epoll's behavior for deleted
++                // registrations by dropping it.
++                if !self
++                    .registrations
++                    .lock()
++                    .unwrap()
++                    .iter()
++                    .any(|current| current.fd == entry.fd && current.data == entry.data)
++                {
++                    continue;
++                }
++                if self.handle_event(entry.data as u16, event_set(pollfd.revents))? {
++                    return Ok(());
++                }
++            }
++        }
++    }
++
++    fn handle_event(&self, device_event: u16, evset: EventSet) -> VringEpollResult<bool> {
++        if self.exit_event_fd.is_some() && device_event as usize == self.backend.num_queues() {
++            return Ok(true);
++        }
++        if (device_event as usize) < self.vrings.len() {
++            let enabled = self.vrings[device_event as usize]
++                .read_kick()
++                .map_err(VringEpollError::HandleEventReadKick)?;
++            if !enabled {
++                return Ok(false);
++            }
++        }
++        self.backend
++            .handle_event(device_event, evset, &self.vrings, self.thread_id)
++            .map_err(VringEpollError::HandleEventBackendHandling)?;
++        Ok(false)
++    }
++}
++
++impl<T: VhostUserBackend> AsRawFd for VringEpollHandler<T> {
++    fn as_raw_fd(&self) -> RawFd {
++        self.wake_consumer.as_raw_fd()
++    }
++}
++
++fn poll_events(events: EventSet) -> libc::c_short {
++    let mut result = 0;
++    if events.contains(EventSet::IN) {
++        result |= libc::POLLIN;
++    }
++    if events.contains(EventSet::PRIORITY) {
++        result |= libc::POLLPRI;
++    }
++    if events.contains(EventSet::OUT) {
++        result |= libc::POLLOUT;
++    }
++    result
++}
++
++fn event_set(events: libc::c_short) -> EventSet {
++    let mut result = EventSet::empty();
++    if events & libc::POLLIN != 0 {
++        result |= EventSet::IN;
++    }
++    if events & libc::POLLPRI != 0 {
++        result |= EventSet::PRIORITY;
++    }
++    if events & libc::POLLOUT != 0 {
++        result |= EventSet::OUT;
++    }
++    if events & (libc::POLLERR | libc::POLLNVAL) != 0 {
++        result |= EventSet::ERROR;
++    }
++    if events & libc::POLLHUP != 0 {
++        result |= EventSet::HANG_UP;
++    }
++    result
++}
+diff --git a/src/handler.rs b/src/handler.rs
+index e81d1f9..b376a55 100644
+--- a/src/handler.rs
++++ b/src/handler.rs
+@@ -27,17 +27,14 @@ use vhost::vhost_user::{
+     Backend, Error as VhostUserError, Result as VhostUserResult, VhostUserBackendReqHandlerMut,
+ };
+ 
++use super::backend::VhostUserBackend;
++use super::event_loop::{EventSet, VringEpollError, VringEpollHandler, VringEpollResult};
++use super::vring::VringT;
++use super::GM;
+ use virtio_bindings::bindings::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
+ use virtio_queue::{Error as VirtQueError, QueueT};
+ use vm_memory::mmap::NewBitmap;
+ use vm_memory::{GuestAddress, GuestAddressSpace, GuestMemory, GuestMemoryMmap, GuestRegionMmap};
+-use vmm_sys_util::epoll::EventSet;
+-
+-use super::backend::VhostUserBackend;
+-use super::event_loop::VringEpollHandler;
+-use super::event_loop::{VringEpollError, VringEpollResult};
+-use super::vring::VringT;
+-use super::GM;
+ 
+ // vhost in the kernel usually supports 509 mem slots.
+ // The 509 used to be the KVM limit, it supported 512, but 3 were used
+diff --git a/src/lib.rs b/src/lib.rs
+index 7ade20a..22d3300 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -22,7 +22,12 @@ use self::handler::VhostUserHandler;
+ mod backend;
+ pub use self::backend::{VhostUserBackend, VhostUserBackendMut};
+ 
++#[cfg(any(target_os = "linux", target_os = "android"))]
+ mod event_loop;
++#[cfg(not(any(target_os = "linux", target_os = "android")))]
++#[path = "event_loop_poll.rs"]
++mod event_loop;
++pub use self::event_loop::EventSet;
+ pub use self::event_loop::VringEpollHandler;
+ 
+ mod handler;

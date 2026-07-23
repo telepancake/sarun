@@ -21,6 +21,7 @@ from probe.selected_bundle_orchestrator import (
     SelectedBundleExecutionRequest,
     SelectedBundleError,
     execute_selected_initramfs,
+    execute_selected_with_prebuilt_kernel,
     orchestrate_selected_initramfs,
 )
 from probe.elf_load_identity import elf_load_identity
@@ -196,6 +197,74 @@ def pair_request_and_source(
 
 
 class SelectedBundleOrchestratorTests(unittest.TestCase):
+    def write_prebuilt_kernel(
+        self, root: Path, architecture: str, boot_image: bytes
+    ) -> None:
+        root.mkdir()
+        (root / "kernel").write_bytes(boot_image)
+        (root / "vmlinux").write_bytes(b"kernel symbols")
+        (root / "bundle.json").write_text(
+            __import__("json").dumps(
+                {
+                    "format": "viros-kernel-bundle-v1",
+                    "architecture": architecture,
+                    "kernel": {
+                        "boot_image_sha256": hashlib.sha256(boot_image).hexdigest()
+                    },
+                },
+                sort_keys=True,
+            )
+            + "\n"
+        )
+
+    def test_prebuilt_kernel_adapter_publishes_selected_userspace_bundle(self):
+        request, source, archive = request_and_source()
+        _vmlinux, boot_image = kernel_fixture("x86_64")
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            prebuilt = root / "prebuilt"
+            output = root / "complete"
+            self.write_prebuilt_kernel(prebuilt, "x86_64", boot_image)
+
+            result = execute_selected_with_prebuilt_kernel(
+                execution_request(request, FixedBootProfile.X86_64),
+                source,
+                output,
+                prebuilt,
+            )
+
+            self.assertTrue(result.plan.ready)
+            self.assertEqual(
+                (output / "image-bundle/kernel/kernel").read_bytes(), boot_image
+            )
+            self.assertEqual(
+                (output / "image-bundle/rootfs.cpio").read_bytes(), archive
+            )
+            self.assertEqual(
+                (output / "kernel-bundle/bundle.json").read_bytes(),
+                (prebuilt / "bundle.json").read_bytes(),
+            )
+
+    def test_prebuilt_kernel_adapter_rejects_selected_kernel_mismatch(self):
+        request, source, _archive, _selected_kernel = pair_request_and_source()
+        _vmlinux, different_boot = kernel_fixture("x86_64")
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            prebuilt = root / "prebuilt"
+            output = root / "complete"
+            self.write_prebuilt_kernel(prebuilt, "x86_64", different_boot)
+
+            with self.assertRaisesRegex(
+                SelectedBundleError, "does not match the resolved debugger kernel"
+            ):
+                execute_selected_with_prebuilt_kernel(
+                    execution_request(request, FixedBootProfile.X86_64),
+                    source,
+                    output,
+                    prebuilt,
+                )
+            self.assertFalse(output.exists())
+
     def test_loadable_fallback_identity_reaches_internal_image_bundle(self):
         request, source, _archive = request_and_source()
         runtime = load_elf64(stripped_sections=True)

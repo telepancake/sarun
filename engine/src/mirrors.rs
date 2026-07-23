@@ -346,6 +346,7 @@ fn spawn_run(job: Job) {
         unsafe {
             use std::os::unix::process::CommandExt;
             cmd.pre_exec(|| {
+                #[cfg(target_os = "linux")]
                 if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
                     return Err(std::io::Error::last_os_error());
                 }

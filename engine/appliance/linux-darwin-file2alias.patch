@@ -1,0 +1,29 @@
+--- a/scripts/mod/file2alias.c
++++ b/scripts/mod/file2alias.c
+@@ -106,8 +106,13 @@
+ typedef struct {
+ 	__u8 b[16];
+ } guid_t;
+ 
++/* The macOS SDK owns uuid_t; keep this host helper's Linux layout distinct. */
++#ifdef __APPLE__
++#define uuid_t linux_uuid_t
++#endif
++
+ typedef struct {
+ 	__u8 b[16];
+ } uuid_t;
+ 
+@@ -121,8 +126,12 @@
+ /* Big exception to the "don't include kernel headers into userspace, which
+  * even potentially has different endianness and word sizes, since
+  * we handle those differences explicitly below */
+ #include "../../include/linux/mod_devicetable.h"
+ 
++#ifdef __APPLE__
++#undef uuid_t
++#endif
++
+ struct devtable {
+ 	const char *device_id;
+ 	unsigned long id_size;

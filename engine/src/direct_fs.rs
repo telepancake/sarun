@@ -843,10 +843,10 @@ fn path_parts(path: &Path) -> io::Result<VecDeque<PathPart>> {
 }
 
 fn mode_type(mode: u32) -> VfsFileType {
-    match mode & libc::S_IFMT {
-        libc::S_IFREG => VfsFileType::File,
-        libc::S_IFDIR => VfsFileType::Directory,
-        libc::S_IFLNK => VfsFileType::Symlink,
+    match mode & libc::S_IFMT as u32 {
+        value if value == libc::S_IFREG as u32 => VfsFileType::File,
+        value if value == libc::S_IFDIR as u32 => VfsFileType::Directory,
+        value if value == libc::S_IFLNK as u32 => VfsFileType::Symlink,
         _ => VfsFileType::Other,
     }
 }
@@ -1070,7 +1070,7 @@ mod tests {
     fn root_attr_handler() -> Handler {
         expect(Opcode::Getattr, ROOT_ID, |header, payload| {
             let _: GetattrIn = read_exact_pod(payload, "test root GETATTR").unwrap();
-            attr(header, ROOT_ID, libc::S_IFDIR | 0o755, 0)
+            attr(header, ROOT_ID, libc::S_IFDIR as u32 | 0o755, 0)
         })
     }
 
@@ -1100,7 +1100,7 @@ mod tests {
             root_attr_handler(),
             expect(Opcode::Lookup, ROOT_ID, |header, payload| {
                 assert_eq!(payload, b"link\0");
-                entry(header, 2, libc::S_IFLNK | 0o777, 4)
+                entry(header, 2, libc::S_IFLNK as u32 | 0o777, 4)
             }),
             expect(Opcode::Readlink, 2, |header, payload| {
                 assert!(payload.is_empty());
@@ -1108,15 +1108,15 @@ mod tests {
             }),
             expect(Opcode::Lookup, ROOT_ID, |header, payload| {
                 assert_eq!(payload, b"real\0");
-                entry(header, 3, libc::S_IFDIR | 0o755, 0)
+                entry(header, 3, libc::S_IFDIR as u32 | 0o755, 0)
             }),
             expect(Opcode::Lookup, 3, |header, payload| {
                 assert_eq!(payload, b"item\0");
-                entry(header, 4, libc::S_IFREG | 0o644, 19)
+                entry(header, 4, libc::S_IFREG as u32 | 0o644, 19)
             }),
             expect(Opcode::Getattr, 4, |header, payload| {
                 let _: GetattrIn = read_exact_pod(payload, "test GETATTR").unwrap();
-                attr(header, 4, libc::S_IFREG | 0o644, 19)
+                attr(header, 4, libc::S_IFREG as u32 | 0o644, 19)
             }),
             forget_handler(4),
             forget_handler(3),
@@ -1138,7 +1138,7 @@ mod tests {
             root_attr_handler(),
             expect(Opcode::Lookup, ROOT_ID, |header, payload| {
                 assert_eq!(payload, b"link\0");
-                entry(header, 12, libc::S_IFLNK | 0o777, 6)
+                entry(header, 12, libc::S_IFLNK as u32 | 0o777, 6)
             }),
             expect(Opcode::Getattr, 12, |header, _| {
                 ok(
@@ -1146,7 +1146,7 @@ mod tests {
                     &AttrOut {
                         attr: Attr {
                             ino: 12,
-                            mode: libc::S_IFLNK | 0o777,
+                            mode: libc::S_IFLNK as u32 | 0o777,
                             size: 6,
                             mtime: 123,
                             mtimensec: 456,
@@ -1174,10 +1174,10 @@ mod tests {
             root_attr_handler(),
             expect(Opcode::Lookup, ROOT_ID, |header, payload| {
                 assert_eq!(payload, b"dir\0");
-                entry(header, 20, libc::S_IFDIR | 0o755, 0)
+                entry(header, 20, libc::S_IFDIR as u32 | 0o755, 0)
             }),
             expect(Opcode::Getattr, 20, |header, _| {
-                attr(header, 20, libc::S_IFDIR | 0o755, 0)
+                attr(header, 20, libc::S_IFDIR as u32 | 0o755, 0)
             }),
             expect(Opcode::Opendir, 20, |header, _| {
                 ok(
@@ -1210,14 +1210,14 @@ mod tests {
             root_attr_handler(),
             expect(Opcode::Lookup, ROOT_ID, |header, payload| {
                 assert_eq!(payload, b"dir\0");
-                entry(header, 24, libc::S_IFDIR | 0o755, 0)
+                entry(header, 24, libc::S_IFDIR as u32 | 0o755, 0)
             }),
             expect(Opcode::Lookup, 24, |header, payload| {
                 assert_eq!(payload, b"a.mk\0");
-                entry(header, 25, libc::S_IFREG | 0o644, 1)
+                entry(header, 25, libc::S_IFREG as u32 | 0o644, 1)
             }),
             expect(Opcode::Getattr, 25, |header, _| {
-                attr(header, 25, libc::S_IFREG | 0o644, 1)
+                attr(header, 25, libc::S_IFREG as u32 | 0o644, 1)
             }),
             forget_handler(25),
             forget_handler(24),
@@ -1238,10 +1238,10 @@ mod tests {
             root_attr_handler(),
             expect(Opcode::Lookup, ROOT_ID, |header, payload| {
                 assert_eq!(payload, b"file\0");
-                entry(header, 8, libc::S_IFREG | 0o644, 3)
+                entry(header, 8, libc::S_IFREG as u32 | 0o644, 3)
             }),
             expect(Opcode::Getattr, 8, |header, _| {
-                attr(header, 8, libc::S_IFREG | 0o644, 3)
+                attr(header, 8, libc::S_IFREG as u32 | 0o644, 3)
             }),
             expect(Opcode::Open, 8, |header, payload| {
                 let input: OpenIn = read_exact_pod(payload, "test OPEN").unwrap();
@@ -1291,7 +1291,7 @@ mod tests {
             root_attr_handler(),
             expect(Opcode::Lookup, ROOT_ID, |header, payload| {
                 assert_eq!(payload, b"file\0");
-                entry(header, 12, libc::S_IFREG | 0o755, 0)
+                entry(header, 12, libc::S_IFREG as u32 | 0o755, 0)
             }),
             forget_handler(12),
         ]);
@@ -1320,7 +1320,7 @@ mod tests {
                         nodeid: 13,
                         attr: Attr {
                             ino: 13,
-                            mode: libc::S_IFDIR | 0o700,
+                            mode: libc::S_IFDIR as u32 | 0o700,
                             uid: 123.into(),
                             gid: 123.into(),
                             ..Default::default()
@@ -1363,7 +1363,7 @@ mod tests {
     #[test]
     fn access_evaluation_uses_owner_group_other_and_root_execute_rules() {
         let attr = Attr {
-            mode: libc::S_IFREG | 0o640,
+            mode: libc::S_IFREG as u32 | 0o640,
             uid: 1000.into(),
             gid: 2000.into(),
             ..Default::default()
@@ -1384,7 +1384,7 @@ mod tests {
             Some(libc::EACCES)
         );
         let executable = Attr {
-            mode: libc::S_IFREG | 0o100,
+            mode: libc::S_IFREG as u32 | 0o100,
             ..attr
         };
         assert!(evaluate_access(executable, 0, 0, &[], VfsAccess::Execute).is_ok());

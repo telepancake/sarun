@@ -166,6 +166,11 @@ struct TapPhy {
     mtu: usize,
 }
 
+fn trace_packets() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("SARUN_NET_TRACE").is_some())
+}
+
 impl Device for TapPhy {
     type RxToken<'a> = TapRx;
     type TxToken<'a> = TapTx<'a>;
@@ -180,8 +185,21 @@ impl Device for TapPhy {
     fn receive(&mut self, _ts: SmolInstant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         let mut buf = vec![0u8; self.mtu + 14];
         let n = unsafe { libc::read(self.fd, buf.as_mut_ptr().cast(), buf.len()) };
-        if n <= 0 {
+        if n < 0 {
+            let error = std::io::Error::last_os_error();
+            if !matches!(
+                error.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+            ) {
+                eprintln!("sarun-engine: net: packet read failed: {error}");
+            }
             return None;
+        }
+        if n == 0 {
+            return None;
+        }
+        if trace_packets() {
+            eprintln!("sarun-engine: net: received packet ({n} bytes)");
         }
         buf.truncate(n as usize);
         // pcap capture is observability-only and must never break the

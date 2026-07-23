@@ -20,6 +20,7 @@ from inferiors.provider_handshake import (
     encode_prepare,
     read_outcome,
     read_prepare,
+    sarun_selected_bundle_preparer,
     serve_pre_rsp_handshake,
 )
 from inferiors.sarun_provider import run_provider
@@ -390,12 +391,100 @@ class ProviderHandshakeStateTests(unittest.TestCase):
 
 
 class SelectedBundleTransactionTests(unittest.TestCase):
+    def test_sarun_preparer_uses_only_fixed_box_capsule_resources(self):
+        expected = execution(pair=True)
+        source = object()
+        transaction = object()
+        with (
+            mock.patch(
+                "inferiors.provider_handshake.FilesystemArtifactSource",
+                return_value=source,
+            ) as source_factory,
+            mock.patch(
+                "inferiors.provider_handshake.SelectedBundleTransaction",
+                return_value=transaction,
+            ) as transaction_factory,
+        ):
+            self.assertIs(sarun_selected_bundle_preparer(expected), transaction)
+
+        source_factory.assert_called_once_with(
+            {17: Path("/.viros-input/boxes/17")}
+        )
+        arguments = transaction_factory.call_args.args
+        self.assertEqual(arguments[:4], (
+            expected,
+            source,
+            Path("/"),
+            ".viros-generated/bundle",
+        ))
+        self.assertIn("executor", transaction_factory.call_args.kwargs)
+
+    def test_sarun_preparer_builds_and_commits_from_engine_capsule(self):
+        from tests.test_selected_bundle_orchestrator import (
+            kernel_fixture,
+            request_and_source,
+        )
+
+        request, memory_source, archive = request_and_source()
+        prepared_request = SelectedBundleExecutionRequest(
+            request, (), FixedBootProfile.X86_64
+        )
+        _vmlinux, boot_image = kernel_fixture("x86_64")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            boxes = root / "boxes"
+            kernel = root / "kernel"
+            provider = root / "provider"
+            kernel.mkdir()
+            provider.mkdir()
+            (kernel / "kernel").write_bytes(boot_image)
+            (kernel / "vmlinux").write_bytes(b"kernel symbols")
+            (kernel / "bundle.json").write_text(
+                __import__("json").dumps(
+                    {
+                        "format": "viros-kernel-bundle-v1",
+                        "architecture": "x86_64",
+                        "kernel": {
+                            "boot_image_sha256": hashlib.sha256(
+                                boot_image
+                            ).hexdigest()
+                        },
+                    }
+                )
+                + "\n"
+            )
+            selected = request.selected
+            for row in (selected, *request.captured_artifacts):
+                path = boxes / str(row.box_id) / row.path
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(memory_source.rows[(row.box_id, row.path)])
+
+            with (
+                mock.patch(
+                    "inferiors.provider_handshake.SARUN_ARTIFACT_ROOT", boxes
+                ),
+                mock.patch(
+                    "inferiors.provider_handshake.SARUN_KERNEL_BUNDLE_ROOT",
+                    kernel,
+                ),
+                mock.patch(
+                    "inferiors.provider_handshake.SARUN_PROVIDER_ROOT", provider
+                ),
+            ):
+                transaction = sarun_selected_bundle_preparer(prepared_request)
+                self.assertEqual(transaction.prepared.kernel_init, "/init")
+                transaction.commit()
+
+            published = provider / ".viros-generated/bundle/image-bundle"
+            self.assertEqual((published / "rootfs.cpio").read_bytes(), archive)
+            self.assertEqual((published / "kernel/kernel").read_bytes(), boot_image)
+
     def fake_executor(self, requested, _source, output):
         self.assertEqual(requested, execution(pair=True))
         for relative, contents in (
-            ("kernel-bundle/bundle.json", b"kernel-manifest"),
+            ("image-bundle/kernel/bundle.json", b"kernel-manifest"),
             ("image-bundle/image.json", b"image-manifest"),
-            ("kernel-bundle/kernel", b"kernel"),
+            ("image-bundle/kernel/kernel", b"kernel"),
             ("image-bundle/rootfs.cpio", b"initramfs"),
         ):
             path = output.joinpath(*relative.split("/"))
@@ -419,12 +508,12 @@ class SelectedBundleTransactionTests(unittest.TestCase):
             self.assertFalse((root / "sessions/42").exists())
             self.assertEqual(
                 transaction.prepared.kernel.path,
-                "sessions/42/kernel-bundle/kernel",
+                "sessions/42/image-bundle/kernel/kernel",
             )
             self.assertEqual(transaction.prepared.kernel_init, "/sbin/init")
             transaction.commit()
             self.assertEqual(
-                (root / "sessions/42/kernel-bundle/kernel").read_bytes(),
+                (root / "sessions/42/image-bundle/kernel/kernel").read_bytes(),
                 b"kernel",
             )
 

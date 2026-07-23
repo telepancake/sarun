@@ -145,11 +145,42 @@ impl BoxExport {
 mod tests {
     use super::*;
     use crate::capture::BoxState;
+    use std::ffi::OsString;
     use std::sync::Arc;
+
+    struct TestStateHome {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        previous: Option<OsString>,
+    }
+
+    impl TestStateHome {
+        fn set(path: &Path) -> Self {
+            let lock = crate::depot::TEST_STATE_HOME_LOCK.lock().unwrap();
+            let previous = std::env::var_os("XDG_STATE_HOME");
+            unsafe { std::env::set_var("XDG_STATE_HOME", path) };
+            std::fs::create_dir_all(crate::paths::state_home()).unwrap();
+            Self {
+                _lock: lock,
+                previous,
+            }
+        }
+    }
+
+    impl Drop for TestStateHome {
+        fn drop(&mut self) {
+            unsafe {
+                match self.previous.take() {
+                    Some(value) => std::env::set_var("XDG_STATE_HOME", value),
+                    None => std::env::remove_var("XDG_STATE_HOME"),
+                }
+            }
+        }
+    }
 
     #[test]
     fn export_scopes_root_and_binds_private_socket() {
         let temp = tempfile::tempdir().unwrap();
+        let _state_home = TestStateHome::set(temp.path());
         let fs = crate::sarunfs::SarunFs::new(temp.path().to_owned());
         let box_id = 9_000_000_071_i64;
         fs.add_box(Arc::new(BoxState::create(box_id).unwrap()));
@@ -180,6 +211,7 @@ mod tests {
     #[test]
     fn stop_cancels_a_listener_before_qemu_connects() {
         let temp = tempfile::tempdir().unwrap();
+        let _state_home = TestStateHome::set(temp.path());
         let fs = crate::sarunfs::SarunFs::new(temp.path().to_owned());
         let box_id = 9_000_000_072_i64;
         fs.add_box(Arc::new(BoxState::create(box_id).unwrap()));

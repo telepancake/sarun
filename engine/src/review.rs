@@ -1113,37 +1113,71 @@ fn consume(conn: &Connection, id: i64, rel: &str, rowid: i64) {
 const S_IFIFO: u32 = 0o010000;
 const S_IFBLK: u32 = 0o060000;
 
-/// `lsetxattr` on the leaf beneath the already-resolved `parent` dir fd,
-/// surfacing the OS error instead of dropping it (audit H4). Mirrors
-/// `hostfs::setxattr_at` byte for byte (the same `/proc/self/fd/<parent>/<leaf>`
-/// confinement that does not follow the final symlink), except it returns a
-/// Result so a failed restore can abort the apply rather than be silently lost.
-/// Lives here (not hostfs) only because hostfs is out of scope for this change.
+/// Set an xattr on the leaf beneath the already-resolved `parent` dir fd,
+/// surfacing the OS error instead of dropping it (audit H4). Linux uses its
+/// `/proc/self/fd` path plus `lsetxattr`; Darwin opens the leaf relative to the
+/// trusted parent (including symlinks via `O_SYMLINK`) and uses `fsetxattr`.
 fn setxattr_at_checked(
     parent: BorrowedFd,
     name: &CStr,
     key: &CStr,
     val: &[u8],
 ) -> Result<(), String> {
-    let leaf = name
-        .to_str()
-        .map_err(|_| "non-utf8 leaf name".to_string())?;
-    let path = format!("/proc/self/fd/{}/{}", parent.as_raw_fd(), leaf);
-    let cpath = CString::new(path).map_err(|_| "NUL in xattr path".to_string())?;
-    // SAFETY: valid C strings and byte buffer.
-    let r = unsafe {
-        libc::lsetxattr(
-            cpath.as_ptr(),
-            key.as_ptr(),
-            val.as_ptr().cast(),
-            val.len(),
-            0,
-        )
-    };
-    if r != 0 {
-        return Err(std::io::Error::last_os_error().to_string());
+    #[cfg(target_os = "linux")]
+    {
+        let leaf = name
+            .to_str()
+            .map_err(|_| "non-utf8 leaf name".to_string())?;
+        let path = format!("/proc/self/fd/{}/{}", parent.as_raw_fd(), leaf);
+        let cpath = CString::new(path).map_err(|_| "NUL in xattr path".to_string())?;
+        // SAFETY: valid C strings and byte buffer.
+        let r = unsafe {
+            libc::lsetxattr(
+                cpath.as_ptr(),
+                key.as_ptr(),
+                val.as_ptr().cast(),
+                val.len(),
+                0,
+            )
+        };
+        if r != 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        Ok(())
     }
-    Ok(())
+
+    #[cfg(target_os = "macos")]
+    {
+        let is_symlink = hostfs::lstat_at(parent, name)
+            .is_some_and(|st| st.st_mode & libc::S_IFMT == libc::S_IFLNK);
+        let mut flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+        if is_symlink {
+            flags |= libc::O_SYMLINK;
+        }
+        // SAFETY: parent is a trusted directory descriptor and name is a valid
+        // C string. O_NOFOLLOW/O_SYMLINK prevents final-component traversal.
+        let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        // SAFETY: openat returned a fresh descriptor and all pointers remain
+        // valid for the duration of the call.
+        let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+        let r = unsafe {
+            libc::fsetxattr(
+                owned.as_raw_fd(),
+                key.as_ptr(),
+                val.as_ptr().cast(),
+                val.len(),
+                0,
+                0,
+            )
+        };
+        if r != 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        Ok(())
+    }
 }
 
 /// Atomically write `bytes` (with exact `mode`) to the leaf `name` beneath the
@@ -1204,7 +1238,7 @@ fn write_file_atomic_at(
         // O_CREAT's mode is umask-masked, so set the exact mode explicitly and
         // surface any failure (audit H4: a 0600 file must not land world-readable).
         // SAFETY: valid open fd.
-        if unsafe { libc::fchmod(f.as_raw_fd(), mode & 0o7777) } != 0 {
+        if unsafe { libc::fchmod(f.as_raw_fd(), (mode & 0o7777) as libc::mode_t) } != 0 {
             return Err(format!("set mode: {}", std::io::Error::last_os_error()));
         }
         // Flush the data to disk before the rename so a crash can't leave a

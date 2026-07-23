@@ -16,7 +16,9 @@ import time
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
-from sarun_test_paths import ENGINE_BIN, HOST_ARCH, LIBTESTSARUN, REPO_ROOT
+from sarun_test_paths import (
+    ENGINE_BIN, HOST_ARCH, LIBTESTSARUN, QEMU_HOST_DIR, REPO_ROOT,
+)
 from test_backend_equiv_rs import backend_selector
 
 
@@ -106,7 +108,7 @@ def available_backends():
         root = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) \
             / "sarun/appliances/v1"
     appliance = root / HOST_ARCH / "kernel"
-    qemu = root / f"host-{HOST_ARCH}" / f"qemu-system-{HOST_ARCH}"
+    qemu = root / QEMU_HOST_DIR / f"qemu-system-{HOST_ARCH}"
     if appliance.exists() and qemu.exists():
         result.append("qemu")
     return result
@@ -119,7 +121,7 @@ def qemu_accelerator(stderr):
         for line in stderr.splitlines()
         if line.startswith(prefix)
     }
-    if len(accelerators) != 1 or not accelerators <= {"kvm", "tcg"}:
+    if len(accelerators) != 1 or not accelerators <= {"hvf", "kvm", "tcg"}:
         raise RuntimeError(
             f"missing or ambiguous QEMU accelerator marker: {sorted(accelerators)!r}"
         )

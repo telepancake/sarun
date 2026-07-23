@@ -9,7 +9,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from sarun_test_paths import ENGINE_BIN, HOST_ARCH, REPO_ROOT
+from sarun_test_paths import ENGINE_BIN, HOST_ARCH, QEMU_HOST_DIR, REPO_ROOT
 
 
 ARCHITECTURES = {
@@ -67,7 +67,7 @@ def available(architecture):
     return all(path.is_file() for path in (
         root / architecture / "kernel",
         root / architecture / "init",
-        root / f"host-{HOST_ARCH}" / f"qemu-system-{architecture}",
+        root / QEMU_HOST_DIR / f"qemu-system-{architecture}",
     ))
 
 

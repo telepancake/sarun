@@ -26,17 +26,21 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
-/// Open `/` as an `O_PATH` directory fd — the production root for apply.
+/// Open `/` as a directory fd — the production root for apply.
 pub fn open_root() -> std::io::Result<OwnedFd> {
     open_dir(Path::new("/"))
 }
 
-/// Open `path` as an `O_PATH` directory fd (used for the root; tests pass a temp
-/// dir). `O_PATH|O_DIRECTORY` is enough to serve as the `dirfd` for the `*at`
-/// calls below and needs no read permission.
+/// Open `path` as a directory fd (used for the root; tests pass a temp dir).
+/// Linux can use its metadata-only `O_PATH`; Darwin has no equivalent, so it
+/// uses a read-only directory descriptor. Both are valid anchors for the `*at`
+/// calls below.
 pub fn open_dir(path: &Path) -> std::io::Result<OwnedFd> {
     let c = CString::new(path.as_os_str().as_bytes())?;
+    #[cfg(target_os = "linux")]
     let flags = libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC;
+    #[cfg(target_os = "macos")]
+    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
     // SAFETY: `c` is a valid NUL-terminated C string for the duration of the call.
     let fd = unsafe { libc::open(c.as_ptr(), flags) };
     if fd < 0 {
@@ -70,10 +74,13 @@ fn safe_components(rel: &str) -> Result<Vec<&str>, String> {
 /// non-directory component fails closed (the `openat` returns ELOOP/ENOTDIR).
 fn open_dir_component(at: BorrowedFd, name: &str, create: bool) -> Result<OwnedFd, String> {
     let cname = CString::new(name).map_err(|_| "NUL in path component".to_string())?;
-    // O_PATH|O_DIRECTORY|O_NOFOLLOW: a real dir opens; a symlink yields ENOTDIR
-    // (O_NOFOLLOW keeps the link itself, which is not a directory); a regular
-    // file yields ENOTDIR. Either way a non-dir/symlink component is refused.
+    // O_DIRECTORY|O_NOFOLLOW: a real dir opens while a symlink or regular file
+    // fails closed. Linux additionally uses O_PATH so traversing an execute-only
+    // directory does not require read permission; Darwin has no O_PATH.
+    #[cfg(target_os = "linux")]
     let flags = libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    #[cfg(target_os = "macos")]
+    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
     // SAFETY: valid dirfd and C string.
     let mut fd = unsafe { libc::openat(at.as_raw_fd(), cname.as_ptr(), flags) };
     if fd < 0 {
@@ -265,7 +272,15 @@ pub fn mkdir_at(parent: BorrowedFd, name: &CStr, mode: u32) -> Result<(), String
     }
     // fchmodat without AT_SYMLINK_NOFOLLOW is safe here: we just confirmed a real dir.
     // SAFETY: valid dirfd and C string.
-    if unsafe { libc::fchmodat(parent.as_raw_fd(), name.as_ptr(), mode & 0o7777, 0) } != 0 {
+    if unsafe {
+        libc::fchmodat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            (mode & 0o7777) as libc::mode_t,
+            0,
+        )
+    } != 0
+    {
         return Err(format!("set dir mode: {}", std::io::Error::last_os_error()));
     }
     Ok(())
@@ -276,7 +291,15 @@ pub fn mkdir_at(parent: BorrowedFd, name: &CStr, mode: u32) -> Result<(), String
 pub fn mknod_at(parent: BorrowedFd, name: &CStr, mode: u32, rdev: u64) -> Result<(), String> {
     unlink_at(parent, name)?;
     // SAFETY: valid dirfd and C string.
-    if unsafe { libc::mknodat(parent.as_raw_fd(), name.as_ptr(), mode, rdev as libc::dev_t) } != 0 {
+    if unsafe {
+        libc::mknodat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            mode as libc::mode_t,
+            rdev as libc::dev_t,
+        )
+    } != 0
+    {
         return Err(format!("mknod: {}", std::io::Error::last_os_error()));
     }
     Ok(())

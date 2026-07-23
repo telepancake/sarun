@@ -4,3 +4,4 @@
 0040-Negotiate-kernel-FUSE-transport-defaults.patch
 0050-Preserve-kernel-FUSE-backing-acceleration.patch
 0060-Decode-and-expose-filesystem-record-locks.patch
+0070-Make-embedded-transport-portable-across-Unix-hosts.patch

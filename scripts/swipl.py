@@ -34,6 +34,8 @@ ZLIB_SHA256 = "d9e270d46252734aa49770fbc544125391617956266f220bd63216c834f3a522"
 SUPPORTED_TARGETS = {
     "x86_64-linux-musl": "x86_64",
     "aarch64-linux-musl": "aarch64",
+    "x86_64-apple-darwin": "x86_64",
+    "aarch64-apple-darwin": "aarch64",
 }
 HOST_TARGETS = {
     "x86_64": "x86_64-linux-musl",
@@ -62,7 +64,7 @@ def tool_version(*args: str) -> str:
     return output.splitlines()[0].strip()
 
 
-def metadata(repo: Path, host: str, target: str, zig: str) -> dict[str, str]:
+def metadata(repo: Path, host: str, target: str, zig: str | None) -> dict[str, str]:
     grammar = repo / "engine" / "pl" / "action_grammar.pl"
     grammar_engine = repo / "engine" / "pl" / "grammar_engine.pl"
     text_grammar_engine = repo / "engine" / "pl" / "text_grammar_engine.pl"
@@ -134,7 +136,7 @@ def metadata(repo: Path, host: str, target: str, zig: str) -> dict[str, str]:
         "zlib_license_sha256": sha256(repo / "LICENSES" / "zlib.txt"),
         "cmake": tool_version("cmake", "--version"),
         "ninja": tool_version("ninja", "--version"),
-        "zig": tool_version(zig, "version"),
+        "zig": tool_version(zig, "version") if zig else "not-used-native",
         "cc": tool_version("cc", "--version"),
         "use_signals": "OFF",
         "no_bignum_patch": "guard-ar-alloc-buffer",
@@ -258,16 +260,29 @@ def validate_notices(repo: Path, swipl_source: Path, zlib_source: Path) -> None:
 
 
 def patch_swipl(source: Path) -> None:
-    """Fix 9.2.9 core-only arithmetic; upstream assumes a bignum allocator."""
+    """Apply the two core-only portability fixes needed by the pinned source."""
     path = source / "src" / "pl-vmi.c"
     old = "  __PL_ar_ctx.alloc_buf = __PL_ar_buf;"
     new = "#if O_MY_GMP_ALLOC\n  __PL_ar_ctx.alloc_buf = __PL_ar_buf;\n#endif"
     text = path.read_text()
-    if new in text:
-        return
-    if text.count(old) != 1:
-        raise RuntimeError(f"cannot apply no-bignum SWI patch to {path}")
-    path.write_text(text.replace(old, new))
+    if new not in text:
+        if text.count(old) != 1:
+            raise RuntimeError(f"cannot apply no-bignum SWI patch to {path}")
+        path.write_text(text.replace(old, new))
+
+    # Apple's headers expose the C `false` macro after SWI's flag helper of
+    # the same name. Avoid the collision at the one late include site while
+    # retaining the exact flag test used upstream.
+    path = source / "src" / "pl-thread.c"
+    old = "  if ( false(def, P_THREAD_LOCAL) )"
+    intermediate = "  if ( !true(def, P_THREAD_LOCAL) )"
+    new = "  if ( !(def->flags & P_THREAD_LOCAL) )"
+    text = path.read_text()
+    if new not in text:
+        candidate = intermediate if text.count(intermediate) == 1 else old
+        if text.count(candidate) != 1:
+            raise RuntimeError(f"cannot apply Darwin false-macro SWI patch to {path}")
+        path.write_text(text.replace(candidate, new))
 
 
 def configure(
@@ -482,7 +497,11 @@ def main() -> int:
     cache_home = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
     default_cache = cache_home / "sarun" / "swipl" / SWIPL_VERSION
     host = platform.machine().lower()
-    default_target = HOST_TARGETS.get(host)
+    host_arch = {"arm64": "aarch64", "amd64": "x86_64"}.get(host, host)
+    if platform.system() == "Darwin":
+        default_target = f"{host_arch}-apple-darwin"
+    else:
+        default_target = HOST_TARGETS.get(host)
     if default_target is None:
         raise RuntimeError(f"unsupported build host architecture: {host}")
 
@@ -500,12 +519,16 @@ def main() -> int:
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     target = args.target
+    native_darwin = (
+        platform.system() == "Darwin"
+        and target == f"{host_arch}-apple-darwin"
+    )
 
     for tool in ("cmake", "ninja", "cc"):
         if not shutil.which(tool):
             raise RuntimeError(f"required tool not found: {tool}")
     zig = os.environ.get("SWIPL_ZIG") or shutil.which("python-zig")
-    if not zig:
+    if not native_darwin and not zig:
         raise RuntimeError("python-zig not found; install cargo-zigbuild with ziglang")
 
     cache = args.cache.resolve()
@@ -535,19 +558,74 @@ def main() -> int:
     env.update({"SOURCE_DATE_EPOCH": SOURCE_DATE_EPOCH, "TZ": "UTC", "LC_ALL": "C"})
     prefix_map = f"-ffile-prefix-map={cache}=/usr/src/sarun-swipl -fdebug-prefix-map={cache}=/usr/src/sarun-swipl"
 
+    if native_darwin:
+        target_zlib = work / "target-zlib-install"
+        build_zlib(zlib_source, work / "target-zlib-build", target_zlib, env, [])
+        target_swipl_build = work / "target-swipl-build"
+        configure(
+            swipl_source,
+            target_swipl_build,
+            [
+                *swipl_options(target_zlib),
+                # Darwin's libc allocator discovery uses PL_dlsym even in an
+                # otherwise static core. Keep the loader shim compiled; with
+                # SWIPL_SHARED_LIB=OFF the published library remains static.
+                "-DSTATIC_EXTENSIONS=OFF",
+                f"-DCMAKE_C_FLAGS=-Wno-error=date-time -g0 {prefix_map}",
+                f"-DCMAKE_CXX_FLAGS=-Wno-error=date-time -g0 {prefix_map}",
+            ],
+            env,
+        )
+        run(
+            "cmake",
+            "--build",
+            str(target_swipl_build),
+            "--target",
+            "swipl",
+            "bootfile",
+            "--parallel",
+            env=env,
+        )
+        publish(
+            repo,
+            swipl_source,
+            target_swipl_build,
+            target_zlib,
+            output,
+            build_metadata,
+        )
+        print(f"SWI-Prolog output: {output}")
+        return 0
+
     native_zlib = work / "native-zlib-install"
     build_zlib(zlib_source, work / "native-zlib-build", native_zlib, env, [])
     native_swipl_build = work / "native-swipl-build"
-    configure(
-        swipl_source,
-        native_swipl_build,
-        [
+    if platform.system() == "Darwin":
+        # The native friend is executed while generating the target boot
+        # archive, so it must be a Mach-O program on a macOS build host.  Zig
+        # still builds the final Linux/musl archive below; using it here would
+        # produce an un-runnable Linux helper and also lets CMake inject
+        # incompatible Apple `-arch`/SDK flags into Zig's command line.
+        native_options = [
+            "-DCMAKE_C_COMPILER=/usr/bin/cc",
+            "-DCMAKE_CXX_COMPILER=/usr/bin/c++",
+            *swipl_options(native_zlib),
+            "-DSTATIC_EXTENSIONS=OFF",
+            f"-DCMAKE_C_FLAGS=-Wno-error=date-time -g0 {prefix_map}",
+            f"-DCMAKE_CXX_FLAGS=-Wno-error=date-time -g0 {prefix_map}",
+        ]
+    else:
+        native_options = [
             f"-DCMAKE_CXX_COMPILER={zig}",
             "-DCMAKE_CXX_COMPILER_ARG1=c++",
             f"-DCMAKE_CXX_FLAGS=-target {host}-linux-gnu -Wno-error=date-time -g0 {prefix_map}",
             *swipl_options(native_zlib),
             f"-DCMAKE_C_FLAGS=-Wno-error=date-time -g0 {prefix_map}",
-        ],
+        ]
+    configure(
+        swipl_source,
+        native_swipl_build,
+        native_options,
         env,
     )
     run(

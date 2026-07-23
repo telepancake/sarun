@@ -30,6 +30,7 @@ from typing import Callable, Protocol
 from probe.image_inspector import CapturedArtifact, ImageInspectionError
 from probe.provider_derivation import (
     ArtifactSource,
+    FilesystemArtifactSource,
     ProviderDerivationError,
     SelectedImageRequest,
     SelectedKernelInitramfsRequest,
@@ -40,6 +41,7 @@ from probe.selected_bundle_orchestrator import (
     SelectedBundleError,
     SelectedBundleExecutionRequest,
     execute_selected_initramfs,
+    execute_selected_with_prebuilt_kernel,
 )
 
 
@@ -51,6 +53,10 @@ MAX_CATALOG_ARTIFACTS = 100_000
 MAX_ROLES = 64
 MAX_EXECUTABLES = 4
 TOKEN_BYTES = 32
+SARUN_ARTIFACT_ROOT = Path("/.viros-input/boxes")
+SARUN_KERNEL_BUNDLE_ROOT = Path("/.viros-input/kernel-bundle")
+SARUN_PROVIDER_ROOT = Path("/")
+SARUN_BUNDLE_DESTINATION = ".viros-generated/bundle"
 
 MESSAGE_PREPARE = 1
 MESSAGE_COMMIT = 2
@@ -755,9 +761,11 @@ class SelectedBundleTransaction:
             token = token_factory()
             self._prepared = PreparedBoot(
                 token=token,
-                kernel_manifest=_file_identity(self._staged, "kernel-bundle/bundle.json"),
+                kernel_manifest=_file_identity(
+                    self._staged, "image-bundle/kernel/bundle.json"
+                ),
                 image_manifest=_file_identity(self._staged, "image-bundle/image.json"),
-                kernel=_file_identity(self._staged, "kernel-bundle/kernel"),
+                kernel=_file_identity(self._staged, "image-bundle/kernel/kernel"),
                 initramfs=_file_identity(self._staged, "image-bundle/rootfs.cpio"),
                 kernel_init=init,
             )
@@ -797,10 +805,52 @@ class SelectedBundleTransaction:
 
 
 def selected_bundle_preparer(
-    source: ArtifactSource, provider_root: Path, destination: str
+    source: ArtifactSource,
+    provider_root: Path,
+    destination: str,
+    *,
+    executor=execute_selected_initramfs,
 ) -> Prepare:
     """Bind provider-owned resources to the typed handshake callback."""
 
     return lambda execution: SelectedBundleTransaction(
-        execution, source, provider_root, destination
+        execution, source, provider_root, destination, executor=executor
+    )
+
+
+def sarun_selected_bundle_preparer(
+    execution: SelectedBundleExecutionRequest,
+) -> SelectedBundleTransaction:
+    """Prepare from the fixed, engine-populated Sarun service-box capsule."""
+
+    selected = execution.selected_boot
+    rows = (
+        (selected.selected,)
+        if isinstance(selected, SelectedImageRequest)
+        else (selected.kernel, selected.initramfs)
+    )
+    box_ids = {
+        row.box_id for row in (*rows, *selected.captured_artifacts)
+    }
+    source = FilesystemArtifactSource(
+        {
+            box_id: SARUN_ARTIFACT_ROOT / str(box_id)
+            for box_id in sorted(box_ids)
+        }
+    )
+
+    def execute(request, artifact_source, output):
+        return execute_selected_with_prebuilt_kernel(
+            request,
+            artifact_source,
+            output,
+            SARUN_KERNEL_BUNDLE_ROOT,
+        )
+
+    return SelectedBundleTransaction(
+        execution,
+        source,
+        SARUN_PROVIDER_ROOT,
+        SARUN_BUNDLE_DESTINATION,
+        executor=execute,
     )

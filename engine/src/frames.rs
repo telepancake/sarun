@@ -20,6 +20,12 @@
 //   UNMUTE    (inner→engine) empty; removes --inner's pid from the muted set.
 
 pub const FRAME_ECHO: u8 = 2;
+
+// A registration carrying SCM_RIGHTS attaches its descriptors to this
+// sacrificial byte. The engine consumes the marker and descriptors together,
+// leaving the actual request queued for the normal parser. This avoids relying
+// on OS-specific recvmsg(MSG_PEEK) descriptor semantics.
+pub const REGISTER_FD_MARKER: u8 = 0xa5;
 pub const FRAME_ECHO_DONE: u8 = 3;
 pub const FRAME_MUTE: u8 = 4;
 pub const FRAME_UNMUTE: u8 = 5;

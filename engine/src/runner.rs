@@ -32,6 +32,16 @@ use crate::paths;
 
 const KIDS_DIR: &str = ".slopbox-kids";
 
+#[cfg(target_os = "linux")]
+const fn socket_cloexec_flag() -> i32 {
+    libc::SOCK_CLOEXEC
+}
+
+#[cfg(target_os = "macos")]
+const fn socket_cloexec_flag() -> i32 {
+    0
+}
+
 /// Standard CA bundle paths the augmented bundle is bound over. Distro
 /// coverage as of 2026: Debian/Ubuntu (ca-certificates.crt), RHEL/Fedora
 /// (tls/certs/ca-bundle.crt + the .pem twin), Alpine (cert.pem). `--ro-bind-try`
@@ -45,8 +55,53 @@ pub const CA_BUNDLE_TARGETS: &[&str] = &[
     "/var/lib/ca-certificates/ca-bundle.pem",
 ];
 
+#[cfg(target_os = "linux")]
 fn pidfd_open(pid: i32) -> i32 {
     unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) as i32 }
+}
+
+/// Darwin has no pidfd. A runner can provide the engine an equivalent pollable
+/// lifetime descriptor by holding the write end of a CLOEXEC pipe for its own
+/// lifetime and passing duplicates of the read end. EOF means the runner died.
+#[cfg(target_os = "macos")]
+fn pidfd_open(pid: i32) -> i32 {
+    struct LivenessPipe {
+        read: OwnedFd,
+        _write: OwnedFd,
+    }
+    static PIPE: std::sync::OnceLock<Option<LivenessPipe>> = std::sync::OnceLock::new();
+    if pid != unsafe { libc::getpid() } {
+        return -1;
+    }
+    let Some(pipe) = PIPE
+        .get_or_init(|| {
+            let mut descriptors = [-1; 2];
+            if unsafe { libc::pipe(descriptors.as_mut_ptr()) } < 0 {
+                return None;
+            }
+            for descriptor in descriptors {
+                let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
+                if flags < 0
+                    || unsafe { libc::fcntl(descriptor, libc::F_SETFD, flags | libc::FD_CLOEXEC) }
+                        < 0
+                {
+                    unsafe {
+                        libc::close(descriptors[0]);
+                        libc::close(descriptors[1]);
+                    }
+                    return None;
+                }
+            }
+            Some(LivenessPipe {
+                read: unsafe { OwnedFd::from_raw_fd(descriptors[0]) },
+                _write: unsafe { OwnedFd::from_raw_fd(descriptors[1]) },
+            })
+        })
+        .as_ref()
+    else {
+        return -1;
+    };
+    unsafe { libc::fcntl(pipe.read.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) }
 }
 
 /// Acquire a control connection from the runner's current execution context.
@@ -190,7 +245,7 @@ impl DirectFsLaunch {
         if unsafe {
             libc::socketpair(
                 libc::AF_UNIX,
-                libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+                libc::SOCK_SEQPACKET | socket_cloexec_flag(),
                 0,
                 lanes.as_mut_ptr(),
             )
@@ -274,7 +329,7 @@ fn install_direct_fs_descriptors(ring: i32, lane: i32) -> std::io::Result<()> {
     error.map_or(Ok(()), Err)
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod direct_fs_launch_tests {
     use super::*;
 
@@ -308,7 +363,7 @@ mod direct_fs_launch_tests {
 /// (sud boxes). The engine (recv_first_fd + register) assigns roles from the
 /// same want_sud/net_mode it reads out of `line`, so the order must match:
 /// [pidfd, tap?, trace?, ring?, lane?].
-fn send_register_fds(
+pub(crate) fn send_register_fds(
     conn: &UnixStream,
     line: &[u8],
     pidfd: i32,
@@ -343,9 +398,10 @@ fn send_register_fds(
         return false;
     }
     let nbytes = (fds.len() * std::mem::size_of::<i32>()) as u32;
+    let ancillary_payload = [crate::frames::REGISTER_FD_MARKER];
     let mut iov = libc::iovec {
-        iov_base: line.as_ptr() as *mut libc::c_void,
-        iov_len: line.len(),
+        iov_base: ancillary_payload.as_ptr() as *mut libc::c_void,
+        iov_len: ancillary_payload.len(),
     };
     let mut cmsg = [0u8; 128];
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
@@ -364,7 +420,7 @@ fn send_register_fds(
     if sent < 0 {
         false
     } else {
-        conn_write_all(conn, &line[sent as usize..])
+        sent as usize == ancillary_payload.len() && conn_write_all(conn, line)
     }
 }
 
@@ -1044,7 +1100,10 @@ pub fn run(
     // subordinate-ID namespace. Do not ask bwrap to select a uid in that case:
     // its rootless uid machinery would replace the complete map with a one-ID
     // namespace.
+    #[cfg(target_os = "linux")]
     let canonical_id_map = crate::fuse_broker::runner_has_canonical_id_map();
+    #[cfg(not(target_os = "linux"))]
+    let canonical_id_map = false;
     let mut bwrap = Command::new("bwrap");
     bwrap.args([
         "--bind",
@@ -1592,7 +1651,7 @@ pub fn run_qemu(
         crate::wire::BoundedBytes::new(value.as_os_str().as_bytes().to_vec())
             .map_err(|error| format!("path exceeds relation bound: {error:?}"))
     };
-    let executable = std::fs::read_link("/proc/self/exe").unwrap_or_default();
+    let executable = std::env::current_exe().unwrap_or_default();
     let cwd = std::env::current_dir().unwrap_or_default();
     let provenance = match (bounded_path(&executable), bounded_path(&cwd)) {
         (Ok(executable), Ok(cwd)) => ProcessProvenance {
@@ -1846,6 +1905,7 @@ const SUD_STATE_FD: i32 = 1022;
 
 /// Resolve `cmd0` through PATH like sudtrace's build_wrapper_argv (only
 /// used for probing the target — the wrapper gets the user's argv).
+#[cfg(target_os = "linux")]
 fn sud_resolve_target(cmd0: &str) -> String {
     if cmd0.contains('/') {
         return cmd0.to_string();
@@ -1868,6 +1928,7 @@ fn sud_resolve_target(cmd0: &str) -> String {
 /// Probe `path` head bytes: Some((interp, Some(arg))) for a shebang
 /// script, None for anything else. Mirrors sudtrace's parse (first
 /// whitespace-separated token = interpreter, rest = one argument).
+#[cfg(target_os = "linux")]
 fn sud_shebang(path: &str) -> Option<(String, Option<String>)> {
     let head = {
         use std::io::Read;
@@ -1896,6 +1957,7 @@ fn sud_shebang(path: &str) -> Option<(String, Option<String>)> {
 }
 
 /// ELF class of `path`: 1 = 32-bit, 2 = 64-bit, 0 = not readable/ELF.
+#[cfg(target_os = "linux")]
 fn sud_elf_class(path: &str) -> u8 {
     use std::io::Read;
     let Ok(mut f) = std::fs::File::open(path) else {
@@ -1913,6 +1975,7 @@ fn sud_elf_class(path: &str) -> u8 {
 
 /// /proc/<pid>/status field parse with sudtrace's fallbacks
 /// (tgid → pid, ppid → 0) — reaped pids read back absent.
+#[cfg(target_os = "linux")]
 fn sud_proc_field(pid: i32, field: &str, fallback: i32) -> i32 {
     let Ok(s) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
         return fallback;
@@ -1932,6 +1995,7 @@ fn sud_proc_field(pid: i32, field: &str, fallback: i32) -> i32 {
 /// the filesystem session.
 ///
 /// The body is orchestration only; each labelled step is a named helper below.
+#[cfg(target_os = "linux")]
 pub fn run_sud(
     name: Option<String>,
     env: bool,
@@ -2168,12 +2232,26 @@ pub fn run_sud(
     code
 }
 
+#[cfg(target_os = "macos")]
+pub fn run_sud(
+    _name: Option<String>,
+    _env: bool,
+    _chdir: Option<String>,
+    _net_mode: crate::net::NetMode,
+    _brush: bool,
+    _cmd: Vec<String>,
+) -> i32 {
+    eprintln!("sarun-engine run --sud: SUD is Linux-only; use --qemu on macOS");
+    2
+}
+
 /// Resolve the sud64/sud32 wrapper binary paths. `$SARUN_SUD64` / `$SARUN_SUD32`
 /// override; otherwise a `sud64` SIBLING OF THE ENGINE BINARY (`make engine`
 /// installs the wrappers next to it — what makes sud viable as the default
 /// backend), else `sud64` on PATH. sud32 is always the dir-sibling of
 /// whatever sud64 resolved to (the cross-class contract the wrapper itself
 /// uses to find its twin).
+#[cfg(target_os = "linux")]
 fn sud_wrapper_paths() -> (String, String) {
     let sud64 = std::env::var("SARUN_SUD64")
         .ok()
@@ -2198,6 +2276,7 @@ fn sud_wrapper_paths() -> (String, String) {
 /// into the fresh netns; the wrapper, spawned later, inherits it) and return
 /// the TAP fd to hand the engine. Off → an empty netns where every dial fails
 /// closed. Host → share the launcher's netns. Fails loud on tap/off error.
+#[cfg(target_os = "linux")]
 fn sud_netns_setup(net_mode: crate::net::NetMode) -> Result<Option<std::os::fd::OwnedFd>, String> {
     match net_mode {
         crate::net::NetMode::Tap => create_runner_tap().map(Some).map_err(|e| {
@@ -2218,6 +2297,7 @@ fn sud_netns_setup(net_mode: crate::net::NetMode) -> Result<Option<std::os::fd::
 /// [pidfd, tap?, trace_r, ring, lane], drop our copies of the fds the engine dup'd
 /// (`tap_fd` + `trace_r` are consumed here), read the ack, and return it once
 /// validated. `Err(code)` carries the process exit code on any failure.
+#[cfg(target_os = "linux")]
 fn sud_register(
     conn: &UnixStream,
     cmd: &[String],
@@ -2332,11 +2412,14 @@ fn brush_cmd(exe: &str, cmd: &[String]) -> Vec<String> {
 /// The wrapper child's pid (== its process-group id; the launcher setpgids
 /// it), for the SIGTERM forwarder + the engine-EOF watchdog. 0 = not
 /// launched yet.
+#[cfg(target_os = "linux")]
 static SUD_WRAPPER_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 /// Signal escalation: first SIGTERM/SIGINT forwards SIGTERM to the group,
 /// the second forwards SIGKILL (a wedged tree may ignore SIGTERM).
+#[cfg(target_os = "linux")]
 static SUD_TERM_SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+#[cfg(target_os = "linux")]
 extern "C" fn sud_on_term(_sig: i32) {
     use std::sync::atomic::Ordering;
     let p = SUD_WRAPPER_PID.load(Ordering::SeqCst);
@@ -2370,13 +2453,16 @@ extern "C" fn sud_on_term(_sig: i32) {
 /// second and steals from a dead holder — a traced process SIGKILLed mid-
 /// write (OOM killer, a build's own kill -9) must degrade capture, never
 /// freeze the box.
+#[cfg(target_os = "linux")]
 const WIRE_WAITERS: u32 = 0x8000_0000;
 
+#[cfg(target_os = "linux")]
 unsafe fn wire_tid_dead(tid: u32) -> bool {
     (unsafe { libc::syscall(libc::SYS_tkill, tid, 0) }) == -1
         && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
 }
 
+#[cfg(target_os = "linux")]
 unsafe fn wire_lock(word: *mut u32) {
     use std::sync::atomic::Ordering::{Acquire, Relaxed};
     let a = unsafe { std::sync::atomic::AtomicU32::from_ptr(word) };
@@ -2433,6 +2519,7 @@ unsafe fn wire_lock(word: *mut u32) {
         }
     }
 }
+#[cfg(target_os = "linux")]
 unsafe fn wire_unlock(word: *mut u32) {
     let a = unsafe { std::sync::atomic::AtomicU32::from_ptr(word) };
     if a.swap(0, std::sync::atomic::Ordering::Release) & WIRE_WAITERS != 0 {
@@ -2442,6 +2529,7 @@ unsafe fn wire_unlock(word: *mut u32) {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn sud_launcher_exec(
     mut sc: Command,
     wrapper: &str,
@@ -2820,6 +2908,7 @@ static BROKER_QUEUE: OnceLock<Mutex<VecDeque<std::os::unix::net::UnixStream>>> =
 /// Bind the broker's abstract UDS inside the box and spawn the accept thread.
 /// `abstract_name` is the SARUN_BROKER name (bwrap propagated it to us and to
 /// every box child). Idempotent.
+#[cfg(target_os = "linux")]
 fn inner_broker_serve(conn_fd: i32, abstract_name: &str) {
     if BROKER_QUEUE.get().is_some() {
         return;
@@ -2858,6 +2947,9 @@ fn inner_broker_serve(conn_fd: i32, abstract_name: &str) {
         }
     });
 }
+
+#[cfg(not(target_os = "linux"))]
+fn inner_broker_serve(_conn_fd: i32, _abstract_name: &str) {}
 
 /// Handle a FRAME_CONN: pop the front-of-queue waiter and forward `fd` to it
 /// via SCM_RIGHTS. Closes our copy. If nothing is waiting (shouldn't happen
@@ -2939,6 +3031,7 @@ pub(crate) fn recv_box_frame_bytes(raw: i32, buf: &mut [u8], fd: &mut Option<i32
 /// Dial the broker via abstract UDS named by SARUN_BROKER; recvmsg the
 /// SCM_RIGHTS-attached engine conn fd; wrap as a UnixStream. Used by
 /// in-box `sarun run` and any other in-box engine client.
+#[cfg(target_os = "linux")]
 pub fn broker_dial(abstract_name: &str) -> std::io::Result<UnixStream> {
     use std::os::fd::FromRawFd;
     use std::os::linux::net::SocketAddrExt;
@@ -2981,6 +3074,14 @@ pub fn broker_dial(abstract_name: &str) -> std::io::Result<UnixStream> {
         std::io::Error::new(std::io::ErrorKind::Other, "broker reply: no fd attached")
     })?;
     Ok(unsafe { UnixStream::from_raw_fd(fd) })
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn broker_dial(_abstract_name: &str) -> std::io::Result<UnixStream> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "the in-box abstract-socket broker runs inside Linux guests",
+    ))
 }
 
 fn inner_capture(conn_fd: i32, cmd: Vec<String>) -> i32 {
@@ -3158,14 +3259,14 @@ fn inner_pty(conn_fd: i32, cmd: Vec<String>) -> i32 {
     let initial_ws = get_winsize(real_tty);
     let ws_ptr = initial_ws
         .as_ref()
-        .map(|w| w as *const libc::winsize)
-        .unwrap_or(std::ptr::null());
+        .map(|w| w as *const libc::winsize as *mut libc::winsize)
+        .unwrap_or(std::ptr::null_mut());
     let rc = unsafe {
         libc::openpty(
             &mut master,
             &mut slave,
             std::ptr::null_mut(),
-            std::ptr::null(),
+            std::ptr::null_mut(),
             ws_ptr,
         )
     };
@@ -3230,7 +3331,7 @@ fn inner_pty(conn_fd: i32, cmd: Vec<String>) -> i32 {
             if libc::setsid() < 0 {
                 return Err(std::io::Error::last_os_error());
             }
-            if libc::ioctl(slave_for_pre, libc::TIOCSCTTY, 0) < 0 {
+            if libc::ioctl(slave_for_pre, libc::TIOCSCTTY as _, 0) < 0 {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(())

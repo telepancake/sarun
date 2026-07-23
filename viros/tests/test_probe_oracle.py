@@ -179,6 +179,7 @@ class ProbeOracleTests(unittest.TestCase):
         task = snapshot.tasks[0]
         self.assertEqual(task.identity, TaskId(1, 1))
         self.assertIsNone(task.page_table_root)
+        self.assertEqual(task.address_space_cookie, 0xffff800002000000)
         self.assertEqual(oracle.pgd_kernel_va(task), 0xffff800003000000)
         pairs = struct.iter_unpack("<QQ", task.auxv)
         self.assertEqual(list(pairs), [(3, 0x400040), (9, 0x4064d0), (0, 0)])

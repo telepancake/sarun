@@ -3888,9 +3888,9 @@ fn ingest_layer(b: &BoxState, blob: &[u8], media_type: &str) -> Result<()> {
             }
             tar::EntryType::Fifo | tar::EntryType::Char | tar::EntryType::Block => {
                 let kind = match ent_type {
-                    tar::EntryType::Fifo => libc::S_IFIFO,
-                    tar::EntryType::Char => libc::S_IFCHR,
-                    tar::EntryType::Block => libc::S_IFBLK,
+                    tar::EntryType::Fifo => libc::S_IFIFO as u32,
+                    tar::EntryType::Char => libc::S_IFCHR as u32,
+                    tar::EntryType::Block => libc::S_IFBLK as u32,
                     _ => unreachable!(),
                 };
                 let rdev = ((dev_major as u64) << 8) | (dev_minor as u64);

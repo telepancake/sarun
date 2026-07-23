@@ -52,6 +52,7 @@ from .arm_events import (
     encode_armv7_event_registers,
 )
 from .event_stop import KernelEventReadError, read_kernel_event_stop
+from .executable_resolver import ExecutableCatalog, LiveExecutableResolver
 from .gdb_signals import mips_linux_signal_to_gdb, standard_linux_signal_to_gdb
 from .internal_breakpoints import (
     InternalBreakpoint,
@@ -70,10 +71,12 @@ from .probe_oracle import ProbeOracle
 from .qemu_rsp import QemuRspClient, RspRemoteError, RspRestorationError
 from .rsp_proxy import RspFacade
 from .rsp_server import UnixRspServer, qemu_cpu_stop_resolver
+from .userspace_boundary import reach_userspace_boundary
 
 
 MAX_DESCRIPTION_FILES = 32
 MAX_DESCRIPTION_BYTES = 1024 * 1024
+RESET_BOOT_TIMEOUT_SECONDS = 120.0
 
 # QEMU's legacy 32-bit MIPS GDB ABI has a fixed 73-register ``g`` packet.
 # The first 38 entries are the descriptor's exact call-gate core map.  The
@@ -419,6 +422,8 @@ def build_live_facade(
     runner_factory: RunnerFactory = _make_runner,
     memory_reader_factory: MemoryReaderFactory = _make_memory_reader,
     register_reader_factory: RegisterReaderFactory = _make_register_reader,
+    image_catalog: ExecutableCatalog | None = None,
+    bootstrap_from_reset: bool = False,
 ) -> LiveFacade:
     """Validate, snapshot, and construct one stopped-QEMU facade instance."""
 
@@ -448,6 +453,11 @@ def build_live_facade(
             manifest.kernel_sha256,
             manifest.kernel_build_id,
         )
+        if bootstrap_from_reset:
+            reach_userspace_boundary(
+                target,
+                timeout_seconds=RESET_BOOT_TIMEOUT_SECONDS,
+            )
         try:
             descriptions = load_target_descriptions(qemu)
         except RspRemoteError as exc:
@@ -496,11 +506,19 @@ def build_live_facade(
             ),
             kernel_memory_address_bits=manifest.architecture.address_bits,
         )
+        executable_resolver = (
+            LiveExecutableResolver.from_catalog(
+                manifest.architecture, image_catalog
+            )
+            if image_catalog is not None
+            else None
+        )
         facade = RspFacade(
             oracle,
             qemu,
             descriptions[b"target.xml"],
             target_descriptions=descriptions,
+            executable_resolver=executable_resolver,
         )
         internal_breakpoints = None
         internal_stop = None

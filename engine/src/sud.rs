@@ -112,14 +112,13 @@ impl FuseTrace {
         self.append(&event);
     }
 
-    fn observe_process(
-        &mut self,
-        b: &BoxState,
-        pid: u32,
-        ts_ns: i64,
-    ) -> (u32, u32, i64) {
+    fn observe_process(&mut self, b: &BoxState, pid: u32, ts_ns: i64) -> (u32, u32, i64) {
         let (observed_tgid, start, ppid, observed_exe) = BoxState::read_trace_identity(pid);
-        let tgid = if observed_tgid == 0 { pid } else { observed_tgid };
+        let tgid = if observed_tgid == 0 {
+            pid
+        } else {
+            observed_tgid
+        };
         let identity = (tgid, start);
         if let Some((_, process_id)) = self
             .seen
@@ -139,43 +138,27 @@ impl FuseTrace {
             b.writer_for(pid)
         };
         self.seen.insert(identity, (exe.clone(), process_id));
-        self.event(sudwire::EV_EXEC, ts_ns, pid, tgid, ppid, &[], exe.as_bytes());
+        self.event(
+            sudwire::EV_EXEC,
+            ts_ns,
+            pid,
+            tgid,
+            ppid,
+            &[],
+            exe.as_bytes(),
+        );
         let mut argv_blob = Vec::new();
         for argument in argv {
             argv_blob.extend_from_slice(argument.as_bytes());
             argv_blob.push(0);
         }
-        self.event(
-            sudwire::EV_ARGV,
-            ts_ns,
-            pid,
-            tgid,
-            ppid,
-            &[],
-            &argv_blob,
-        );
+        self.event(sudwire::EV_ARGV, ts_ns, pid, tgid, ppid, &[], &argv_blob);
         if b.env_capture() {
             if let Ok(environment) = std::fs::read(format!("/proc/{tgid}/environ")) {
-                self.event(
-                    sudwire::EV_ENV,
-                    ts_ns,
-                    pid,
-                    tgid,
-                    ppid,
-                    &[],
-                    &environment,
-                );
+                self.event(sudwire::EV_ENV, ts_ns, pid, tgid, ppid, &[], &environment);
             }
         }
-        self.event(
-            sudwire::EV_CWD,
-            ts_ns,
-            pid,
-            tgid,
-            ppid,
-            &[],
-            cwd.as_bytes(),
-        );
+        self.event(sudwire::EV_CWD, ts_ns, pid, tgid, ppid, &[], cwd.as_bytes());
         (tgid, ppid, process_id)
     }
 }
@@ -714,10 +697,13 @@ fn apply_event(b: &BoxState, st: &Stream, cwds: &mut HashMap<i32, String>, ev: &
         }
         sudwire::EV_OPEN => {
             let successful = ev.extras.get(5).copied() == Some(0);
-            let flags = ev.extras.first().and_then(|value| u32::try_from(*value).ok());
-            let path = std::str::from_utf8(&ev.blob).ok().and_then(|path| {
-                trace_root_relative(cwds.get(&ev.tgid).map(String::as_str), path)
-            });
+            let flags = ev
+                .extras
+                .first()
+                .and_then(|value| u32::try_from(*value).ok());
+            let path = std::str::from_utf8(&ev.blob)
+                .ok()
+                .and_then(|path| trace_root_relative(cwds.get(&ev.tgid).map(String::as_str), path));
             if successful {
                 if let (Some(flags), Some(path)) = (flags, path) {
                     let process_id = st

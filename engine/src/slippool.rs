@@ -54,6 +54,7 @@ pub fn global() -> &'static Mutex<Pool> {
 // is event-driven (no /proc polling) and naturally covers whole-box teardown —
 // every process exit reaps. Granted-to-waiters happen inside reap_pid.
 
+#[cfg(target_os = "linux")]
 struct Reaper {
     epfd: i32,
     /// holder pid -> its pidfd (so we can EPOLL_CTL_DEL + close on exit). Also
@@ -63,10 +64,12 @@ struct Reaper {
 
 static REAPER: OnceLock<Arc<Reaper>> = OnceLock::new();
 
+#[cfg(target_os = "linux")]
 fn pidfd_open(pid: i32) -> i32 {
     unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) as i32 }
 }
 
+#[cfg(target_os = "linux")]
 fn reaper() -> &'static Arc<Reaper> {
     REAPER.get_or_init(|| {
         let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
@@ -83,6 +86,7 @@ fn reaper() -> &'static Arc<Reaper> {
     })
 }
 
+#[cfg(target_os = "linux")]
 impl Reaper {
     /// epoll loop: a watched pidfd becomes readable when its process exits.
     fn run(&self) {
@@ -151,6 +155,69 @@ impl Reaper {
             return;
         }
         w.insert(pid, pidfd);
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct Reaper {
+    /// Darwin has no pidfd. Only host actors are watched here (guest actors are
+    /// negative synthetic IDs and are reaped by guest process/box teardown).
+    watched: Mutex<std::collections::HashSet<i32>>,
+}
+
+#[cfg(target_os = "macos")]
+fn reaper() -> &'static Arc<Reaper> {
+    REAPER.get_or_init(|| {
+        let reaper = Arc::new(Reaper {
+            watched: Mutex::new(std::collections::HashSet::new()),
+        });
+        let worker = reaper.clone();
+        let _ = std::thread::Builder::new()
+            .name("slip-reaper".into())
+            .spawn(move || worker.run());
+        reaper
+    })
+}
+
+#[cfg(target_os = "macos")]
+impl Reaper {
+    fn run(&self) {
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let dead: Vec<i32> = self
+                .watched
+                .lock()
+                .unwrap()
+                .iter()
+                .copied()
+                .filter(|pid| {
+                    let result = unsafe { libc::kill(*pid, 0) };
+                    result < 0
+                        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+                })
+                .collect();
+            if dead.is_empty() {
+                continue;
+            }
+            let mut watched = self.watched.lock().unwrap();
+            for pid in dead {
+                if watched.remove(&pid) {
+                    let _ = global().lock().unwrap().reap_pid(pid);
+                }
+            }
+        }
+    }
+
+    fn watch(&self, pid: i32) {
+        if pid <= 0 {
+            return;
+        }
+        let result = unsafe { libc::kill(pid, 0) };
+        if result < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+            global().lock().unwrap().reap_pid(pid);
+            return;
+        }
+        self.watched.lock().unwrap().insert(pid);
     }
 }
 

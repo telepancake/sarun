@@ -46,6 +46,50 @@ class KernelBundleTests(unittest.TestCase):
             ):
                 kernel_bundle.default_boot_image(Path(raw), "x86_64", None)
 
+    def test_managed_bundle_requires_event_and_userspace_boundaries(self):
+        def records(*names: str):
+            return [
+                {"name": name, "shndx": 1, "value": 0x1000 + index * 4}
+                for index, name in enumerate(names)
+            ]
+
+        elf = mock.Mock()
+        with mock.patch.object(kernel_bundle, "ElfObject", return_value=elf):
+            for architecture, boundary in (
+                ("aarch64", "ret_to_user"),
+                ("arm", "ret_to_user"),
+                ("mmips", "start_thread"),
+                ("x86_64", "compat_start_thread"),
+            ):
+                with self.subTest(architecture=architecture):
+                    elf.symbol_records.return_value = records(
+                        "viros_event_stop", boundary
+                    )
+                    kernel_bundle.validate_debug_runtime_symbols(
+                        Path("vmlinux"), architecture
+                    )
+
+            elf.symbol_records.return_value = records("ret_to_user")
+            with self.assertRaisesRegex(kernel_bundle.BundleError, "viros_event_stop"):
+                kernel_bundle.validate_debug_runtime_symbols(
+                    Path("vmlinux"), "aarch64"
+                )
+
+            elf.symbol_records.return_value = records("viros_event_stop")
+            with self.assertRaisesRegex(kernel_bundle.BundleError, "userspace boundary"):
+                kernel_bundle.validate_debug_runtime_symbols(
+                    Path("vmlinux"), "x86_64"
+                )
+
+            elf.symbol_records.return_value = [
+                *records("viros_event_stop", "start_thread"),
+                {"name": "start_thread", "shndx": 2, "value": 0x4000},
+            ]
+            with self.assertRaisesRegex(kernel_bundle.BundleError, "conflicting"):
+                kernel_bundle.validate_debug_runtime_symbols(
+                    Path("vmlinux"), "x86_64"
+                )
+
     def test_exact_absolute_kbuild_commands_supply_tools(self):
         with tempfile.TemporaryDirectory() as raw:
             output = Path(raw) / "kernel"

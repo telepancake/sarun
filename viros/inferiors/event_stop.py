@@ -54,7 +54,11 @@ class KernelEventStop:
         """Represent the event owner, preserving prior ELF metadata when exact."""
 
         cookie = (self.event.task << 64) | self.event.start_cookie
-        reusable = previous is not None and previous.task_cookie == cookie
+        reusable = (
+            previous is not None
+            and previous.task_cookie == cookie
+            and previous.address_space_cookie == self.event.mm
+        )
         return TaskSnapshot(
             identity=self.identity,
             task_cookie=cookie,
@@ -68,6 +72,7 @@ class KernelEventStop:
             ),
             current_cpu=self.event.cpu,
             page_table_root=previous.page_table_root if reusable else None,
+            address_space_cookie=self.event.mm,
         )
 
 

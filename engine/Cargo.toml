@@ -289,6 +289,8 @@ wikimak_mediawiki = { path = "../gimir/wikimak/mediawiki", package = "wikimak-me
 tempfile = "3"
 
 [patch.crates-io]
+vhost                    = { path = "vendor/vhost" }
+vhost-user-backend       = { path = "vendor/vhost-user-backend" }
 brush-core               = { path = "vendor/brush-core" }
 brush-builtins           = { path = "vendor/brush-builtins" }
 brush-coreutils-builtins = { path = "vendor/brush-coreutils-builtins" }

@@ -14,7 +14,7 @@ from inferiors.kernel_events import (
     EVENT_REGS_VALID,
     EVENT_USER_SIGNAL,
 )
-from inferiors.linux_oracle import RegisterRead, TaskId
+from inferiors.linux_oracle import RegisterRead, TaskId, TaskSnapshot
 
 
 HEADER_FORMAT = "I6HIIi5I8Q16s"
@@ -113,6 +113,52 @@ class EventStopTests(unittest.TestCase):
             ],
         )
         self.assertEqual(seen[0].comm, "test-process")
+
+    def test_exec_address_space_change_drops_stale_executable_metadata(self):
+        address = 0x100
+        payload = record()
+        stop = read_kernel_event_stop(
+            qemu=FakeQemu(b"\0" * address + payload),
+            target=FakeTarget(address),
+            cpu_threads=("1",),
+            cpu=0,
+            architecture=MIPS32EL_MMIPS,
+            event_arch=ARCH_MIPS,
+            event_register_count=38,
+            encode_registers=lambda event: RegisterRead(b"00"),
+            map_signal=lambda signal: signal,
+        )
+        cookie = (stop.event.task << 64) | stop.event.start_cookie
+        previous = TaskSnapshot(
+            identity=stop.identity,
+            task_cookie=cookie,
+            comm="old-image",
+            executable="/sbin/old-image",
+            auxv=b"old-auxv",
+            page_table_root=0x1000,
+            address_space_cookie=stop.event.mm + 0x1000,
+        )
+
+        task = stop.task_snapshot(previous)
+
+        self.assertEqual(task.executable, "")
+        self.assertEqual(task.auxv, b"")
+        self.assertIsNone(task.page_table_root)
+        self.assertEqual(task.address_space_cookie, stop.event.mm)
+
+        same_mm = TaskSnapshot(
+            identity=previous.identity,
+            task_cookie=previous.task_cookie,
+            comm=previous.comm,
+            executable=previous.executable,
+            auxv=previous.auxv,
+            page_table_root=previous.page_table_root,
+            address_space_cookie=stop.event.mm,
+        )
+        reused = stop.task_snapshot(same_mm)
+        self.assertEqual(reused.executable, "/sbin/old-image")
+        self.assertEqual(reused.auxv, b"old-auxv")
+        self.assertEqual(reused.page_table_root, 0x1000)
 
     def test_rejects_cpu_mismatch_and_invalid_advertised_size(self):
         for payload in (record(cpu=1), record(size_adjustment=8)):
