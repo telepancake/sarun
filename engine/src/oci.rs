@@ -45,6 +45,32 @@ use crate::paths;
 const ZSTD_LAYER_MEDIA_TYPE: &str = "application/vnd.oci.image.layer.v1.tar+zstd";
 const DOCKER_LAYER_GZIP_MEDIA_TYPE: &str = "application/vnd.docker.image.rootfs.diff.tar.gzip";
 
+/// OCI client config that always resolves to a linux platform, regardless of
+/// the host OS.  sarun always runs Linux containers — on macOS they execute
+/// inside a QEMU appliance, on Linux natively.  The default oci-client
+/// resolver uses the host OS ("darwin" on macOS), which rejects images that
+/// only publish linux entries.
+fn linux_client_config() -> ClientConfig {
+    let (host_arch, _) = host_platform();
+    let mut config = ClientConfig::default();
+    config.platform_resolver = Some(Box::new(move |manifests| {
+        manifests
+            .iter()
+            .find(|entry| {
+                entry.platform.as_ref().is_some_and(|platform| {
+                    // Serialize to string to avoid oci_spec version mismatch
+                    // between oci-client and our direct dependency.
+                    let os_str = serde_json::to_string(&platform.os).unwrap_or_default();
+                    let arch_str =
+                        serde_json::to_string(&platform.architecture).unwrap_or_default();
+                    os_str == "\"linux\"" && arch_str == format!("\"{}\"", host_arch)
+                })
+            })
+            .map(|entry| entry.digest.clone())
+    }));
+    config
+}
+
 /// CLI dispatch: `sarun oci <subverb> <args...>`.
 pub fn cli_oci(args: &[String]) -> i32 {
     let Some(sub) = args.first().map(String::as_str) else {
@@ -1008,10 +1034,6 @@ fn cli_run(args: &[String]) -> i32 {
         );
         return 2;
     };
-    // Rootless Tap needs its user+network namespace while the process is
-    // single-threaded.  Resolve that process boundary before image lookup or
-    // loading, so the one required self-exec never repeats OCI side effects or
-    // emits a phantom container announcement.
     if net_mode == crate::net::NetMode::Tap {
         if let Err(error) = crate::runner::prepare_tap_or_reexec() {
             eprintln!("sarun oci run: tap setup failed: {error}");
@@ -1039,25 +1061,89 @@ fn cli_run(args: &[String]) -> i32 {
     // Interactive when stdin is a tty (so `oci run … -- sh` gives a real shell),
     // mirroring `docker run -it`'s default for an attached terminal.
     let pty = unsafe { libc::isatty(0) == 1 };
+    match run_oci_layer(top_id, session, net_mode, pty, cmd) {
+        Ok(code) => code,
+        Err(error) => {
+            eprintln!("sarun oci run: {error:#}");
+            1
+        }
+    }
+}
+
+fn stored_image_config(top_id: i64) -> Result<String> {
+    let boxes = crate::discover::discover();
+    let mut current = Some(top_id);
+    let mut seen = std::collections::HashSet::new();
+    while let Some(id) = current {
+        if !seen.insert(id) {
+            bail!("OCI image box chain contains a cycle at box {id}");
+        }
+        let image = boxes
+            .get(&id)
+            .ok_or_else(|| anyhow!("OCI image box {id} disappeared"))?;
+        if let Some(config) = image.meta.get("oci_config") {
+            return Ok(config.clone());
+        }
+        current = image.parent;
+    }
+    bail!("box {top_id} has no OCI image config")
+}
+
+fn image_linux_architecture(top_id: i64) -> Result<crate::runner::LinuxArchitecture> {
+    let config = stored_image_config(top_id)?;
+    linux_architecture_from_config(&config)
+}
+
+fn linux_architecture_from_config(config: &str) -> Result<crate::runner::LinuxArchitecture> {
+    use crate::runner::LinuxArchitecture;
+    let value: Value = serde_json::from_str(&config).context("parse stored OCI image config")?;
+    let os = value
+        .get("os")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("OCI image config has no operating system"))?;
+    if os != "linux" {
+        bail!("OCI operating system '{os}' is not supported; Sarun guests must be Linux");
+    }
+    let architecture = value
+        .get("architecture")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("OCI image config has no architecture"))?;
+    match architecture {
+        "arm64" | "aarch64" => Ok(LinuxArchitecture::Aarch64),
+        "amd64" | "x86_64" => Ok(LinuxArchitecture::X86_64),
+        "arm" => Ok(LinuxArchitecture::Arm),
+        other => bail!("OCI architecture '{other}' is not supported by Sarun Linux execution"),
+    }
+}
+
+fn run_oci_layer(
+    top_id: i64,
+    session: String,
+    net_mode: crate::net::NetMode,
+    pty: bool,
+    command: Vec<String>,
+) -> Result<i32> {
+    let architecture = image_linux_architecture(top_id)?;
     eprintln!(
-        "sarun oci run: container '{container}' on image top box {top_id} \
-               (net={})",
+        "sarun oci run: container '{}' on image top box {top_id} \
+         (net={}, architecture={architecture:?})",
+        session
+            .rsplit_once('.')
+            .map_or(session.as_str(), |(_, name)| name),
         net_mode.as_str()
     );
-    crate::runner::run(
-        Some(session),
-        /* passthrough */ false,
-        /* direct      */ false,
-        /* env          */ false,
-        /* pty          */ pty,
-        /* brush        */ false,
-        /* api          */ false,
-        /* no_parent    */ false,
-        /* readonly_parent */ false,
-        /* chdir        */ None,
+    Ok(crate::runner::run_linux(crate::runner::LinuxRunSpec {
+        architecture,
+        name: Some(session),
+        capture_environment: false,
+        no_parent: false,
+        readonly_parent: false,
+        chdir: None,
         net_mode,
-        cmd,
-    )
+        brush: false,
+        pty,
+        command,
+    }))
 }
 
 /// Resolve a run target to the box id of its image stack's TOP layer.
@@ -1259,7 +1345,7 @@ fn probe_manifest_digest(reference: &str) -> Result<String> {
     let r =
         Reference::from_str(reference).with_context(|| format!("parse reference '{reference}'"))?;
     let auth = registry_auth_for(reference);
-    let client = Client::new(ClientConfig::default());
+    let client = Client::new(linux_client_config());
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -1576,7 +1662,7 @@ fn tar_gz_dir_b64(dir: &Path) -> Result<String> {
 }
 
 /// The engine-side `oci.build` handler: unpack the shipped context, run the
-/// build in a HOST worker process (`/proc/self/exe oci __build-worker`) so its
+/// build in a HOST worker process (a self-exec as `oci __build-worker`) so its
 /// layer boxes are created host-side, and return the worker's combined output,
 /// exit code, and top box id. Runs on the connection's own handler thread, so a
 /// long build doesn't block the engine's main loop.
@@ -1602,7 +1688,8 @@ pub(crate) fn build_in_engine(
     let df_path = ctx.join(".sarun-Dockerfile");
     std::fs::write(&df_path, spec.dockerfile.as_slice()).context("write shipped Dockerfile")?;
 
-    let mut cmd = Command::new("/proc/self/exe");
+    let executable = std::env::current_exe().context("locate OCI build worker executable")?;
+    let mut cmd = Command::new(executable);
     cmd.arg("oci")
         .arg("__build-worker")
         .arg("--context")
@@ -1756,6 +1843,8 @@ struct Builder {
     context: PathBuf,
     net_mode: crate::net::NetMode,
     vars: HashMap<String, String>,
+    architecture: String,
+    os: String,
     // image config in progress
     env: Vec<(String, String)>,
     workdir: String,
@@ -1806,10 +1895,13 @@ impl Builder {
         for (k, v) in build_args {
             vars.insert(k, v);
         }
+        let (architecture, os) = host_platform();
         Builder {
             context,
             net_mode,
             vars,
+            architecture,
+            os,
             env: Vec::new(),
             workdir: "/".to_string(),
             user: None,
@@ -2111,20 +2203,7 @@ impl Builder {
         let session = format!("{parent}.{step_name}");
         let cmd = self.cmdline_vec(c);
         eprintln!("sarun oci build: RUN ({}) {:?}", step_name, cmd);
-        let code = crate::runner::run(
-            Some(session),
-            /* passthrough */ false,
-            /* direct */ false,
-            /* env */ false,
-            /* pty */ false,
-            /* brush */ false,
-            /* api */ false,
-            /* no_parent */ false,
-            /* readonly_parent */ false,
-            /* chdir */ None,
-            self.net_mode,
-            cmd,
-        );
+        let code = run_oci_layer(parent, session, self.net_mode, false, cmd)?;
         if code != 0 {
             bail!("RUN step '{step_name}' exited with status {code}");
         }
@@ -2389,6 +2468,9 @@ impl Builder {
     }
 
     fn reset_config(&mut self) {
+        let (architecture, os) = host_platform();
+        self.architecture = architecture;
+        self.os = os;
         self.env.clear();
         self.workdir = "/".to_string();
         self.user = None;
@@ -2413,6 +2495,12 @@ impl Builder {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(j) else {
             return;
         };
+        if let Some(architecture) = v.get("architecture").and_then(|value| value.as_str()) {
+            self.architecture = architecture.to_string();
+        }
+        if let Some(os) = v.get("os").and_then(|value| value.as_str()) {
+            self.os = os.to_string();
+        }
         // Seed the base image's history as our prefix so the built image's
         // `history` is base steps + this build's steps.
         if let Some(h) = v.get("history").and_then(|x| x.as_array()) {
@@ -2537,6 +2625,11 @@ impl Builder {
             cfg.insert("Healthcheck".into(), raw.clone());
         }
         let mut top = serde_json::Map::new();
+        top.insert(
+            "architecture".into(),
+            serde_json::Value::String(self.architecture.clone()),
+        );
+        top.insert("os".into(), serde_json::Value::String(self.os.clone()));
         top.insert("config".into(), serde_json::Value::Object(cfg));
         if !self.history.is_empty() {
             top.insert("history".into(), serde_json::json!(self.history));
@@ -3219,7 +3312,7 @@ async fn fetch_registry(reference: &str) -> Result<PulledImage> {
 async fn pull_one(reference: &str) -> Result<PulledImage> {
     let r =
         Reference::from_str(reference).with_context(|| format!("parse reference '{reference}'"))?;
-    let client = Client::new(ClientConfig::default());
+    let client = Client::new(linux_client_config());
     // Accepted media types: docker + oci variants in gzip / uncompressed /
     // zstd. Passing them all so a server that has multiple variants doesn't
     // serve us a zstd we wouldn't decode.
@@ -3281,7 +3374,7 @@ async fn fetch_registry_sigs(
     let Ok(sig_ref) = Reference::from_str(&sig_ref_str) else {
         return vec![];
     };
-    let client = Client::new(ClientConfig::default());
+    let client = Client::new(linux_client_config());
     let accepted = vec!["application/vnd.dev.cosign.simplesigning.v1+json"];
     let Ok(img) = client.pull(&sig_ref, auth, accepted).await else {
         return vec![];
@@ -4009,7 +4102,8 @@ fn sniff(blob: &[u8]) -> Option<Comp> {
 
 #[cfg(test)]
 mod tests {
-    use super::paths_lcp;
+    use super::{linux_architecture_from_config, paths_lcp};
+    use crate::runner::LinuxArchitecture;
 
     fn v(xs: &[&str]) -> Vec<String> {
         xs.iter().map(|s| s.to_string()).collect()
@@ -4045,5 +4139,16 @@ mod tests {
     #[test]
     fn lcp_empty_input() {
         assert_eq!(paths_lcp(&[]), "");
+    }
+
+    #[test]
+    fn linux_architecture_requires_a_linux_image() {
+        assert_eq!(
+            linux_architecture_from_config(r#"{"os":"linux","architecture":"arm64"}"#).unwrap(),
+            LinuxArchitecture::Aarch64
+        );
+        let error = linux_architecture_from_config(r#"{"os":"darwin","architecture":"arm64"}"#)
+            .unwrap_err();
+        assert!(error.to_string().contains("guests must be Linux"));
     }
 }

@@ -1551,6 +1551,252 @@ pub enum SelectedBootInput {
     },
 }
 
+/// The architecture of the Linux userspace being executed. This is a property
+/// of the workload (for example an OCI image's `architecture` field), not a
+/// request for a particular host backend.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LinuxArchitecture {
+    Aarch64,
+    X86_64,
+    Arm,
+    Mmips,
+}
+
+impl LinuxArchitecture {
+    fn qemu(self) -> crate::generated_wire::QemuArchitecture {
+        match self {
+            Self::Aarch64 => crate::generated_wire::QemuArchitecture::Aarch64,
+            Self::X86_64 => crate::generated_wire::QemuArchitecture::X8664,
+            Self::Arm => crate::generated_wire::QemuArchitecture::Arm,
+            Self::Mmips => crate::generated_wire::QemuArchitecture::Mmips,
+        }
+    }
+
+    fn rust_name(self) -> &'static str {
+        match self {
+            Self::Aarch64 => "aarch64",
+            Self::X86_64 => "x86_64",
+            Self::Arm => "arm",
+            Self::Mmips => "mips",
+        }
+    }
+}
+
+/// One ordinary Linux workload. Callers describe what is to be run; this
+/// module decides whether the host can run it directly or needs an appliance.
+pub struct LinuxRunSpec {
+    pub architecture: LinuxArchitecture,
+    pub name: Option<String>,
+    pub capture_environment: bool,
+    pub no_parent: bool,
+    pub readonly_parent: bool,
+    pub chdir: Option<String>,
+    pub net_mode: crate::net::NetMode,
+    pub brush: bool,
+    pub pty: bool,
+    pub command: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LinuxExecutionBackend {
+    Native,
+    Appliance,
+}
+
+fn select_linux_execution_backend(
+    host_os: &str,
+    host_architecture: &str,
+    target: LinuxArchitecture,
+) -> LinuxExecutionBackend {
+    if host_os == "linux" && host_architecture == target.rust_name() {
+        LinuxExecutionBackend::Native
+    } else {
+        LinuxExecutionBackend::Appliance
+    }
+}
+
+/// Run Linux code through the best host implementation. Linux keeps its
+/// established native path for matching-architecture workloads; macOS and
+/// foreign architectures use the QEMU appliance.
+pub fn run_linux(spec: LinuxRunSpec) -> i32 {
+    match select_linux_execution_backend(
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        spec.architecture,
+    ) {
+        LinuxExecutionBackend::Native => run(
+            spec.name,
+            /* passthrough */ false,
+            /* direct */ false,
+            spec.capture_environment,
+            spec.pty,
+            spec.brush,
+            /* api */ false,
+            spec.no_parent,
+            spec.readonly_parent,
+            spec.chdir,
+            spec.net_mode,
+            spec.command,
+        ),
+        LinuxExecutionBackend::Appliance => run_qemu(
+            spec.architecture.qemu(),
+            spec.name,
+            spec.capture_environment,
+            spec.no_parent,
+            spec.readonly_parent,
+            spec.chdir,
+            spec.net_mode,
+            spec.brush,
+            spec.pty,
+            crate::generated_wire::DebugMode::Off,
+            None,
+            spec.command,
+        ),
+    }
+}
+
+fn qemu_runtime(
+    override_command: &[String],
+    override_cwd: Option<String>,
+    oci: Option<&crate::generated_wire::OciRuntime>,
+) -> Result<
+    (
+        Vec<String>,
+        Option<String>,
+        Vec<(Vec<u8>, Vec<u8>)>,
+        Option<Vec<u8>>,
+    ),
+    String,
+> {
+    let decode = |value: &crate::generated_wire::OsString, field: &str| {
+        String::from_utf8(value.as_slice().to_vec())
+            .map_err(|_| format!("OCI {field} is not valid UTF-8"))
+    };
+    let mut command = override_command.to_vec();
+    if command.is_empty() {
+        if let Some(values) = oci.and_then(|runtime| runtime.entrypoint.as_ref()) {
+            for value in values.as_slice() {
+                command.push(decode(value, "Entrypoint")?);
+            }
+        }
+        if let Some(values) = oci.and_then(|runtime| runtime.command.as_ref()) {
+            for value in values.as_slice() {
+                command.push(decode(value, "Cmd")?);
+            }
+        }
+    }
+    if command.is_empty() {
+        return Err(
+            "no command given and the selected image has neither Entrypoint nor Cmd".into(),
+        );
+    }
+
+    let cwd = match override_cwd {
+        Some(value) => Some(value),
+        None => oci
+            .and_then(|runtime| runtime.cwd.as_ref())
+            .map(|value| decode(value, "WorkingDir"))
+            .transpose()?
+            .filter(|value| !value.is_empty()),
+    };
+    let mut environment = Vec::new();
+    if let Some(values) = oci.and_then(|runtime| runtime.environment.as_ref()) {
+        for entry in values.as_slice() {
+            let bytes = entry.as_slice();
+            let Some(split) = bytes.iter().position(|byte| *byte == b'=') else {
+                continue;
+            };
+            if split == 0 {
+                continue;
+            }
+            environment.push((bytes[..split].to_vec(), bytes[split + 1..].to_vec()));
+        }
+    }
+    let user = oci
+        .and_then(|runtime| runtime.user.as_ref())
+        .map(|value| value.as_slice().to_vec());
+    Ok((command, cwd, environment, user))
+}
+
+#[cfg(test)]
+mod linux_execution_tests {
+    use super::{
+        LinuxArchitecture, LinuxExecutionBackend, qemu_runtime, select_linux_execution_backend,
+    };
+    use crate::generated_wire::OciRuntime;
+
+    fn strings<const MAX: usize>(
+        values: &[&str],
+    ) -> Option<crate::wire::BoundedVec<crate::generated_wire::OsString, 0, MAX>> {
+        Some(
+            crate::wire::BoundedVec::new(
+                values
+                    .iter()
+                    .map(|value| crate::wire::BoundedBytes::new(value.as_bytes().to_vec()).unwrap())
+                    .collect(),
+            )
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn linux_backend_policy_is_hidden_behind_workload_architecture() {
+        assert_eq!(
+            select_linux_execution_backend("linux", "aarch64", LinuxArchitecture::Aarch64),
+            LinuxExecutionBackend::Native
+        );
+        assert_eq!(
+            select_linux_execution_backend("linux", "aarch64", LinuxArchitecture::X86_64),
+            LinuxExecutionBackend::Appliance
+        );
+        assert_eq!(
+            select_linux_execution_backend("macos", "aarch64", LinuxArchitecture::Aarch64),
+            LinuxExecutionBackend::Appliance
+        );
+    }
+
+    #[test]
+    fn qemu_runtime_applies_oci_command_cwd_and_environment() {
+        let runtime = OciRuntime {
+            environment: strings(&["PATH=/image/bin", "EMPTY=", "MALFORMED"]),
+            cwd: Some(crate::wire::BoundedBytes::new(b"/workspace".to_vec()).unwrap()),
+            command: strings(&["default"]),
+            entrypoint: strings(&["/entry"]),
+            user: Some(crate::wire::BoundedBytes::new(b"1000:1001".to_vec()).unwrap()),
+        };
+        let (command, cwd, environment, user) = qemu_runtime(&[], None, Some(&runtime)).unwrap();
+        assert_eq!(command, ["/entry", "default"]);
+        assert_eq!(cwd.as_deref(), Some("/workspace"));
+        assert_eq!(
+            environment,
+            [
+                (b"PATH".to_vec(), b"/image/bin".to_vec()),
+                (b"EMPTY".to_vec(), Vec::new()),
+            ]
+        );
+        assert_eq!(user.as_deref(), Some(b"1000:1001".as_slice()));
+    }
+
+    #[test]
+    fn explicit_command_and_cwd_override_oci_defaults() {
+        let runtime = OciRuntime {
+            environment: None,
+            cwd: Some(crate::wire::BoundedBytes::new(b"/image".to_vec()).unwrap()),
+            command: strings(&["default"]),
+            entrypoint: strings(&["/entry"]),
+            user: None,
+        };
+        let (command, cwd, _, _) = qemu_runtime(
+            &["/override".into()],
+            Some("/caller".into()),
+            Some(&runtime),
+        )
+        .unwrap();
+        assert_eq!(command, ["/override"]);
+        assert_eq!(cwd.as_deref(), Some("/caller"));
+    }
+}
+
 pub fn run_qemu(
     architecture: crate::generated_wire::QemuArchitecture,
     name: Option<String>,
@@ -1560,6 +1806,7 @@ pub fn run_qemu(
     chdir: Option<String>,
     net_mode: crate::net::NetMode,
     brush: bool,
+    pty: bool,
     debug_mode: crate::generated_wire::DebugMode,
     selected_boot: Option<SelectedBootInput>,
     cmd: Vec<String>,
@@ -1570,14 +1817,14 @@ pub fn run_qemu(
     };
     use std::os::unix::ffi::OsStrExt;
 
-    if cmd.is_empty() {
-        eprintln!("sarun-engine run --qemu: needs a command");
-        return 2;
-    }
     if let Some(broker) = std::env::var("SARUN_APPLIANCE_BROKER")
         .ok()
         .filter(|value| !value.is_empty())
     {
+        if cmd.is_empty() {
+            eprintln!("sarun-engine run --qemu: a nested appliance needs an explicit command");
+            return 2;
+        }
         if selected_boot.is_some() {
             eprintln!(
                 "sarun-engine run --qemu: selected boot artifacts must be launched by the host engine"
@@ -1597,6 +1844,7 @@ pub fn run_qemu(
             chdir,
             net_mode,
             brush,
+            pty,
             cmd,
         ) {
             Ok(request) => request,
@@ -1629,18 +1877,32 @@ pub fn run_qemu(
             return 3;
         }
     };
-    let guest_cmd = if brush {
+    let requested_guest_cmd = if brush && !cmd.is_empty() {
         brush_cmd("/init", &cmd)
     } else {
         cmd.clone()
     };
-    let appliance_command = match crate::appliance::wire_command(
-        &guest_cmd,
-        chdir.as_deref(),
-        net_mode,
-        brush,
-        debug_mode,
-    ) {
+    let requested_command = match requested_guest_cmd
+        .iter()
+        .map(|value| {
+            crate::wire::BoundedBytes::new(value.as_bytes().to_vec())
+                .map_err(|error| format!("command argument exceeds relation bound: {error:?}"))
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .and_then(|values| {
+            crate::wire::BoundedVec::new(values)
+                .map_err(|error| format!("command size violates relation bound: {error:?}"))
+        }) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("sarun-engine run --qemu: {error}");
+            return 2;
+        }
+    };
+    let registration_environment = match crate::appliance::wire_environment().and_then(|values| {
+        crate::wire::BoundedMap::new(values)
+            .map_err(|error| format!("environment size violates relation bound: {error:?}"))
+    }) {
         Ok(value) => value,
         Err(error) => {
             eprintln!("sarun-engine run --qemu: {error}");
@@ -1659,9 +1921,8 @@ pub fn run_qemu(
             ppid: unsafe { libc::getppid() },
             executable,
             cwd,
-            argv: crate::wire::BoundedVec::new(appliance_command.command.as_slice().to_vec())
-                .expect("a validated appliance command fits the looser provenance bound"),
-            environment: env.then(|| appliance_command.environment.clone()),
+            argv: requested_command.clone(),
+            environment: env.then(|| registration_environment.clone()),
         },
         (Err(error), _) | (_, Err(error)) => {
             eprintln!("sarun-engine run --qemu: {error}");
@@ -1737,8 +1998,7 @@ pub fn run_qemu(
         None => None,
     };
     let request = RequestEnvelope::Transport(TransportRequest::Register {
-        command: crate::wire::BoundedVec::new(appliance_command.command.as_slice().to_vec())
-            .expect("a validated appliance command fits the looser register bound"),
+        command: requested_command,
         provenance,
         name,
         backend: RunBackend::Qemu,
@@ -1795,6 +2055,37 @@ pub fn run_qemu(
         Err(error) => {
             eprintln!("sarun-engine run --qemu: register read: {error}");
             return 1;
+        }
+    };
+    let (effective_command, effective_cwd, oci_environment, oci_user) =
+        match qemu_runtime(&cmd, chdir, registration.oci.as_ref()) {
+            Ok(value) => value,
+            Err(error) => {
+                eprintln!("sarun-engine run --qemu: {error}");
+                finish_qemu_box_channel(&conn);
+                return 2;
+            }
+        };
+    let guest_cmd = if brush {
+        brush_cmd("/init", &effective_command)
+    } else {
+        effective_command
+    };
+    let appliance_command = match crate::appliance::wire_command_with_environment(
+        &guest_cmd,
+        effective_cwd.as_deref(),
+        net_mode,
+        brush,
+        pty,
+        debug_mode,
+        &oci_environment,
+        oci_user.as_deref(),
+    ) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("sarun-engine run --qemu: {error}");
+            finish_qemu_box_channel(&conn);
+            return 2;
         }
     };
     let debug_image_start = registration.debug_image.clone();

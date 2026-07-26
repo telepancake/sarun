@@ -1001,8 +1001,8 @@ fn main() {
                     );
                     std::process::exit(2);
                 }
-                if passthrough || direct || pty || api {
-                    eprintln!("sarun: --qemu is currently incompatible with -t/-d/-p/--api");
+                if passthrough || direct || api {
+                    eprintln!("sarun: --qemu is currently incompatible with -t/-d/--api");
                     std::process::exit(2);
                 }
                 std::process::exit(runner::run_qemu(
@@ -1014,6 +1014,7 @@ fn main() {
                     chdir,
                     net_mode,
                     brush,
+                    pty,
                     debug_mode,
                     selected_boot,
                     cmd,

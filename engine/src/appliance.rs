@@ -25,6 +25,9 @@ use crate::generated_wire::{
 const ROOT_TAG: &str = "sarun-root";
 const CONTROL_PORT: &str = "sarun-control";
 pub const NESTED_BROKER: &str = "sarun-appliance-run";
+const APPLIANCE_UID: &[u8] = b"SARUN_APPLIANCE_UID";
+const APPLIANCE_GID: &[u8] = b"SARUN_APPLIANCE_GID";
+const APPLIANCE_PTY: &[u8] = b"SARUN_APPLIANCE_PTY";
 
 const MAX_APPLIANCE_CPUS: usize = 16;
 
@@ -1078,6 +1081,14 @@ fn nested_host_args(request: &ApplianceRunRequest) -> Vec<OsString> {
     if request.brush {
         arguments.push(OsString::from("-b"));
     }
+    if request
+        .environment
+        .as_map()
+        .keys()
+        .any(|key| key.as_slice() == APPLIANCE_PTY)
+    {
+        arguments.push(OsString::from("-p"));
+    }
     if let Some(name) = &request.name {
         arguments.push(OsString::from(name.as_str()));
     }
@@ -1149,6 +1160,9 @@ fn spawn_nested_appliance(
     let mut child_command = Command::new(executable);
     child_command.args(arguments).env_clear();
     for (key, value) in request.environment.as_map() {
+        if key.as_slice() == APPLIANCE_PTY {
+            continue;
+        }
         child_command.env(
             OsStr::from_bytes(key.as_slice()),
             OsStr::from_bytes(value.as_slice()),
@@ -1233,6 +1247,19 @@ pub fn wire_command(
     brush: bool,
     debug_mode: DebugMode,
 ) -> Result<ApplianceCommand, String> {
+    wire_command_with_environment(command, cwd, net_mode, brush, false, debug_mode, &[], None)
+}
+
+pub fn wire_command_with_environment(
+    command: &[String],
+    cwd: Option<&str>,
+    net_mode: crate::net::NetMode,
+    brush: bool,
+    pty: bool,
+    debug_mode: DebugMode,
+    environment_overrides: &[(Vec<u8>, Vec<u8>)],
+    user: Option<&[u8]>,
+) -> Result<ApplianceCommand, String> {
     let command = command
         .iter()
         .map(|value| {
@@ -1249,6 +1276,62 @@ pub fn wire_command(
         })
         .transpose()?;
     let mut environment = wire_environment()?;
+    for (key, value) in environment_overrides {
+        if matches!(
+            key.as_slice(),
+            b"SARUN_APPLIANCE_UID" | b"SARUN_APPLIANCE_GID" | b"SARUN_APPLIANCE_PTY"
+        ) {
+            continue;
+        }
+        let key = crate::wire::BoundedBytes::new(key.clone())
+            .map_err(|error| format!("environment name exceeds relation bound: {error:?}"))?;
+        let value = crate::wire::BoundedBytes::new(value.clone())
+            .map_err(|error| format!("environment value exceeds relation bound: {error:?}"))?;
+        environment.insert(key, value);
+    }
+    if pty {
+        let mut size: libc::winsize = unsafe { std::mem::zeroed() };
+        if unsafe { libc::ioctl(libc::STDIN_FILENO, libc::TIOCGWINSZ, &mut size) } != 0
+            || size.ws_row == 0
+            || size.ws_col == 0
+        {
+            size.ws_row = 24;
+            size.ws_col = 80;
+        }
+        for (name, value) in [
+            (b"LINES".as_slice(), size.ws_row.to_string()),
+            (b"COLUMNS".as_slice(), size.ws_col.to_string()),
+        ] {
+            environment.insert(
+                crate::wire::BoundedBytes::new(name.to_vec())
+                    .expect("fixed terminal environment name is bounded"),
+                crate::wire::BoundedBytes::new(value.into_bytes())
+                    .expect("u16 terminal dimension is bounded"),
+            );
+        }
+    }
+    if let Some(user) = user.and_then(|value| std::str::from_utf8(value).ok()) {
+        let (uid, gid) = user
+            .split_once(':')
+            .map(|(uid, gid)| (uid, Some(gid)))
+            .unwrap_or((user, None));
+        if let Ok(uid) = uid.parse::<u32>() {
+            environment.insert(
+                crate::wire::BoundedBytes::new(APPLIANCE_UID.to_vec())
+                    .expect("fixed appliance UID name is bounded"),
+                crate::wire::BoundedBytes::new(uid.to_string().into_bytes())
+                    .expect("u32 UID is bounded"),
+            );
+            if let Some(gid) = gid.and_then(|value| value.parse::<u32>().ok()) {
+                environment.insert(
+                    crate::wire::BoundedBytes::new(APPLIANCE_GID.to_vec())
+                        .expect("fixed appliance GID name is bounded"),
+                    crate::wire::BoundedBytes::new(gid.to_string().into_bytes())
+                        .expect("u32 GID is bounded"),
+                );
+            }
+        }
+    }
     if brush {
         environment.insert(
             crate::wire::BoundedBytes::new(b"SARUN_EXE".to_vec())
@@ -1288,16 +1371,22 @@ pub fn wire_command(
             crate::net::NetMode::Host => NetMode::Host,
             crate::net::NetMode::Tap => NetMode::Tap,
         },
+        pty,
         debug_mode,
     })
 }
 
-fn wire_environment() -> Result<BTreeMap<ShortOsString, WireOsString>, String> {
+pub(crate) fn wire_environment() -> Result<BTreeMap<ShortOsString, WireOsString>, String> {
     std::env::vars_os()
         .filter(|(key, _)| {
             !matches!(
                 key.as_bytes(),
-                b"SARUN_ENGINE_FD" | b"SARUN_ENGINE_PARENT" | b"SARUN_APPLIANCE_ROOT"
+                b"SARUN_ENGINE_FD"
+                    | b"SARUN_ENGINE_PARENT"
+                    | b"SARUN_APPLIANCE_ROOT"
+                    | b"SARUN_APPLIANCE_UID"
+                    | b"SARUN_APPLIANCE_GID"
+                    | b"SARUN_APPLIANCE_PTY"
             )
         })
         .map(|(key, value)| {
@@ -1319,6 +1408,7 @@ pub fn wire_nested_request(
     cwd: Option<String>,
     net_mode: crate::net::NetMode,
     brush: bool,
+    pty: bool,
     command: Vec<String>,
 ) -> Result<ApplianceRunRequest, String> {
     let command = command
@@ -1338,7 +1428,16 @@ pub fn wire_nested_request(
         .map(|value| crate::wire::BoundedBytes::new(value.into_bytes()))
         .transpose()
         .map_err(|error| format!("cwd exceeds relation bound: {error:?}"))?;
-    let environment = crate::wire::BoundedMap::new(wire_environment()?)
+    let mut environment = wire_environment()?;
+    if pty {
+        environment.insert(
+            crate::wire::BoundedBytes::new(APPLIANCE_PTY.to_vec())
+                .expect("fixed appliance PTY name is bounded"),
+            crate::wire::BoundedBytes::new(b"1".to_vec())
+                .expect("fixed appliance PTY value is bounded"),
+        );
+    }
+    let environment = crate::wire::BoundedMap::new(environment)
         .map_err(|error| format!("environment size violates relation bound: {error:?}"))?;
     Ok(ApplianceRunRequest {
         architecture,
@@ -1624,6 +1723,23 @@ fn observe_guest_processes(
     }
 }
 
+fn copy_pty_output<R: Read, W: Write>(reader: &mut R, writer: &mut W) -> io::Result<()> {
+    let mut buffer = [0u8; 8192];
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => return writer.flush(),
+            Ok(count) => writer.write_all(&buffer[..count])?,
+            Err(error) if error.raw_os_error() == Some(libc::EIO) => {
+                // Linux PTY masters report EIO, rather than EOF, after the
+                // final slave closes. This is normal command completion.
+                return writer.flush();
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 fn execute_guest(
     command: &ApplianceCommand,
     control: &Arc<Mutex<std::fs::File>>,
@@ -1636,11 +1752,29 @@ fn execute_guest(
         .collect();
     let mut process = Command::new(&words[0]);
     process.args(&words[1..]).env_clear();
+    let control_identity = |name: &[u8]| {
+        command
+            .environment
+            .as_map()
+            .iter()
+            .find(|(key, _)| key.as_slice() == name)
+            .and_then(|(_, value)| std::str::from_utf8(value.as_slice()).ok())
+            .and_then(|value| value.parse::<u32>().ok())
+    };
     for (key, value) in command.environment.as_map() {
+        if key.as_slice() == APPLIANCE_UID || key.as_slice() == APPLIANCE_GID {
+            continue;
+        }
         process.env(
             OsStr::from_bytes(key.as_slice()),
             OsStr::from_bytes(value.as_slice()),
         );
+    }
+    if let Some(uid) = control_identity(APPLIANCE_UID) {
+        process.uid(uid);
+    }
+    if let Some(gid) = control_identity(APPLIANCE_GID) {
+        process.gid(gid);
     }
     // Every appliance command can launch another flat QEMU box. The broker is
     // local to this guest and carries only typed run/I/O operations to PID 1;
@@ -1650,34 +1784,101 @@ fn execute_guest(
     if let Some(cwd) = &command.cwd {
         process.current_dir(OsStr::from_bytes(cwd.as_slice()));
     }
-    // Route ordinary command output through SarunFs itself. Virtio-fs carries
-    // the calling guest TID on every sink write, so the engine records the
-    // actual writer and returns the same bytes as live ECHO frames. PID 1's
-    // control stream remains separate and cannot be confused with user output.
-    let stdout = std::fs::OpenOptions::new()
-        .write(true)
-        .open("/.slopbox-stdout")
-        .map_err(|error| {
-            io::Error::new(
-                error.kind(),
-                format!("open guest stdout capture sink: {error}"),
+    let mut terminal_output = None;
+    if command.pty {
+        // Continue the UI's terminal semantics inside the guest with a fresh
+        // Linux PTY.  The console carries input into its master; output is
+        // written to the ordinary SarunFs sink so it remains live *and*
+        // recorded.  The workload sees only a normal controlling terminal.
+        let dimension = |name: &[u8], default| {
+            command
+                .environment
+                .as_map()
+                .iter()
+                .find(|(key, _)| key.as_slice() == name)
+                .and_then(|(_, value)| std::str::from_utf8(value.as_slice()).ok())
+                .and_then(|value| value.parse::<u16>().ok())
+                .filter(|value| *value != 0)
+                .unwrap_or(default)
+        };
+        let mut size = libc::winsize {
+            ws_row: dimension(b"LINES", 24),
+            ws_col: dimension(b"COLUMNS", 80),
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        let mut master = -1;
+        let mut slave = -1;
+        if unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut size,
             )
-        })?;
-    let stderr = std::fs::OpenOptions::new()
-        .write(true)
-        .open("/.slopbox-stderr")
-        .map_err(|error| {
-            io::Error::new(
-                error.kind(),
-                format!("open guest stderr capture sink: {error}"),
-            )
-        })?;
-    process
-        .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(stderr));
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let master = unsafe { std::fs::File::from_raw_fd(master) };
+        let slave = unsafe { std::fs::File::from_raw_fd(slave) };
+        process
+            .stdin(Stdio::from(slave.try_clone()?))
+            .stdout(Stdio::from(slave.try_clone()?))
+            .stderr(Stdio::from(slave));
+
+        let mut input = master.try_clone()?;
+        std::thread::spawn(move || {
+            let _ = io::copy(&mut io::stdin().lock(), &mut input);
+        });
+        terminal_output = Some(std::thread::spawn(move || -> io::Result<()> {
+            let mut output = std::fs::OpenOptions::new()
+                .write(true)
+                .open("/.slopbox-stdout")?;
+            let mut master = master;
+            copy_pty_output(&mut master, &mut output)
+        }));
+    } else {
+        // Route ordinary command output through SarunFs itself. Virtio-fs
+        // carries the calling guest TID on every sink write, so the engine
+        // records the actual writer and returns the same bytes as live ECHO
+        // frames. PID 1's control stream remains separate and cannot be
+        // confused with user output.
+        let stdout = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/.slopbox-stdout")
+            .map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("open guest stdout capture sink: {error}"),
+                )
+            })?;
+        let stderr = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/.slopbox-stderr")
+            .map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("open guest stderr capture sink: {error}"),
+                )
+            })?;
+        process
+            .stdout(Stdio::from(stdout))
+            .stderr(Stdio::from(stderr));
+    }
+    let pty = command.pty;
     unsafe {
-        process.pre_exec(|| {
-            if libc::setpgid(0, 0) == 0 {
+        process.pre_exec(move || {
+            if pty {
+                if libc::setsid() < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY as _, 0) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            } else if libc::setpgid(0, 0) == 0 {
                 Ok(())
             } else {
                 Err(io::Error::last_os_error())
@@ -1685,6 +1886,10 @@ fn execute_guest(
         });
     }
     let child = process.spawn()?;
+    // Command retains its configured Stdio handles so it can be spawned
+    // repeatedly.  Drop it now; otherwise its copy of the PTY slave keeps the
+    // master readable forever after the one workload child exits.
+    drop(process);
     let root = child.id() as i32;
     GUEST_CHILD.store(root, std::sync::atomic::Ordering::SeqCst);
     let process_epoch = std::time::SystemTime::now()
@@ -1734,6 +1939,11 @@ fn execute_guest(
     GUEST_CHILD.store(0, std::sync::atomic::Ordering::SeqCst);
     process_observer_stop.store(true, std::sync::atomic::Ordering::Relaxed);
     let _ = observer.join();
+    if let Some(output) = terminal_output {
+        output
+            .join()
+            .map_err(|_| io::Error::other("guest terminal output bridge panicked"))??;
+    }
     let status = root_status.unwrap();
     Ok(if libc::WIFEXITED(status) {
         libc::WEXITSTATUS(status)
@@ -1913,6 +2123,14 @@ pub fn init_main() -> i32 {
     if let Err(error) = mount_one("devtmpfs", "/dev", "devtmpfs", 0) {
         eprintln!("sarun init: mount /dev: {error}");
     }
+    if let Err(error) = std::fs::create_dir_all("/dev/pts")
+        .and_then(|()| mount_one("devpts", "/dev/pts", "devpts", 0))
+    {
+        eprintln!("sarun init: mount /dev/pts: {error}");
+    }
+    if !std::path::Path::new("/dev/ptmx").exists() {
+        let _ = std::os::unix::fs::symlink("pts/ptmx", "/dev/ptmx");
+    }
     for (source, target, kind) in [("proc", "/proc", "proc"), ("sysfs", "/sys", "sysfs")] {
         if let Err(error) = mount_one(source, target, kind, 0) {
             eprintln!("sarun init: mount {target}: {error}");
@@ -1971,6 +2189,31 @@ pub fn init_main() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pty_output_treats_linux_eio_after_data_as_eof() {
+        struct PtyReader {
+            data: Option<&'static [u8]>,
+        }
+
+        impl Read for PtyReader {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                if let Some(data) = self.data.take() {
+                    buffer[..data.len()].copy_from_slice(data);
+                    Ok(data.len())
+                } else {
+                    Err(io::Error::from_raw_os_error(libc::EIO))
+                }
+            }
+        }
+
+        let mut reader = PtyReader {
+            data: Some(b"terminal output"),
+        };
+        let mut output = Vec::new();
+        copy_pty_output(&mut reader, &mut output).unwrap();
+        assert_eq!(output, b"terminal output");
+    }
 
     #[test]
     fn guest_exec_failure_is_a_framed_result_not_a_missing_reply() {
@@ -2304,6 +2547,7 @@ mod tests {
             cwd: None,
             environment: crate::wire::BoundedMap::new(BTreeMap::new()).unwrap(),
             net_mode: NetMode::Off,
+            pty: false,
             debug_mode: DebugMode::Off,
         };
         let mut bytes = Vec::new();
@@ -2365,6 +2609,76 @@ mod tests {
                 Some(b"/etc/ssl/certs/ca-certificates.crt".as_slice())
             );
         }
+    }
+
+    #[test]
+    fn appliance_command_carries_numeric_oci_identity_as_private_control_data() {
+        let command = wire_command_with_environment(
+            &["/probe".into()],
+            None,
+            crate::net::NetMode::Off,
+            false,
+            false,
+            DebugMode::Off,
+            &[],
+            Some(b"1000:1001"),
+        )
+        .unwrap();
+        let value = |name: &[u8]| {
+            command
+                .environment
+                .as_map()
+                .iter()
+                .find(|(key, _)| key.as_slice() == name)
+                .map(|(_, value)| value.as_slice())
+        };
+        assert_eq!(value(APPLIANCE_UID), Some(b"1000".as_slice()));
+        assert_eq!(value(APPLIANCE_GID), Some(b"1001".as_slice()));
+
+        let untrusted = wire_command_with_environment(
+            &["/probe".into()],
+            None,
+            crate::net::NetMode::Off,
+            false,
+            false,
+            DebugMode::Off,
+            &[(APPLIANCE_UID.to_vec(), b"7".to_vec())],
+            None,
+        )
+        .unwrap();
+        assert!(
+            !untrusted
+                .environment
+                .as_map()
+                .keys()
+                .any(|key| key.as_slice() == APPLIANCE_UID)
+        );
+    }
+
+    #[test]
+    fn nested_appliance_preserves_pty_via_private_control_environment() {
+        let request = wire_nested_request(
+            QemuArchitecture::Aarch64,
+            None,
+            false,
+            false,
+            false,
+            None,
+            crate::net::NetMode::Off,
+            false,
+            true,
+            vec!["/probe".into()],
+        )
+        .unwrap();
+        let arguments = nested_host_args(&request);
+        assert!(arguments.iter().any(|argument| argument == "-p"));
+        assert!(
+            request
+                .environment
+                .as_map()
+                .keys()
+                .any(|key| key.as_slice() == APPLIANCE_PTY)
+        );
     }
 
     #[test]

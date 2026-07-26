@@ -1235,9 +1235,6 @@ impl SarunFs {
         for alias in self.projection_aliases(rel) {
             self.inner.synthetic.project(id, &alias, source.clone());
         }
-        if rel == "etc/resolv.conf" {
-            eprintln!("sarun-engine: projection registered box={id} rel={rel}");
-        }
         Ok(())
     }
 
@@ -1294,17 +1291,7 @@ impl SarunFs {
     }
 
     fn projected_file(&self, id: i64, rel: &str) -> Option<PathBuf> {
-        let projected = self.inner.synthetic.projected(id, rel);
-        if rel.ends_with("etc/resolv.conf") {
-            eprintln!(
-                "sarun-engine: projection probe root={} box={id} rel={rel} source={}",
-                self.root.0,
-                projected
-                    .as_deref()
-                    .map_or_else(|| "<none>".into(), |path| path.display().to_string())
-            );
-        }
-        projected
+        self.inner.synthetic.projected(id, rel)
     }
 
     pub fn box_ids(&self) -> Vec<i64> {

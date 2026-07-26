@@ -111,26 +111,27 @@ check-wire-codegen: swipl ## Fail if the checked-in Rust transport projection is
 
 .PHONY: test-action-grammar
 test-action-grammar: swipl ## Run the core-only action grammar tests with pinned host SWI-Prolog
-	@shopt -s nullglob; \
-	  bins=( "$${XDG_CACHE_HOME:-$$HOME/.cache}"/sarun/swipl/9.2.9/pipeline-*/$$(uname -m)/native-swipl-build/src/swipl ); \
-	  (( $${#bins[@]} )) || { echo "pinned host swipl not found after make swipl"; exit 1; }; \
-	  "$${bins[-1]}" -q -f none -s engine/pl/test_relation_api.pl \
+	@swipl=$$(find "$${SARUN_SWIPL_CACHE:-$${XDG_CACHE_HOME:-$$HOME/.cache}/sarun/swipl/9.2.9}" \
+	    .tools/host-macos-$$(uname -m | sed 's/^arm64$$/aarch64/')/swipl-cache \
+	    -path '*/native-swipl-build/src/swipl' -type f 2>/dev/null | sort | tail -1); \
+	  [ -n "$$swipl" ] || { echo "pinned host swipl not found after make swipl"; exit 1; }; \
+	  $$swipl -q -f none -s engine/pl/test_relation_api.pl \
 	    -g test_relation_api:run_relation_api_tests -t halt; \
-	  "$${bins[-1]}" -q -f none -s engine/pl/test_grammar_ir.pl \
+	  $$swipl -q -f none -s engine/pl/test_grammar_ir.pl \
 	    -g test_grammar_ir:run_grammar_ir_tests -t halt; \
-	  "$${bins[-1]}" -q -f none -s engine/pl/test_grammar_engine.pl \
+	  $$swipl -q -f none -s engine/pl/test_grammar_engine.pl \
 	    -g test_grammar_engine:run_grammar_engine_tests -t halt; \
-	  "$${bins[-1]}" -q -f none -s engine/pl/test_brush_grammar.pl \
+	  $$swipl -q -f none -s engine/pl/test_brush_grammar.pl \
 	    -g test_brush_grammar:run_brush_grammar_tests -t halt; \
-	  "$${bins[-1]}" -q -f none -s engine/pl/test_action_grammar.pl \
+	  $$swipl -q -f none -s engine/pl/test_action_grammar.pl \
 	    -g test_action_grammar:run_action_grammar_tests -t halt; \
-	  "$${bins[-1]}" -q -f none -s engine/pl/test_context_relation.pl \
+	  $$swipl -q -f none -s engine/pl/test_context_relation.pl \
 	    -g test_context_relation:run_context_relation_tests -t halt; \
-	  "$${bins[-1]}" -q -f none -s engine/pl/test_local_state_relation.pl \
+	  $$swipl -q -f none -s engine/pl/test_local_state_relation.pl \
 	    -g test_local_state_relation:run_local_state_relation_tests -t halt; \
-	  "$${bins[-1]}" -q -f none -s engine/pl/test_ast_state_relation.pl \
+	  $$swipl -q -f none -s engine/pl/test_ast_state_relation.pl \
 	    -g test_ast_state_relation:run_ast_state_relation_tests -t halt; \
-	  "$${bins[-1]}" -q -f none -s engine/pl/test_transport_catalog.pl \
+	  $$swipl -q -f none -s engine/pl/test_transport_catalog.pl \
 	    -g test_transport_catalog:run_transport_catalog_tests -t halt
 
 # ---- Tests ----------------------------------------------------------------

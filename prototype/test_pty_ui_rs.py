@@ -71,40 +71,86 @@ def wait_socket(sock, timeout=30):
     return False
 
 
+def _prefix(payload: bytes, explicit=False) -> bytes:
+    length = len(payload)
+    if not explicit and length == 1 and payload[0] < 0xC0:
+        return payload
+    if length <= 55:
+        return bytes([0xC0 + length]) + payload
+    width = (length.bit_length() + 7) // 8
+    return bytes([0xF8 + width]) + length.to_bytes(width, "little") + payload
+
+
 def encode(ftype: int, payload: bytes) -> bytes:
-    """One typed frame: [total-len:4 BE][type:1][payload]."""
-    total = 1 + len(payload)
-    return struct.pack(">I", total) + bytes([ftype]) + payload
+    """One typed tv/wire compound atom: type atom followed by payload atom."""
+    fields = _prefix(bytes([ftype])) + _prefix(payload)
+    return _prefix(fields, explicit=True)
+
+
+def _atom(buf: bytes, offset: int):
+    if offset >= len(buf):
+        return None
+    tag = buf[offset]
+    if tag < 0xC0:
+        return bytes([tag]), offset + 1
+    if tag < 0xF8:
+        prefix = 1
+        length = tag - 0xC0
+    else:
+        width = tag - 0xF8
+        if len(buf) < offset + 1 + width:
+            return None
+        prefix = 1 + width
+        length = int.from_bytes(buf[offset + 1:offset + prefix], "little")
+    end = offset + prefix + length
+    if len(buf) < end:
+        return None
+    return buf[offset + prefix:end], end
 
 
 def decode_all(buf: bytes):
     """Decode every whole frame in buf; return (frames, consumed)."""
     out = []
     i = 0
-    n = len(buf)
-    while n - i >= 4:
-        tot = struct.unpack(">I", buf[i:i+4])[0]
-        if n - (i + 4) < tot:
+    while i < len(buf):
+        outer = _atom(buf, i)
+        if outer is None:
             break
-        if tot == 0:
-            i += 4
-            continue
-        ftype = buf[i+4]
-        payload = buf[i+5:i+4+tot]
-        out.append((ftype, payload))
-        i += 4 + tot
+        fields, end = outer
+        kind = _atom(fields, 0)
+        if kind is None:
+            break
+        kind_payload, position = kind
+        body = _atom(fields, position)
+        if body is None:
+            break
+        payload, position = body
+        if position != len(fields) or len(kind_payload) > 1:
+            break
+        out.append((kind_payload[0] if kind_payload else 0, payload))
+        i = end
     return out, i
 
 
 class PtyClient:
     """A `pty_spawn` connection: send the request line, read the JSON ack, then
     speak FRAME_PTY_* frames over the same socket."""
-    def __init__(self, sock_path, argv, rows=24, cols=80):
+    def __init__(self, sock_path, argv, rows=24, cols=80,
+                 environment=None, cwd=None):
+        import json
         self.s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.s.connect(sock_path)
-        req = ('{"type":"pty_spawn","argv":%s,"rows":%d,"cols":%d}\n'
-               % (_json_argv(argv), rows, cols))
-        self.s.sendall(req.encode())
+        request = {
+            "type": "pty_spawn",
+            "argv": argv,
+            "rows": rows,
+            "cols": cols,
+        }
+        if environment is not None:
+            request["env"] = environment
+        if cwd is not None:
+            request["cwd"] = cwd
+        self.s.sendall((json.dumps(request) + "\n").encode())
         # Read exactly one ack line (engine writes it before the frame stream).
         self.ack = self._read_line()
         self.buf = b""

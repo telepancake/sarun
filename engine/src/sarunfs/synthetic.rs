@@ -412,7 +412,7 @@ mod tests {
             runtime.projected(7, "init"),
             Some(PathBuf::from("/engine/init"))
         );
-        assert_eq!(runtime.projected_children(7, ""), vec!["init"]);
+        assert_eq!(runtime.projected_children(7, ""), vec!["etc", "init"]);
         assert_eq!(runtime.projected_children(7, "etc"), vec!["resolv.conf"]);
 
         let (writer, mut reader) = UnixStream::pair().unwrap();

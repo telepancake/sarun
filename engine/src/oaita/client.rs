@@ -398,8 +398,19 @@ fn default_tls_connector() -> tokio_rustls::TlsConnector {
     // would be the choice, but to avoid a new dep we just fall back to
     // /etc/ssl/certs/ca-certificates.crt (the canonical Debian/Ubuntu path
     // which sarun's CA augmentation also targets — see runner.rs).
-    let pem_path = std::env::var("SSL_CERT_FILE")
-        .unwrap_or_else(|_| "/etc/ssl/certs/ca-certificates.crt".to_string());
+    let pem_path = std::env::var("SSL_CERT_FILE").unwrap_or_else(|_| {
+        // Try the canonical Debian/Ubuntu path first (also where sarun's CA
+        // augmentation targets), then macOS's system bundle.
+        for candidate in [
+            "/etc/ssl/certs/ca-certificates.crt",
+            "/etc/ssl/cert.pem",
+        ] {
+            if std::path::Path::new(candidate).exists() {
+                return candidate.to_string();
+            }
+        }
+        "/etc/ssl/certs/ca-certificates.crt".to_string()
+    });
     if let Ok(pem) = std::fs::read(&pem_path) {
         let mut cursor = &pem[..];
         let mut count = 0usize;

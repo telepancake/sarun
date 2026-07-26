@@ -7,6 +7,7 @@ import argparse
 from dataclasses import dataclass
 import glob
 import hashlib
+import os
 from pathlib import Path
 import platform
 import re
@@ -133,13 +134,22 @@ def parse_term(source: str) -> Term:
 
 def find_swipl() -> str:
     machine = platform.machine()
-    candidates = glob.glob(
-        str(Path.home() / ".cache/sarun/swipl/9.2.9/pipeline-*" / machine
-            / "native-swipl-build/src/swipl")
-    )
-    if not candidates:
-        raise RuntimeError("pinned host SWI-Prolog is missing; run `make swipl`")
-    return sorted(candidates)[-1]
+    tool_machine = "aarch64" if machine == "arm64" else machine
+    cache = os.environ.get("SARUN_SWIPL_CACHE")
+    search_roots = [Path(cache)] if cache else []
+    cache_home = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
+    search_roots.extend([
+        cache_home / "sarun" / "swipl" / "9.2.9",
+        Path(".tools") / f"host-macos-{tool_machine}" / "swipl-cache",
+    ])
+    for root in search_roots:
+        candidates = glob.glob(
+            str(root / "pipeline-*" / machine
+                / "native-swipl-build/src/swipl")
+        )
+        if candidates:
+            return sorted(candidates)[-1]
+    raise RuntimeError("pinned host SWI-Prolog is missing; run `make swipl`")
 
 
 def relation_rows(repo: Path, swipl: str) -> list[tuple[str, list[Term]]]:

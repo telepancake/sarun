@@ -265,6 +265,7 @@ wire_type(appliance_command, record([
     field(cwd, option(path)),
     field(environment, environment),
     field(net_mode, net_mode),
+    field(pty, bool),
     field(debug_mode, debug_mode)
 ])).
 % A nested `run --qemu` does not start QEMU in the guest.  The guest sends this
