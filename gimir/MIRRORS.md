@@ -6,7 +6,7 @@ each corpus's shape wants, served through sarun. Three mirrors first:
 
 | mirror | shape | store | state |
 |---|---|---|---|
-| **wikipedia** | ~99%-identical revision chains per page | `wikimak/*` (depot chains, un-sabotaged 2026-07, 138× measured after session-end `collect`) | `wikimak` CLI: import/head/text/history + discover/fetch sync with `parts_seen` watermarks |
+| **wikipedia** | ~99%-identical revision chains per page, plus page actions | `wikimak/*` (depot chains, un-sabotaged 2026-07, 138× measured after session-end `collect`) | `wikimak` CLI: full-snapshot bootstrap, daily adds/changes maintenance, MediaWiki History page actions, local browse |
 | **IETF drafts** | revision chains per draft name (`draft-x-00..-NN`) — the tiered-VBF doc's other named workload | multi-chain `depot-vbf::VbfDepot` (canonical layers) + sqlite bookkeeping | `ietf-mirror` crate + `ietfmak` CLI: update (idempotent, incremental, 404-watermarked) / list / head / text / history |
 | **git repos** | DAG of tree snapshots, newest-first | `gitdepot` store (tiered four-chain wikimak-depot store — TREES/COMMITS/REFLOG/TAGS with stable indices; annotated tags stored as raw tag objects, nested chains included, tags at trees supported (deduped to a commit's tree or imported as a standalone TREES record; blob-target tags are the only refusal), refs resolve peeled; bounded prepend, proven by roundtrip.rs update_io_is_bounded_not_o_history; SHA-exact export, tag objects verbatim; no re-import path — a rewrite is new records + repointed refs) | import/export/`update` (incremental prepend, rewrites included) + `mirror` (bare-clone fetch loop) |
 
@@ -37,8 +37,23 @@ each corpus's shape wants, served through sarun. Three mirrors first:
 ## Phases
 
 1. **wikipedia driver** (`wikimak` CLI): DONE — import + head/history/
-   text, and `discover`/`fetch` (`sync`) against dumps.wikimedia.org
-   with per-part watermarks and streamed checksum verification.
+   text and local HTTP browsing. A new mirror bootstraps once from a full
+   content-history XML snapshot. Routine `fetch` consumes only daily
+   adds/changes and MediaWiki History page-action TSVs: initially every
+   action partition, then the previous snapshot's frontier partition plus
+   every later partition from a newer History snapshot (the former frontier
+   is partial and expands in the next snapshot).
+   Full XML re-ingest is the separate explicit `refresh-full` command;
+   all-partition action/visibility reconciliation is the separate explicit
+   `reconcile-history` command. Neither is scheduled automatically.
+   Advertised XML SHA-256/SHA-1/MD5 is
+   checked on the compressed download before import; History TSVs have no
+   adjacent advertised digest, so each bzip2 stream is imported in one
+   SQLite transaction and rolls back on decoding or parse failure.
+   History also records upstream revision visibility/suppression metadata;
+   it never removes archived revision content. Because Wikimedia may revise
+   arbitrary old partitions, the frontier update is recorded separately
+   from the last explicitly fully reconciled History snapshot.
 2. **IETF drafts** (`ietf-mirror` crate): DONE — `all_id.txt` index →
    per-draft chains of full-snapshot canonical layers in a multi-chain
    `VbfDepot`; sqlite for series state; `update` idempotent + resumable

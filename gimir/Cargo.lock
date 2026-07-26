@@ -2657,6 +2657,7 @@ dependencies = [
  "chrono",
  "hex",
  "httpmock",
+ "md-5",
  "quick-xml",
  "regex",
  "reqwest",
@@ -2683,11 +2684,14 @@ dependencies = [
 name = "wikimak-wikipedia"
 version = "0.0.0"
 dependencies = [
+ "bzip2",
  "chrono",
  "depot",
  "hex",
  "httpmock",
  "libc",
+ "md-5",
+ "regex",
  "reqwest",
  "rusqlite",
  "serde",

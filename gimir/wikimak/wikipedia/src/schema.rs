@@ -43,6 +43,39 @@ pub const META_DDL: &[&str] = &[
         sha256 TEXT,
         completed_at INTEGER
     )",
+    "CREATE TABLE IF NOT EXISTS sync_state (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+    )",
+    "CREATE TABLE IF NOT EXISTS page_actions (
+        source_key TEXT PRIMARY KEY,
+        source_partition TEXT NOT NULL,
+        event_log_id INTEGER,
+        event_type TEXT NOT NULL,
+        event_timestamp TEXT NOT NULL,
+        event_comment TEXT NOT NULL,
+        actor_id INTEGER,
+        actor_name TEXT NOT NULL,
+        page_id INTEGER NOT NULL,
+        title_historical TEXT NOT NULL,
+        title_current TEXT NOT NULL,
+        namespace_historical INTEGER,
+        namespace_current INTEGER,
+        page_deleted INTEGER NOT NULL
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_page_actions_page_time
+        ON page_actions(page_id, event_timestamp DESC)",
+    "CREATE TABLE IF NOT EXISTS revision_visibility (
+        revision_id INTEGER PRIMARY KEY,
+        page_id INTEGER NOT NULL,
+        source_partition TEXT NOT NULL,
+        deleted_parts TEXT NOT NULL,
+        parts_are_suppressed INTEGER NOT NULL,
+        deleted_by_page_deletion INTEGER NOT NULL,
+        page_deletion_timestamp TEXT NOT NULL
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_revision_visibility_page
+        ON revision_visibility(page_id, revision_id)",
     "CREATE TABLE IF NOT EXISTS siteinfo_snapshots (
         captured_at INTEGER PRIMARY KEY,
         json BLOB NOT NULL
@@ -103,6 +136,9 @@ pub const META_TABLES: &[&str] = &[
     "page_to_title_id",
     "category_intervals",
     "parts_seen",
+    "sync_state",
+    "page_actions",
+    "revision_visibility",
     "siteinfo_snapshots",
     "interwiki_map",
 ];

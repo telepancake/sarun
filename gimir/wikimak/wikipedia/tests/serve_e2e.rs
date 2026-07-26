@@ -170,6 +170,7 @@ fn serve_renders_and_waybacks_a_synthesized_wiki() {
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");
     let cfg = ServeConfig {
+        root: tmp.path().to_path_buf(),
         addr: addr.clone(),
         media_cache: tmp.path().join("media"),
     };
@@ -179,6 +180,9 @@ fn serve_renders_and_waybacks_a_synthesized_wiki() {
         let _ = serve(inst, cfg);
     });
     wait_ready(&addr);
+    // The long-lived browser must not hold the store lock between requests;
+    // scheduled daily imports need to open the writer while it is running.
+    drop(make_instance(&tmp, 1024));
 
     // (a) current /wiki/Page: CURRENT template revision + module output.
     let (status, body) = http_get(&addr, "/wiki/Page");

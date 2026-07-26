@@ -30,10 +30,10 @@ pub(crate) mod titles;
 pub use error::{Error, Result};
 pub use instance::{
     max_chain_id_for_root, read_config, ContributorMeta, HistoryEntry, HistoryIter, ImportStats,
-    Instance, InstanceConfig, RevisionMeta, DEFAULT_MAX_CHAIN_ID,
+    Instance, InstanceConfig, PageAction, RevisionMeta, RevisionVisibility, DEFAULT_MAX_CHAIN_ID,
 };
 #[cfg(feature = "fetch")]
-pub use sync::{sync, SyncStats};
+pub use sync::{maintain, reconcile_history, sync, SyncStats};
 pub use revision::{
     FLAG_COMMENT_HIDDEN, FLAG_CONTRIBUTOR_HIDDEN, FLAG_SHA1_MISMATCH, FLAG_SUPPRESSED,
     FLAG_TEXT_HIDDEN, KIND_ANONYMOUS, KIND_HIDDEN, KIND_NAMED, REVISION_SCHEMA_VERSION,

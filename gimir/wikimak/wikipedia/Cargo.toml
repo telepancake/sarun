@@ -23,6 +23,7 @@ serde.workspace = true
 serde_json.workspace = true
 sha1.workspace = true
 hex.workspace = true
+regex.workspace = true
 # flock() for the one-process-per-root guard.
 libc.workspace = true
 # `sync` (discover → fetch → import) drives wikimak_mediawiki's HTTP
@@ -45,6 +46,8 @@ serve = ["dep:wikimak-wikitext", "dep:wikimak-scribunto", "dep:wikimak-media", "
 tempfile = "3"
 # `tests/sync.rs` stands in for dumps.wikimedia.org.
 httpmock = "0.7"
+md-5.workspace = true
+bzip2.workspace = true
 # `tests/streaming_ram.rs` measures a spawned import's peak RSS via
 # getrusage(RUSAGE_CHILDREN).
 libc.workspace = true

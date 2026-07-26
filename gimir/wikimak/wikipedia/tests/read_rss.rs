@@ -72,12 +72,14 @@ fn doc_two_revs(first_rev: u64) -> String {
     )
 }
 
-/// Peak RSS in bytes over all reaped children (Linux ru_maxrss is KB).
+/// Peak RSS in bytes over all reaped children (Linux reports KiB,
+/// macOS reports bytes).
 fn children_peak_rss() -> u64 {
     let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
     let rc = unsafe { libc::getrusage(libc::RUSAGE_CHILDREN, &mut ru) };
     assert_eq!(rc, 0, "getrusage failed");
-    ru.ru_maxrss as u64 * 1024
+    let rss = ru.ru_maxrss as u64;
+    if cfg!(target_os = "macos") { rss } else { rss * 1024 }
 }
 
 fn read_text_child(root: &Path, page: u64, asof: Option<i64>) -> Vec<u8> {

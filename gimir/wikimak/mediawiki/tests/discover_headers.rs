@@ -64,18 +64,8 @@ fn discover_transfers_no_part_body_bytes() {
         }));
     }
 
-    // _SUCCESS: HEAD-visible; its GET route is also body-counted.
-    let success_head = server.mock(|when, then| {
-        when.method("HEAD").path(format!("{bz2dir}_SUCCESS"));
-        then.status(200).header("Content-Length", "0");
-    });
-    let success_get = server.mock(|when, then| {
-        when.method(GET).path(format!("{bz2dir}_SUCCESS"));
-        then.status(200).body("");
-    });
-
-    // SHA256SUMS is a listing discover legitimately reads (bounded,
-    // kilobytes) — GET stays correct for it.
+    // SHA256SUMS is both the completion fence and a listing discover
+    // legitimately reads (bounded, kilobytes).
     let sums = build_sha256sums(&[
         (p1.0, &b"IRRELEVANT-ONE"[..]),
         (p2.0, &b"IRRELEVANT-TWO"[..]),
@@ -100,8 +90,6 @@ fn discover_transfers_no_part_body_bytes() {
     for m in &body_mocks {
         assert_eq!(m.hits(), 0, "ZERO part-body GETs during discover");
     }
-    assert_eq!(success_head.hits(), 1, "_SUCCESS checked via HEAD");
-    assert_eq!(success_get.hits(), 0, "_SUCCESS body never fetched");
 }
 
 // ---------------------------------------------------------------------------

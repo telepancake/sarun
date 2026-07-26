@@ -500,6 +500,19 @@ enum Modal {
     /// Editor path entry: the host file to open in the text editor.
     /// Enter opens; Esc cancels.
     EditorOpen { buf: String },
+    /// Add one or more Wikipedia mirrors without exposing the generic
+    /// mirror-driver CLI. Preset sites are toggled in the first field;
+    /// `custom` accepts any other Wikimedia database name. `destination`
+    /// is a user-chosen BASE directory: every selected database gets its
+    /// own child (for example BASE/enwiki), so stores never collide.
+    WikiMirrorSetup {
+        selected: std::collections::BTreeSet<String>,
+        site_cursor: usize,
+        custom: String,
+        destination: String,
+        cadence: usize,
+        field: WikiSetupField,
+    },
     /// Standalone image viewer popover (DESIGN-web.md W8). `title` is the
     /// caption (source · dimensions · format); `note` is a fallback message
     /// shown in the box body when there's no image to blit (no sixel support,
@@ -608,6 +621,13 @@ enum Modal {
     },
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WikiSetupField {
+    Sites,
+    Destination,
+    Cadence,
+}
+
 /// One level of the image-picker menu stack.
 #[derive(Clone)]
 struct PickLevel {
@@ -696,8 +716,11 @@ enum Action {
     MoveRuleUp,
     MoveRuleDown,
     /// Mirrors pane: the r / R / space / D / b key actions, menu-discoverable.
+    WikiMirrorAdd,
     MirrorRun,
     MirrorRunPending,
+    MirrorFullRefresh,
+    MirrorHistoryReconcile,
     MirrorTogglePause,
     MirrorRemove,
     MirrorBrowse,
@@ -826,6 +849,10 @@ enum ConfirmAction {
     Dissolve,
     /// Mirrors pane: delete the selected mirror job (by id).
     MirrorRemove(i64),
+    /// Explicitly re-ingest Wikipedia's current full content snapshot.
+    MirrorFullRefresh(i64),
+    /// Explicitly rebuild metadata from every MediaWiki History partition.
+    MirrorHistoryReconcile(i64),
 }
 
 /// State of the off-loop structural diff for the selected BINARY change. Mirrors
@@ -3895,6 +3922,126 @@ impl App {
         self.mirrors_loaded_at = Some(std::time::Instant::now());
     }
 
+    fn open_wiki_mirror_setup(&mut self) {
+        let destination = self
+            .mirror_jobs
+            .iter()
+            .find(|job| job.kind == "wiki")
+            .and_then(|job| {
+                let path = std::path::Path::new(&job.dest);
+                (path.file_name().and_then(|name| name.to_str()) == Some(job.src.as_str()))
+                    .then(|| path.parent())
+                    .flatten()
+            })
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        self.modal = Some(Modal::WikiMirrorSetup {
+            selected: std::collections::BTreeSet::new(),
+            site_cursor: 0,
+            custom: String::new(),
+            destination,
+            cadence: 0,
+            field: WikiSetupField::Sites,
+        });
+    }
+
+    fn commit_wiki_mirror_setup(
+        &mut self,
+        mut selected: std::collections::BTreeSet<String>,
+        custom: String,
+        destination: String,
+        cadence: usize,
+    ) {
+        let custom = custom.trim();
+        if !custom.is_empty() {
+            selected.insert(custom.to_ascii_lowercase());
+        }
+        let destination = expand_user_path(destination.trim());
+        let error = if selected.is_empty() {
+            Some("select at least one Wikipedia site".to_string())
+        } else if let Some(site) = selected.iter().find(|site| !valid_wiki_dbname(site)) {
+            Some(format!(
+                "{site:?} is not a Wikimedia database name (example: enwiki)"
+            ))
+        } else if destination.as_os_str().is_empty() {
+            Some("choose a storage folder".to_string())
+        } else if !destination.is_absolute() {
+            Some("storage folder must be an absolute path (or start with ~/)".to_string())
+        } else {
+            None
+        };
+        if let Some(error) = error {
+            self.status = format!("Wikipedia mirror: {error}");
+            self.modal = Some(Modal::WikiMirrorSetup {
+                selected,
+                site_cursor: 0,
+                custom: custom.to_string(),
+                destination: destination.to_string_lossy().into_owned(),
+                cadence,
+                field: WikiSetupField::Sites,
+            });
+            return;
+        }
+
+        let interval = WIKI_CADENCES
+            .get(cadence)
+            .map(|(_, seconds)| *seconds)
+            .unwrap_or(7 * 24 * 3600);
+        let existing: std::collections::HashSet<_> = self
+            .mirror_jobs
+            .iter()
+            .filter(|job| job.kind == "wiki")
+            .map(|job| job.src.clone())
+            .collect();
+        let mut added = Vec::new();
+        let mut skipped = Vec::new();
+        for site in selected {
+            if existing.contains(&site) {
+                skipped.push(site);
+                continue;
+            }
+            let root = destination.join(&site).to_string_lossy().into_owned();
+            match self.mirror_verb("mirror_add", json!(["wiki", site, root, interval])) {
+                Ok(value) => {
+                    let Some(id) = value.get("id").and_then(Value::as_i64) else {
+                        self.status = "Wikipedia mirror: engine returned no job id".into();
+                        self.load_mirrors();
+                        return;
+                    };
+                    if let Err(error) = self.mirror_verb("mirror_run", json!([id])) {
+                        self.status = format!(
+                            "Wikipedia mirror #{id} was added but could not start: {error}"
+                        );
+                        self.load_mirrors();
+                        return;
+                    }
+                    added.push(site);
+                }
+                Err(error) => {
+                    self.status = format!("Wikipedia mirror: {error}");
+                    self.load_mirrors();
+                    return;
+                }
+            }
+        }
+        self.load_mirrors();
+        self.status = match (added.is_empty(), skipped.is_empty()) {
+            (false, true) => format!(
+                "Wikipedia: started {} mirror{} in {}",
+                added.len(),
+                if added.len() == 1 { "" } else { "s" },
+                destination.display()
+            ),
+            (false, false) => format!(
+                "Wikipedia: started {}; already configured: {}",
+                added.join(", "),
+                skipped.join(", ")
+            ),
+            (true, false) => format!("Wikipedia: already configured: {}", skipped.join(", ")),
+            (true, true) => "Wikipedia: no mirrors added".into(),
+        };
+    }
+
     /// 'r' on Mirrors: force-run the selected job (works on paused too).
     /// Verb, not crate call: the run must be the ENGINE's child, or it
     /// dies with the attach UI and the engine never sees it.
@@ -3906,6 +4053,59 @@ impl App {
         self.status = match self.mirror_verb("mirror_run", json!([id])) {
             Ok(_) => format!("mirror #{id}: run started"),
             Err(e) => format!("mirror #{id}: {e}"),
+        };
+        self.load_mirrors();
+    }
+
+    fn confirm_mirror_full_refresh(&mut self) {
+        let Some(job) = self.mirror_jobs.get(self.sel_mirror) else {
+            self.status = "no mirror job selected".into();
+            return;
+        };
+        if job.kind != "wiki" {
+            self.status =
+                "full content snapshot re-ingest is only available for Wikipedia mirrors".into();
+            return;
+        }
+        self.modal = Some(Modal::Confirm {
+            prompt: format!(
+                "Re-ingest the full {} content snapshot now? This can download hundreds of GB; it is never scheduled automatically.",
+                job.src
+            ),
+            action: ConfirmAction::MirrorFullRefresh(job.id),
+        });
+    }
+
+    fn mirror_full_refresh(&mut self, id: i64) {
+        self.status = match self.mirror_verb("mirror_run_full", json!([id])) {
+            Ok(_) => format!("Wikipedia mirror #{id}: full content re-ingest started"),
+            Err(error) => format!("Wikipedia mirror #{id}: {error}"),
+        };
+        self.load_mirrors();
+    }
+
+    fn confirm_mirror_history_reconcile(&mut self) {
+        let Some(job) = self.mirror_jobs.get(self.sel_mirror) else {
+            self.status = "no mirror job selected".into();
+            return;
+        };
+        if job.kind != "wiki" {
+            self.status = "history reconciliation is only available for Wikipedia mirrors".into();
+            return;
+        }
+        self.modal = Some(Modal::Confirm {
+            prompt: format!(
+                "Reconcile all {} action/visibility history now? This downloads every History partition; it is never scheduled automatically.",
+                job.src
+            ),
+            action: ConfirmAction::MirrorHistoryReconcile(job.id),
+        });
+    }
+
+    fn mirror_history_reconcile(&mut self, id: i64) {
+        self.status = match self.mirror_verb("mirror_reconcile_history", json!([id])) {
+            Ok(_) => format!("Wikipedia mirror #{id}: full History reconciliation started"),
+            Err(error) => format!("Wikipedia mirror #{id}: {error}"),
         };
         self.load_mirrors();
     }
@@ -3935,6 +4135,12 @@ impl App {
                 return;
             }
         };
+        // A Linux guest under QEMU cannot use its own 127.0.0.1 to reach
+        // this macOS process. QEMU user networking exposes the host loopback
+        // as 10.0.2.2; native Linux boxes continue to share the host network
+        // namespace and use the ordinary loopback URL.
+        #[cfg(target_os = "macos")]
+        let url = url.replacen("127.0.0.1", "10.0.2.2", 1);
         let how = How {
             net: "host".into(),
             env: self.launch_env,
@@ -5086,6 +5292,13 @@ impl App {
                 self.var_item_act();
             }
             Pane::Inspect => self.ins_enter(),
+            Pane::Mirrors => {
+                if self.mirror_jobs.is_empty() {
+                    self.open_wiki_mirror_setup();
+                } else {
+                    self.mirror_read_selected();
+                }
+            }
             // Enter on a capture opens it in the RIGHT viewer for its type
             // (DESIGN-web.md W4.2/W8): an image → the sixel popover; an HTML
             // page → carbonyl replaying THIS box's archive at that URL; other
@@ -5137,7 +5350,6 @@ impl App {
             | Pane::Processes
             | Pane::Outputs
             | Pane::Rules
-            | Pane::Mirrors
             | Pane::Pipelines
             | Pane::BuildEdges
             | Pane::Packets
@@ -5983,6 +6195,8 @@ impl App {
             ConfirmAction::Kill => self.kill(),
             ConfirmAction::Dissolve => self.dissolve(),
             ConfirmAction::MirrorRemove(id) => self.mirror_remove(id),
+            ConfirmAction::MirrorFullRefresh(id) => self.mirror_full_refresh(id),
+            ConfirmAction::MirrorHistoryReconcile(id) => self.mirror_history_reconcile(id),
         }
     }
 
@@ -8687,6 +8901,40 @@ fn mirror_state_color(state: &str) -> Color {
 
 /// "in 5m" / "due" for a next_due unix timestamp (already-elapsed shows
 /// as the state column's "pending"; the due cell just says "due").
+const WIKI_SITES: &[(&str, &str)] = &[
+    ("enwiki", "English"),
+    ("lvwiki", "Latvian"),
+    ("dewiki", "German"),
+    ("frwiki", "French"),
+    ("eswiki", "Spanish"),
+    ("plwiki", "Polish"),
+    ("ukwiki", "Ukrainian"),
+    ("ruwiki", "Russian"),
+    ("jawiki", "Japanese"),
+    ("zhwiki", "Chinese"),
+    ("simplewiki", "Simple English"),
+];
+
+const WIKI_CADENCES: &[(&str, i64)] =
+    &[("daily", 24 * 3600), ("weekly", 7 * 24 * 3600)];
+
+fn valid_wiki_dbname(name: &str) -> bool {
+    name.ends_with("wiki")
+        && name.len() > 4
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+fn expand_user_path(input: &str) -> std::path::PathBuf {
+    if input == "~" || input.starts_with("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return std::path::PathBuf::from(home).join(input.trim_start_matches("~/"));
+        }
+    }
+    std::path::PathBuf::from(input)
+}
+
 fn mirror_due_label(next_due: Option<i64>) -> String {
     let Some(due) = next_due else {
         return "—".into();
@@ -8700,31 +8948,51 @@ fn mirror_due_label(next_due: Option<i64>) -> String {
         "due".into()
     } else if dt < 3600 {
         format!("in {}m", (dt + 59) / 60)
+    } else if dt >= 48 * 3600 {
+        format!("in {}d", (dt + 86399) / 86400)
     } else {
         format!("in {}h{:02}m", dt / 3600, (dt % 3600) / 60)
+    }
+}
+
+fn mirror_cadence_label(seconds: i64) -> String {
+    match seconds {
+        86400 => "daily".into(),
+        604800 => "weekly".into(),
+        2592000 => "monthly".into(),
+        value if value % 86400 == 0 => format!("every {}d", value / 86400),
+        value if value % 3600 == 0 => format!("every {}h", value / 3600),
+        value => format!("every {}m", value / 60),
     }
 }
 
 /// MIRRORS pane: one row per mirror-update job.
 fn mirrors_lines(app: &App) -> Vec<Line<'static>> {
     let mut out = vec![Line::from(Span::styled(
-        "scheduled mirror updates — r run selected · R run pending · V read · space pause/resume",
+        "n add Wikipedia · Enter read · b browse · r update now · space pause",
         Style::default().add_modifier(Modifier::BOLD),
     ))];
     if app.mirror_jobs.is_empty() {
-        out.push(Line::from("(no mirror jobs — `sarun mirror add …`)"));
+        out.push(Line::from(""));
+        out.push(Line::from("No local mirrors yet."));
+        out.push(Line::from(Span::styled(
+            "Press n or Enter to choose Wikipedia sites and storage.",
+            Style::default().fg(Color::Cyan),
+        )));
         return out;
     }
     for (i, j) in app.mirror_jobs.iter().enumerate() {
+        let name = if j.kind == "wiki" {
+            format!("Wikipedia · {}", j.src)
+        } else {
+            format!("{} · {}", j.kind, j.src)
+        };
         let text = format!(
-            "{:>3} {:<9} {:<4} {} → {} every {}m {}",
-            j.id,
+            " {:<24} {:<10} {:<10} {}",
+            name,
             j.state,
-            j.kind,
-            j.src,
-            j.dest,
-            j.interval_secs / 60,
-            mirror_due_label(j.next_due)
+            mirror_cadence_label(j.interval_secs),
+            mirror_due_label(j.next_due),
         );
         let line = if i == app.sel_mirror {
             Line::from(Span::styled(
@@ -8748,13 +9016,16 @@ fn mirror_detail_lines(app: &App) -> Vec<Line<'static>> {
     let Some(j) = app.mirror_jobs.get(app.sel_mirror) else {
         return vec![
             Line::from(Span::styled(
-                "r run · R run pending · space pause/resume",
-                Style::default().add_modifier(Modifier::DIM),
+                "Add a Wikipedia mirror",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
             )),
             Line::from(""),
-            Line::from("Mirror jobs keep local gitdepot / wikimak / ietfmak"),
-            Line::from("stores fresh on a per-job interval. The engine"),
-            Line::from("schedules; the driver binaries fetch."),
+            Line::from("Choose one or more sites, where they should live,"),
+            Line::from("and how often sarun should collect daily adds/changes."),
+            Line::from(""),
+            Line::from("Nothing downloads until you confirm the setup."),
         ];
     };
     let dim = Style::default().add_modifier(Modifier::DIM);
@@ -8780,15 +9051,19 @@ fn mirror_detail_lines(app: &App) -> Vec<Line<'static>> {
         ),
         Span::styled(format!("  job #{}", j.id), dim),
     ])];
+    if j.kind == "wiki" {
+        out.push(Line::from(Span::styled(
+            "Enter read locally · b browse as a website · r update now",
+            Style::default().fg(Color::Cyan),
+        )));
+        out.push(Line::from(""));
+    }
     let field =
         |k: &str, v: String| Line::from(vec![Span::styled(format!("{k:>9} "), cyan), Span::raw(v)]);
     out.push(field("kind", j.kind.clone()));
     out.push(field("src", j.src.clone()));
     out.push(field("dest", j.dest.clone()));
-    out.push(field(
-        "interval",
-        format!("{}s ({}m)", j.interval_secs, j.interval_secs / 60),
-    ));
+    out.push(field("interval", mirror_cadence_label(j.interval_secs)));
     out.push(field("paused", j.paused.to_string()));
     out.push(field(
         "next due",
@@ -9076,6 +9351,7 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
         Modal::ModelPicker { models, .. } => (models.len() as u16 + 1).clamp(1, 18) + 7,
         // 3 fields + header + result + help + borders.
         Modal::ApiConfig { .. } => 11,
+        Modal::WikiMirrorSetup { .. } => 24,
         Modal::Command {
             buf, completions, ..
         } => {
@@ -9269,6 +9545,128 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
                 Line::from("Enter open · Esc cancel"),
             ],
         ),
+        Modal::WikiMirrorSetup {
+            selected,
+            site_cursor,
+            custom,
+            destination,
+            cadence,
+            field,
+        } => {
+            let active = Style::default().fg(Color::Black).bg(Color::Cyan);
+            let label = Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD);
+            let mut body = vec![Line::from(Span::styled(
+                "1  Wikipedia sites",
+                if *field == WikiSetupField::Sites {
+                    label.add_modifier(Modifier::UNDERLINED)
+                } else {
+                    label
+                },
+            ))];
+            for (row, chunk) in WIKI_SITES.chunks(3).enumerate() {
+                let mut spans = Vec::new();
+                for (column, (dbname, language)) in chunk.iter().enumerate() {
+                    let index = row * 3 + column;
+                    let checked = selected.contains(*dbname);
+                    let text = format!("{} {:<15}", if checked { "●" } else { "○" }, language);
+                    let style = if *field == WikiSetupField::Sites && index == *site_cursor {
+                        active
+                    } else if checked {
+                        Style::default().fg(Color::Yellow)
+                    } else {
+                        Style::default()
+                    };
+                    spans.push(Span::styled(text, style));
+                }
+                body.push(Line::from(spans));
+            }
+            body.push(Line::from(format!(
+                "   Other database: {}{}",
+                custom,
+                if *field == WikiSetupField::Sites {
+                    "_"
+                } else {
+                    ""
+                }
+            )));
+            body.push(Line::from(""));
+            body.push(Line::from(Span::styled(
+                "2  Storage folder",
+                if *field == WikiSetupField::Destination {
+                    label.add_modifier(Modifier::UNDERLINED)
+                } else {
+                    label
+                },
+            )));
+            body.push(Line::from(Span::styled(
+                format!(
+                    "   {}{}",
+                    destination,
+                    if *field == WikiSetupField::Destination {
+                        "_"
+                    } else {
+                        ""
+                    }
+                ),
+                if *field == WikiSetupField::Destination {
+                    active
+                } else {
+                    Style::default()
+                },
+            )));
+            body.push(Line::from(Span::styled(
+                "   Each site is stored in FOLDER/dbname; full editions can require substantial space.",
+                Style::default().add_modifier(Modifier::DIM),
+            )));
+            body.push(Line::from(Span::styled(
+                "   Initial setup downloads full revision content and all available action history.",
+                Style::default().fg(Color::Yellow),
+            )));
+            body.push(Line::from(Span::styled(
+                "   Later full content re-ingest and all-history reconciliation are separate explicit actions.",
+                Style::default().add_modifier(Modifier::DIM),
+            )));
+            body.push(Line::from(""));
+            body.push(Line::from(Span::styled(
+                "3  Check for updates",
+                if *field == WikiSetupField::Cadence {
+                    label.add_modifier(Modifier::UNDERLINED)
+                } else {
+                    label
+                },
+            )));
+            body.push(Line::from(
+                WIKI_CADENCES
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(index, (name, _))| {
+                        [
+                            Span::raw(if index == 0 { "   " } else { "  " }),
+                            Span::styled(
+                                format!("[{name}]"),
+                                if index == *cadence {
+                                    if *field == WikiSetupField::Cadence {
+                                        active
+                                    } else {
+                                        Style::default().fg(Color::Yellow)
+                                    }
+                                } else {
+                                    Style::default().add_modifier(Modifier::DIM)
+                                },
+                            ),
+                        ]
+                    })
+                    .collect::<Vec<_>>(),
+            ));
+            body.push(Line::from(""));
+            body.push(Line::from(
+                "Tab fields · ↑/↓ sites · Space select · type other dbname · ←/→ cadence",
+            ));
+            body.push(Line::from("Enter create and start · Esc cancel"));
+            (" add Wikipedia mirrors ", body)
+        }
         Modal::EditorOpen { buf } => (
             " open in editor ",
             vec![
@@ -10135,6 +10533,7 @@ enum PaneAction {
     NewRule,
     DeleteRule,
     StartRename,
+    WikiMirrorAdd,
     MirrorRun,
     MirrorRunPending,
     MirrorTogglePause,
@@ -10301,6 +10700,12 @@ const PANE_ACTION_KEYS: &[(Key, PaneGate, PaneAction, Option<&str>)] = &[
         Some("force-run selected mirror job (on Mirrors)"),
     ),
     (
+        Key::Char('n'),
+        PaneGate::On(Pane::Mirrors),
+        PaneAction::WikiMirrorAdd,
+        Some("add Wikipedia mirrors (on Mirrors)"),
+    ),
+    (
         Key::Char('R'),
         PaneGate::On(Pane::Mirrors),
         PaneAction::MirrorRunPending,
@@ -10460,6 +10865,7 @@ fn run_pane_action(app: &mut App, action: PaneAction) {
             })
         }
         PaneAction::DeleteRule => app.delete_rule(),
+        PaneAction::WikiMirrorAdd => app.open_wiki_mirror_setup(),
         PaneAction::MirrorRun => app.mirror_run_selected(),
         PaneAction::MirrorRunPending => app.mirror_run_pending(),
         PaneAction::MirrorBrowse => app.mirror_browse_selected(),
@@ -16766,8 +17172,19 @@ fn pane_action_menu(app: &App) -> Option<(String, Vec<ActionItem>)> {
             Some((
                 title("Mirror job", &target),
                 vec![
+                    mk("Add Wikipedia mirrors…", "n", Action::WikiMirrorAdd),
                     mk("Force-run this job", "r", Action::MirrorRun),
                     mk("Run all pending jobs", "R", Action::MirrorRunPending),
+                    mk(
+                        "Re-ingest full Wikipedia content snapshot…",
+                        "",
+                        Action::MirrorFullRefresh,
+                    ),
+                    mk(
+                        "Reconcile all Wikipedia action metadata…",
+                        "",
+                        Action::MirrorHistoryReconcile,
+                    ),
                     mk(
                         if paused {
                             "Resume this job"
@@ -16873,8 +17290,11 @@ fn run_action(app: &mut App, a: Action) {
         Action::DeleteRule => app.delete_rule(),
         Action::MoveRuleUp => app.move_rule(-1),
         Action::MoveRuleDown => app.move_rule(1),
+        Action::WikiMirrorAdd => app.open_wiki_mirror_setup(),
         Action::MirrorRun => app.mirror_run_selected(),
         Action::MirrorRunPending => app.mirror_run_pending(),
+        Action::MirrorFullRefresh => app.confirm_mirror_full_refresh(),
+        Action::MirrorHistoryReconcile => app.confirm_mirror_history_reconcile(),
         Action::MirrorTogglePause => app.mirror_toggle_pause(),
         Action::MirrorRemove => app.confirm_mirror_remove(),
         Action::MirrorBrowse => app.mirror_browse_selected(),
@@ -17344,6 +17764,81 @@ fn handle_modal_key(
             }
             _ => app.modal = Some(Modal::ReaderOpen { buf }),
         },
+        Modal::WikiMirrorSetup {
+            mut selected,
+            mut site_cursor,
+            mut custom,
+            mut destination,
+            mut cadence,
+            mut field,
+        } => {
+            if code == KeyCode::Enter {
+                app.commit_wiki_mirror_setup(selected, custom, destination, cadence);
+                return;
+            }
+            if code == KeyCode::Esc {
+                app.status = "Wikipedia mirror setup cancelled".into();
+                return;
+            }
+            match code {
+                KeyCode::Tab => {
+                    field = match field {
+                        WikiSetupField::Sites => WikiSetupField::Destination,
+                        WikiSetupField::Destination => WikiSetupField::Cadence,
+                        WikiSetupField::Cadence => WikiSetupField::Sites,
+                    }
+                }
+                KeyCode::BackTab => {
+                    field = match field {
+                        WikiSetupField::Sites => WikiSetupField::Cadence,
+                        WikiSetupField::Destination => WikiSetupField::Sites,
+                        WikiSetupField::Cadence => WikiSetupField::Destination,
+                    }
+                }
+                KeyCode::Up if field == WikiSetupField::Sites => {
+                    site_cursor = site_cursor.saturating_sub(1)
+                }
+                KeyCode::Down if field == WikiSetupField::Sites => {
+                    site_cursor = (site_cursor + 1).min(WIKI_SITES.len() - 1)
+                }
+                KeyCode::Char(' ') if field == WikiSetupField::Sites => {
+                    let dbname = WIKI_SITES[site_cursor].0.to_string();
+                    if !selected.remove(&dbname) {
+                        selected.insert(dbname);
+                    }
+                }
+                KeyCode::Backspace if field == WikiSetupField::Sites => {
+                    custom.pop();
+                }
+                KeyCode::Char(character)
+                    if field == WikiSetupField::Sites
+                        && (character.is_ascii_alphanumeric() || character == '_') =>
+                {
+                    custom.push(character.to_ascii_lowercase());
+                }
+                KeyCode::Backspace if field == WikiSetupField::Destination => {
+                    destination.pop();
+                }
+                KeyCode::Char(character) if field == WikiSetupField::Destination => {
+                    destination.push(character);
+                }
+                KeyCode::Left if field == WikiSetupField::Cadence => {
+                    cadence = cadence.saturating_sub(1);
+                }
+                KeyCode::Right | KeyCode::Char(' ') if field == WikiSetupField::Cadence => {
+                    cadence = (cadence + 1) % WIKI_CADENCES.len();
+                }
+                _ => {}
+            }
+            app.modal = Some(Modal::WikiMirrorSetup {
+                selected,
+                site_cursor,
+                custom,
+                destination,
+                cadence,
+                field,
+            });
+        }
         Modal::EditorOpen { mut buf } => match code {
             KeyCode::Enter => app.editor_open_spec(&buf),
             KeyCode::Esc => app.status = "editor open cancelled".into(),
@@ -22611,6 +23106,7 @@ mod tests {
     /// fixture SETUP still calls crate::mirrors directly, like other pane
     /// tests inject their data.
     fn mirror_verb_server(tag: &str) -> String {
+        let fake_run = tag == "setup";
         let sock =
             std::env::temp_dir().join(format!("sarun-mvs-{tag}-{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&sock);
@@ -22636,6 +23132,20 @@ mod tests {
                         Ok(j) => serde_json::to_value(j).unwrap(),
                         Err(e) => json!({"ok": false, "error": e}),
                     },
+                    "mirror_add" => {
+                        let kind = args.first().and_then(Value::as_str).unwrap_or("");
+                        let src = args.get(1).and_then(Value::as_str).unwrap_or("");
+                        let dest = args.get(2).and_then(Value::as_str).unwrap_or("");
+                        let interval = args.get(3).and_then(Value::as_i64).unwrap_or(86400);
+                        match crate::mirrors::job_add(kind, src, dest, interval) {
+                            Ok(id) => json!({"ok": true, "id": id}),
+                            Err(e) => json!({"ok": false, "error": e}),
+                        }
+                    }
+                    "mirror_run" if fake_run => json!({"ok": true}),
+                    "mirror_run_full" | "mirror_reconcile_history" if fake_run => {
+                        json!({"ok": true})
+                    }
                     "mirror_run" => match crate::mirrors::job_run(id) {
                         Ok(()) => json!({"ok": true}),
                         Err(e) => json!({"ok": false, "error": e}),
@@ -22701,6 +23211,70 @@ mod tests {
         assert_eq!(job.state, "paused");
         let buf = render_to_string(&app, 120, 30).unwrap();
         assert!(buf.contains("paused"), "pause must show:\n{buf}");
+    }
+
+    #[test]
+    fn wikipedia_setup_adds_selected_sites_under_user_chosen_folder() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let _g = crate::depot::TEST_STATE_HOME_LOCK.lock().unwrap();
+        let tmp = std::env::temp_dir().join(format!("sarun-wikisetup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", &tmp);
+        }
+        std::fs::create_dir_all(crate::paths::state_home()).unwrap();
+
+        let mut app = App::bare(mirror_verb_server("setup"));
+        app.go_to_pane(Pane::Mirrors);
+        assert!(dispatch_pane_key(&mut app, KeyCode::Char('n')));
+        let rendered = render_to_string(&app, 120, 34).unwrap();
+        assert!(rendered.contains("add Wikipedia mirrors"), "{rendered}");
+        assert!(rendered.contains("Storage folder"), "{rendered}");
+        assert!(
+            !rendered.contains("/Volumes/Elements"),
+            "the UI must not contain a machine-specific path:\n{rendered}"
+        );
+
+        app.modal = Some(Modal::WikiMirrorSetup {
+            selected: ["enwiki".to_string(), "lvwiki".to_string()]
+                .into_iter()
+                .collect(),
+            site_cursor: 0,
+            custom: String::new(),
+            destination: "/mirror-library".into(),
+            cadence: 1,
+            field: WikiSetupField::Cadence,
+        });
+        handle_modal_key(&mut app, KeyCode::Enter, KeyModifiers::empty());
+        assert!(app.modal.is_none());
+        let jobs = crate::mirrors::jobs_list().unwrap();
+        assert_eq!(jobs.len(), 2);
+        assert!(jobs.iter().all(|job| job.kind == "wiki"));
+        assert!(jobs.iter().all(|job| job.interval_secs == 7 * 24 * 3600));
+        assert!(
+            jobs.iter()
+                .any(|job| job.src == "enwiki" && job.dest == "/mirror-library/enwiki")
+        );
+        assert!(
+            jobs.iter()
+                .any(|job| job.src == "lvwiki" && job.dest == "/mirror-library/lvwiki")
+        );
+        assert!(app.status.contains("started 2 mirrors"), "{}", app.status);
+    }
+
+    #[test]
+    fn wikipedia_setup_validates_database_names_and_expands_home() {
+        assert!(valid_wiki_dbname("enwiki"));
+        assert!(valid_wiki_dbname("simplewiki"));
+        assert!(!valid_wiki_dbname("https://en.wikipedia.org"));
+        assert!(!valid_wiki_dbname("../enwiki"));
+        if let Ok(home) = std::env::var("HOME") {
+            assert_eq!(
+                expand_user_path("~/wikipedia"),
+                std::path::Path::new(&home).join("wikipedia")
+            );
+        }
     }
 
     /// 'D' on the Mirrors pane deletes the SELECTED JOB behind a y/n

@@ -7,6 +7,7 @@
 use std::io::{self, Read};
 
 use reqwest::blocking::Client;
+use md5::Md5;
 use sha1::Sha1;
 use sha2::{Digest as _, Sha256};
 
@@ -17,6 +18,7 @@ use crate::types::{Error, Part, Result};
 enum Hasher {
     Sha256(Sha256),
     Sha1(Sha1),
+    Md5(Md5),
 }
 
 impl Hasher {
@@ -24,12 +26,14 @@ impl Hasher {
         match self {
             Hasher::Sha256(h) => sha2::Digest::update(h, data),
             Hasher::Sha1(h) => sha1::Digest::update(h, data),
+            Hasher::Md5(h) => md5::Digest::update(h, data),
         }
     }
     fn finalize_hex(self) -> String {
         match self {
             Hasher::Sha256(h) => hex::encode(h.finalize()),
             Hasher::Sha1(h) => hex::encode(h.finalize()),
+            Hasher::Md5(h) => hex::encode(h.finalize()),
         }
     }
 }
@@ -87,18 +91,45 @@ impl<R: Read> Read for VerifyingReader<R> {
 
 /// Fetch a Part: GET the URL, return a streaming reader.
 pub fn fetch(client: &Client, part: &Part) -> Result<VerifyingReader<Box<dyn Read + Send>>> {
-    let resp = client.get(&part.url).send()?;
-    let status = resp.status();
-    if !status.is_success() {
-        return Err(Error::HttpStatus {
-            status: status.as_u16(),
-            url: part.url.clone(),
-        });
-    }
-    let (hasher, expected) = match (&part.sha256, &part.sha1) {
-        (Some(h), _) => (Some(Hasher::Sha256(Sha256::new())), h.to_lowercase()),
-        (None, Some(h)) => (Some(Hasher::Sha1(Sha1::new())), h.to_lowercase()),
-        (None, None) => (None, String::new()),
+    let mut attempt = 0u32;
+    let resp = loop {
+        match client.get(&part.url).send() {
+            Ok(resp) if resp.status().is_success() => break resp,
+            Ok(resp)
+                if attempt < 3
+                    && (resp.status().as_u16() == 429 || resp.status().is_server_error()) =>
+            {
+                let retry_after = resp
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.parse::<u64>().ok());
+                let delay = retry_after
+                    .unwrap_or(2u64.saturating_pow(attempt + 1))
+                    .min(120);
+                std::thread::sleep(std::time::Duration::from_secs(delay));
+                attempt += 1;
+            }
+            Ok(resp) => {
+                return Err(Error::HttpStatus {
+                    status: resp.status().as_u16(),
+                    url: part.url.clone(),
+                });
+            }
+            Err(error) if attempt < 3 && (error.is_connect() || error.is_timeout()) => {
+                std::thread::sleep(std::time::Duration::from_secs(
+                    2u64.saturating_pow(attempt + 1),
+                ));
+                attempt += 1;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    };
+    let (hasher, expected) = match (&part.sha256, &part.sha1, &part.md5) {
+        (Some(h), _, _) => (Some(Hasher::Sha256(Sha256::new())), h.to_lowercase()),
+        (None, Some(h), _) => (Some(Hasher::Sha1(Sha1::new())), h.to_lowercase()),
+        (None, None, Some(h)) => (Some(Hasher::Md5(Md5::new())), h.to_lowercase()),
+        (None, None, None) => (None, String::new()),
     };
     Ok(VerifyingReader {
         inner: Box::new(resp) as Box<dyn Read + Send>,

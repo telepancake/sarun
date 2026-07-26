@@ -14,10 +14,8 @@
 //! against `DUMPS_BASE_URL`. Tests construct a `Config { base_url: ... }`
 //! pointed at a local mock server and call `discover_with` directly.
 //!
-//! Per SPEC §"Wire facts": parts live under `<date>/xml/bzip2/`
-//! alongside `SHA256SUMS` and `_SUCCESS`. The discoverer keys "done"
-//! off the presence of `_SUCCESS` and authoritatively lists parts from
-//! `SHA256SUMS`.
+//! Content-history parts live under `<date>/xml/bzip2/`; the published
+//! `SHA256SUMS` is both the completion fence and authoritative part list.
 
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
@@ -61,6 +59,78 @@ pub fn discover_with(client: &Client, cfg: &Config, dbname: &str) -> Result<Run>
         Err(BranchErr::Unavailable) => discover_legacy(client, cfg, dbname),
         Err(BranchErr::Fatal(e)) => Err(e),
     }
+}
+
+/// Completed daily adds/changes runs newer than `after`, oldest first.
+/// These are the normal maintenance source after a full-history bootstrap.
+pub fn discover_incremental_with(
+    client: &Client,
+    cfg: &Config,
+    dbname: &str,
+    after: Option<NaiveDate>,
+) -> Result<Vec<Run>> {
+    let root = format!("{}/other/incr/{dbname}/", cfg.base_url);
+    let (body, status) = http_get(client, &root)?;
+    if !status.is_success() {
+        return Err(Error::HttpStatus { status: status.as_u16(), url: root });
+    }
+    let body = String::from_utf8_lossy(&body);
+    let mut dates: Vec<NaiveDate> = re_href_ymd()
+        .captures_iter(&body)
+        .filter_map(|capture| NaiveDate::parse_from_str(&capture[1], "%Y%m%d").ok())
+        .filter(|date| after.map(|after| *date > after).unwrap_or(true))
+        .collect();
+    dates.sort();
+    dates.dedup();
+
+    let mut runs = Vec::new();
+    for date in dates {
+        let ymd = date.format("%Y%m%d");
+        let dir = format!("{root}{ymd}/");
+        let (status_body, status) = http_get(client, &format!("{dir}status.txt"))?;
+        if status == StatusCode::NOT_FOUND {
+            continue;
+        }
+        if !status.is_success() {
+            return Err(Error::HttpStatus {
+                status: status.as_u16(),
+                url: format!("{dir}status.txt"),
+            });
+        }
+        if !String::from_utf8_lossy(&status_body).to_ascii_lowercase().contains("done") {
+            continue;
+        }
+        let sums_url = format!("{dir}{dbname}-{ymd}-md5sums.txt");
+        let (sums, status) = http_get(client, &sums_url)?;
+        if !status.is_success() {
+            return Err(Error::HttpStatus { status: status.as_u16(), url: sums_url });
+        }
+        let wanted = format!("{dbname}-{ymd}-pages-meta-hist-incr.xml.bz2");
+        let text = std::str::from_utf8(&sums)
+            .map_err(|error| Error::Parse(format!("incremental md5sums not utf-8: {error}")))?;
+        let digest = text.lines().find_map(|line| {
+            let mut fields = line.split_whitespace();
+            let digest = fields.next()?;
+            let name = fields.next()?.trim_start_matches('*');
+            (name == wanted).then(|| digest.to_string())
+        }).ok_or_else(|| Error::Parse(format!("{wanted} missing from {sums_url}")))?;
+        if digest.len() != 32 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(Error::Parse(format!("invalid md5 for {wanted}")));
+        }
+        runs.push(Run {
+            source: RunSource::Incremental,
+            date,
+            parts: vec![Part {
+                url: format!("{dir}{wanted}"),
+                filename: wanted,
+                size_bytes: 0,
+                sha256: None,
+                sha1: None,
+                md5: Some(digest),
+            }],
+        });
+    }
+    Ok(runs)
 }
 
 /// Internal: a branch either yielded a run, declared itself unavailable
@@ -127,14 +197,24 @@ fn discover_content_history(
 
     for d in dates {
         let dir = format!("{}{}/xml/bzip2/", root, d.format("%Y-%m-%d"));
-        if !http_exists(client, &format!("{dir}_SUCCESS")) {
+        // Wikimedia documents SHA256SUMS itself as the completion fence.
+        // Avoid a redundant _SUCCESS probe on every poll.
+        let sums_url = format!("{dir}SHA256SUMS");
+        let (sums, status) = http_get(client, &sums_url)?;
+        if status == StatusCode::NOT_FOUND {
             continue;
         }
-        let sums = match http_fetch_ok(client, &format!("{dir}SHA256SUMS")) {
-            Some(s) => s,
-            None => continue,
-        };
+        if !status.is_success() {
+            return Err(Error::HttpStatus {
+                status: status.as_u16(),
+                url: sums_url,
+            }
+            .into());
+        }
         let parts = parse_sha256sums(client, &dir, &sums)?;
+        if parts.is_empty() {
+            return Err(Error::Parse(format!("empty SHA256SUMS at {dir}")).into());
+        }
         return Ok(Run {
             source: RunSource::ContentHistory,
             date: d,
@@ -161,8 +241,15 @@ fn parse_sha256sums(client: &Client, dir: &str, sums: &[u8]) -> Result<Vec<Part>
                 None => continue,
             },
         };
-        if digest.len() != 64 {
+        if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err(Error::Parse(format!("malformed SHA256SUMS line: {line:?}")));
+        }
+        if std::path::Path::new(name)
+            .file_name()
+            .and_then(|value| value.to_str())
+            != Some(name)
+        {
+            return Err(Error::Parse(format!("unsafe dump part name: {name:?}")));
         }
         let url = format!("{dir}{name}");
         let size = http_resolve_size(client, &url)?;
@@ -172,6 +259,7 @@ fn parse_sha256sums(client: &Client, dir: &str, sums: &[u8]) -> Result<Vec<Part>
             size_bytes: size,
             sha256: Some(digest.to_string()),
             sha1: None,
+            md5: None,
         });
     }
     sort_parts_by_page_range(&mut parts);
@@ -297,6 +385,7 @@ fn discover_legacy(client: &Client, cfg: &Config, dbname: &str) -> Result<Run> {
                     } else {
                         Some(rec.sha1.clone())
                     },
+                    md5: None,
                 }
             })
             .collect();
@@ -319,37 +408,6 @@ fn http_get(client: &Client, url: &str) -> Result<(Vec<u8>, StatusCode)> {
     let status = resp.status();
     let body = resp.bytes()?;
     Ok((body.to_vec(), status))
-}
-
-/// Existence probe that transfers NO body bytes: HEAD first; a server
-/// that rejects/doesn't match HEAD (405, or a mock that only routes
-/// GET) is retried with a plain GET whose response is dropped after
-/// the status line — the body is never read.
-fn http_exists(client: &Client, url: &str) -> bool {
-    if let Ok(r) = client.head(url).send() {
-        if r.status().is_success() {
-            return true;
-        }
-        if r.status() == StatusCode::METHOD_NOT_ALLOWED || r.status() == StatusCode::NOT_FOUND {
-            // fall through to the GET probe: a HEAD 404 may be a
-            // GET-only route (mock servers), and 405 is an explicit
-            // "use another method".
-        } else {
-            return false;
-        }
-    }
-    match client.get(url).send() {
-        Ok(r) => r.status().is_success(), // response dropped unread
-        Err(_) => false,
-    }
-}
-
-fn http_fetch_ok(client: &Client, url: &str) -> Option<Vec<u8>> {
-    let resp = client.get(url).send().ok()?;
-    if !resp.status().is_success() {
-        return None;
-    }
-    resp.bytes().ok().map(|b| b.to_vec())
 }
 
 /// The `Content-Length` header as a number, if present and parseable.

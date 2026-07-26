@@ -146,6 +146,24 @@ pub struct ImportStats {
     pub sha1_mismatch: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PageAction {
+    pub event_type: String,
+    pub timestamp: String,
+    pub comment: String,
+    pub actor: String,
+    pub historical_title: String,
+    pub current_title: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RevisionVisibility {
+    pub deleted_parts: String,
+    pub parts_are_suppressed: bool,
+    pub deleted_by_page_deletion: bool,
+    pub page_deletion_timestamp: String,
+}
+
 /// One entry in a [`HistoryIter`]: metadata + a one-shot lazy text
 /// fetcher.
 pub struct HistoryEntry {
@@ -167,6 +185,7 @@ impl Iterator for HistoryIter {
 
 /// The per-dbname mirror. One process at a time per `root`.
 pub struct Instance {
+    root: PathBuf,
     /// `Arc` so the streaming [`HistoryIter`] (and its lazy `fetch_text`
     /// closures) can hold the handles across calls without borrowing
     /// the `Instance` — a history walk is frame-at-a-time, not a
@@ -293,6 +312,7 @@ impl Instance {
             .unwrap_or(false);
 
         Ok(Self {
+            root: cfg.root.clone(),
             inner: Arc::new(Mutex::new(InstanceInner {
                 depot,
                 titles,
@@ -391,6 +411,7 @@ impl Instance {
             .unwrap_or(false);
 
         Ok(Self {
+            root: cfg.root.clone(),
             inner: Arc::new(Mutex::new(InstanceInner {
                 depot,
                 titles,
@@ -413,6 +434,11 @@ impl Instance {
             title_shard_count,
             dbname: cfg.dbname,
         })
+    }
+
+    /// On-disk root for download staging and short-lived read-side opens.
+    pub fn root(&self) -> &std::path::Path {
+        &self.root
     }
 
     /// Import one `PageStream` into the instance. Per-page atomic.
@@ -1110,6 +1136,39 @@ impl Instance {
         Ok(n > 0)
     }
 
+    pub fn has_seen_parts(&self) -> Result<bool> {
+        let g = self.inner.lock().expect("instance mutex poisoned");
+        Ok(g.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM parts_seen LIMIT 1)",
+            [],
+            |row| row.get::<_, i64>(0),
+        )? != 0)
+    }
+
+    /// Digest-aware watermark lookup used by network sync. A publisher-side
+    /// replacement under the same filename must not inherit the old part's
+    /// skip marker.
+    pub fn part_seen_with_digest(&self, filename: &str, digest: Option<&str>) -> Result<bool> {
+        let g = self.inner.lock().expect("instance mutex poisoned");
+        let stored: Option<Option<String>> = g
+            .conn
+            .query_row(
+                "SELECT sha256 FROM parts_seen WHERE part_filename = ?1",
+                [filename],
+                |row| row.get(0),
+            )
+            .map(Some)
+            .or_else(ignore_no_rows)?;
+        Ok(match (stored, digest) {
+            (None, _) => false,
+            (Some(Some(stored)), Some(digest)) => stored.eq_ignore_ascii_case(digest),
+            // Preserve legacy/no-checksum watermarks only when the current
+            // manifest also provides no checksum.
+            (Some(None), None) => true,
+            _ => false,
+        })
+    }
+
     /// Record a fully-imported dump part. Call only after the part's
     /// pages are durably flushed — the watermark is the skip signal for
     /// the next sync, so writing it early would drop data on a crash.
@@ -1124,6 +1183,68 @@ impl Instance {
             rusqlite::params![filename, sha256],
         )?;
         Ok(())
+    }
+
+    pub fn sync_state(&self, key: &str) -> Result<Option<String>> {
+        let g = self.inner.lock().expect("instance mutex poisoned");
+        g.conn
+            .query_row("SELECT value FROM sync_state WHERE key = ?1", [key], |row| row.get(0))
+            .map(Some)
+            .or_else(ignore_no_rows)
+    }
+
+    pub fn set_sync_state(&self, key: &str, value: &str) -> Result<()> {
+        if self.read_only {
+            return Err(Error::ReadOnly("set_sync_state"));
+        }
+        let g = self.inner.lock().expect("instance mutex poisoned");
+        g.conn.execute(
+            "INSERT OR REPLACE INTO sync_state(key, value) VALUES(?1, ?2)",
+            rusqlite::params![key, value],
+        )?;
+        Ok(())
+    }
+
+    pub fn page_actions(&self, page_id: u64) -> Result<Vec<PageAction>> {
+        let g = self.inner.lock().expect("instance mutex poisoned");
+        let mut statement = g.conn.prepare(
+            "SELECT event_type,event_timestamp,event_comment,actor_name,
+                    title_historical,title_current
+             FROM page_actions WHERE page_id = ?1
+             ORDER BY event_timestamp DESC",
+        )?;
+        let rows = statement.query_map([page_id], |row| {
+            Ok(PageAction {
+                event_type: row.get(0)?,
+                timestamp: row.get(1)?,
+                comment: row.get(2)?,
+                actor: row.get(3)?,
+                historical_title: row.get(4)?,
+                current_title: row.get(5)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn revision_visibility(&self, revision_id: u64) -> Result<Option<RevisionVisibility>> {
+        let g = self.inner.lock().expect("instance mutex poisoned");
+        g.conn
+            .query_row(
+                "SELECT deleted_parts,parts_are_suppressed,
+                        deleted_by_page_deletion,page_deletion_timestamp
+                 FROM revision_visibility WHERE revision_id = ?1",
+                [revision_id],
+                |row| {
+                    Ok(RevisionVisibility {
+                        deleted_parts: row.get(0)?,
+                        parts_are_suppressed: row.get::<_, i64>(1)? != 0,
+                        deleted_by_page_deletion: row.get::<_, i64>(2)? != 0,
+                        page_deletion_timestamp: row.get(3)?,
+                    })
+                },
+            )
+            .map(Some)
+            .or_else(ignore_no_rows)
     }
 
     /// Session-end compaction: reclaim update-churn slack parked in the

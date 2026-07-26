@@ -194,6 +194,18 @@ pub fn job_add(kind: &str, src: &str, dest: &str, interval_secs: i64) -> Result<
         return Err(format!("unknown mirror kind {kind:?} (git|wiki|ietf|cmd)"));
     }
     let conn = db()?;
+    let collision: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM jobs WHERE dest = ?1 LIMIT 1",
+            [dest],
+            |row| row.get(0),
+        )
+        .ok();
+    if let Some(id) = collision {
+        return Err(format!(
+            "destination {dest:?} is already owned by mirror job #{id}"
+        ));
+    }
     conn.execute(
         "INSERT INTO jobs(kind, src, dest, interval_secs) VALUES(?1,?2,?3,?4)",
         params![kind, src, dest, interval_secs.max(60)],
@@ -268,17 +280,60 @@ pub fn job_run(id: i64) -> Result<(), String> {
     if running_map(|m| m.contains_key(&id)) {
         return Err("job is already running".into());
     }
-    spawn_run(job);
+    spawn_run(job, WikiRun::Maintain);
+    Ok(())
+}
+
+/// Explicitly re-ingest the newest full Wikipedia snapshot. This is never
+/// scheduled: routine wiki jobs consume daily adds/changes through `fetch`.
+pub fn job_run_full(id: i64) -> Result<(), String> {
+    let jobs = jobs_list()?;
+    let job = jobs.into_iter().find(|j| j.id == id).ok_or("no such job")?;
+    if job.kind != "wiki" {
+        return Err("full snapshot re-ingest is only available for wiki mirrors".into());
+    }
+    if running_map(|m| m.contains_key(&id)) {
+        return Err("job is already running".into());
+    }
+    spawn_run(job, WikiRun::RefreshContent);
+    Ok(())
+}
+
+/// Explicitly reconcile every MediaWiki History partition. Kept separate
+/// from full XML content re-ingest because either operation can be enormous.
+pub fn job_reconcile_history(id: i64) -> Result<(), String> {
+    let jobs = jobs_list()?;
+    let job = jobs.into_iter().find(|j| j.id == id).ok_or("no such job")?;
+    if job.kind != "wiki" {
+        return Err("history reconciliation is only available for wiki mirrors".into());
+    }
+    if running_map(|m| m.contains_key(&id)) {
+        return Err("job is already running".into());
+    }
+    spawn_run(job, WikiRun::ReconcileHistory);
     Ok(())
 }
 
 /// Start every due, unpaused, not-running job. Returns the started ids.
 pub fn run_pending() -> Result<Vec<i64>, String> {
     let mut started = Vec::new();
-    for j in jobs_list()? {
+    let jobs = jobs_list()?;
+    // Full-history Wikimedia parts are large. Keep at most one automatic
+    // wiki transfer active; other mirror kinds remain independent. A user
+    // can still force-run a particular job explicitly.
+    let mut wiki_running = jobs
+        .iter()
+        .any(|job| job.kind == "wiki" && job.state == "running");
+    for j in jobs {
         if j.state == "pending" || j.state == "stopped" {
+            if j.kind == "wiki" && wiki_running {
+                continue;
+            }
+            if j.kind == "wiki" {
+                wiki_running = true;
+            }
             let id = j.id;
-            spawn_run(j);
+            spawn_run(j, WikiRun::Maintain);
             started.push(id);
         }
     }
@@ -297,7 +352,14 @@ fn driver_argv(name: &str, self_exe: Option<std::path::PathBuf>) -> Vec<String> 
     }
 }
 
-fn spawn_run(job: Job) {
+#[derive(Clone, Copy)]
+enum WikiRun {
+    Maintain,
+    RefreshContent,
+    ReconcileHistory,
+}
+
+fn spawn_run(job: Job, wiki_run: WikiRun) {
     let driver = |name: &str| driver_argv(name, std::env::current_exe().ok());
     let argv: Vec<String> = match job.kind.as_str() {
         "git" => [
@@ -307,7 +369,16 @@ fn spawn_run(job: Job) {
         .concat(),
         "wiki" => [
             driver("wikimak"),
-            vec!["fetch".into(), job.src.clone(), job.dest.clone()],
+            vec![
+                match wiki_run {
+                    WikiRun::Maintain => "fetch",
+                    WikiRun::RefreshContent => "refresh-full",
+                    WikiRun::ReconcileHistory => "reconcile-history",
+                }
+                .into(),
+                job.src.clone(),
+                job.dest.clone(),
+            ],
         ]
         .concat(),
         "cmd" => vec![

@@ -90,12 +90,14 @@ fn write_dump(path: &Path) -> u64 {
     total
 }
 
-/// Peak RSS in bytes over all reaped children (Linux ru_maxrss is KB).
+/// Peak RSS in bytes over all reaped children (Linux reports KiB,
+/// macOS reports bytes).
 fn children_peak_rss() -> u64 {
     let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
     let rc = unsafe { libc::getrusage(libc::RUSAGE_CHILDREN, &mut ru) };
     assert_eq!(rc, 0, "getrusage failed");
-    ru.ru_maxrss as u64 * 1024
+    let rss = ru.ru_maxrss as u64;
+    if cfg!(target_os = "macos") { rss } else { rss * 1024 }
 }
 
 /// Total bytes of every regular file under `dir`, recursively, as a

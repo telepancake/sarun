@@ -24,6 +24,7 @@ fn part(url: String, filename: &str, body: &[u8], sha256: Option<String>, sha1: 
         size_bytes: body.len() as u64,
         sha256,
         sha1,
+        md5: None,
     }
 }
 

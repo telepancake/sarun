@@ -2,6 +2,8 @@
 //!
 //!   wikimak discover <dbname>                  list newest complete run
 //!   wikimak fetch <dbname> <root>               discover + fetch + import
+//!   wikimak refresh-full <dbname> <root>        explicit full snapshot ingest
+//!   wikimak reconcile-history <dbname> <root>   explicit metadata rebuild
 //!   wikimak import <dump.xml[.bz2]> <root>     import/refresh a dump
 //!   wikimak head <root> <page_id>              newest revision meta
 //!   wikimak text <root> <page_id>              newest revision text
@@ -70,8 +72,20 @@ fn cmd_import(dump: &str, root: &str, max_page_id: Option<u64>) -> Result<(), St
 }
 
 fn http_client() -> Result<reqwest::blocking::Client, String> {
+    let operator = std::env::var("SARUN_WIKIMEDIA_CONTACT")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| format!("; operator: {value}"))
+        .unwrap_or_default();
     reqwest::blocking::Client::builder()
-        .user_agent("wikimak/0 (sarun mirror; contact: local)")
+        .user_agent(format!(
+            "sarun-wikimak/{} (+https://github.com/telepancake/sarun{operator})",
+            env!("CARGO_PKG_VERSION")
+        ))
+        .connect_timeout(std::time::Duration::from_secs(30))
+        // A full-history part can legitimately stream for hours. This is
+        // finite so a dead connection cannot pin a scheduled job forever.
+        .timeout(std::time::Duration::from_secs(24 * 3600))
         .build()
         .map_err(|e| e.to_string())
 }
@@ -90,14 +104,48 @@ fn cmd_discover(dbname: &str) -> Result<(), String> {
 fn cmd_fetch(dbname: &str, root: &str, max_page_id: Option<u64>) -> Result<(), String> {
     let inst = open_instance(PathBuf::from(root), max_page_id)?;
     let client = http_client()?;
+    let stats = crate::maintain(
+        &inst, &client, &wikimak_mediawiki::Config::default(), dbname,
+        |name, fetched| eprintln!("{} {}", if fetched { "fetch" } else { "skip " }, name),
+    ).map_err(|e| e.to_string())?;
+    println!(
+        "daily maintenance: content parts {}/{} fetched ({} skipped)  pages {}  revisions new {}  deduped {}  history parts {}  page actions {}",
+        stats.parts_fetched, stats.parts_total, stats.parts_skipped,
+        stats.import.pages, stats.import.revisions_new, stats.import.revisions_deduped,
+        stats.history_parts_fetched, stats.page_actions
+    );
+    Ok(())
+}
+
+fn cmd_refresh_full(dbname: &str, root: &str, max_page_id: Option<u64>) -> Result<(), String> {
+    let inst = open_instance(PathBuf::from(root), max_page_id)?;
+    let client = http_client()?;
     let (run, stats) = crate::sync(
         &inst, &client, &wikimak_mediawiki::Config::default(), dbname,
         |name, fetched| eprintln!("{} {}", if fetched { "fetch" } else { "skip " }, name),
     ).map_err(|e| e.to_string())?;
     println!(
-        "run {}  parts {}/{} fetched ({} skipped)  pages {}  revisions new {}  deduped {}",
+        "full content snapshot {}: parts {}/{} fetched ({} skipped)  pages {}  revisions new {}  deduped {}",
         run.date, stats.parts_fetched, stats.parts_total, stats.parts_skipped,
         stats.import.pages, stats.import.revisions_new, stats.import.revisions_deduped
+    );
+    Ok(())
+}
+
+fn cmd_reconcile_history(
+    dbname: &str,
+    root: &str,
+    max_page_id: Option<u64>,
+) -> Result<(), String> {
+    let inst = open_instance(PathBuf::from(root), max_page_id)?;
+    let client = http_client()?;
+    let stats = crate::reconcile_history(
+        &inst, &client, &wikimak_mediawiki::Config::default(), dbname,
+        |name, fetched| eprintln!("{} {}", if fetched { "fetch" } else { "skip " }, name),
+    ).map_err(|e| e.to_string())?;
+    println!(
+        "MediaWiki History reconciliation: parts {}  page actions {}",
+        stats.history_parts_fetched, stats.page_actions
     );
     Ok(())
 }
@@ -142,6 +190,7 @@ fn cmd_text(root: &str, page: u64, asof_micros: Option<i64>) -> Result<(), Strin
 fn cmd_serve(root: &str, addr: &str) -> Result<(), String> {
     let inst = open_instance(PathBuf::from(root), None)?;
     let cfg = crate::serve::ServeConfig {
+        root: PathBuf::from(root),
         addr: addr.to_string(),
         media_cache: PathBuf::from(root).join("media"),
     };
@@ -189,6 +238,10 @@ pub fn cli_main(args: &[String]) -> i32 {
     let r = match strs.as_slice() {
         ["discover", dbname] => cmd_discover(dbname),
         ["fetch", dbname, root] => cmd_fetch(dbname, root, max_page_id),
+        ["refresh-full", dbname, root] => cmd_refresh_full(dbname, root, max_page_id),
+        ["reconcile-history", dbname, root] => {
+            cmd_reconcile_history(dbname, root, max_page_id)
+        }
         ["import", dump, root] => cmd_import(dump, root, max_page_id),
         ["pages", root] => cmd_pages(root, None),
         ["pages", root, filter] => cmd_pages(root, Some(filter)),
@@ -208,6 +261,8 @@ pub fn cli_main(args: &[String]) -> i32 {
         _ => Err("usage: wikimak discover <dbname>\n\
                   \x20      wikimak pages <root> [filter]\n\
                   \x20      wikimak fetch <dbname> <root> [--max-page-id N]\n\
+                  \x20      wikimak refresh-full <dbname> <root> [--max-page-id N]\n\
+                  \x20      wikimak reconcile-history <dbname> <root> [--max-page-id N]\n\
                   \x20      wikimak import <dump.xml[.bz2]> <root> [--max-page-id N]\n\
                   \x20      wikimak serve <root> [addr]        (default 127.0.0.1:8642)\n\
                   \x20      wikimak head|history <root> <page_id>\n\

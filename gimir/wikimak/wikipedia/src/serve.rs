@@ -14,11 +14,11 @@
 //! the renderer covers content links through [`RenderOptions::asof_query`];
 //! the chrome links (history/allpages/date-picker) append it here.
 //!
-//! Concurrency: [`Instance`] is `Sync` (its state sits behind an inner
-//! `Mutex`), so it is shared as `Arc` across a fixed 4-thread pool that
-//! each block in `Server::recv`. A [`LuaInvoker`] is built PER RENDER — its
-//! module-source cache is per-τ (per-render), so it cannot be pooled across
-//! requests that may carry different τ.
+//! Concurrency: each request opens a bounded read-side [`Instance`] and drops
+//! it after producing the response. The server therefore does not hold a
+//! lifetime flock that would prevent scheduled imports. A [`LuaInvoker`] is
+//! built PER RENDER — its module-source cache is per-τ (per-render), so it
+//! cannot be pooled across requests that may carry different τ.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -44,6 +44,8 @@ const MAX_REDIRECT_HOPS: u32 = 10;
 const POOL_THREADS: usize = 4;
 
 pub struct ServeConfig {
+    /// Existing wikimak instance root.
+    pub root: PathBuf,
     /// Bind address, e.g. `127.0.0.1:8642`.
     pub addr: String,
     /// Blob-cache root for materialized media. Offline serve (no `fetch`
@@ -54,19 +56,28 @@ pub struct ServeConfig {
 type Resp = Response<std::io::Cursor<Vec<u8>>>;
 
 struct App {
-    inst: Arc<Instance>,
+    inst: Instance,
+    media: Arc<MediaStore>,
+}
+
+struct ServerApp {
+    root: PathBuf,
     media: Arc<MediaStore>,
 }
 
 /// Start the server and block, dispatching requests across the pool.
 pub fn serve(inst: Instance, cfg: ServeConfig) -> Result<(), String> {
+    // The caller historically handed serve a writable instance. Release its
+    // exclusive lifetime lock before accepting requests; each request below
+    // takes only the shared read lock needed to decode its response.
+    drop(inst);
     let server = Server::http(&cfg.addr).map_err(|e| format!("bind {}: {e}", cfg.addr))?;
     let server = Arc::new(server);
     // No repos + no `fetch` feature ⇒ every media miss is an offline miss
     // (inline placeholder). A prefetch driver could pass a commons chain.
     let media = MediaStore::new(cfg.media_cache, Vec::new());
-    let app = Arc::new(App {
-        inst: Arc::new(inst),
+    let app = Arc::new(ServerApp {
+        root: cfg.root,
         media: Arc::new(media),
     });
 
@@ -89,10 +100,18 @@ pub fn serve(inst: Instance, cfg: ServeConfig) -> Result<(), String> {
     Ok(())
 }
 
-fn handle(app: &App, req: &Request) -> Resp {
+fn handle(server: &ServerApp, req: &Request) -> Resp {
     if *req.method() != Method::Get {
         return text_resp(405, "method not allowed");
     }
+    let inst = match Instance::open_read(crate::instance::read_config(server.root.clone())) {
+        Ok(inst) => inst,
+        Err(error) => return text_resp(503, &format!("mirror temporarily unavailable: {error}")),
+    };
+    let app = App {
+        inst,
+        media: Arc::clone(&server.media),
+    };
     let url = req.url();
     let (path, query_raw) = match url.split_once('?') {
         Some((p, q)) => (p, q),
@@ -104,18 +123,18 @@ fn handle(app: &App, req: &Request) -> Resp {
         return redirect("/w/allpages");
     }
     if let Some(rest) = path.strip_prefix("/wiki/") {
-        return page_response(app, &percent_decode(rest), &query);
+        return page_response(&app, &percent_decode(rest), &query);
     }
     if let Some(rest) = path.strip_prefix("/w/history/") {
-        return history_response(app, &percent_decode(rest), &query);
+        return history_response(&app, &percent_decode(rest), &query);
     }
     if path == "/w/allpages" {
-        return allpages_response(app, &query);
+        return allpages_response(&app, &query);
     }
     if let Some(rest) = path.strip_prefix("/w/media/") {
-        return media_response(app, &percent_decode(rest), &query);
+        return media_response(&app, &percent_decode(rest), &query);
     }
-    not_found_page(app, &query)
+    not_found_page(&app, &query)
 }
 
 // ---------------------------------------------------------------------------
@@ -271,7 +290,7 @@ fn page_response(app: &App, raw_title: &str, query: &HashMap<String, String>) ->
     if let Some(out) = &out {
         body.push_str(&categories_footer(&out.categories, &asof_query));
     }
-    body.push_str(&instance_footer(site, ts));
+    body.push_str(&instance_footer(site, ts, Some(&display)));
 
     html_resp(200, &shell(site, &escape(&display), &body))
 }
@@ -308,8 +327,45 @@ fn history_response(app: &App, raw_title: &str, query: &HashMap<String, String>)
                     crate::ContributorMeta::Anonymous { ip } => ip.clone(),
                     crate::ContributorMeta::Hidden => "(hidden)".to_string(),
                 };
+                let visibility = inst
+                    .revision_visibility(e.meta.rev_id)
+                    .ok()
+                    .flatten()
+                    .map(|state| {
+                        let mut notes = Vec::new();
+                        if !state.deleted_parts.is_empty() {
+                            notes.push(format!(
+                                "upstream marks {} hidden{}",
+                                escape(&state.deleted_parts),
+                                if state.parts_are_suppressed {
+                                    " (suppressed)"
+                                } else {
+                                    ""
+                                }
+                            ));
+                        }
+                        if state.deleted_by_page_deletion {
+                            notes.push(if state.page_deletion_timestamp.is_empty() {
+                                "upstream page deletion".to_string()
+                            } else {
+                                format!(
+                                    "upstream page deletion at {}",
+                                    escape(&state.page_deletion_timestamp)
+                                )
+                            });
+                        }
+                        if notes.is_empty() {
+                            String::new()
+                        } else {
+                            format!(
+                                " · <span class=\"visibility\">archived locally; {}</span>",
+                                notes.join("; ")
+                            )
+                        }
+                    })
+                    .unwrap_or_default();
                 rows.push_str(&format!(
-                    r#"<li><a href="/wiki/{path}?asof={micros}">{when}</a> · rev {rev} · {len} bytes · {who}{comment}</li>"#,
+                    r#"<li><a href="/wiki/{path}?asof={micros}">{when}</a> · rev {rev} · {len} bytes · {who}{comment}{visibility}</li>"#,
                     path = wikimak_wikitext::html::encode_path(&display),
                     micros = micros,
                     when = escape(&micros_to_datetime(micros)),
@@ -321,12 +377,50 @@ fn history_response(app: &App, raw_title: &str, query: &HashMap<String, String>)
                     } else {
                         format!(" · <span class=\"comment\">{}</span>", escape(&e.meta.comment))
                     },
+                    visibility = visibility,
                 ));
             }
         }
     }
     if rows.is_empty() {
         rows.push_str("<li class=\"noarticle\">No revisions.</li>");
+    }
+
+    let mut actions = String::new();
+    if let Some(pid) = page_id {
+        if let Ok(page_actions) = inst.page_actions(pid) {
+            for action in page_actions {
+                let titles = match (
+                    action.historical_title.is_empty(),
+                    action.current_title.is_empty(),
+                    action.historical_title == action.current_title,
+                ) {
+                    (false, false, false) => format!(
+                        " · {} → {}",
+                        escape(&action.historical_title),
+                        escape(&action.current_title)
+                    ),
+                    (false, _, _) => format!(" · {}", escape(&action.historical_title)),
+                    (_, false, _) => format!(" · {}", escape(&action.current_title)),
+                    _ => String::new(),
+                };
+                actions.push_str(&format!(
+                    "<li>{when} · {kind} · {actor}{titles}{comment}</li>",
+                    when = escape(&action.timestamp),
+                    kind = escape(&action.event_type),
+                    actor = if action.actor.is_empty() {
+                        "(hidden)".to_string()
+                    } else {
+                        escape(&action.actor)
+                    },
+                    comment = if action.comment.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" · <span class=\"comment\">{}</span>", escape(&action.comment))
+                    },
+                ));
+            }
+        }
     }
 
     let mut body = String::new();
@@ -338,7 +432,11 @@ fn history_response(app: &App, raw_title: &str, query: &HashMap<String, String>)
         disp = escape(&display),
     ));
     body.push_str(&format!("<ul class=\"history\">{rows}</ul>"));
-    body.push_str(&instance_footer(site, ts));
+    if !actions.is_empty() {
+        body.push_str("<h2>Page actions</h2>");
+        body.push_str(&format!("<ul class=\"history\">{actions}</ul>"));
+    }
+    body.push_str(&instance_footer(site, ts, Some(&display)));
 
     html_resp(200, &shell(site, &escape(&display), &body))
 }
@@ -390,7 +488,7 @@ fn allpages_response(app: &App, query: &HashMap<String, String>) -> Resp {
         },
     ));
     body.push_str(&format!("<ul class=\"allpages\">{rows}</ul>"));
-    body.push_str(&instance_footer(site, ts));
+    body.push_str(&instance_footer(site, ts, None));
 
     html_resp(200, &shell(site, "All pages", &body))
 }
@@ -556,7 +654,11 @@ fn categories_footer(categories: &[String], asof_query: &str) -> String {
     )
 }
 
-fn instance_footer(site: &wikimak_wikitext::SiteConfig, ts: Option<i64>) -> String {
+fn instance_footer(
+    site: &wikimak_wikitext::SiteConfig,
+    ts: Option<i64>,
+    source_title: Option<&str>,
+) -> String {
     let name = if !site.site_name.is_empty() {
         site.site_name.clone()
     } else if !site.db_name.is_empty() {
@@ -568,8 +670,20 @@ fn instance_footer(site: &wikimak_wikitext::SiteConfig, ts: Option<i64>) -> Stri
         Some(ts) => format!("τ = {}", micros_to_datetime(ts)),
         None => "τ = now (head)".to_string(),
     };
+    let source = if site.server.is_empty() {
+        String::new()
+    } else if let Some(title) = source_title {
+        let path = wikimak_wikitext::html::encode_path(title);
+        format!(
+            r#" · <a href="{server}/wiki/{path}">source page</a> · <a href="{server}/w/index.php?title={query}&action=history">revision history</a>"#,
+            server = escape(&site.server),
+            query = urlq(title),
+        )
+    } else {
+        format!(r#" · <a href="{}">source site</a>"#, escape(&site.server))
+    };
     format!(
-        r#"<footer class="site"><span>{}</span> · <span>{}</span></footer>"#,
+        r#"<footer class="site"><span>{}</span> · <span>{}</span>{source} · <span>Text from Wikimedia, available under <a href="https://creativecommons.org/licenses/by-sa/4.0/">CC BY-SA 4.0</a>; additional terms may apply.</span></footer>"#,
         escape(&name),
         escape(&tau),
     )
@@ -583,7 +697,7 @@ fn not_found_page(app: &App, query: &HashMap<String, String>) -> Resp {
             format!(
                 "{}<h1 class=\"page-title\">Not found</h1><p>No such route.</p>{}",
                 header_bar(app, site, "/w/allpages", ts, ""),
-                instance_footer(site, ts),
+                instance_footer(site, ts, None),
             )
         }
         Err(_) => "<h1>Not found</h1>".to_string(),

@@ -8040,6 +8040,26 @@ macro_rules! ui_verbs {
                 state, crate::generated_wire::ActionRequest::MirrorRun { id },
             ));
         }
+        // args: [id] — explicit, never-scheduled Wikipedia full snapshot.
+        "mirror_run_full" => {
+            let Some(id) = args.first().and_then(Value::as_i64) else {
+                return json!({"ok": false, "error": "need job id"});
+            };
+            return match crate::mirrors::job_run_full(id) {
+                Ok(()) => json!({"ok": true}),
+                Err(error) => json!({"ok": false, "error": error}),
+            };
+        }
+        // args: [id] — explicit all-partition MediaWiki History rebuild.
+        "mirror_reconcile_history" => {
+            let Some(id) = args.first().and_then(Value::as_i64) else {
+                return json!({"ok": false, "error": "need job id"});
+            };
+            return match crate::mirrors::job_reconcile_history(id) {
+                Ok(()) => json!({"ok": true}),
+                Err(error) => json!({"ok": false, "error": error}),
+            };
+        }
         // Start every due/stopped unpaused job.
         "mirror_run_pending" => {
             return legacy_ui_action_reply(dispatch_action(

@@ -39,6 +39,7 @@ pub enum Error {
 pub enum RunSource {
     ContentHistory,
     Legacy,
+    Incremental,
 }
 
 #[derive(Debug, Clone)]
@@ -55,6 +56,7 @@ pub struct Part {
     pub size_bytes: u64,
     pub sha256: Option<String>,
     pub sha1: Option<String>,
+    pub md5: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -78,8 +78,9 @@ the depot, instance table, and titles table.
 
 - **mediawiki_history TSV** (`dumps.wikimedia.org/other/mediawiki_history/`):
   monthly, ~2–7 days after month end, **only the last 2 snapshots are
-  retained**, each snapshot is a full rebuild since 2001 (never mix
-  snapshots). TSV bz2, no header row, 76 columns (authoritative list:
+  retained**, each snapshot is a full rebuild since 2001 (never call a
+  mixed-snapshot frontier update fully reconciled). TSV bz2, no header row, 76 columns in the legacy schema
+  and 78 in current dumps after temporary-account fields were added (field list:
   wikitech "MediaWiki history dumps"). Per-wiki files split monthly
   (enwiki/wikidata/commons), yearly (~40 mid wikis), or all-time.
   Relevant: `event_entity` page|revision|user, `event_type`
@@ -531,7 +532,7 @@ reinforce each other.
   (Kind "wiki") + engine/CLI wiring; cooldown integration. Acceptance:
   `wiki:<domain>` in repos.txt → `gimir pull` seeds and is resumable;
   admin index lists the wiki mirror with a badge.
-- **W5 — titles.** mediawiki_history TSV streaming parser (76-col,
+- **W5 — titles.** mediawiki_history TSV streaming parser (explicit 76/78-col mappings,
   escaping rules), interval builder, title + reverse KV indexes,
   page-events lane population, page.sql/redirect.sql cross-check
   parser (extended-INSERT streaming). Acceptance: title-at-time queries
