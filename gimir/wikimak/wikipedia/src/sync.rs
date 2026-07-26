@@ -14,8 +14,9 @@
 //! A crash between 2 and 3 re-imports the part; `revisions_seen` dedup
 //! makes that a cheap no-op, never a correctness problem.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::io::{BufRead, Read};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use reqwest::blocking::Client;
@@ -408,6 +409,7 @@ fn import_run(
         parts_total: run.parts.len() as u64,
         ..Default::default()
     };
+    let mut pending = Vec::new();
     for part in &run.parts {
         let digest = part.sha256.as_deref().or(part.sha1.as_deref()).or(part.md5.as_deref());
         if inst.part_seen_with_digest(&part.filename, digest)? {
@@ -416,39 +418,149 @@ fn import_run(
             continue;
         }
         progress(&part.filename, true);
-        let reader = fetch(client, part)?;
-        let boxed: Box<dyn Read + Send> = if part.filename.ends_with(".bz2") {
-            Box::new(wikimak_mediawiki::bz2::new_bz2_reader(
-                reader,
-                wikimak_mediawiki::bz2::Bz2Options { workers: 0 },
-            ))
-        } else {
-            Box::new(reader)
-        };
-        let mut stream = new_page_stream(boxed);
-        let s = match inst.import(&mut stream) {
-            Ok(stats) => stats,
-            Err(error) => {
-                // Complete pages are independent archival records. Make the
-                // successfully parsed prefix durable but leave the instance
-                // dirty and this part unwatermarked; a later copy repairs or
-                // deduplicates the prefix and continues past the damage.
-                inst.flush_salvage()?;
-                return Err(error);
-            }
-        };
-        add_import(&mut stats.import, &s);
-        inst.flush()?;
+        pending.push(part.clone());
+    }
+    if pending.is_empty() {
+        return Ok(stats);
+    }
+
+    // A page may be split into revision slices (`-pXrArB`). Such slices form
+    // one sequential group; groups with disjoint page-id ranges are safe to
+    // fetch, decode, and parse concurrently. The Instance's per-page mutex is
+    // the narrow final writer boundary.
+    let groups = part_groups(pending.clone());
+    let cores = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1);
+    let outer_workers = groups.len().min(cores).min(4).max(1);
+    let bz2_workers = (cores / outer_workers).max(1);
+    let queue = Arc::new(Mutex::new(VecDeque::from(groups)));
+    let imported = Arc::new(Mutex::new(ImportStats::default()));
+    let failure = Arc::new(Mutex::new(None));
+
+    std::thread::scope(|scope| {
+        for _ in 0..outer_workers {
+            let queue = Arc::clone(&queue);
+            let imported = Arc::clone(&imported);
+            let failure = Arc::clone(&failure);
+            scope.spawn(move || {
+                loop {
+                    if failure.lock().expect("failure mutex poisoned").is_some() {
+                        return;
+                    }
+                    let Some(group) = queue.lock().expect("part queue poisoned").pop_front() else {
+                        return;
+                    };
+                    let mut local = ImportStats::default();
+                    for part in group {
+                        if failure.lock().expect("failure mutex poisoned").is_some() {
+                            return;
+                        }
+                        match import_part(inst, client, &part, bz2_workers) {
+                            Ok(part_stats) => add_import(&mut local, &part_stats),
+                            Err(error) => {
+                                *failure.lock().expect("failure mutex poisoned") = Some(error);
+                                return;
+                            }
+                        }
+                    }
+                    add_import(
+                        &mut imported.lock().expect("import stats mutex poisoned"),
+                        &local,
+                    );
+                }
+            });
+        }
+    });
+
+    if let Some(error) = failure.lock().expect("failure mutex poisoned").take() {
+        // Complete pages from every active pipeline are independent archival
+        // records. Make all successfully parsed prefixes durable, but leave
+        // every pending part unwatermarked so a retry repairs/deduplicates.
+        inst.flush_salvage()?;
+        return Err(error);
+    }
+
+    // One durability fence covers the concurrent batch. Only after it lands
+    // do any part watermarks become skippable.
+    inst.flush()?;
+    for part in &pending {
+        let digest = part
+            .sha256
+            .as_deref()
+            .or(part.sha1.as_deref())
+            .or(part.md5.as_deref());
         inst.mark_part_seen(&part.filename, digest)?;
-        stats.parts_fetched += 1;
     }
-    // Sync session over: reclaim the churn slack (dead superseded heads)
-    // parked in the depot's current write files. Once per sync, not per
-    // part — mid-session the slack is what keeps prepends cheap.
-    if stats.parts_fetched > 0 {
-        inst.collect()?;
-    }
+    stats.parts_fetched = pending.len() as u64;
+    stats.import = std::mem::take(&mut *imported.lock().expect("import stats mutex poisoned"));
+    inst.collect()?;
     Ok(stats)
+}
+
+fn import_part(
+    inst: &Instance,
+    client: &Client,
+    part: &wikimak_mediawiki::Part,
+    bz2_workers: usize,
+) -> Result<ImportStats> {
+    let reader = fetch(client, part)?;
+    let boxed: Box<dyn Read + Send> = if part.filename.ends_with(".bz2") {
+        Box::new(wikimak_mediawiki::bz2::new_bz2_reader(
+            reader,
+            wikimak_mediawiki::bz2::Bz2Options {
+                workers: bz2_workers,
+            },
+        ))
+    } else {
+        Box::new(reader)
+    };
+    let mut stream = new_page_stream(boxed);
+    inst.import(&mut stream)
+}
+
+fn part_groups(parts: Vec<wikimak_mediawiki::Part>) -> Vec<Vec<wikimak_mediawiki::Part>> {
+    let spans: Option<Vec<_>> = parts
+        .iter()
+        .map(|part| part_page_span(&part.filename))
+        .collect();
+    let Some(spans) = spans else {
+        // An unparseable filename might overlap any other part. Preserve the
+        // source order rather than guessing that parallel import is safe.
+        return vec![parts];
+    };
+    let mut groups: Vec<Vec<wikimak_mediawiki::Part>> = Vec::new();
+    let mut group_end = 0u64;
+    for (part, (start, end)) in parts.into_iter().zip(spans) {
+        if groups.is_empty() || start > group_end {
+            groups.push(vec![part]);
+            group_end = end;
+        } else {
+            groups.last_mut().expect("group exists").push(part);
+            group_end = group_end.max(end);
+        }
+    }
+    groups
+}
+
+fn part_page_span(filename: &str) -> Option<(u64, u64)> {
+    let marker = filename.rfind("-p")?;
+    let tail = &filename[marker + 2..];
+    let start_len = tail.bytes().take_while(u8::is_ascii_digit).count();
+    if start_len == 0 {
+        return None;
+    }
+    let start = tail[..start_len].parse().ok()?;
+    match tail.as_bytes().get(start_len).copied()? {
+        b'r' => Some((start, start)),
+        b'p' => {
+            let rest = &tail[start_len + 1..];
+            let end_len = rest.bytes().take_while(u8::is_ascii_digit).count();
+            let end = rest.get(..end_len)?.parse().ok()?;
+            (start <= end).then_some((start, end))
+        }
+        _ => None,
+    }
 }
 
 /// Bootstrap once from a full-history snapshot, then consume only Wikimedia's
@@ -514,4 +626,58 @@ pub fn maintain(
     total.history_parts_fetched = history_parts;
     total.page_actions = page_actions;
     Ok(total)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn part(filename: &str) -> wikimak_mediawiki::Part {
+        wikimak_mediawiki::Part {
+            url: String::new(),
+            filename: filename.into(),
+            size_bytes: 0,
+            sha256: None,
+            sha1: None,
+            md5: None,
+        }
+    }
+
+    #[test]
+    fn disjoint_page_ranges_form_parallel_groups() {
+        let groups = part_groups(vec![
+            part("lvwiki-2026-07-01-p1p35441.xml.bz2"),
+            part("lvwiki-2026-07-01-p35442p146417.xml.bz2"),
+            part("lvwiki-2026-07-01-p146418p415563.xml.bz2"),
+        ]);
+        assert_eq!(groups.len(), 3);
+        assert!(groups.iter().all(|group| group.len() == 1));
+    }
+
+    #[test]
+    fn same_page_revision_slices_remain_sequential() {
+        let groups = part_groups(vec![
+            part("enwiki-2026-07-01-p1p99.xml.bz2"),
+            part("enwiki-2026-07-01-p100r1r999.xml.bz2"),
+            part("enwiki-2026-07-01-p100r1000r1999.xml.bz2"),
+            part("enwiki-2026-07-01-p101p200.xml.bz2"),
+        ]);
+        assert_eq!(groups.len(), 3);
+        assert_eq!(groups[1].len(), 2);
+    }
+
+    #[test]
+    fn overlapping_or_unknown_ranges_disable_unsafe_parallelism() {
+        let overlapping = part_groups(vec![
+            part("x-p1p100.xml.bz2"),
+            part("x-p50p150.xml.bz2"),
+            part("x-p151p200.xml.bz2"),
+        ]);
+        assert_eq!(overlapping.len(), 2);
+        assert_eq!(overlapping[0].len(), 2);
+
+        let unknown = part_groups(vec![part("x-p1p100.xml.bz2"), part("mystery.xml.bz2")]);
+        assert_eq!(unknown.len(), 1);
+        assert_eq!(unknown[0].len(), 2);
+    }
 }
