@@ -8031,6 +8031,49 @@ macro_rules! ui_verbs {
                 },
             ));
         }
+        // args: [kind, src, dest, interval?] — attach an existing portable
+        // mirror to this host without starting or scheduling network upkeep.
+        "mirror_register" => {
+            let (Some(kind), Some(src), Some(dest)) = (
+                args.first().and_then(Value::as_str),
+                args.get(1).and_then(Value::as_str),
+                args.get(2).and_then(Value::as_str),
+            ) else {
+                return json!({"ok": false, "error": "need kind, src, dest"});
+            };
+            if crate::wire::BoundedText::<{ crate::generated_wire::LIMIT_TEXT_BYTES }>::new(
+                kind.to_owned(),
+            )
+            .is_err()
+            {
+                return json!({"ok": false, "error": "mirror kind exceeds relation bound"});
+            }
+            if crate::wire::BoundedText::<{ crate::generated_wire::LIMIT_TEXT_BYTES }>::new(
+                src.to_owned(),
+            )
+            .is_err()
+            {
+                return json!({"ok": false, "error": "mirror source exceeds relation bound"});
+            }
+            if crate::wire::BoundedBytes::<{ crate::generated_wire::LIMIT_PATH_BYTES }>::new(
+                dest.as_bytes().to_vec(),
+            )
+            .is_err()
+            {
+                return json!({"ok": false, "error": "mirror destination exceeds relation bound"});
+            }
+            let interval = match args.get(3) {
+                None | Some(Value::Null) => 24 * 3600,
+                Some(value) => match value.as_i64().filter(|value| *value > 0) {
+                    Some(value) => value,
+                    None => return json!({"ok": false, "error": "invalid mirror interval"}),
+                },
+            };
+            return match crate::mirrors::job_register_paused(kind, src, dest, interval) {
+                Ok(id) => json!({"ok": true, "id": id}),
+                Err(error) => json!({"ok": false, "error": error}),
+            };
+        }
         // args: [id] — force-run one job now (paused included).
         "mirror_run" => {
             let Some(id) = legacy_u64(args, 0) else {

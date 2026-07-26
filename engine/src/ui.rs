@@ -513,6 +513,10 @@ enum Modal {
         cadence: usize,
         field: WikiSetupField,
     },
+    /// Attach a portable Wikipedia mirror library already present on disk.
+    /// The path may be one mirror root or a folder containing mirror roots.
+    /// Discovery is read-only; registration is local and initially paused.
+    WikiMirrorLibrary { path: String },
     /// Standalone image viewer popover (DESIGN-web.md W8). `title` is the
     /// caption (source · dimensions · format); `note` is a fallback message
     /// shown in the box body when there's no image to blit (no sixel support,
@@ -717,6 +721,7 @@ enum Action {
     MoveRuleDown,
     /// Mirrors pane: the r / R / space / D / b key actions, menu-discoverable.
     WikiMirrorAdd,
+    WikiMirrorOpenLibrary,
     MirrorRun,
     MirrorRunPending,
     MirrorFullRefresh,
@@ -3943,6 +3948,87 @@ impl App {
             cadence: 0,
             field: WikiSetupField::Sites,
         });
+    }
+
+    fn open_wiki_mirror_library(&mut self) {
+        self.modal = Some(Modal::WikiMirrorLibrary {
+            path: String::new(),
+        });
+    }
+
+    fn commit_wiki_mirror_library(&mut self, input: String) {
+        let path = expand_user_path(input.trim());
+        if path.as_os_str().is_empty() {
+            self.status = "Wikipedia library: choose a folder".into();
+            self.modal = Some(Modal::WikiMirrorLibrary { path: input });
+            return;
+        }
+        if !path.is_absolute() {
+            self.status =
+                "Wikipedia library: folder must be an absolute path (or start with ~/)".into();
+            self.modal = Some(Modal::WikiMirrorLibrary {
+                path: path.to_string_lossy().into_owned(),
+            });
+            return;
+        }
+
+        let mirrors = match discover_wiki_mirrors(&path) {
+            Ok(mirrors) => mirrors,
+            Err(error) => {
+                self.status = format!("Wikipedia library: {error}");
+                self.modal = Some(Modal::WikiMirrorLibrary {
+                    path: path.to_string_lossy().into_owned(),
+                });
+                return;
+            }
+        };
+        if mirrors.is_empty() {
+            self.status = format!(
+                "Wikipedia library: no mirror roots found in {}",
+                path.display()
+            );
+            self.modal = Some(Modal::WikiMirrorLibrary {
+                path: path.to_string_lossy().into_owned(),
+            });
+            return;
+        }
+
+        let mut attached = Vec::new();
+        let mut skipped = Vec::new();
+        for (dbname, root) in mirrors {
+            let root = root.to_string_lossy().into_owned();
+            if let Some(job) = self
+                .mirror_jobs
+                .iter()
+                .find(|job| job.kind == "wiki" && (job.src == dbname || job.dest == root))
+            {
+                skipped.push(format!("{dbname} (already job #{})", job.id));
+                continue;
+            }
+            match self.mirror_verb("mirror_register", json!(["wiki", dbname, root, 24 * 3600])) {
+                Ok(_) => attached.push(dbname),
+                Err(error) => {
+                    self.status = format!("Wikipedia library: {error}");
+                    self.load_mirrors();
+                    return;
+                }
+            }
+        }
+        self.load_mirrors();
+        self.status = if attached.is_empty() {
+            format!("Wikipedia library: {}", skipped.join(", "))
+        } else if skipped.is_empty() {
+            format!(
+                "Wikipedia library: attached {} paused; browse now or press Space to enable updates",
+                attached.join(", ")
+            )
+        } else {
+            format!(
+                "Wikipedia library: attached {} paused; skipped {}",
+                attached.join(", "),
+                skipped.join(", ")
+            )
+        };
     }
 
     fn commit_wiki_mirror_setup(
@@ -8935,6 +9021,93 @@ fn expand_user_path(input: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(input)
 }
 
+/// Find portable Wikipedia mirror roots without opening them through the
+/// writable instance API. A library may be either one mirror root or a
+/// directory whose immediate children are roots. The identity stored inside
+/// meta.db is authoritative; mount points and directory names may change.
+fn discover_wiki_mirrors(
+    library: &std::path::Path,
+) -> Result<Vec<(String, std::path::PathBuf)>, String> {
+    if !library.is_dir() {
+        return Err(format!("{} is not a directory", library.display()));
+    }
+
+    fn inspect(root: &std::path::Path) -> Result<Option<String>, String> {
+        let meta = root.join("meta.db");
+        if !meta.is_file() {
+            return Ok(None);
+        }
+        if !root.join("depot").is_dir() || !root.join("titles").is_dir() {
+            return Err(format!(
+                "{} has meta.db but is missing depot/ or titles/",
+                root.display()
+            ));
+        }
+        let conn = rusqlite::Connection::open_with_flags(
+            &meta,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .map_err(|error| format!("cannot read {}: {error}", meta.display()))?;
+        let dbname: String = conn
+            .query_row(
+                "SELECT value FROM sync_state WHERE key = 'wiki_dbname'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| {
+                format!(
+                    "{} has no readable wiki_dbname identity: {error}",
+                    meta.display()
+                )
+            })?;
+        if !valid_wiki_dbname(&dbname) {
+            return Err(format!(
+                "{} contains invalid wiki_dbname {dbname:?}",
+                meta.display()
+            ));
+        }
+        Ok(Some(dbname))
+    }
+
+    let mut found = Vec::new();
+    if let Some(dbname) = inspect(library)? {
+        let root = std::fs::canonicalize(library)
+            .map_err(|error| format!("resolve {}: {error}", library.display()))?;
+        found.push((dbname, root));
+    } else {
+        let entries = std::fs::read_dir(library)
+            .map_err(|error| format!("read {}: {error}", library.display()))?;
+        for entry in entries {
+            let entry = entry.map_err(|error| format!("read directory entry: {error}"))?;
+            let root = entry.path();
+            if !root.is_dir() {
+                continue;
+            }
+            match inspect(&root) {
+                Ok(Some(dbname)) => {
+                    let root = std::fs::canonicalize(&root)
+                        .map_err(|error| format!("resolve {}: {error}", root.display()))?;
+                    found.push((dbname, root));
+                }
+                Ok(None) => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    found.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
+    for pair in found.windows(2) {
+        if pair[0].0 == pair[1].0 {
+            return Err(format!(
+                "duplicate embedded identity {:?} in {} and {}",
+                pair[0].0,
+                pair[0].1.display(),
+                pair[1].1.display()
+            ));
+        }
+    }
+    Ok(found)
+}
+
 fn mirror_due_label(next_due: Option<i64>) -> String {
     let Some(due) = next_due else {
         return "—".into();
@@ -8969,14 +9142,14 @@ fn mirror_cadence_label(seconds: i64) -> String {
 /// MIRRORS pane: one row per mirror-update job.
 fn mirrors_lines(app: &App) -> Vec<Line<'static>> {
     let mut out = vec![Line::from(Span::styled(
-        "n add Wikipedia · Enter read · b browse · r update now · space pause",
+        "n add Wikipedia · O open existing library · Enter read · b browse · r update now · space pause",
         Style::default().add_modifier(Modifier::BOLD),
     ))];
     if app.mirror_jobs.is_empty() {
         out.push(Line::from(""));
         out.push(Line::from("No local mirrors yet."));
         out.push(Line::from(Span::styled(
-            "Press n or Enter to choose Wikipedia sites and storage.",
+            "Press n/Enter to create one, or O to open a mirror library from another drive/system.",
             Style::default().fg(Color::Cyan),
         )));
         return out;
@@ -9024,6 +9197,8 @@ fn mirror_detail_lines(app: &App) -> Vec<Line<'static>> {
             Line::from(""),
             Line::from("Choose one or more sites, where they should live,"),
             Line::from("and how often sarun should collect daily adds/changes."),
+            Line::from(""),
+            Line::from("Already have a portable library? Press O to attach it paused."),
             Line::from(""),
             Line::from("Nothing downloads until you confirm the setup."),
         ];
@@ -9352,6 +9527,7 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
         // 3 fields + header + result + help + borders.
         Modal::ApiConfig { .. } => 11,
         Modal::WikiMirrorSetup { .. } => 24,
+        Modal::WikiMirrorLibrary { .. } => 9,
         Modal::Command {
             buf, completions, ..
         } => {
@@ -9667,6 +9843,20 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
             body.push(Line::from("Enter create and start · Esc cancel"));
             (" add Wikipedia mirrors ", body)
         }
+        Modal::WikiMirrorLibrary { path } => (
+            " open existing Wikipedia mirror library ",
+            vec![
+                Line::from("Folder containing enwiki/, lvwiki/, … — or one mirror root"),
+                Line::from(""),
+                Line::from(format!("{path}_")),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Discovery is read-only. Mirrors are attached paused: no download or update starts.",
+                    Style::default().fg(Color::Yellow),
+                )),
+                Line::from("Enter attach · Esc cancel"),
+            ],
+        ),
         Modal::EditorOpen { buf } => (
             " open in editor ",
             vec![
@@ -10534,6 +10724,7 @@ enum PaneAction {
     DeleteRule,
     StartRename,
     WikiMirrorAdd,
+    WikiMirrorOpenLibrary,
     MirrorRun,
     MirrorRunPending,
     MirrorTogglePause,
@@ -10706,6 +10897,12 @@ const PANE_ACTION_KEYS: &[(Key, PaneGate, PaneAction, Option<&str>)] = &[
         Some("add Wikipedia mirrors (on Mirrors)"),
     ),
     (
+        Key::Char('O'),
+        PaneGate::On(Pane::Mirrors),
+        PaneAction::WikiMirrorOpenLibrary,
+        Some("open an existing Wikipedia mirror library (on Mirrors)"),
+    ),
+    (
         Key::Char('R'),
         PaneGate::On(Pane::Mirrors),
         PaneAction::MirrorRunPending,
@@ -10866,6 +11063,7 @@ fn run_pane_action(app: &mut App, action: PaneAction) {
         }
         PaneAction::DeleteRule => app.delete_rule(),
         PaneAction::WikiMirrorAdd => app.open_wiki_mirror_setup(),
+        PaneAction::WikiMirrorOpenLibrary => app.open_wiki_mirror_library(),
         PaneAction::MirrorRun => app.mirror_run_selected(),
         PaneAction::MirrorRunPending => app.mirror_run_pending(),
         PaneAction::MirrorBrowse => app.mirror_browse_selected(),
@@ -17172,6 +17370,11 @@ fn pane_action_menu(app: &App) -> Option<(String, Vec<ActionItem>)> {
             Some((
                 title("Mirror job", &target),
                 vec![
+                    mk(
+                        "Open existing Wikipedia mirror library…",
+                        "",
+                        Action::WikiMirrorOpenLibrary,
+                    ),
                     mk("Add Wikipedia mirrors…", "n", Action::WikiMirrorAdd),
                     mk("Force-run this job", "r", Action::MirrorRun),
                     mk("Run all pending jobs", "R", Action::MirrorRunPending),
@@ -17291,6 +17494,7 @@ fn run_action(app: &mut App, a: Action) {
         Action::MoveRuleUp => app.move_rule(-1),
         Action::MoveRuleDown => app.move_rule(1),
         Action::WikiMirrorAdd => app.open_wiki_mirror_setup(),
+        Action::WikiMirrorOpenLibrary => app.open_wiki_mirror_library(),
         Action::MirrorRun => app.mirror_run_selected(),
         Action::MirrorRunPending => app.mirror_run_pending(),
         Action::MirrorFullRefresh => app.confirm_mirror_full_refresh(),
@@ -17839,6 +18043,19 @@ fn handle_modal_key(
                 field,
             });
         }
+        Modal::WikiMirrorLibrary { mut path } => match code {
+            KeyCode::Enter => app.commit_wiki_mirror_library(path),
+            KeyCode::Esc => app.status = "Wikipedia library attachment cancelled".into(),
+            KeyCode::Backspace => {
+                path.pop();
+                app.modal = Some(Modal::WikiMirrorLibrary { path });
+            }
+            KeyCode::Char(character) => {
+                path.push(character);
+                app.modal = Some(Modal::WikiMirrorLibrary { path });
+            }
+            _ => app.modal = Some(Modal::WikiMirrorLibrary { path }),
+        },
         Modal::EditorOpen { mut buf } => match code {
             KeyCode::Enter => app.editor_open_spec(&buf),
             KeyCode::Esc => app.status = "editor open cancelled".into(),
@@ -23142,6 +23359,16 @@ mod tests {
                             Err(e) => json!({"ok": false, "error": e}),
                         }
                     }
+                    "mirror_register" => {
+                        let kind = args.first().and_then(Value::as_str).unwrap_or("");
+                        let src = args.get(1).and_then(Value::as_str).unwrap_or("");
+                        let dest = args.get(2).and_then(Value::as_str).unwrap_or("");
+                        let interval = args.get(3).and_then(Value::as_i64).unwrap_or(86400);
+                        match crate::mirrors::job_register_paused(kind, src, dest, interval) {
+                            Ok(id) => json!({"ok": true, "id": id}),
+                            Err(e) => json!({"ok": false, "error": e}),
+                        }
+                    }
                     "mirror_run" if fake_run => json!({"ok": true}),
                     "mirror_run_full" | "mirror_reconcile_history" if fake_run => {
                         json!({"ok": true})
@@ -23275,6 +23502,81 @@ mod tests {
                 std::path::Path::new(&home).join("wikipedia")
             );
         }
+    }
+
+    fn make_portable_wiki_root(root: &std::path::Path, dbname: &str) {
+        std::fs::create_dir_all(root.join("depot")).unwrap();
+        std::fs::create_dir_all(root.join("titles")).unwrap();
+        let conn = rusqlite::Connection::open(root.join("meta.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sync_state (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+             );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sync_state(key, value) VALUES('wiki_dbname', ?1)",
+            [dbname],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn existing_wikipedia_library_attaches_by_embedded_identity_paused() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let _g = crate::depot::TEST_STATE_HOME_LOCK.lock().unwrap();
+        let tmp = std::env::temp_dir().join(format!("sarun-wikiattach-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let state = tmp.join("state");
+        let library = tmp.join("remounted-drive");
+        let root = library.join("directory-name-is-not-identity");
+        std::fs::create_dir_all(&state).unwrap();
+        make_portable_wiki_root(&root, "lvwiki");
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", &state);
+        }
+        std::fs::create_dir_all(crate::paths::state_home()).unwrap();
+
+        let mut app = App::bare(mirror_verb_server("setup"));
+        app.go_to_pane(Pane::Mirrors);
+        run_action(&mut app, Action::WikiMirrorOpenLibrary);
+        let rendered = render_to_string(&app, 120, 20).unwrap();
+        assert!(rendered.contains("open existing Wikipedia"), "{rendered}");
+        assert!(rendered.contains("read-only"), "{rendered}");
+        app.modal = Some(Modal::WikiMirrorLibrary {
+            path: library.to_string_lossy().into_owned(),
+        });
+        handle_modal_key(&mut app, KeyCode::Enter, KeyModifiers::empty());
+
+        assert!(app.modal.is_none());
+        let jobs = crate::mirrors::jobs_list().unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].src, "lvwiki");
+        assert_eq!(
+            std::path::Path::new(&jobs[0].dest),
+            std::fs::canonicalize(&root).unwrap()
+        );
+        assert!(jobs[0].paused);
+        assert_eq!(jobs[0].state, "paused");
+        assert!(jobs[0].next_due.is_none());
+        assert!(
+            app.status.contains("attached lvwiki paused"),
+            "{}",
+            app.status
+        );
+        assert!(root.join("meta.db").is_file());
+    }
+
+    #[test]
+    fn existing_wikipedia_library_accepts_one_mirror_root() {
+        let tmp = std::env::temp_dir().join(format!("sarun-wikiroot-scan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        make_portable_wiki_root(&tmp, "enwiki");
+        let found = discover_wiki_mirrors(&tmp).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].0, "enwiki");
+        assert_eq!(found[0].1, std::fs::canonicalize(&tmp).unwrap());
     }
 
     /// 'D' on the Mirrors pane deletes the SELECTED JOB behind a y/n

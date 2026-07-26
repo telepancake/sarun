@@ -190,6 +190,27 @@ pub fn jobs_list_typed() -> Result<Vec<crate::generated_wire::MirrorJob>, String
 }
 
 pub fn job_add(kind: &str, src: &str, dest: &str, interval_secs: i64) -> Result<i64, String> {
+    job_add_with_paused(kind, src, dest, interval_secs, false)
+}
+
+/// Register a mirror without starting or scheduling it. Used when an existing
+/// portable mirror library is attached to this host for browsing.
+pub fn job_register_paused(
+    kind: &str,
+    src: &str,
+    dest: &str,
+    interval_secs: i64,
+) -> Result<i64, String> {
+    job_add_with_paused(kind, src, dest, interval_secs, true)
+}
+
+fn job_add_with_paused(
+    kind: &str,
+    src: &str,
+    dest: &str,
+    interval_secs: i64,
+    paused: bool,
+) -> Result<i64, String> {
     if !matches!(kind, "git" | "wiki" | "ietf" | "cmd") {
         return Err(format!("unknown mirror kind {kind:?} (git|wiki|ietf|cmd)"));
     }
@@ -207,8 +228,8 @@ pub fn job_add(kind: &str, src: &str, dest: &str, interval_secs: i64) -> Result<
         ));
     }
     conn.execute(
-        "INSERT INTO jobs(kind, src, dest, interval_secs) VALUES(?1,?2,?3,?4)",
-        params![kind, src, dest, interval_secs.max(60)],
+        "INSERT INTO jobs(kind, src, dest, interval_secs, paused) VALUES(?1,?2,?3,?4,?5)",
+        params![kind, src, dest, interval_secs.max(60), paused as i64],
     )
     .map_err(|e| e.to_string())?;
     Ok(conn.last_insert_rowid())
@@ -596,6 +617,27 @@ mod tests {
         assert_eq!(sig, 9);
         // The signal-name logic is now inline in stream_stderr's caller;
         // this test just proves the signal is observable on the ExitStatus.
+    }
+
+    #[test]
+    fn portable_registration_is_atomically_paused() {
+        let _g = crate::depot::TEST_STATE_HOME_LOCK.lock().unwrap();
+        let tmp =
+            std::env::temp_dir().join(format!("sarun-mirror-register-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", &tmp);
+        }
+        std::fs::create_dir_all(crate::paths::state_home()).unwrap();
+
+        let id = job_register_paused("wiki", "enwiki", "/mounted/archive/enwiki", 86400).unwrap();
+        let jobs = jobs_list().unwrap();
+        let job = jobs.iter().find(|job| job.id == id).unwrap();
+        assert!(job.paused);
+        assert_eq!(job.state, "paused");
+        assert!(job.next_due.is_none());
+        assert!(job.last_start.is_none());
     }
 
     fn sh_git(repo: &std::path::Path, args: &[&str]) {

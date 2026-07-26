@@ -33,6 +33,13 @@ each corpus's shape wants, served through sarun. Three mirrors first:
   `stopped` and auto-resume — safe because the stores self-repair
   (dirty-flag chain repair in wikimak, watermark fences in ietf-mirror,
   per-root flocks in both).
+- **Portable Wikipedia libraries**: the mirror root is self-identifying
+  (`wiki_dbname` in `meta.db`); its mount path and directory name are not
+  identity. In the Mirrors pane, `O` opens either one existing root or a
+  directory containing roots. Sarun validates `meta.db`, `depot/`, and
+  `titles/` read-only, then records the current absolute paths in this
+  host's `mirrors.db`. Attached jobs start paused—browsing is immediate,
+  while network upkeep requires an explicit resume.
 
 ## Phases
 
