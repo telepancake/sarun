@@ -46,10 +46,11 @@ each corpus's shape wants, served through sarun. Three mirrors first:
    Full XML re-ingest is the separate explicit `refresh-full` command;
    all-partition action/visibility reconciliation is the separate explicit
    `reconcile-history` command. Neither is scheduled automatically.
-   Advertised XML SHA-256/SHA-1/MD5 is
-   checked on the compressed download before import; History TSVs have no
-   adjacent advertised digest, so each bzip2 stream is imported in one
-   SQLite transaction and rolls back on decoding or parse failure.
+   Advertised XML SHA-256/SHA-1/MD5 is calculated during direct streaming:
+   a mismatch leaves complete pages recovered but refuses the part watermark,
+   so a later copy deduplicates the valid prefix and continues. History TSVs
+   have no adjacent advertised digest, so each bzip2 stream is imported in
+   one SQLite transaction and rolls back on decoding or parse failure.
    History also records upstream revision visibility/suppression metadata;
    it never removes archived revision content. Because Wikimedia may revise
    arbitrary old partitions, the frontier update is recorded separately

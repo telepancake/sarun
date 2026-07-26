@@ -1292,6 +1292,24 @@ impl Instance {
             .map_err(Error::Sqlite)?;
         Ok(())
     }
+
+    /// Make successfully committed pages durable after the source stream
+    /// fails, without clearing the dirty fence. The next attempt/open repairs
+    /// bookkeeping from the depot before deduplicating the salvaged prefix.
+    pub(crate) fn flush_salvage(&self) -> Result<()> {
+        if self.read_only {
+            return Err(Error::ReadOnly("flush_salvage"));
+        }
+        let g = self.inner.lock().expect("instance mutex poisoned");
+        g.depot.flush()?;
+        for sid in 0..self.title_shard_count {
+            g.titles.flush(sid)?;
+        }
+        g.conn
+            .pragma_update(None, "wal_checkpoint", "TRUNCATE")
+            .map_err(Error::Sqlite)?;
+        Ok(())
+    }
 }
 
 /// Take the per-root flock (`op` = `LOCK_EX` for the one writer,

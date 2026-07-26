@@ -5,7 +5,7 @@
 //!   - the part is watermarked in `parts_seen`;
 //!   - a second sync skips the part (no re-fetch: hit counter static)
 //!     and imports nothing new;
-//!   - a checksum mismatch fails the sync and leaves NO watermark.
+//!   - a checksum mismatch leaves NO watermark but preserves complete pages.
 
 mod common;
 
@@ -146,6 +146,10 @@ fn sync_fetches_then_skips() {
     // Real effect: page 1's head text is readable from the depot.
     assert!(inst.page_head_text(1).unwrap().is_some());
     assert!(inst.part_seen(PART).unwrap());
+    assert!(
+        !tmp.path().join(".downloads").exists(),
+        "sync must stream directly without a compressed staging copy"
+    );
     let hits_after_first = part_mock.hits();
     assert!(hits_after_first >= 1);
 
@@ -161,7 +165,7 @@ fn sync_fetches_then_skips() {
 }
 
 #[test]
-fn checksum_mismatch_fails_and_leaves_no_watermark() {
+fn checksum_mismatch_salvages_complete_pages_but_leaves_no_watermark() {
     let server = MockServer::start();
     let xml = fixture("export_three_pages.xml");
     // Advertise a wrong digest.
@@ -178,9 +182,40 @@ fn checksum_mismatch_fails_and_leaves_no_watermark() {
     assert!(err.is_err(), "mismatched sha1 must fail the sync");
     assert!(!inst.part_seen(PART).unwrap(), "no watermark on failure");
     assert!(
-        inst.page_head_text(1).unwrap().is_none(),
-        "checksum failure must be detected before any records are imported"
+        inst.page_head_text(1).unwrap().is_some(),
+        "complete independently parsed pages should survive a whole-part checksum mismatch"
     );
+    let retry_server = MockServer::start();
+    let correct = hex::encode(Sha1::digest(&xml));
+    mount(&retry_server, &xml, &correct);
+    let retry_cfg = Config { base_url: retry_server.base_url() };
+    let (_, retry) =
+        sync(&inst, &client, &retry_cfg, "testwiki", |_, _| ()).unwrap();
+    assert_eq!(retry.import.revisions_new, 0, "valid prefix should deduplicate");
+    assert!(inst.part_seen(PART).unwrap(), "successful retry advances watermark");
+}
+
+#[test]
+fn truncated_xml_salvages_complete_pages_before_the_damage() {
+    let server = MockServer::start();
+    let xml = fixture("export_three_pages.xml");
+    let marker = b"</page>";
+    let end = xml
+        .windows(marker.len())
+        .position(|window| window == marker)
+        .unwrap()
+        + marker.len();
+    let truncated = xml[..end].to_vec();
+    let digest = hex::encode(Sha1::digest(&xml));
+    mount(&server, &truncated, &digest);
+
+    let tmp = TempDir::new().unwrap();
+    let inst = make_instance(&tmp, 1024);
+    let cfg = Config { base_url: server.base_url() };
+    assert!(sync(&inst, &Client::new(), &cfg, "testwiki", |_, _| ()).is_err());
+    assert!(inst.page_head_text(1).unwrap().is_some());
+    assert!(inst.page_head_text(2).unwrap().is_none());
+    assert!(!inst.part_seen(PART).unwrap());
 }
 
 #[test]

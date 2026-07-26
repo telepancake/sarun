@@ -1,14 +1,15 @@
 //! Discover → fetch → import loop (MIRRORS.md phase 1).
 //!
 //! `sync` pulls the newest complete dump run for a dbname and imports
-//! every part not already recorded in `parts_seen`. Advertised checksums
-//! are verified while materializing a compressed part under the instance;
-//! only then does bz2 decoder → page stream → depot begin.
+//! every part not already recorded in `parts_seen`, streaming HTTP →
+//! checksum reader → bz2 decoder → page stream → depot. A checksum or
+//! tail failure leaves complete pages recovered but the part unwatermarked.
 //!
 //! Ordering of the durability handshake per part:
-//!   1. import the whole part (per-page atomic inside);
-//!   2. `Instance::flush` — pages durable;
-//!   3. `mark_part_seen` — only now is the part skippable.
+//!   1. import complete pages atomically as the part streams;
+//!   2. reach clean EOF with the advertised checksum;
+//!   3. `Instance::flush` — pages durable;
+//!   4. `mark_part_seen` — only now is the part skippable.
 //!
 //! A crash between 2 and 3 re-imports the part; `revisions_seen` dedup
 //! makes that a cheap no-op, never a correctness problem.
@@ -26,46 +27,6 @@ use wikimak_mediawiki::{
 
 use crate::error::Result;
 use crate::instance::{ImportStats, Instance};
-
-fn safe_cache_name(part: &wikimak_mediawiki::Part) -> Result<String> {
-    let path = std::path::Path::new(&part.filename);
-    if path.file_name().and_then(|name| name.to_str()) != Some(part.filename.as_str()) {
-        return Err(crate::error::Error::Mediawiki(
-            wikimak_mediawiki::Error::Parse("dump part filename contains a path".into()),
-        ));
-    }
-    let digest = part
-        .sha256
-        .as_deref()
-        .or(part.sha1.as_deref())
-        .or(part.md5.as_deref())
-        .unwrap_or("unchecked");
-    Ok(format!("{}.{}", part.filename, digest))
-}
-
-/// Materialize and verify the compressed part before the importer sees a
-/// byte. The verified file doubles as a crash/retry cache: a process that
-/// dies after download does not ask Wikimedia for the same multi-GB object
-/// again.
-fn verified_part(
-    inst: &Instance,
-    client: &Client,
-    part: &wikimak_mediawiki::Part,
-) -> Result<std::path::PathBuf> {
-    let dir = inst.root().join(".downloads");
-    std::fs::create_dir_all(&dir)?;
-    let final_path = dir.join(safe_cache_name(part)?);
-    if final_path.exists() {
-        return Ok(final_path);
-    }
-    let partial = final_path.with_extension("partial");
-    let mut source = fetch(client, part)?;
-    let mut output = std::fs::File::create(&partial)?;
-    std::io::copy(&mut source, &mut output)?;
-    output.sync_all()?;
-    std::fs::rename(&partial, &final_path)?;
-    Ok(final_path)
-}
 
 /// Counters from one [`sync`] pass.
 #[derive(Debug, Clone, Default)]
@@ -195,8 +156,11 @@ fn unescape_tsv(value: &str) -> String {
     out
 }
 
-fn import_history_file(inst: &Instance, file: &HistoryFile, path: &std::path::Path) -> Result<u64> {
-    let input = std::fs::File::open(path)?;
+fn import_history_file<R: Read + Send + 'static>(
+    inst: &Instance,
+    file: &HistoryFile,
+    input: R,
+) -> Result<u64> {
     let decoder = wikimak_mediawiki::bz2::new_bz2_reader(
         input,
         wikimak_mediawiki::bz2::Bz2Options { workers: 0 },
@@ -352,17 +316,8 @@ fn sync_page_actions(
     let mut actions = 0;
     for file in &selected {
         progress(&file.part.filename, true);
-        let cached = verified_part(inst, client, &file.part)?;
-        match import_history_file(inst, file, &cached) {
-            Ok(count) => {
-                actions += count;
-                let _ = std::fs::remove_file(cached);
-            }
-            Err(error) => {
-                let _ = std::fs::remove_file(cached);
-                return Err(error);
-            }
-        }
+        let source = fetch(client, &file.part)?;
+        actions += import_history_file(inst, file, source)?;
     }
     let frontier = files
         .last()
@@ -461,8 +416,7 @@ fn import_run(
             continue;
         }
         progress(&part.filename, true);
-        let cached = verified_part(inst, client, part)?;
-        let reader = std::fs::File::open(&cached)?;
+        let reader = fetch(client, part)?;
         let boxed: Box<dyn Read + Send> = if part.filename.ends_with(".bz2") {
             Box::new(wikimak_mediawiki::bz2::new_bz2_reader(
                 reader,
@@ -472,11 +426,20 @@ fn import_run(
             Box::new(reader)
         };
         let mut stream = new_page_stream(boxed);
-        let s = inst.import(&mut stream)?;
+        let s = match inst.import(&mut stream) {
+            Ok(stats) => stats,
+            Err(error) => {
+                // Complete pages are independent archival records. Make the
+                // successfully parsed prefix durable but leave the instance
+                // dirty and this part unwatermarked; a later copy repairs or
+                // deduplicates the prefix and continues past the damage.
+                inst.flush_salvage()?;
+                return Err(error);
+            }
+        };
         add_import(&mut stats.import, &s);
         inst.flush()?;
         inst.mark_part_seen(&part.filename, digest)?;
-        let _ = std::fs::remove_file(cached);
         stats.parts_fetched += 1;
     }
     // Sync session over: reclaim the churn slack (dead superseded heads)
