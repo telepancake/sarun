@@ -471,7 +471,9 @@ fn import_run(
     let cores = std::thread::available_parallelism()
         .map(usize::from)
         .unwrap_or(1);
-    let outer_workers = groups.len().min(cores).min(4).max(1);
+    // Wikimedia may rate-limit a fourth simultaneous large transfer. Three
+    // still overlaps network and decompression without provoking that limit.
+    let outer_workers = groups.len().min(cores).min(3).max(1);
     let bz2_workers = (cores / outer_workers).max(1);
     let queue = Arc::new(Mutex::new(VecDeque::from(groups)));
     let imported = Arc::new(Mutex::new(ImportStats::default()));
