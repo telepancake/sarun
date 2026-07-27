@@ -154,6 +154,9 @@ struct CurlAttempt {
 }
 
 #[cfg(target_os = "macos")]
+const MAX_CURL_RESUMPTIONS: u32 = 16;
+
+#[cfg(target_os = "macos")]
 struct CurlReader {
     url: String,
     user_agent: String,
@@ -267,7 +270,7 @@ impl CurlReader {
     }
 
     fn restart(&mut self) -> io::Result<()> {
-        if self.retries >= 3 {
+        if self.retries >= MAX_CURL_RESUMPTIONS {
             return Err(io::Error::other(format!(
                 "curl transfer failed after {} resumptions",
                 self.retries
@@ -275,7 +278,10 @@ impl CurlReader {
         }
         let _ = self.attempt.child.kill();
         let _ = self.attempt.child.wait();
-        std::thread::sleep(std::time::Duration::from_secs(2u64.pow(self.retries + 1)));
+        let delay = 2u64
+            .saturating_pow(self.retries.saturating_add(1))
+            .min(30);
+        std::thread::sleep(std::time::Duration::from_secs(delay));
         self.retries += 1;
         self.attempt = Self::spawn(&self.url, &self.user_agent, self.offset)?;
         self.headers_ready = false;
@@ -293,7 +299,7 @@ impl Read for CurlReader {
         }
         loop {
             if let Err(error) = self.prepare_body() {
-                if self.retries >= 3 {
+                if self.retries >= MAX_CURL_RESUMPTIONS {
                     return Err(error);
                 }
                 self.restart()?;
@@ -328,7 +334,7 @@ impl Read for CurlReader {
                     self.restart()?;
                 }
                 Err(error) => {
-                    if self.retries >= 3 {
+                    if self.retries >= MAX_CURL_RESUMPTIONS {
                         return Err(error);
                     }
                     self.restart()?;
