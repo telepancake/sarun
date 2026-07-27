@@ -278,6 +278,7 @@ impl Instance {
             conn.execute(stmt, [])?;
         }
         ensure_revision_ts_schema(&conn)?;
+        ensure_nullable_page_actions_page(&conn)?;
         ensure_nullable_revision_visibility_page(&conn)?;
         ensure_title_dictionary_schema(&conn)?;
         // The effective shard count: persisted at creation, validated
@@ -1372,6 +1373,50 @@ fn ensure_revision_ts_schema(conn: &Connection) -> Result<()> {
         "CREATE INDEX IF NOT EXISTS idx_revisions_seen_page_ts
          ON revisions_seen(page_id, ts DESC, rev_id DESC)",
         [],
+    )?;
+    Ok(())
+}
+
+/// Deleted-page log events in MediaWiki History can lack a page id. Rebuild
+/// the derived action table created by older versions so those archival
+/// records can be retained instead of rejecting the whole history snapshot.
+fn ensure_nullable_page_actions_page(conn: &Connection) -> Result<()> {
+    let page_id_not_null = conn
+        .prepare("PRAGMA table_info(page_actions)")?
+        .query_map([], |row| Ok((row.get::<_, String>(1)?, row.get::<_, i64>(3)?)))?
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .into_iter()
+        .find_map(|(name, not_null)| (name == "page_id").then_some(not_null != 0))
+        .unwrap_or(false);
+    if !page_id_not_null {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "BEGIN IMMEDIATE;
+         DROP INDEX IF EXISTS idx_page_actions_page_time;
+         ALTER TABLE page_actions RENAME TO page_actions_not_null;
+         CREATE TABLE page_actions (
+             source_key TEXT PRIMARY KEY,
+             source_partition TEXT NOT NULL,
+             event_log_id INTEGER,
+             event_type TEXT NOT NULL,
+             event_timestamp TEXT NOT NULL,
+             event_comment TEXT NOT NULL,
+             actor_id INTEGER,
+             actor_name TEXT NOT NULL,
+             page_id INTEGER,
+             title_historical TEXT NOT NULL,
+             title_current TEXT NOT NULL,
+             namespace_historical INTEGER,
+             namespace_current INTEGER,
+             page_deleted INTEGER NOT NULL
+         );
+         INSERT INTO page_actions
+             SELECT * FROM page_actions_not_null;
+         DROP TABLE page_actions_not_null;
+         CREATE INDEX idx_page_actions_page_time
+             ON page_actions(page_id, event_timestamp DESC);
+         COMMIT;",
     )?;
     Ok(())
 }

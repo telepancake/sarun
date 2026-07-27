@@ -15,6 +15,7 @@ use bzip2::write::BzEncoder;
 use bzip2::Compression;
 use httpmock::prelude::*;
 use reqwest::blocking::Client;
+use rusqlite::Connection;
 use sha1::{Digest as _, Sha1};
 use md5::Md5;
 use tempfile::TempDir;
@@ -51,6 +52,15 @@ fn history_body(event_type: &str) -> Vec<u8> {
     fields[36] = "false";
     let mut encoder = BzEncoder::new(Vec::new(), Compression::default());
     writeln!(encoder, "{}", fields.join("\t")).unwrap();
+    // Old deletion log events can retain their titles but have no page id.
+    let mut orphan_page = fields.clone();
+    orphan_page[1] = "124";
+    orphan_page[3] = "delete";
+    orphan_page[28] = "";
+    orphan_page[29] = "Deleted title";
+    orphan_page[30] = "Deleted title";
+    orphan_page[36] = "true";
+    writeln!(encoder, "{}", orphan_page.join("\t")).unwrap();
     let mut revision = vec![""; 78];
     revision[0] = "testwiki";
     revision[2] = "revision";
@@ -298,6 +308,15 @@ fn maintenance_consumes_daily_adds_changes_without_full_redownload() {
     let actions = inst.page_actions(1).unwrap();
     assert_eq!(actions.len(), 1);
     assert_eq!(actions[0].event_type, "move");
+    let unattached_actions: i64 = Connection::open(tmp.path().join("meta.db"))
+        .unwrap()
+        .query_row(
+            "SELECT count(*) FROM page_actions WHERE page_id IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(unattached_actions, 1);
     let visibility = inst.revision_visibility(100).unwrap().unwrap();
     assert_eq!(visibility.deleted_parts, "text,user");
     assert!(visibility.parts_are_suppressed);

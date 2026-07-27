@@ -305,13 +305,6 @@ fn import_history_file<R: Read + Send + 'static>(
             "page_is_deleted",
             fields[page + 8],
         )?;
-        let page_id = page_id.ok_or_else(|| crate::error::Error::Mediawiki(
-            wikimak_mediawiki::Error::Parse(format!(
-                "{}:{} page event has no page id",
-                file.part.filename,
-                line_number + 1
-            )),
-        ))?;
         let source_key = format!("{}:{}", file.partition, line_number + 1);
         insert.execute(params![
             source_key,

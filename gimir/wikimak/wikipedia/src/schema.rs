@@ -56,7 +56,7 @@ pub const META_DDL: &[&str] = &[
         event_comment TEXT NOT NULL,
         actor_id INTEGER,
         actor_name TEXT NOT NULL,
-        page_id INTEGER NOT NULL,
+        page_id INTEGER,
         title_historical TEXT NOT NULL,
         title_current TEXT NOT NULL,
         namespace_historical INTEGER,
