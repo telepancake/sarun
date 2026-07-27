@@ -14,6 +14,26 @@ fn allowed_tag_with_allowed_attr() {
 }
 
 #[test]
+fn adjacent_quoted_attributes_are_accepted() {
+    assert_eq!(
+        render_inner(
+            "<th colspan=\"3\" align=\"center\" class=\"mergedtoprow\"style=\"padding:0.25em\">x</th>"
+        ),
+        "<th colspan=\"3\" align=\"center\" class=\"mergedtoprow\" style=\"padding:0.25em\">x</th>"
+    );
+}
+
+#[test]
+fn allowed_tag_may_span_source_lines() {
+    assert_eq!(
+        render_inner(
+            "<tr class=\"adr\">\n <th colspan=\"3\" align=\"center\" class=\"mergedtoprow\"\n style=\"padding:0.25em\">x</th></tr>"
+        ),
+        "<tr class=\"adr\"><th colspan=\"3\" align=\"center\" class=\"mergedtoprow\" style=\"padding:0.25em\">x</th></tr>"
+    );
+}
+
+#[test]
 fn quotation_tag_is_allowed() {
     assert_eq!(render_inner("<q>quoted</q>"), "<p><q>quoted</q></p>");
 }

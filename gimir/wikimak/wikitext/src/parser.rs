@@ -295,7 +295,7 @@ impl<'a> Ctx<'a> {
         let (raw, next) = if self_closing {
             ("", past)
         } else {
-            read_to_close(s, past, "ref")
+            read_to_matching_close(s, past, "ref")
         };
         let has_body = !raw.trim().is_empty();
 
@@ -381,7 +381,7 @@ impl<'a> Ctx<'a> {
                         i = past;
                         continue;
                     }
-                    let (body, next) = read_to_close(inner, past, "ref");
+                    let (body, next) = read_to_matching_close(inner, past, "ref");
                     if !name.is_empty() && !body.trim().is_empty() {
                         let rendered = self.inline(body);
                         self.cite.define(gidx, &name, rendered);
@@ -439,7 +439,11 @@ impl<'a> Ctx<'a> {
     // ---- block level -------------------------------------------------
 
     fn parse_blocks(&mut self, text: &str) -> String {
-        let lines: Vec<&str> = text.split('\n').collect();
+        // Template source commonly formats one HTML opening tag over
+        // several lines. Block parsing is line-oriented, so join only
+        // newlines that parse_tag proves are inside an allowed tag.
+        let normalized = normalize_html_tag_newlines(text);
+        let lines: Vec<&str> = normalized.split('\n').collect();
         let mut out = String::new();
         let mut para: Vec<String> = Vec::new();
         let mut i = 0;
@@ -1823,6 +1827,37 @@ fn read_to_close<'b>(s: &'b str, after: usize, name: &str) -> (&'b str, usize) {
     }
 }
 
+/// Read an extension body whose content may itself contain the same tag.
+/// MediaWiki templates sometimes generate nested `<ref>` elements. The
+/// inner tag remains literal note content here, but it must not terminate
+/// the outer reference and leak its closing tag into the article body.
+fn read_to_matching_close<'b>(s: &'b str, after: usize, name: &str) -> (&'b str, usize) {
+    let mut depth = 1usize;
+    let mut pos = after;
+    while let Some(rel) = s[pos..].find('<') {
+        let start = pos + rel;
+        if let Some((tag, close, self_closing, _, end)) = parse_tag(s, start) {
+            if tag.eq_ignore_ascii_case(name) {
+                if close {
+                    depth -= 1;
+                    if depth == 0 {
+                        return (&s[after..start], end);
+                    }
+                } else if !self_closing {
+                    depth += 1;
+                }
+            }
+            pos = end;
+        } else {
+            pos = start + 1;
+        }
+    }
+    // Malformed nesting is common in old pages. If no balanced outer close
+    // exists, retain the long-standing recovery rule: stop at the first
+    // close instead of consuming the remainder of the article.
+    read_to_close(s, after, name)
+}
+
 /// Parse an HTML tag at `pos` (`b[pos]=='<'`). Returns
 /// (name, is_close, is_selfclose, attrs, index-past-`>`). None if it does
 /// not look like a tag (a bare `<`).
@@ -1869,6 +1904,31 @@ fn parse_tag(s: &str, pos: usize) -> Option<(String, bool, bool, &str, usize)> {
     }
     let attrs = &s[i..attr_end];
     Some((name, close, selfclose, attrs, j + 1))
+}
+
+fn normalize_html_tag_newlines(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut pos = 0;
+    while let Some(rel) = s[pos..].find('<') {
+        let start = pos + rel;
+        out.push_str(&s[pos..start]);
+        if let Some((name, _, _, _, end)) = parse_tag(s, start) {
+            let raw = &s[start..end];
+            if html::tag_allowed(&name.to_ascii_lowercase())
+                && raw.contains('\n')
+                && raw.len() <= 4096
+                && !raw[1..raw.len() - 1].contains('<')
+            {
+                out.extend(raw.chars().map(|c| if c == '\n' { ' ' } else { c }));
+                pos = end;
+                continue;
+            }
+        }
+        out.push('<');
+        pos = start + 1;
+    }
+    out.push_str(&s[pos..]);
+    out
 }
 
 /// Split `s` on any of the top-level separators in `seps` (respecting
