@@ -278,6 +278,7 @@ impl Instance {
             conn.execute(stmt, [])?;
         }
         ensure_revision_ts_schema(&conn)?;
+        ensure_nullable_revision_visibility_page(&conn)?;
         ensure_title_dictionary_schema(&conn)?;
         // The effective shard count: persisted at creation, validated
         // against an explicit config, backfilled (writer-side) on a
@@ -1371,6 +1372,45 @@ fn ensure_revision_ts_schema(conn: &Connection) -> Result<()> {
         "CREATE INDEX IF NOT EXISTS idx_revisions_seen_page_ts
          ON revisions_seen(page_id, ts DESC, rev_id DESC)",
         [],
+    )?;
+    Ok(())
+}
+
+/// MediaWiki History contains orphan revisions whose upstream page id is
+/// genuinely absent. Older mirrors created `revision_visibility.page_id` as
+/// NOT NULL and therefore could not retain suppression/deletion metadata for
+/// those revisions. Rebuild that small derived table once with a nullable
+/// page id; all existing rows and the revision-id primary key are preserved.
+fn ensure_nullable_revision_visibility_page(conn: &Connection) -> Result<()> {
+    let page_id_not_null = conn
+        .prepare("PRAGMA table_info(revision_visibility)")?
+        .query_map([], |row| Ok((row.get::<_, String>(1)?, row.get::<_, i64>(3)?)))?
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .into_iter()
+        .find_map(|(name, not_null)| (name == "page_id").then_some(not_null != 0))
+        .unwrap_or(false);
+    if !page_id_not_null {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "BEGIN IMMEDIATE;
+         DROP INDEX IF EXISTS idx_revision_visibility_page;
+         ALTER TABLE revision_visibility RENAME TO revision_visibility_not_null;
+         CREATE TABLE revision_visibility (
+             revision_id INTEGER PRIMARY KEY,
+             page_id INTEGER,
+             source_partition TEXT NOT NULL,
+             deleted_parts TEXT NOT NULL,
+             parts_are_suppressed INTEGER NOT NULL,
+             deleted_by_page_deletion INTEGER NOT NULL,
+             page_deletion_timestamp TEXT NOT NULL
+         );
+         INSERT INTO revision_visibility
+             SELECT * FROM revision_visibility_not_null;
+         DROP TABLE revision_visibility_not_null;
+         CREATE INDEX idx_revision_visibility_page
+             ON revision_visibility(page_id, revision_id);
+         COMMIT;",
     )?;
     Ok(())
 }

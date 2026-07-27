@@ -246,15 +246,19 @@ fn import_history_file<R: Read + Send + 'static>(
         if fields[2] != "page" && fields[2] != "revision" {
             continue;
         }
-        let page_id = fields[page].parse::<i64>().ok().filter(|value| *value > 0)
-            .ok_or_else(|| crate::error::Error::Mediawiki(
+        let page_id = if fields[page].is_empty() {
+            None
+        } else {
+            Some(fields[page].parse::<i64>().ok().filter(|value| *value > 0)
+                .ok_or_else(|| crate::error::Error::Mediawiki(
                 wikimak_mediawiki::Error::Parse(format!(
                     "{}:{} has invalid page id {:?}",
                     file.part.filename,
                     line_number + 1,
                     fields[page]
                 )),
-            ))?;
+            ))?)
+        };
         if fields[2] == "revision" {
             let revision_id = fields[revision].parse::<i64>().ok()
                 .filter(|value| *value > 0)
@@ -301,6 +305,13 @@ fn import_history_file<R: Read + Send + 'static>(
             "page_is_deleted",
             fields[page + 8],
         )?;
+        let page_id = page_id.ok_or_else(|| crate::error::Error::Mediawiki(
+            wikimak_mediawiki::Error::Parse(format!(
+                "{}:{} page event has no page id",
+                file.part.filename,
+                line_number + 1
+            )),
+        ))?;
         let source_key = format!("{}:{}", file.partition, line_number + 1);
         insert.execute(params![
             source_key,

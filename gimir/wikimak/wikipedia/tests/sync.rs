@@ -73,6 +73,20 @@ fn history_body(event_type: &str) -> Vec<u8> {
     visible_revision[64] = "false";
     visible_revision[70] = "false";
     writeln!(encoder, "{}", visible_revision.join("\t")).unwrap();
+    // Imported/orphan revisions can have no upstream page id while still
+    // carrying page-deletion visibility metadata.
+    let mut orphan_revision = vec![""; 78];
+    orphan_revision[0] = "testwiki";
+    orphan_revision[2] = "revision";
+    orphan_revision[3] = "create";
+    orphan_revision[4] = "2024-06-01 12:02:00.0";
+    orphan_revision[29] = "Imported orphan";
+    orphan_revision[31] = "0";
+    orphan_revision[60] = "102";
+    orphan_revision[64] = "false";
+    orphan_revision[70] = "true";
+    orphan_revision[71] = "2024-06-03 00:00:00.0";
+    writeln!(encoder, "{}", orphan_revision.join("\t")).unwrap();
     encoder.finish().unwrap()
 }
 
@@ -292,6 +306,9 @@ fn maintenance_consumes_daily_adds_changes_without_full_redownload() {
         inst.revision_visibility(101).unwrap().is_none(),
         "fully visible revisions must not consume visibility rows"
     );
+    let orphan = inst.revision_visibility(102).unwrap().unwrap();
+    assert!(orphan.deleted_by_page_deletion);
+    assert_eq!(orphan.page_deletion_timestamp, "2024-06-03 00:00:00.0");
 }
 
 #[test]

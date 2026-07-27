@@ -92,6 +92,47 @@ fn open_then_reopen_no_op() {
     assert_eq!(before, after, "reopen must not add or remove files");
 }
 
+#[test]
+fn open_migrates_revision_visibility_page_id_to_nullable() {
+    let tmp = TempDir::new().unwrap();
+    {
+        let conn = Connection::open(tmp.path().join("meta.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE revision_visibility (
+                revision_id INTEGER PRIMARY KEY,
+                page_id INTEGER NOT NULL,
+                source_partition TEXT NOT NULL,
+                deleted_parts TEXT NOT NULL,
+                parts_are_suppressed INTEGER NOT NULL,
+                deleted_by_page_deletion INTEGER NOT NULL,
+                page_deletion_timestamp TEXT NOT NULL
+             );
+             INSERT INTO revision_visibility VALUES
+                (7, 3, 'legacy', 'text', 0, 1, '2024-01-01');",
+        )
+        .unwrap();
+    }
+
+    let instance = make_instance(&tmp, 1024);
+    assert!(
+        instance
+            .revision_visibility(7)
+            .unwrap()
+            .unwrap()
+            .deleted_by_page_deletion
+    );
+    let conn = Connection::open(tmp.path().join("meta.db")).unwrap();
+    let page_not_null: i64 = conn
+        .query_row(
+            "SELECT \"notnull\" FROM pragma_table_info('revision_visibility')
+             WHERE name = 'page_id'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(page_not_null, 0);
+}
+
 fn walkdir_relative(root: &std::path::Path) -> Vec<String> {
     let mut out = Vec::new();
     fn walk(dir: &std::path::Path, root: &std::path::Path, out: &mut Vec<String>) {

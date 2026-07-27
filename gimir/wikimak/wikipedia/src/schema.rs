@@ -67,7 +67,7 @@ pub const META_DDL: &[&str] = &[
         ON page_actions(page_id, event_timestamp DESC)",
     "CREATE TABLE IF NOT EXISTS revision_visibility (
         revision_id INTEGER PRIMARY KEY,
-        page_id INTEGER NOT NULL,
+        page_id INTEGER,
         source_partition TEXT NOT NULL,
         deleted_parts TEXT NOT NULL,
         parts_are_suppressed INTEGER NOT NULL,
