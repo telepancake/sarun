@@ -49,35 +49,16 @@ struct HistoryFile {
 fn history_listing(client: &Client, url: &str) -> Result<String> {
     let mut delay = Duration::from_secs(1);
     for attempt in 0..4 {
-        let response = match client.get(url).send() {
-            Ok(response) => response,
-            Err(error) if attempt < 3 && (error.is_connect() || error.is_timeout()) => {
-                std::thread::sleep(delay);
-                delay = delay.saturating_mul(2);
-                continue;
-            }
-            Err(error) => {
-                return Err(crate::error::Error::Mediawiki(
-                    wikimak_mediawiki::Error::Http(error),
-                ));
-            }
-        };
-        let status = response.status();
+        let (body, status) = wikimak_mediawiki::discover::get_small(client, url)?;
         if status.is_success() {
-            return response.text().map_err(|error| {
-                crate::error::Error::Mediawiki(wikimak_mediawiki::Error::Http(error))
+            return String::from_utf8(body).map_err(|error| {
+                crate::error::Error::Mediawiki(wikimak_mediawiki::Error::Parse(format!(
+                    "history listing is not utf-8: {error}"
+                )))
             });
         }
         if attempt < 3 && (status.as_u16() == 429 || status.is_server_error()) {
-            let retry_after = response
-                .headers()
-                .get(reqwest::header::RETRY_AFTER)
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| value.parse::<u64>().ok())
-                .map(Duration::from_secs)
-                .unwrap_or(delay)
-                .min(Duration::from_secs(60));
-            std::thread::sleep(retry_after);
+            std::thread::sleep(delay.min(Duration::from_secs(60)));
             delay = delay.saturating_mul(2);
             continue;
         }

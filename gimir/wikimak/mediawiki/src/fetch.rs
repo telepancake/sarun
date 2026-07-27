@@ -5,6 +5,8 @@
 //! `sha256` takes precedence; if `None`, `sha1` is used.
 
 use std::io::{self, Read};
+#[cfg(target_os = "macos")]
+use std::process::{Child, ChildStdout, Command, Stdio};
 
 use reqwest::blocking::Client;
 use md5::Md5;
@@ -91,6 +93,11 @@ impl<R: Read> Read for VerifyingReader<R> {
 
 /// Fetch a Part: GET the URL, return a streaming reader.
 pub fn fetch(client: &Client, part: &Part) -> Result<VerifyingReader<Box<dyn Read + Send>>> {
+    #[cfg(target_os = "macos")]
+    if part.url.starts_with("https://dumps.wikimedia.org/") {
+        return fetch_with_curl(part);
+    }
+
     let mut attempt = 0u32;
     let resp = loop {
         match client.get(&part.url).send() {
@@ -138,4 +145,86 @@ pub fn fetch(client: &Client, part: &Part) -> Result<VerifyingReader<Box<dyn Rea
         filename: part.filename.clone(),
         finalized: false,
     })
+}
+
+#[cfg(target_os = "macos")]
+struct CurlReader {
+    child: Child,
+    stdout: ChildStdout,
+    finished: bool,
+}
+
+#[cfg(target_os = "macos")]
+impl Read for CurlReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.stdout.read(buf)?;
+        if n != 0 || self.finished {
+            return Ok(n);
+        }
+        self.finished = true;
+        let status = self.child.wait()?;
+        if status.success() {
+            Ok(0)
+        } else {
+            Err(io::Error::other(format!(
+                "curl download failed with {status}"
+            )))
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn fetch_with_curl(part: &Part) -> Result<VerifyingReader<Box<dyn Read + Send>>> {
+    let user_agent = curl_user_agent();
+    let mut child = Command::new("/usr/bin/curl")
+        .args([
+            "--fail",
+            "--location",
+            "--silent",
+            "--show-error",
+            "--connect-timeout",
+            "30",
+            "--max-time",
+            "86400",
+            "--user-agent",
+            &user_agent,
+            "--url",
+            &part.url,
+        ])
+        .stdout(Stdio::piped())
+        .spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("curl stdout unavailable"))?;
+    let (hasher, expected) = match (&part.sha256, &part.sha1, &part.md5) {
+        (Some(h), _, _) => (Some(Hasher::Sha256(Sha256::new())), h.to_lowercase()),
+        (None, Some(h), _) => (Some(Hasher::Sha1(Sha1::new())), h.to_lowercase()),
+        (None, None, Some(h)) => (Some(Hasher::Md5(Md5::new())), h.to_lowercase()),
+        (None, None, None) => (None, String::new()),
+    };
+    Ok(VerifyingReader {
+        inner: Box::new(CurlReader {
+            child,
+            stdout,
+            finished: false,
+        }),
+        hasher,
+        expected,
+        filename: part.filename.clone(),
+        finalized: false,
+    })
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn curl_user_agent() -> String {
+    let operator = std::env::var("SARUN_WIKIMEDIA_CONTACT")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| format!("; operator: {value}"))
+        .unwrap_or_default();
+    format!(
+        "sarun-wikimak/{} (+https://github.com/telepancake/sarun{operator})",
+        env!("CARGO_PKG_VERSION")
+    )
 }

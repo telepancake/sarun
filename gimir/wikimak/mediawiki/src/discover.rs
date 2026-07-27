@@ -19,6 +19,8 @@
 
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
+#[cfg(target_os = "macos")]
+use std::process::Command;
 
 use chrono::NaiveDate;
 use regex::Regex;
@@ -403,7 +405,17 @@ fn discover_legacy(client: &Client, cfg: &Config, dbname: &str) -> Result<Run> {
 
 // ---- HTTP helpers ----------------------------------------------------
 
+/// Fetch a small metadata document. Dump payloads must use [`crate::fetch`].
+pub fn get_small(client: &Client, url: &str) -> Result<(Vec<u8>, StatusCode)> {
+    http_get(client, url)
+}
+
 fn http_get(client: &Client, url: &str) -> Result<(Vec<u8>, StatusCode)> {
+    #[cfg(target_os = "macos")]
+    if url.starts_with("https://dumps.wikimedia.org/") {
+        return curl_get(url);
+    }
+
     let mut delay = std::time::Duration::from_secs(1);
     for attempt in 0..4 {
         match client.get(url).send() {
@@ -452,6 +464,11 @@ fn header_content_range_total(resp: &Response) -> Option<u64> {
 /// ignored-Range 200) are read and whose body never is. No usable
 /// header on any route is a LOUD error, never a silent drain.
 fn http_resolve_size(client: &Client, url: &str) -> Result<u64> {
+    #[cfg(target_os = "macos")]
+    if url.starts_with("https://dumps.wikimedia.org/") {
+        return curl_resolve_size(url);
+    }
+
     if let Ok(resp) = client.head(url).send() {
         if resp.status().is_success() {
             if let Some(len) = header_content_length(&resp) {
@@ -485,4 +502,120 @@ fn http_resolve_size(client: &Client, url: &str) -> Result<u64> {
         status: status.as_u16(),
         url: url.to_string(),
     })
+}
+
+#[cfg(target_os = "macos")]
+const CURL_STATUS_MARKER: &[u8] = b"\nSARUN_HTTP_STATUS:";
+
+#[cfg(target_os = "macos")]
+fn curl_output(args: &[&str], url: &str) -> Result<(Vec<u8>, StatusCode)> {
+    let mut delay = std::time::Duration::from_secs(1);
+    for attempt in 0..4 {
+        let user_agent = crate::fetch::curl_user_agent();
+        let output = Command::new("/usr/bin/curl")
+            .args([
+                "--location",
+                "--silent",
+                "--show-error",
+                "--connect-timeout",
+                "30",
+                "--max-time",
+                "300",
+                "--user-agent",
+                &user_agent,
+            ])
+            .args(args)
+            .args(["--write-out", "\nSARUN_HTTP_STATUS:%{http_code}", "--url", url])
+            .output()?;
+        if output.status.success() {
+            return parse_curl_output(&output.stdout, url);
+        }
+        if attempt == 3 {
+            return Err(Error::Io(std::io::Error::other(format!(
+                "curl request failed for {url}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ))));
+        }
+        std::thread::sleep(delay);
+        delay = delay.saturating_mul(2);
+    }
+    unreachable!("curl retry loop returns")
+}
+
+#[cfg(target_os = "macos")]
+fn parse_curl_output(stdout: &[u8], url: &str) -> Result<(Vec<u8>, StatusCode)> {
+    let marker = stdout
+        .windows(CURL_STATUS_MARKER.len())
+        .rposition(|window| window == CURL_STATUS_MARKER)
+        .ok_or_else(|| Error::Parse(format!("curl returned no HTTP status for {url}")))?;
+    let code = std::str::from_utf8(&stdout[marker + CURL_STATUS_MARKER.len()..])
+        .ok()
+        .and_then(|value| value.trim().parse::<u16>().ok())
+        .and_then(|value| StatusCode::from_u16(value).ok())
+        .ok_or_else(|| Error::Parse(format!("curl returned invalid HTTP status for {url}")))?;
+    Ok((stdout[..marker].to_vec(), code))
+}
+
+#[cfg(target_os = "macos")]
+fn curl_get(url: &str) -> Result<(Vec<u8>, StatusCode)> {
+    curl_output(&[], url)
+}
+
+#[cfg(target_os = "macos")]
+fn curl_resolve_size(url: &str) -> Result<u64> {
+    let (headers, status) = curl_output(&["--head"], url)?;
+    if !status.is_success() {
+        return Err(Error::HttpStatus {
+            status: status.as_u16(),
+            url: url.to_string(),
+        });
+    }
+    if let Some(size) = header_value(&headers, b"content-length:") {
+        return size
+            .parse()
+            .map_err(|_| Error::Parse(format!("invalid Content-Length for {url}")));
+    }
+
+    let (headers, status) =
+        curl_output(&["--range", "0-0", "--dump-header", "-", "--output", "/dev/null"], url)?;
+    if status == StatusCode::PARTIAL_CONTENT || status == StatusCode::RANGE_NOT_SATISFIABLE {
+        let range = header_value(&headers, b"content-range:")
+            .and_then(|value| value.rsplit('/').next())
+            .and_then(|value| value.trim().parse::<u64>().ok());
+        return range.ok_or_else(|| Error::Parse(format!("no total in Content-Range for {url}")));
+    }
+    Err(Error::Parse(format!("no Content-Length for {url}")))
+}
+
+#[cfg(target_os = "macos")]
+fn header_value<'a>(headers: &'a [u8], name: &[u8]) -> Option<&'a str> {
+    headers
+        .split(|byte| *byte == b'\n')
+        .rev()
+        .find_map(|line| {
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            (line.len() >= name.len() && line[..name.len()].eq_ignore_ascii_case(name))
+                .then(|| std::str::from_utf8(line[name.len()..].trim_ascii()).ok())
+                .flatten()
+        })
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod curl_tests {
+    use super::*;
+
+    #[test]
+    fn curl_output_keeps_body_and_uses_last_status_marker() {
+        let raw = b"body\nSARUN_HTTP_STATUS:not-a-status\nSARUN_HTTP_STATUS:206";
+        let (body, status) = parse_curl_output(raw, "https://example.test").unwrap();
+        assert_eq!(body, b"body\nSARUN_HTTP_STATUS:not-a-status");
+        assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+    }
+
+    #[test]
+    fn curl_headers_are_case_insensitive_and_last_response_wins() {
+        let headers =
+            b"HTTP/1.1 301\r\nContent-Length: 0\r\n\r\nHTTP/2 200\r\ncontent-length: 42\r\n";
+        assert_eq!(header_value(headers, b"content-length:"), Some("42"));
+    }
 }
