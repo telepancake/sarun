@@ -50,6 +50,14 @@ impl PageStore for MockStore {
     fn page_exists(&self, title: &Title) -> bool {
         self.pages.contains_key(&(title.ns, title.text.clone()))
     }
+    fn page_count(&self, namespace: Option<i32>) -> Option<u64> {
+        Some(
+            self.pages
+                .keys()
+                .filter(|(ns, _)| namespace.is_none_or(|want| *ns == want))
+                .count() as u64,
+        )
+    }
     fn site(&self) -> &SiteConfig {
         &self.site
     }

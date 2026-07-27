@@ -14,6 +14,11 @@ fn allowed_tag_with_allowed_attr() {
 }
 
 #[test]
+fn quotation_tag_is_allowed() {
+    assert_eq!(render_inner("<q>quoted</q>"), "<p><q>quoted</q></p>");
+}
+
+#[test]
 fn disallowed_attribute_dropped() {
     assert_eq!(
         render_inner("<b class=\"a\" onclick=\"evil()\">t</b>"),
@@ -36,6 +41,14 @@ fn style_strips_expression() {
     assert_eq!(
         render_inner("<div style=\"width:expression(alert(1)); height:2px\">d</div>"),
         "<div style=\"height:2px\">d</div>"
+    );
+}
+
+#[test]
+fn indented_block_html_is_not_preformatted() {
+    assert_eq!(
+        render_inner(" <div>one</div>\n <div>two</div>"),
+        "<div>one</div><div>two</div>"
     );
 }
 
@@ -76,6 +89,13 @@ fn gallery_is_placeholder() {
         render_inner("<gallery>\nFile:A.jpg\n</gallery>"),
         "<div class=\"gallery-placeholder\">[gallery]</div>"
     );
+}
+
+#[test]
+fn inputbox_is_replaced_for_the_read_only_archive() {
+    let out = render_out("<inputbox>\ntype=create\n</inputbox>");
+    assert!(out.html.contains("Page creation is unavailable"), "{}", out.html);
+    assert!(out.misses.unknown_tags.is_empty(), "{:?}", out.misses);
 }
 
 #[test]

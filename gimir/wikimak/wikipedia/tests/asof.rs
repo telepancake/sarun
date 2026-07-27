@@ -496,6 +496,11 @@ fn interwiki_seed_prefixes_are_real() {
     assert_eq!(get("commons").as_deref(), Some("https://commons.wikimedia.org/wiki/$1"));
     assert_eq!(get("meta").as_deref(), Some("https://meta.wikimedia.org/wiki/$1"));
     assert_eq!(get("d").as_deref(), Some("https://www.wikidata.org/wiki/$1"));
+    assert_eq!(get("es").as_deref(), Some("https://es.wikipedia.org/wiki/$1"));
+    assert_eq!(
+        get("be-x-old").as_deref(),
+        Some("https://be-tarask.wikipedia.org/wiki/$1")
+    );
     // Every seed URL is a real https pattern with a $1 placeholder, and
     // NONE is marked local (we mirror none of these).
     for e in &seed {
@@ -514,7 +519,7 @@ fn interwiki_at_seeds_then_prefers_captured_rows() {
     // No interwiki rows captured (export dump has none) → the seed.
     let map = interwiki_at(&inst, None).unwrap();
     assert!(map.iter().any(|e| e.prefix == "commons"), "seed used when table empty");
-    assert!(!map.iter().any(|e| e.prefix == "es"), "seed has no es prefix");
+    assert!(map.iter().any(|e| e.prefix == "es"), "language seed is present");
 
     // Attach an interwiki row to THE snapshot the importer captured, so the
     // τ selection lands on it; interwiki_at then prefers the captured rows.

@@ -8,7 +8,7 @@
 //!   * `GET /w/allpages?filter=<substr>` — the titles listing.
 //!   * `GET /w/media/<file>?w=<bucket>` — stream a materialized blob, or an
 //!     inline SVG placeholder (HTTP 200) on a miss so pages stay clean.
-//!   * `GET /` — redirect to `/w/allpages`.
+//!   * `GET /` — redirect to the wiki's configured main page.
 //!
 //! Every internal link carries `?asof=` when the view is time-shifted:
 //! the renderer covers content links through [`RenderOptions::asof_query`];
@@ -120,7 +120,7 @@ fn handle(server: &ServerApp, req: &Request) -> Resp {
     let query = parse_query(query_raw);
 
     if path == "/" {
-        return redirect("/w/allpages");
+        return home_response(&app);
     }
     if let Some(rest) = path.strip_prefix("/wiki/") {
         return page_response(&app, &percent_decode(rest), &query);
@@ -135,6 +135,30 @@ fn handle(server: &ServerApp, req: &Request) -> Resp {
         return media_response(&app, &percent_decode(rest), &query);
     }
     not_found_page(&app, &query)
+}
+
+fn home_response(app: &App) -> Resp {
+    let main_page = app
+        .inst
+        .site_config_at(None)
+        .ok()
+        .flatten()
+        .and_then(|snapshot| {
+            snapshot
+                .get("base")
+                .and_then(|base| base.as_str())
+                .map(str::to_string)
+        })
+        .and_then(|base| base.split_once("/wiki/").map(|(_, title)| title.to_string()))
+        .map(|title| percent_decode(title.split(['?', '#']).next().unwrap_or(&title)))
+        .filter(|title| !title.is_empty());
+    match main_page {
+        Some(title) => redirect(&format!(
+            "/wiki/{}",
+            wikimak_wikitext::html::encode_path(&title)
+        )),
+        None => redirect("/w/allpages"),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -455,10 +479,12 @@ fn allpages_response(app: &App, query: &HashMap<String, String>) -> Resp {
     let site = view.site();
     let filter = query.get("filter").map(String::as_str).filter(|s| !s.is_empty());
 
-    let pages = inst.pages(filter, 5000).unwrap_or_default();
+    const PAGE_LIMIT: usize = 500;
+    let pages = inst.pages(filter, PAGE_LIMIT + 1).unwrap_or_default();
+    let truncated = pages.len() > PAGE_LIMIT;
 
     let mut rows = String::new();
-    for (_id, title) in &pages {
+    for (_id, title) in pages.iter().take(PAGE_LIMIT) {
         rows.push_str(&format!(
             r#"<li><a href="/wiki/{path}{asof}">{disp}</a></li>"#,
             path = wikimak_wikitext::html::encode_path(title),
@@ -487,6 +513,11 @@ fn allpages_response(app: &App, query: &HashMap<String, String>) -> Resp {
             String::new()
         },
     ));
+    if truncated {
+        body.push_str(
+            "<p class=\"result-note\">Showing the first 500 matches. Narrow the filter to continue.</p>",
+        );
+    }
     body.push_str(&format!("<ul class=\"allpages\">{rows}</ul>"));
     body.push_str(&instance_footer(site, ts, None));
 
@@ -568,20 +599,37 @@ fn error_shell(msg: &str) -> String {
 
 fn header_bar(
     app: &App,
-    _site: &wikimak_wikitext::SiteConfig,
+    site: &wikimak_wikitext::SiteConfig,
     page_path: &str,
     ts: Option<i64>,
     asof_query: &str,
 ) -> String {
     let _ = app;
     let date_val = ts.map(micros_to_date).unwrap_or_default();
+    let site_name = if site.site_name.is_empty() {
+        "Wikipedia mirror"
+    } else {
+        &site.site_name
+    };
+    let history = page_path
+        .strip_prefix("/wiki/")
+        .map(|title| {
+            format!(
+                r#"<a href="/w/history/{title}{asof}">History</a>"#,
+                asof = asof_query
+            )
+        })
+        .unwrap_or_default();
     // The date form GETs back to THIS page, preserving the current path.
     format!(
         r#"<header class="bar">
-  <nav>
-    <a href="/w/allpages{asof}">All pages</a>
-    <a href="{hist}{asof}">History</a>
-  </nav>
+  <div class="primary">
+    <a class="brand" href="/">{site_name}</a>
+    <nav>
+      <a href="/w/allpages{asof}">All pages</a>
+      {history}
+    </nav>
+  </div>
   <form class="asof" method="get" action="{action}">
     <label>As of <input type="date" name="asof" value="{date}"></label>
     <button type="submit">Go</button>
@@ -589,7 +637,8 @@ fn header_bar(
   </form>
 </header>"#,
         asof = asof_query,
-        hist = page_path.replacen("/wiki/", "/w/history/", 1),
+        site_name = escape(site_name),
+        history = history,
         action = page_path,
         date = escape(&date_val),
         now = if ts.is_some() {
@@ -798,17 +847,19 @@ const CSS: &str = r#"
 :root { color-scheme: light; }
 * { box-sizing: border-box; }
 body {
-  font-family: Georgia, 'Times New Roman', serif;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
   line-height: 1.6; color: #202122; background: #fff;
   margin: 0; padding: 0 0 3rem;
 }
 .bar {
   display: flex; flex-wrap: wrap; gap: 1rem; align-items: center;
   justify-content: space-between;
-  padding: 0.6rem 1rem; background: #f6f6f6; border-bottom: 1px solid #a2a9b1;
-  font-family: sans-serif; font-size: 0.9rem;
+  padding: 0.65rem max(1rem, calc((100vw - 100rem) / 2));
+  background: #f8f9fa; border-bottom: 1px solid #a2a9b1;
+  font-size: 0.9rem;
 }
-.bar nav a { margin-right: 1rem; }
+.bar .primary, .bar nav { display: flex; gap: 1.25rem; align-items: center; }
+.bar .brand { color: #202122; font-family: Georgia, serif; font-size: 1.15rem; font-weight: 600; }
 .bar .asof { display: flex; gap: 0.4rem; align-items: center; }
 .bar .now { margin-left: 0.5rem; }
 a { color: #3366cc; text-decoration: none; }
@@ -816,10 +867,12 @@ a:hover { text-decoration: underline; }
 a.new, .new a { color: #ba0000; }
 h1.page-title {
   font-family: 'Linux Libertine', Georgia, serif; font-weight: normal;
-  border-bottom: 1px solid #a2a9b1; margin: 1rem 1rem 0.5rem; padding-bottom: 0.2rem;
+  border-bottom: 1px solid #a2a9b1;
+  margin: 1.25rem auto 0.75rem; padding: 0 1rem 0.25rem; max-width: 100rem;
 }
 .content, .redirect-note, .misses, .catlinks, .allpages, .history, .filter, .noarticle {
-  margin-left: 1rem; margin-right: 1rem;
+  margin-left: auto; margin-right: auto; max-width: 100rem;
+  padding-left: 1rem; padding-right: 1rem;
 }
 .redirect-note { color: #54595d; font-style: italic; margin-bottom: 0.5rem; }
 .misses {
@@ -836,8 +889,21 @@ h1.page-title {
   font-family: sans-serif;
 }
 .content .infobox td, .content .infobox th { padding: 0.25rem 0.5rem; vertical-align: top; border: 1px solid #eaecf0; }
-.content table td, .content table th { border: 1px solid #a2a9b1; padding: 0.3rem 0.6rem; }
-.content th { background: #eaecf0; }
+.content table.wikitable { background: #f8f9fa; border: 1px solid #a2a9b1; }
+.content table.wikitable td, .content table.wikitable th {
+  border: 1px solid #a2a9b1; padding: 0.3rem 0.6rem;
+}
+.content table.wikitable th { background: #eaecf0; }
+.content img { max-width: 100%; height: auto; }
+.content .floatright, .content .tright { float: right; clear: right; margin: 0 0 1rem 1rem; }
+.content .floatleft, .content .tleft { float: left; clear: left; margin: 0 1rem 1rem 0; }
+.content .center { margin-left: auto; margin-right: auto; text-align: center; }
+.content pre { overflow: auto; white-space: pre-wrap; }
+.mw-inputbox-unavailable {
+  margin: 0.75rem 0; padding: 0.6rem 0.75rem;
+  border: 1px solid #c8ccd1; background: #f8f9fa; color: #54595d;
+  font-size: 0.9rem;
+}
 .error, span.error {
   color: #d33; border: 1px solid #d33; background: #fff0f0;
   padding: 0 0.3rem; border-radius: 2px; font-family: sans-serif; font-size: 0.9rem;
@@ -848,10 +914,16 @@ h1.page-title {
 }
 .catlabel { font-weight: bold; }
 ul.allpages, ul.history { font-family: sans-serif; font-size: 0.9rem; }
+ul.allpages { columns: 20rem; column-gap: 2rem; }
+ul.allpages li { break-inside: avoid; }
 .history .comment { color: #54595d; font-style: italic; }
 .filter { font-family: sans-serif; font-size: 0.9rem; margin-bottom: 0.8rem; }
+.filter input { min-width: min(28rem, 65vw); padding: 0.35rem 0.5rem; }
+.filter button, .asof button { padding: 0.3rem 0.65rem; }
+.result-note { max-width: 100rem; margin: 0.5rem auto; padding: 0 1rem; color: #54595d; }
 footer.site {
-  margin: 2rem 1rem 0; padding-top: 0.6rem; border-top: 1px solid #a2a9b1;
+  max-width: 100rem; margin: 2rem auto 0;
+  padding: 0.6rem 1rem 0; border-top: 1px solid #a2a9b1;
   font-family: sans-serif; font-size: 0.8rem; color: #54595d;
 }
 [dir="rtl"] .content .infobox { float: left; margin: 0 1rem 1rem 0; }

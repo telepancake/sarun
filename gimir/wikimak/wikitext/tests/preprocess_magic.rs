@@ -89,6 +89,31 @@ fn sitename_and_empty_safe_server_vars() {
 }
 
 #[test]
+fn page_count_variables_and_raw_modifier_use_the_store() {
+    let mut s = MockStore::new();
+    s.add(0, "One", "");
+    s.add(0, "Two", "");
+    s.add(10, "Box", "");
+    assert_eq!(xt(&s, "{{NUMBEROFARTICLES}}"), "2");
+    assert_eq!(xt(&s, "{{NUMBEROFARTICLES:R}}"), "2");
+    assert_eq!(xt(&s, "{{NUMBEROFPAGES:R}}"), "3");
+}
+
+#[test]
+fn page_url_variables_use_the_site_server() {
+    let mut s = MockStore::new();
+    s.site.server = "https://en.wikipedia.org".into();
+    assert_eq!(
+        xt(&s, "{{FULLURL:Main page}}"),
+        "https://en.wikipedia.org/wiki/Main_page"
+    );
+    assert_eq!(
+        xt(&s, "{{LOCALURL:Main page|oldid=7}}"),
+        "/wiki/Main_page?oldid=7"
+    );
+}
+
+#[test]
 fn displaytitle_and_defaultsort_are_swallowed_and_surfaced() {
     let s = MockStore::new();
     let out = ex(&s, "before{{DISPLAYTITLE:My Title}}{{DEFAULTSORT:Sortkey}}after");
@@ -105,6 +130,12 @@ fn behavior_switches_stripped_and_flagged() {
     assert!(out.switches.no_toc);
     assert!(out.switches.no_editsection);
     assert!(!out.switches.force_toc);
+}
+
+#[test]
+fn wikibase_language_link_switch_is_swallowed() {
+    let s = MockStore::new();
+    assert_eq!(xt(&s, "a{{NOEXTERNALLANGLINKS}}b"), "ab");
 }
 
 #[test]

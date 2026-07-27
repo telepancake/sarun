@@ -123,13 +123,40 @@ pub fn seed_interwiki() -> Vec<InterwikiRow> {
         ("voy", "https://en.wikivoyage.org/wiki/$1"),
         ("wikivoyage", "https://en.wikivoyage.org/wiki/$1"),
     ];
-    SEED.iter()
+    let mut rows: Vec<InterwikiRow> = SEED
+        .iter()
         .map(|(prefix, url)| InterwikiRow {
             prefix: prefix.to_string(),
             url: url.to_string(),
             is_local: false,
         })
-        .collect()
+        .collect();
+    // Export dumps normally omit the interwiki table. Preserve the common
+    // language links found in article sidebars and main-page footers until a
+    // captured map is available. These are Wikimedia's actual database
+    // language prefixes, not a guess for every two-letter string.
+    const WIKIPEDIA_LANGS: &[&str] = &[
+        "ar", "be", "ca", "cs", "da", "de", "el", "en", "eo", "es", "et", "fa",
+        "fi", "fr", "he", "hu", "id", "it", "ja", "ko", "la", "lt", "ltg", "nl",
+        "no", "pl", "pt", "ro", "ru", "sk", "sr", "sv", "tr", "uk", "vi", "zh",
+    ];
+    rows.extend(WIKIPEDIA_LANGS.iter().map(|prefix| InterwikiRow {
+        prefix: (*prefix).to_string(),
+        url: format!("https://{prefix}.wikipedia.org/wiki/$1"),
+        is_local: false,
+    }));
+    rows.extend([
+        ("be-x-old", "https://be-tarask.wikipedia.org/wiki/$1"),
+        ("bat-smg", "https://sgs.wikipedia.org/wiki/$1"),
+        ("fiu-vro", "https://vro.wikipedia.org/wiki/$1"),
+    ]
+    .into_iter()
+    .map(|(prefix, url)| InterwikiRow {
+        prefix: prefix.to_string(),
+        url: url.to_string(),
+        is_local: false,
+    }));
+    rows
 }
 
 /// The interwiki map for τ: the rows captured with the τ-selected siteinfo
@@ -413,6 +440,37 @@ impl wikimak_wikitext::PageStore for AsOfView<'_> {
     fn page_id(&self, title: &wikimak_wikitext::Title) -> Option<u64> {
         let key = title.prefixed(&self.site);
         self.inst.page_id_by_title_at(&key, self.ts).ok().flatten()
+    }
+
+    fn page_count(&self, namespace: Option<i32>) -> Option<u64> {
+        let g = self.inst.inner.lock().ok()?;
+        let count = match (self.ts, namespace) {
+            (None, Some(ns)) => g.conn.query_row(
+                "SELECT count(*) FROM title_intervals
+                 WHERE end_ts IS NULL AND ns = ?1",
+                [ns],
+                |row| row.get::<_, u64>(0),
+            ),
+            (None, None) => g.conn.query_row(
+                "SELECT count(*) FROM title_intervals WHERE end_ts IS NULL",
+                [],
+                |row| row.get::<_, u64>(0),
+            ),
+            (Some(ts), Some(ns)) => g.conn.query_row(
+                "SELECT count(*) FROM title_intervals
+                 WHERE start_ts <= ?1 AND (end_ts IS NULL OR end_ts > ?1)
+                   AND ns = ?2",
+                rusqlite::params![ts, ns],
+                |row| row.get::<_, u64>(0),
+            ),
+            (Some(ts), None) => g.conn.query_row(
+                "SELECT count(*) FROM title_intervals
+                 WHERE start_ts <= ?1 AND (end_ts IS NULL OR end_ts > ?1)",
+                [ts],
+                |row| row.get::<_, u64>(0),
+            ),
+        };
+        count.ok()
     }
 
     fn site(&self) -> &wikimak_wikitext::SiteConfig {

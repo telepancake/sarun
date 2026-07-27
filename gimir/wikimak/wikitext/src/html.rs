@@ -314,7 +314,7 @@ pub(crate) fn tag_allowed(name: &str) -> bool {
         name,
         "div" | "span" | "sup" | "sub" | "small" | "big" | "center" | "blockquote"
             | "table" | "tr" | "td" | "th" | "caption" | "code" | "pre" | "tt" | "b"
-            | "i" | "u" | "s" | "strike" | "em" | "strong" | "abbr" | "font" | "hr"
+            | "i" | "u" | "s" | "strike" | "em" | "strong" | "q" | "abbr" | "font" | "hr"
             | "br" | "wbr" | "dl" | "dt" | "dd" | "ul" | "ol" | "li" | "h1" | "h2"
             | "h3" | "h4" | "h5" | "h6" | "p" | "poem"
     )

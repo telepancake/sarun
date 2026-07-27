@@ -599,7 +599,20 @@ fn magic_word(ctx: &mut Ctx, upper: &str, arg: Option<&str>) -> Option<String> {
             }
             return Some(String::new());
         }
+        // Wikibase behavior word used by wiki main pages to suppress the
+        // ordinary language-link sidebar. This local reader has no sidebar.
+        "NOEXTERNALLANGLINKS" => return Some(String::new()),
         _ => {}
+    }
+    if arg.is_none() || arg.is_some_and(|value| value.trim().eq_ignore_ascii_case("R")) {
+        let count = match upper {
+            "NUMBEROFARTICLES" => ctx.store.page_count(Some(0)),
+            "NUMBEROFPAGES" => ctx.store.page_count(None),
+            _ => None,
+        };
+        if let Some(count) = count {
+            return Some(count.to_string());
+        }
     }
     let subject = match arg {
         Some(a) => resolve_title(a, 0, ctx.site),
@@ -691,6 +704,9 @@ fn dispatch_colon(
         "#titleparts" => pf_titleparts(ctx, arg0, rest, frame),
         "#tag" => pf_tag(ctx, arg0, rest, frame),
         "#invoke" => pf_invoke(ctx, arg0, rest, frame),
+        // GeoData parser hook: coordinates are already rendered visibly by
+        // the calling template; this call only records page metadata.
+        "#coordinates" => String::new(),
         "lc" => trim_arg(ctx, arg0, frame).to_lowercase(),
         "uc" => trim_arg(ctx, arg0, frame).to_uppercase(),
         "lcfirst" => first_case(&trim_arg(ctx, arg0, frame), false),
@@ -699,6 +715,8 @@ fn dispatch_colon(
         "padright" => pf_pad(ctx, arg0, rest, frame, false),
         "urlencode" => pf_urlencode(ctx, arg0, rest, frame),
         "anchorencode" => anchor_encode(&expand_nodes(ctx, arg0, frame)),
+        "fullurl" | "canonicalurl" => pf_page_url(ctx, arg0, rest, frame, true),
+        "localurl" => pf_page_url(ctx, arg0, rest, frame, false),
         "ns" => pf_ns(ctx, arg0, frame, false),
         "nse" => pf_ns(ctx, arg0, frame, true),
         "plural" => pf_plural(ctx, arg0, rest, frame),
@@ -707,6 +725,34 @@ fn dispatch_colon(
         _ => return None,
     };
     Some(s)
+}
+
+fn pf_page_url(
+    ctx: &mut Ctx,
+    arg0: &[Node],
+    rest: &[Part],
+    frame: &Frame,
+    absolute: bool,
+) -> String {
+    let raw = trim_arg(ctx, arg0, frame);
+    let title = resolve_title(&raw, 0, ctx.site).prefixed(ctx.site);
+    let mut url = if absolute {
+        format!(
+            "{}/wiki/{}",
+            ctx.site.server.trim_end_matches('/'),
+            html::encode_path(&title)
+        )
+    } else {
+        format!("/wiki/{}", html::encode_path(&title))
+    };
+    if let Some(query) = rest.first() {
+        let query = part_trim(ctx, query, frame);
+        if !query.is_empty() {
+            url.push('?');
+            url.push_str(&query);
+        }
+    }
+    url
 }
 
 fn trim_arg(ctx: &mut Ctx, nodes: &[Node], frame: &Frame) -> String {
@@ -1029,7 +1075,7 @@ fn pf_time(ctx: &mut Ctx, arg0: &[Node], rest: &[Part], frame: &Frame) -> String
     let civ = if datearg.is_empty() || datearg.eq_ignore_ascii_case("now") {
         magic::civil_from_micros(ctx.ts)
     } else {
-        match parse_datetime(&datearg) {
+        match parse_datetime(&datearg, ctx.ts) {
             Some(c) => c,
             None => return html::error_box("Error: Invalid time."),
         }
@@ -1122,8 +1168,50 @@ fn days_in_month(y: i64, m: u32) -> u32 {
 }
 
 /// Parse the common ISO-ish datetime forms {{#time}} sees in dumps.
-fn parse_datetime(s: &str) -> Option<magic::Civil> {
+fn parse_datetime(s: &str, ts_micros: i64) -> Option<magic::Civil> {
     let s = s.trim();
+    let mut words: Vec<&str> = s.split_whitespace().collect();
+    let day_delta = if words.len() >= 2
+        && words.last().is_some_and(|word| {
+            word.eq_ignore_ascii_case("day") || word.eq_ignore_ascii_case("days")
+        })
+    {
+        words.pop();
+        words.pop()?.parse::<i64>().ok()?
+    } else {
+        0
+    };
+    let textual = match words.as_slice() {
+        [month] => english_month(month)
+            .map(|month| (magic::civil_from_micros(ts_micros).year, month, 1)),
+        [day, month, year] => year.parse::<i64>().ok().and_then(|year| {
+            english_month(month).and_then(|month| {
+                day.parse::<u32>().ok().map(|day| (year, month, day))
+            })
+        }),
+        _ => None,
+    };
+    let base = match textual {
+        Some((year, month, day)) => magic::civil_from_parts(year, month, day, 0, 0, 0),
+        None => parse_iso_datetime(&words.join(" "))?,
+    };
+    let unix = base.unix.checked_add(day_delta.checked_mul(86_400)?)?;
+    Some(magic::civil_from_micros(unix.checked_mul(1_000_000)?))
+}
+
+fn english_month(value: &str) -> Option<u32> {
+    const MONTHS: [&str; 12] = [
+        "january", "february", "march", "april", "may", "june",
+        "july", "august", "september", "october", "november", "december",
+    ];
+    let value = value.trim().to_ascii_lowercase();
+    MONTHS
+        .iter()
+        .position(|month| month.starts_with(&value) && value.len() >= 3)
+        .map(|index| index as u32 + 1)
+}
+
+fn parse_iso_datetime(s: &str) -> Option<magic::Civil> {
     let digits: String = s.chars().filter(|c| c.is_ascii_digit()).collect();
     if s.chars().all(|c| c.is_ascii_digit()) && s.len() == 14 {
         let g = |a: usize, b: usize| digits[a..b].parse::<i64>().ok();
@@ -1695,6 +1783,9 @@ fn ns_id_lookup(site: &SiteConfig, prefix: &str) -> Option<i32> {
         return None;
     }
     for (id, info) in &site.namespaces {
+        if normalize_ns_key(&info.localized) == want {
+            return Some(*id);
+        }
         if normalize_ns_key(&info.canonical) == want {
             return Some(*id);
         }

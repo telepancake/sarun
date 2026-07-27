@@ -45,6 +45,14 @@ fn explicit_datetime_with_time() {
 }
 
 #[test]
+fn english_month_and_relative_days() {
+    let s = MockStore::at(TS);
+    assert_eq!(t(&s, "m", "July"), "07");
+    assert_eq!(t(&s, "Y-m-d", "27 July 2026 -1 days"), "2026-07-26");
+    assert_eq!(t(&s, "Y-m-d", "27 July 2026 +1 day"), "2026-07-28");
+}
+
+#[test]
 fn fourteen_digit_timestamp() {
     let s = MockStore::at(TS);
     assert_eq!(t(&s, "Y-m-d H:i:s", "20051225133000"), "2005-12-25 13:30:00");

@@ -223,11 +223,21 @@ fn serve_renders_and_waybacks_a_synthesized_wiki() {
     assert!(body.contains("rev 101"), "history lists rev 101:\n{body}");
     assert!(body.contains("rev 102"), "history lists rev 102:\n{body}");
 
-    // allpages lists the mainspace article; `/` redirects there.
+    // allpages lists the mainspace article; `/` redirects to siteinfo's
+    // configured main page rather than dumping a huge title index.
     let (status, body) = http_get(&addr, "/w/allpages");
     assert_eq!(status, 200);
     assert!(body.contains("/wiki/Page"), "allpages links the article:\n{body}");
 
-    let (status, _body) = http_get(&addr, "/");
-    assert_eq!(status, 302, "root redirects to allpages");
+    let mut stream = TcpStream::connect(&addr).expect("connect");
+    stream
+        .write_all(format!("GET / HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n").as_bytes())
+        .expect("write request");
+    let mut response = String::new();
+    stream.read_to_string(&mut response).expect("read response");
+    assert!(response.starts_with("HTTP/1.1 302"), "{response}");
+    assert!(
+        response.contains("Location: /wiki/Main_Page"),
+        "root redirects to configured main page:\n{response}"
+    );
 }

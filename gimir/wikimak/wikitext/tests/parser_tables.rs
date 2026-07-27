@@ -65,6 +65,14 @@ fn links_inside_cells() {
 }
 
 #[test]
+fn block_markup_inside_cell_is_parsed_as_blocks() {
+    assert_eq!(
+        render_inner("{|\n| <div>\n* one\n* two\n</div>\n|}"),
+        "<table><tbody><tr><td><div><ul><li>one</li><li>two</li></ul></div></td></tr></tbody></table>"
+    );
+}
+
+#[test]
 fn implicit_first_row_before_any_row_marker() {
     assert_eq!(
         render_inner("{|\n| a\n| b\n|}"),

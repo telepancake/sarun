@@ -88,6 +88,12 @@ fn tag_emits_literal_markup() {
 }
 
 #[test]
+fn coordinates_hook_is_metadata_only() {
+    let s = MockStore::new();
+    assert_eq!(xt(&s, "a{{#coordinates:56|N|24|E}}b"), "ab");
+}
+
+#[test]
 fn lc_uc_first_case() {
     let s = MockStore::new();
     assert_eq!(xt(&s, "{{lc:HELLO World}}"), "hello world");

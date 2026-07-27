@@ -278,6 +278,7 @@ impl Instance {
             conn.execute(stmt, [])?;
         }
         ensure_revision_ts_schema(&conn)?;
+        ensure_current_title_count_index(&conn)?;
         ensure_nullable_page_actions_page(&conn)?;
         ensure_nullable_revision_visibility_page(&conn)?;
         ensure_title_dictionary_schema(&conn)?;
@@ -1372,6 +1373,18 @@ fn ensure_revision_ts_schema(conn: &Connection) -> Result<()> {
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_revisions_seen_page_ts
          ON revisions_seen(page_id, ts DESC, rev_id DESC)",
+        [],
+    )?;
+    Ok(())
+}
+
+/// Current page and namespace counts drive MediaWiki's NUMBEROF* variables.
+/// Keep the active interval subset indexed so rendering them does not scan
+/// the full move history on every page view.
+fn ensure_current_title_count_index(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_title_intervals_current_ns
+         ON title_intervals(ns) WHERE end_ts IS NULL",
         [],
     )?;
     Ok(())

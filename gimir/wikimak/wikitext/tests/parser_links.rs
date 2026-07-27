@@ -114,6 +114,14 @@ fn interwiki_with_label() {
 }
 
 #[test]
+fn leading_colon_interwiki_is_still_external() {
+    assert_eq!(
+        render_inner("[[:fr:Paris|Paris FR]]"),
+        "<p><a href=\"https://fr.wikipedia.org/wiki/Paris\" class=\"external extiw\">Paris FR</a></p>"
+    );
+}
+
+#[test]
 fn interwiki_local_instance_is_not_external() {
     assert_eq!(
         render_inner("[[meta:Help]]"),

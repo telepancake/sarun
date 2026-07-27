@@ -254,6 +254,15 @@ impl<'a> Ctx<'a> {
                     i = next;
                     continue;
                 }
+                if let Some(after) = match_open(s, i, "inputbox") {
+                    let (_inner, next) = read_to_close(s, after, "inputbox");
+                    let m = self.strip.stash_block(
+                        "<div class=\"mw-inputbox-unavailable\">Page creation is unavailable in this archival mirror.</div>".to_string(),
+                    );
+                    out.push_str(&m);
+                    i = next;
+                    continue;
+                }
                 out.push('<');
                 i += 1;
             } else {
@@ -494,6 +503,16 @@ impl<'a> Ctx<'a> {
                 continue;
             }
 
+            // Leading whitespace before a block-level HTML tag is formatting
+            // around that tag, not a request for a preformatted block.
+            if line_has_block_tag(line) {
+                self.flush_para(&mut para, &mut out);
+                let rendered = self.inline(line.trim_start());
+                out.push_str(&rendered);
+                i += 1;
+                continue;
+            }
+
             if line.starts_with(' ') || line.starts_with('\t') {
                 self.flush_para(&mut para, &mut out);
                 let mut block: Vec<&str> = Vec::new();
@@ -506,19 +525,6 @@ impl<'a> Ctx<'a> {
                 }
                 let body: Vec<String> = block.iter().map(|l| self.inline(l)).collect();
                 out.push_str(&format!("<pre dir=\"ltr\">{}</pre>", body.join("\n")));
-                continue;
-            }
-
-            // A line carrying a block-level HTML tag (open or close) closes
-            // any open paragraph and is emitted as its own block — MediaWiki's
-            // BlockLevelPass never wraps such a line in <p> (so `<div>`,
-            // `<center>`, `<table>`, … at block level are hoisted, while
-            // inline tags like `<big>`/`<font>` stay in the paragraph).
-            if line_has_block_tag(line) {
-                self.flush_para(&mut para, &mut out);
-                let rendered = self.inline(line);
-                out.push_str(&rendered);
-                i += 1;
                 continue;
             }
 
@@ -715,7 +721,16 @@ impl<'a> Ctx<'a> {
                 html.push_str(&format!("<tr{}>", html::sanitize_attrs(&attrs)));
                 for cell in cells {
                     let tag = if cell.header { "th" } else { "td" };
-                    let inner = self.inline(cell.content.trim());
+                    let content = cell.content.trim();
+                    let blocky = content.lines().any(|line| {
+                        let first = line.chars().next().unwrap_or(' ');
+                        matches!(first, '*' | '#' | ':' | ';') || line_has_block_tag(line)
+                    });
+                    let inner = if blocky {
+                        self.parse_blocks(content)
+                    } else {
+                        self.inline(content)
+                    };
                     html.push_str(&format!("<{tag}{}>{}</{tag}>", cell.attrs, inner));
                 }
                 html.push_str("</tr>");
@@ -777,10 +792,8 @@ impl<'a> Ctx<'a> {
             target_raw.clone()
         };
 
-        if !leading_colon {
-            if let Some(entry) = self.interwiki_of(&target) {
-                return self.render_interwiki(&entry, &target, &parts, trail);
-            }
+        if let Some(entry) = self.interwiki_of(&target) {
+            return self.render_interwiki(&entry, &target, &parts, trail);
         }
 
         let (title, frag) = Title::parse_parts(&target, self.site);

@@ -157,6 +157,14 @@ fn explicit_namespace_transclusion() {
 }
 
 #[test]
+fn localized_namespace_transclusion() {
+    let mut s = MockStore::new();
+    s.site.namespaces.get_mut(&4).unwrap().localized = "Vikipēdija".into();
+    s.add(4, "Today", "localized project page");
+    assert_eq!(xt(&s, "{{Vikipēdija:Today}}"), "localized project page");
+}
+
+#[test]
 fn underscore_and_case_normalization_on_lookup() {
     let mut s = MockStore::new();
     s.template("Foo bar", "matched");

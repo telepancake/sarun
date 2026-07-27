@@ -101,6 +101,13 @@ pub trait PageStore {
         let _ = title;
         None
     }
+    /// Number of pages visible at τ, optionally restricted to one namespace.
+    /// Stores without an efficient count may return `None`; numeric magic
+    /// words then retain their conservative zero fallback.
+    fn page_count(&self, namespace: Option<i32>) -> Option<u64> {
+        let _ = namespace;
+        None
+    }
     fn site(&self) -> &SiteConfig;
     /// τ in unix micros — drives {{CURRENTYEAR}} etc. (plan §3.2: τ!).
     fn timestamp_micros(&self) -> i64;

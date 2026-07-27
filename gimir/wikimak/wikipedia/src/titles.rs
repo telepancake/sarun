@@ -80,11 +80,11 @@ pub(crate) struct TitleCache {
     shards: HashMap<u32, CachedShard>,
 }
 
-/// Default cache budget: a few MB, per the render-batching design note.
-/// Enough for every test-scale pool and for several real shards; a
-/// render touching more shards than fit re-scans on the LRU boundary,
-/// trading RAM for I/O exactly like any cache.
-pub(crate) const TITLE_CACHE_BUDGET: usize = 8 << 20;
+/// Default cache budget. Large template graphs touch most title shards; the
+/// old 8 MiB limit thrashed on medium wikis and repeatedly decompressed the
+/// same shards during one render. 64 MiB remains bounded while fitting the
+/// complete title dictionary of wikis in that class.
+pub(crate) const TITLE_CACHE_BUDGET: usize = 64 << 20;
 
 impl TitleCache {
     pub(crate) fn new(budget_bytes: usize) -> Self {
