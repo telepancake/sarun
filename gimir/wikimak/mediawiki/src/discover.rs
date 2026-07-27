@@ -511,7 +511,7 @@ const CURL_STATUS_MARKER: &[u8] = b"\nSARUN_HTTP_STATUS:";
 fn curl_output(args: &[&str], url: &str) -> Result<(Vec<u8>, StatusCode)> {
     let mut delay = std::time::Duration::from_secs(1);
     for attempt in 0..4 {
-        let user_agent = crate::fetch::curl_user_agent();
+        let user_agent = curl_user_agent();
         let output = Command::new("/usr/bin/curl")
             .args([
                 "--location",
@@ -540,6 +540,19 @@ fn curl_output(args: &[&str], url: &str) -> Result<(Vec<u8>, StatusCode)> {
         delay = delay.saturating_mul(2);
     }
     unreachable!("curl retry loop returns")
+}
+
+#[cfg(target_os = "macos")]
+fn curl_user_agent() -> String {
+    let operator = std::env::var("SARUN_WIKIMEDIA_CONTACT")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| format!("; operator: {value}"))
+        .unwrap_or_default();
+    format!(
+        "sarun-wikimak/{} (+https://github.com/telepancake/sarun{operator})",
+        env!("CARGO_PKG_VERSION")
+    )
 }
 
 #[cfg(target_os = "macos")]
