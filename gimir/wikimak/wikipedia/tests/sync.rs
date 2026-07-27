@@ -63,6 +63,16 @@ fn history_body(event_type: &str) -> Vec<u8> {
     revision[70] = "true";
     revision[71] = "2024-06-02 00:00:00.0";
     writeln!(encoder, "{}", revision.join("\t")).unwrap();
+    let mut visible_revision = vec![""; 78];
+    visible_revision[0] = "testwiki";
+    visible_revision[2] = "revision";
+    visible_revision[3] = "create";
+    visible_revision[4] = "2024-06-01 12:01:00.0";
+    visible_revision[28] = "1";
+    visible_revision[60] = "101";
+    visible_revision[64] = "false";
+    visible_revision[70] = "false";
+    writeln!(encoder, "{}", visible_revision.join("\t")).unwrap();
     encoder.finish().unwrap()
 }
 
@@ -225,7 +235,11 @@ fn maintenance_consumes_daily_adds_changes_without_full_redownload() {
     let sha1_hex = hex::encode(Sha1::digest(&xml));
     let full_part = mount(&server, &xml, &sha1_hex);
     let tmp = TempDir::new().unwrap();
-    let inst = make_instance(&tmp, 1024);
+    // The CLI opens stores with a neutral local label; the persisted
+    // `wiki_dbname` supplied to maintain is the upstream identity.
+    let mut instance_cfg = common::cfg(tmp.path().to_path_buf(), 1024);
+    instance_cfg.dbname = "wiki".into();
+    let inst = wikimak_wikipedia::Instance::open(instance_cfg).unwrap();
     let client = Client::new();
     let cfg = Config { base_url: server.base_url() };
     sync(&inst, &client, &cfg, "testwiki", |_, _| ()).unwrap();
@@ -274,10 +288,14 @@ fn maintenance_consumes_daily_adds_changes_without_full_redownload() {
     assert_eq!(visibility.deleted_parts, "text,user");
     assert!(visibility.parts_are_suppressed);
     assert!(visibility.deleted_by_page_deletion);
+    assert!(
+        inst.revision_visibility(101).unwrap().is_none(),
+        "fully visible revisions must not consume visibility rows"
+    );
 }
 
 #[test]
-fn history_fast_forward_replaces_the_previous_frontier_and_new_tail() {
+fn new_history_snapshot_replaces_every_partition() {
     let server = MockServer::start();
     server.mock(|when, then| {
         when.method(GET).path("/other/incr/testwiki/");
@@ -285,26 +303,26 @@ fn history_fast_forward_replaces_the_previous_frontier_and_new_tail() {
     });
     server.mock(|when, then| {
         when.method(GET).path("/other/mediawiki_history/");
-        then.status(200).body(r#"<a href="2024-06/">2024-06/</a>"#);
+        then.status(200).body(r#"<a href="2024-07/">2024-07/</a>"#);
     });
     server.mock(|when, then| {
         when.method(GET)
-            .path("/other/mediawiki_history/2024-06/testwiki/");
+            .path("/other/mediawiki_history/2024-07/testwiki/");
         then.status(200).body(
-            r#"<a href="2024-06.testwiki.2024-06.tsv.bz2">June</a>
-               <a href="2024-06.testwiki.2024-07.tsv.bz2">July</a>"#,
+            r#"<a href="2024-07.testwiki.2024-06.tsv.bz2">June</a>
+               <a href="2024-07.testwiki.2024-07.tsv.bz2">July</a>"#,
         );
     });
     let june_body = history_body("move");
     let june = server.mock(move |when, then| {
         when.method(GET)
-            .path("/other/mediawiki_history/2024-06/testwiki/2024-06.testwiki.2024-06.tsv.bz2");
+            .path("/other/mediawiki_history/2024-07/testwiki/2024-07.testwiki.2024-06.tsv.bz2");
         then.status(200).body(june_body.clone());
     });
     let july_body = history_body("delete");
     let july = server.mock(move |when, then| {
         when.method(GET)
-            .path("/other/mediawiki_history/2024-06/testwiki/2024-06.testwiki.2024-07.tsv.bz2");
+            .path("/other/mediawiki_history/2024-07/testwiki/2024-07.testwiki.2024-07.tsv.bz2");
         then.status(200).body(july_body.clone());
     });
 
@@ -318,46 +336,56 @@ fn history_fast_forward_replaces_the_previous_frontier_and_new_tail() {
     let stats = maintain(&inst, &Client::new(), &cfg, "testwiki", |_, _| ()).unwrap();
 
     assert_eq!(stats.history_parts_fetched, 2);
-    assert_eq!(june.hits(), 1, "expanded prior frontier must be replaced");
-    assert_eq!(july.hits(), 1, "new partial frontier must be imported");
+    assert_eq!(june.hits(), 1, "every partition belongs to the new snapshot");
+    assert_eq!(july.hits(), 1, "every partition belongs to the new snapshot");
     assert_eq!(
         inst.sync_state("history_frontier_partition").unwrap().as_deref(),
         Some("2024-07")
     );
     assert_eq!(
-        inst.sync_state("history_reconciled_snapshot").unwrap(),
-        None,
-        "a frontier update must not claim full reconciliation"
+        inst.sync_state("history_reconciled_snapshot").unwrap().as_deref(),
+        Some("2024-07"),
+        "the complete replacement is a reconciled snapshot"
     );
 }
 
 #[test]
 fn malformed_history_partition_rolls_back_all_rows() {
+    let initial = MockServer::start();
+    mount_history(&initial);
+    let tmp = TempDir::new().unwrap();
+    let inst = make_instance(&tmp, 1024);
+    let initial_cfg = Config { base_url: initial.base_url() };
+    reconcile_history(&inst, &Client::new(), &initial_cfg, "testwiki", |_, _| ()).unwrap();
+    let before = inst.page_actions(1).unwrap();
+    assert_eq!(before.len(), 1);
+
     let server = MockServer::start();
     server.mock(|when, then| {
         when.method(GET).path("/other/mediawiki_history/");
-        then.status(200).body(r#"<a href="2024-06/">2024-06/</a>"#);
+        then.status(200).body(r#"<a href="2024-07/">2024-07/</a>"#);
     });
     server.mock(|when, then| {
         when.method(GET)
-            .path("/other/mediawiki_history/2024-06/testwiki/");
+            .path("/other/mediawiki_history/2024-07/testwiki/");
         then.status(200).body(
-            r#"<a href="2024-06.testwiki.all-time.tsv.bz2">all</a>"#,
+            r#"<a href="2024-07.testwiki.all-time.tsv.bz2">all</a>"#,
         );
     });
     let body = malformed_history_body();
     server.mock(move |when, then| {
         when.method(GET)
-            .path("/other/mediawiki_history/2024-06/testwiki/2024-06.testwiki.all-time.tsv.bz2");
+            .path("/other/mediawiki_history/2024-07/testwiki/2024-07.testwiki.all-time.tsv.bz2");
         then.status(200).body(body.clone());
     });
-    let tmp = TempDir::new().unwrap();
-    let inst = make_instance(&tmp, 1024);
     let cfg = Config { base_url: server.base_url() };
 
     assert!(
         reconcile_history(&inst, &Client::new(), &cfg, "testwiki", |_, _| ()).is_err()
     );
-    assert!(inst.page_actions(1).unwrap().is_empty());
-    assert_eq!(inst.sync_state("history_reconciled_snapshot").unwrap(), None);
+    assert_eq!(inst.page_actions(1).unwrap(), before);
+    assert_eq!(
+        inst.sync_state("history_reconciled_snapshot").unwrap().as_deref(),
+        Some("2024-06")
+    );
 }

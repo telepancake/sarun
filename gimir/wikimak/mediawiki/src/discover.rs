@@ -404,10 +404,22 @@ fn discover_legacy(client: &Client, cfg: &Config, dbname: &str) -> Result<Run> {
 // ---- HTTP helpers ----------------------------------------------------
 
 fn http_get(client: &Client, url: &str) -> Result<(Vec<u8>, StatusCode)> {
-    let resp = client.get(url).send()?;
-    let status = resp.status();
-    let body = resp.bytes()?;
-    Ok((body.to_vec(), status))
+    let mut delay = std::time::Duration::from_secs(1);
+    for attempt in 0..4 {
+        match client.get(url).send() {
+            Ok(resp) => {
+                let status = resp.status();
+                let body = resp.bytes()?;
+                return Ok((body.to_vec(), status));
+            }
+            Err(error) if attempt < 3 && (error.is_connect() || error.is_timeout()) => {
+                std::thread::sleep(delay);
+                delay = delay.saturating_mul(2);
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    unreachable!("discovery retry loop returns")
 }
 
 /// The `Content-Length` header as a number, if present and parseable.

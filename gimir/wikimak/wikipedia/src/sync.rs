@@ -14,7 +14,7 @@
 //! A crash between 2 and 3 re-imports the part; `revisions_seen` dedup
 //! makes that a cheap no-op, never a correctness problem.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::io::{BufRead, Read};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -49,9 +49,19 @@ struct HistoryFile {
 fn history_listing(client: &Client, url: &str) -> Result<String> {
     let mut delay = Duration::from_secs(1);
     for attempt in 0..4 {
-        let response = client.get(url).send().map_err(|error| {
-            crate::error::Error::Mediawiki(wikimak_mediawiki::Error::Http(error))
-        })?;
+        let response = match client.get(url).send() {
+            Ok(response) => response,
+            Err(error) if attempt < 3 && (error.is_connect() || error.is_timeout()) => {
+                std::thread::sleep(delay);
+                delay = delay.saturating_mul(2);
+                continue;
+            }
+            Err(error) => {
+                return Err(crate::error::Error::Mediawiki(
+                    wikimak_mediawiki::Error::Http(error),
+                ));
+            }
+        };
         let status = response.status();
         if status.is_success() {
             return response.text().map_err(|error| {
@@ -131,6 +141,34 @@ fn discover_history(
             )),
         ));
     }
+    let first_partition = files[0].partition.as_str();
+    if first_partition == "all-time" {
+        if files.len() != 1 {
+            return Err(crate::error::Error::Mediawiki(
+                wikimak_mediawiki::Error::Parse(format!(
+                    "mixed all-time and partitioned MediaWiki History files for {dbname} in {snapshot}"
+                )),
+            ));
+        }
+    } else {
+        let width = first_partition.len();
+        if !matches!(width, 4 | 7)
+            || files.iter().any(|file| file.partition.len() != width)
+            || files.last().is_some_and(|file| {
+                if width == 7 {
+                    file.partition.as_str() > snapshot.as_str()
+                } else {
+                    file.partition.as_str() > &snapshot[..4]
+                }
+            })
+        {
+            return Err(crate::error::Error::Mediawiki(
+                wikimak_mediawiki::Error::Parse(format!(
+                    "invalid or mixed MediaWiki History partition scheme for {dbname} in {snapshot}"
+                )),
+            ));
+        }
+    }
     Ok((snapshot, files))
 }
 
@@ -157,9 +195,23 @@ fn unescape_tsv(value: &str) -> String {
     out
 }
 
+fn history_bool(file: &HistoryFile, line: usize, field: &str, value: &str) -> Result<bool> {
+    match value {
+        "" | "false" | "0" => Ok(false),
+        "true" | "1" => Ok(true),
+        _ => Err(crate::error::Error::Mediawiki(
+            wikimak_mediawiki::Error::Parse(format!(
+                "{}:{line} has invalid {field} boolean {value:?}",
+                file.part.filename
+            )),
+        )),
+    }
+}
+
 fn import_history_file<R: Read + Send + 'static>(
-    inst: &Instance,
+    tx: &rusqlite::Transaction<'_>,
     file: &HistoryFile,
+    expected_dbname: &str,
     input: R,
 ) -> Result<u64> {
     let decoder = wikimak_mediawiki::bz2::new_bz2_reader(
@@ -167,16 +219,6 @@ fn import_history_file<R: Read + Send + 'static>(
         wikimak_mediawiki::bz2::Bz2Options { workers: 0 },
     );
     let reader = std::io::BufReader::new(decoder);
-    let mut g = inst.inner.lock().expect("instance mutex poisoned");
-    let tx = g.conn.transaction()?;
-    tx.execute(
-        "DELETE FROM page_actions WHERE source_partition = ?1",
-        [&file.partition],
-    )?;
-    tx.execute(
-        "DELETE FROM revision_visibility WHERE source_partition = ?1",
-        [&file.partition],
-    )?;
     let mut insert = tx.prepare(
         "INSERT INTO page_actions(
             source_key,source_partition,event_log_id,event_type,event_timestamp,
@@ -209,39 +251,75 @@ fn import_history_file<R: Read + Send + 'static>(
                 ));
             }
         };
-        if fields[0] != inst.dbname {
+        if fields[0] != expected_dbname {
             return Err(crate::error::Error::Mediawiki(
                 wikimak_mediawiki::Error::Parse(format!(
                     "{}:{} contains wiki {:?}, expected {:?}",
                     file.part.filename,
                     line_number + 1,
                     fields[0],
-                    inst.dbname
+                    expected_dbname
                 )),
             ));
         }
         if fields[2] != "page" && fields[2] != "revision" {
             continue;
         }
-        let page_id = match fields[page].parse::<i64>() {
-            Ok(value) if value >= 0 => value,
-            _ => continue,
-        };
+        let page_id = fields[page].parse::<i64>().ok().filter(|value| *value > 0)
+            .ok_or_else(|| crate::error::Error::Mediawiki(
+                wikimak_mediawiki::Error::Parse(format!(
+                    "{}:{} has invalid page id {:?}",
+                    file.part.filename,
+                    line_number + 1,
+                    fields[page]
+                )),
+            ))?;
         if fields[2] == "revision" {
-            let Ok(revision_id) = fields[revision].parse::<i64>() else {
-                continue;
-            };
-            insert_visibility.execute(params![
-                revision_id,
-                page_id,
-                file.partition,
-                fields[revision + 3],
-                matches!(fields[revision + 4], "true" | "1") as i64,
-                matches!(fields[revision + 10], "true" | "1") as i64,
-                fields[revision + 11],
-            ])?;
+            let revision_id = fields[revision].parse::<i64>().ok()
+                .filter(|value| *value > 0)
+                .ok_or_else(|| crate::error::Error::Mediawiki(
+                    wikimak_mediawiki::Error::Parse(format!(
+                        "{}:{} has invalid revision id {:?}",
+                        file.part.filename,
+                        line_number + 1,
+                        fields[revision]
+                    )),
+                ))?;
+            let suppressed = history_bool(
+                file,
+                line_number + 1,
+                "revision_parts_are_suppressed",
+                fields[revision + 4],
+            )?;
+            let page_deleted = history_bool(
+                file,
+                line_number + 1,
+                "revision_deleted_by_page_deletion",
+                fields[revision + 10],
+            )?;
+            if !fields[revision + 3].is_empty()
+                || suppressed
+                || page_deleted
+                || !fields[revision + 11].is_empty()
+            {
+                insert_visibility.execute(params![
+                    revision_id,
+                    page_id,
+                    file.partition,
+                    fields[revision + 3],
+                    suppressed as i64,
+                    page_deleted as i64,
+                    fields[revision + 11],
+                ])?;
+            }
             continue;
         }
+        let page_deleted = history_bool(
+            file,
+            line_number + 1,
+            "page_is_deleted",
+            fields[page + 8],
+        )?;
         let source_key = format!("{}:{}", file.partition, line_number + 1);
         insert.execute(params![
             source_key,
@@ -257,13 +335,12 @@ fn import_history_file<R: Read + Send + 'static>(
             unescape_tsv(fields[page + 2]),
             fields[page + 3].parse::<i64>().ok(),
             fields[page + 5].parse::<i64>().ok(),
-            matches!(fields[page + 8], "true" | "1") as i64,
+            page_deleted as i64,
         ])?;
         imported += 1;
     }
     drop(insert_visibility);
     drop(insert);
-    tx.commit()?;
     Ok(imported)
 }
 
@@ -280,57 +357,38 @@ fn sync_page_actions(
     if !reconcile_all && previous_snapshot.as_deref() == Some(&snapshot) {
         return Ok((0, 0));
     }
-    let previous_frontier = inst.sync_state("history_frontier_partition")?;
-    let available: HashSet<&str> = files.iter().map(|file| file.partition.as_str()).collect();
-    if !reconcile_all {
-        if let Some(frontier) = previous_frontier.as_deref() {
-            if !available.contains(frontier) {
-                return Err(crate::error::Error::Mediawiki(
-                    wikimak_mediawiki::Error::Parse(format!(
-                        "MediaWiki History partition scheme changed or frontier {frontier} disappeared; run explicit full refresh"
-                    )),
-                ));
-            }
-            if frontier.len() == 7
-                && files
-                    .last()
-                    .is_some_and(|file| file.partition.as_str() <= frontier)
-            {
-                return Err(crate::error::Error::Mediawiki(
-                    wikimak_mediawiki::Error::Parse(format!(
-                        "new MediaWiki History snapshot {snapshot} has no complete monthly frontier after {frontier}; retry later"
-                    )),
-                ));
-            }
-        }
-    }
-    let selected: Vec<&HistoryFile> = files
-        .iter()
-        .filter(|file| {
-            reconcile_all
-                || previous_snapshot.is_none()
-                || previous_frontier
-                    .as_deref()
-                    .is_some_and(|frontier| file.partition.as_str() >= frontier)
-        })
-        .collect();
+
+    // Every MediaWiki History release is a reconstructed snapshot, not an
+    // append-only continuation of the preceding month. Old partitions can
+    // change after later moves, renames, and reverts, so a new release must
+    // replace the complete derived metadata set.
+    let mut g = inst.inner.lock().expect("instance mutex poisoned");
+    let tx = g.conn.transaction()?;
+    tx.execute("DELETE FROM page_actions", [])?;
+    tx.execute("DELETE FROM revision_visibility", [])?;
     let mut actions = 0;
-    for file in &selected {
+    for file in &files {
         progress(&file.part.filename, true);
         let source = fetch(client, &file.part)?;
-        actions += import_history_file(inst, file, source)?;
+        actions += import_history_file(&tx, file, dbname, source)?;
     }
     let frontier = files
         .last()
         .expect("history discovery rejects empty file lists")
         .partition
         .as_str();
-    inst.set_sync_state("history_frontier_snapshot", &snapshot)?;
-    inst.set_sync_state("history_frontier_partition", frontier)?;
-    if reconcile_all || previous_snapshot.is_none() {
-        inst.set_sync_state("history_reconciled_snapshot", &snapshot)?;
+    for (key, value) in [
+        ("history_frontier_snapshot", snapshot.as_str()),
+        ("history_frontier_partition", frontier),
+        ("history_reconciled_snapshot", snapshot.as_str()),
+    ] {
+        tx.execute(
+            "INSERT OR REPLACE INTO sync_state(key, value) VALUES(?1, ?2)",
+            [key, value],
+        )?;
     }
-    Ok((selected.len() as u64, actions))
+    tx.commit()?;
+    Ok((files.len() as u64, actions))
 }
 
 fn add_import(into: &mut ImportStats, s: &ImportStats) {
