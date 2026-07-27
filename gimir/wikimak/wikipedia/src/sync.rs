@@ -190,11 +190,11 @@ fn unescape_tsv(file: &HistoryFile, line: usize, field: &str, value: &str) -> Re
             continue;
         }
         let Some(&escape) = input.get(cursor) else {
-            return Err(history_parse_error(
-                file,
-                line,
-                format!("has a dangling escape in {field}"),
-            ));
+            // A terminal backslash is legal title content. MWH demonstrably
+            // does not escape literal backslashes consistently, so absence
+            // of an escape code means the byte is literal.
+            out.push(b'\\');
+            break;
         };
         cursor += 1;
         match escape {
@@ -1244,6 +1244,15 @@ mod tests {
         assert_eq!(
             unescape_tsv(&file, 1_049_781, "page_title_historical", r"M\S_Kaunas").unwrap(),
             r"M\S_Kaunas"
+        );
+    }
+
+    #[test]
+    fn terminal_backslash_is_literal_title_content() {
+        let file = history_file();
+        assert_eq!(
+            unescape_tsv(&file, 1_402_387, "page_title_current", r"Broken ending\").unwrap(),
+            r"Broken ending\"
         );
     }
 
