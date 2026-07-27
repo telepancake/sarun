@@ -228,11 +228,11 @@ fn unescape_tsv(file: &HistoryFile, line: usize, field: &str, value: &str) -> Re
                 cursor += 2;
             }
             other => {
-                return Err(history_parse_error(
-                    file,
-                    line,
-                    format!("has invalid escape \\\\{} in {field}", char::from(other)),
-                ));
+                // Backslash is legal title content. MWH uses it as an
+                // introducer only for the structural escapes above; an
+                // unknown pair is therefore literal, not malformed.
+                out.push(b'\\');
+                out.push(other);
             }
         }
     }
@@ -1206,11 +1206,10 @@ mod tests {
         assert!(integer.contains("testwiki.tsv.bz2:7"), "{integer}");
         assert!(integer.contains("event_user_id"), "{integer}");
 
-        let escape = unescape_tsv(&file, 8, "event_comment", r"bad\qescape")
-            .unwrap_err()
-            .to_string();
-        assert!(escape.contains("testwiki.tsv.bz2:8"), "{escape}");
-        assert!(escape.contains("event_comment"), "{escape}");
+        assert_eq!(
+            unescape_tsv(&file, 8, "event_comment", r"bad\qescape").unwrap(),
+            r"bad\qescape"
+        );
     }
 
     #[test]
@@ -1237,6 +1236,15 @@ mod tests {
             assert!(error.contains("page_title_historical"), "{error}");
             assert!(error.contains(expected), "{error}");
         }
+    }
+
+    #[test]
+    fn unknown_backslash_sequence_is_literal_title_content() {
+        let file = history_file();
+        assert_eq!(
+            unescape_tsv(&file, 1_049_781, "page_title_historical", r"M\S_Kaunas").unwrap(),
+            r"M\S_Kaunas"
+        );
     }
 
     #[test]
