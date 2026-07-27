@@ -517,6 +517,19 @@ fn read_text<B: BufRead>(reader: &mut Reader<B>, end: &[u8]) -> Result<String> {
                     std::str::from_utf8(c.as_ref()).map_err(|e| Error::Xml(e.to_string()))?,
                 );
             }
+            Event::GeneralRef(reference) => {
+                if let Some(ch) = reference
+                    .resolve_char_ref()
+                    .map_err(|e| Error::Xml(e.to_string()))?
+                {
+                    out.push(ch);
+                } else {
+                    let name = reference.decode().map_err(|e| Error::Xml(e.to_string()))?;
+                    let value = quick_xml::escape::resolve_predefined_entity(&name)
+                        .ok_or_else(|| Error::Xml(format!("unknown XML entity &{name};")))?;
+                    out.push_str(value);
+                }
+            }
             Event::End(e) if local_name_end(&e) == end => return Ok(out),
             Event::Eof => {
                 return Err(Error::Xml(format!(

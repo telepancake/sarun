@@ -257,6 +257,7 @@ impl PtStore {
                 NamespaceInfo {
                     id,
                     canonical: canonical.to_string(),
+                    localized: aliases.first().unwrap_or(&canonical).to_string(),
                     aliases: aliases.iter().map(|s| s.to_string()).collect(),
                     case_first_letter: true,
                 },

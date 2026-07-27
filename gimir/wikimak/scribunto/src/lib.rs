@@ -111,7 +111,7 @@ impl LuaInvoker {
         // find its own subpage suffix; the raw lowercased title would leave the
         // pattern unmatched and mangle every submodule path). The frozen
         // preprocessor hands us the raw name, so we canonicalize here.
-        let canonical_title = mwlib::module_title(module).prefixed(store.site());
+        let canonical_title = mwlib::module_title(module).canonical_prefixed(store.site());
         let mut frame = frame.clone();
         frame.title = canonical_title.clone();
         let frame = &frame;

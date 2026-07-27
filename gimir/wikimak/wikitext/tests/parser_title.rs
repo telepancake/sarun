@@ -87,3 +87,14 @@ fn project_alias_resolves() {
     assert_eq!(t.ns, 4);
     assert_eq!(t.prefixed(&site()), "Wikipedia:About");
 }
+
+#[test]
+fn prefixed_uses_localized_namespace_for_storage_lookup() {
+    let mut lv = site();
+    lv.namespaces.get_mut(&10).unwrap().localized = "Veidne".to_string();
+
+    let canonical = Title::parse("Template:Infobox", &lv);
+    let localized = Title::parse("Veidne:Infobox", &lv);
+    assert_eq!(canonical, localized);
+    assert_eq!(canonical.prefixed(&lv), "Veidne:Infobox");
+}

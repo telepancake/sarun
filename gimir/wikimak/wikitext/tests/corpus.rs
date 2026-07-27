@@ -110,13 +110,7 @@ fn build_site(b: &Bundle) -> SiteConfig {
     }
     for row in b.siteinfo.namespaces.values() {
         let canonical = row.canonical.clone().unwrap_or_default();
-        // Aliases the resolver matches transclusions/links against: the
-        // localized name plus any namespacealiases. (Title::parse also matches
-        // `canonical` directly, so the English form always resolves too.)
         let mut aliases = Vec::new();
-        if !row.name.is_empty() && row.name != canonical {
-            aliases.push(row.name.clone());
-        }
         if let Some(ex) = extra.get(&row.id) {
             aliases.extend(ex.iter().cloned());
         }
@@ -128,6 +122,7 @@ fn build_site(b: &Bundle) -> SiteConfig {
                 // namespaces (id 0 has no canonical); harmless — prefixed() of
                 // ns 0 drops the prefix anyway.
                 canonical: if canonical.is_empty() { row.name.clone() } else { canonical },
+                localized: row.name.clone(),
                 aliases,
                 case_first_letter: row.case.as_deref() != Some("case-sensitive"),
             },

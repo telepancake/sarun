@@ -70,9 +70,6 @@ fn full_store(name: &str) -> (FullStore, String, String) {
             let canonical = row["canonical"].as_str().unwrap_or("").to_string();
             let name_ = row["name"].as_str().unwrap_or("").to_string();
             let mut aliases = Vec::new();
-            if !name_.is_empty() && name_ != canonical {
-                aliases.push(name_.clone());
-            }
             if let Some(ex) = extra.get(&id) {
                 aliases.extend(ex.iter().cloned());
             }
@@ -81,6 +78,7 @@ fn full_store(name: &str) -> (FullStore, String, String) {
                 NamespaceInfo {
                     id,
                     canonical: if canonical.is_empty() { name_.clone() } else { canonical },
+                    localized: name_,
                     aliases,
                     case_first_letter: row["case"].as_str() != Some("case-sensitive"),
                 },

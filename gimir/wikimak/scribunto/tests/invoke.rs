@@ -23,6 +23,7 @@ impl TestStore {
         let ns = |id: i32, canon: &str| NamespaceInfo {
             id,
             canonical: canon.to_string(),
+            localized: canon.to_string(),
             aliases: if canon.is_empty() { vec![] } else { vec![canon.to_string()] },
             case_first_letter: true,
         };
@@ -667,14 +668,15 @@ fn require_resolves_localized_module_namespace() {
     // source is stored under the resolved (828, Name). Give ns 828 a localized
     // alias and require through it.
     let mut namespaces = BTreeMap::new();
-    let ns = |id: i32, canon: &str, aliases: Vec<&str>| NamespaceInfo {
+    let ns = |id: i32, canon: &str, localized: &str| NamespaceInfo {
         id,
         canonical: canon.to_string(),
-        aliases: aliases.into_iter().map(|s| s.to_string()).collect(),
+        localized: localized.to_string(),
+        aliases: Vec::new(),
         case_first_letter: true,
     };
-    namespaces.insert(0, ns(0, "", vec![]));
-    namespaces.insert(828, ns(828, "Module", vec!["Модуль"]));
+    namespaces.insert(0, ns(0, "", ""));
+    namespaces.insert(828, ns(828, "Module", "Модуль"));
     let mut store = TestStore::new();
     store.site.namespaces = namespaces;
     store.add_module("Helper", "return { v = function() return 'hi' end }");

@@ -15,6 +15,7 @@ fn ns(id: i32, canonical: &str, aliases: &[&str]) -> NamespaceInfo {
     NamespaceInfo {
         id,
         canonical: canonical.to_string(),
+        localized: canonical.to_string(),
         aliases: aliases.iter().map(|s| s.to_string()).collect(),
         case_first_letter: true,
     }

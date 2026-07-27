@@ -91,6 +91,34 @@ fn parser_three_pages_round_trip() {
     assert_eq!(si.namespaces.get(&10).expect("ns 10").name, "Template");
 }
 
+#[test]
+fn parser_preserves_xml_entities_in_wikitext() {
+    let doc = br#"<mediawiki xmlns="http://www.mediawiki.org/xml/export-0.11/" version="0.11" xml:lang="lv">
+  <siteinfo><sitename>x</sitename><dbname>xwiki</dbname><base>x</base>
+    <generator>x</generator><case>first-letter</case>
+    <namespaces><namespace key="0" case="first-letter"/></namespaces>
+  </siteinfo>
+  <page>
+    <title>A &amp; B</title><ns>0</ns><id>1</id>
+    <revision>
+      <id>2</id><timestamp>2024-01-01T00:00:00Z</timestamp>
+      <contributor><username>U</username><id>3</id></contributor>
+      <comment>&lt;fixed&gt;</comment>
+      <model>wikitext</model><format>text/x-wiki</format>
+      <text bytes="31" xml:space="preserve">&lt;ref a=&quot;x&quot;&gt;&amp; &apos; &quot; &#x1F600;&lt;/ref&gt;</text>
+      <sha1></sha1>
+    </revision>
+  </page>
+</mediawiki>"#;
+    let page = new_page_stream(Cursor::new(doc))
+        .next()
+        .expect("one page")
+        .expect("valid export");
+    assert_eq!(page.title, "A & B");
+    assert_eq!(page.revisions[0].comment, "<fixed>");
+    assert_eq!(page.revisions[0].text, "<ref a=\"x\">& ' \" 😀</ref>");
+}
+
 // ---------------------------------------------------------------------------
 // parser_contributor_variants
 //

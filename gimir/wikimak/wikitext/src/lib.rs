@@ -34,7 +34,9 @@ pub struct NamespaceInfo {
     pub id: i32,
     /// Canonical name, e.g. "Template". Empty for ns 0.
     pub canonical: String,
-    /// Localized name + aliases, normalized (underscores → spaces).
+    /// Localized namespace name used in stored and displayed titles.
+    pub localized: String,
+    /// Additional namespace aliases, normalized (underscores → spaces).
     pub aliases: Vec<String>,
     /// true = first-letter case-insensitive (the usual MediaWiki rule).
     pub case_first_letter: bool,

@@ -209,16 +209,11 @@ fn read_interwiki_rows(conn: &rusqlite::Connection, captured_at: i64) -> Result<
     Ok(out)
 }
 
-/// Resolvable aliases for one namespace JSON object: the dump's `localized`
-/// name when it differs from `canonical`, plus any explicit `aliases`
-/// array. Tolerates old snapshots missing `localized`/`aliases`. The
-/// renderer resolves a namespace by canonical OR any alias, so a non-English
-/// wiki's localized prefix (e.g. "Vorlage") resolves through this list while
-/// the canonical English prefix ("Template") resolves via the canonical
-/// field. Never fabricates: an alias appears only if the dump gave the name.
+/// Additional aliases for one namespace JSON object. Canonical and localized
+/// names are carried in their own fields. Tolerates old snapshots without an
+/// `aliases` array.
 pub fn namespace_aliases(ns: &serde_json::Value) -> Vec<String> {
-    let canonical = ns.get("canonical").and_then(|x| x.as_str()).unwrap_or("");
-    let mut out: Vec<String> = ns
+    ns
         .get("aliases")
         .and_then(|x| x.as_array())
         .map(|a| {
@@ -226,13 +221,7 @@ pub fn namespace_aliases(ns: &serde_json::Value) -> Vec<String> {
                 .filter_map(|x| x.as_str().map(str::to_string))
                 .collect()
         })
-        .unwrap_or_default();
-    if let Some(loc) = ns.get("localized").and_then(|x| x.as_str()) {
-        if !loc.is_empty() && loc != canonical && !out.iter().any(|a| a == loc) {
-            out.push(loc.to_string());
-        }
-    }
-    out
+        .unwrap_or_default()
 }
 
 /// Serve-layer redirect resolution: [`resolve_at_with`] bound to the
@@ -341,6 +330,11 @@ fn build_site_config(
                 .and_then(|x| x.as_str())
                 .unwrap_or("")
                 .to_string();
+            let localized = ns
+                .get("localized")
+                .and_then(|x| x.as_str())
+                .unwrap_or(&canonical)
+                .to_string();
             let case = ns.get("case").and_then(|x| x.as_str()).unwrap_or("");
             let aliases = namespace_aliases(ns);
             namespaces.insert(
@@ -348,6 +342,7 @@ fn build_site_config(
                 wikimak_wikitext::NamespaceInfo {
                     id,
                     canonical,
+                    localized,
                     aliases,
                     case_first_letter: case == "first-letter",
                 },

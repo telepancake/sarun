@@ -82,8 +82,17 @@ impl Title {
         )
     }
 
-    /// Full prefixed form for display and PageStore lookups.
+    /// Localized prefixed form for display and PageStore lookups.
     pub fn prefixed(&self, site: &SiteConfig) -> String {
+        match site.namespaces.get(&self.ns) {
+            Some(ns) if !ns.localized.is_empty() => format!("{}:{}", ns.localized, self.text),
+            Some(ns) if !ns.canonical.is_empty() => format!("{}:{}", ns.canonical, self.text),
+            _ => self.text.clone(),
+        }
+    }
+
+    /// Canonically prefixed form for MediaWiki APIs which require it.
+    pub fn canonical_prefixed(&self, site: &SiteConfig) -> String {
         match site.namespaces.get(&self.ns) {
             Some(ns) if !ns.canonical.is_empty() => format!("{}:{}", ns.canonical, self.text),
             _ => self.text.clone(),
@@ -100,6 +109,9 @@ pub fn resolve_ns<'a>(prefix: &str, site: &'a SiteConfig) -> Option<&'a Namespac
         return None;
     }
     for ns in site.namespaces.values() {
+        if !ns.localized.is_empty() && ns.localized.to_lowercase() == want {
+            return Some(ns);
+        }
         if !ns.canonical.is_empty() && ns.canonical.to_lowercase() == want {
             return Some(ns);
         }

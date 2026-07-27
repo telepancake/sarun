@@ -58,15 +58,16 @@ impl PageStore for MockStore {
     }
 }
 
-/// `aliases[0]` is the localized DISPLAY name (per the NamespaceInfo
-/// contract: "Localized name + aliases"); later entries are extra aliases.
+/// The first supplied name is the localized display name; later entries are
+/// additional aliases.
 fn ns(id: i32, canonical: &str, aliases: &[&str]) -> (i32, NamespaceInfo) {
     (
         id,
         NamespaceInfo {
             id,
             canonical: canonical.to_string(),
-            aliases: aliases.iter().map(|a| a.to_string()).collect(),
+            localized: aliases.first().copied().unwrap_or(canonical).to_string(),
+            aliases: aliases.iter().skip(1).map(|a| a.to_string()).collect(),
             case_first_letter: true,
         },
     )

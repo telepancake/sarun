@@ -127,8 +127,8 @@ fn ns_name(site: &SiteConfig, ns: i32) -> String {
     site.namespaces
         .get(&ns)
         .map(|n| {
-            if !n.aliases.is_empty() {
-                n.aliases[0].clone()
+            if !n.localized.is_empty() {
+                n.localized.clone()
             } else {
                 n.canonical.clone()
             }

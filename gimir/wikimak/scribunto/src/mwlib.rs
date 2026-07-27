@@ -81,6 +81,7 @@ pub fn resolve_module(name: &str, site: &SiteConfig) -> Title {
         let is_module_ns = prefix.eq_ignore_ascii_case("Module")
             || site.namespaces.get(&NS_MODULE).is_some_and(|ns| {
                 ns.canonical.eq_ignore_ascii_case(&prefix)
+                    || ns.localized.eq_ignore_ascii_case(&prefix)
                     || ns.aliases.iter().any(|a| a.eq_ignore_ascii_case(&prefix))
             });
         if is_module_ns {
@@ -335,7 +336,7 @@ fn build_site_table(lua: &Lua, site: &SiteConfig) -> mlua::Result<Table> {
     for info in site.namespaces.values() {
         let e = lua.create_table()?;
         let name = if info.canonical.is_empty() {
-            info.aliases.first().cloned().unwrap_or_default()
+            info.localized.clone()
         } else {
             info.canonical.clone()
         };
@@ -357,7 +358,10 @@ fn build_site_table(lua: &Lua, site: &SiteConfig) -> mlua::Result<Table> {
         // canonical, which callers read separately). Namespace detect iterates
         // this to build its name→id map, so it must be a real sequence.
         let aliases = lua.create_table()?;
-        for (i, a) in info.aliases.iter().enumerate() {
+        let names = std::iter::once(&info.localized)
+            .filter(|name| !name.is_empty() && *name != &info.canonical)
+            .chain(info.aliases.iter());
+        for (i, a) in names.enumerate() {
             aliases.raw_set(i as i64 + 1, a.clone())?;
         }
         e.raw_set("aliases", aliases)?;

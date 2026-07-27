@@ -440,15 +440,11 @@ fn site_config_at_carries_namespaces() {
 }
 
 // ---------------------------------------------------------------------------
-// Namespace aliases (browsing plan §7): the dump gives ONE localized name
-// per namespace. When it differs from the canonical (Project ns 4 localized
-// to "Wikipédia" in the fixture), the canonical fills from the built-in
-// MediaWiki map and the localized name becomes a resolvable alias — never
-// fabricated, only the dump's own name. Pins capture + `namespace_aliases`
-// (the derivation `build_site_config` uses, compile-checked under serve).
+// Namespace names (browsing plan §7): the dump gives one localized name per
+// namespace. It remains distinct from canonical and from additional aliases.
 // ---------------------------------------------------------------------------
 #[test]
-fn namespace_localized_becomes_alias() {
+fn namespace_localized_remains_distinct_from_aliases() {
     let tmp = TempDir::new().unwrap();
     let inst = fixture_instance(&tmp);
 
@@ -464,11 +460,7 @@ fn namespace_localized_becomes_alias() {
     assert_eq!(ns4["localized"], "Wikipédia", "localized from the dump");
 
     let aliases = wikimak_wikipedia::asof::namespace_aliases(ns4);
-    assert!(
-        aliases.iter().any(|a| a == "Wikipédia"),
-        "localized name resolves as an alias, got {aliases:?}"
-    );
-    // The canonical is NOT duplicated into aliases.
+    assert!(!aliases.iter().any(|a| a == "Wikipédia"));
     assert!(!aliases.iter().any(|a| a == "Project"));
 
     // Direct unit pins on the pure derivation (no import needed).
@@ -478,13 +470,13 @@ fn namespace_localized_becomes_alias() {
     // Old snapshot missing `localized` → tolerated, only explicit aliases.
     let legacy = serde_json::json!({"canonical": "Help"});
     assert!(wikimak_wikipedia::asof::namespace_aliases(&legacy).is_empty());
-    // Explicit aliases carried through, plus a differing localized name.
+    // Explicit aliases are carried through without duplicating localized.
     let both = serde_json::json!({
         "canonical": "Category", "localized": "Kategorie", "aliases": ["CAT"]
     });
     let got = wikimak_wikipedia::asof::namespace_aliases(&both);
     assert!(got.iter().any(|a| a == "CAT"));
-    assert!(got.iter().any(|a| a == "Kategorie"));
+    assert!(!got.iter().any(|a| a == "Kategorie"));
 }
 
 // ---------------------------------------------------------------------------

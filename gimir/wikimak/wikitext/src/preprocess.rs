@@ -1722,9 +1722,13 @@ fn ns_name_lookup(site: &SiteConfig, arg: &str) -> Option<String> {
     site.namespaces.get(&id).map(ns_display_name)
 }
 
-/// Localized display name: `aliases[0]` when present, else the canonical.
+/// Localized display name, falling back to the canonical name.
 fn ns_display_name(n: &crate::NamespaceInfo) -> String {
-    n.aliases.first().cloned().unwrap_or_else(|| n.canonical.clone())
+    if n.localized.is_empty() {
+        n.canonical.clone()
+    } else {
+        n.localized.clone()
+    }
 }
 
 fn normalize_ns_key(s: &str) -> String {
