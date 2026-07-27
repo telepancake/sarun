@@ -153,14 +153,12 @@ fn ceiling_overflow_is_a_loud_error_before_any_write() {
         "a rejected id must not grow the index"
     );
 
-    // NO sqlite rows: the overflow fired before the siteinfo capture,
-    // the dirty stamp, and every per-page row.
+    // NO import-derived sqlite rows: the overflow fired before siteinfo
+    // capture or any title redo/history metadata.
     let conn = Connection::open(tmp.path().join("meta.db")).expect("meta.db");
     for table in [
-        "revisions_seen",
-        "page_to_title_id",
-        "title_id_to_page",
-        "title_intervals",
+        "title_interval_overflow",
+        "title_slot_intent",
         "siteinfo_snapshots",
         "parts_seen",
     ] {
@@ -170,9 +168,8 @@ fn ceiling_overflow_is_a_loud_error_before_any_write() {
             "{table} has rows after a rejected import"
         );
     }
-    // instance_flags holds exactly the creation-time shard-count flag
-    // — open-time bookkeeping, not an import effect. In particular NO
-    // dirty stamp: the overflow fired before the first write.
+    // instance_flags contains creation-time configuration only, not an
+    // import effect.
     let flags: Vec<String> = conn
         .prepare("SELECT key FROM instance_flags ORDER BY key")
         .unwrap()

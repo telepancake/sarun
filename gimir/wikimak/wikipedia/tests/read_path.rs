@@ -9,9 +9,6 @@
 //!     frame;
 //!   * an oldest-revision read touches every frame but its peak RSS
 //!     stays ~one-frame-sized (measured on the real CLI in a child);
-//!   * a legacy store whose `revisions_seen` rows predate the `ts`
-//!     column answers correctly via the one-time fallback scan, then
-//!     BACKFILLS the rows so the next head read is f0-only again.
 //!
 //! Store shape: the page is imported ONE REVISION PER IMPORT with a
 //! tiny f1 seal threshold, so every prepend seals the previous
@@ -122,19 +119,18 @@ fn early_stop_reads_touch_only_the_needed_frames() {
         "page_head_text must touch only f0"
     );
 
-    // (b) A τ read whose target lives in f1 (rev N-1) stops there:
-    // f0 + f1, NO cold frame.
+    // (b) An exact revision read whose target lives in f1 (rev N-1)
+    // stops there: f0 + f1, NO cold frame. An as-of timestamp query
+    // must inspect older records because chain position alone does not
+    // prove timestamp order.
     let c0 = inst.depot_read_counts();
-    let tau = micros(2000 + (N - 1) as u32);
-    let meta = inst.revision_at(PAGE_ID, Some(tau)).unwrap().unwrap();
-    assert_eq!(meta.rev_id, N - 1);
-    let text = inst.page_text_at(PAGE_ID, Some(tau)).unwrap().unwrap();
+    let text = inst.revision_text(PAGE_ID, N - 1).unwrap().unwrap();
     assert_eq!(text, text_of(N - 1).into_bytes());
     let c1 = inst.depot_read_counts();
     assert_eq!(
         (c1.f0 - c0.f0, c1.f1 - c0.f1, c1.cold - c0.cold),
-        (2, 2, 0),
-        "an f1-resident τ read (meta + text) must stop before cold"
+        (1, 1, 0),
+        "an f1-resident exact read must stop before cold"
     );
 
     // (c) The oldest revision needs every frame — and exactly one read
@@ -150,14 +146,15 @@ fn early_stop_reads_touch_only_the_needed_frames() {
         "an oldest-revision read walks each frame exactly once"
     );
 
-    // τ before the first revision: answered from sqlite alone.
+    // τ before the first revision: with no relational revision ledger,
+    // the authoritative chain must be checked before returning absence.
     let c0 = inst.depot_read_counts();
     assert_eq!(inst.revision_at(PAGE_ID, Some(micros(1999))).unwrap(), None);
     let c1 = inst.depot_read_counts();
     assert_eq!(
         (c1.f0 - c0.f0, c1.f1 - c0.f1, c1.cold - c0.cold),
-        (0, 0, 0),
-        "τ-before-existence must touch no frame at all"
+        (1, 1, cold_frames),
+        "τ-before-existence must check the authoritative chain"
     );
 }
 
@@ -179,46 +176,4 @@ fn history_text_fetch_is_lazy_and_early_stops() {
     assert_eq!(text, text_of(N - 1).into_bytes());
     let c1 = inst.depot_read_counts();
     assert_eq!(c1.cold - c0.cold, 0, "f1-resident text fetch must not read cold");
-}
-
-#[test]
-fn legacy_null_ts_rows_scan_once_then_backfill() {
-    const N: u64 = 6;
-    let tmp = TempDir::new().unwrap();
-    {
-        let inst = Instance::open(deep_cfg(tmp.path().to_path_buf())).unwrap();
-        build_deep_chain(&inst, N);
-    }
-    // Regress the store to the pre-ts-column state: rows exist, no
-    // timestamps (exactly what a db written before the migration has).
-    {
-        let conn = rusqlite::Connection::open(tmp.path().join("meta.db")).unwrap();
-        conn.execute("UPDATE revisions_seen SET ts = NULL", []).unwrap();
-    }
-
-    let inst = Instance::open(deep_cfg(tmp.path().to_path_buf())).unwrap();
-
-    // First head read: rows can't answer → full-chain streaming scan
-    // (touches cold), correct answer, rows backfilled.
-    let c0 = inst.depot_read_counts();
-    let head = inst.page_head(PAGE_ID).unwrap().unwrap();
-    assert_eq!(head.rev_id, N, "argmax over the scanned chain");
-    let c1 = inst.depot_read_counts();
-    assert!(c1.cold - c0.cold > 0, "legacy read must have scanned the chain");
-
-    let conn = rusqlite::Connection::open(tmp.path().join("meta.db")).unwrap();
-    let nulls: i64 = conn
-        .query_row("SELECT COUNT(*) FROM revisions_seen WHERE ts IS NULL", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(nulls, 0, "the scan must backfill every row's ts");
-
-    // Second head read: indexed path again — f0 only.
-    let c0 = inst.depot_read_counts();
-    assert_eq!(inst.page_head(PAGE_ID).unwrap().unwrap().rev_id, N);
-    let c1 = inst.depot_read_counts();
-    assert_eq!(
-        (c1.f0 - c0.f0, c1.f1 - c0.f1, c1.cold - c0.cold),
-        (1, 0, 0),
-        "backfilled page must take the f0-only head path"
-    );
 }

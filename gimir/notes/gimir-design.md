@@ -146,7 +146,7 @@ displays, grouped by domain.
     operations — move, delete, restore, merge in/out, visibility
     flip, tombstone, source attribution. O(1)–O(10²) per page;
     append-only (import-plan §2.2, §1.4).
-27. **Page-level pretrained dictionary.** One per (instance, lane),
+27. **Instance/lane pretrained dictionary.** One per (instance, lane),
     trained on a representative sample of newest revisions; zstd
     dictionary bytes (~10⁵ bytes per dict). O(10⁰)–O(10¹) per
     instance per lane. Trained once, refreshed on deliberate
@@ -189,7 +189,7 @@ displays, grouped by domain.
     or in refPrefix mode (frames 1+). Frame 0 is the solitary
     head (import-plan §2.2); frame 1 is the accumulator;
     frames 2+ are immutable sealed.
-36. **Chain pretrained dictionary.** Identified by dict_id riding
+36. **Chain frame dictionary identity.** Identified by dict_id riding
     in the zstd frame header; bytes resolved through a caller-
     supplied lookup. O(10⁰)–O(10²) per backing.
 37. **Mux artifact.** Directory of named chains (lanes) plus a

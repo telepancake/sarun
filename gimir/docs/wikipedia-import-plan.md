@@ -260,10 +260,13 @@ Seed (per instance):
    Crash recovery = per-file rerun; idempotence makes reruns cheap
    (pages already at-or-past the file's revisions are skipped by rev_id
    check before any chain write).
-3. Per page: buffer revisions up to a byte budget (default 256 MB;
-   wikitext caps at 2 MB/rev), reverse to newest-first, one batched
-   columnar append per buffer. Oldest buffer lands first, newer buffers
-   prepend on top — chain head re-encoding stays bounded.
+3. Per page: collect the page's revisions, sort by immutable revision
+   id, and build exactly one standalone f0 plus one cold history frame.
+   Page-scoped collection/reversal is the accepted rare-huge-page
+   memory bound; it must not create arbitrary persistent frame
+   boundaries. Existing chains deduplicate by revision id: a strictly
+   newer prefix prepends, while interleaved/older additions use a
+   streaming merge and atomic whole-chain replacement.
    SPLIT PAGES (load-bearing, easy to miss): a page being complete
    within one part file is NOT an invariant. At least enwiki has pages
    whose revisions span multiple dump files — the content exports name

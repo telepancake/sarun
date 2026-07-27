@@ -26,6 +26,7 @@ hex.workspace = true
 regex.workspace = true
 # flock() for the one-process-per-root guard.
 libc.workspace = true
+memmap2 = "0.9"
 # `sync` (discover → fetch → import) drives wikimak_mediawiki's HTTP
 # surface. Optional behind `fetch` (default ON) so read-only embedders
 # (the sarun engine's wiki_attach) don't carry an HTTP stack.

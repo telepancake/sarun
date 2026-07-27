@@ -1,10 +1,9 @@
 //! Read-side wiring of the sharded title dictionary (browsing plan;
 //! "wire the designed dictionary" work order).
 //!
-//! Import appends each `(ns, normalized_title)` ONCE to the strpool
-//! (shard = `fnv1a(title) % shard_count`) and records the dense id in
-//! `title_id_to_page` / `page_to_title_id`. This module is the READ
-//! half:
+//! Import appends each normalized, namespace-qualified title once to the
+//! strpool (shard = `fnv1a(title) % shard_count`). Fixed-width forward
+//! and reverse slot files bind dense title ids to current page ids.
 //!
 //!   * [`lookup_ids`] — exact title → dense ids. It walks only the
 //!     fnv-picked shard; writer-side dynamic re-sharding keeps that
@@ -15,21 +14,21 @@
 //!     merged into a globally byte-ordered candidate window. Bounded
 //!     memory: never more than `threads * need` candidates resident.
 //!
-//! The pool stores title BYTES exactly as import normalized them
-//! (`page.title.trim()`, namespace prefix kept); matching semantics
-//! here must mirror the sqlite reads they replace — exact = byte
-//! equality, substring filter = lossy-UTF-8 lowercase `contains`, the
-//! same rule `Instance::pages` has always applied.
+//! The pool stores normalized title bytes with namespace prefixes kept.
+//! Exact matching is byte equality; substring matching is lossy-UTF-8
+//! lowercase `contains`.
 
 use strpool::Pool;
 
 use crate::error::Result;
 
+pub(crate) fn normalize_title(title: &[u8]) -> Vec<u8> {
+    let text = String::from_utf8_lossy(title).replace('_', " ");
+    text.split_whitespace().collect::<Vec<_>>().join(" ").into_bytes()
+}
+
 /// FNV-1a 64-bit over the normalized title bytes — MUST stay in
-/// lockstep with import.rs's private `fnv1a` (the shard picker used at
-/// append time); a divergence would send lookups to the wrong shard.
-/// Pinned by the one-shard-per-exact-lookup acceptance test, which
-/// fails loudly if the two hashes ever disagree.
+/// lockstep with every title append and lookup.
 pub(crate) fn fnv1a(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
     for &b in bytes {

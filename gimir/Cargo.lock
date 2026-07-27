@@ -2691,6 +2691,7 @@ dependencies = [
  "httpmock",
  "libc",
  "md-5",
+ "memmap2",
  "regex",
  "reqwest",
  "rusqlite",

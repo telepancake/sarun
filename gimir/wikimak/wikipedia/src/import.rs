@@ -7,12 +7,11 @@
 //! wikipedia layer encodes (the depot is byte-opaque):
 //!
 //!   * f0 = the NEWEST revision's record, standalone zstd.
-//!   * f1 = the older records concatenated newest-first, zstd with
-//!     refPrefix anchored on f0's RECORD — successive revisions are
-//!     ~99% identical, so the accumulator costs ~the delta per
-//!     revision. Records are self-delimiting (codec fixed prefix + four
-//!     varint-prefixed blobs), so the reader walks the decompressed
-//!     payload sequentially.
+//!   * On updates, f1 is the mutable accumulator of older records
+//!     concatenated newest-first, zstd with refPrefix anchored on f0's
+//!     RECORD — successive revisions are ~99% identical, so the
+//!     accumulator costs ~the delta per revision. Fresh imports bypass
+//!     f1 and forward-build their history directly into cold.
 //!   * When the decompressed accumulator would exceed the instance's
 //!     `f1_seal_threshold_bytes`, the old f1 SEALS: its zstd bytes move
 //!     verbatim into a cold frame (no re-encode — its anchor, the old
@@ -23,41 +22,19 @@
 //! store-uncompressed scheme (no zstd, no seal) was the sabotage
 //! documented in meta/reports/vbf-recovery.md §4.
 //!
-//! A FRESH page (empty chain — the bulk-import common case) skips the
-//! prepend cycle entirely: dumps arrive oldest-first, and the depot's
-//! forward construction (`ChainBuilder`, SPEC §"Bulk forward
-//! construction") writes older revisions straight to sealed cold
-//! frames (one for ordinary pages; additional frames only when the
-//! exceptional-page RAM bound is crossed). The newest revision lands
-//! alone in f0. A fresh import never creates f1; f1 is exclusively the
-//! mutable accumulator for later updates. History write amplification:
-//! 1.0. Update mode (existing chain) keeps the prepend path.
-//!
-//! ## Per-page atomicity — and the RAM bound
-//!
-//! Per SPEC §"Crash-safety contract":
-//!   1. `BEGIN IMMEDIATE` on sqlite.
-//!   2. The page's revisions STREAM off the parser one at a time (a
-//!      hot full-history page must never be resident whole); each new
-//!      record is encoded as it arrives and lands on the chain in
-//!      batch prepends (SPEC §"Prepend multiple records") bounded by
-//!      the ingest RAM bound — one prepend for any page under the
-//!      bound. The depot index flip is the depot's commit; if sqlite
-//!      then rolls back, those frames are orphaned but unreferenced
-//!      (sqlite owns the page-id↔chain-id story) — the dirty flag is
-//!      already durable, so the next session's suspect-mode repair
-//!      re-derives `revisions_seen` from the chain.
-//!   3. Append the title bytes to the strpool ONCE per (ns, normalized
-//!      title) if not already present; record the resulting id.
-//!   4. Insert sqlite rows: `revisions_seen`, `title_id_to_page` (if
-//!      new title), `page_to_title_id`, `title_intervals` (one row per
-//!      stable title), `siteinfo_snapshots` (once per import).
-//!   5. Commit sqlite. The commit is the atomic boundary.
+//! A fresh page is collected page-at-a-time, sorted by immutable
+//! revision id, and committed as exactly one f0 plus one cold history
+//! frame (when history exists), never f1. An existing chain is the
+//! dedup authority. Strictly newer ids take the prepend fast path;
+//! an interleaved/older addition is streaming-merged with the chain
+//! and installed by one atomic replacement index flip.
 //!
 //! ## Dedup
 //!
-//! A revision `(page_id, rev_id)` already present in `revisions_seen`
-//! is skipped and counted toward `revisions_deduped`.
+//! Revision id is the identity key. Identical records deduplicate.
+//! Different bytes for an existing id never replace archival content:
+//! the incoming complete record is appended to the page's separate
+//! correction lane and surfaced in import statistics/read APIs.
 
 use std::io::Read;
 
@@ -74,59 +51,37 @@ use crate::revision::{
     FLAG_SUPPRESSED, FLAG_TEXT_HIDDEN,
 };
 
-/// RAM bound for the per-page ingest batch: the encoded revision
-/// records resident between depot prepends. This bounds the
-/// COLLECTION, not just the prepend — revisions are encoded as they
-/// stream off the parser (one `Revision` resident at a time) and
-/// flushed to the chain in bounded batches, oldest batch first, so a
-/// full-history page of any size imports in ~this much memory.
-/// Test-overridable via `WIKIMAK_TEST_INGEST_RAM` (bytes), like the
-/// `GITDEPOT_TEST_*` knobs.
-const INGEST_RAM_BOUND: u64 = 256 << 20;
+const TITLE_INTENT_BATCH: usize = 4096;
 
-fn ingest_ram_bound() -> u64 {
-    std::env::var("WIKIMAK_TEST_INGEST_RAM")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(INGEST_RAM_BOUND)
+#[cfg(test)]
+struct PrepareGate {
+    state: std::sync::Mutex<(usize, bool)>,
+    changed: std::sync::Condvar,
 }
 
-/// Test knob: route FRESH chains through the update prepend path
-/// instead of forward construction, so tests can build both stores
-/// from one dump and compare (forward_build.rs equivalence +
-/// write-amplification). Never set outside tests.
-fn force_prepend() -> bool {
-    std::env::var("WIKIMAK_TEST_FORCE_PREPEND").is_ok_and(|v| v == "1")
-}
+#[cfg(test)]
+static PREPARE_GATE: std::sync::Mutex<Option<std::sync::Arc<PrepareGate>>> =
+    std::sync::Mutex::new(None);
 
-/// Test knob: `std::process::abort()` once a forward build has
-/// appended this many history frames — the crash-mid-construction
-/// fixture (forward_build.rs). Never set outside tests.
-fn abort_after_history_frames() -> Option<u64> {
-    std::env::var("WIKIMAK_TEST_ABORT_AFTER_COLD_FRAMES")
-        .ok()
-        .and_then(|v| v.parse().ok())
-}
-
-/// Test knob: return a mid-page error while importing this page id,
-/// AFTER at least one staged batch is prepended to the chain — the
-/// in-session chain-ahead-of-rolled-back-rows fixture (crash_repair.rs).
-/// A non-fatal `Err` (the process survives), so the SAME process can
-/// re-import and must not duplicate the already-stored revisions. Never
-/// set outside tests.
-fn fail_after_prepend_page() -> Option<u64> {
-    std::env::var("WIKIMAK_TEST_FAIL_AFTER_PREPEND")
-        .ok()
-        .and_then(|v| v.parse().ok())
+#[cfg(test)]
+fn wait_at_prepare_gate() {
+    let gate = PREPARE_GATE.lock().unwrap().clone();
+    let Some(gate) = gate else { return };
+    let mut state = gate.state.lock().unwrap();
+    state.0 += 1;
+    gate.changed.notify_all();
+    while !state.1 {
+        state = gate.changed.wait(state).unwrap();
+    }
 }
 
 pub(crate) fn do_import<R: Read>(
     instance: &Instance,
     stream: &mut PageStream<R>,
 ) -> Result<ImportStats> {
-    // Consume via the streaming core: pages yield a header, then
-    // revisions ONE AT A TIME — a hot full-history page (~10^6
-    // revisions, ~10^11 text bytes) must never be resident whole.
+    // The parser yields revisions one at a time, but this canonical merge
+    // deliberately collects ONE page before sorting by immutable revision
+    // id. Exceptionally huge pages therefore set the import RAM bound.
     let stream = stream.revisions_mut();
     let mut stats = ImportStats::default();
     let mut siteinfo_captured = false;
@@ -168,6 +123,8 @@ pub(crate) fn do_import<R: Read>(
         import_one_page(instance, &header, stream, &mut stats)?;
     }
 
+    let mut g = instance.inner.lock().expect("instance mutex poisoned");
+    crate::instance::finish_title_slot_intent(&instance.root, &mut g)?;
     Ok(stats)
 }
 
@@ -178,430 +135,371 @@ fn import_one_page<R: Read>(
     stats: &mut ImportStats,
 ) -> Result<()> {
     let page_id = header.id as u64;
+    let mut incoming = Vec::<Vec<u8>>::new();
+    let mut earliest_ts = None;
+    while let Some(revision) = stream.next_revision() {
+        let revision = revision?;
+        let ts = revision.timestamp.timestamp_micros();
+        earliest_ts = Some(earliest_ts.map_or(ts, |old: i64| old.min(ts)));
+        incoming.push(encode_new_revision(revision, stats));
+    }
+    incoming.sort_by(|a, b| revision_key(b).cmp(&revision_key(a)));
+    let (incoming, conflicts) = dedup_incoming(incoming, stats);
+    let likely_fresh = {
+        let g = instance.inner.lock().expect("instance mutex poisoned");
+        !g.depot.has_chain(page_id)?
+    };
+    let prepared_fresh = if likely_fresh {
+        let dictionaries = crate::frames::DictionaryStore::open_existing(&instance.root);
+        prepare_fresh_chain(&incoming, &dictionaries)?
+    } else {
+        None
+    };
+    #[cfg(test)]
+    wait_at_prepare_gate();
 
     let mut g = instance.inner.lock().expect("instance mutex poisoned");
-
-    // Dirty fence (once per session, durable BEFORE any import write):
-    // between here and the next flush, revisions_seen commits may be
-    // durable while their depot frames are not — a power loss in that
-    // window is what the flag records, and what suspect-mode repairs.
-    if !g.dirty_stamped {
-        g.conn.execute(
-            "INSERT OR REPLACE INTO instance_flags(key, value) VALUES('dirty', 1)",
-            [],
-        )?;
-        g.conn.pragma_update(None, "wal_checkpoint", "TRUNCATE")?;
-        g.dirty_stamped = true;
-    }
-    // Chain-scan repair: this page's revisions_seen rows may reference
-    // frames that never became durable, OR — the same shape from the
-    // other side — be MISSING rows for frames a mid-page error this very
-    // session already prepended (the tx rolled the rows back, the chain
-    // kept the frames). Both leave the chain AHEAD of the rows; both are
-    // healed by re-deriving the rows FROM THE CHAIN (the depot is the
-    // data fence; bookkeeping must never be ahead of it). Two triggers:
-    //   * `suspect` — a previous session died dirty: repair each touched
-    //     page ONCE (tracked in `repaired`).
-    //   * `errored_pages` — a mid-page import error THIS session: repair
-    //     on the next import of that page REGARDLESS of `repaired` (the
-    //     page may have been repaired earlier then errored again), and
-    //     clear it so a clean re-import doesn't pay the scan twice.
-    // Without the errored-page trigger a same-process re-import would
-    // treat the already-stored (but row-less) revisions as unseen and
-    // re-prepend them — duplicate records on the chain.
-    // Streaming: the chain is walked one frame at a time, each record
-    // peeked for (rev_id, ts) and inserted as it goes by — a hot page's
-    // decompressed history is never resident during repair either.
-    let page_errored = g.errored_pages.contains(&page_id);
-    if page_errored || (instance.suspect && !g.repaired.contains(&page_id)) {
-        let inner = &mut *g;
-        inner.conn.execute(
-            "DELETE FROM revisions_seen WHERE page_id = ?1",
-            params![page_id as i64],
-        )?;
-        let mut insert = inner.conn.prepare_cached(
-            "INSERT OR IGNORE INTO revisions_seen(page_id, rev_id, ts) VALUES(?1, ?2, ?3)",
-        )?;
-        let mut walk = crate::instance::WalkState::new(page_id);
-        while let Some(rec) = walk.next_record(&inner.depot)? {
-            insert.execute(params![
-                page_id as i64,
-                crate::revision::peek_rev_id(rec)? as i64,
-                crate::revision::peek_ts(rec)?,
-            ])?;
-        }
-        drop(insert);
-        g.repaired.insert(page_id);
-        g.errored_pages.remove(&page_id);
-    }
-    let mut guard = g;
-    let g = &*guard;
-
-    // Begin the per-page transaction.
-    g.conn.execute("BEGIN IMMEDIATE", [])?;
-    let outcome = (|| -> Result<bool> {
-        // Stream the page's revisions in source order (oldest →
-        // newest, one resident at a time); skip those already in
-        // revisions_seen. Source order isn't strictly
-        // timestamp-ordered in the wild, but every test fixture has it
-        // so. New records land on the chain in batches bounded by the
-        // ingest RAM bound, down one of two paths:
-        //
-        //   * FRESH chain (the bulk-import common case): forward
-        //     construction (depot SPEC §"Bulk forward construction").
-        //     Dumps are oldest-first and the chain format's links
-        //     point newer→older, so each full batch becomes ONE cold
-        //     frame written ONCE — an exceptional-page RAM boundary
-        //     may become a frame boundary,
-        //     the batch's newest record excluded and carried as the
-        //     next frame's oldest record (it is the frame's refPrefix
-        //     anchor, exactly what the newest-first read walk decodes
-        //     against). At `finish_chain`, the final partial history
-        //     batch is sealed to cold and only the newest record lands
-        //     in f0. The index flip is the commit — until then
-        //     everything is an invisible orphan. Write amplification
-        //     for history: 1.0.
-        //
-        //   * EXISTING chain (update mode): the prepend path,
-        //     untouched — one prepend per bound-sized batch (depot
-        //     SPEC §"Prepend multiple records": one f0 swap, one f1
-        //     re-encode, one seal check), oldest batch first, exactly
-        //     the partition `wikimak_depot::chunk_newest_first`
-        //     computes.
-        //
-        // On a mid-page error the sqlite transaction rolls back but
-        // frames already on the chain (prepend path) stay — the same
-        // chain-ahead-of-bookkeeping state a crash leaves, healed by
-        // the same machinery: the dirty flag is already stamped, so
-        // the next session opens suspect and re-derives revisions_seen
-        // from the chain before trusting it. On the forward path the
-        // unfinished build stays invisible (index never flipped) and a
-        // re-import simply builds again; the orphan cold bytes die
-        // with the instance.
-        // This is only a transient collection bound. The f1 seal
-        // threshold governs mutable update layout and must not enlarge
-        // a fresh import's working set or decide its persistent layout.
-        let batch_bound = ingest_ram_bound().max(1);
-        let mut batch: Vec<Vec<u8>> = Vec::new(); // oldest-first
-        let mut batch_bytes: u64 = 0;
-        let mut new_this_page = 0u64;
-        // Fresh-vs-update fork (one index peek). The test knob forces
-        // the prepend path so suites can build both stores and compare.
-        let mut builder = if !force_prepend() && !g.depot.has_chain(page_id)? {
-            Some(g.depot.begin_chain(page_id)?)
-        } else {
-            None
-        };
-        // Forward path: the previous batch's newest record, excluded
-        // from its frame — the anchor it was compressed against, and
-        // the oldest record of the NEXT frame (or of the final cold
-        // frame directly below f0).
-        let mut carry: Option<Vec<u8>> = None;
-
-        // Earliest revision timestamp for THIS dump's copy of the page
-        // — the real start of a title interval (browsing plan §2
-        // wayback contract). Over ALL revisions in hand (not just the
-        // new ones) so an idempotent reimport recomputes the SAME
-        // value. `None` (no revisions) leaves the interval logic a
-        // no-op.
-        let mut earliest_ts: Option<i64> = None;
-        // Does this dump carry the page FORWARD — is its newest
-        // revision (by timestamp; `>=` so ties resolve to the LAST
-        // maximal, matching the old `max_by_key` scan) one we had not
-        // already stored? Each revision's `seen` is checked before its
-        // own insert, so this matches the old pre-scan against the
-        // pre-import state.
-        let mut newest: Option<(i64, bool)> = None;
-
-        while let Some(rev) = stream.next_revision() {
-            let rev = rev?;
-            let rev_id = rev.id as u64;
-            // Test knob: once at least one record is staged, flush it to
-            // the chain and fail — leaving the chain AHEAD of the rows the
-            // rollback drops (the in-session mid-page error this session's
-            // errored-page repair must heal). Prepend path only: on a
-            // forward build the unfinished frames stay invisible, so no
-            // duplicate is possible and the fixture doesn't apply.
-            if fail_after_prepend_page() == Some(page_id) && builder.is_none() && !batch.is_empty()
-            {
-                batch.reverse();
-                prepend_depot_frames(g, page_id, &batch, instance.f1_seal_threshold_bytes)?;
-                batch.clear();
-                return Err(crate::error::Error::Corrupt("WIKIMAK_TEST_FAIL_AFTER_PREPEND"));
-            }
-            let ts = rev.timestamp.timestamp_micros();
-            earliest_ts = Some(earliest_ts.map_or(ts, |e| e.min(ts)));
-
-            let seen = revision_seen(&g.conn, page_id, rev_id)?;
-            if newest.is_none_or(|(m, _)| ts >= m) {
-                newest = Some((ts, !seen));
-            }
-            if seen {
-                stats.revisions_deduped += 1;
-                continue;
-            }
-
-            let record = encode_new_revision(rev, stats);
-            // `ts` rides along so reads resolve "newest revision ≤ τ"
-            // in sqlite instead of decoding the chain (instance.rs
-            // `revision_query`).
-            g.conn
-                .prepare_cached(
-                    "INSERT INTO revisions_seen(page_id, rev_id, ts) VALUES(?1, ?2, ?3)",
-                )?
-                .execute(params![page_id as i64, rev_id as i64, ts])?;
-            new_this_page += 1;
-
-            // Flush BEFORE the record that would overflow the bound
-            // (a single oversized record still travels alone) — the
-            // same greedy oldest-first partition as chunk_newest_first.
-            if !batch.is_empty() && batch_bytes + record.len() as u64 > batch_bound {
-                match builder.as_mut() {
-                    Some(b) => forward_flush(g, b, &mut carry, &mut batch)?,
-                    None => {
-                        batch.reverse(); // the chain wants newest-first
-                        prepend_depot_frames(g, page_id, &batch, instance.f1_seal_threshold_bytes)?;
-                        batch.clear();
-                    }
-                }
-                batch_bytes = 0;
-            }
-            batch_bytes += record.len() as u64;
-            batch.push(record);
-        }
-        match builder.take() {
-            Some(b) => forward_finish(g, b, carry, batch)?,
-            None => {
-                if !batch.is_empty() {
-                    batch.reverse(); // the chain wants newest-first
-                    prepend_depot_frames(g, page_id, &batch, instance.f1_seal_threshold_bytes)?;
-                }
-            }
-        }
-
-        // Title bookkeeping: title pool + reverse index, and the
-        // rename-aware title-interval bookkeeping (a moved page closes
-        // its open interval and opens a new one — browsing plan §2).
-        // After the revision loop (its inputs are streamed aggregates)
-        // but inside the same transaction — the commit stays atomic.
-        let dump_extends_head = newest.is_some_and(|(_, head_is_new)| head_is_new);
-        ensure_title(
-            g,
+    for conflict in conflicts {
+        if append_correction(
+            &g,
             page_id,
-            header.namespace as i64,
-            header.title.trim().as_bytes(),
+            &conflict,
+            instance.f1_seal_threshold_bytes,
+        )? {
+            stats.revision_conflicts += 1;
+        }
+    }
+    let had_chain = g.depot.has_chain(page_id)?;
+    let old_head_key = if had_chain {
+        let raw = crate::frames::decompress_head(
+            &g.depot.read_f0(page_id)?,
+            &g.revision_dictionaries,
+            "revision",
+        )?;
+        Some(revision_key(&raw))
+    } else {
+        None
+    };
+    let dump_extends_head = incoming
+        .first()
+        .is_some_and(|record| old_head_key.is_none_or(|old| revision_key(record) > old));
+
+    let (new_this_page, deduped) = if incoming.is_empty() {
+        (0, 0)
+    } else if !had_chain {
+        let prepared = prepared_fresh.ok_or(crate::error::Error::Corrupt(
+            "fresh-chain preparation missing",
+        ))?;
+        install_fresh_chain(&g, page_id, prepared)?;
+        (incoming.len() as u64, 0)
+    } else if incoming
+        .last()
+        .is_some_and(|record| revision_key(record) > old_head_key.expect("existing head"))
+    {
+        prepend_depot_frames(&g, page_id, &incoming, instance.f1_seal_threshold_bytes)?;
+        (incoming.len() as u64, 0)
+    } else {
+        merge_existing_chain(
+            &g,
+            page_id,
+            old_head_key.expect("existing head"),
+            &incoming,
+            instance.f1_seal_threshold_bytes,
+            stats,
+        )?
+    };
+
+    g.conn.execute("BEGIN IMMEDIATE", [])?;
+    let outcome = (|| -> Result<usize> {
+        ensure_current_title(
+            &mut g,
+            page_id,
+            header.title.as_bytes(),
             instance.title_shard_count.load(std::sync::atomic::Ordering::Relaxed),
             earliest_ts,
             dump_extends_head,
-        )?;
-
-        stats.revisions_new += new_this_page;
-        // Pages counter: bump even when the page was wholly deduped —
-        // it WAS observed in the stream. Tests don't pin this case but
-        // the "pages" semantic is "pages seen this run".
-        stats.pages += 1;
-        Ok(true)
+        )
     })();
-
     match outcome {
-        Ok(_) => {
+        Ok(added_intents) => {
             g.conn.execute("COMMIT", [])?;
-            let title = header.title.trim().as_bytes();
+            g.pending_title_intents += added_intents;
+            if g.pending_title_intents >= TITLE_INTENT_BATCH {
+                crate::instance::finish_title_slot_intent(&instance.root, &mut g)?;
+            }
+            stats.revisions_new += new_this_page;
+            stats.revisions_deduped += deduped;
+            stats.pages += 1;
+            let normalized = crate::titles::normalize_title(header.title.as_bytes());
             let count = instance
                 .title_shard_count
                 .load(std::sync::atomic::Ordering::Relaxed);
-            let sid = crate::titles::shard_for(title, count);
-            instance.maintain_title_shard(&mut guard, sid)?;
+            let sid = crate::titles::shard_for(&normalized, count);
+            instance.maintain_title_shard(&mut g, sid)?;
             Ok(())
         }
         Err(e) => {
-            // Rollback sqlite; depot frames already prepended are
-            // orphaned (dead bytes), per SPEC's per-page atomicity
-            // contract. The chain is now AHEAD of the rows for this
-            // page — flag it so reads this session distrust the rows
-            // and scan the chain (the dirty flag already routes the
-            // NEXT session through suspect-mode repair).
             let _ = g.conn.execute("ROLLBACK", []);
-            guard.import_errored = true;
-            // Route this page's NEXT same-process import through chain-scan
-            // repair: the frames prepended before the error are live on the
-            // chain but their rows just rolled back, so a naive re-import
-            // would re-prepend and duplicate them.
-            guard.errored_pages.insert(page_id);
             Err(e)
         }
     }
 }
 
-/// Insert title pool entry + meta.db rows for a `(ns, normalized_title)`
-/// pair, and maintain the page's `title_intervals` (the wayback title
-/// time-travel index, browsing plan §2).
-///
-/// Interval discipline (`earliest_ts` = the earliest revision timestamp of
-/// this dump's copy of the page). The dump only ever states a page's
-/// CURRENT title; the rename INSTANT is not in the XML export (that lives
-/// in the `mediawiki_history` TSV, import plan §2.4 / W5 — plan §2 "title
-/// history is approximate"). So this bookkeeping does what a dump can
-/// support and no more:
-///
-///   * First sighting of the page → open ONE interval `[earliest_ts, ∞)`
-///     (real start, NOT 0 — so `exists_at` is false before the page's first
-///     revision).
-///   * SAME title still open → idempotent, EXCEPT a later dump that
-///     backfills an EARLIER revision (a full-history dump split across parts
-///     imported out of order) lowers the interval's start to `earliest_ts`,
-///     keeping `exists_at` honest.
-///   * DIFFERENT title whose earliest revision is strictly LATER than the
-///     open interval's start → an INCREMENTAL move: an adds-changes dump
-///     (W6) carries only the post-move revisions, so `earliest_ts` IS the
-///     handoff. CLOSE the old interval there and OPEN the new one — the one
-///     rename shape a dump can date. Old title stops resolving at the move.
-///   * DIFFERENT title, earliest NOT later → a FULL-HISTORY re-export under
-///     the page's current (post-move) title: it re-lists every revision from
-///     the first, so the move cannot be dated. Adopt the new title as
-///     authoritative by RETITLING the open interval in place (single-valued;
-///     the prior title keeps no interval and stops resolving at τ). Real
-///     per-instant rename history awaits the TSV.
-fn ensure_title(
-    g: &InstanceInner,
-    page_id: u64,
-    ns: i64,
-    normalized: &[u8],
-    title_shard_count: u32,
-    earliest_ts: Option<i64>,
-    dump_extends_head: bool,
-) -> Result<()> {
-    // Look up an existing title_id for this (ns, normalized_title).
-    let existing: Option<i64> = g
-        .conn
-        .query_row(
-            "SELECT title_id FROM title_id_to_page
-             WHERE ns = ?1 AND normalized_title = ?2",
-            params![ns, normalized],
-            |r| r.get(0),
-        )
-        .ok();
+fn revision_key(record: &[u8]) -> u64 {
+    crate::revision::peek_rev_id(record).expect("freshly encoded revision record")
+}
 
-    let title_id = match existing {
-        Some(id) => id as u64,
-        None => {
-            // Pick a shard: simple modulo on a stable hash. For
-            // shard_count=1 (test default) this is always shard 0.
-            let shard_id = if title_shard_count == 0 {
-                0
-            } else {
-                (fnv1a(normalized) % title_shard_count as u64) as u32
-            };
-            let id = g.titles.append(shard_id, normalized)?;
-            g.conn.execute(
-                "INSERT INTO title_id_to_page(title_id, ns, normalized_title)
-                 VALUES(?1, ?2, ?3)",
-                params![id as i64, ns, normalized],
-            )?;
-            id
-        }
-    };
-
-    // Idempotent inserts for the page→title side.
-    g.conn.execute(
-        "INSERT OR IGNORE INTO page_to_title_id(page_id, title_id)
-         VALUES(?1, ?2)",
-        params![page_id as i64, title_id as i64],
-    )?;
-
-    // A page with no revisions in this dump has no anchor for an interval;
-    // leave the interval table untouched.
-    let Some(start) = earliest_ts else {
-        return Ok(());
-    };
-
-    // The page's current OPEN interval (end_ts IS NULL), if any. A legacy
-    // start_ts=0 row is also open and matches here — its title is compared
-    // like any other, so a rename off a pre-interval import still works.
-    let open: Option<(i64, Vec<u8>)> = g
-        .conn
-        .query_row(
-            "SELECT start_ts, normalized_title FROM title_intervals
-             WHERE page_id = ?1 AND end_ts IS NULL
-             ORDER BY start_ts DESC LIMIT 1",
-            params![page_id as i64],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .ok();
-
-    match open {
-        None => {
-            // First interval for this page. Real start = earliest revision.
-            // INSERT OR IGNORE guards the (page_id, start_ts) PK against a
-            // same-instant re-run.
-            g.conn.execute(
-                "INSERT OR IGNORE INTO title_intervals
-                    (page_id, ns, normalized_title, title_id, start_ts, end_ts)
-                 VALUES(?1, ?2, ?3, ?4, ?5, NULL)",
-                params![page_id as i64, ns, normalized, title_id as i64, start],
-            )?;
-        }
-        Some((open_start, open_title)) => {
-            if open_title == normalized {
-                // Same title. Backfill only: a later dump may supply an
-                // EARLIER revision (history split across parts, imported out
-                // of order) — lower the start so exists_at stays correct.
-                // Otherwise a true no-op (idempotent reimport).
-                if start < open_start {
-                    g.conn.execute(
-                        "UPDATE title_intervals SET start_ts = ?1
-                         WHERE page_id = ?2 AND start_ts = ?3 AND end_ts IS NULL",
-                        params![start, page_id as i64, open_start],
-                    )?;
+fn dedup_incoming(
+    incoming: Vec<Vec<u8>>,
+    stats: &mut ImportStats,
+) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+    let mut unique: Vec<Vec<u8>> = Vec::with_capacity(incoming.len());
+    let mut conflicts = Vec::new();
+    for record in incoming {
+        if let Some(previous) = unique.last() {
+            if revision_key(previous) == revision_key(&record) {
+                if previous == &record {
+                    stats.revisions_deduped += 1;
+                } else {
+                    conflicts.push(record);
                 }
-            } else if !dump_extends_head {
-                // A DIFFERENT title but this dump adds no new head — a
-                // re-run of an older slice (crash-resume, idempotent
-                // reimport) under a title the page has already moved past.
-                // Leave every interval alone.
-            } else if start > open_start {
-                // Incremental move (adds-changes / W6): a fresh dump whose
-                // revisions begin strictly after the open interval, so
-                // earliest_ts IS the handoff. Close the old interval there
-                // and open the new one — the one datable rename shape.
-                g.conn.execute(
-                    "UPDATE title_intervals SET end_ts = ?1
-                     WHERE page_id = ?2 AND start_ts = ?3 AND end_ts IS NULL",
-                    params![start, page_id as i64, open_start],
-                )?;
-                g.conn.execute(
-                    "INSERT OR IGNORE INTO title_intervals
-                        (page_id, ns, normalized_title, title_id, start_ts, end_ts)
-                     VALUES(?1, ?2, ?3, ?4, ?5, NULL)",
-                    params![page_id as i64, ns, normalized, title_id as i64, start],
-                )?;
-            } else {
-                // A fresh full-history re-export under a new (post-move)
-                // title: it re-lists every revision from the first, so the
-                // move instant is not in the dump. Adopt the new title as
-                // authoritative — retitle the open interval in place, keeping
-                // it single-valued (the prior title then has no interval and
-                // stops resolving at τ). Backfill the start too.
-                let new_start = start.min(open_start);
-                g.conn.execute(
-                    "UPDATE title_intervals
-                        SET normalized_title = ?1, ns = ?2, title_id = ?3, start_ts = ?4
-                     WHERE page_id = ?5 AND start_ts = ?6 AND end_ts IS NULL",
-                    params![normalized, ns, title_id as i64, new_start, page_id as i64, open_start],
-                )?;
+                continue;
             }
         }
+        unique.push(record);
     }
+    (unique, conflicts)
+}
+
+struct PreparedFreshChain {
+    f0: Vec<u8>,
+    history: Option<Vec<u8>>,
+}
+
+fn prepare_fresh_chain(
+    records: &[Vec<u8>],
+    dictionaries: &crate::frames::DictionaryStore,
+) -> Result<Option<PreparedFreshChain>> {
+    let Some(head) = records.first() else {
+        return Ok(None);
+    };
+    let history = if records.len() > 1 {
+        let total = records[1..].iter().try_fold(0u64, |sum, record| {
+            sum.checked_add(record.len() as u64)
+                .ok_or(crate::error::Error::Corrupt("revision history size overflow"))
+        })?;
+        let mut encoder = wikimak_depot::FrameEncoder::new(total, Some(head), 3)
+            .map_err(|_| crate::error::Error::Codec("zstd compress"))?;
+        for record in &records[1..] {
+            encoder
+                .write(record)
+                .map_err(|_| crate::error::Error::Codec("zstd compress"))?;
+        }
+        let history = encoder
+            .finish()
+            .map_err(|_| crate::error::Error::Codec("zstd compress"))?;
+        Some(history)
+    } else {
+        None
+    };
+    let f0 = crate::frames::compress_head(head, dictionaries)?;
+    Ok(Some(PreparedFreshChain { f0, history }))
+}
+
+fn install_fresh_chain(
+    g: &InstanceInner,
+    page_id: u64,
+    prepared: PreparedFreshChain,
+) -> Result<()> {
+    let mut builder = g.depot.begin_chain(page_id)?;
+    if let Some(history) = prepared.history {
+        g.depot.append_history_frame(&mut builder, &history)?;
+    }
+    g.depot.finish_chain(builder, &prepared.f0, None)?;
     Ok(())
 }
 
-fn revision_seen(conn: &rusqlite::Connection, page_id: u64, rev_id: u64) -> Result<bool> {
-    // prepare_cached: this runs once per revision of every page — a
-    // fresh prepare per call was measurable parse overhead at scale.
-    let n: i64 = conn
-        .prepare_cached("SELECT COUNT(*) FROM revisions_seen WHERE page_id = ?1 AND rev_id = ?2")?
-        .query_row(params![page_id as i64, rev_id as i64], |r| r.get(0))?;
-    Ok(n > 0)
+fn merge_existing_chain(
+    g: &InstanceInner,
+    page_id: u64,
+    old_head_id: u64,
+    incoming: &[Vec<u8>],
+    seal_threshold: u64,
+    stats: &mut ImportStats,
+) -> Result<(u64, u64)> {
+    use crate::revision_merge::{MergeOrigin, RevisionMerge, StoredRecords};
+
+    let incoming_stream = || incoming.iter().cloned().map(Ok);
+    let mut merge = RevisionMerge::new(
+        StoredRecords::new(&g.depot, &g.revision_dictionaries, page_id),
+        incoming_stream(),
+    );
+    let mut new_count = 0u64;
+    let mut deduped = 0u64;
+    let mut has_interleaved_new = false;
+    let mut record_count = 0u64;
+    let mut history_bytes = 0u64;
+    while let Some(item) = merge.next()? {
+        if record_count > 0 {
+            history_bytes = history_bytes
+                .checked_add(item.record.len() as u64)
+                .ok_or(crate::error::Error::Corrupt(
+                    "replacement history byte count overflow",
+                ))?;
+        }
+        record_count += 1;
+        match item.origin {
+            MergeOrigin::Incoming => {
+                new_count += 1;
+                has_interleaved_new |= revision_key(&item.record) <= old_head_id;
+            }
+            MergeOrigin::Both => deduped += 1,
+            MergeOrigin::Stored => {}
+        }
+        if let Some(conflict) = item.conflicting_incoming {
+            if append_correction(g, page_id, &conflict, seal_threshold)? {
+                stats.revision_conflicts += 1;
+            }
+        }
+    }
+    if new_count == 0 {
+        return Ok((0, deduped));
+    }
+    if !has_interleaved_new {
+        let prefix: Vec<Vec<u8>> = incoming
+            .iter()
+            .take_while(|record| revision_key(record) > old_head_id)
+            .cloned()
+            .collect();
+        if prefix.len() as u64 != new_count {
+            return Err(crate::error::Error::Corrupt(
+                "newer revision prefix disagrees with merge",
+            ));
+        }
+        prepend_depot_frames(g, page_id, &prefix, seal_threshold)?;
+        return Ok((new_count, deduped));
+    }
+
+    let mut merge = RevisionMerge::new(
+        StoredRecords::new(&g.depot, &g.revision_dictionaries, page_id),
+        incoming_stream(),
+    );
+    let head = merge
+        .next()?
+        .ok_or(crate::error::Error::Corrupt("replacement merge produced no head"))?
+        .record;
+    let mut builder = g.depot.begin_replace_chain(page_id)?;
+    if history_bytes > 0 {
+        let mut encoder = wikimak_depot::FrameEncoder::new(history_bytes, Some(&head), 3)
+            .map_err(|_| crate::error::Error::Codec("zstd compress"))?;
+        while let Some(item) = merge.next()? {
+            encoder
+                .write(&item.record)
+                .map_err(|_| crate::error::Error::Codec("zstd compress"))?;
+        }
+        let history = encoder
+            .finish()
+            .map_err(|_| crate::error::Error::Codec("zstd compress"))?;
+        g.depot.append_history_frame(&mut builder, &history)?;
+    }
+    let f0 = crate::frames::compress_head(&head, &g.revision_dictionaries)?;
+    g.depot.finish_chain(builder, &f0, None)?;
+    Ok((new_count, deduped))
+}
+
+fn append_correction(
+    g: &InstanceInner,
+    page_id: u64,
+    incoming: &[u8],
+    seal_threshold: u64,
+) -> Result<bool> {
+    use crate::revision_merge::encode_correction;
+
+    let revision_id = crate::revision::peek_rev_id(incoming)?;
+    let corrections = crate::revision_merge::read_corrections(&g.corrections, page_id)?;
+    if corrections
+        .iter()
+        .any(|event| event.revision_id == revision_id && event.incoming_record == incoming)
+    {
+        return Ok(false);
+    }
+    let max_occurrence = corrections.iter().map(|event| event.occurrence).max().unwrap_or(0);
+
+    let event = encode_correction(revision_id, max_occurrence + 1, incoming);
+    let new_f0 = crate::frames::compress(&event, None)?;
+    if !g.corrections.has_chain(page_id)? {
+        g.corrections.prepend(page_id, &new_f0, None, false)?;
+        return Ok(true);
+    }
+    let old_f0 = crate::frames::decompress(&g.corrections.read_f0(page_id)?, None)?;
+    let old_f1 = match g.corrections.read_f1(page_id)? {
+        Some(frame) => Some(crate::frames::decompress(&frame, Some(&old_f0))?),
+        None => None,
+    };
+    let (new_f1_raw, seal) =
+        wikimak_depot::compose_f1(&[old_f0.as_slice()], old_f1.as_deref(), seal_threshold);
+    let new_f1 = crate::frames::compress(&new_f1_raw, Some(&event))?;
+    g.corrections.prepend(page_id, &new_f0, Some(&new_f1), seal)?;
+    if new_f1_raw.len() as u64 > seal_threshold {
+        g.corrections.seal_f1(page_id)?;
+    }
+    Ok(true)
+}
+
+fn ensure_current_title(
+    g: &mut InstanceInner,
+    page_id: u64,
+    title: &[u8],
+    title_shard_count: u32,
+    earliest_ts: Option<i64>,
+    dump_extends_head: bool,
+) -> Result<usize> {
+    let Some(start_micros) = earliest_ts else {
+        return Ok(0);
+    };
+    let start = u32::try_from(start_micros.div_euclid(1_000_000))
+        .map_err(|_| crate::error::Error::Corrupt("title timestamp outside u32 seconds"))?;
+    let normalized = crate::titles::normalize_title(title);
+    let mut ids = crate::titles::lookup_ids(&g.titles, title_shard_count, &normalized)?;
+    let title_id = match ids.pop() {
+        Some(id) => id,
+        None => {
+            let shard = crate::titles::shard_for(&normalized, title_shard_count);
+            g.titles.append(shard, &normalized)?
+        }
+    };
+    let page_id: u32 =
+        page_id.try_into().map_err(|_| crate::error::Error::Corrupt("page id exceeds u32"))?;
+    let current_title = crate::instance::effective_page_title_id(g, page_id)?;
+    if current_title != Some(title_id) && current_title.is_some() && !dump_extends_head {
+        return Ok(0);
+    }
+    let mut changes = Vec::with_capacity(2);
+    if let Some(old_title_id) = current_title {
+        if old_title_id != title_id {
+            changes.push((old_title_id, crate::title_slots::TitleBinding::unbound(start)));
+        }
+    }
+    let since = crate::instance::effective_title_binding(g, title_id)?
+        .filter(|binding| binding.page_id == page_id)
+        .map_or(start, |binding| binding.valid_since.min(start));
+    changes.push((
+        title_id,
+        crate::title_slots::TitleBinding::bound(page_id, since)?,
+    ));
+    let mut added = 0;
+    for (title_id, binding) in changes {
+        added += g.conn.execute(
+            "INSERT OR IGNORE INTO title_slot_intent(title_id,page_id,valid_since)
+             VALUES(?1,?2,?3)",
+            rusqlite::params![title_id as i64, binding.page_id, binding.valid_since],
+        )?;
+        g.conn.execute(
+            "UPDATE title_slot_intent SET page_id=?2,valid_since=?3 WHERE title_id=?1",
+            rusqlite::params![title_id as i64, binding.page_id, binding.valid_since],
+        )?;
+    }
+    Ok(added)
 }
 
 /// Encode one NEW mediawiki Revision into its depot record. Consumes
@@ -669,81 +567,6 @@ fn encode_new_revision(rev: Revision, stats: &mut ImportStats) -> Vec<u8> {
     encode_revision(&meta, text)
 }
 
-/// Forward-construction batch flush (fresh chains only): turn the full
-/// oldest-first `batch` into ONE cold frame written ONCE. The batch's
-/// NEWEST record is excluded — it is the frame's refPrefix anchor and
-/// becomes the next frame's oldest record (`carry`), reproducing the
-/// read walk's invariant (each cold frame decodes against the oldest
-/// record of the next-newer frame) in dump order. The frame holds, in
-/// newest-first record order: the batch minus its newest, then the
-/// incoming carry. A wrong anchor here would fail the read-back's zstd
-/// decode loudly — the equivalence test's real teeth.
-fn forward_flush(
-    g: &InstanceInner,
-    b: &mut wikimak_depot::ChainBuilder,
-    carry: &mut Option<Vec<u8>>,
-    batch: &mut Vec<Vec<u8>>,
-) -> Result<()> {
-    let newest = batch.pop().expect("forward_flush wants a non-empty batch");
-    // A single-record batch with no carry has nothing to frame: the
-    // record just becomes the carry (a lone oversized record travels
-    // to the NEXT frame as its oldest entry, or into the head).
-    if !batch.is_empty() || carry.is_some() {
-        let mut raw =
-            Vec::with_capacity(batch.iter().map(Vec::len).sum::<usize>()
-                + carry.as_ref().map_or(0, |c| c.len()));
-        // Newest-first; each drained record is freed as it is copied.
-        for rec in batch.drain(..).rev() {
-            raw.extend_from_slice(&rec);
-        }
-        if let Some(c) = carry.take() {
-            raw.extend_from_slice(&c);
-        }
-        let zstd = crate::frames::compress(&raw, Some(&newest))?;
-        g.depot.append_history_frame(b, &zstd)?;
-        if abort_after_history_frames().is_some_and(|n| b.frames_written() >= n) {
-            // Crash-mid-construction test knob: die BETWEEN frames,
-            // before the index flip — the build must stay invisible.
-            std::process::abort();
-        }
-    }
-    *carry = Some(newest);
-    Ok(())
-}
-
-/// Forward-construction commit: the final partial batch plus the carry
-/// become the chain head — the newest record is standalone f0 and all
-/// older records are one sealed cold frame, refPrefix-anchored on f0.
-/// Earlier exceptional-page batches, if any, are already older cold
-/// frames. Fresh construction never creates f1. The depot's
-/// `finish_chain` index flip is the atomic commit. No new records at
-/// all ⇒ nothing was ever written; the builder just drops.
-fn forward_finish(
-    g: &InstanceInner,
-    mut b: wikimak_depot::ChainBuilder,
-    carry: Option<Vec<u8>>,
-    mut batch: Vec<Vec<u8>>,
-) -> Result<()> {
-    batch.reverse(); // newest-first
-    if let Some(c) = carry {
-        batch.push(c);
-    }
-    let Some((head, older)) = batch.split_first() else {
-        return Ok(());
-    };
-    let f0 = crate::frames::compress(head, None)?;
-    if !older.is_empty() {
-        let mut raw = Vec::with_capacity(older.iter().map(Vec::len).sum());
-        for rec in older {
-            raw.extend_from_slice(rec);
-        }
-        let cold = crate::frames::compress(&raw, Some(head))?;
-        g.depot.append_history_frame(&mut b, &cold)?;
-    }
-    g.depot.finish_chain(b, &f0, None)?;
-    Ok(())
-}
-
 /// Prepend one or more revision records (NEWEST-first) to the depot
 /// chain for `chain_id` as ONE prepend — the normative multi-record
 /// composition (depot SPEC §"Prepend multiple records", exposed as
@@ -756,21 +579,6 @@ pub(crate) fn prepend_depot_frames(
     records_newest_first: &[Vec<u8>],
     seal_threshold: u64,
 ) -> Result<()> {
-    // NEVER chunk at the seal threshold: one batch = one prepend =
-    // one f1 re-encode regardless of size; splitting only churns dead
-    // head frames. Sealing is decided BETWEEN prepends against the OLD
-    // accumulator (compose_f1). Chunking survives solely as a RAM
-    // bound for pathological batches — the streaming import loop
-    // already flushes at this same bound (same greedy oldest-first
-    // partition), so for import this is a no-op invariant guard.
-    let sizes: Vec<usize> = records_newest_first.iter().map(|r| r.len()).collect();
-    let chunks = wikimak_depot::chunk_newest_first(&sizes, ingest_ram_bound().max(seal_threshold));
-    if chunks.len() > 1 {
-        for range in chunks {
-            prepend_depot_frames(g, chain_id, &records_newest_first[range], seal_threshold)?;
-        }
-        return Ok(());
-    }
     // Is this the first prepend on the chain?
     let prev_f0 = match g.depot.read_f0(chain_id) {
         Ok(b) => Some(b),
@@ -782,7 +590,11 @@ pub(crate) fn prepend_depot_frames(
         Some(frame) => (
             &records_newest_first[0],
             &records_newest_first[1..],
-            crate::frames::decompress(&frame, None)?,
+            crate::frames::decompress_head(
+                &frame,
+                &g.revision_dictionaries,
+                "revision",
+            )?,
         ),
         None => {
             // Empty chain: seed with the OLDEST record (the depot
@@ -790,7 +602,12 @@ pub(crate) fn prepend_depot_frames(
             // rest as one batch.
             let (seed, rest) = records_newest_first.split_last().expect("non-empty batch");
             g.depot
-                .prepend(chain_id, &crate::frames::compress(seed, None)?, None, false)?;
+                .prepend(
+                    chain_id,
+                    &crate::frames::compress_head(seed, &g.revision_dictionaries)?,
+                    None,
+                    false,
+                )?;
             if rest.is_empty() {
                 return Ok(());
             }
@@ -798,7 +615,7 @@ pub(crate) fn prepend_depot_frames(
         }
     };
     let old_f1_raw = match g.depot.read_f1(chain_id)? {
-        Some(f1_frame) => crate::frames::decompress(&f1_frame, Some(&prev_record))?,
+        Some(f1_frame) => crate::frames::decompress_history(&f1_frame, &prev_record)?,
         None => Vec::new(),
     };
     // Accumulator entries newest-first: the older new records, then the
@@ -810,14 +627,13 @@ pub(crate) fn prepend_depot_frames(
         if old_f1_raw.is_empty() { None } else { Some(&old_f1_raw) },
         seal_threshold,
     );
-    let new_f0 = crate::frames::compress(head, None)?;
-    let new_f1 = crate::frames::compress(&new_f1_raw, Some(head))?;
+    let new_f0 = crate::frames::compress_head(head, &g.revision_dictionaries)?;
+    let new_f1 = crate::frames::compress_history(&new_f1_raw, head)?;
     g.depot.prepend(chain_id, &new_f0, Some(&new_f1), seal)?;
     Ok(())
 }
 
 fn capture_siteinfo(conn: &rusqlite::Connection, si: &wikimak_mediawiki::SiteInfo) -> Result<()> {
-    let captured_at = chrono::Utc::now().timestamp_micros();
     // Per-namespace JSON (browsing plan §2 / §7 siteinfo). Keys are
     // ADDITIVE: the asof read API tolerates snapshots written before a key
     // existed. The dump's `<namespace>` gives one localized name + the
@@ -851,10 +667,26 @@ fn capture_siteinfo(conn: &rusqlite::Connection, si: &wikimak_mediawiki::SiteInf
     // serde_json::to_vec on a flat object of String fields cannot fail
     // (no custom Serialize, no non-UTF-8 keys); unwrap is fine.
     let bytes = serde_json::to_vec(&payload).expect("siteinfo json");
-    // PRIMARY KEY on captured_at; OR IGNORE so a re-import doesn't
-    // collide on the rare same-microsecond reopen.
+
+    // The export header is a minimal bootstrap, not an upstream-timed
+    // siteinfo history source: it carries no effective timestamp and is
+    // repeated byte-for-byte in every multipart dump. Keep exactly one
+    // bootstrap snapshot. Rich API siteinfo refreshes belong to their
+    // own changed-content/versioned path with an actual observation
+    // time; reimporting an old dump must not fabricate a new present-day
+    // configuration event.
+    let already_bootstrapped: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM siteinfo_snapshots LIMIT 1)",
+        [],
+        |row| row.get(0),
+    )?;
+    if already_bootstrapped {
+        return Ok(());
+    }
+
+    let captured_at = chrono::Utc::now().timestamp_micros();
     conn.execute(
-        "INSERT OR IGNORE INTO siteinfo_snapshots(captured_at, json) VALUES(?1, ?2)",
+        "INSERT INTO siteinfo_snapshots(captured_at, json) VALUES(?1, ?2)",
         params![captured_at, bytes],
     )?;
     // Interwiki map for this snapshot. Export dumps carry none, so this is
@@ -906,13 +738,131 @@ fn canonical_namespace_name(id: i32) -> Option<&'static str> {
     })
 }
 
-/// FNV-1a 64-bit. Used solely to pick a strpool shard deterministically
-/// from the normalized title bytes — never persisted, never read back.
-fn fnv1a(bytes: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf29ce484222325;
-    for &b in bytes {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x100000001b3);
+#[cfg(test)]
+mod concurrency_tests {
+    use std::io::Cursor;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use tempfile::TempDir;
+    use wikimak_mediawiki::new_page_stream;
+
+    use super::*;
+
+    fn xml(page: u64) -> Vec<u8> {
+        let text = "parallel fresh-page compression ".repeat(20_000);
+        format!(
+            "<mediawiki xmlns=\"http://www.mediawiki.org/xml/export-0.11/\" version=\"0.11\">\
+             <siteinfo><sitename>P</sitename><dbname>p</dbname><base>x</base><generator>g</generator>\
+             <case>first-letter</case><namespaces><namespace key=\"0\" case=\"first-letter\"/>\
+             </namespaces></siteinfo><page><title>Page {page}</title><ns>0</ns><id>{page}</id>\
+             <revision><id>{}</id><timestamp>2024-01-01T00:00:00Z</timestamp>\
+             <contributor><username>E</username><id>1</id></contributor>\
+             <text xml:space=\"preserve\">{text}</text></revision></page></mediawiki>",
+            1000 + page
+        )
+        .into_bytes()
     }
-    h
+
+    fn many_pages_xml(pages: u64) -> Vec<u8> {
+        let mut body = String::new();
+        for page in 1..=pages {
+            body.push_str(&format!(
+                "<page><title>Batch {page}</title><ns>0</ns><id>{page}</id>\
+                 <revision><id>{}</id><timestamp>2024-01-01T00:00:00Z</timestamp>\
+                 <contributor><username>E</username><id>1</id></contributor>\
+                 <text xml:space=\"preserve\">text {page}</text></revision></page>",
+                2000 + page
+            ));
+        }
+        format!(
+            "<mediawiki xmlns=\"http://www.mediawiki.org/xml/export-0.11/\" version=\"0.11\">\
+             <siteinfo><sitename>P</sitename><dbname>p</dbname><base>x</base><generator>g</generator>\
+             <case>first-letter</case><namespaces><namespace key=\"0\" case=\"first-letter\"/>\
+             </namespaces></siteinfo>{body}</mediawiki>"
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn two_page_streams_prepare_before_either_enters_final_install() {
+        let tmp = TempDir::new().unwrap();
+        let instance = crate::Instance::open(crate::InstanceConfig {
+            root: tmp.path().to_path_buf(),
+            dbname: "parallel".into(),
+            max_chain_id: 16,
+            depot: wikimak_depot::DepotConfig {
+                root: std::path::PathBuf::new(),
+                max_chain_id: 16,
+                file_size_threshold: 8 << 20,
+                eviction_dead_ratio: 0.5,
+            },
+            title_shard_count: 1,
+            title_seal_threshold_bytes: 8 << 20,
+            f1_seal_threshold_bytes: 1 << 20,
+        })
+        .unwrap();
+        let gate = Arc::new(PrepareGate {
+            state: std::sync::Mutex::new((0, false)),
+            changed: std::sync::Condvar::new(),
+        });
+        *PREPARE_GATE.lock().unwrap() = Some(Arc::clone(&gate));
+
+        let both_prepared = std::thread::scope(|scope| {
+            let a = scope.spawn(|| {
+                let mut stream = new_page_stream(Cursor::new(xml(1)));
+                instance.import(&mut stream)
+            });
+            let b = scope.spawn(|| {
+                let mut stream = new_page_stream(Cursor::new(xml(2)));
+                instance.import(&mut stream)
+            });
+
+            let mut state = gate.state.lock().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while state.0 < 2 {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                let (next, _) = gate.changed.wait_timeout(state, remaining).unwrap();
+                state = next;
+            }
+            let both_prepared = state.0 == 2;
+            state.1 = true;
+            gate.changed.notify_all();
+            drop(state);
+
+            a.join().unwrap().unwrap();
+            b.join().unwrap().unwrap();
+            both_prepared
+        });
+        *PREPARE_GATE.lock().unwrap() = None;
+        assert!(both_prepared, "page-local parsing/compression serialized behind Instance");
+        assert!(instance.page_head(1).unwrap().is_some());
+        assert!(instance.page_head(2).unwrap().is_some());
+    }
+
+    #[test]
+    fn title_slot_files_are_applied_once_per_import_not_once_per_page() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let tmp = TempDir::new().unwrap();
+        let instance = crate::Instance::open(crate::instance::read_config(
+            tmp.path().to_path_buf(),
+        ))
+        .unwrap();
+        let count = Arc::new(AtomicU64::new(0));
+        crate::title_slots::set_apply_counter(Some((
+            tmp.path().to_path_buf(),
+            Arc::clone(&count),
+        )));
+        let mut stream = new_page_stream(Cursor::new(many_pages_xml(32)));
+        instance.import(&mut stream).unwrap();
+        crate::title_slots::set_apply_counter(None);
+
+        assert_eq!(count.load(Ordering::Relaxed), 1);
+        assert!(instance.page_current_title(1).unwrap().is_some());
+        assert!(instance.page_current_title(32).unwrap().is_some());
+    }
 }

@@ -62,6 +62,11 @@ pub enum Error {
     #[error("bulk construction requires an empty chain")]
     ChainNotEmpty,
 
+    /// The chain changed after a replacement builder captured its old
+    /// head. Finishing it would lose that concurrent update.
+    #[error("replacement builder is stale: chain head changed")]
+    StaleBuilder,
+
     /// The on-disk index file length is not a whole number of 8-byte
     /// slots — a torn ftruncate or outside interference. (Capacity
     /// itself is DERIVED from the length; a differing
@@ -236,6 +241,7 @@ pub struct ChainBuilder {
     /// f1/f0 cold-head at finish.
     cold_head: u64,
     frames: u64,
+    replaced_ptr: Option<u64>,
 }
 
 impl ChainBuilder {
@@ -318,6 +324,25 @@ impl Depot {
         Ok(out)
     }
 
+    /// Atomically replace only f0's opaque bytes, preserving its exact
+    /// next pointer. f1 and cold frames are neither copied nor repointed.
+    pub fn replace_f0(&self, chain_id: u64, new_f0_bytes: &[u8]) -> Result<()> {
+        self.inner
+            .lock()
+            .expect("depot mutex poisoned")
+            .replace_f0(chain_id, new_f0_bytes)
+    }
+
+    /// Return at most `limit` non-empty chain ids strictly after
+    /// `after` (`None` starts at zero). This scans only the mmap index
+    /// and permits bounded iteration over very large sparse stores.
+    pub fn occupied_chain_ids_after(&self, after: Option<u64>, limit: usize) -> Vec<u64> {
+        self.inner
+            .lock()
+            .expect("depot mutex poisoned")
+            .occupied_chain_ids_after(after, limit)
+    }
+
     /// Read the current f1 frame's opaque zstd bytes; `Ok(None)` if no f1.
     pub fn read_f1(&self, chain_id: u64) -> Result<Option<Vec<u8>>> {
         let mut g = self.inner.lock().expect("depot mutex poisoned");
@@ -379,7 +404,21 @@ impl Depot {
     pub fn begin_chain(&self, chain_id: u64) -> Result<ChainBuilder> {
         let mut g = self.inner.lock().expect("depot mutex poisoned");
         g.begin_chain(chain_id)?;
-        Ok(ChainBuilder { chain_id, cold_head: 0, frames: 0 })
+        Ok(ChainBuilder { chain_id, cold_head: 0, frames: 0, replaced_ptr: None })
+    }
+
+    /// Begin an atomic replacement build for an EXISTING chain. New
+    /// cold/head frames remain unreachable until [`Depot::finish_chain`]
+    /// flips the index slot; that flip replaces the complete chain.
+    pub fn begin_replace_chain(&self, chain_id: u64) -> Result<ChainBuilder> {
+        let mut g = self.inner.lock().expect("depot mutex poisoned");
+        let replaced_ptr = g.begin_replace_chain(chain_id)?;
+        Ok(ChainBuilder {
+            chain_id,
+            cold_head: 0,
+            frames: 0,
+            replaced_ptr: Some(replaced_ptr),
+        })
     }
 
     /// Append the next-NEWER history frame (opaque zstd; the caller's
@@ -403,7 +442,12 @@ impl Depot {
     /// bytes. Durability, as everywhere in the depot, is `flush()`.
     pub fn finish_chain(&self, b: ChainBuilder, f0: &[u8], f1: Option<&[u8]>) -> Result<()> {
         let mut g = self.inner.lock().expect("depot mutex poisoned");
-        g.finish_chain(b.chain_id, b.cold_head, f0, f1)
+        match b.replaced_ptr {
+            Some(expected) => {
+                g.finish_replace_chain(b.chain_id, expected, b.cold_head, f0, f1)
+            }
+            None => g.finish_chain(b.chain_id, b.cold_head, f0, f1),
+        }
     }
 
     /// Delete `chain_id` outright: its f0/f1 frames are marked dead
@@ -472,6 +516,15 @@ impl Depot {
     pub fn collect(&self) -> Result<()> {
         let mut g = self.inner.lock().expect("depot mutex poisoned");
         g.collect()?;
+        g.flush()?;
+        g.persist_counters()
+    }
+
+    /// Compact every f0 file containing deprecated frames. f1 and cold
+    /// files are not rolled, copied, patched, or unlinked.
+    pub fn collect_f0(&self) -> Result<()> {
+        let mut g = self.inner.lock().expect("depot mutex poisoned");
+        g.collect_f0()?;
         g.flush()?;
         g.persist_counters()
     }

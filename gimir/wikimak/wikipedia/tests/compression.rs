@@ -106,7 +106,7 @@ fn dir_size(p: &Path) -> u64 {
 #[test]
 fn multi_revision_page_compresses_and_seals() {
     const N: usize = 120;
-    let (xml, texts) = export_xml(N);
+    let (_, texts) = export_xml(N);
     let raw_total: u64 = texts.iter().map(|t| t.len() as u64).sum();
     assert!(raw_total > 4 << 20, "fixture should be multi-MB raw");
 

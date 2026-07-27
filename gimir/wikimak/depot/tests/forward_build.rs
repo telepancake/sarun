@@ -160,3 +160,112 @@ fn forward_build_writes_each_byte_once() {
         "forward build must write each byte once: wrote {written}, {disk} on disk"
     );
 }
+
+#[test]
+fn replacement_flips_atomically_and_accounts_the_old_chain() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().to_path_buf();
+    let d = open(root.clone());
+    let mut old = d.begin_chain(12).unwrap();
+    d.append_history_frame(&mut old, b"old-cold").unwrap();
+    d.finish_chain(old, b"old-f0", Some(b"old-f1")).unwrap();
+
+    // An abandoned replacement never disturbs the live chain.
+    {
+        let mut abandoned = d.begin_replace_chain(12).unwrap();
+        d.append_history_frame(&mut abandoned, b"orphan").unwrap();
+    }
+    assert_eq!(d.read_f0(12).unwrap(), b"old-f0");
+    d.flush().unwrap();
+    drop(d);
+    let d = open(root.clone());
+    assert_eq!(d.read_f0(12).unwrap(), b"old-f0", "pre-flip crash keeps old chain");
+
+    let mut stale = d.begin_replace_chain(12).unwrap();
+    d.append_history_frame(&mut stale, b"stale-history").unwrap();
+    d.prepend(12, b"concurrent-f0", Some(b"concurrent-f1"), false).unwrap();
+    assert!(matches!(
+        d.finish_chain(stale, b"stale-f0", None),
+        Err(Error::StaleBuilder)
+    ));
+    assert_eq!(d.read_f0(12).unwrap(), b"concurrent-f0");
+
+    let mut replacement = d.begin_replace_chain(12).unwrap();
+    d.append_history_frame(&mut replacement, b"new-oldest").unwrap();
+    d.finish_chain(replacement, b"new-f0", None).unwrap();
+    assert_eq!(d.read_f0(12).unwrap(), b"new-f0");
+    assert_eq!(d.read_f1(12).unwrap(), None);
+    let cold: Vec<Vec<u8>> = d.cold_iter(12).unwrap().map(|r| r.unwrap()).collect();
+    assert_eq!(cold, vec![b"new-oldest".to_vec()]);
+    assert_eq!(d.cold_stats().1, 24 + b"old-cold".len() as u64);
+    assert!(
+        d.tier_stats().iter().any(|(tier, _, _, dead)| *tier == "f0" && *dead > 0),
+        "old f0 must be dead"
+    );
+    assert!(
+        d.tier_stats().iter().any(|(tier, _, _, dead)| *tier == "f1" && *dead > 0),
+        "old f1 must be dead"
+    );
+    d.flush().unwrap();
+    drop(d);
+
+    let d = open(root);
+    assert_eq!(d.read_f0(12).unwrap(), b"new-f0");
+    assert_eq!(d.cold_stats().1, 24 + b"old-cold".len() as u64);
+}
+
+#[test]
+fn head_only_replacement_preserves_history_reachability_and_bytes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    let d = open(root.clone());
+    let mut b = d.begin_chain(21).unwrap();
+    d.append_history_frame(&mut b, b"cold-oldest").unwrap();
+    d.finish_chain(b, b"old-head", Some(b"warm-history")).unwrap();
+
+    let before_f1 = d.read_f1(21).unwrap();
+    let before_cold: Vec<Vec<u8>> =
+        d.cold_iter(21).unwrap().collect::<Result<_, _>>().unwrap();
+    let f1_file = std::fs::read(root.join("f1/file-0001")).unwrap();
+    let cold_file = std::fs::read(root.join("cold/cold")).unwrap();
+    let f1_dead = d
+        .tier_stats()
+        .iter()
+        .filter(|(tier, _, _, _)| *tier == "f1")
+        .map(|(_, _, _, dead)| *dead)
+        .sum::<u64>();
+    d.replace_f0(21, b"new-head").unwrap();
+
+    assert_eq!(d.read_f0(21).unwrap(), b"new-head");
+    assert_eq!(d.read_f1(21).unwrap(), before_f1);
+    assert_eq!(
+        d.cold_iter(21).unwrap().collect::<Result<Vec<_>, _>>().unwrap(),
+        before_cold
+    );
+    assert_eq!(std::fs::read(root.join("f1/file-0001")).unwrap(), f1_file);
+    assert_eq!(std::fs::read(root.join("cold/cold")).unwrap(), cold_file);
+    assert_eq!(
+        d.tier_stats()
+            .iter()
+            .filter(|(tier, _, _, _)| *tier == "f1")
+            .map(|(_, _, _, dead)| *dead)
+            .sum::<u64>(),
+        f1_dead
+    );
+    assert!(
+        d.tier_stats().iter().any(|(tier, _, _, dead)| *tier == "f0" && *dead > 0),
+        "the replaced head must be accounted dead"
+    );
+    d.collect_f0().unwrap();
+    assert_eq!(std::fs::read(root.join("f1/file-0001")).unwrap(), f1_file);
+    assert_eq!(std::fs::read(root.join("cold/cold")).unwrap(), cold_file);
+    drop(d);
+
+    let d = open(root);
+    assert_eq!(d.read_f0(21).unwrap(), b"new-head");
+    assert_eq!(d.read_f1(21).unwrap(), before_f1);
+    assert_eq!(
+        d.cold_iter(21).unwrap().collect::<Result<Vec<_>, _>>().unwrap(),
+        before_cold
+    );
+}

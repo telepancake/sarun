@@ -138,6 +138,32 @@ impl Pool {
         })
     }
 
+    /// Resolve one dense global id without a pool-wide scan. The id encodes
+    /// its shard in the low bits; only that deliberately small shard is
+    /// walked.
+    pub fn get(&self, id: u64) -> Result<Option<Vec<u8>>> {
+        let shard_mask = if self.shard_bits == 0 {
+            0
+        } else {
+            (1u64 << self.shard_bits) - 1
+        };
+        let shard_id = (id & shard_mask) as u32;
+        let local_id: u32 = (id >> self.shard_bits).try_into().map_err(|_| {
+            StrpoolError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "strpool id local component exceeds u32",
+            ))
+        })?;
+        let mut found = None;
+        self.for_each_in_shard(shard_id, |global_id, bytes| {
+            if (global_id >> self.shard_bits) as u32 == local_id {
+                found = Some(bytes.to_vec());
+            }
+            Ok(())
+        })?;
+        Ok(found)
+    }
+
     /// Parallel substring scan across all shards. Order across shards is
     /// unspecified; within a shard, results are in insertion order.
     pub fn scan_substring<'a>(

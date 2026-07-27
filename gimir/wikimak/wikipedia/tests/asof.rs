@@ -224,93 +224,6 @@ fn id_at(inst: &Instance, title: &str, ts: Option<i64>) -> Option<u64> {
 }
 
 // ---------------------------------------------------------------------------
-// The τ-window SQL, pinned against a synthetic BOUNDED interval written
-// straight into meta.db: start_ts <= τ AND (end_ts IS NULL OR end_ts > τ).
-// This is the query render-time rename-aware lookups depend on, exercised
-// with a real end_ts the importer never produces today.
-// ---------------------------------------------------------------------------
-#[test]
-fn title_at_tau_bounded_interval_window() {
-    let tmp = TempDir::new().unwrap();
-    let inst = fixture_instance(&tmp);
-
-    // Page 500 held the title "Windowed" only during [1000, 2000).
-    let conn = meta_conn(&tmp);
-    conn.execute(
-        "INSERT INTO title_intervals(page_id, ns, normalized_title, start_ts, end_ts)
-         VALUES(500, 0, ?1, 1000, 2000)",
-        params![b"Windowed".to_vec()],
-    )
-    .unwrap();
-
-    assert_eq!(id_at(&inst, "Windowed", Some(999)), None, "before start");
-    assert_eq!(id_at(&inst, "Windowed", Some(1000)), Some(500), "at start (inclusive)");
-    assert_eq!(id_at(&inst, "Windowed", Some(1500)), Some(500), "mid interval");
-    assert_eq!(id_at(&inst, "Windowed", Some(1999)), Some(500), "just before end");
-    assert_eq!(id_at(&inst, "Windowed", Some(2000)), None, "at end (exclusive)");
-    assert_eq!(id_at(&inst, "Windowed", Some(3000)), None, "after end");
-}
-
-// ---------------------------------------------------------------------------
-// Two intervals for one title over disjoint windows resolve to different
-// pages by τ — the core wayback promise for renamed titles.
-// ---------------------------------------------------------------------------
-#[test]
-fn title_at_tau_two_windows_resolve_distinct_pages() {
-    let tmp = TempDir::new().unwrap();
-    let inst = fixture_instance(&tmp);
-
-    let conn = meta_conn(&tmp);
-    conn.execute(
-        "INSERT INTO title_intervals(page_id, ns, normalized_title, start_ts, end_ts)
-         VALUES(600, 0, ?1, 1000, 2000)",
-        params![b"Moved".to_vec()],
-    )
-    .unwrap();
-    conn.execute(
-        "INSERT INTO title_intervals(page_id, ns, normalized_title, start_ts, end_ts)
-         VALUES(601, 0, ?1, 2000, NULL)",
-        params![b"Moved".to_vec()],
-    )
-    .unwrap();
-
-    assert_eq!(id_at(&inst, "Moved", Some(1500)), Some(600));
-    assert_eq!(id_at(&inst, "Moved", Some(2500)), Some(601));
-    // exactly at the handoff instant: old window is end-exclusive, new is
-    // start-inclusive → the newer page.
-    assert_eq!(id_at(&inst, "Moved", Some(2000)), Some(601));
-}
-
-// ---------------------------------------------------------------------------
-// Fallback path: a title with NO interval rows (an import predating
-// interval bookkeeping) resolves via the current title→page mapping.
-// Simulated by deleting the importer's interval row but keeping the
-// title_id_to_page / page_to_title_id rows.
-// ---------------------------------------------------------------------------
-#[test]
-fn title_at_tau_falls_back_to_current_mapping() {
-    let tmp = TempDir::new().unwrap();
-    let inst = fixture_instance(&tmp);
-
-    let conn = meta_conn(&tmp);
-    conn.execute("DELETE FROM title_intervals WHERE page_id = 100", [])
-        .unwrap();
-
-    // No interval rows remain for "Multi Rev", but the current mapping
-    // still points at page 100 → fall back to it.
-    assert_eq!(id_at(&inst, "Multi Rev", Some(1_000_000)), Some(100));
-
-    // A title with interval rows but none covering τ must NOT fall back.
-    conn.execute(
-        "INSERT INTO title_intervals(page_id, ns, normalized_title, start_ts, end_ts)
-         VALUES(700, 0, ?1, 5000, 6000)",
-        params![b"Gated".to_vec()],
-    )
-    .unwrap();
-    assert_eq!(id_at(&inst, "Gated", Some(1000)), None, "has intervals, none cover τ");
-}
-
-// ---------------------------------------------------------------------------
 // exists_at is a title-table point check (no frame decode); it agrees
 // with page_id_by_title_at's presence.
 // ---------------------------------------------------------------------------
@@ -333,30 +246,6 @@ fn exists_at_title_only() {
         "title must not exist before its first revision");
     assert!(inst.exists_at("Multi Rev", Some(t10)).unwrap(),
         "title exists from its first revision (start inclusive)");
-}
-
-// ---------------------------------------------------------------------------
-// Back-compat: a pre-interval import left a `start_ts = 0` open row. Under
-// the same window SQL it must still resolve for any τ ≥ 0 (old depots keep
-// working). Simulated by rewriting page 100's interval start_ts to 0.
-// ---------------------------------------------------------------------------
-#[test]
-fn back_compat_start_ts_zero_row_resolves() {
-    let tmp = TempDir::new().unwrap();
-    let inst = fixture_instance(&tmp);
-
-    let conn = meta_conn(&tmp);
-    conn.execute(
-        "UPDATE title_intervals SET start_ts = 0 WHERE page_id = 100 AND end_ts IS NULL",
-        [],
-    )
-    .unwrap();
-
-    // A tiny τ (a legacy start_ts=0 row covers all of [0, ∞)).
-    assert_eq!(id_at(&inst, "Multi Rev", Some(1)), Some(100));
-    assert!(inst.exists_at("Multi Rev", Some(1)).unwrap());
-    // τ = 0 exactly resolves (start inclusive at 0).
-    assert_eq!(id_at(&inst, "Multi Rev", Some(0)), Some(100));
 }
 
 // ---------------------------------------------------------------------------
@@ -410,8 +299,7 @@ fn parse_redirect_like(bytes: &[u8]) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
-// capture_siteinfo now records namespaces; site_config_at surfaces them.
-// The importer captures one snapshot per import.
+// capture_siteinfo records one dump bootstrap; site_config_at surfaces it.
 // ---------------------------------------------------------------------------
 #[test]
 fn site_config_at_carries_namespaces() {
@@ -437,6 +325,25 @@ fn site_config_at_carries_namespaces() {
     assert_eq!(ns10["localized"], "Template");
     assert!(wikimak_wikipedia::asof::namespace_aliases(ns10).is_empty());
     assert!(namespaces.iter().any(|n| n["id"] == 0), "mainspace captured");
+}
+
+#[test]
+fn repeated_dump_import_does_not_duplicate_siteinfo_bootstrap() {
+    let tmp = TempDir::new().unwrap();
+    let inst = fixture_instance(&tmp);
+    let before: i64 = meta_conn(&tmp)
+        .query_row("SELECT COUNT(*) FROM siteinfo_snapshots", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(before, 1);
+
+    let mut stream = new_page_stream(Cursor::new(FIXTURE.as_bytes().to_vec()));
+    inst.import(&mut stream).expect("idempotent reimport");
+
+    let conn = meta_conn(&tmp);
+    let after: i64 = conn
+        .query_row("SELECT COUNT(*) FROM siteinfo_snapshots", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(after, 1, "multipart/reimport headers must not fabricate snapshots");
 }
 
 // ---------------------------------------------------------------------------
@@ -689,17 +596,17 @@ fn revision_at_out_of_order_import_selects_newest_by_time() {
     let tmp = TempDir::new().unwrap();
     let inst = ooo_instance(&tmp);
 
-    // The chain head is the LAST-imported record (rev20), proving order is
-    // import-prepend, not timestamp.
+    // The authoritative chain is canonical by immutable revision id;
+    // the later gap import is merged into its proper position.
     let hist = history_micros(&inst, 300);
-    assert_eq!(hist[0].0, 20, "chain head is the last-imported gap revision");
+    assert_eq!(hist[0].0, 30, "highest revision id remains the chain head");
     let t2020 = hist.iter().find(|h| h.0 == 10).unwrap().1;
     let t2021 = hist.iter().find(|h| h.0 == 20).unwrap().1;
     let t2022 = hist.iter().find(|h| h.0 == 30).unwrap().1;
 
-    // Head / None τ must be the newest BY TIME (rev30), not the chain head.
-    assert_eq!(rev_id_at(&inst, 300, None), Some(30), "None τ → newest by time");
-    assert_eq!(inst.page_head(300).unwrap().unwrap().rev_id, 30, "page_head → newest by time");
+    // Head / None τ is the canonical f0 record.
+    assert_eq!(rev_id_at(&inst, 300, None), Some(30), "None τ → f0");
+    assert_eq!(inst.page_head(300).unwrap().unwrap().rev_id, 30, "page_head → f0");
 
     // τ well past the last edit → rev30 (was rev20 with first-in-chain).
     assert_eq!(rev_id_at(&inst, 300, Some(t2022 + 1_000_000)), Some(30));

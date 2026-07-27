@@ -185,6 +185,30 @@ fn mount<'a>(server: &'a MockServer, xml: &[u8], sha1_hex: &str) -> httpmock::Mo
     part_mock
 }
 
+fn dictionary_seed_xml(pages: usize) -> Vec<u8> {
+    let mut body = String::new();
+    for page in 1..=pages {
+        let text = format!(
+            "Article {page} with representative shared encyclopedia markup. {}",
+            "abcdefghij".repeat(1024)
+        );
+        body.push_str(&format!(
+            "<page><title>Article {page}</title><ns>0</ns><id>{page}</id>\
+             <revision><id>{}</id><timestamp>2024-01-01T00:00:00Z</timestamp>\
+             <contributor><username>E</username><id>1</id></contributor>\
+             <text xml:space=\"preserve\">{text}</text></revision></page>",
+            10_000 + page
+        ));
+    }
+    format!(
+        "<mediawiki xmlns=\"http://www.mediawiki.org/xml/export-0.11/\" version=\"0.11\">\
+         <siteinfo><sitename>D</sitename><dbname>d</dbname><base>x</base><generator>g</generator>\
+         <case>first-letter</case><namespaces><namespace key=\"0\" case=\"first-letter\"/>\
+         </namespaces></siteinfo>{body}</mediawiki>"
+    )
+    .into_bytes()
+}
+
 #[test]
 fn sync_fetches_then_skips() {
     let server = MockServer::start();
@@ -223,6 +247,44 @@ fn sync_fetches_then_skips() {
         .unwrap_err()
         .to_string();
     assert!(wrong.contains("belongs to testwiki"), "{wrong}");
+}
+
+#[test]
+fn initial_full_sync_finalizes_exactly_one_revision_dictionary() {
+    let server = MockServer::start();
+    let xml = dictionary_seed_xml(160);
+    let sha1_hex = hex::encode(Sha1::digest(&xml));
+    mount(&server, &xml, &sha1_hex);
+
+    let tmp = TempDir::new().unwrap();
+    let inst = make_instance(&tmp, 1024);
+    let client = Client::new();
+    let cfg = Config { base_url: server.base_url() };
+    sync(&inst, &client, &cfg, "testwiki", |_, _| ()).unwrap();
+
+    let pointer = std::fs::read(tmp.path().join("dictionaries/revision.current")).unwrap();
+    let dictionaries = std::fs::read_dir(tmp.path().join("dictionaries"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "zdict"))
+        .count();
+    assert_eq!(dictionaries, 1);
+
+    // An explicit later sync may skip every part, but must not train a
+    // successor dictionary or rewrite the active pointer.
+    sync(&inst, &client, &cfg, "testwiki", |_, _| ()).unwrap();
+    assert_eq!(
+        std::fs::read(tmp.path().join("dictionaries/revision.current")).unwrap(),
+        pointer
+    );
+    assert_eq!(
+        std::fs::read_dir(tmp.path().join("dictionaries"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "zdict"))
+            .count(),
+        1
+    );
 }
 
 #[test]
@@ -478,7 +540,7 @@ fn new_history_snapshot_replaces_every_partition() {
     let db = Connection::open(tmp.path().join("meta.db")).unwrap();
     db.execute(
         "INSERT INTO page_actions VALUES(
-            'obsolete:1','obsolete',NULL,'delete','2001-01-01','',
+            'obsolete:1','obsolete',NULL,0,'delete','2001-01-01','',
             NULL,'',99,'Gone','Gone',0,0,1
         )",
         [],

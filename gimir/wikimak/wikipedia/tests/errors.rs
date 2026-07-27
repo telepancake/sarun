@@ -67,22 +67,10 @@ fn page_id_overflow_errors_before_writes() {
     );
 
     let conn = Connection::open(tmp.path().join("meta.db")).expect("meta.db");
-    let count_pti: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM page_to_title_id WHERE page_id = 1099511627776",
-            [],
-            |r| r.get(0),
-        )
-        .expect("count page_to_title_id");
-    assert_eq!(count_pti, 0, "no meta.db row references the overflowing page");
-    let count_ti: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM title_intervals WHERE page_id = 1099511627776",
-            [],
-            |r| r.get(0),
-        )
-        .expect("count title_intervals");
-    assert_eq!(count_ti, 0, "no title_intervals row references the overflowing page");
+    let pending: i64 = conn
+        .query_row("SELECT COUNT(*) FROM title_slot_intent", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(pending, 0, "no pending title binding references the rejected page");
 }
 
 // ---------------------------------------------------------------------------
@@ -155,13 +143,6 @@ fn import_is_per_page_atomic_around_overflow() {
         "the overflowing page must never be committed"
     );
 
-    let conn = Connection::open(tmp.path().join("meta.db")).expect("meta.db");
-    let count_500: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM page_to_title_id WHERE page_id = 1099511627776",
-            [],
-            |r| r.get(0),
-        )
-        .expect("count");
-    assert_eq!(count_500, 0, "no meta.db state for the overflowing page");
+    // A durable redo row for the already-committed page 10 is allowed;
+    // the overflowing id cannot fit the row-log's u32 page field.
 }

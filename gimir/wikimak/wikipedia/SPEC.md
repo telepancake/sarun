@@ -82,38 +82,68 @@ Schema_version starts at 1; flags bits: TEXT_HIDDEN, COMMENT_HIDDEN,
 CONTRIBUTOR_HIDDEN, SUPPRESSED, SHA1_MISMATCH. The depot sees this as
 opaque bytes; the wikipedia layer is the only thing that decodes it.
 
-Subsequent design pass may switch from "one frame per revision" to
-"frame per revision batch" once we measure the per-frame overhead on real
-data. The depot doesn't care.
+After a successful first full-content import, a deterministic min-hash
+sample of at most 2,048 current f0 records is read. Each sample contributes
+at most 16 KiB and the total is capped at 32 MiB. At least 128 records and
+1 MiB are required; smaller mirrors remain plain. The sample trains exactly
+one 64 KiB `revision` dictionary per instance. This seed finalization is not
+run by daily updates.
 
-A FRESH page (empty chain — the bulk-import common case) is built
-FORWARD (depot SPEC §"Bulk forward construction"): the dump's
-oldest-first revisions stream through in ingest-RAM-bound batches, each
-exceptional full batch landing as ONE cold frame written ONCE (the batch's newest
-record is excluded — it is the frame's refPrefix anchor and carries into
-the next batch as its oldest record, reproducing the newest-first read
-walk's anchor invariant in dump order). At commit, the newest revision
-lands alone in f0 and all older revisions in the final tail are sealed
-as one cold frame. Fresh construction never creates mutable f1. History
-write amplification is 1.0, measured in the forward_build tests. A page
-whose chain already exists (update mode) takes the prepend path.
+Dictionary-compressed f0 frames carry the trained dictionary's native
+zstd dictionary id; dictionary id zero means a provisional plain f0.
+The immutable dictionary bytes live under
+`dictionaries/<lane>-<dict_id>.zdict` and must be fsynced before a
+referencing depot head is committed; `<lane>.current` is an atomic,
+fsynced pointer selecting the dictionary for future heads. f1/cold
+context is known from the depot tier and must carry dictionary id zero
+because those frames use refPrefix. Missing ids and dictionary-bearing
+history frames are hard errors. No extra per-frame envelope or generic
+depot-format bump is needed: the depot deliberately treats payloads as
+opaque.
+
+The dictionary is persisted and activated before heads are repacked. Each
+f0 replacement preserves its exact next pointer, so f1/cold bytes are never
+rewritten. A crash may leave a valid mixture of plain and dictionary heads;
+reopening decodes both, and rerunning seed finalization resumes the remaining
+heads with the already-active dictionary rather than training another.
+
+A FRESH page is collected page-at-a-time and sorted by immutable
+revision id. The highest id lands alone in f0; every older record lands
+newest-first in exactly one cold frame. Fresh construction never creates
+f1. On update, identical ids deduplicate against the authoritative depot
+chain. A strictly newer prefix takes the prepend path; interleaved/older
+additions are streaming-merged by revision id and installed with the
+depot's expected-pointer atomic replacement.
+
+If an existing revision id arrives with different complete record
+bytes, the stored archival record remains canonical. The incoming bytes
+are retained as a tagged, self-delimiting correction occurrence in the
+separate `corrections/` depot (one logical append-only chain per page).
+No conflict blob or revision timestamp is duplicated in SQLite.
 
 ## sqlite schema (sketch)
 
 ```
-title_intervals(page_id INTEGER, ns INTEGER, normalized_title BLOB,
-                start_ts INTEGER, end_ts INTEGER /* NULL = open */,
-                PRIMARY KEY(page_id, start_ts)) WITHOUT ROWID;
-title_id_to_page(title_id INTEGER PRIMARY KEY, ns INTEGER, normalized_title BLOB);
-page_to_title_id(page_id INTEGER, title_id INTEGER, PRIMARY KEY(page_id, title_id));
-category_intervals(page_id INTEGER, category BLOB,
-                   start_ts INTEGER, end_ts INTEGER) WITHOUT ROWID;
+title_interval_overflow(title_id INTEGER, start_s INTEGER,
+                        end_s INTEGER, page_id INTEGER,
+                        PRIMARY KEY(title_id, start_s)) WITHOUT ROWID;
+title_slot_state(singleton INTEGER PRIMARY KEY, generation INTEGER);
+title_slot_intent(title_id INTEGER PRIMARY KEY,
+                  page_id INTEGER, valid_since INTEGER);
 parts_seen(part_filename TEXT PRIMARY KEY, sha256 TEXT, completed_at INTEGER);
 siteinfo_snapshots(captured_at INTEGER PRIMARY KEY, json BLOB);
 ```
 
-`title_id` is the strpool id for a normalized title. The renderer uses it
-everywhere instead of the title bytes.
+`title_id` is the strpool id for a normalized, namespace-qualified title.
+`title-slots.N` stores one eight-byte `{page_id, valid_since_s}` current
+binding per title id; page id zero is unbound. `page-titles.N` is the
+eight-byte reverse current mapping (`title_id + 1`, zero absent). Only
+closed intervals older than the current binding live in SQLite.
+Current-binding intents are durable row-log upserts. Writer reads overlay
+them immediately; every 4,096 pending title ids and each clean/salvage
+flush applies the whole set to both flat files with one paired fsync,
+then clears the rows. Writer open replays rows idempotently; read-only
+open rejects an unreplayed set.
 
 ## Crash-safety contract
 
@@ -122,12 +152,12 @@ everywhere instead of the title bytes.
 - strpool gives us its `flush()` contract.
 - `Instance::flush` calls `depot.flush()`, sqlite WAL checkpoint or commit
   boundary, and `pool.flush(shard_id)` for all shards.
-- Import is per-page atomic: one transaction per page that ties together
-  the depot append, the strpool title append (if title is new), and the
-  sqlite inserts. We use sqlite's `BEGIN IMMEDIATE` per page; on commit
-  the page is visible end-to-end. On crash without commit, the page is
-  not visible (depot frame bytes may be present but the index points at
-  the old f0, sqlite row absent).
+- Revision content is per-page atomic at the depot index flip. A crash
+  before a fresh/replacement flip leaves the prior chain (or emptiness)
+  visible; a retry re-merges from that authoritative chain. Title
+  metadata changes first enter a durable, idempotent redo set. Bounded
+  batches update and fsync both flat directions, then clear the redo rows.
+  Writer open replays a surviving batch before exposing the instance.
 
 ## Out of scope (for now)
 

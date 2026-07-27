@@ -152,44 +152,6 @@ fn explicit_mismatch_is_loud() {
     Instance::open_read(cfg_with(&tmp, 8)).expect("matching reader open");
 }
 
-// ---------------------------------------------------------------------------
-// legacy_store_defaults_to_4_and_writer_backfills
-//
-// A store from before the flag existed (simulated by deleting the kv
-// row) counts as 4 — every store the pre-persistence CLI ever built
-// was 4-shard — so reads keep working; the next WRITER open backfills
-// the flag, a reader never writes it.
-// ---------------------------------------------------------------------------
-#[test]
-fn legacy_store_defaults_to_4_and_writer_backfills() {
-    let tmp = TempDir::new().unwrap();
-    // Build the historical four-shard shape explicitly, then remove its
-    // modern flag to simulate a store from before count persistence.
-    let inst = Instance::open(cfg_with(&tmp, 4)).expect("create with legacy layout");
-    assert_eq!(inst.title_shard_count(), 4);
-    import_titles(&inst, 32);
-    drop(inst);
-
-    // Rewind to the legacy state: no flag row.
-    Connection::open(tmp.path().join("meta.db"))
-        .unwrap()
-        .execute("DELETE FROM instance_flags WHERE key = 'title_shard_count'", [])
-        .unwrap();
-    assert_eq!(persisted_flag(&tmp), None, "legacy state verified");
-
-    let r = Instance::open_read(read_config(tmp.path().to_path_buf()))
-        .expect("read-side open of a legacy store");
-    assert_eq!(r.title_shard_count(), 4, "legacy default is 4");
-    assert_exact_lookup_one_shard(&r);
-    drop(r);
-    assert_eq!(persisted_flag(&tmp), None, "a reader never backfills the flag");
-
-    let w = Instance::open(cfg_with(&tmp, 0)).expect("writer open of a legacy store");
-    assert_eq!(w.title_shard_count(), 4);
-    assert_eq!(persisted_flag(&tmp), Some(4), "the writer backfilled the flag");
-    assert_exact_lookup_one_shard(&w);
-}
-
 #[test]
 fn fresh_derived_store_starts_with_256_small_shards() {
     let tmp = TempDir::new().unwrap();
@@ -253,20 +215,6 @@ fn oversized_shards_repeat_double_and_reopen_with_remapped_ids() {
             entry.path()
         );
     }
-    let dangling: i64 = conn
-        .query_row(
-            "SELECT
-               (SELECT COUNT(*) FROM page_to_title_id p
-                LEFT JOIN title_id_to_page t ON t.title_id=p.title_id
-                WHERE t.title_id IS NULL)
-             + (SELECT COUNT(*) FROM title_intervals i
-                LEFT JOIN title_id_to_page t ON t.title_id=i.title_id
-                WHERE i.title_id IS NOT NULL AND t.title_id IS NULL)",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(dangling, 0, "all dependent dense ids were remapped");
 }
 
 #[test]

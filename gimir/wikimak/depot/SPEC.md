@@ -9,8 +9,9 @@ layer) does all compression and decompression.
 Each chain has, at any given moment:
 
 - **One f0 frame** — the current head revision, standalone zstd-encoded
-  with the chain's pretrained dict. Always present once the chain has
-  been prepended to.
+  with its caller-selected pretrained dict. Wikipedia uses one dict per
+  instance/lane, shared by every page chain. Always present once the
+  chain has been prepended to.
 - **One f1 frame** — the accumulator: zero or more records (newest-first),
   zstd-encoded with refPrefix anchored against f0's record. Always
   present after at least two prepends; on the first prepend, the chain has
@@ -201,6 +202,15 @@ impl Depot {
     /// Returns Err if the chain has no f0 yet.
     pub fn read_f0(&self, chain_id: u64) -> Result<Vec<u8>>;
 
+    /// Append a replacement f0 and atomically flip the index slot while
+    /// preserving the old f0's exact next pointer. f1/cold are untouched.
+    pub fn replace_f0(&self, chain_id: u64, new_f0_bytes: &[u8]) -> Result<()>;
+
+    /// Bounded index-only pagination over non-empty chain ids.
+    pub fn occupied_chain_ids_after(
+        &self, after: Option<u64>, limit: usize
+    ) -> Vec<u64>;
+
     /// Read the current f1 frame bytes (zstd, header stripped).
     /// Returns Ok(None) if the chain has no f1 yet.
     pub fn read_f1(&self, chain_id: u64) -> Result<Option<Vec<u8>>>;
@@ -211,6 +221,7 @@ impl Depot {
     /// Bulk forward construction of an EMPTY chain (dump import fast
     /// path) — see "Bulk forward construction".
     pub fn begin_chain(&self, chain_id: u64) -> Result<ChainBuilder>;
+    pub fn begin_replace_chain(&self, chain_id: u64) -> Result<ChainBuilder>;
     pub fn append_history_frame(&self, b: &mut ChainBuilder, zstd: &[u8]) -> Result<()>;
     pub fn finish_chain(&self, b: ChainBuilder, f0: &[u8], f1: Option<&[u8]>) -> Result<()>;
 
@@ -219,6 +230,9 @@ impl Depot {
     /// Session-end compaction: run eviction with the current write file
     /// included (rolled first). See "Eviction".
     pub fn collect(&self) -> Result<()>;
+
+    /// Reclaim deprecated f0 frames without considering f1 files.
+    pub fn collect_f0(&self) -> Result<()>;
 
     /// Delete one chain: f0/f1 frames marked dead (reclaimed by
     /// eviction/collect), cold frames accounted dead (bytes stay —
@@ -373,6 +387,16 @@ again. Note the sidecar fence: an aborted build changed `cold_len`
 without a `flush`, so the next open rebuilds the dead counters once —
 correct, not a bug (the orphan tier bytes of `finish_chain`, if it got
 that far, must be re-counted).
+
+For a complete rebuild of an existing chain,
+`begin_replace_chain(chain_id)` captures the exact live index pointer.
+`finish_chain` requires that pointer still to be current, appends the
+replacement head, and commits with the same one-slot index flip. A
+concurrent prepend makes the builder stale and fails loudly before any
+new head is installed. After the flip, the replaced f0/f1 are marked
+dead and every replaced cold frame is added to the cold-dead ledger.
+An abandoned or crashed pre-flip replacement leaves the old chain
+fully reachable.
 
 ### Eviction of an f0 or f1 file
 

@@ -183,6 +183,13 @@ pub struct DepotInner {
     rebuilt_on_open: bool,
 }
 
+struct ChainFootprint {
+    f0_file: u32,
+    f0_bytes: u64,
+    f1: Option<(u32, u64)>,
+    cold_bytes: u64,
+}
+
 impl DepotInner {
     pub fn open(cfg: DepotConfig) -> Result<Self> {
         std::fs::create_dir_all(&cfg.root)?;
@@ -579,6 +586,48 @@ impl DepotInner {
         Ok(())
     }
 
+    /// Start a forward replacement build. The old chain remains live
+    /// until `finish_replace_chain` performs the one index-slot flip.
+    pub fn begin_replace_chain(&mut self, chain_id: u64) -> Result<u64> {
+        self.ensure_slot(chain_id)?;
+        let ptr = self.index_get(chain_id);
+        if ptr == 0 {
+            return Err(Error::NoFrame);
+        }
+        Ok(ptr)
+    }
+
+    /// Replace only the current f0 payload. The new frame preserves the
+    /// old f0's exact next pointer, so f1/cold reachability is unchanged.
+    /// The index-slot flip is the commit point.
+    pub fn replace_f0(&mut self, chain_id: u64, f0_bytes: &[u8]) -> Result<()> {
+        let old_ptr = self.slot_ptr(chain_id)?;
+        if old_ptr == 0 {
+            return Err(Error::NoFrame);
+        }
+        let (old_file, old_off) = unpack(old_ptr);
+        let next = read_next_pointer(&self.f0, old_file, old_off)?;
+        let old_bytes = HEADER_LEN as u64 + read_zstd_len(&self.f0, old_file, old_off)?;
+        let frame = encode_frame(chain_id, next, f0_bytes);
+        let (file, off) = self.f0.append(&frame, self.cfg.file_size_threshold)?;
+        self.index_put(chain_id, pack(file, off));
+        if let Some(df) = self.f0.files.get_mut(&old_file) {
+            df.dead += old_bytes;
+        }
+        Ok(())
+    }
+
+    /// Return at most `limit` occupied ids strictly after `after`
+    /// (`None` starts at zero). Index-only and naturally paged, so a
+    /// caller never has to materialize every page id in a large wiki.
+    pub fn occupied_chain_ids_after(&self, after: Option<u64>, limit: usize) -> Vec<u64> {
+        let start = after.map_or(0, |id| id.saturating_add(1));
+        (start..self.slots)
+            .filter(|&id| self.index_get(id) != 0)
+            .take(limit)
+            .collect()
+    }
+
     /// Append the next-NEWER history frame (opaque zstd) to the cold
     /// file, linking it to `next_ptr` (the previously appended, older
     /// frame — 0 for the oldest). Returns the new frame's pointer
@@ -621,6 +670,77 @@ impl DepotInner {
         let (fid, off) = self.f0.append(&f0_frame, self.cfg.file_size_threshold)?;
         self.index_put(chain_id, pack(fid, off));
         Ok(())
+    }
+
+    /// Commit a complete replacement over an existing chain. All old
+    /// reachability and sizes are validated before any new head is
+    /// installed. The index flip is the commit point; old f0/f1 are
+    /// then marked dead and old cold bytes accounted.
+    pub fn finish_replace_chain(
+        &mut self,
+        chain_id: u64,
+        expected_old_ptr: u64,
+        cold_head: u64,
+        f0_bytes: &[u8],
+        f1_bytes: Option<&[u8]>,
+    ) -> Result<()> {
+        let old_ptr = self.slot_ptr(chain_id)?;
+        if old_ptr == 0 {
+            return Err(Error::NoFrame);
+        }
+        if old_ptr != expected_old_ptr {
+            return Err(Error::StaleBuilder);
+        }
+        let old = self.chain_footprint(old_ptr)?;
+        let f0_next = match f1_bytes {
+            Some(f1) => {
+                let f1_frame = encode_frame(chain_id, cold_head, f1);
+                let (fid, off) = self.f1.append(&f1_frame, self.cfg.file_size_threshold)?;
+                pack(fid, off)
+            }
+            None => cold_head,
+        };
+        let f0_frame = encode_frame(chain_id, f0_next, f0_bytes);
+        let (fid, off) = self.f0.append(&f0_frame, self.cfg.file_size_threshold)?;
+        self.index_put(chain_id, pack(fid, off));
+        if let Some(df) = self.f0.files.get_mut(&old.f0_file) {
+            df.dead += old.f0_bytes;
+        }
+        if let Some((file, bytes)) = old.f1 {
+            if let Some(df) = self.f1.files.get_mut(&file) {
+                df.dead += bytes;
+            }
+        }
+        self.cold_dead += old.cold_bytes;
+        Ok(())
+    }
+
+    fn chain_footprint(&self, ptr: u64) -> Result<ChainFootprint> {
+        let (f0_file, f0_off) = unpack(ptr);
+        let f0_bytes = HEADER_LEN as u64 + read_zstd_len(&self.f0, f0_file, f0_off)?;
+        let f0_next = read_next_pointer(&self.f0, f0_file, f0_off)?;
+        let (f1, mut cold) = if f0_next == 0 {
+            (None, 0)
+        } else if is_cold_ptr(f0_next) {
+            (None, f0_next)
+        } else {
+            let (file, off) = unpack(f0_next);
+            let bytes = HEADER_LEN as u64 + read_zstd_len(&self.f1, file, off)?;
+            (Some((file, bytes)), read_next_pointer(&self.f1, file, off)?)
+        };
+        let mut cold_bytes = 0u64;
+        while cold != 0 {
+            let (file, off) = unpack(cold);
+            if file != COLD_FILE_ID {
+                return Err(Error::Corrupt("cold pointer with nonzero file_id"));
+            }
+            let mut header = [0u8; HEADER_LEN];
+            self.cold_file.read_exact_at(&mut header, off)?;
+            let zstd_len = u64::from_le_bytes(header[16..24].try_into().unwrap());
+            cold_bytes += HEADER_LEN as u64 + zstd_len;
+            cold = u64::from_le_bytes(header[8..16].try_into().unwrap());
+        }
+        Ok(ChainFootprint { f0_file, f0_bytes, f1, cold_bytes })
     }
 
     pub fn read_f0(&mut self, chain_id: u64) -> Result<Vec<u8>> {
@@ -709,6 +829,27 @@ impl DepotInner {
     /// nothing.
     pub fn collect(&mut self) -> Result<()> {
         self.evict_pass(true)
+    }
+
+    /// Reclaim every file containing deprecated heads without considering
+    /// f1. Unlike ordinary ratio-based collection, a one-time full head
+    /// repack should not leave its old plain copies parked at rest.
+    pub fn collect_f0(&mut self) -> Result<()> {
+        loop {
+            let victim = self
+                .f0
+                .files
+                .values()
+                .find(|df| df.dead > 0)
+                .map(|df| df.id);
+            let Some(vid) = victim else {
+                return Ok(());
+            };
+            if self.f0.current == Some(vid) {
+                self.f0.current = None;
+            }
+            self.evict_f0(vid)?;
+        }
     }
 
     fn evict_pass(&mut self, include_current: bool) -> Result<()> {

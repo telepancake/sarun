@@ -17,6 +17,14 @@ use crate::error::{Error, Result};
 use crate::import::do_import;
 use crate::schema::META_DDL;
 
+const REVISION_DICTIONARY_BYTES: usize = 64 << 10;
+const REVISION_SAMPLE_COUNT: usize = 2048;
+const REVISION_SAMPLE_BYTES: usize = 32 << 20;
+const REVISION_SAMPLE_RECORD_BYTES: usize = 16 << 10;
+const REVISION_MIN_SAMPLES: usize = 128;
+const REVISION_MIN_SAMPLE_BYTES: usize = 1 << 20;
+const OCCUPIED_ID_BATCH: usize = 4096;
+
 /// Legacy initial index-capacity value. Fresh depots now start with
 /// one eight-byte slot and grow geometrically from observed page ids;
 /// the field remains in the public configuration for compatibility.
@@ -142,6 +150,10 @@ pub struct ImportStats {
     pub sha1_ok: u64,
     pub sha1_fudged: u64,
     pub sha1_mismatch: u64,
+    /// Same immutable revision id arrived with different complete
+    /// record bytes; canonical content stayed unchanged and the
+    /// incoming occurrence was archived in the correction lane.
+    pub revision_conflicts: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -162,6 +174,15 @@ pub struct RevisionVisibility {
     pub page_deletion_timestamp: String,
 }
 
+/// A conflicting occurrence of an immutable revision retained outside
+/// the canonical page chain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RevisionCorrection {
+    pub revision_id: u64,
+    pub occurrence: u64,
+    pub incoming_record: Vec<u8>,
+}
+
 /// One entry in a [`HistoryIter`]: metadata + a one-shot lazy text
 /// fetcher.
 pub struct HistoryEntry {
@@ -174,6 +195,14 @@ pub struct HistoryIter {
     pub(crate) inner: Box<dyn Iterator<Item = Result<HistoryEntry>> + Send>,
 }
 
+/// Outcome of the one-time revision-head dictionary finalization.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RevisionDictionaryStats {
+    pub dictionary_id: Option<u32>,
+    pub trained: bool,
+    pub heads_repacked: u64,
+}
+
 impl Iterator for HistoryIter {
     type Item = Result<HistoryEntry>;
     fn next(&mut self) -> Option<Self::Item> {
@@ -183,7 +212,7 @@ impl Iterator for HistoryIter {
 
 /// The per-dbname mirror. One process at a time per `root`.
 pub struct Instance {
-    root: PathBuf,
+    pub(crate) root: PathBuf,
     /// `Arc` so the streaming [`HistoryIter`] (and its lazy `fetch_text`
     /// closures) can hold the handles across calls without borrowing
     /// the `Instance` — a history walk is record-at-a-time, not a
@@ -195,11 +224,6 @@ pub struct Instance {
     pub(crate) f1_seal_threshold_bytes: u64,
     pub(crate) title_shard_count: AtomicU32,
     pub(crate) title_shard_target_bytes: u64,
-    /// True when the previous session ended dirty (crash between an
-    /// import write and a flush): `revisions_seen` may then be AHEAD of
-    /// the depot (rows durable, frames lost). Imports repair each
-    /// touched page's rows from the chain before trusting them.
-    pub(crate) suspect: bool,
     /// Opened under a shared flock ([`Instance::open_read`]): every
     /// write API refuses loudly, and reads never backfill.
     pub(crate) read_only: bool,
@@ -213,26 +237,15 @@ pub struct Instance {
 /// keeps the per-page atomicity story simple.
 pub(crate) struct InstanceInner {
     pub(crate) depot: Depot,
+    pub(crate) revision_dictionaries: crate::frames::DictionaryStore,
+    /// Append-only logical lane for conflicting immutable revision
+    /// records. One correction chain per page id.
+    pub(crate) corrections: Depot,
     pub(crate) titles: Pool,
+    pub(crate) title_slots: crate::title_slots::TitleSlots,
+    pub(crate) page_titles: crate::title_slots::PageTitleSlots,
+    pub(crate) pending_title_intents: usize,
     pub(crate) conn: Connection,
-    /// Pages whose `revisions_seen` rows were re-derived from the chain
-    /// this session (suspect-mode repair) — each repaired once.
-    pub(crate) repaired: std::collections::HashSet<u64>,
-    /// Whether this session has already stamped the dirty flag.
-    pub(crate) dirty_stamped: bool,
-    /// An import errored mid-page this session: the chain may be AHEAD
-    /// of `revisions_seen` (prepends landed, rows rolled back). Reads
-    /// then distrust the rows and scan the chain, exactly like a
-    /// suspect open would after the crash-equivalent state.
-    pub(crate) import_errored: bool,
-    /// Pages whose in-session import errored mid-page and left the chain
-    /// AHEAD of the (rolled-back) rows. `suspect` is fixed at open, so a
-    /// same-process RE-import can't lean on it — but re-prepending the
-    /// revisions the crashed attempt already stored would duplicate them.
-    /// The next same-process import of such a page is routed through the
-    /// same chain-scan repair a suspect open uses (re-derive
-    /// `revisions_seen` from the chain), then the page is cleared here.
-    pub(crate) errored_pages: std::collections::HashSet<u64>,
     /// The root's flock, held for the instance's lifetime.
     pub(crate) _lock: std::fs::File,
 }
@@ -264,20 +277,14 @@ impl Instance {
         // meta.db FIRST: the titles pool below must open with the
         // store's persisted shard count, so resolve it before any pool
         // file exists to get wrong.
-        let conn = Connection::open(cfg.root.join("meta.db"))?;
+        let mut conn = Connection::open(cfg.root.join("meta.db"))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         for stmt in META_DDL {
             conn.execute(stmt, [])?;
         }
-        ensure_revision_ts_schema(&conn)?;
-        ensure_current_title_count_index(&conn)?;
-        ensure_nullable_page_actions_page(&conn)?;
-        ensure_nullable_revision_visibility_page(&conn)?;
-        ensure_title_dictionary_schema(&conn)?;
         // The effective shard count: persisted at creation, validated
-        // against an explicit config, backfilled (writer-side) on a
-        // legacy store — see `resolve_title_shard_count`.
+        // against an explicit config.
         let title_shard_count =
             resolve_title_shard_count(&conn, &cfg.root, cfg.title_shard_count, true)?;
 
@@ -285,7 +292,15 @@ impl Instance {
         let mut depot_cfg = cfg.depot;
         depot_cfg.root = cfg.root.join("depot");
         std::fs::create_dir_all(&depot_cfg.root)?;
+        let correction_cfg = DepotConfig {
+            root: cfg.root.join("corrections"),
+            max_chain_id: depot_cfg.max_chain_id,
+            file_size_threshold: depot_cfg.file_size_threshold,
+            eviction_dead_ratio: depot_cfg.eviction_dead_ratio,
+        };
         let depot = Depot::open(depot_cfg)?;
+        let corrections = Depot::open(correction_cfg)?;
+        let revision_dictionaries = crate::frames::DictionaryStore::open(&cfg.root)?;
 
         // Title pool — <root>/titles/.
         let title_generation = persisted_title_pool_generation(&conn)?;
@@ -303,29 +318,40 @@ impl Instance {
         // also removes a complete-or-partial generation left by a crash
         // before the SQLite generation switch.
         gc_stale_title_generations(&cfg.root, title_generation)?;
-
-        let suspect: bool = conn
-            .query_row(
-                "SELECT value FROM instance_flags WHERE key = 'dirty'",
-                [],
-                |r| r.get::<_, i64>(0),
-            )
-            .map(|v| v != 0)
-            .unwrap_or(false);
+        if conn
+            .query_row("SELECT generation FROM title_slot_state WHERE singleton=1", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .is_err()
+        {
+            let tx = conn.transaction()?;
+            let builder =
+                crate::title_slots::TitleSlotGenerations::prepare_snapshot(&cfg.root, 1, &tx)?;
+            builder.finish()?.commit()?;
+            crate::title_slots::TitleSlotGenerations::select(&tx, 1)?;
+            tx.commit()?;
+        }
+        recover_title_slot_intent(&cfg.root, &mut conn)?;
+        let title_slots =
+            crate::title_slots::TitleSlotGenerations::open_selected(&cfg.root, &conn)?;
+        let page_titles =
+            crate::title_slots::TitleSlotGenerations::open_selected_page_titles(&cfg.root, &conn)?;
+        let selected_slots = crate::title_slots::TitleSlotGenerations::selected(&conn)?;
+        crate::title_slots::TitleSlotGenerations::collect_unselected(&cfg.root, selected_slots)?;
 
         Ok(Self {
             root: cfg.root.clone(),
             inner: Arc::new(Mutex::new(InstanceInner {
                 depot,
+                revision_dictionaries,
+                corrections,
                 titles,
+                title_slots,
+                page_titles,
+                pending_title_intents: 0,
                 conn,
-                repaired: Default::default(),
-                dirty_stamped: false,
-                import_errored: false,
-                errored_pages: Default::default(),
                 _lock: lock,
             })),
-            suspect,
             read_only: false,
             // The page-id clip is the depot's 2^40 sanity ceiling, not
             // the config value: `cfg.max_chain_id` is only the fresh
@@ -352,14 +378,9 @@ impl Instance {
     /// dangling pointers), so hold the handle only as long as the read
     /// takes: decode, drop.
     ///
-    /// Never creates or migrates anything: a non-instance root is a
-    /// loud error, a meta.db predating the read-side schema migrations
-    /// is [`Error::LegacySchema`] (open it writable once to migrate),
-    /// and every write API refuses with [`Error::ReadOnly`] — including
-    /// the legacy-row ts backfill, which stays writer-side. A dirty
-    /// flag left by a crashed writer still demotes reads to the
-    /// chain-scan path (`suspect`); the repair itself is import-side
-    /// and therefore refused here.
+    /// Never creates or migrates anything: a non-instance or incomplete
+    /// root is a loud error, and every write API refuses with
+    /// [`Error::ReadOnly`].
     pub fn open_read(cfg: InstanceConfig) -> Result<Self> {
         if !cfg.root.join("meta.db").exists() {
             return Err(Error::Io(std::io::Error::new(
@@ -372,18 +393,11 @@ impl Instance {
         let lock = flock_root(&cfg.root, libc::LOCK_SH)?;
 
         // No DDL, no pragma writes, no ALTERs: the writer created the
-        // schema; this connection only ever SELECTs. Reads key off the
-        // migrated `ts`/`title_id` columns, so a pre-migration db is a
-        // loud error naming the cure, never a wrong answer.
+        // schema; this connection only ever SELECTs.
         let conn = Connection::open_with_flags(
             cfg.root.join("meta.db"),
             rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE, // WAL recovery may write; we never do
         )?;
-        for (table, col) in [("revisions_seen", "ts"), ("title_intervals", "title_id")] {
-            if !has_column(&conn, table, col)? {
-                return Err(Error::LegacySchema(cfg.root.clone()));
-            }
-        }
         // The store's shard count, NOT the config's assumption: exact
         // lookups route by fnv % count, so a reader guessing wrong
         // would silently miss titles. Derived from the flag persisted
@@ -393,7 +407,22 @@ impl Instance {
 
         let mut depot_cfg = cfg.depot;
         depot_cfg.root = cfg.root.join("depot");
+        let correction_cfg = DepotConfig {
+            root: cfg.root.join("corrections"),
+            max_chain_id: depot_cfg.max_chain_id,
+            file_size_threshold: depot_cfg.file_size_threshold,
+            eviction_dead_ratio: depot_cfg.eviction_dead_ratio,
+        };
         let depot = Depot::open(depot_cfg)?;
+        let corrections = Depot::open(correction_cfg)?;
+        let revision_dictionaries = crate::frames::DictionaryStore::open_existing(&cfg.root);
+        let pending_title_intents: i64 =
+            conn.query_row("SELECT COUNT(*) FROM title_slot_intent", [], |row| row.get(0))?;
+        if pending_title_intents != 0 {
+            return Err(Error::Corrupt(
+                "pending title-slot intent requires writable recovery",
+            ));
+        }
         let title_generation = persisted_title_pool_generation(&conn)?;
         let titles = Pool::open(
             &title_pool_dir(&cfg.root, title_generation),
@@ -403,29 +432,24 @@ impl Instance {
             },
             None,
         )?;
-
-        let suspect: bool = conn
-            .query_row(
-                "SELECT value FROM instance_flags WHERE key = 'dirty'",
-                [],
-                |r| r.get::<_, i64>(0),
-            )
-            .map(|v| v != 0)
-            .unwrap_or(false);
+        let title_slots =
+            crate::title_slots::TitleSlotGenerations::open_selected(&cfg.root, &conn)?;
+        let page_titles =
+            crate::title_slots::TitleSlotGenerations::open_selected_page_titles(&cfg.root, &conn)?;
 
         Ok(Self {
             root: cfg.root.clone(),
             inner: Arc::new(Mutex::new(InstanceInner {
                 depot,
+                revision_dictionaries,
+                corrections,
                 titles,
+                title_slots,
+                page_titles,
+                pending_title_intents: 0,
                 conn,
-                repaired: Default::default(),
-                dirty_stamped: false,
-                import_errored: false,
-                errored_pages: Default::default(),
                 _lock: lock,
             })),
-            suspect,
             read_only: true,
             max_chain_id: wikimak_depot::CHAIN_ID_CEILING,
             f1_seal_threshold_bytes: if cfg.f1_seal_threshold_bytes == 0 {
@@ -453,17 +477,12 @@ impl Instance {
         do_import(self, stream)
     }
 
-    /// Read the current head revision metadata for `page_id` — the
-    /// newest revision by timestamp.
+    /// Read the current head revision metadata for `page_id`.
     ///
-    /// NOT the depot chain's f0 frame: f0 is the most-recently-*imported*
-    /// record, which is only the newest-by-time when revisions were
-    /// appended in chronological order. Out-of-order / cross-import
-    /// prepends (a later import supplying a gap revision) make f0 an older
-    /// revision. The head's identity comes from the per-revision `ts`
-    /// rows import persists in sqlite (see [`Instance::revision_at`]);
-    /// in the common in-order case the named record IS f0, so a head
-    /// read decodes exactly one frame.
+    /// The canonical f0 frame is always the highest revision id and is
+    /// therefore the current-head fast path. Time-travel reads inspect the
+    /// remaining immutable revision records and choose the timestamp/revision
+    /// maximum at the requested instant.
     pub fn page_head(&self, page_id: u64) -> Result<Option<RevisionMeta>> {
         Ok(self.revision_query(page_id, None, false)?.map(|(m, _)| m))
     }
@@ -473,6 +492,20 @@ impl Instance {
     /// `Ok(None)` if no such page.
     pub fn page_head_text(&self, page_id: u64) -> Result<Option<Vec<u8>>> {
         Ok(self.revision_query(page_id, None, true)?.and_then(|(_, t)| t))
+    }
+
+    /// Conflicting immutable revision occurrences retained for
+    /// archaeology. The canonical stored revision remains unchanged.
+    pub fn revision_corrections(&self, page_id: u64) -> Result<Vec<RevisionCorrection>> {
+        let g = self.inner.lock().expect("instance mutex poisoned");
+        Ok(crate::revision_merge::read_corrections(&g.corrections, page_id)?
+            .into_iter()
+            .map(|event| RevisionCorrection {
+                revision_id: event.revision_id,
+                occurrence: event.occurrence,
+                incoming_record: event.incoming_record,
+            })
+            .collect())
     }
 
     /// Iterate all revisions of `page_id`, newest-first (chain order).
@@ -514,6 +547,100 @@ impl Instance {
         self.inner.lock().expect("instance mutex poisoned").depot.bytes_written()
     }
 
+    /// Finalize the initial full-content seed: deterministically sample a
+    /// bounded cross-section of current f0 records, train exactly one
+    /// 64-KiB per-instance revision dictionary, publish it durably, and
+    /// repack f0 only. A rerun resumes a partially completed repack using
+    /// the already-active dictionary; it never trains a successor.
+    pub fn finalize_seed_revision_dictionary(&self) -> Result<RevisionDictionaryStats> {
+        if self.read_only {
+            return Err(Error::ReadOnly("finalize_seed_revision_dictionary"));
+        }
+        self.finalize_seed_revision_dictionary_inner(None)
+    }
+
+    fn finalize_seed_revision_dictionary_inner(
+        &self,
+        repack_limit: Option<usize>,
+    ) -> Result<RevisionDictionaryStats> {
+        let g = self.inner.lock().expect("instance mutex poisoned");
+        let mut stats = RevisionDictionaryStats::default();
+        let dict_id = match g.revision_dictionaries.current("revision")? {
+            Some(id) => id,
+            None => {
+                let ids = representative_chain_ids(&g.depot);
+                let mut samples = Vec::with_capacity(ids.len());
+                let mut total = 0usize;
+                for id in ids {
+                    if total >= REVISION_SAMPLE_BYTES {
+                        break;
+                    }
+                    let frame = g.depot.read_f0(id)?;
+                    let record = crate::frames::decompress_head(
+                        &frame,
+                        &g.revision_dictionaries,
+                        "revision",
+                    )?;
+                    let take = record
+                        .len()
+                        .min(REVISION_SAMPLE_RECORD_BYTES)
+                        .min(REVISION_SAMPLE_BYTES - total);
+                    if take != 0 {
+                        samples.push(record[..take].to_vec());
+                        total += take;
+                    }
+                }
+                if samples.len() < REVISION_MIN_SAMPLES
+                    || total < REVISION_MIN_SAMPLE_BYTES
+                {
+                    return Ok(stats);
+                }
+                let dictionary =
+                    crate::frames::train_dictionary(&samples, REVISION_DICTIONARY_BYTES)?;
+                let id = g.revision_dictionaries.persist("revision", &dictionary)?;
+                g.revision_dictionaries.activate("revision", id)?;
+                stats.trained = true;
+                id
+            }
+        };
+        stats.dictionary_id = Some(dict_id);
+        let dictionary = g.revision_dictionaries.load("revision", dict_id)?;
+
+        let mut after = None;
+        'pages: loop {
+            let ids = g
+                .depot
+                .occupied_chain_ids_after(after, OCCUPIED_ID_BATCH);
+            if ids.is_empty() {
+                break;
+            }
+            for id in ids.iter().copied() {
+                after = Some(id);
+                let old = g.depot.read_f0(id)?;
+                if crate::frames::frame_dictionary_id(&old) == Some(dict_id) {
+                    continue;
+                }
+                let raw = crate::frames::decompress_head(
+                    &old,
+                    &g.revision_dictionaries,
+                    "revision",
+                )?;
+                let replacement =
+                    crate::frames::compress_head_dictionary(&raw, &dictionary)?;
+                g.depot.replace_f0(id, &replacement)?;
+                stats.heads_repacked += 1;
+                if repack_limit.is_some_and(|limit| stats.heads_repacked as usize >= limit) {
+                    break 'pages;
+                }
+            }
+        }
+        g.depot.flush()?;
+        if repack_limit.is_none() {
+            g.depot.collect_f0()?;
+        }
+        Ok(stats)
+    }
+
     /// List `(page_id, title)` pairs, title-ordered, optionally filtered
     /// by a case-insensitive substring. The answer to "which pages do I
     /// have?" — ids alone are not a UI.
@@ -523,8 +650,7 @@ impl Instance {
     /// same lossy-UTF-8 lowercase `contains` filter this method has
     /// always applied; the byte ordering equals the old
     /// `ORDER BY normalized_title`. Each matched title resolves to its
-    /// page through the INTEGER-keyed `title_id` hop — reads never scan
-    /// `title_intervals.normalized_title`. Memory is bounded by the
+    /// page through its fixed-width current slot. Memory is bounded by the
     /// scan window (≤ threads × `limit` candidates), never the corpus.
     pub fn pages(&self, filter: Option<&str>, limit: usize)
         -> Result<Vec<(u64, String)>>
@@ -541,36 +667,6 @@ impl Instance {
             }
         };
 
-        // Open intervals only: a page renamed away keeps its old title
-        // as a closed interval, which must not surface as current.
-        let mut open_rows = g.conn.prepare_cached(
-            "SELECT page_id FROM title_intervals
-             WHERE title_id = ?1 AND end_ts IS NULL
-             ORDER BY page_id",
-        )?;
-
-        // Degenerate compatibility set: open rows the dictionary does
-        // not know (rows written outside import, e.g. synthetic test
-        // fixtures; empty on any imported store — O(1) via the partial
-        // index). Collected once, merged into the ordered walk below.
-        let mut extras: Vec<(Vec<u8>, u64)> = Vec::new();
-        if has_unmapped_interval_rows(&g.conn)? {
-            let mut st = g.conn.prepare(
-                "SELECT normalized_title, page_id FROM title_intervals
-                 WHERE title_id IS NULL AND end_ts IS NULL",
-            )?;
-            let rows = st
-                .query_map([], |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, i64>(1)? as u64)))?;
-            for row in rows {
-                let (bytes, pid) = row?;
-                if matches(&bytes) {
-                    extras.push((bytes, pid));
-                }
-            }
-            extras.sort();
-        }
-        let mut extras = extras.into_iter().peekable();
-
         let mut out: Vec<(u64, String)> = Vec::new();
         let mut window: Option<crate::titles::Candidate> = None;
         loop {
@@ -582,23 +678,11 @@ impl Instance {
                 window.as_ref(),
             )?;
             for cand in &pass.candidates {
-                // Extras that sort at or before this candidate go first.
-                while out.len() < limit
-                    && extras.peek().is_some_and(|e| e.0.as_slice() <= cand.0.as_slice())
+                if let Some(page_id) =
+                    effective_title_binding(&g, cand.1)?.and_then(|b| b.page_id())
                 {
-                    let (bytes, pid) = extras.next().expect("peeked");
-                    out.push((pid, String::from_utf8_lossy(&bytes).into_owned()));
-                }
-                if out.len() >= limit {
-                    break;
-                }
-                let title = String::from_utf8_lossy(&cand.0).into_owned();
-                let pids = open_rows
-                    .query_map([cand.1 as i64], |r| r.get::<_, i64>(0))?
-                    .collect::<std::result::Result<Vec<i64>, _>>()?;
-                for pid in pids {
-                    out.push((pid as u64, title.clone()));
-                    if out.len() >= limit {
+                    out.push((page_id as u64, String::from_utf8_lossy(&cand.0).into_owned()));
+                    if out.len() == limit {
                         break;
                     }
                 }
@@ -606,15 +690,6 @@ impl Instance {
             match (out.len() >= limit, pass.next_window) {
                 (true, _) | (false, None) => break,
                 (false, Some(bound)) => window = Some(bound),
-            }
-        }
-        // Extras past the last dictionary candidate.
-        while out.len() < limit {
-            match extras.next() {
-                Some((bytes, pid)) => {
-                    out.push((pid, String::from_utf8_lossy(&bytes).into_owned()))
-                }
-                None => break,
             }
         }
         Ok(out)
@@ -646,36 +721,16 @@ impl Instance {
     /// integer-keyed interval rows. The smallest matching page id wins
     /// (deterministic where the old scan order was not).
     fn exact_current_page_id(&self, normalized: &[u8]) -> Result<Option<u64>> {
-        let mut g = self.inner.lock().expect("instance mutex poisoned");
-        let g = &mut *g;
-        let ids = g.title_ids(self.title_shard_count.load(Ordering::Relaxed), normalized)?;
+        let normalized = crate::titles::normalize_title(normalized);
+        let g = self.inner.lock().expect("instance mutex poisoned");
+        let ids = g.title_ids(self.title_shard_count.load(Ordering::Relaxed), &normalized)?;
         let mut best: Option<u64> = None;
         for id in &ids {
-            let pid: Option<i64> = g
-                .conn
-                .prepare_cached(
-                    "SELECT page_id FROM title_intervals
-                     WHERE title_id = ?1 AND end_ts IS NULL
-                     ORDER BY page_id LIMIT 1",
-                )?
-                .query_row([*id as i64], |r| r.get(0))
-                .map(Some)
-                .or_else(ignore_no_rows)?;
-            if let Some(pid) = pid {
+            if let Some(pid) =
+                effective_title_binding(&g, *id)?.and_then(|binding| binding.page_id())
+            {
                 best = Some(best.map_or(pid as u64, |b| b.min(pid as u64)));
             }
-        }
-        if best.is_none() && has_unmapped_interval_rows(&g.conn)? {
-            best = g
-                .conn
-                .prepare_cached(
-                    "SELECT page_id FROM title_intervals
-                     WHERE title_id IS NULL AND normalized_title = ?1 AND end_ts IS NULL
-                     ORDER BY page_id LIMIT 1",
-                )?
-                .query_row(rusqlite::params![normalized], |r| r.get::<_, i64>(0))
-                .map(|v| Some(v as u64))
-                .or_else(ignore_no_rows)?;
         }
         Ok(best)
     }
@@ -695,103 +750,30 @@ impl Instance {
     }
 
     /// The CURRENT title of `page_id` — the reverse of the exact-title
-    /// lookup, and the engine's attach-by-id name recovery. Indexed and
-    /// O(1): the open `title_intervals` row comes off the `(page_id,
-    /// start_ts)` primary key, its dense `title_id` resolves through
-    /// `title_id_to_page`'s PRIMARY KEY. No strpool shard is walked and
-    /// no pool-wide listing happens (this replaces an
-    /// `Instance::pages(None, usize::MAX)` sweep in the engine).
-    /// `Ok(None)` = the page has no open interval and no dictionary
-    /// mapping — it does not exist (or was never imported here).
-    ///
-    /// Compatibility tails, same discipline as every dictionary read:
-    /// an open interval the dictionary doesn't know (`title_id` NULL —
-    /// rows written outside import) answers from the row itself, and a
-    /// pre-interval legacy page falls back to its `page_to_title_id`
-    /// mapping — both indexed point lookups.
+    /// lookup, and the engine's attach-by-id name recovery. The reverse
+    /// flat file gives the dense title id in O(1), then `Pool::get`
+    /// decodes only that id's bounded shard. No pool-wide listing occurs.
+    /// `Ok(None)` means the page has no current title.
     pub fn page_current_title(&self, page_id: u64) -> Result<Option<String>> {
         let g = self.inner.lock().expect("instance mutex poisoned");
-        // Open interval (end_ts IS NULL) → dense title_id. The newest
-        // open interval wins if several exist (import keeps one).
-        let open: Option<Option<i64>> = g
-            .conn
-            .prepare_cached(
-                "SELECT title_id FROM title_intervals
-                 WHERE page_id = ?1 AND end_ts IS NULL
-                 ORDER BY start_ts DESC LIMIT 1",
-            )?
-            .query_row([page_id as i64], |r| r.get(0))
-            .map(Some)
-            .or_else(ignore_no_rows)?;
-        let title: Option<Vec<u8>> = match open {
-            // The dictionary hop: dense id → title bytes, one PK lookup.
-            Some(Some(tid)) => g
-                .conn
-                .prepare_cached(
-                    "SELECT normalized_title FROM title_id_to_page WHERE title_id = ?1",
-                )?
-                .query_row([tid], |r| r.get(0))
-                .map(Some)
-                .or_else(ignore_no_rows)?,
-            // Unmapped row (written outside import): only here does the
-            // interval row's own bytes column answer — the same
-            // compatibility branch as `pages`/`page_id_by_title_at`.
-            Some(None) => g
-                .conn
-                .prepare_cached(
-                    "SELECT normalized_title FROM title_intervals
-                     WHERE page_id = ?1 AND end_ts IS NULL
-                     ORDER BY start_ts DESC LIMIT 1",
-                )?
-                .query_row([page_id as i64], |r| r.get(0))
-                .map(Some)
-                .or_else(ignore_no_rows)?,
-            // No interval at all: pre-interval legacy import — the
-            // page's dictionary mapping is the only title on record.
-            None => g
-                .conn
-                .prepare_cached(
-                    "SELECT t.normalized_title FROM page_to_title_id p
-                     JOIN title_id_to_page t ON t.title_id = p.title_id
-                     WHERE p.page_id = ?1 LIMIT 1",
-                )?
-                .query_row([page_id as i64], |r| r.get(0))
-                .map(Some)
-                .or_else(ignore_no_rows)?,
+        let page_id: u32 = page_id.try_into().map_err(|_| Error::Corrupt("page id exceeds u32"))?;
+        let title = match effective_page_title_id(&g, page_id)? {
+            Some(title_id) => g.titles.get(title_id)?,
+            None => None,
         };
         Ok(title.map(|b| String::from_utf8_lossy(&b).into_owned()))
     }
 
     // --- asof-τ read API (browsing plan §2, the wayback contract) ---
     //
-    // Title normalization here MUST match import's (`ensure_title` in
-    // import.rs): the importer stores `page.title.trim()` verbatim as the
-    // `normalized_title` BLOB — namespace prefix kept, underscores NOT
-    // folded to spaces, no per-namespace case rule applied. So the τ
-    // lookups below normalize an incoming title with `.trim()` only.
-    // Fuller normalization (underscores→spaces, first-letter case from
-    // siteinfo) is a documented gap: it belongs at import time (import
-    // plan §7 amendment) and cannot be added at read time without
-    // re-keying the stored titles.
+    // Import, MWH reconstruction, and reads share title normalization:
+    // underscores become spaces and whitespace is collapsed.
 
     /// Resolve a title to its page id AS OF `ts_micros` (unix micros).
     ///
-    /// `None` τ → current behavior ([`Instance::page_by_title`], exact
-    /// then unique-substring). `Some(τ)` → `title_intervals` window
-    /// lookup on the normalized (trimmed) title:
-    /// `start_ts <= τ AND (end_ts IS NULL OR end_ts > τ)`. When NO
-    /// interval rows exist for the title at all (an old import that
-    /// predates interval bookkeeping), fall back to the current
-    /// title→page mapping. A title that HAS interval rows but none
-    /// covering τ resolves to `None` — it did not exist at τ.
-    ///
-    /// Resolution is dictionary-first: the trimmed title's fnv-picked
-    /// strpool shard yields its dense ids (one bounded shard walk), and
-    /// every sqlite hop below is an INTEGER-keyed indexed lookup —
-    /// `title_intervals.normalized_title` is never scanned. Rows the
-    /// dictionary does not know (written outside import; none exist on
-    /// an imported store) are covered by an O(1)-guarded compatibility
-    /// branch over the unmapped-row set.
+    /// `None` τ uses the current flat slot. `Some(τ)` uses that slot when
+    /// τ falls in its continuously-valid range, otherwise the sparse
+    /// older-interval store. A deletion or pre-creation gap returns `None`.
     pub fn page_id_by_title_at(&self, title: &str, ts_micros: Option<i64>) -> Result<Option<u64>> {
         let ts = match ts_micros {
             None => {
@@ -806,110 +788,38 @@ impl Instance {
             }
             Some(ts) => ts,
         };
-        let key = title.trim().as_bytes().to_vec();
-        let mut g = self.inner.lock().expect("instance mutex poisoned");
-        let g = &mut *g;
+        let key = crate::titles::normalize_title(title.as_bytes());
+        let g = self.inner.lock().expect("instance mutex poisoned");
         let ids = g.title_ids(self.title_shard_count.load(Ordering::Relaxed), &key)?;
-        let unmapped = has_unmapped_interval_rows(&g.conn)?;
-        // The τ window per id: start_ts <= τ AND (end_ts IS NULL OR
-        // end_ts > τ), newest interval wins — same window SQL as ever,
-        // keyed by title_id via idx_title_intervals_title_id.
-        let mut hit: Option<(i64, i64)> = None; // (start_ts, page_id), max by start_ts
-        for id in &ids {
-            let row: Option<(i64, i64)> = g
-                .conn
-                .prepare_cached(
-                    "SELECT start_ts, page_id FROM title_intervals
-                     WHERE title_id = ?1
-                       AND start_ts <= ?2
-                       AND (end_ts IS NULL OR end_ts > ?2)
-                     ORDER BY start_ts DESC LIMIT 1",
-                )?
-                .query_row(rusqlite::params![*id as i64, ts], |r| Ok((r.get(0)?, r.get(1)?)))
-                .map(Some)
-                .or_else(ignore_no_rows)?;
-            if let Some(row) = row {
-                if hit.is_none_or(|h| row.0 > h.0) {
-                    hit = Some(row);
+        let seconds: u32 = ts
+            .div_euclid(1_000_000)
+            .try_into()
+            .map_err(|_| Error::Corrupt("title timestamp outside u32 seconds"))?;
+        for id in ids {
+            if let Some(binding) = effective_title_binding(&g, id)? {
+                if seconds >= binding.valid_since {
+                    if let Some(page_id) = binding.page_id() {
+                        return Ok(Some(page_id as u64));
+                    }
+                    continue;
                 }
             }
-        }
-        if unmapped {
-            let row: Option<(i64, i64)> = g
+            let page_id: Option<i64> = g
                 .conn
-                .prepare_cached(
-                    "SELECT start_ts, page_id FROM title_intervals
-                     WHERE title_id IS NULL AND normalized_title = ?1
-                       AND start_ts <= ?2
-                       AND (end_ts IS NULL OR end_ts > ?2)
-                     ORDER BY start_ts DESC LIMIT 1",
-                )?
-                .query_row(rusqlite::params![key, ts], |r| Ok((r.get(0)?, r.get(1)?)))
+                .query_row(
+                    "SELECT page_id FROM title_interval_overflow
+                     WHERE title_id=?1 AND start_s<=?2 AND end_s>?2
+                     ORDER BY start_s DESC LIMIT 1",
+                    rusqlite::params![id as i64, seconds],
+                    |row| row.get(0),
+                )
                 .map(Some)
                 .or_else(ignore_no_rows)?;
-            if let Some(row) = row {
-                if hit.is_none_or(|h| row.0 > h.0) {
-                    hit = Some(row);
-                }
+            if let Some(page_id) = page_id.filter(|page_id| *page_id != 0) {
+                return Ok(Some(page_id as u64));
             }
         }
-        if let Some((_, id)) = hit {
-            return Ok(Some(id as u64));
-        }
-        // Distinguish "title has interval rows, none cover τ" (→ None,
-        // did not exist at τ) from "no interval rows at all" (→ fall back
-        // to the current mapping, for pre-interval imports).
-        let mut any_interval: i64 = 0;
-        for id in &ids {
-            any_interval += g
-                .conn
-                .prepare_cached("SELECT COUNT(*) FROM title_intervals WHERE title_id = ?1")?
-                .query_row([*id as i64], |r| r.get::<_, i64>(0))?;
-        }
-        if any_interval == 0 && unmapped {
-            any_interval += g.conn.query_row(
-                "SELECT COUNT(*) FROM title_intervals
-                 WHERE title_id IS NULL AND normalized_title = ?1",
-                rusqlite::params![key],
-                |r| r.get::<_, i64>(0),
-            )?;
-        }
-        if any_interval > 0 {
-            return Ok(None);
-        }
-        let mut current: Option<i64> = None;
-        for id in &ids {
-            current = g
-                .conn
-                .prepare_cached(
-                    "SELECT page_id FROM page_to_title_id WHERE title_id = ?1 LIMIT 1",
-                )?
-                .query_row([*id as i64], |r| r.get(0))
-                .map(Some)
-                .or_else(ignore_no_rows)?;
-            if current.is_some() {
-                break;
-            }
-        }
-        // Fall back to the untimed mapping ONLY for a genuinely pre-interval
-        // page (no title_intervals rows at all). If the resolved page IS
-        // interval-tracked but none of its intervals carry this title, the
-        // title was retitled away by a rename — it never covered τ, so →
-        // None rather than the all-τ resolution that would report the page
-        // before it existed (adversarial-review leak: a renamed-away title
-        // resolving at every τ). The page stays reachable under its current
-        // title's interval and, for τ = None, under `page_by_title`.
-        if let Some(pid) = current {
-            let tracked: i64 = g.conn.query_row(
-                "SELECT COUNT(*) FROM title_intervals WHERE page_id = ?1",
-                rusqlite::params![pid],
-                |r| r.get(0),
-            )?;
-            if tracked > 0 {
-                return Ok(None);
-            }
-        }
-        Ok(current.map(|id| id as u64))
+        Ok(None)
     }
 
     /// Newest revision of `page_id` with timestamp ≤ `ts_micros`.
@@ -918,18 +828,10 @@ impl Instance {
     /// revision whose timestamp is ≤ τ; `Ok(None)` when every revision is
     /// newer than τ (the page did not yet exist at τ).
     ///
-    /// The answer is `argmax` over `(timestamp, rev_id)` — NOT the first
-    /// record in chain order. Chain order is import-prepend order, not
-    /// timestamp order: an out-of-order or cross-import gap revision (a
-    /// later import supplying an earlier revision) lands at the chain
-    /// head, so "first with ts ≤ τ" would return a non-newest revision.
-    /// The argmax itself is one indexed lookup over the per-revision `ts`
-    /// rows import persists in sqlite; the chain is then walked
-    /// newest-first, meta-only, stopping at the named record — never
-    /// decoding the frames past it. Only when the rows can't be trusted
-    /// (legacy NULL-ts rows, a suspect open, or sqlite ahead of the
-    /// chain after a crash) does the read fall back to the full
-    /// streaming scan — once, backfilling the rows it derived.
+    /// The authoritative depot chain is scanned and the answer is
+    /// `argmax(timestamp, rev_id)` among qualifying records. Revision
+    /// identity/order in storage is by revision id; timestamp remains
+    /// record content and is not duplicated in SQLite.
     pub fn revision_at(&self, page_id: u64, ts_micros: Option<i64>) -> Result<Option<RevisionMeta>> {
         Ok(self.revision_query(page_id, ts_micros, false)?.map(|(m, _)| m))
     }
@@ -956,7 +858,14 @@ impl Instance {
             return Ok(None);
         }
         let g = self.inner.lock().expect("instance mutex poisoned");
-        Ok(find_revision(&g.depot, page_id, rev_id, true)?.and_then(|(_, t)| t))
+        Ok(find_revision(
+            &g.depot,
+            &g.revision_dictionaries,
+            page_id,
+            rev_id,
+            true,
+        )?
+        .and_then(|(_, t)| t))
     }
 
     /// The shared read core behind [`page_head`](Self::page_head) /
@@ -975,106 +884,29 @@ impl Instance {
             return Ok(None);
         }
         let g = self.inner.lock().expect("instance mutex poisoned");
-        let g = &*g;
-
-        // COUNT(ts) counts non-NULL rows: the page's bookkeeping is
-        // complete iff every row carries a timestamp.
-        let (total, with_ts): (i64, i64) = g
-            .conn
-            .prepare_cached("SELECT COUNT(*), COUNT(ts) FROM revisions_seen WHERE page_id = ?1")?
-            .query_row([page_id as i64], |r| Ok((r.get(0)?, r.get(1)?)))?;
-
-        // Rows are authoritative only when timestamped AND this session
-        // has no reason to believe the chain diverged from them (a
-        // suspect open or a mid-page import error can leave the chain
-        // AHEAD of the rows — the chain is the data fence, so those
-        // states scan it).
-        let rows_trusted = total > 0 && with_ts == total && !self.suspect && !g.import_errored;
-        if rows_trusted {
-            let target: Option<i64> = match ts_micros {
-                None => g
-                    .conn
-                    .prepare_cached(
-                        "SELECT rev_id FROM revisions_seen WHERE page_id = ?1
-                         ORDER BY ts DESC, rev_id DESC LIMIT 1",
-                    )?
-                    .query_row([page_id as i64], |r| r.get(0))
-                    .map(Some)
-                    .or_else(ignore_no_rows)?,
-                Some(tau) => g
-                    .conn
-                    .prepare_cached(
-                        "SELECT rev_id FROM revisions_seen WHERE page_id = ?1 AND ts <= ?2
-                         ORDER BY ts DESC, rev_id DESC LIMIT 1",
-                    )?
-                    .query_row(rusqlite::params![page_id as i64, tau], |r| r.get(0))
-                    .map(Some)
-                    .or_else(ignore_no_rows)?,
+        if ts_micros.is_none() {
+            let mut walk = WalkState::new(page_id);
+            let Some(record) = walk.next_record(&g.depot, &g.revision_dictionaries)? else {
+                return Ok(None);
             };
-            match target {
-                Some(rev_id) => {
-                    if let Some(hit) = find_revision(&g.depot, page_id, rev_id as u64, want_text)? {
-                        return Ok(Some(hit));
-                    }
-                    // The named revision is not on the chain: sqlite got
-                    // ahead of the depot (rows durable, frames lost in a
-                    // crash) and this page wasn't repaired yet. Fall
-                    // through to the chain scan — the chain is truth.
-                }
-                // Complete, trusted rows and none qualifies: the page
-                // did not exist at τ. No frame is touched at all.
-                None => return Ok(None),
-            }
+            let (meta, text) = crate::revision::decode_revision_view(record)?;
+            return Ok(Some((meta, want_text.then(|| text.to_vec()))));
         }
-
-        // Fallback: stream the whole chain (one frame resident at a
-        // time), argmax over (ts, rev_id) — and, when rows exist but
-        // predate the ts column, backfill them inside one transaction
-        // so the NEXT read takes the indexed path. Rows the chain
-        // doesn't confirm are never invented here; suspect-mode import
-        // repair owns row re-derivation. A read-only open still scans
-        // (correct answer) but never backfills — that write belongs to
-        // the exclusive-lock holder.
-        let backfill = total > 0 && with_ts < total && !self.read_only;
-        if backfill {
-            g.conn.execute("BEGIN IMMEDIATE", [])?;
-        }
-        let result = (|| {
-            let mut fill = if backfill {
-                Some(g.conn.prepare_cached(
-                    "UPDATE revisions_seen SET ts = ?3
-                     WHERE page_id = ?1 AND rev_id = ?2 AND ts IS NULL",
-                )?)
-            } else {
-                None
-            };
-            scan_best(&g.depot, page_id, ts_micros, want_text, &mut |rev_id, ts| {
-                if let Some(st) = fill.as_mut() {
-                    st.execute(rusqlite::params![page_id as i64, rev_id as i64, ts])?;
-                }
-                Ok(())
-            })
-        })();
-        if backfill {
-            match &result {
-                Ok(_) => {
-                    g.conn.execute("COMMIT", [])?;
-                }
-                Err(_) => {
-                    let _ = g.conn.execute("ROLLBACK", []);
-                }
-            }
-        }
-        result
+        scan_best(
+            &g.depot,
+            &g.revision_dictionaries,
+            page_id,
+            ts_micros,
+            want_text,
+            &mut |_, _| Ok(()),
+        )
     }
 
     /// Existence of `title` at τ — the red-link / `#ifexist` fast path.
     ///
-    /// Title tables only, NO frame decode: resolves through the same
-    /// `title_intervals` window as [`Instance::page_id_by_title_at`], so it
-    /// is `false` for τ before the title's first interval opens (import
-    /// records the real earliest-revision start, not 0). Legacy pre-interval
-    /// depots (start_ts = 0) still report existence from t = 0.
+    /// Title metadata only, with no revision-frame decode: resolves through
+    /// the same current-slot/sparse-overflow path as
+    /// [`Instance::page_id_by_title_at`].
     pub fn exists_at(&self, title: &str, ts_micros: Option<i64>) -> Result<bool> {
         Ok(self.page_id_by_title_at(title, ts_micros)?.is_some())
     }
@@ -1261,19 +1093,19 @@ impl Instance {
         }
         let g = self.inner.lock().expect("instance mutex poisoned");
         g.depot.collect()?;
+        g.corrections.collect()?;
         Ok(())
     }
 
     /// Flush depot + strpool + sqlite to durable storage.
     pub fn flush(&self) -> Result<()> {
         if self.read_only {
-            // A read-only flush would also CLEAR the dirty flag a
-            // crashed writer left — never touch the fence from a reader.
             return Err(Error::ReadOnly("flush"));
         }
         let mut g = self.inner.lock().expect("instance mutex poisoned");
-        g.dirty_stamped = false; // next import re-stamps
+        finish_title_slot_intent(&self.root, &mut g)?;
         g.depot.flush()?;
+        g.corrections.flush()?;
         for sid in 0..self.title_shard_count.load(Ordering::Relaxed) {
             g.titles.maybe_seal(sid)?;
             g.titles.flush(sid)?;
@@ -1288,16 +1120,6 @@ impl Instance {
         // sqlite WAL checkpoint — commit boundaries flushed by the
         // per-page transactions; the checkpoint pushes WAL pages to the
         // main db file.
-        g.conn
-            .pragma_update(None, "wal_checkpoint", "TRUNCATE")
-            .map_err(Error::Sqlite)?;
-        // Everything the session wrote is now durable IN ORDER (depot
-        // first, then bookkeeping): clear the dirty flag. A crash after
-        // this point is a clean shutdown for the repair logic.
-        g.conn.execute(
-            "INSERT OR REPLACE INTO instance_flags(key, value) VALUES('dirty', 0)",
-            [],
-        )?;
         g.conn
             .pragma_update(None, "wal_checkpoint", "TRUNCATE")
             .map_err(Error::Sqlite)?;
@@ -1322,6 +1144,7 @@ impl Instance {
         }
         g.titles.maybe_seal(shard_id)?;
         g.titles.flush(shard_id)?;
+        finish_title_slot_intent(&self.root, g)?;
         while title_pool_is_oversized(
             &g.titles,
             self.title_shard_count.load(Ordering::Relaxed),
@@ -1346,18 +1169,8 @@ impl Instance {
             None,
         )?;
 
-        g.conn.execute("DROP TABLE IF EXISTS temp.title_id_reshard", [])?;
-        g.conn.execute(
-            "CREATE TEMP TABLE title_id_reshard (
-                old_id INTEGER PRIMARY KEY,
-                new_id INTEGER NOT NULL UNIQUE
-             )",
-            [],
-        )?;
+        let mut remap = Vec::new();
         {
-            let mut map = g
-                .conn
-                .prepare("INSERT INTO title_id_reshard(old_id, new_id) VALUES(?1, ?2)")?;
             for old_sid in 0..old_count {
                 // Bound migration memory by one old shard instead of
                 // materializing the wiki's entire title dictionary.
@@ -1372,7 +1185,7 @@ impl Instance {
                     if old_id > i64::MAX as u64 || new_id > i64::MAX as u64 {
                         return Err(Error::Corrupt("title id exceeds sqlite integer"));
                     }
-                    map.execute(rusqlite::params![old_id as i64, new_id as i64])?;
+                    remap.push((old_id, new_id));
                 }
             }
         }
@@ -1381,53 +1194,34 @@ impl Instance {
             new_pool.flush(sid)?;
         }
         sync_parent_dir(&new_dir);
-
-        g.conn.execute("BEGIN IMMEDIATE", [])?;
-        let switched = (|| -> Result<()> {
-            // Negative temporary ids cannot collide with any old/new dense
-            // id while primary keys and indexes are maintained in place.
-            for table in ["title_id_to_page", "page_to_title_id", "title_intervals"] {
-                g.conn.execute(
-                    &format!(
-                        "UPDATE {table}
-                         SET title_id = -1 - (
-                           SELECT new_id FROM title_id_reshard m
-                           WHERE m.old_id = {table}.title_id
-                         )
-                         WHERE title_id IS NOT NULL"
-                    ),
-                    [],
-                )?;
-            }
-            for table in ["title_id_to_page", "page_to_title_id", "title_intervals"] {
-                g.conn.execute(
-                    &format!("UPDATE {table} SET title_id = -1 - title_id WHERE title_id < 0"),
-                    [],
-                )?;
-            }
-            g.conn.execute(
-                "INSERT OR REPLACE INTO instance_flags(key, value)
-                 VALUES('title_shard_count', ?1)",
-                [new_count as i64],
-            )?;
-            g.conn.execute(
-                "INSERT OR REPLACE INTO instance_flags(key, value)
-                 VALUES('title_pool_generation', ?1)",
-                [generation as i64],
-            )?;
-            Ok(())
-        })();
-        match switched {
-            Ok(()) => {
-                g.conn.execute("COMMIT", [])?;
-            }
-            Err(e) => {
-                let _ = g.conn.execute("ROLLBACK", []);
-                return Err(e);
-            }
-        }
+        let prepared_slots = crate::title_slots::TitleSlotGenerations::prepare_remapped(
+            &self.root,
+            generation,
+            &g.title_slots,
+            &remap,
+        )?;
+        let new_slots = prepared_slots.commit()?;
+        let new_page_titles = crate::title_slots::PageTitleSlots::open(
+            self.root.join(format!("page-titles.{generation}")),
+        )?;
+        let tx = g.conn.transaction()?;
+        crate::title_slots::SqliteOlderTitleIntervals::remap_in_transaction(&tx, &remap)?;
+        crate::title_slots::TitleSlotGenerations::select(&tx, generation)?;
+        tx.execute(
+            "INSERT OR REPLACE INTO instance_flags(key, value)
+             VALUES('title_shard_count', ?1)",
+            [new_count as i64],
+        )?;
+        tx.execute(
+            "INSERT OR REPLACE INTO instance_flags(key, value)
+             VALUES('title_pool_generation', ?1)",
+            [generation as i64],
+        )?;
+        tx.commit()?;
 
         g.titles = new_pool;
+        g.title_slots = new_slots;
+        g.page_titles = new_page_titles;
         self.title_shard_count.store(new_count, Ordering::Relaxed);
         // The live handles and SQLite flags now select the new durable
         // generation. Older generations are no longer rollback state: the
@@ -1436,14 +1230,15 @@ impl Instance {
         Ok(())
     }
 
-    /// Make successfully committed pages durable after the source stream
-    /// fails, without clearing the dirty fence. The next attempt/open repairs
-    /// bookkeeping from the depot before deduplicating the salvaged prefix.
+    /// Make successfully committed pages and pending title intents durable
+    /// after the source stream fails. The depot remains the dedup authority
+    /// when the source is retried.
     pub(crate) fn flush_salvage(&self) -> Result<()> {
         if self.read_only {
             return Err(Error::ReadOnly("flush_salvage"));
         }
-        let g = self.inner.lock().expect("instance mutex poisoned");
+        let mut g = self.inner.lock().expect("instance mutex poisoned");
+        finish_title_slot_intent(&self.root, &mut g)?;
         g.depot.flush()?;
         for sid in 0..self.title_shard_count.load(Ordering::Relaxed) {
             g.titles.flush(sid)?;
@@ -1473,17 +1268,6 @@ fn flock_root(root: &std::path::Path, op: libc::c_int) -> Result<std::fs::File> 
     Ok(f)
 }
 
-/// Does `table` carry a column named `col`? (PRAGMA table_info — a
-/// pure read; `open_read`'s schema fence and the lazy migrations both
-/// probe through this.)
-fn has_column(conn: &Connection, table: &str, col: &str) -> Result<bool> {
-    Ok(conn
-        .prepare(&format!("PRAGMA table_info({table})"))?
-        .query_map([], |r| r.get::<_, String>(1))?
-        .flatten()
-        .any(|name| name == col))
-}
-
 /// Total order used to pick the newest revision: latest timestamp wins,
 /// ties broken by higher rev_id. See [`Instance::revision_at`] for why
 /// chain position cannot be used instead.
@@ -1499,175 +1283,10 @@ fn ignore_no_rows<T>(e: rusqlite::Error) -> std::result::Result<Option<T>, Error
     }
 }
 
-/// Lazy meta.db migration for the per-revision `ts` column (2026-07,
-/// "reads must not decode whole chains"): a db created before the column
-/// existed gets it via ALTER (rows NULL — backfilled per page by the
-/// first read that needs them, see `Instance::revision_query`); fresh
-/// dbs already carry it from the DDL. The (page_id, ts, rev_id) index
-/// makes the head/τ argmax one logarithmic lookup. Runs after the DDL,
-/// BEFORE the index — the index references the column.
-fn ensure_revision_ts_schema(conn: &Connection) -> Result<()> {
-    if !has_column(conn, "revisions_seen", "ts")? {
-        conn.execute("ALTER TABLE revisions_seen ADD COLUMN ts INTEGER", [])?;
-    }
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_revisions_seen_page_ts
-         ON revisions_seen(page_id, ts DESC, rev_id DESC)",
-        [],
-    )?;
-    Ok(())
-}
-
-/// Current page and namespace counts drive MediaWiki's NUMBEROF* variables.
-/// Keep the active interval subset indexed so rendering them does not scan
-/// the full move history on every page view.
-fn ensure_current_title_count_index(conn: &Connection) -> Result<()> {
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_title_intervals_current_ns
-         ON title_intervals(ns) WHERE end_ts IS NULL",
-        [],
-    )?;
-    Ok(())
-}
-
-/// Deleted-page log events in MediaWiki History can lack a page id. Rebuild
-/// the derived action table created by older versions so those archival
-/// records can be retained instead of rejecting the whole history snapshot.
-fn ensure_nullable_page_actions_page(conn: &Connection) -> Result<()> {
-    let page_id_not_null = conn
-        .prepare("PRAGMA table_info(page_actions)")?
-        .query_map([], |row| Ok((row.get::<_, String>(1)?, row.get::<_, i64>(3)?)))?
-        .collect::<std::result::Result<Vec<_>, _>>()?
-        .into_iter()
-        .find_map(|(name, not_null)| (name == "page_id").then_some(not_null != 0))
-        .unwrap_or(false);
-    if !page_id_not_null {
-        return Ok(());
-    }
-    conn.execute_batch(
-        "BEGIN IMMEDIATE;
-         DROP INDEX IF EXISTS idx_page_actions_page_time;
-         ALTER TABLE page_actions RENAME TO page_actions_not_null;
-         CREATE TABLE page_actions (
-             source_key TEXT PRIMARY KEY,
-             source_partition TEXT NOT NULL,
-             event_log_id INTEGER,
-             event_type TEXT NOT NULL,
-             event_timestamp TEXT NOT NULL,
-             event_comment TEXT NOT NULL,
-             actor_id INTEGER,
-             actor_name TEXT NOT NULL,
-             page_id INTEGER,
-             title_historical TEXT NOT NULL,
-             title_current TEXT NOT NULL,
-             namespace_historical INTEGER,
-             namespace_current INTEGER,
-             page_deleted INTEGER NOT NULL
-         );
-         INSERT INTO page_actions
-             SELECT * FROM page_actions_not_null;
-         DROP TABLE page_actions_not_null;
-         CREATE INDEX idx_page_actions_page_time
-             ON page_actions(page_id, event_timestamp DESC);
-         COMMIT;",
-    )?;
-    Ok(())
-}
-
-/// MediaWiki History contains orphan revisions whose upstream page id is
-/// genuinely absent. Older mirrors created `revision_visibility.page_id` as
-/// NOT NULL and therefore could not retain suppression/deletion metadata for
-/// those revisions. Rebuild that small derived table once with a nullable
-/// page id; all existing rows and the revision-id primary key are preserved.
-fn ensure_nullable_revision_visibility_page(conn: &Connection) -> Result<()> {
-    let page_id_not_null = conn
-        .prepare("PRAGMA table_info(revision_visibility)")?
-        .query_map([], |row| Ok((row.get::<_, String>(1)?, row.get::<_, i64>(3)?)))?
-        .collect::<std::result::Result<Vec<_>, _>>()?
-        .into_iter()
-        .find_map(|(name, not_null)| (name == "page_id").then_some(not_null != 0))
-        .unwrap_or(false);
-    if !page_id_not_null {
-        return Ok(());
-    }
-    conn.execute_batch(
-        "BEGIN IMMEDIATE;
-         DROP INDEX IF EXISTS idx_revision_visibility_page;
-         ALTER TABLE revision_visibility RENAME TO revision_visibility_not_null;
-         CREATE TABLE revision_visibility (
-             revision_id INTEGER PRIMARY KEY,
-             page_id INTEGER,
-             source_partition TEXT NOT NULL,
-             deleted_parts TEXT NOT NULL,
-             parts_are_suppressed INTEGER NOT NULL,
-             deleted_by_page_deletion INTEGER NOT NULL,
-             page_deletion_timestamp TEXT NOT NULL
-         );
-         INSERT INTO revision_visibility
-             SELECT * FROM revision_visibility_not_null;
-         DROP TABLE revision_visibility_not_null;
-         CREATE INDEX idx_revision_visibility_page
-             ON revision_visibility(page_id, revision_id);
-         COMMIT;",
-    )?;
-    Ok(())
-}
-
-/// Lazy meta.db migration for `title_intervals.title_id` (2026-07,
-/// "wire the title dictionary"): reads resolve titles by dense strpool
-/// id, so every interval row must carry the id of its title.
-///
-///   * Legacy dbs get the column via ALTER, then a one-shot backfill
-///     joins each row to `title_id_to_page` on `(ns, normalized_title)`
-///     — the same fence discipline as `ensure_revision_ts_schema`.
-///   * Import writes the column directly (`ensure_title` carries
-///     title_id in every `title_intervals` INSERT and in the
-///     retitle-in-place UPDATE), so no write-path compatibility
-///     machinery remains: the two interim triggers that derived a
-///     missing title_id are DROPPED here (legacy dbs still carry them —
-///     they only existed for the window when import didn't write the
-///     column; the insert one was WHEN NEW.title_id IS NULL, a no-op
-///     since, and the retitle one re-derived the value the UPDATE now
-///     sets itself).
-///   * A row whose title the dictionary genuinely lacks stays NULL and
-///     is served by the reads' unmapped-row compatibility branch, whose
-///     guard is O(1) via the partial index below (an INTEGER index over
-///     rows that are empty on any imported store — not a text index
-///     entrenching the redundant title copy).
-fn ensure_title_dictionary_schema(conn: &Connection) -> Result<()> {
-    if !has_column(conn, "title_intervals", "title_id")? {
-        conn.execute("ALTER TABLE title_intervals ADD COLUMN title_id INTEGER", [])?;
-    }
-    conn.execute_batch(
-        "CREATE INDEX IF NOT EXISTS idx_title_intervals_title_id
-             ON title_intervals(title_id, start_ts);
-         CREATE INDEX IF NOT EXISTS idx_page_to_title_id_title
-             ON page_to_title_id(title_id);
-         CREATE INDEX IF NOT EXISTS idx_title_intervals_unmapped
-             ON title_intervals(page_id) WHERE title_id IS NULL;
-         DROP TRIGGER IF EXISTS title_intervals_title_id_insert;
-         DROP TRIGGER IF EXISTS title_intervals_title_id_retitle;",
-    )?;
-    conn.execute(
-        "UPDATE title_intervals SET title_id =
-             (SELECT title_id FROM title_id_to_page t
-               WHERE t.ns = title_intervals.ns
-                 AND t.normalized_title = title_intervals.normalized_title)
-         WHERE title_id IS NULL",
-        [],
-    )?;
-    Ok(())
-}
-
-/// The shard count every store the pre-persistence CLI ever built
-/// used — the assumed truth for a LEGACY store (meta.db without the
-/// `title_shard_count` flag).
-const LEGACY_TITLE_SHARD_COUNT: u32 = 4;
 const FRESH_TITLE_SHARD_COUNT: u32 = 256;
 
 /// The titles-pool shard count persisted at instance creation
-/// (`instance_flags` key `title_shard_count`), or `None` on a legacy
-/// store that predates the flag.
+/// (`instance_flags` key `title_shard_count`).
 fn persisted_title_shard_count(conn: &Connection) -> Result<Option<u32>> {
     let v: Option<i64> = conn
         .query_row(
@@ -1700,12 +1319,9 @@ fn persisted_title_shard_count(conn: &Connection) -> Result<Option<u32>> {
 ///     [`Error::TitleShardMismatch`] — a mis-counted open would
 ///     silently route exact lookups to the wrong shard;
 ///   * flag absent + `may_persist` (writer): a fresh root persists the
-///     requested count (0 → 4, the CLI default); a LEGACY store (built
-///     before the flag existed) gets the same treatment — the CLI only
-///     ever built 4-shard stores and derives (0) today, so the
-///     backfill records the truth;
-///   * flag absent + read-only: assume the legacy 4 (or trust an
-///     explicit count), persist nothing.
+///     requested count (0 → 256);
+///   * flag absent + read-only: fail loudly because routing cannot be
+///     inferred from lazy shard files.
 fn resolve_title_shard_count(
     conn: &Connection,
     root: &std::path::Path,
@@ -1724,25 +1340,15 @@ fn resolve_title_shard_count(
             Ok(on_disk)
         }
         None => {
-            let has_titles: bool = conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM title_id_to_page LIMIT 1)",
-                [],
-                |r| r.get::<_, i64>(0),
-            )? != 0;
-            let n = if requested != 0 {
-                requested
-            } else if has_titles {
-                LEGACY_TITLE_SHARD_COUNT
-            } else {
-                FRESH_TITLE_SHARD_COUNT
-            };
-            if may_persist {
-                conn.execute(
-                    "INSERT OR REPLACE INTO instance_flags(key, value)
-                     VALUES('title_shard_count', ?1)",
-                    [n as i64],
-                )?;
+            if !may_persist {
+                return Err(Error::Corrupt("missing title_shard_count instance flag"));
             }
+            let n = if requested != 0 { requested } else { FRESH_TITLE_SHARD_COUNT };
+            conn.execute(
+                "INSERT OR REPLACE INTO instance_flags(key, value)
+                 VALUES('title_shard_count', ?1)",
+                [n as i64],
+            )?;
             Ok(n)
         }
     }
@@ -1813,10 +1419,12 @@ fn next_title_pool_generation(root: &std::path::Path) -> Result<u32> {
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
-        if let Some(raw) = name.strip_prefix("titles-g") {
-            if let Ok(n) = raw.parse::<u32>() {
-                max_generation = max_generation.max(n);
-            }
+        let raw = name
+            .strip_prefix("titles-g")
+            .or_else(|| name.strip_prefix("title-slots."))
+            .or_else(|| name.strip_prefix("page-titles."));
+        if let Some(Ok(n)) = raw.map(str::parse::<u32>) {
+            max_generation = max_generation.max(n);
         }
     }
     max_generation.checked_add(1).ok_or(Error::Corrupt("title pool generation overflow"))
@@ -1842,15 +1450,133 @@ fn sync_parent_dir(path: &std::path::Path) {
     }
 }
 
-/// Do any `title_intervals` rows lack a dictionary id? O(1) via the
-/// partial index; `false` on every imported store, so the reads'
-/// compatibility branches cost one point query and nothing more.
-fn has_unmapped_interval_rows(conn: &Connection) -> Result<bool> {
-    Ok(conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM title_intervals WHERE title_id IS NULL)",
-        [],
-        |r| r.get::<_, i64>(0),
-    )? != 0)
+pub(crate) fn effective_title_binding(
+    inner: &InstanceInner,
+    title_id: u64,
+) -> Result<Option<crate::title_slots::TitleBinding>> {
+    let pending = inner
+        .conn
+        .query_row(
+            "SELECT page_id,valid_since FROM title_slot_intent WHERE title_id=?1",
+            [title_id as i64],
+            |row| {
+                Ok(crate::title_slots::TitleBinding {
+                    page_id: row.get(0)?,
+                    valid_since: row.get(1)?,
+                })
+            },
+        )
+        .map(Some)
+        .or_else(ignore_no_rows)?;
+    Ok(pending.or_else(|| inner.title_slots.current(title_id)))
+}
+
+pub(crate) fn effective_page_title_id(
+    inner: &InstanceInner,
+    page_id: u32,
+) -> Result<Option<u64>> {
+    let pending: Option<i64> = inner
+        .conn
+        .query_row(
+            "SELECT title_id FROM title_slot_intent
+             WHERE page_id=?1 ORDER BY title_id LIMIT 1",
+            [page_id],
+            |row| row.get(0),
+        )
+        .map(Some)
+        .or_else(ignore_no_rows)?;
+    if let Some(title_id) = pending {
+        return Ok(Some(title_id as u64));
+    }
+    let Some(title_id) = inner.page_titles.current_title_id(page_id) else {
+        return Ok(None);
+    };
+    let shadowed: bool = inner.conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM title_slot_intent WHERE title_id=?1)",
+        [title_id as i64],
+        |row| row.get(0),
+    )?;
+    Ok((!shadowed).then_some(title_id))
+}
+
+fn load_title_slot_intents(
+    conn: &Connection,
+) -> Result<Vec<(u64, crate::title_slots::TitleBinding)>> {
+    let mut statement = conn.prepare(
+        "SELECT title_id,page_id,valid_since FROM title_slot_intent ORDER BY title_id",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, i64>(0)? as u64,
+            crate::title_slots::TitleBinding {
+                page_id: row.get(1)?,
+                valid_since: row.get(2)?,
+            },
+        ))
+    })?;
+    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
+pub(crate) fn finish_title_slot_intent(
+    root: &std::path::Path,
+    inner: &mut InstanceInner,
+) -> Result<()> {
+    let changes = load_title_slot_intents(&inner.conn)?;
+    if changes.is_empty() {
+        return Ok(());
+    }
+    let generation = crate::title_slots::TitleSlotGenerations::selected(&inner.conn)?;
+    let (titles, pages) =
+        crate::title_slots::TitleSlotGenerations::apply_current(root, generation, &changes)?;
+    inner.title_slots = titles;
+    inner.page_titles = pages;
+    inner.conn.execute("DELETE FROM title_slot_intent", [])?;
+    inner.pending_title_intents = 0;
+    inner.conn.pragma_update(None, "wal_checkpoint", "TRUNCATE")?;
+    Ok(())
+}
+
+fn recover_title_slot_intent(root: &std::path::Path, conn: &mut Connection) -> Result<()> {
+    let changes = load_title_slot_intents(conn)?;
+    if changes.is_empty() {
+        return Ok(());
+    }
+    let generation = crate::title_slots::TitleSlotGenerations::selected(conn)?;
+    crate::title_slots::TitleSlotGenerations::apply_current(root, generation, &changes)?;
+    conn.execute("DELETE FROM title_slot_intent", [])?;
+    conn.pragma_update(None, "wal_checkpoint", "TRUNCATE")?;
+    Ok(())
+}
+
+/// Deterministic min-hash sample across the full occupied id space. We
+/// inspect only the index during selection, then read at most the fixed
+/// sample count of heads.
+fn representative_chain_ids(depot: &Depot) -> Vec<u64> {
+    let mut selected = std::collections::BTreeMap::<(u64, u64), ()>::new();
+    let mut after = None;
+    loop {
+        let ids = depot.occupied_chain_ids_after(after, OCCUPIED_ID_BATCH);
+        if ids.is_empty() {
+            break;
+        }
+        for id in ids.iter().copied() {
+            after = Some(id);
+            selected.insert((sample_hash(id), id), ());
+            if selected.len() > REVISION_SAMPLE_COUNT {
+                selected.pop_last();
+            }
+        }
+    }
+    let mut ids: Vec<u64> = selected.keys().map(|(_, id)| *id).collect();
+    ids.sort_unstable();
+    ids
+}
+
+fn sample_hash(mut value: u64) -> u64 {
+    value = value.wrapping_add(0x9e3779b97f4a7c15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d049bb133111eb);
+    value ^ (value >> 31)
 }
 
 // ---------------------------------------------------------------------
@@ -1887,6 +1613,12 @@ pub(crate) struct WalkState {
 
 enum WalkFrame {
     Start,
+    Head {
+        record: Vec<u8>,
+        yielded: bool,
+        pending_f1: Option<Vec<u8>>,
+        cold: Option<wikimak_depot::ColdCursor>,
+    },
     InFrame {
         /// Incremental zstd decode state. The decompressed frame is
         /// never materialized; the decoder retains its compressed
@@ -1921,7 +1653,11 @@ impl WalkState {
 
     /// Yield the next (newest-first) record, or `None` at chain end.
     /// The slice borrows this walk; it is invalidated by the next call.
-    pub(crate) fn next_record(&mut self, depot: &Depot) -> Result<Option<&[u8]>> {
+    pub(crate) fn next_record(
+        &mut self,
+        depot: &Depot,
+        dictionaries: &crate::frames::DictionaryStore,
+    ) -> Result<Option<&[u8]>> {
         loop {
             match &mut self.frame {
                 WalkFrame::Done => return Ok(None),
@@ -1940,10 +1676,24 @@ impl WalkState {
                     } else {
                         (None, None)
                     };
-                    let decoder = wikimak_depot::OwnedFrameDecoder::new(f0, None)
-                        .map_err(|_| Error::Codec("zstd decompress"))?;
-                    self.frame =
-                        WalkFrame::InFrame { decoder, record: Vec::new(), pending_f1, cold };
+                    let record = crate::frames::decompress_head(
+                        &f0,
+                        dictionaries,
+                        "revision",
+                    )?;
+                    self.frame = WalkFrame::Head {
+                        record,
+                        yielded: false,
+                        pending_f1,
+                        cold,
+                    };
+                }
+                WalkFrame::Head { yielded, .. } if !*yielded => {
+                    *yielded = true;
+                    break;
+                }
+                WalkFrame::Head { .. } => {
+                    self.advance_frame(depot)?;
                 }
                 WalkFrame::InFrame { decoder, record, .. } => {
                     if read_revision_record(decoder, record)? {
@@ -1953,17 +1703,26 @@ impl WalkState {
                 }
             }
         }
-        let WalkFrame::InFrame { record, .. } = &self.frame else { unreachable!() };
-        Ok(Some(record))
+        match &self.frame {
+            WalkFrame::Head { record, .. } | WalkFrame::InFrame { record, .. } => {
+                Ok(Some(record))
+            }
+            _ => unreachable!(),
+        }
     }
 
     /// Cross a frame boundary: the current frame is exhausted; its
     /// oldest record anchors the next frame's refPrefix decode.
     fn advance_frame(&mut self, depot: &Depot) -> Result<()> {
-        let WalkFrame::InFrame { record, pending_f1, cold, .. } =
-            std::mem::replace(&mut self.frame, WalkFrame::Done)
-        else {
-            return Ok(());
+        let (record, pending_f1, cold) =
+            match std::mem::replace(&mut self.frame, WalkFrame::Done) {
+                WalkFrame::Head { record, pending_f1, cold, .. } => {
+                    (record, pending_f1, cold)
+                }
+                WalkFrame::InFrame { record, pending_f1, cold, .. } => {
+                    (record, pending_f1, cold)
+                }
+                _ => return Ok(()),
         };
         // At EOF `record` is the oldest record yielded from this frame,
         // exactly the refPrefix anchor for the next frame.
@@ -1983,6 +1742,11 @@ impl WalkState {
             None => depot.cold_cursor(self.chain_id)?,
         };
         if let Some(f1) = pending_f1 {
+            if crate::frames::frame_dictionary_id(&f1).is_some() {
+                return Err(Error::FrameEnvelope(
+                    "history frame carries a dictionary id",
+                ));
+            }
             let decoder = wikimak_depot::OwnedFrameDecoder::new(f1, Some(anchor))
                 .map_err(|_| Error::Codec("zstd decompress"))?;
             self.frame = WalkFrame::InFrame {
@@ -1995,6 +1759,11 @@ impl WalkState {
         }
         match depot.cold_next(&mut cold)? {
             Some(frame) => {
+                if crate::frames::frame_dictionary_id(&frame).is_some() {
+                    return Err(Error::FrameEnvelope(
+                        "history frame carries a dictionary id",
+                    ));
+                }
                 let decoder = wikimak_depot::OwnedFrameDecoder::new(frame, Some(anchor))
                     .map_err(|_| Error::Codec("zstd decompress"))?;
                 self.frame = WalkFrame::InFrame {
@@ -2081,12 +1850,13 @@ fn read_record_bytes(
 /// target decoded once and its text copied out only if `want_text`.
 pub(crate) fn find_revision(
     depot: &Depot,
+    dictionaries: &crate::frames::DictionaryStore,
     chain_id: u64,
     rev_id: u64,
     want_text: bool,
 ) -> Result<Option<(RevisionMeta, Option<Vec<u8>>)>> {
     let mut walk = WalkState::new(chain_id);
-    while let Some(rec) = walk.next_record(depot)? {
+    while let Some(rec) = walk.next_record(depot, dictionaries)? {
         if crate::revision::peek_rev_id(rec)? == rev_id {
             let (meta, text) = crate::revision::decode_revision_view(rec)?;
             let text = if want_text { Some(text.to_vec()) } else { None };
@@ -2105,6 +1875,7 @@ pub(crate) fn find_revision(
 /// text (when `want_text`) is resident.
 pub(crate) fn scan_best(
     depot: &Depot,
+    dictionaries: &crate::frames::DictionaryStore,
     chain_id: u64,
     tau: Option<i64>,
     want_text: bool,
@@ -2112,7 +1883,7 @@ pub(crate) fn scan_best(
 ) -> Result<Option<(RevisionMeta, Option<Vec<u8>>)>> {
     let mut best: Option<(RevisionMeta, Option<Vec<u8>>)> = None;
     let mut walk = WalkState::new(chain_id);
-    while let Some(rec) = walk.next_record(depot)? {
+    while let Some(rec) = walk.next_record(depot, dictionaries)? {
         let rev_id = crate::revision::peek_rev_id(rec)?;
         let ts = crate::revision::peek_ts(rec)?;
         each(rev_id, ts)?;
@@ -2143,7 +1914,7 @@ impl Iterator for HistoryWalk {
     fn next(&mut self) -> Option<Self::Item> {
         let meta = {
             let g = self.inner.lock().expect("instance mutex poisoned");
-            let rec = match self.walk.next_record(&g.depot) {
+            let rec = match self.walk.next_record(&g.depot, &g.revision_dictionaries) {
                 Ok(Some(rec)) => rec,
                 Ok(None) => return None,
                 Err(e) => return Some(Err(e)),
@@ -2158,7 +1929,13 @@ impl Iterator for HistoryWalk {
         let rev_id = meta.rev_id;
         let fetch_text: Box<dyn FnOnce() -> Result<Vec<u8>> + Send> = Box::new(move || {
             let g = inner.lock().expect("instance mutex poisoned");
-            match find_revision(&g.depot, chain_id, rev_id, true)? {
+            match find_revision(
+                &g.depot,
+                &g.revision_dictionaries,
+                chain_id,
+                rev_id,
+                true,
+            )? {
                 Some((_meta, Some(text))) => Ok(text),
                 _ => Err(Error::Corrupt("revision vanished from its chain")),
             }
@@ -2208,5 +1985,198 @@ mod streaming_record_tests {
         let mut decoder = wikimak_depot::OwnedFrameDecoder::new(frame, None).unwrap();
         let err = read_revision_record(&mut decoder, &mut Vec::new()).unwrap_err();
         assert!(matches!(err, crate::Error::Codec("truncated revision record")));
+    }
+}
+
+#[cfg(test)]
+mod dictionary_lifecycle_tests {
+    use chrono::TimeZone;
+    use tempfile::TempDir;
+
+    use super::*;
+
+    fn cfg(root: PathBuf) -> InstanceConfig {
+        InstanceConfig {
+            root,
+            dbname: "dictwiki".into(),
+            max_chain_id: 1024,
+            depot: DepotConfig {
+                root: PathBuf::new(),
+                max_chain_id: 1024,
+                file_size_threshold: 8 << 20,
+                eviction_dead_ratio: 0.45,
+            },
+            title_shard_count: 1,
+            title_seal_threshold_bytes: 8 << 20,
+            f1_seal_threshold_bytes: 1 << 20,
+        }
+    }
+
+    fn record(page: usize, text_bytes: usize) -> Vec<u8> {
+        let text = format!(
+            "Page {page} shared encyclopedia prose and markup. {}",
+            "abcdefghij".repeat(text_bytes / 10)
+        );
+        crate::revision::encode_revision(
+            &RevisionMeta {
+                rev_id: 10_000 + page as u64,
+                parent_id: 0,
+                ts: Utc.timestamp_opt(1_704_067_200, 0).single().unwrap(),
+                contributor: ContributorMeta::Named {
+                    username: "Editor".into(),
+                    user_id: 1,
+                },
+                comment: "seed".into(),
+                sha1: String::new(),
+                flags: 0,
+                text_len: text.len() as u64,
+            },
+            text.as_bytes(),
+        )
+    }
+
+    fn seed_pages(instance: &Instance, pages: usize, text_bytes: usize) {
+        let g = instance.inner.lock().unwrap();
+        for page in 1..=pages {
+            let head = record(page, text_bytes);
+            let mut builder = g.depot.begin_chain(page as u64).unwrap();
+            if page == 1 {
+                let older = record(5001, 1024);
+                let history = crate::frames::compress_history(&older, &head).unwrap();
+                g.depot.append_history_frame(&mut builder, &history).unwrap();
+            }
+            let f0 = crate::frames::compress_head_plain(&head).unwrap();
+            g.depot.finish_chain(builder, &f0, None).unwrap();
+        }
+    }
+
+    #[test]
+    fn one_native_dictionary_resumes_mixed_head_repack_and_reopens() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let instance = Instance::open(cfg(root.clone())).unwrap();
+        seed_pages(&instance, 160, 10 << 10);
+        let cold_before = std::fs::read(root.join("depot/cold/cold")).unwrap();
+        assert!(!cold_before.is_empty());
+
+        let first = instance
+            .finalize_seed_revision_dictionary_inner(Some(7))
+            .unwrap();
+        assert!(first.trained);
+        assert_eq!(first.heads_repacked, 7);
+        let dict_id = first.dictionary_id.unwrap();
+        {
+            let g = instance.inner.lock().unwrap();
+            let mut encoded = 0;
+            let mut plain = 0;
+            for id in 1..=160 {
+                match crate::frames::frame_dictionary_id(&g.depot.read_f0(id).unwrap()) {
+                    Some(id) if id == dict_id => encoded += 1,
+                    None => plain += 1,
+                    other => panic!("unexpected dictionary id {other:?}"),
+                }
+            }
+            assert_eq!((encoded, plain), (7, 153));
+        }
+
+        let resumed = instance.finalize_seed_revision_dictionary().unwrap();
+        assert!(!resumed.trained);
+        assert_eq!(resumed.dictionary_id, Some(dict_id));
+        assert_eq!(resumed.heads_repacked, 153);
+        assert_eq!(std::fs::read(root.join("depot/cold/cold")).unwrap(), cold_before);
+        {
+            let g = instance.inner.lock().unwrap();
+            let head = record(161, 10 << 10);
+            let builder = g.depot.begin_chain(161).unwrap();
+            let f0 =
+                crate::frames::compress_head(&head, &g.revision_dictionaries).unwrap();
+            g.depot.finish_chain(builder, &f0, None).unwrap();
+            assert_eq!(
+                crate::frames::frame_dictionary_id(&g.depot.read_f0(161).unwrap()),
+                Some(dict_id),
+                "later heads use the active dictionary"
+            );
+        }
+        let dictionaries = std::fs::read_dir(root.join("dictionaries"))
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "zdict"))
+            .count();
+        assert_eq!(dictionaries, 1);
+        drop(instance);
+
+        let reader = Instance::open_read(cfg(root)).unwrap();
+        assert_eq!(reader.page_head(160).unwrap().unwrap().rev_id, 10_160);
+        let g = reader.inner.lock().unwrap();
+        for id in 1..=161 {
+            assert_eq!(
+                crate::frames::frame_dictionary_id(&g.depot.read_f0(id).unwrap()),
+                Some(dict_id)
+            );
+        }
+    }
+
+    #[test]
+    fn tiny_seed_does_not_train_a_dictionary() {
+        let tmp = TempDir::new().unwrap();
+        let instance = Instance::open(cfg(tmp.path().to_path_buf())).unwrap();
+        seed_pages(&instance, 2, 1024);
+        assert_eq!(
+            instance.finalize_seed_revision_dictionary().unwrap(),
+            RevisionDictionaryStats::default()
+        );
+        assert!(!tmp.path().join("dictionaries/revision.current").exists());
+    }
+
+    #[test]
+    fn pending_title_rows_overlay_writer_reads_reject_readers_and_replay_on_open() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let instance = Instance::open(cfg(root.clone())).unwrap();
+        {
+            let mut g = instance.inner.lock().unwrap();
+            let title = b"Crash pending title";
+            let title_id = g.titles.append(0, title).unwrap();
+            g.titles.flush(0).unwrap();
+            g.conn
+                .execute(
+                    "INSERT INTO title_slot_intent(title_id,page_id,valid_since)
+                     VALUES(?1,7,100)",
+                    [title_id as i64],
+                )
+                .unwrap();
+            g.pending_title_intents = 1;
+            assert_eq!(effective_page_title_id(&g, 7).unwrap(), Some(title_id));
+            assert_eq!(
+                effective_title_binding(&g, title_id).unwrap().unwrap().page_id(),
+                Some(7)
+            );
+        }
+        assert_eq!(
+            instance.page_current_title(7).unwrap().as_deref(),
+            Some("Crash pending title")
+        );
+        drop(instance);
+
+        let read_error = match Instance::open_read(cfg(root.clone())) {
+            Ok(_) => panic!("reader accepted unreplayed title intent"),
+            Err(error) => error.to_string(),
+        };
+        assert!(read_error.contains("writable recovery"), "{read_error}");
+
+        let recovered = Instance::open(cfg(root)).unwrap();
+        assert_eq!(
+            recovered.page_current_title(7).unwrap().as_deref(),
+            Some("Crash pending title")
+        );
+        let g = recovered.inner.lock().unwrap();
+        assert_eq!(
+            g.conn
+                .query_row("SELECT COUNT(*) FROM title_slot_intent", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0
+        );
     }
 }

@@ -5,9 +5,8 @@
 //!   * lock algebra: reader+reader coexist; reader excludes writer and
 //!     writer excludes reader (`InstanceLocked` both ways); a second
 //!     writer is still excluded;
-//!   * read-only discipline: every write API refuses loudly, a legacy
-//!     NULL-ts store is answered by scan WITHOUT backfilling the rows,
-//!     and a missing root is a loud error that creates nothing;
+//!   * read-only discipline: every write API refuses loudly and a
+//!     missing root is a loud error that creates nothing;
 //!   * the pinned read is bounded, measured by the depot's
 //!     frame-payload counters: a pin at the chain head decodes
 //!     (f0,f1,cold) = (1,0,0); an f1-resident pin (1,1,0) — never the
@@ -136,34 +135,6 @@ fn open_read_refuses_writes_and_never_creates() {
     assert!(!ghost.exists(), "open_read must never create a root");
 }
 
-/// A legacy store (rows predate the `ts` column values) is answered
-/// correctly read-side via the chain scan, but the rows are NOT
-/// backfilled — that write belongs to the exclusive-lock holder.
-#[test]
-fn read_only_scan_answers_but_never_backfills() {
-    let tmp = TempDir::new().unwrap();
-    build_store(&tmp, 4);
-    {
-        let conn = rusqlite::Connection::open(tmp.path().join("meta.db")).unwrap();
-        conn.execute("UPDATE revisions_seen SET ts = NULL", []).unwrap();
-    }
-    let nulls = || -> i64 {
-        let conn = rusqlite::Connection::open(tmp.path().join("meta.db")).unwrap();
-        conn.query_row("SELECT COUNT(*) FROM revisions_seen WHERE ts IS NULL", [], |r| r.get(0))
-            .unwrap()
-    };
-
-    let r = open_read(&tmp).unwrap();
-    assert_eq!(r.page_head(PAGE).unwrap().unwrap().rev_id, 4, "scan answers");
-    drop(r);
-    assert!(nulls() > 0, "read-only scan must not backfill ts rows");
-
-    // The writer's first read still backfills as before.
-    let w = Instance::open(deep_cfg(tmp.path().to_path_buf())).unwrap();
-    assert_eq!(w.page_head(PAGE).unwrap().unwrap().rev_id, 4);
-    drop(w);
-    assert_eq!(nulls(), 0, "writer-side scan backfills");
-}
 
 /// The bounded pinned read, measured: `revision_text` early-stops on
 /// the newest-first walk — a pinned-head read touches ONLY f0; an

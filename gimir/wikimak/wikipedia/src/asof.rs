@@ -439,33 +439,64 @@ impl wikimak_wikitext::PageStore for AsOfView<'_> {
 
     fn page_count(&self, namespace: Option<i32>) -> Option<u64> {
         let g = self.inst.inner.lock().ok()?;
-        let count = match (self.ts, namespace) {
-            (None, Some(ns)) => g.conn.query_row(
-                "SELECT count(*) FROM title_intervals
-                 WHERE end_ts IS NULL AND ns = ?1",
-                [ns],
-                |row| row.get::<_, u64>(0),
-            ),
-            (None, None) => g.conn.query_row(
-                "SELECT count(*) FROM title_intervals WHERE end_ts IS NULL",
-                [],
-                |row| row.get::<_, u64>(0),
-            ),
-            (Some(ts), Some(ns)) => g.conn.query_row(
-                "SELECT count(*) FROM title_intervals
-                 WHERE start_ts <= ?1 AND (end_ts IS NULL OR end_ts > ?1)
-                   AND ns = ?2",
-                rusqlite::params![ts, ns],
-                |row| row.get::<_, u64>(0),
-            ),
-            (Some(ts), None) => g.conn.query_row(
-                "SELECT count(*) FROM title_intervals
-                 WHERE start_ts <= ?1 AND (end_ts IS NULL OR end_ts > ?1)",
-                [ts],
-                |row| row.get::<_, u64>(0),
-            ),
+        let seconds = match self.ts {
+            Some(ts) => Some(u32::try_from(ts.div_euclid(1_000_000)).ok()?),
+            None => None,
         };
-        count.ok()
+        let namespace_matches = |title: &[u8]| {
+            let Some(wanted) = namespace else {
+                return true;
+            };
+            let text = String::from_utf8_lossy(title);
+            let prefix = text.split_once(':').map(|(prefix, _)| prefix);
+            if wanted == 0 {
+                return prefix.is_none();
+            }
+            self.site.namespaces.get(&wanted).is_some_and(|info| {
+                prefix.is_some_and(|prefix| {
+                    prefix.eq_ignore_ascii_case(&info.localized)
+                        || prefix.eq_ignore_ascii_case(&info.canonical)
+                        || info.aliases.iter().any(|alias| prefix.eq_ignore_ascii_case(alias))
+                })
+            })
+        };
+        let mut count = 0_u64;
+        for shard in 0..g.titles.shard_count() {
+            g.titles
+                .for_each_in_shard(shard, |title_id, title| {
+                    if !namespace_matches(title) {
+                        return Ok(());
+                    }
+                    let current = crate::instance::effective_title_binding(&g, title_id)
+                        .map_err(|error| std::io::Error::other(error.to_string()))?;
+                    let page = match seconds {
+                        None => current.and_then(|slot| slot.page_id()),
+                        Some(at) => {
+                            if let Some(slot) = current {
+                                if at >= slot.valid_since {
+                                    slot.page_id()
+                                } else {
+                                    g.conn
+                                        .query_row(
+                                            "SELECT page_id FROM title_interval_overflow
+                                             WHERE title_id=?1 AND start_s<=?2 AND end_s>?2
+                                             ORDER BY start_s DESC LIMIT 1",
+                                            rusqlite::params![title_id as i64, at],
+                                            |row| row.get::<_, u32>(0),
+                                        )
+                                        .ok()
+                                }
+                            } else {
+                                None
+                            }
+                        }
+                    };
+                    count += page.is_some() as u64;
+                    Ok(())
+                })
+                .ok()?;
+        }
+        Some(count)
     }
 
     fn site(&self) -> &wikimak_wikitext::SiteConfig {

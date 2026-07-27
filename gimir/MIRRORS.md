@@ -31,7 +31,8 @@ each corpus's shape wants, served through sarun. Three mirrors first:
   mode, so the engine PROCESS still never dials out — fetch happens in
   the child. Interrupted runs surface as
   `stopped` and auto-resume — safe because the stores self-repair
-  (dirty-flag chain repair in wikimak, watermark fences in ietf-mirror,
+  (chain-authoritative rerun/atomic index flips in wikimak,
+  watermark fences in ietf-mirror,
   per-root flocks in both).
 - **Portable Wikipedia libraries**: the mirror root is self-identifying
   (`wiki_dbname` in `meta.db`); its mount path and directory name are not
@@ -111,14 +112,14 @@ remain design or follow-up work.
 
 - [x] A fresh page must finish as one standalone f0 plus sealed cold
   history (or f0 alone for a one-revision page), never with an f1.
-  The transient importer RAM bound must not determine the persistent
-  f1/cold layout. An exceptional huge page may split into several cold
-  frames, but its final partial history must also be cold.
-- [ ] Measure and specify the pretrained f0 dictionaries; the current
-  Wikipedia frame encoder uses none. The design must first resolve
-  per-chain versus per-instance scope, training reservoir/byte caps,
-  dictionary size/count and update lifecycle, then define a versioned
-  f0 envelope plus durable dictionary identity and crash ordering.
+  Page-scoped collection/reversal is the accepted memory bound; all
+  older revisions form exactly one cold frame.
+- [x] Train one 64 KiB native-zstd f0 dictionary per Wikipedia instance
+  after the initial full import, from a deterministic sample capped at
+  2,048 heads/32 MiB. Persist and activate it before crash-resumable
+  f0-only repacking; daily updates reuse it. Mixed plain/dictionary heads
+  remain readable, and f1/cold frames remain dictionary-free refPrefix
+  frames. No custom frame envelope is used.
 - [x] Wire the depot's streaming frame decoder into Wikipedia history
   walks so an exceptional cold frame is not materialized whole.
 - [x] A fresh depot index must start small and grow geometrically. Do
@@ -145,7 +146,7 @@ remain design or follow-up work.
   revision suppressed. Suppression is additional archival metadata.
 - [x] Preserve malformed-field evidence and report it explicitly rather
   than silently coercing records.
-- [ ] Apply page move/deletion events to the browsing title timeline
+- [x] Apply page move/deletion events to the browsing title timeline
   without erasing archaeological content.
 - [ ] The current verbose SQLite representation is intentionally shelved
   for a separate redesign; do not entrench it while fixing the above.

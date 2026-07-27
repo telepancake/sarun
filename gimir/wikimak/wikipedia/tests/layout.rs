@@ -55,12 +55,11 @@ fn open_meta_db_has_schema_tables() {
         .map(|r| r.unwrap())
         .collect();
     for expected in [
-        "category_intervals",
-        "page_to_title_id",
         "parts_seen",
         "siteinfo_snapshots",
-        "title_id_to_page",
-        "title_intervals",
+        "title_interval_overflow",
+        "title_slot_intent",
+        "title_slot_state",
     ] {
         assert!(
             names.iter().any(|n| n == expected),
@@ -90,90 +89,6 @@ fn open_then_reopen_no_op() {
 
     let after: Vec<_> = walkdir_relative(tmp.path());
     assert_eq!(before, after, "reopen must not add or remove files");
-}
-
-#[test]
-fn open_migrates_revision_visibility_page_id_to_nullable() {
-    let tmp = TempDir::new().unwrap();
-    {
-        let conn = Connection::open(tmp.path().join("meta.db")).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE revision_visibility (
-                revision_id INTEGER PRIMARY KEY,
-                page_id INTEGER NOT NULL,
-                source_partition TEXT NOT NULL,
-                deleted_parts TEXT NOT NULL,
-                parts_are_suppressed INTEGER NOT NULL,
-                deleted_by_page_deletion INTEGER NOT NULL,
-                page_deletion_timestamp TEXT NOT NULL
-             );
-             INSERT INTO revision_visibility VALUES
-                (7, 3, 'legacy', 'text', 0, 1, '2024-01-01');",
-        )
-        .unwrap();
-    }
-
-    let instance = make_instance(&tmp, 1024);
-    assert!(
-        instance
-            .revision_visibility(7)
-            .unwrap()
-            .unwrap()
-            .deleted_by_page_deletion
-    );
-    let conn = Connection::open(tmp.path().join("meta.db")).unwrap();
-    let page_not_null: i64 = conn
-        .query_row(
-            "SELECT \"notnull\" FROM pragma_table_info('revision_visibility')
-             WHERE name = 'page_id'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(page_not_null, 0);
-}
-
-#[test]
-fn open_migrates_page_actions_page_id_to_nullable() {
-    let tmp = TempDir::new().unwrap();
-    {
-        let conn = Connection::open(tmp.path().join("meta.db")).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE page_actions (
-                source_key TEXT PRIMARY KEY,
-                source_partition TEXT NOT NULL,
-                event_log_id INTEGER,
-                event_type TEXT NOT NULL,
-                event_timestamp TEXT NOT NULL,
-                event_comment TEXT NOT NULL,
-                actor_id INTEGER,
-                actor_name TEXT NOT NULL,
-                page_id INTEGER NOT NULL,
-                title_historical TEXT NOT NULL,
-                title_current TEXT NOT NULL,
-                namespace_historical INTEGER,
-                namespace_current INTEGER,
-                page_deleted INTEGER NOT NULL
-             );
-             INSERT INTO page_actions VALUES
-                ('legacy:1', 'legacy', 7, 'delete', '2024-01-01', '', NULL,
-                 '', 3, 'Old', 'Old', 0, 0, 1);",
-        )
-        .unwrap();
-    }
-
-    let instance = make_instance(&tmp, 1024);
-    assert_eq!(instance.page_actions(3).unwrap().len(), 1);
-    let conn = Connection::open(tmp.path().join("meta.db")).unwrap();
-    let page_not_null: i64 = conn
-        .query_row(
-            "SELECT \"notnull\" FROM pragma_table_info('page_actions')
-             WHERE name = 'page_id'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(page_not_null, 0);
 }
 
 fn walkdir_relative(root: &std::path::Path) -> Vec<String> {

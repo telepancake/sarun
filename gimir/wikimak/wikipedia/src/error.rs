@@ -34,6 +34,18 @@ pub enum Error {
     #[error("revision codec: {0}")]
     Codec(&'static str),
 
+    #[error("frame envelope: {0}")]
+    FrameEnvelope(&'static str),
+
+    #[error("frame requires missing {lane} dictionary {dict_id}")]
+    MissingFrameDictionary { lane: String, dict_id: u32 },
+
+    #[error("dictionary id {dict_id} already names different bytes in lane {lane}")]
+    DictionaryCollision { lane: String, dict_id: u32 },
+
+    #[error("invalid zstd dictionary")]
+    InvalidDictionary,
+
     #[error("corrupt: {0}")]
     Corrupt(&'static str),
 
@@ -47,15 +59,6 @@ pub enum Error {
     /// mutate the store the writer's exclusive lock protects).
     #[error("instance opened read-only (open_read): {0} refused")]
     ReadOnly(&'static str),
-
-    /// `open_read` found a meta.db predating the read-side schema
-    /// migrations (`revisions_seen.ts` / `title_intervals.title_id`).
-    /// Only a writer open may ALTER; readers fail loudly, naming the cure.
-    #[error(
-        "meta.db at {0} predates the current schema: open it writable once \
-         (any wikimak command) to migrate, then retry"
-    )]
-    LegacySchema(std::path::PathBuf),
 
     /// An explicit `InstanceConfig::title_shard_count` disagrees with
     /// the count persisted at instance creation (the

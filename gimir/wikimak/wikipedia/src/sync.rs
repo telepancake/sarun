@@ -11,10 +11,11 @@
 //!   3. `Instance::flush` — pages durable;
 //!   4. `mark_part_seen` — only now is the part skippable.
 //!
-//! A crash between 2 and 3 re-imports the part; `revisions_seen` dedup
-//! makes that a cheap no-op, never a correctness problem.
+//! A crash between 2 and 3 re-imports the part. The depot chain is the
+//! revision ledger: identical ids deduplicate without a write, newer
+//! prefixes prepend, and interleaved additions use an atomic replacement.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufRead, Read};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -232,11 +233,34 @@ fn history_bool(file: &HistoryFile, line: usize, field: &str, value: &str) -> Re
     }
 }
 
+fn history_unix_seconds(file: &HistoryFile, line: usize, value: &str) -> Result<u32> {
+    let seconds = parse_history_timestamp(value)
+        .ok_or_else(|| history_parse_error(file, line, format!("has invalid timestamp {value:?}")))?;
+    seconds.try_into().map_err(|_| {
+        history_parse_error(
+            file,
+            line,
+            format!("has timestamp outside the title-history range {value:?}"),
+        )
+    })
+}
+
+fn parse_history_timestamp(value: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .map(|timestamp| timestamp.timestamp())
+        .or_else(|_| {
+            chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f")
+                .map(|timestamp| timestamp.and_utc().timestamp())
+        })
+        .ok()
+}
+
 fn import_history_file<R: Read + Send + 'static>(
     tx: &rusqlite::Transaction<'_>,
     file: &HistoryFile,
     expected_dbname: &str,
     input: R,
+    source_ordinal: &mut u64,
 ) -> Result<u64> {
     let decoder = wikimak_mediawiki::bz2::new_bz2_reader(
         input,
@@ -245,10 +269,10 @@ fn import_history_file<R: Read + Send + 'static>(
     let reader = std::io::BufReader::new(decoder);
     let mut insert = tx.prepare(
         "INSERT INTO page_actions(
-            source_key,source_partition,event_log_id,event_type,event_timestamp,
+            source_key,source_partition,event_log_id,source_ordinal,event_type,event_timestamp,
             event_comment,actor_id,actor_name,page_id,title_historical,title_current,
             namespace_historical,namespace_current,page_deleted
-         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
     )?;
     let mut insert_visibility = tx.prepare(
         "INSERT INTO revision_visibility(
@@ -258,6 +282,10 @@ fn import_history_file<R: Read + Send + 'static>(
     )?;
     let mut imported = 0_u64;
     for (line_number, line) in reader.lines().enumerate() {
+        let ordinal = *source_ordinal;
+        *source_ordinal = source_ordinal.checked_add(1).ok_or(
+            crate::error::Error::Corrupt("MediaWiki History source ordinal overflow"),
+        )?;
         let line = line?;
         let fields: Vec<&str> = line.split('\t').collect();
         let (page, revision) = match fields.len() {
@@ -304,20 +332,37 @@ fn import_history_file<R: Read + Send + 'static>(
                 "has an empty event type or timestamp".into(),
             ));
         }
+        let event_at = history_unix_seconds(file, line_number + 1, fields[4])?;
         let page_id = if fields[page].is_empty() || fields[page] == "0" {
             None
         } else {
-            Some(fields[page].parse::<i64>().ok().filter(|value| *value > 0)
-                .ok_or_else(|| crate::error::Error::Mediawiki(
-                wikimak_mediawiki::Error::Parse(format!(
-                    "{}:{} has invalid page id {:?}",
-                    file.part.filename,
-                    line_number + 1,
-                    fields[page]
-                )),
-            ))?)
+            let value = fields[page]
+                .parse::<i64>()
+                .ok()
+                .filter(|value| *value > 0)
+                .ok_or_else(|| {
+                    crate::error::Error::Mediawiki(wikimak_mediawiki::Error::Parse(format!(
+                        "{}:{} has invalid page id {:?}",
+                        file.part.filename,
+                        line_number + 1,
+                        fields[page]
+                    )))
+                })?;
+            u32::try_from(value).map_err(|_| history_parse_error(
+                file,
+                line_number + 1,
+                format!("has page id outside the flat-title range {value}"),
+            ))?;
+            Some(value)
         };
         if fields[2] == "revision" {
+            if fields[3] != "create" {
+                return Err(history_parse_error(
+                    file,
+                    line_number + 1,
+                    format!("has unsupported revision event type {:?}", fields[3]),
+                ));
+            }
             let revision_id = fields[revision].parse::<i64>().ok()
                 .filter(|value| *value > 0)
                 .ok_or_else(|| crate::error::Error::Mediawiki(
@@ -355,6 +400,35 @@ fn import_history_file<R: Read + Send + 'static>(
                     fields[revision + 11],
                 ])?;
             }
+            if let (Some(page_id), Some(namespace)) = (
+                page_id,
+                optional_i64(
+                    file,
+                    line_number + 1,
+                    "page_namespace_historical",
+                    fields[page + 3],
+                )?,
+            ) {
+                let title = unescape_tsv(
+                    file,
+                    line_number + 1,
+                    "page_title_historical",
+                    fields[page + 1],
+                )?;
+                if !title.is_empty() {
+                    tx.execute(
+                        "INSERT INTO temp.title_history_observations(
+                            page_id,title,namespace_historical,event_s,source_ordinal
+                         ) VALUES(?1,?2,?3,?4,?5)
+                         ON CONFLICT(page_id,title,namespace_historical) DO UPDATE SET
+                           event_s=excluded.event_s,
+                           source_ordinal=excluded.source_ordinal
+                         WHERE (excluded.event_s,excluded.source_ordinal)
+                             < (event_s,source_ordinal)",
+                        params![page_id, title, namespace, event_at, ordinal],
+                    )?;
+                }
+            }
             continue;
         }
         let page_deleted = history_bool(
@@ -387,6 +461,7 @@ fn import_history_file<R: Read + Send + 'static>(
             source_key,
             file.partition,
             event_log_id,
+            ordinal,
             fields[3],
             fields[4],
             unescape_tsv(file, line_number + 1, "event_comment", fields[5])?,
@@ -409,6 +484,264 @@ fn import_history_file<R: Read + Send + 'static>(
     drop(insert_visibility);
     drop(insert);
     Ok(imported)
+}
+
+fn history_namespace_names(
+    tx: &rusqlite::Transaction<'_>,
+) -> Result<HashMap<i64, (String, String)>> {
+    let payload: Option<Vec<u8>> = tx
+        .query_row(
+            "SELECT json FROM siteinfo_snapshots ORDER BY captured_at DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .map(Some)
+        .or_else(|error| match error {
+            rusqlite::Error::QueryReturnedNoRows => Ok(None),
+            other => Err(other),
+        })?;
+    let Some(payload) = payload else {
+        return Ok(HashMap::new());
+    };
+    let value: serde_json::Value = serde_json::from_slice(&payload).map_err(|_| {
+        crate::error::Error::Mediawiki(wikimak_mediawiki::Error::Parse(
+            "stored siteinfo snapshot is invalid JSON".into(),
+        ))
+    })?;
+    let mut names = HashMap::new();
+    for namespace in value
+        .get("namespaces")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(id) = namespace.get("id").and_then(serde_json::Value::as_i64) else {
+            continue;
+        };
+        let localized = namespace
+            .get("localized")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let canonical = namespace
+            .get("canonical")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        names.insert(id, (localized, canonical));
+    }
+    Ok(names)
+}
+
+fn qualify_history_title(
+    namespace: i64,
+    title: &[u8],
+    names: &HashMap<i64, (String, String)>,
+) -> Result<Vec<u8>> {
+    let normalized = crate::titles::normalize_title(title);
+    if namespace == 0 {
+        return Ok(normalized);
+    }
+    let (localized, canonical) = names.get(&namespace).ok_or_else(|| {
+        crate::error::Error::Mediawiki(wikimak_mediawiki::Error::Parse(format!(
+            "MediaWiki History names unknown namespace {namespace}"
+        )))
+    })?;
+    let raw = String::from_utf8_lossy(&normalized);
+    if let Some((prefix, _)) = raw.split_once(':') {
+        if prefix.eq_ignore_ascii_case(localized) || prefix.eq_ignore_ascii_case(canonical) {
+            return Ok(normalized);
+        }
+    }
+    if localized.is_empty() {
+        return Err(crate::error::Error::Mediawiki(
+            wikimak_mediawiki::Error::Parse(format!(
+                "siteinfo has no localized name for namespace {namespace}"
+            )),
+        ));
+    }
+    Ok(crate::titles::normalize_title(
+        format!("{localized}:{raw}").as_bytes(),
+    ))
+}
+
+fn history_event_kind(value: &str) -> Result<crate::title_history::EventKind> {
+    use crate::title_history::EventKind;
+    match value {
+        "create" => Ok(EventKind::Create),
+        "create-page" => Ok(EventKind::CreatePage),
+        "move" => Ok(EventKind::Move),
+        "delete" => Ok(EventKind::Delete),
+        "restore" => Ok(EventKind::Restore),
+        "merge" => Ok(EventKind::Merge),
+        other => Err(crate::error::Error::Mediawiki(
+            wikimak_mediawiki::Error::Parse(format!(
+                "unsupported MediaWiki History page event type {other:?}"
+            )),
+        )),
+    }
+}
+
+fn next_title_slot_generation(root: &std::path::Path, selected: u32) -> Result<u32> {
+    let mut generation = selected.checked_add(1).ok_or(
+        crate::error::Error::Corrupt("title-slot generation overflow"),
+    )?;
+    loop {
+        if !root.join(format!("title-slots.{generation}")).exists()
+            && !root.join(format!("page-titles.{generation}")).exists()
+        {
+            return Ok(generation);
+        }
+        generation = generation.checked_add(1).ok_or(
+            crate::error::Error::Corrupt("title-slot generation overflow"),
+        )?;
+    }
+}
+
+fn rebuild_title_history(
+    root: &std::path::Path,
+    titles: &strpool::Pool,
+    tx: &rusqlite::Transaction<'_>,
+) -> Result<u32> {
+    use crate::title_history::{Event, EventKind, Reconstruction, TitleKey};
+
+    let namespace_names = history_namespace_names(tx)?;
+    let mut events = Vec::new();
+    {
+        let mut statement = tx.prepare(
+            "SELECT page_id,event_type,event_timestamp,source_ordinal,
+                    title_historical,namespace_historical
+             FROM page_actions",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, Option<i64>>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get_ref(4)?.as_bytes()?.to_vec(),
+                row.get::<_, Option<i64>>(5)?,
+            ))
+        })?;
+        for row in rows {
+            let (page_id, kind, timestamp, ordinal, title, namespace) = row?;
+            let at = parse_history_timestamp(&timestamp)
+                .ok_or_else(|| crate::error::Error::Mediawiki(
+                    wikimak_mediawiki::Error::Parse(format!(
+                        "stored MediaWiki History timestamp is invalid: {timestamp:?}"
+                    )),
+                ))?
+                .try_into()
+                .map_err(|_| crate::error::Error::Corrupt("title timestamp outside u32"))?;
+            let historical = match (namespace, title.is_empty()) {
+                (Some(ns), false) => Some(TitleKey {
+                    ns: 0,
+                    title: qualify_history_title(ns, &title, &namespace_names)?,
+                }),
+                _ => None,
+            };
+            events.push(Event {
+                page_id: page_id
+                    .map(u32::try_from)
+                    .transpose()
+                    .map_err(|_| crate::error::Error::Corrupt(
+                        "stored MediaWiki History page id outside u32",
+                    ))?,
+                kind: history_event_kind(&kind)?,
+                at,
+                source_ordinal: ordinal.try_into().map_err(|_| {
+                    crate::error::Error::Corrupt("negative MediaWiki History source ordinal")
+                })?,
+                historical,
+            });
+        }
+    }
+    {
+        let mut statement = tx.prepare(
+            "SELECT page_id,title,namespace_historical,event_s,source_ordinal
+             FROM temp.title_history_observations",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get_ref(1)?.as_bytes()?.to_vec(),
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })?;
+        for row in rows {
+            let (page_id, title, namespace, at, ordinal) = row?;
+            events.push(Event {
+                page_id: Some(page_id.try_into().map_err(|_| {
+                    crate::error::Error::Corrupt("MediaWiki History page id outside u32")
+                })?),
+                kind: EventKind::RevisionInferred,
+                at: at.try_into().map_err(|_| {
+                    crate::error::Error::Corrupt("title timestamp outside u32")
+                })?,
+                source_ordinal: ordinal.try_into().map_err(|_| {
+                    crate::error::Error::Corrupt("negative MediaWiki History source ordinal")
+                })?,
+                historical: Some(TitleKey {
+                    ns: 0,
+                    title: qualify_history_title(namespace, &title, &namespace_names)?,
+                }),
+            });
+        }
+    }
+
+    let reconstructed = Reconstruction::from_events(events);
+    let shard_count = titles.shard_count();
+    let mut touched_shards = HashSet::new();
+    let mut snapshots = Vec::with_capacity(reconstructed.by_title.len());
+    for (title, mut intervals) in reconstructed.by_title {
+        intervals.sort_by_key(|interval| interval.start);
+        let mut ids = crate::titles::lookup_ids(titles, shard_count, &title.title)?;
+        let title_id = if let Some(id) = ids.pop() {
+            id
+        } else {
+            let shard = crate::titles::shard_for(&title.title, shard_count);
+            touched_shards.insert(shard);
+            titles.append(shard, &title.title)?
+        };
+        let current = intervals
+            .last()
+            .filter(|interval| interval.end.is_none())
+            .cloned();
+        let current_since = current
+            .as_ref()
+            .map_or_else(|| intervals.last().and_then(|i| i.end).unwrap_or(0), |i| i.start);
+        let older = intervals
+            .iter()
+            .filter_map(|interval| {
+                interval
+                    .end
+                    .map(|end| (interval.start as i64, end as i64, interval.page_id as u64))
+            })
+            .collect::<Vec<_>>();
+        snapshots.push((
+            title_id,
+            current.map_or(0, |interval| interval.page_id as u64),
+            current_since as i64,
+            older,
+        ));
+    }
+    for shard in touched_shards {
+        titles.flush(shard)?;
+    }
+
+    let selected = crate::title_slots::TitleSlotGenerations::selected(tx)?;
+    let generation = next_title_slot_generation(root, selected)?;
+    let mut builder =
+        crate::title_slots::TitleSlotGenerations::prepare_snapshot(root, generation, tx)?;
+    snapshots.sort_by_key(|snapshot| snapshot.0);
+    for (title_id, page_id, since, older) in snapshots {
+        builder.push_title(title_id, page_id, since, &older)?;
+    }
+    builder.finish()?.commit()?;
+    crate::title_slots::TitleSlotGenerations::select(tx, generation)?;
+    Ok(generation)
 }
 
 fn sync_page_actions(
@@ -438,15 +771,29 @@ fn sync_page_actions(
     // change after later moves, renames, and reverts, so a new release must
     // replace the complete derived metadata set.
     let mut g = inst.inner.lock().expect("instance mutex poisoned");
-    let tx = g.conn.transaction()?;
+    let crate::instance::InstanceInner { conn, titles, .. } = &mut *g;
+    let tx = conn.transaction()?;
     tx.execute("DELETE FROM page_actions", [])?;
     tx.execute("DELETE FROM revision_visibility", [])?;
+    tx.execute_batch(
+        "DROP TABLE IF EXISTS temp.title_history_observations;
+         CREATE TEMP TABLE title_history_observations (
+           page_id INTEGER NOT NULL,
+           title BLOB NOT NULL,
+           namespace_historical INTEGER NOT NULL,
+           event_s INTEGER NOT NULL,
+           source_ordinal INTEGER NOT NULL,
+           PRIMARY KEY(page_id,title,namespace_historical)
+         ) WITHOUT ROWID;",
+    )?;
     let mut actions = 0;
+    let mut source_ordinal = 0;
     for file in &files {
         progress(&file.part.filename, true);
         let source = fetch(client, &file.part)?;
-        actions += import_history_file(&tx, file, dbname, source)?;
+        actions += import_history_file(&tx, file, dbname, source, &mut source_ordinal)?;
     }
+    let title_generation = rebuild_title_history(&inst.root, titles, &tx)?;
     let frontier = files
         .last()
         .expect("history discovery rejects empty file lists")
@@ -463,6 +810,18 @@ fn sync_page_actions(
         )?;
     }
     tx.commit()?;
+    g.title_slots =
+        crate::title_slots::TitleSlotGenerations::open_selected(&inst.root, &g.conn)?;
+    g.page_titles =
+        crate::title_slots::TitleSlotGenerations::open_selected_page_titles(&inst.root, &g.conn)?;
+    crate::title_slots::TitleSlotGenerations::collect_unselected(
+        &inst.root,
+        title_generation,
+    )?;
+    debug_assert_eq!(
+        crate::title_slots::TitleSlotGenerations::selected(&g.conn)?,
+        title_generation
+    );
     Ok((files.len() as u64, actions))
 }
 
@@ -500,8 +859,13 @@ pub fn sync(
     mut progress: impl FnMut(&str, bool),
 ) -> Result<(Run, SyncStats)> {
     ensure_dbname(inst, dbname)?;
+    let initial_seed = inst.sync_state("full_snapshot_date")?.is_none()
+        && !inst.has_seen_parts()?;
     let run = discover_with(client, cfg, dbname)?;
     let stats = import_run(inst, client, &run, &mut progress)?;
+    if initial_seed {
+        inst.finalize_seed_revision_dictionary()?;
+    }
     inst.set_sync_state("full_snapshot_date", &run.date.to_string())?;
     let run_date = run.date.to_string();
     let incremental = inst
