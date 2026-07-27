@@ -105,7 +105,7 @@ sample exposed the following correctness work. These are required
 corrections, not optional tuning:
 
 Completed items below are pinned by regression tests; unchecked items
-remain design or migration work.
+remain design or follow-up work.
 
 ### Revision storage
 
@@ -123,7 +123,6 @@ remain design or migration work.
   walks so an exceptional cold frame is not materialized whole.
 - [x] A fresh depot index must start small and grow geometrically. Do
   not preallocate the enwiki-sized 100,000,000-slot/800 MB index.
-- [ ] Provide a safe shrink migration for existing oversized indexes.
 
 ### Title storage and lookup
 
