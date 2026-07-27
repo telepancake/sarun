@@ -5,7 +5,10 @@
 //! **single file** that contains zero or more zstd frames followed by a
 //! plaintext tail and a fixed 8-byte footer.
 //!
-//! There is no lookup-by-id API; readers iterate or substring-scan.
+//! Dense ids encode their shard, so lookup-by-id opens and walks only that
+//! shard. Shard descriptors are operation-scoped rather than retained by the
+//! pool: opening a 256- or 512-shard dictionary consumes constant file
+//! descriptors, and parallel scans consume at most the worker concurrency.
 //!
 //! ## On-disk format (one shard = one file, no sidecars)
 //!

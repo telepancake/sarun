@@ -13,15 +13,14 @@ use crate::error::StrpoolError;
 use crate::footer::{parse_footer, write_footer_bytes, Footer, FOOTER_SIZE};
 use crate::{DictProvider, Result};
 
-/// In-memory state for an open shard.
+/// In-memory metadata for one shard. File descriptors are deliberately
+/// operation-scoped so a pool can contain hundreds of shards below macOS's
+/// default soft descriptor limit.
 pub struct Shard {
     #[allow(dead_code)]
     pub shard_id: u32,
     pub path: PathBuf,
     pub tmp_path: PathBuf,
-    /// `O_RDWR` handle. `None` until the first append/seal materializes the
-    /// file on disk.
-    pub file: Option<File>,
     /// Length of the file in bytes (cached; kept in sync with all writes).
     pub file_size: u64,
     /// Plaintext-tail length encoded in the footer.
@@ -52,7 +51,6 @@ impl Shard {
                 shard_id,
                 path,
                 tmp_path,
-                file: None,
                 file_size: 0,
                 tail_len: 0,
                 entry_count: 0,
@@ -67,7 +65,6 @@ impl Shard {
                 shard_id,
                 path,
                 tmp_path,
-                file: None,
                 file_size: 0,
                 tail_len: 0,
                 entry_count: 0,
@@ -101,7 +98,6 @@ impl Shard {
             shard_id,
             path,
             tmp_path,
-            file: Some(file),
             file_size,
             tail_len: footer.tail_len,
             entry_count: footer.entry_count,
@@ -134,11 +130,8 @@ impl Shard {
         payload.extend_from_slice(&footer_bytes);
 
         let write_offset = self.write_offset();
-        self.ensure_file_open()?;
-        self.file
-            .as_ref()
-            .expect("ensured open")
-            .write_all_at(&payload, write_offset)?;
+        let file = self.open_for_write()?;
+        file.write_all_at(&payload, write_offset)?;
 
         self.tail_len = new_tail_len;
         self.entry_count = new_entry_count;
@@ -181,11 +174,8 @@ impl Shard {
         payload.extend_from_slice(&footer_bytes);
 
         let write_offset = self.write_offset();
-        self.ensure_file_open()?;
-        self.file
-            .as_ref()
-            .expect("ensured open")
-            .write_all_at(&payload, write_offset)?;
+        let file = self.open_for_write()?;
+        file.write_all_at(&payload, write_offset)?;
 
         self.tail_len = new_tail_len;
         self.entry_count = new_entry_count;
@@ -194,8 +184,8 @@ impl Shard {
     }
 
     pub fn flush(&mut self) -> Result<()> {
-        if let Some(f) = &self.file {
-            f.sync_all()?;
+        if self.file_size != 0 {
+            self.open_for_write()?.sync_all()?;
         }
         Ok(())
     }
@@ -219,17 +209,16 @@ impl Shard {
             return Ok(false);
         }
         let tail_start = self.tail_start();
+        let file = File::open(&self.path)?;
         // Read the existing frame region and the plaintext tail.
         let frame_region = if tail_start == 0 {
             Vec::new()
         } else {
             let mut buf = vec![0u8; tail_start as usize];
-            let file = self.file.as_ref().expect("file open if tail_len > 0");
             file.read_exact_at(&mut buf, 0)?;
             buf
         };
         let mut tail = vec![0u8; self.tail_len as usize];
-        let file = self.file.as_ref().expect("file open if tail_len > 0");
         file.read_exact_at(&mut tail, tail_start)?;
 
         // Compress the tail into ONE frame.
@@ -263,10 +252,7 @@ impl Shard {
             }
         }
 
-        // Reopen the file descriptor; the old one points at an unlinked inode.
-        let new_file = OpenOptions::new().read(true).write(true).open(&self.path)?;
         let new_size = (frame_region.len() + frame.len() + FOOTER_SIZE) as u64;
-        self.file = Some(new_file);
         self.file_size = new_size;
         self.tail_len = 0;
         Ok(true)
@@ -279,7 +265,7 @@ impl Shard {
         if self.file_size == 0 {
             return Ok(());
         }
-        let file = self.file.as_ref().expect("file open if size > 0");
+        let file = File::open(&self.path)?;
         let tail_start = self.tail_start();
         let mut local_id: u32 = 0;
 
@@ -360,17 +346,13 @@ impl Shard {
         }
     }
 
-    fn ensure_file_open(&mut self) -> Result<()> {
-        if self.file.is_none() {
-            let f = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(&self.path)?;
-            self.file = Some(f);
-        }
-        Ok(())
+    fn open_for_write(&self) -> Result<File> {
+        Ok(OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&self.path)?)
     }
 }
 
