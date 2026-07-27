@@ -1,10 +1,6 @@
-//! The index at enwiki scale must be SPARSE — real on-disk effect, not
-//! a code-reading claim. `max_chain_id = 1e8` makes the index 800MB
-//! LOGICAL (8 bytes/chain); creation goes through `ftruncate`
-//! (`File::set_len`), so a depot that only ever touches a handful of
-//! chains must allocate almost none of it. This is what lets the
-//! wikipedia layer default to an enwiki-sized bound without taxing
-//! small wikis.
+//! The index starts at one slot and grows geometrically on demand.
+//! Growth to a far id uses `ftruncate` (`File::set_len`), so untouched
+//! ranges remain sparse where the filesystem supports sparse files.
 
 use std::os::unix::fs::MetadataExt;
 
@@ -29,14 +25,13 @@ fn allocated(path: &std::path::Path) -> u64 {
 }
 
 #[test]
-fn hundred_million_chain_index_is_sparse() {
+fn far_chain_index_growth_is_sparse() {
     let tmp = TempDir::new().unwrap();
     let root = tmp.path().join("depot");
     let depot = Depot::open(cfg(root.clone())).unwrap();
 
     let index = root.join("index");
-    let md = std::fs::metadata(&index).unwrap();
-    assert_eq!(md.len(), ENWIKI_SCALE * 8, "index is 8 bytes/chain");
+    assert_eq!(std::fs::metadata(&index).unwrap().len(), 8, "fresh index is one slot");
 
     // Touch the very top of the id space: the flip dirties one index
     // page, nothing else.
@@ -45,12 +40,18 @@ fn hundred_million_chain_index_is_sparse() {
         .unwrap();
     depot.flush().unwrap();
 
+    let md = std::fs::metadata(&index).unwrap();
+    assert_eq!(
+        md.len(),
+        (ENWIKI_SCALE.next_power_of_two()) * 8,
+        "growth covers the requested id geometrically"
+    );
     let alloc = allocated(&index);
     assert!(
         alloc < 16 << 20,
         "index must stay sparse after create+flush: {alloc} bytes \
          allocated of {} logical",
-        ENWIKI_SCALE * 8
+         md.len()
     );
 
     // Reopen (walks DATA files for dead-byte rebuild, never the whole
@@ -65,7 +66,7 @@ fn hundred_million_chain_index_is_sparse() {
     assert!(alloc < 16 << 20, "reopen materialized the index: {alloc} bytes");
 }
 
-/// The retired knob: a chain id beyond the initial hint GROWS the
+/// The retired knob: a chain id beyond the legacy hint GROWS the
 /// index (sparse — real st_blocks effect, not a code-reading claim)
 /// instead of erroring, capacity survives a reopen with the same tiny
 /// hint (derived from disk, never compared), and the store round-trips.
@@ -78,7 +79,7 @@ fn index_grows_sparse_beyond_the_initial_hint() {
     let depot = Depot::open(small).unwrap();
 
     let index = root.join("index");
-    assert_eq!(std::fs::metadata(&index).unwrap().len(), 16 * 8, "hint sizes a fresh index");
+    assert_eq!(std::fs::metadata(&index).unwrap().len(), 8, "fresh index is one slot");
 
     // Far beyond the hint: 5e7 forces growth to next_pow2(5e7+1) = 2^26 slots.
     const FAR: u64 = 50_000_000;
@@ -134,9 +135,9 @@ fn ceiling_rejects_loudly_with_no_writes() {
             "reads reject the ceiling too"
         );
     }
-    // No write happened: the index kept its hint size and no tier file
+    // No write happened: the index stayed at one slot and no tier file
     // holds a byte.
-    assert_eq!(std::fs::metadata(root.join("index")).unwrap().len(), 16 * 8);
+    assert_eq!(std::fs::metadata(root.join("index")).unwrap().len(), 8);
     for tier in ["f0", "f1"] {
         let bytes: u64 = std::fs::read_dir(root.join(tier))
             .unwrap()
@@ -148,9 +149,9 @@ fn ceiling_rejects_loudly_with_no_writes() {
     assert_eq!(std::fs::metadata(root.join("cold/cold")).unwrap().len(), 0);
 }
 
-/// `delete_all` must not dirty the index either: zeroing 1e8 chains
-/// byte-by-byte through the mmap would fault in and write 800MB of
-/// pages. It recreates the file sparse (ftruncate) instead.
+/// `delete_all` must not dirty the index either: zeroing a far-grown
+/// index byte-by-byte would fault in every page. It recreates the file
+/// sparse (`ftruncate`) instead.
 #[test]
 fn delete_all_recreates_a_sparse_index() {
     let tmp = TempDir::new().unwrap();
@@ -165,7 +166,11 @@ fn delete_all_recreates_a_sparse_index() {
 
     let index = root.join("index");
     let md = std::fs::metadata(&index).unwrap();
-    assert_eq!(md.len(), ENWIKI_SCALE * 8, "index keeps its logical size");
+    assert_eq!(
+        md.len(),
+        ENWIKI_SCALE.next_power_of_two() * 8,
+        "index keeps its grown logical size"
+    );
     let alloc = allocated(&index);
     assert!(
         alloc < 16 << 20,

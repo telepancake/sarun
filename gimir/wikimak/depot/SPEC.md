@@ -167,7 +167,7 @@ pub struct Depot { /* opaque */ }
 
 pub struct DepotConfig {
     pub root: PathBuf,
-    pub max_chain_id: u64,              // INITIAL index size hint only; the index auto-grows (see "Index")
+    pub max_chain_id: u64,              // legacy compatibility field; fresh index starts at one slot
     pub file_size_threshold: u64,       // default ~1 GiB; rolls to a fresh f0/f1 file past this
     pub eviction_dead_ratio: f32,       // default 0.5
 }

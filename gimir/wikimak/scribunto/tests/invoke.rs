@@ -204,6 +204,51 @@ fn mw_html_css_and_void_and_escaping() {
     );
 }
 
+#[test]
+fn mw_html_nil_removes_attributes_and_styles() {
+    let mut store = TestStore::new();
+    store.add_module(
+        "HNil",
+        r#"
+        local p = {}
+        function p.main()
+            local d = mw.html.create("div")
+            d:attr("id", "old"):attr("id", nil):attr("title", nil)
+            d:css("color", "red"):css("color", nil):css("display", nil)
+            d:attr("data-kept", "yes"):css("float", "left")
+            return d
+        end
+        return p
+        "#,
+    );
+    assert_eq!(
+        invoke(&store, "HNil", "main", &frame_with(&[])).unwrap(),
+        r#"<div style="float:left" data-kept="yes"></div>"#
+    );
+}
+
+#[test]
+fn mw_html_builder_return_uses_tostring_metamethod() {
+    let mut store = TestStore::new();
+    store.add_module(
+        "HReturn",
+        r#"
+        return {
+            main = function()
+                return mw.html.create("span"):addClass("map"):wikitext("Rīga")
+            end,
+            plain = function() return {} end
+        }
+        "#,
+    );
+    assert_eq!(
+        invoke(&store, "HReturn", "main", &frame_with(&[])).unwrap(),
+        r#"<span class="map">Rīga</span>"#
+    );
+    let err = invoke(&store, "HReturn", "plain", &frame_with(&[])).unwrap_err();
+    assert!(err.contains("returned a table value"), "got: {err}");
+}
+
 // ------------------------------------------------------------------ ustring
 
 #[test]
@@ -235,6 +280,28 @@ fn ustring_utf8_semantics() {
     assert_eq!(invoke(&store, "U", "find", &f).unwrap(), "3");
     assert_eq!(invoke(&store, "U", "cp", &f).unwrap(), "8364");
     assert_eq!(invoke(&store, "U", "char", &f).unwrap(), "€");
+}
+
+#[test]
+fn ustring_gsub_handles_unicode_minus_class() {
+    let mut store = TestStore::new();
+    store.add_module(
+        "UMinus",
+        r##"
+        return {
+            main = function()
+                local normalized, count = mw.ustring.gsub("-1,2 –3,4 −5,6 —7,8", "[-–−—]", "-")
+                normalized = mw.ustring.gsub(normalized, ",", ".")
+                local bounded, boundedCount = mw.ustring.gsub("–a-b", "[-–−—]", "_", 1)
+                return normalized .. "#" .. count .. "|" .. bounded .. "#" .. boundedCount
+            end
+        }
+        "##,
+    );
+    assert_eq!(
+        invoke(&store, "UMinus", "main", &frame_with(&[])).unwrap(),
+        "-1.2 -3.4 -5.6 -7.8#4|_a-b#1"
+    );
 }
 
 // ------------------------------------------------------------------ mw.text

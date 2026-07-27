@@ -155,7 +155,19 @@ fn forward_equals_prepend_and_amplification_is_measured() {
         cold_frames >= 3,
         "fixture must forward-build several cold frames, got {cold_frames}"
     );
-    assert_eq!((c1.f0 - c0.f0, c1.f1 - c0.f1), (1, 1), "one f0 + one f1 on the meta walk");
+    assert_eq!(
+        (c1.f0 - c0.f0, c1.f1 - c0.f1),
+        (1, 0),
+        "fresh construction must have f0 plus sealed cold history, never f1"
+    );
+    assert_eq!(
+        std::fs::read_dir(tmp_a.path().join("depot").join("f1"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .count(),
+        0,
+        "fresh construction must not create an f1 data file"
+    );
     let (hist_a, digest_a) = served_history(&a);
 
     // Round-trip against the generator, newest-first.
@@ -187,8 +199,24 @@ fn forward_equals_prepend_and_amplification_is_measured() {
     let c1 = a.depot_read_counts();
     assert_eq!(
         (c1.f0 - c0.f0, c1.f1 - c0.f1, c1.cold - c0.cold),
-        (1, 1, cold_frames),
+        (1, 0, cold_frames),
         "oldest-revision read walks each frame exactly once"
+    );
+
+    // A single-revision fresh page has only f0: no f1 and no cold
+    // frame. This is checked in the same test because the ingest-bound
+    // override is process-global.
+    let tmp_single = TempDir::new().unwrap();
+    let single = mk(&tmp_single);
+    let mut single_stream = new_page_stream(Cursor::new(export_xml(1, LINES).into_bytes()));
+    single.import(&mut single_stream).unwrap();
+    let c0 = single.depot_read_counts();
+    assert_eq!(single.page_history(PAGE_ID).unwrap().count(), 1);
+    let c1 = single.depot_read_counts();
+    assert_eq!(
+        (c1.f0 - c0.f0, c1.f1 - c0.f1, c1.cold - c0.cold),
+        (1, 0, 0),
+        "a single-revision fresh chain must contain f0 only"
     );
 
     // ---- prepend-built store of the same dump (test knob) ----

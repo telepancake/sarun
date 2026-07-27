@@ -76,7 +76,7 @@ fn indented_block_html_is_not_preformatted() {
 fn unknown_tag_is_escaped_and_counted() {
     let out = render_out("<blink>x</blink>");
     assert_eq!(out.html, "<div class=\"mw-parser-output\"><p>&lt;blink&gt;x&lt;/blink&gt;</p></div>");
-    assert_eq!(out.misses.unknown_tags, vec!["blink".to_string(), "blink".to_string()]);
+    assert_eq!(out.misses.unknown_tags, vec!["blink ×2".to_string()]);
 }
 
 #[test]
@@ -116,6 +116,28 @@ fn inputbox_is_replaced_for_the_read_only_archive() {
     let out = render_out("<inputbox>\ntype=create\n</inputbox>");
     assert!(out.html.contains("Page creation is unavailable"), "{}", out.html);
     assert!(out.misses.unknown_tags.is_empty(), "{:?}", out.misses);
+}
+
+#[test]
+fn indicator_is_metadata_not_visible_body_text() {
+    let out = render_out("<indicator name=\"featured\">[[File:Star.svg]]</indicator>Body");
+    assert_eq!(out.html, "<div class=\"mw-parser-output\"><p>Body</p></div>");
+    assert!(out.misses.unknown_tags.is_empty());
+}
+
+#[test]
+fn graph_and_imagemap_have_safe_deduplicated_fallbacks() {
+    let out = render_out(
+        "<graph>{\"data\":[]}</graph>\n<graph>x</graph>\n<imagemap>File:Map.png</imagemap>",
+    );
+    assert_eq!(
+        out.misses.unknown_tags,
+        vec!["graph ×2".to_string(), "imagemap".to_string()]
+    );
+    assert_eq!(out.html.matches("graph-fallback").count(), 2);
+    assert_eq!(out.html.matches("imagemap-fallback").count(), 1);
+    assert!(!out.html.contains("&lt;graph"));
+    assert!(!out.html.contains("&lt;imagemap"));
 }
 
 #[test]

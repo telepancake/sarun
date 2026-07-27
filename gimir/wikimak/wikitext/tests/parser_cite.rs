@@ -150,6 +150,18 @@ fn nested_markup_inside_ref_is_rendered() {
 }
 
 #[test]
+fn nowiki_inside_ref_is_literal_without_leaking_tags() {
+    let out = render_out(
+        "X<ref>dead <nowiki>[</nowiki>link<nowiki>]</nowiki></ref>\n<references/>",
+    );
+    assert!(out.html.contains(
+        "<span class=\"reference-text\">dead [link]</span>"
+    ), "{}", out.html);
+    assert!(!out.html.contains("&lt;nowiki"), "{}", out.html);
+    assert!(!out.misses.unknown_tags.iter().any(|tag| tag == "nowiki"));
+}
+
+#[test]
 fn empty_ref_without_name_is_inline_error() {
     let out = render_out("Oops<ref></ref>");
     assert_eq!(

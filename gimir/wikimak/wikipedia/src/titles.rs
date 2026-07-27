@@ -6,15 +6,9 @@
 //! `title_id_to_page` / `page_to_title_id`. This module is the READ
 //! half:
 //!
-//!   * [`TitleCache`] — exact title → dense ids. One decompress-walk of
-//!     the fnv-picked shard builds a byte-keyed map; a bounded-budget
-//!     LRU keeps the hottest shard maps resident so a render's link set
-//!     costs at most ONE walk per touched shard (repeat lookups are
-//!     hash probes). This is the batching mechanism for render-time
-//!     link resolution: the renderer discovers links *during* template
-//!     expansion, so the "whole link set" is not knowable up front —
-//!     the shard-granular cache gives the same I/O shape (one scan per
-//!     touched shard per render) without a pre-pass.
+//!   * [`lookup_ids`] — exact title → dense ids. It walks only the
+//!     fnv-picked shard; writer-side dynamic re-sharding keeps that
+//!     direct lookup unit small without an expanded dictionary cache.
 //!   * [`scan_candidates`] — the pages-listing / substring-search scan:
 //!     ALL shards walked in parallel (`std::thread::scope`), each
 //!     thread keeping only the K smallest matching `(title, id)` pairs,
@@ -26,8 +20,6 @@
 //! here must mirror the sqlite reads they replace — exact = byte
 //! equality, substring filter = lossy-UTF-8 lowercase `contains`, the
 //! same rule `Instance::pages` has always applied.
-
-use std::collections::HashMap;
 
 use strpool::Pool;
 
@@ -56,92 +48,23 @@ pub(crate) fn shard_for(normalized: &[u8], shard_count: u32) -> u32 {
     }
 }
 
-/// One decompressed shard, indexed for exact lookup. `ids` is a Vec
-/// because the pool may hold the same bytes more than once (two
-/// namespaces sharing a prefixed title, or an append whose sqlite
-/// transaction rolled back followed by a re-append).
-struct CachedShard {
-    /// `Pool::shard_entry_count` at build time; append-only pool, so a
-    /// changed stamp means "rebuild", never "silently wrong".
-    stamp: u32,
-    map: HashMap<Vec<u8>, Vec<u64>>,
-    /// Approximate resident bytes (keys + entries), for the budget.
-    bytes: usize,
-    /// LRU clock value of the last hit.
-    last_used: u64,
-}
-
-/// Bounded LRU of decompressed-and-indexed title shards. Lives on
-/// `InstanceInner` (under the instance mutex), so no interior locking.
-pub(crate) struct TitleCache {
-    budget_bytes: usize,
-    used_bytes: usize,
-    clock: u64,
-    shards: HashMap<u32, CachedShard>,
-}
-
-/// Default cache budget. Large template graphs touch most title shards; the
-/// old 8 MiB limit thrashed on medium wikis and repeatedly decompressed the
-/// same shards during one render. 64 MiB remains bounded while fitting the
-/// complete title dictionary of wikis in that class.
-pub(crate) const TITLE_CACHE_BUDGET: usize = 64 << 20;
-
-impl TitleCache {
-    pub(crate) fn new(budget_bytes: usize) -> Self {
-        TitleCache { budget_bytes, used_bytes: 0, clock: 0, shards: HashMap::new() }
-    }
-
-    /// Dense ids whose pool bytes equal `normalized` — the exact-title
-    /// lookup. Touches only the fnv-picked shard: a cache hit (fresh
-    /// stamp) is a hash probe with NO pool I/O; a miss walks that one
-    /// shard once and indexes it.
-    pub(crate) fn lookup(
-        &mut self,
-        pool: &Pool,
-        shard_count: u32,
-        normalized: &[u8],
-    ) -> Result<Vec<u64>> {
-        let sid = shard_for(normalized, shard_count);
-        self.clock += 1;
-        let stamp = pool.shard_entry_count(sid)?;
-        let fresh = self.shards.get(&sid).is_some_and(|c| c.stamp == stamp);
-        if !fresh {
-            self.rebuild(pool, sid, stamp)?;
+/// Exact lookup scans one deliberately small shard directly. Dynamic
+/// re-sharding keeps that unit bounded, so retaining expanded whole-shard
+/// hash maps (formerly a 64 MiB request cache) is counterproductive.
+pub(crate) fn lookup_ids(
+    pool: &Pool,
+    shard_count: u32,
+    normalized: &[u8],
+) -> Result<Vec<u64>> {
+    let sid = shard_for(normalized, shard_count);
+    let mut ids = Vec::new();
+    pool.for_each_in_shard(sid, |id, bytes| {
+        if bytes == normalized {
+            ids.push(id);
         }
-        let entry = self.shards.get_mut(&sid).expect("just ensured");
-        entry.last_used = self.clock;
-        Ok(entry.map.get(normalized).cloned().unwrap_or_default())
-    }
-
-    fn rebuild(&mut self, pool: &Pool, sid: u32, stamp: u32) -> Result<()> {
-        if let Some(old) = self.shards.remove(&sid) {
-            self.used_bytes -= old.bytes;
-        }
-        let mut map: HashMap<Vec<u8>, Vec<u64>> = HashMap::new();
-        let mut bytes = 0usize;
-        pool.for_each_in_shard(sid, |id, b| {
-            bytes += b.len() + std::mem::size_of::<u64>() * 2;
-            map.entry(b.to_vec()).or_default().push(id);
-            Ok(())
-        })?;
-        // Evict least-recently-used shards until the newcomer fits. A
-        // single shard larger than the whole budget still gets cached
-        // (alone) — refusing it would re-walk the shard on every
-        // lookup, the exact cost the cache exists to avoid.
-        while self.used_bytes + bytes > self.budget_bytes && !self.shards.is_empty() {
-            let coldest = *self
-                .shards
-                .iter()
-                .min_by_key(|(_, c)| c.last_used)
-                .map(|(k, _)| k)
-                .expect("non-empty");
-            let old = self.shards.remove(&coldest).expect("present");
-            self.used_bytes -= old.bytes;
-        }
-        self.used_bytes += bytes;
-        self.shards.insert(sid, CachedShard { stamp, map, bytes, last_used: self.clock });
         Ok(())
-    }
+    })?;
+    Ok(ids)
 }
 
 /// One pool hit from [`scan_candidates`]: the title bytes and the dense

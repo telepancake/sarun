@@ -39,7 +39,7 @@ fn rev_text(r: usize) -> String {
     let mut i = 0usize;
     while s.len() < REV_TEXT_BYTES {
         // Every 17th line is revision-specific; the rest are shared.
-        if i.is_multiple_of(17) {
+        if i % 17 == 0 {
             s.push_str(&format!("line {i:07} salted by revision {r:04}\n"));
         } else {
             s.push_str(&format!("line {i:07} shared corpus filler text\n"));
@@ -185,7 +185,7 @@ fn oversized_page_imports_under_the_ram_bound_and_round_trips() {
                 file_size_threshold: 1 << 30,
                 eviction_dead_ratio: 0.5,
             },
-            title_shard_count: 4,
+            title_shard_count: 0,
             title_seal_threshold_bytes: 8 << 20,
             f1_seal_threshold_bytes: 0,
         })

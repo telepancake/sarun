@@ -35,7 +35,16 @@ fn dumpstatus(sha1_hex: &str, size: usize) -> String {
 }
 
 fn history_body(event_type: &str) -> Vec<u8> {
-    let mut fields = vec![""; 78];
+    history_body_with_schema(event_type, 78)
+}
+
+fn history_body_with_schema(event_type: &str, columns: usize) -> Vec<u8> {
+    let (page, revision) = match columns {
+        76 => (26, 58),
+        78 => (28, 60),
+        _ => panic!("unsupported test schema"),
+    };
+    let mut fields = vec![""; columns];
     fields[0] = "testwiki";
     fields[1] = "123";
     fields[2] = "page";
@@ -44,58 +53,58 @@ fn history_body(event_type: &str) -> Vec<u8> {
     fields[5] = "action comment";
     fields[6] = "9";
     fields[9] = "Editor";
-    fields[28] = "1";
-    fields[29] = "Old title";
-    fields[30] = "Current title";
-    fields[31] = "0";
-    fields[33] = "0";
-    fields[36] = "false";
+    fields[page] = "1";
+    fields[page + 1] = "Old title";
+    fields[page + 2] = "Current title";
+    fields[page + 3] = "0";
+    fields[page + 5] = "0";
+    fields[page + 8] = "false";
     let mut encoder = BzEncoder::new(Vec::new(), Compression::default());
     writeln!(encoder, "{}", fields.join("\t")).unwrap();
     // Old deletion log events can retain their titles but have no page id.
     let mut orphan_page = fields.clone();
     orphan_page[1] = "124";
     orphan_page[3] = "delete";
-    orphan_page[28] = "0";
-    orphan_page[29] = "Deleted title";
-    orphan_page[30] = "Deleted title";
-    orphan_page[36] = "true";
+    orphan_page[page] = "0";
+    orphan_page[page + 1] = "Deleted title";
+    orphan_page[page + 2] = "Deleted title";
+    orphan_page[page + 8] = "true";
     writeln!(encoder, "{}", orphan_page.join("\t")).unwrap();
-    let mut revision = vec![""; 78];
-    revision[0] = "testwiki";
-    revision[2] = "revision";
-    revision[3] = "create";
-    revision[4] = "2024-06-01 12:00:00.0";
-    revision[28] = "1";
-    revision[60] = "100";
-    revision[63] = "text,user";
-    revision[64] = "true";
-    revision[70] = "true";
-    revision[71] = "2024-06-02 00:00:00.0";
-    writeln!(encoder, "{}", revision.join("\t")).unwrap();
-    let mut visible_revision = vec![""; 78];
+    let mut revision_fields = vec![""; columns];
+    revision_fields[0] = "testwiki";
+    revision_fields[2] = "revision";
+    revision_fields[3] = "create";
+    revision_fields[4] = "2024-06-01 12:00:00.0";
+    revision_fields[page] = "1";
+    revision_fields[revision] = "100";
+    revision_fields[revision + 3] = "text,user";
+    revision_fields[revision + 4] = "true";
+    revision_fields[revision + 10] = "true";
+    revision_fields[revision + 11] = "2024-06-02 00:00:00.0";
+    writeln!(encoder, "{}", revision_fields.join("\t")).unwrap();
+    let mut visible_revision = vec![""; columns];
     visible_revision[0] = "testwiki";
     visible_revision[2] = "revision";
     visible_revision[3] = "create";
     visible_revision[4] = "2024-06-01 12:01:00.0";
-    visible_revision[28] = "1";
-    visible_revision[60] = "101";
-    visible_revision[64] = "false";
-    visible_revision[70] = "false";
+    visible_revision[page] = "1";
+    visible_revision[revision] = "101";
+    visible_revision[revision + 4] = "false";
+    visible_revision[revision + 10] = "false";
     writeln!(encoder, "{}", visible_revision.join("\t")).unwrap();
     // Imported/orphan revisions can have no upstream page id while still
     // carrying page-deletion visibility metadata.
-    let mut orphan_revision = vec![""; 78];
+    let mut orphan_revision = vec![""; columns];
     orphan_revision[0] = "testwiki";
     orphan_revision[2] = "revision";
     orphan_revision[3] = "create";
     orphan_revision[4] = "2024-06-01 12:02:00.0";
-    orphan_revision[29] = "Imported orphan";
-    orphan_revision[31] = "0";
-    orphan_revision[60] = "102";
-    orphan_revision[64] = "false";
-    orphan_revision[70] = "true";
-    orphan_revision[71] = "2024-06-03 00:00:00.0";
+    orphan_revision[page + 1] = "Imported orphan";
+    orphan_revision[page + 3] = "0";
+    orphan_revision[revision] = "102";
+    orphan_revision[revision + 4] = "false";
+    orphan_revision[revision + 10] = "true";
+    orphan_revision[revision + 11] = "2024-06-03 00:00:00.0";
     writeln!(encoder, "{}", orphan_revision.join("\t")).unwrap();
     encoder.finish().unwrap()
 }
@@ -110,6 +119,24 @@ fn malformed_history_body() -> Vec<u8> {
     let mut encoder = BzEncoder::new(Vec::new(), Compression::default());
     writeln!(encoder, "{}", fields.join("\t")).unwrap();
     writeln!(encoder, "truncated").unwrap();
+    encoder.finish().unwrap()
+}
+
+fn page_history_body(event_type: &str, page_id: &str) -> Vec<u8> {
+    let mut fields = vec![""; 78];
+    fields[0] = "testwiki";
+    fields[1] = page_id;
+    fields[2] = "page";
+    fields[3] = event_type;
+    fields[4] = "2024-07-01 12:34:56.0";
+    fields[28] = page_id;
+    fields[29] = "Historical title";
+    fields[30] = "Current title";
+    fields[31] = "0";
+    fields[33] = "0";
+    fields[36] = "false";
+    let mut encoder = BzEncoder::new(Vec::new(), Compression::default());
+    writeln!(encoder, "{}", fields.join("\t")).unwrap();
     encoder.finish().unwrap()
 }
 
@@ -331,6 +358,90 @@ fn maintenance_consumes_daily_adds_changes_without_full_redownload() {
 }
 
 #[test]
+fn history_import_accepts_legacy_76_column_schema() {
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET).path("/other/mediawiki_history/");
+        then.status(200).body(r#"<a href="2024-06/">2024-06/</a>"#);
+    });
+    server.mock(|when, then| {
+        when.method(GET)
+            .path("/other/mediawiki_history/2024-06/testwiki/");
+        then.status(200).body(
+            r#"<a href="2024-06.testwiki.all-time.tsv.bz2">history</a>"#,
+        );
+    });
+    let body = history_body_with_schema("move", 76);
+    server.mock(move |when, then| {
+        when.method(GET)
+            .path("/other/mediawiki_history/2024-06/testwiki/2024-06.testwiki.all-time.tsv.bz2");
+        then.status(200).body(body.clone());
+    });
+
+    let tmp = TempDir::new().unwrap();
+    let inst = make_instance(&tmp, 1024);
+    let cfg = Config { base_url: server.base_url() };
+    let stats =
+        reconcile_history(&inst, &Client::new(), &cfg, "testwiki", |_, _| ()).unwrap();
+    assert_eq!(stats.history_parts_fetched, 1);
+    assert_eq!(inst.page_actions(1).unwrap().len(), 1);
+    assert!(inst.revision_visibility(100).unwrap().unwrap().parts_are_suppressed);
+}
+
+#[test]
+fn suppression_metadata_never_removes_archived_revision_content() {
+    let server = MockServer::start();
+    let xml = fixture("export_three_pages.xml");
+    let sha1_hex = hex::encode(Sha1::digest(&xml));
+    mount(&server, &xml, &sha1_hex);
+    let tmp = TempDir::new().unwrap();
+    let inst = make_instance(&tmp, 1024);
+    let cfg = Config { base_url: server.base_url() };
+
+    sync(&inst, &Client::new(), &cfg, "testwiki", |_, _| ()).unwrap();
+    let before = inst.page_head_text(1).unwrap().unwrap();
+    reconcile_history(&inst, &Client::new(), &cfg, "testwiki", |_, _| ()).unwrap();
+
+    assert!(inst.revision_visibility(100).unwrap().unwrap().parts_are_suppressed);
+    assert_eq!(inst.page_head_text(1).unwrap().unwrap(), before);
+    let revisions: Vec<_> = inst.page_history(1).unwrap().collect();
+    assert_eq!(revisions.len(), 1);
+    assert_eq!(revisions[0].as_ref().unwrap().meta.rev_id, 100);
+}
+
+#[test]
+fn incomplete_partition_listing_never_advances_history_snapshot() {
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(GET).path("/other/mediawiki_history/");
+        then.status(200).body(r#"<a href="2024-07/">2024-07/</a>"#);
+    });
+    server.mock(|when, then| {
+        when.method(GET)
+            .path("/other/mediawiki_history/2024-07/testwiki/");
+        then.status(200).body(
+            r#"<a href="2024-07.testwiki.2024-05.tsv.bz2">May</a>
+               <a href="2024-07.testwiki.2024-07.tsv.bz2">July</a>"#,
+        );
+    });
+    let tmp = TempDir::new().unwrap();
+    let inst = make_instance(&tmp, 1024);
+    inst.set_sync_state("history_frontier_snapshot", "2024-06").unwrap();
+    inst.set_sync_state("history_reconciled_snapshot", "2024-06").unwrap();
+    let cfg = Config { base_url: server.base_url() };
+
+    let error =
+        reconcile_history(&inst, &Client::new(), &cfg, "testwiki", |_, _| ())
+            .unwrap_err()
+            .to_string();
+    assert!(error.contains("incomplete"), "{error}");
+    assert_eq!(
+        inst.sync_state("history_reconciled_snapshot").unwrap().as_deref(),
+        Some("2024-06")
+    );
+}
+
+#[test]
 fn new_history_snapshot_replaces_every_partition() {
     let server = MockServer::start();
     server.mock(|when, then| {
@@ -355,7 +466,7 @@ fn new_history_snapshot_replaces_every_partition() {
             .path("/other/mediawiki_history/2024-07/testwiki/2024-07.testwiki.2024-06.tsv.bz2");
         then.status(200).body(june_body.clone());
     });
-    let july_body = history_body("delete");
+    let july_body = page_history_body("delete", "2");
     let july = server.mock(move |when, then| {
         when.method(GET)
             .path("/other/mediawiki_history/2024-07/testwiki/2024-07.testwiki.2024-07.tsv.bz2");
@@ -364,6 +475,19 @@ fn new_history_snapshot_replaces_every_partition() {
 
     let tmp = TempDir::new().unwrap();
     let inst = make_instance(&tmp, 1024);
+    let db = Connection::open(tmp.path().join("meta.db")).unwrap();
+    db.execute(
+        "INSERT INTO page_actions VALUES(
+            'obsolete:1','obsolete',NULL,'delete','2001-01-01','',
+            NULL,'',99,'Gone','Gone',0,0,1
+        )",
+        [],
+    ).unwrap();
+    db.execute(
+        "INSERT INTO revision_visibility VALUES(999,99,'obsolete','text',1,0,'')",
+        [],
+    ).unwrap();
+    drop(db);
     inst.set_sync_state("full_snapshot_date", "2024-06-01").unwrap();
     inst.set_sync_state("incremental_date", "2024-06-01").unwrap();
     inst.set_sync_state("history_frontier_snapshot", "2024-05").unwrap();
@@ -382,6 +506,11 @@ fn new_history_snapshot_replaces_every_partition() {
         inst.sync_state("history_reconciled_snapshot").unwrap().as_deref(),
         Some("2024-07"),
         "the complete replacement is a reconciled snapshot"
+    );
+    assert!(inst.page_actions(99).unwrap().is_empty(), "stale action survived");
+    assert!(
+        inst.revision_visibility(999).unwrap().is_none(),
+        "stale visibility survived"
     );
 }
 
@@ -405,13 +534,20 @@ fn malformed_history_partition_rolls_back_all_rows() {
         when.method(GET)
             .path("/other/mediawiki_history/2024-07/testwiki/");
         then.status(200).body(
-            r#"<a href="2024-07.testwiki.all-time.tsv.bz2">all</a>"#,
+            r#"<a href="2024-07.testwiki.2024-06.tsv.bz2">June</a>
+               <a href="2024-07.testwiki.2024-07.tsv.bz2">July</a>"#,
         );
+    });
+    let good_body = page_history_body("delete", "2");
+    server.mock(move |when, then| {
+        when.method(GET)
+            .path("/other/mediawiki_history/2024-07/testwiki/2024-07.testwiki.2024-06.tsv.bz2");
+        then.status(200).body(good_body.clone());
     });
     let body = malformed_history_body();
     server.mock(move |when, then| {
         when.method(GET)
-            .path("/other/mediawiki_history/2024-07/testwiki/2024-07.testwiki.all-time.tsv.bz2");
+            .path("/other/mediawiki_history/2024-07/testwiki/2024-07.testwiki.2024-07.tsv.bz2");
         then.status(200).body(body.clone());
     });
     let cfg = Config { base_url: server.base_url() };
@@ -423,5 +559,9 @@ fn malformed_history_partition_rolls_back_all_rows() {
     assert_eq!(
         inst.sync_state("history_reconciled_snapshot").unwrap().as_deref(),
         Some("2024-06")
+    );
+    assert!(
+        inst.page_actions(2).unwrap().is_empty(),
+        "rows from the first part of a failed snapshot leaked"
     );
 }

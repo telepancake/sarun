@@ -135,6 +135,7 @@ impl Strip {
 struct Ctx<'a> {
     store: &'a dyn PageStore,
     site: &'a SiteConfig,
+    render_title: Title,
     opts: &'a RenderOptions<'a>,
     misses: RenderMisses,
     categories: Vec<String>,
@@ -151,11 +152,11 @@ pub fn to_html(
     opts: &RenderOptions<'_>,
     misses: RenderMisses,
 ) -> RenderOutput {
-    let _ = title;
     let site = store.site();
     let mut ctx = Ctx {
         store,
         site,
+        render_title: title.clone(),
         opts,
         misses,
         categories: Vec::new(),
@@ -187,12 +188,39 @@ pub fn to_html(
     }
     open.push('>');
     let html = format!("{open}{body}</div>");
+    aggregate_misses(&mut ctx.misses);
 
     RenderOutput {
         html,
         categories: ctx.categories,
         misses: ctx.misses,
     }
+}
+
+fn aggregate_misses(misses: &mut RenderMisses) {
+    fn stable(values: &mut Vec<String>) {
+        let mut counts = std::collections::HashMap::new();
+        for value in values.iter() {
+            *counts.entry(value.clone()).or_insert(0usize) += 1;
+        }
+
+        let mut seen = std::collections::HashSet::new();
+        let mut aggregated = Vec::with_capacity(counts.len());
+        for value in values.drain(..) {
+            if !seen.insert(value.clone()) {
+                continue;
+            }
+            match counts[&value] {
+                1 => aggregated.push(value),
+                count => aggregated.push(format!("{value} ×{count}")),
+            }
+        }
+        *values = aggregated;
+    }
+    stable(&mut misses.unknown_tags);
+    stable(&mut misses.failed_invokes);
+    stable(&mut misses.missing_templates);
+    stable(&mut misses.missing_media);
 }
 
 impl<'a> Ctx<'a> {
@@ -263,6 +291,42 @@ impl<'a> Ctx<'a> {
                     i = next;
                     continue;
                 }
+                if let Some((_, self_closing, past)) = match_ext_tag(s, i, "indicator") {
+                    // Page indicators belong to the skin/chrome, not article
+                    // body HTML. Suppressing the metadata is preferable to
+                    // exposing raw `<indicator>` source in an archive.
+                    i = if self_closing {
+                        past
+                    } else {
+                        read_to_close(s, past, "indicator").1
+                    };
+                    continue;
+                }
+                let extension_start = i;
+                for tag in ["graph", "imagemap"] {
+                    if let Some((_, self_closing, past)) = match_ext_tag(s, i, tag) {
+                        let next = if self_closing {
+                            past
+                        } else {
+                            read_to_close(s, past, tag).1
+                        };
+                        self.misses.unknown_tags.push(tag.to_string());
+                        let label = if tag == "graph" {
+                            "Interactive graph unavailable in this archival mirror."
+                        } else {
+                            "Image map unavailable in this archival mirror."
+                        };
+                        let marker = self.strip.stash_block(format!(
+                            "<div class=\"extension-fallback {tag}-fallback\">{label}</div>"
+                        ));
+                        out.push_str(&marker);
+                        i = next;
+                        break;
+                    }
+                }
+                if i != extension_start {
+                    continue;
+                }
                 out.push('<');
                 i += 1;
             } else {
@@ -313,7 +377,16 @@ impl<'a> Ctx<'a> {
 
         // Render the body through the inline path (escapes any HTML/markup
         // — this is the XSS boundary) before it becomes note content.
-        let content = if has_body { Some(self.inline(raw)) } else { None };
+        let content = if has_body {
+            // Extension tags can be introduced inside a reference by an
+            // expanded citation template. Run the same shielding pass here
+            // so `<nowiki>[</nowiki>` becomes a literal bracket rather than
+            // visible escaped tag source.
+            let protected = self.strip_nowiki_in_ref(raw);
+            Some(self.inline(&protected))
+        } else {
+            None
+        };
         let name_opt = if name.is_empty() {
             None
         } else {
@@ -329,6 +402,29 @@ impl<'a> Ctx<'a> {
         }
         out.push_str(&Strip::marker(strip_idx));
         next
+    }
+
+    fn strip_nowiki_in_ref(&mut self, text: &str) -> String {
+        let mut out = String::with_capacity(text.len());
+        let mut i = 0;
+        while i < text.len() {
+            if text.as_bytes()[i] == b'<' {
+                if let Some((_, self_closing, past)) = match_ext_tag(text, i, "nowiki") {
+                    if self_closing {
+                        i = past;
+                    } else {
+                        let (inner, next) = read_to_close(text, past, "nowiki");
+                        out.push_str(&self.strip.stash_inline(html::escape_body(inner)));
+                        i = next;
+                    }
+                    continue;
+                }
+            }
+            let len = html::utf8_len(text.as_bytes()[i]);
+            out.push_str(&text[i..i + len]);
+            i += len;
+        }
+        out
     }
 
     /// Handle one `<references …/>` or `<references …>…</references>`.
@@ -795,12 +891,17 @@ impl<'a> Ctx<'a> {
         } else {
             target_raw.clone()
         };
+        let decoded_target = crate::title::percent_decode_utf8(&target);
 
-        if let Some(entry) = self.interwiki_of(&target) {
-            return self.render_interwiki(&entry, &target, &parts, trail);
+        if let Some(entry) = self.interwiki_of(&decoded_target) {
+            return self.render_interwiki(&entry, &decoded_target, &parts, trail);
         }
 
-        let (title, frag) = Title::parse_parts(&target, self.site);
+        let (mut title, frag) = Title::parse_parts(&target, self.site);
+        let same_page_fragment = title.text.is_empty() && frag.is_some();
+        if same_page_fragment {
+            title = self.render_title.clone();
+        }
 
         if !leading_colon && title.ns == NS_CATEGORY {
             self.categories.push(title.text.clone());
@@ -820,9 +921,15 @@ impl<'a> Ctx<'a> {
                 explicit
             }
         } else {
-            display_target(&target)
+            display_target(&decoded_target)
         };
-        self.render_page_link(&title, frag.as_deref(), &label, trail)
+        self.render_page_link(
+            &title,
+            frag.as_deref(),
+            &label,
+            trail,
+            same_page_fragment,
+        )
     }
 
     fn render_page_link(
@@ -831,10 +938,15 @@ impl<'a> Ctx<'a> {
         frag: Option<&str>,
         label: &str,
         trail: &str,
+        same_page_fragment: bool,
     ) -> String {
         let prefixed = title.prefixed(self.site);
-        let path = html::encode_path(&prefixed);
-        let mut href = format!("{}{}{}", self.opts.link_prefix, path, self.opts.asof_query);
+        let mut href = if same_page_fragment {
+            String::new()
+        } else {
+            let path = html::encode_path(&prefixed);
+            format!("{}{}{}", self.opts.link_prefix, path, self.opts.asof_query)
+        };
         if let Some(f) = frag {
             href.push('#');
             href.push_str(&html::encode_frag(f));
@@ -844,7 +956,7 @@ impl<'a> Ctx<'a> {
         // "(page does not exist)" suffix on its title. The href stays on the
         // serve layer's `link_prefix` route (see the module note on the
         // red-link/serve tension) rather than MediaWiki's index.php form.
-        let (class, title_attr) = if self.store.page_exists(title) {
+        let (class, title_attr) = if same_page_fragment || self.store.page_exists(title) {
             (String::new(), prefixed.clone())
         } else {
             (
@@ -1029,7 +1141,11 @@ impl<'a> Ctx<'a> {
         if !has_url_scheme(inner) {
             return None;
         }
-        let (url, label) = match inner.find(char::is_whitespace) {
+        // MediaWiki also ends a bracketed URL when its HTML label begins
+        // immediately (`[https://x<abbr>edit</abbr>]`). The HTML sanitizer
+        // runs later, and already-stashed fragments begin with SEP.
+        let boundary = inner.find(|c: char| c.is_whitespace() || c == '<' || c == SEP);
+        let (url, label) = match boundary {
             Some(sp) => (&inner[..sp], inner[sp..].trim_start()),
             None => (inner, ""),
         };

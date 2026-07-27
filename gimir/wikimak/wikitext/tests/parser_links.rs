@@ -49,6 +49,22 @@ fn fragment_in_href() {
 }
 
 #[test]
+fn same_page_fragment_does_not_route_to_wiki_root() {
+    assert_eq!(
+        render_inner("[[#History|history]]"),
+        "<p><a href=\"#History\" title=\"Test\">history</a></p>"
+    );
+}
+
+#[test]
+fn percent_encoded_page_target_is_canonicalized_once() {
+    assert_eq!(
+        render_inner("[[R%C4%ABga]]"),
+        "<p><a href=\"/wiki/R%C4%ABga\" class=\"new\" title=\"Rīga (page does not exist)\">Rīga</a></p>"
+    );
+}
+
+#[test]
 fn namespaced_link_display_keeps_prefix() {
     assert_eq!(
         render_inner("[[Help:Contents]]"),
@@ -134,6 +150,14 @@ fn external_link_with_label() {
     assert_eq!(
         render_inner("[http://example.com Label]"),
         "<p><a rel=\"nofollow\" class=\"external text\" href=\"http://example.com\">Label</a></p>"
+    );
+}
+
+#[test]
+fn external_link_url_stops_when_html_label_starts() {
+    assert_eq!(
+        render_inner("[https://example.test/?action=edit<abbr title=\"Edit\">e</abbr>]"),
+        "<p><a rel=\"nofollow\" class=\"external text\" href=\"https://example.test/?action=edit\"><abbr title=\"Edit\">e</abbr></a></p>"
     );
 }
 

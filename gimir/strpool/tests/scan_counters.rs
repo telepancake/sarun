@@ -84,3 +84,25 @@ fn entry_count_stamp_is_append_monotone_and_seal_stable() {
         "seal does not change the entry-count stamp"
     );
 }
+
+#[test]
+fn shard_file_size_tracks_lazy_creation_and_seal() {
+    let dir = common::scratch_dir("shard_file_size");
+    let pool = Pool::open(
+        &dir,
+        PoolConfig {
+            shard_count: 2,
+            seal_threshold_bytes: 0,
+        },
+        None,
+    )
+    .unwrap();
+    assert_eq!(pool.shard_file_size(1).unwrap(), 0);
+    pool.append(1, b"a measured title").unwrap();
+    let raw = pool.shard_file_size(1).unwrap();
+    assert!(raw > 0);
+    pool.maybe_seal(1).unwrap();
+    let sealed = pool.shard_file_size(1).unwrap();
+    assert!(sealed > 0);
+    assert_eq!(sealed, std::fs::metadata(dir.join("shard-0001")).unwrap().len());
+}

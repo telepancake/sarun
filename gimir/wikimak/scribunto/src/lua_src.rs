@@ -98,6 +98,42 @@ function ustring.gmatch(s, pattern)
 end
 
 function ustring.gsub(s, pattern, repl, n)
+    -- Lua 5.1 patterns operate on bytes, while mw.ustring character classes
+    -- operate on Unicode codepoints.  This class is used by Module:String and
+    -- Module:Range to normalize the four minus/dash spellings accepted in
+    -- numeric input.  Treat each member as a literal codepoint instead of
+    -- letting PUC interpret the UTF-8 bytes as ranges.
+    if pattern == "[-–−—]" then
+        local members = { ["-"] = true, ["–"] = true, ["−"] = true, ["—"] = true }
+        local buf = {}
+        local count = 0
+        for ch in string.gmatch(s, "[%z\1-\127\194-\244][\128-\191]*") do
+            if members[ch] and (n == nil or count < n) then
+                local replacement
+                if type(repl) == "string" then
+                    replacement = repl:gsub("%%(.)", function(mark)
+                        if mark == "%" then return "%" end
+                        if mark == "0" then return ch end
+                        error("invalid use of '%' in replacement string")
+                    end)
+                elseif type(repl) == "function" then
+                    replacement = repl(ch)
+                elseif type(repl) == "table" then
+                    replacement = repl[ch]
+                end
+                if replacement == nil or replacement == false then
+                    replacement = ch
+                else
+                    replacement = tostring(replacement)
+                end
+                buf[#buf + 1] = replacement
+                count = count + 1
+            else
+                buf[#buf + 1] = ch
+            end
+        end
+        return table.concat(buf), count
+    end
     if n == nil then return string.gsub(s, fix_pat(pattern), repl) end
     return string.gsub(s, fix_pat(pattern), repl, n)
 end
@@ -452,9 +488,13 @@ function HtmlMeta:attr(name, value)
         for k, v in pairs(name) do self:attr(k, v) end
         return self
     end
-    for _, a in ipairs(self.attributes) do
-        if a.name == name then a.val = value; return self end
+    for i, a in ipairs(self.attributes) do
+        if a.name == name then
+            if value == nil then table.remove(self.attributes, i) else a.val = value end
+            return self
+        end
     end
+    if value == nil then return self end
     self.attributes[#self.attributes + 1] = { name = name, val = value }
     return self
 end
@@ -469,9 +509,13 @@ function HtmlMeta:css(name, value)
         for k, v in pairs(name) do self:css(k, v) end
         return self
     end
-    for _, s in ipairs(self.styles) do
-        if s.name == name then s.val = value; return self end
+    for i, s in ipairs(self.styles) do
+        if s.name == name then
+            if value == nil then table.remove(self.styles, i) else s.val = value end
+            return self
+        end
     end
+    if value == nil then return self end
     self.styles[#self.styles + 1] = { name = name, val = value }
     return self
 end
@@ -496,14 +540,16 @@ local function render_attrs(node)
         buf[#buf + 1] = ' class="' .. text.encode(table.concat(node.classes, " "), "<>&\"") .. '"'
     end
     for _, s in ipairs(node.styles) do
-        styleBuf[#styleBuf + 1] = s.name .. ":" .. tostring(s.val)
+        if s.val ~= nil then styleBuf[#styleBuf + 1] = s.name .. ":" .. tostring(s.val) end
     end
     if node._cssText then styleBuf[#styleBuf + 1] = node._cssText:gsub(";$", "") end
     if #styleBuf > 0 then
         buf[#buf + 1] = ' style="' .. text.encode(table.concat(styleBuf, ";"), "<>&\"") .. '"'
     end
     for _, a in ipairs(node.attributes) do
-        buf[#buf + 1] = " " .. a.name .. '="' .. text.encode(tostring(a.val), "<>&\"") .. '"'
+        if a.val ~= nil then
+            buf[#buf + 1] = " " .. a.name .. '="' .. text.encode(tostring(a.val), "<>&\"") .. '"'
+        end
     end
     return table.concat(buf)
 end
@@ -1152,4 +1198,3 @@ return {
     end,
 }
 "#;
-

@@ -22,6 +22,14 @@ fn image_alias_namespace_resolves() {
 }
 
 #[test]
+fn percent_encoded_file_target_is_decoded_before_resolution() {
+    assert_eq!(
+        render_inner("[[File:R%C4%ABga%20view.jpg]]"),
+        "<p><img src=\"https://media.example/Rīga view.jpg?w=0\" alt=\"Rīga view.jpg\"/></p>"
+    );
+}
+
+#[test]
 fn thumb_with_size_align_and_caption() {
     assert_eq!(
         render_inner("[[File:Pic.jpg|thumb|left|120px|A ''caption'' here]]"),
@@ -61,6 +69,15 @@ fn missing_media_is_placeholder_and_counted() {
 <div class=\"thumbcaption\">Nope</div></div></div></p></div>"
     );
     assert_eq!(out.misses.missing_media, vec!["File:Missing.jpg".to_string()]);
+}
+
+#[test]
+fn repeated_missing_media_is_aggregated_with_count() {
+    let out = render_out("[[File:Missing.jpg]][[File:Missing.jpg]]");
+    assert_eq!(
+        out.misses.missing_media,
+        vec!["File:Missing.jpg ×2".to_string()]
+    );
 }
 
 #[test]

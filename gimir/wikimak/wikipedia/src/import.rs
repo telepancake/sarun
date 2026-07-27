@@ -26,10 +26,11 @@
 //! A FRESH page (empty chain — the bulk-import common case) skips the
 //! prepend cycle entirely: dumps arrive oldest-first, and the depot's
 //! forward construction (`ChainBuilder`, SPEC §"Bulk forward
-//! construction") writes each RAM-bound batch as one cold frame, once
-//! (batch boundary = frame boundary; the batch's newest record is the
-//! frame's refPrefix anchor and carries into the next batch), with the
-//! tail landing as f0/f1 at the commit. History write amplification:
+//! construction") writes older revisions straight to sealed cold
+//! frames (one for ordinary pages; additional frames only when the
+//! exceptional-page RAM bound is crossed). The newest revision lands
+//! alone in f0. A fresh import never creates f1; f1 is exclusively the
+//! mutable accumulator for later updates. History write amplification:
 //! 1.0. Update mode (existing chain) keeps the prepend path.
 //!
 //! ## Per-page atomicity — and the RAM bound
@@ -141,8 +142,7 @@ pub(crate) fn do_import<R: Read>(
         // page — checked even before the once-per-import siteinfo
         // capture so a first-page overflow leaves meta.db untouched.
         // Ids below the ceiling never overflow: the depot's index
-        // auto-grows (sparse) to cover them, so `--max-page-id` is only
-        // a fresh-index size hint. Silently skipping instead would let
+        // auto-grows to cover actual ids. Silently skipping would let
         // the part watermark land over a lossy import. Pages already
         // committed this run stay (per-page atomicity); the run fails,
         // so no part is ever marked seen.
@@ -251,14 +251,16 @@ fn import_one_page<R: Read>(
         //     construction (depot SPEC §"Bulk forward construction").
         //     Dumps are oldest-first and the chain format's links
         //     point newer→older, so each full batch becomes ONE cold
-        //     frame written ONCE — batch boundary = frame boundary,
+        //     frame written ONCE — an exceptional-page RAM boundary
+        //     may become a frame boundary,
         //     the batch's newest record excluded and carried as the
         //     next frame's oldest record (it is the frame's refPrefix
         //     anchor, exactly what the newest-first read walk decodes
-        //     against). The final partial batch (plus the carry)
-        //     lands as f0/f1 at `finish_chain`, whose index flip is
-        //     the commit — until then everything is an invisible
-        //     orphan. Write amplification for history: 1.0.
+        //     against). At `finish_chain`, the final partial history
+        //     batch is sealed to cold and only the newest record lands
+        //     in f0. The index flip is the commit — until then
+        //     everything is an invisible orphan. Write amplification
+        //     for history: 1.0.
         //
         //   * EXISTING chain (update mode): the prepend path,
         //     untouched — one prepend per bound-sized batch (depot
@@ -276,7 +278,10 @@ fn import_one_page<R: Read>(
         // unfinished build stays invisible (index never flipped) and a
         // re-import simply builds again; the orphan cold bytes die
         // with the instance.
-        let batch_bound = ingest_ram_bound().max(instance.f1_seal_threshold_bytes);
+        // This is only a transient collection bound. The f1 seal
+        // threshold governs mutable update layout and must not enlarge
+        // a fresh import's working set or decide its persistent layout.
+        let batch_bound = ingest_ram_bound().max(1);
         let mut batch: Vec<Vec<u8>> = Vec::new(); // oldest-first
         let mut batch_bytes: u64 = 0;
         let mut new_this_page = 0u64;
@@ -289,7 +294,8 @@ fn import_one_page<R: Read>(
         };
         // Forward path: the previous batch's newest record, excluded
         // from its frame — the anchor it was compressed against, and
-        // the oldest record of the NEXT frame (or of the f0/f1 head).
+        // the oldest record of the NEXT frame (or of the final cold
+        // frame directly below f0).
         let mut carry: Option<Vec<u8>> = None;
 
         // Earliest revision timestamp for THIS dump's copy of the page
@@ -384,7 +390,7 @@ fn import_one_page<R: Read>(
             page_id,
             header.namespace as i64,
             header.title.trim().as_bytes(),
-            instance.title_shard_count,
+            instance.title_shard_count.load(std::sync::atomic::Ordering::Relaxed),
             earliest_ts,
             dump_extends_head,
         )?;
@@ -400,6 +406,12 @@ fn import_one_page<R: Read>(
     match outcome {
         Ok(_) => {
             g.conn.execute("COMMIT", [])?;
+            let title = header.title.trim().as_bytes();
+            let count = instance
+                .title_shard_count
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let sid = crate::titles::shard_for(title, count);
+            instance.maintain_title_shard(&mut guard, sid)?;
             Ok(())
         }
         Err(e) => {
@@ -700,14 +712,15 @@ fn forward_flush(
 }
 
 /// Forward-construction commit: the final partial batch plus the carry
-/// are the chain HEAD — f0 = the newest record standalone, f1 = the
-/// rest (newest-first, refPrefix-anchored on f0's record, its oldest
-/// entry being the carry that anchors the newest cold frame). The
-/// depot's `finish_chain` index flip is the atomic commit. No new
-/// records at all ⇒ nothing was ever written; the builder just drops.
+/// become the chain head — the newest record is standalone f0 and all
+/// older records are one sealed cold frame, refPrefix-anchored on f0.
+/// Earlier exceptional-page batches, if any, are already older cold
+/// frames. Fresh construction never creates f1. The depot's
+/// `finish_chain` index flip is the atomic commit. No new records at
+/// all ⇒ nothing was ever written; the builder just drops.
 fn forward_finish(
     g: &InstanceInner,
-    b: wikimak_depot::ChainBuilder,
+    mut b: wikimak_depot::ChainBuilder,
     carry: Option<Vec<u8>>,
     mut batch: Vec<Vec<u8>>,
 ) -> Result<()> {
@@ -719,16 +732,15 @@ fn forward_finish(
         return Ok(());
     };
     let f0 = crate::frames::compress(head, None)?;
-    let f1 = if older.is_empty() {
-        None
-    } else {
+    if !older.is_empty() {
         let mut raw = Vec::with_capacity(older.iter().map(Vec::len).sum());
         for rec in older {
             raw.extend_from_slice(rec);
         }
-        Some(crate::frames::compress(&raw, Some(head))?)
-    };
-    g.depot.finish_chain(b, &f0, f1.as_deref())?;
+        let cold = crate::frames::compress(&raw, Some(head))?;
+        g.depot.append_history_frame(&mut b, &cold)?;
+    }
+    g.depot.finish_chain(b, &f0, None)?;
     Ok(())
 }
 

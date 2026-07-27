@@ -98,6 +98,82 @@ each corpus's shape wants, served through sarun. Three mirrors first:
    gitdepot. `test_mirror_attach_rs.py` proves all three through the
    real CLI. Later: browse panes per mirror.
 
+## Wikipedia correction backlog (2026-07-27 audit)
+
+The first real lvwiki import and a 15-page, high-revision rendering
+sample exposed the following correctness work. These are required
+corrections, not optional tuning:
+
+Completed items below are pinned by regression tests; unchecked items
+remain design or migration work.
+
+### Revision storage
+
+- [x] A fresh page must finish as one standalone f0 plus sealed cold
+  history (or f0 alone for a one-revision page), never with an f1.
+  The transient importer RAM bound must not determine the persistent
+  f1/cold layout. An exceptional huge page may split into several cold
+  frames, but its final partial history must also be cold.
+- [ ] Measure and specify the pretrained f0 dictionaries; the current
+  Wikipedia frame encoder uses none. The design must first resolve
+  per-chain versus per-instance scope, training reservoir/byte caps,
+  dictionary size/count and update lifecycle, then define a versioned
+  f0 envelope plus durable dictionary identity and crash ordering.
+- [x] Wire the depot's streaming frame decoder into Wikipedia history
+  walks so an exceptional cold frame is not materialized whole.
+- [x] A fresh depot index must start small and grow geometrically. Do
+  not preallocate the enwiki-sized 100,000,000-slot/800 MB index.
+- [ ] Provide a safe shrink migration for existing oversized indexes.
+
+### Title storage and lookup
+
+- [x] Title shards grow on demand. When a shard crosses its measured size
+  target, atomically rebuild with twice as many shards and remap every
+  persisted dense title id. Four fixed shards are not an acceptable
+  default.
+- [x] Exact lookup must touch one small shard directly (or the existing
+  keyed title index), not decompress and hash an enormous shard.
+  Remove the 64 MiB whole-dictionary request cache once shard sizing
+  is correct.
+
+### MediaWiki History metadata
+
+- [x] Treat each monthly MediaWiki History release as a reconstructed
+  metadata snapshot. Replacement/reconciliation must be complete and
+  atomic across all published parts; partition changes must not leave
+  stale action or visibility rows.
+- [x] Do not remove archived revision content when later metadata marks a
+  revision suppressed. Suppression is additional archival metadata.
+- [x] Preserve malformed-field evidence and report it explicitly rather
+  than silently coercing records.
+- [ ] Apply page move/deletion events to the browsing title timeline
+  without erasing archaeological content.
+- [ ] The current verbose SQLite representation is intentionally shelved
+  for a separate redesign; do not entrench it while fixing the above.
+
+### Rendering fidelity
+
+Regression fixtures must cover the exact audited failures:
+
+- [x] `mw.html` nil attributes/styles are omitted, never rendered as
+  `id="nil"` or `style="nil"`.
+- [x] `mw.ustring` implements the Unicode pattern behavior needed by
+  Latvian climate templates (including `[-–−—]` replacement).
+- [x] Template redirects transclude their target with caller arguments
+  and retain redirect loop/depth protection.
+- [x] Lua functions may return stringifiable `mw.html` objects while a
+  plain table remains an error.
+- [x] `indicator` is metadata-only; `graph` and `imagemap` receive a safe,
+  unobtrusive fallback instead of leaking raw source.
+- [x] Extension stripping applies inside references, especially `nowiki`.
+- [x] Large valid template invocations such as the audited Wikidata-list
+  SPARQL call must not leak as raw braces/query text.
+- [x] Percent-encoded wiki and file targets are decoded/canonicalized once,
+  never encoded into `%25...`.
+- [x] Same-page fragment links remain `#fragment`.
+- [x] External links stop their URL before an HTML/strip-marker label.
+- [x] Repeated render misses are aggregated by cause and count.
+
 ## Non-goals for now
 
 Provider extradata (issues/PRs), CDP capture, full provider matrix —

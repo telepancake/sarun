@@ -217,7 +217,12 @@ fn parse_nodes(text: &str) -> Vec<Node> {
         match b {
             b'{' => {
                 let n = run_len(bytes, i, b'{');
-                if stack.len() < MAX_PARSE_DEPTH {
+                if n < 2 {
+                    // A single brace is ordinary template-argument text.
+                    // Treating SPARQL/CSS/JSON `{ ... }` as an uncloseable
+                    // Curly(1) frame strands the surrounding `{{Template}}`.
+                    top_text(&mut stack, "{");
+                } else if stack.len() < MAX_PARSE_DEPTH {
                     stack.push(OpenB::new(OpenKind::Curly(n)));
                 } else {
                     // At the cap: keep the braces as literal text rather than
@@ -230,6 +235,10 @@ fn parse_nodes(text: &str) -> Vec<Node> {
             b'}' => {
                 let mut m = run_len(bytes, i, b'}');
                 i += m;
+                if m < 2 {
+                    top_text(&mut stack, "}");
+                    continue;
+                }
                 while m >= 2 {
                     let n = match stack.last().map(|o| o.kind) {
                         Some(OpenKind::Curly(n)) => n,
@@ -622,27 +631,42 @@ fn magic_word(ctx: &mut Ctx, upper: &str, arg: Option<&str>) -> Option<String> {
 }
 
 fn transclude(ctx: &mut Ctx, title_str: &str, arg_parts: &[Part], frame: &Frame) -> String {
-    let title = resolve_title(title_str, TEMPLATE_NS, ctx.site);
-    let prefixed = title.prefixed(ctx.site);
-    if ctx.stack.iter().any(|t| t == &prefixed) {
-        return html::error_box(&format!("Template loop detected: [[{prefixed}]]"));
-    }
-    if ctx.depth >= MAX_DEPTH {
-        return html::error_box(&format!("Template recursion depth limit exceeded ([[{prefixed}]])"));
-    }
-    let body = match ctx.store.page_text(&title) {
-        Some(b) => b,
-        None => {
-            ctx.misses.missing_templates.push(prefixed.clone());
-            return red_link(&title, ctx.site);
+    let mut title = resolve_title(title_str, TEMPLATE_NS, ctx.site);
+    let mut redirect_chain = Vec::new();
+    let (body, prefixed) = loop {
+        let prefixed = title.prefixed(ctx.site);
+        if ctx.stack.iter().any(|t| t == &prefixed)
+            || redirect_chain.iter().any(|t| t == &prefixed)
+        {
+            return html::error_box(&format!("Template loop detected: [[{prefixed}]]"));
         }
+        if ctx.depth as usize + redirect_chain.len() >= MAX_DEPTH as usize {
+            return html::error_box(&format!(
+                "Template recursion depth limit exceeded ([[{prefixed}]])"
+            ));
+        }
+        let body = match ctx.store.page_text(&title) {
+            Some(body) => body,
+            None => {
+                ctx.misses.missing_templates.push(prefixed);
+                return red_link(&title, ctx.site);
+            }
+        };
+        let Some(target) = parse_redirect_with_site(&body, ctx.site) else {
+            break (body, prefixed);
+        };
+        redirect_chain.push(prefixed);
+        title = Title::parse(&target, ctx.site);
     };
+
     let child = build_frame(ctx, &prefixed, arg_parts, frame);
+    let stack_len = ctx.stack.len();
+    ctx.stack.extend(redirect_chain);
     ctx.stack.push(prefixed);
     ctx.depth += 1;
     let out = expand_body(ctx, &body, &child, true);
     ctx.depth -= 1;
-    ctx.stack.pop();
+    ctx.stack.truncate(stack_len);
     out
 }
 
@@ -2190,17 +2214,29 @@ fn set_switch(sw: &mut BehaviorSwitches, word: &str) {
 // Redirects
 // ---------------------------------------------------------------------------
 
-/// Localized `#REDIRECT` synonyms. English first; extend for other wikis
-/// (the depot supplies the localized magic-word list at import).
-const REDIRECT_SYNONYMS: [&str; 1] = ["#redirect"];
-
 /// `#REDIRECT [[Target]]` on RAW wikitext. Case-insensitive; tolerant of
 /// an optional trailing `#section`/`|label` and a leading `:`.
 pub fn parse_redirect(text: &str) -> Option<String> {
+    parse_redirect_if(text, |word| word.eq_ignore_ascii_case("redirect"))
+}
+
+fn parse_redirect_with_site(text: &str, site: &SiteConfig) -> Option<String> {
+    parse_redirect_if(text, |word| {
+        resolve_magic(site, &format!("#{word}")).eq_ignore_ascii_case("#redirect")
+    })
+}
+
+fn parse_redirect_if(text: &str, is_redirect: impl FnOnce(&str) -> bool) -> Option<String> {
     let t = text.trim_start();
-    let lower = t.to_ascii_lowercase();
-    let syn = REDIRECT_SYNONYMS.iter().find(|s| lower.starts_with(**s))?;
-    let rest = &t[syn.len()..];
+    let after_hash = t.strip_prefix('#')?;
+    let word_end = after_hash
+        .find(|c: char| c.is_whitespace() || c == '[')
+        .unwrap_or(after_hash.len());
+    let word = &after_hash[..word_end];
+    if word.is_empty() || !is_redirect(word) {
+        return None;
+    }
+    let rest = &after_hash[word_end..];
     let open = rest.find("[[")?;
     let close = rest[open + 2..].find("]]")?;
     let inner = &rest[open + 2..open + 2 + close];

@@ -4,6 +4,7 @@
 
 use std::io::Read;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
@@ -16,22 +17,15 @@ use crate::error::{Error, Result};
 use crate::import::do_import;
 use crate::schema::META_DDL;
 
-/// Default `max_chain_id` INDEX SIZE HINT for fresh instances: sized
-/// for enwiki (~80M page ids in 2026) with headroom. The cost is the
-/// depot's index file at 8 bytes/chain — 800MB LOGICAL, but the index
-/// is created with `ftruncate` and stays sparse: untouched chains
-/// never allocate a disk block (pinned by the depot's sparse-index
-/// test). It is ONLY a hint: page ids beyond it grow the index
-/// automatically; only ids at/above the depot's 2^40 sanity ceiling
-/// are rejected ([`crate::Error::PageIdOverflow`]).
-pub const DEFAULT_MAX_CHAIN_ID: u64 = 100_000_000;
+/// Legacy initial index-capacity value. Fresh depots now start with
+/// one eight-byte slot and grow geometrically from observed page ids;
+/// the field remains in the public configuration for compatibility.
+pub const DEFAULT_MAX_CHAIN_ID: u64 = 1;
 
 /// The index capacity an EXISTING instance root currently has —
 /// derived from the on-disk depot index (`capacity * 8` bytes). A
 /// fresh root (no index yet) gets [`DEFAULT_MAX_CHAIN_ID`]. The depot
-/// derives capacity from disk and auto-grows, so any hint opens any
-/// root; this helper just keeps a `--max-page-id`-less CLI open from
-/// passing a hint smaller than what the store already holds.
+/// derives capacity from disk and auto-grows.
 pub fn max_chain_id_for_root(root: &std::path::Path) -> u64 {
     std::fs::metadata(root.join("depot").join("index"))
         .map(|m| m.len() / 8)
@@ -61,7 +55,7 @@ pub fn read_config(root: PathBuf) -> InstanceConfig {
             eviction_dead_ratio: 0.5,
         },
         title_shard_count: 0, // derive from the store's persisted count
-        title_seal_threshold_bytes: 8 << 20,
+        title_seal_threshold_bytes: 64 << 10,
         f1_seal_threshold_bytes: 0,
     }
 }
@@ -76,10 +70,9 @@ pub struct InstanceConfig {
     pub root: PathBuf,
     /// Wiki database name, e.g. `"enwiki"`, `"votewiki"`.
     pub dbname: String,
-    /// Initial page-id capacity HINT: sizes a fresh depot index at
-    /// `max_chain_id * 8` sparse bytes. NOT a limit — the index grows
-    /// automatically for larger page ids; only ids at/above the
-    /// depot's 2^40 sanity ceiling are rejected at import.
+    /// Legacy initial-capacity field retained for API compatibility.
+    /// Fresh indexes start at one slot and grow automatically; only
+    /// ids at/above the depot's 2^40 sanity ceiling are rejected.
     pub max_chain_id: u64,
     /// Depot tuning. The implementer can pass this through to
     /// [`DepotConfig`] — `root` is forced to `<root>/depot/`. Tests
@@ -92,13 +85,18 @@ pub struct InstanceConfig {
     /// files are created lazily, so the truth cannot be recovered from
     /// disk — it is persisted in meta.db at creation (the
     /// `title_shard_count` instance flag). 0 = derive: use the
-    /// persisted count (a fresh root gets 4, the CLI default; a legacy
+    /// persisted count (a fresh root gets 256; a legacy
     /// store without the flag counts as 4, the only value the CLI ever
     /// built — a writer open backfills the flag). A nonzero value on
     /// an existing store must MATCH the persisted count —
     /// [`crate::Error::TitleShardMismatch`] otherwise.
     pub title_shard_count: u32,
     /// Strpool seal threshold for the titles pool.
+    ///
+    /// This is also the dynamic re-sharding target. A shard whose file first
+    /// crosses it is sealed, then compared again: doubling is based on the
+    /// resulting compressed physical file size (frames plus footer), not the
+    /// transient plaintext tail size.
     pub title_seal_threshold_bytes: u64,
     /// f1 accumulator seal threshold, in DECOMPRESSED bytes: when
     /// absorbing the spilled head would push the accumulator past this,
@@ -188,14 +186,15 @@ pub struct Instance {
     root: PathBuf,
     /// `Arc` so the streaming [`HistoryIter`] (and its lazy `fetch_text`
     /// closures) can hold the handles across calls without borrowing
-    /// the `Instance` — a history walk is frame-at-a-time, not a
-    /// snapshot of the whole decompressed chain.
+    /// the `Instance` — a history walk is record-at-a-time, not a
+    /// snapshot of a decompressed frame or chain.
     pub(crate) inner: Arc<Mutex<InstanceInner>>,
     /// Read/import page-id clip — always the depot's 2^40 sanity
     /// ceiling (see `open`); ids below it are covered by index growth.
     pub(crate) max_chain_id: u64,
     pub(crate) f1_seal_threshold_bytes: u64,
-    pub(crate) title_shard_count: u32,
+    pub(crate) title_shard_count: AtomicU32,
+    pub(crate) title_shard_target_bytes: u64,
     /// True when the previous session ended dirty (crash between an
     /// import write and a flush): `revisions_seen` may then be AHEAD of
     /// the depot (rows durable, frames lost). Imports repair each
@@ -234,21 +233,15 @@ pub(crate) struct InstanceInner {
     /// same chain-scan repair a suspect open uses (re-derive
     /// `revisions_seen` from the chain), then the page is cleared here.
     pub(crate) errored_pages: std::collections::HashSet<u64>,
-    /// Bounded LRU of decompressed-and-indexed title shards (exact
-    /// title → dense ids). See `titles::TitleCache` — this is what
-    /// makes a render's link set cost at most one shard walk per
-    /// touched shard.
-    pub(crate) title_cache: crate::titles::TitleCache,
     /// The root's flock, held for the instance's lifetime.
     pub(crate) _lock: std::fs::File,
 }
 
 impl InstanceInner {
     /// Dense title-dictionary ids whose pool bytes equal `normalized`
-    /// — the exact-title read primitive. One fnv-picked shard at most;
-    /// cache hits touch no pool file at all.
-    pub(crate) fn title_ids(&mut self, shard_count: u32, normalized: &[u8]) -> Result<Vec<u64>> {
-        self.title_cache.lookup(&self.titles, shard_count, normalized)
+    /// — the exact-title read primitive. It walks one small fnv-picked shard.
+    pub(crate) fn title_ids(&self, shard_count: u32, normalized: &[u8]) -> Result<Vec<u64>> {
+        crate::titles::lookup_ids(&self.titles, shard_count, normalized)
     }
 }
 
@@ -295,7 +288,8 @@ impl Instance {
         let depot = Depot::open(depot_cfg)?;
 
         // Title pool — <root>/titles/.
-        let titles_dir = cfg.root.join("titles");
+        let title_generation = persisted_title_pool_generation(&conn)?;
+        let titles_dir = title_pool_dir(&cfg.root, title_generation);
         let titles = Pool::open(
             &titles_dir,
             PoolConfig {
@@ -304,6 +298,11 @@ impl Instance {
             },
             None,
         )?;
+        // Only a writer collects unselected immutable generations. The
+        // selected pool is already open and is explicitly protected; this
+        // also removes a complete-or-partial generation left by a crash
+        // before the SQLite generation switch.
+        gc_stale_title_generations(&cfg.root, title_generation)?;
 
         let suspect: bool = conn
             .query_row(
@@ -324,7 +323,6 @@ impl Instance {
                 dirty_stamped: false,
                 import_errored: false,
                 errored_pages: Default::default(),
-                title_cache: crate::titles::TitleCache::new(crate::titles::TITLE_CACHE_BUDGET),
                 _lock: lock,
             })),
             suspect,
@@ -339,7 +337,8 @@ impl Instance {
             } else {
                 cfg.f1_seal_threshold_bytes
             },
-            title_shard_count,
+            title_shard_count: AtomicU32::new(title_shard_count),
+            title_shard_target_bytes: cfg.title_seal_threshold_bytes,
             dbname: cfg.dbname,
         })
     }
@@ -395,8 +394,9 @@ impl Instance {
         let mut depot_cfg = cfg.depot;
         depot_cfg.root = cfg.root.join("depot");
         let depot = Depot::open(depot_cfg)?;
+        let title_generation = persisted_title_pool_generation(&conn)?;
         let titles = Pool::open(
-            &cfg.root.join("titles"),
+            &title_pool_dir(&cfg.root, title_generation),
             PoolConfig {
                 shard_count: title_shard_count,
                 seal_threshold_bytes: cfg.title_seal_threshold_bytes,
@@ -423,7 +423,6 @@ impl Instance {
                 dirty_stamped: false,
                 import_errored: false,
                 errored_pages: Default::default(),
-                title_cache: crate::titles::TitleCache::new(crate::titles::TITLE_CACHE_BUDGET),
                 _lock: lock,
             })),
             suspect,
@@ -434,7 +433,8 @@ impl Instance {
             } else {
                 cfg.f1_seal_threshold_bytes
             },
-            title_shard_count,
+            title_shard_count: AtomicU32::new(title_shard_count),
+            title_shard_target_bytes: cfg.title_seal_threshold_bytes,
             dbname: cfg.dbname,
         })
     }
@@ -477,9 +477,10 @@ impl Instance {
 
     /// Iterate all revisions of `page_id`, newest-first (chain order).
     ///
-    /// STREAMING: the iterator holds at most one decompressed frame at a
-    /// time (plus the record anchoring the next frame's refPrefix) and
-    /// decodes metadata only — no text is materialized by iteration.
+    /// STREAMING: the iterator incrementally decodes one record at a
+    /// time. It retains the compressed frame, zstd's decoder window,
+    /// the prior frame's refPrefix record, and the current record, but
+    /// never materializes the whole decompressed f1/cold payload.
     /// Each entry's `fetch_text` re-walks the chain to its record with
     /// an early stop and copies out that one text. The iterator
     /// snapshots f0/f1/cold-head on its first step, so a concurrent
@@ -575,7 +576,7 @@ impl Instance {
         loop {
             let pass = crate::titles::scan_candidates(
                 &g.titles,
-                self.title_shard_count,
+                self.title_shard_count.load(Ordering::Relaxed),
                 &matches,
                 limit - out.len(),
                 window.as_ref(),
@@ -647,7 +648,7 @@ impl Instance {
     fn exact_current_page_id(&self, normalized: &[u8]) -> Result<Option<u64>> {
         let mut g = self.inner.lock().expect("instance mutex poisoned");
         let g = &mut *g;
-        let ids = g.title_ids(self.title_shard_count, normalized)?;
+        let ids = g.title_ids(self.title_shard_count.load(Ordering::Relaxed), normalized)?;
         let mut best: Option<u64> = None;
         for id in &ids {
             let pid: Option<i64> = g
@@ -690,7 +691,7 @@ impl Instance {
     /// persisted at creation, derived (or validated) at every open.
     /// Tests pin that a read-side open of an 8-shard store routes by 8.
     pub fn title_shard_count(&self) -> u32 {
-        self.title_shard_count
+        self.title_shard_count.load(Ordering::Relaxed)
     }
 
     /// The CURRENT title of `page_id` — the reverse of the exact-title
@@ -785,7 +786,7 @@ impl Instance {
     /// covering τ resolves to `None` — it did not exist at τ.
     ///
     /// Resolution is dictionary-first: the trimmed title's fnv-picked
-    /// strpool shard yields its dense ids (one shard walk, cached), and
+    /// strpool shard yields its dense ids (one bounded shard walk), and
     /// every sqlite hop below is an INTEGER-keyed indexed lookup —
     /// `title_intervals.normalized_title` is never scanned. Rows the
     /// dictionary does not know (written outside import; none exist on
@@ -808,7 +809,7 @@ impl Instance {
         let key = title.trim().as_bytes().to_vec();
         let mut g = self.inner.lock().expect("instance mutex poisoned");
         let g = &mut *g;
-        let ids = g.title_ids(self.title_shard_count, &key)?;
+        let ids = g.title_ids(self.title_shard_count.load(Ordering::Relaxed), &key)?;
         let unmapped = has_unmapped_interval_rows(&g.conn)?;
         // The τ window per id: start_ts <= τ AND (end_ts IS NULL OR
         // end_ts > τ), newest interval wins — same window SQL as ever,
@@ -1272,10 +1273,17 @@ impl Instance {
         }
         let mut g = self.inner.lock().expect("instance mutex poisoned");
         g.dirty_stamped = false; // next import re-stamps
-        let g = &*g;
         g.depot.flush()?;
-        for sid in 0..self.title_shard_count {
+        for sid in 0..self.title_shard_count.load(Ordering::Relaxed) {
+            g.titles.maybe_seal(sid)?;
             g.titles.flush(sid)?;
+        }
+        while title_pool_is_oversized(
+            &g.titles,
+            self.title_shard_count.load(Ordering::Relaxed),
+            self.title_shard_target_bytes,
+        )? {
+            self.reshard_titles_once(&mut g)?;
         }
         // sqlite WAL checkpoint — commit boundaries flushed by the
         // per-page transactions; the checkpoint pushes WAL pages to the
@@ -1296,6 +1304,138 @@ impl Instance {
         Ok(())
     }
 
+    /// Rebuild the immutable title-pool generation at twice the current
+    /// shard count, then atomically switch every persisted dense id and the
+    /// generation/count flags in one SQLite commit. The new directory is
+    /// durable before the transaction; a crash before commit leaves the old
+    /// generation selected, and a crash after commit selects the complete
+    /// new one.
+    pub(crate) fn maintain_title_shard(
+        &self,
+        g: &mut InstanceInner,
+        shard_id: u32,
+    ) -> Result<()> {
+        if self.title_shard_target_bytes == 0
+            || g.titles.shard_file_size(shard_id)? <= self.title_shard_target_bytes
+        {
+            return Ok(());
+        }
+        g.titles.maybe_seal(shard_id)?;
+        g.titles.flush(shard_id)?;
+        while title_pool_is_oversized(
+            &g.titles,
+            self.title_shard_count.load(Ordering::Relaxed),
+            self.title_shard_target_bytes,
+        )? {
+            self.reshard_titles_once(g)?;
+        }
+        Ok(())
+    }
+
+    fn reshard_titles_once(&self, g: &mut InstanceInner) -> Result<()> {
+        let old_count = self.title_shard_count.load(Ordering::Relaxed);
+        let new_count = old_count.checked_mul(2).ok_or(Error::Corrupt("title shard count overflow"))?;
+        let generation = next_title_pool_generation(&self.root)?;
+        let new_dir = title_pool_dir(&self.root, generation);
+        let new_pool = Pool::open(
+            &new_dir,
+            PoolConfig {
+                shard_count: new_count,
+                seal_threshold_bytes: self.title_shard_target_bytes,
+            },
+            None,
+        )?;
+
+        g.conn.execute("DROP TABLE IF EXISTS temp.title_id_reshard", [])?;
+        g.conn.execute(
+            "CREATE TEMP TABLE title_id_reshard (
+                old_id INTEGER PRIMARY KEY,
+                new_id INTEGER NOT NULL UNIQUE
+             )",
+            [],
+        )?;
+        {
+            let mut map = g
+                .conn
+                .prepare("INSERT INTO title_id_reshard(old_id, new_id) VALUES(?1, ?2)")?;
+            for old_sid in 0..old_count {
+                // Bound migration memory by one old shard instead of
+                // materializing the wiki's entire title dictionary.
+                let mut entries = Vec::<(u64, Vec<u8>)>::new();
+                g.titles.for_each_in_shard(old_sid, |old_id, bytes| {
+                    entries.push((old_id, bytes.to_vec()));
+                    Ok(())
+                })?;
+                for (old_id, bytes) in entries {
+                    let sid = crate::titles::shard_for(&bytes, new_count);
+                    let new_id = new_pool.append(sid, &bytes)?;
+                    if old_id > i64::MAX as u64 || new_id > i64::MAX as u64 {
+                        return Err(Error::Corrupt("title id exceeds sqlite integer"));
+                    }
+                    map.execute(rusqlite::params![old_id as i64, new_id as i64])?;
+                }
+            }
+        }
+        for sid in 0..new_count {
+            new_pool.maybe_seal(sid)?;
+            new_pool.flush(sid)?;
+        }
+        sync_parent_dir(&new_dir);
+
+        g.conn.execute("BEGIN IMMEDIATE", [])?;
+        let switched = (|| -> Result<()> {
+            // Negative temporary ids cannot collide with any old/new dense
+            // id while primary keys and indexes are maintained in place.
+            for table in ["title_id_to_page", "page_to_title_id", "title_intervals"] {
+                g.conn.execute(
+                    &format!(
+                        "UPDATE {table}
+                         SET title_id = -1 - (
+                           SELECT new_id FROM title_id_reshard m
+                           WHERE m.old_id = {table}.title_id
+                         )
+                         WHERE title_id IS NOT NULL"
+                    ),
+                    [],
+                )?;
+            }
+            for table in ["title_id_to_page", "page_to_title_id", "title_intervals"] {
+                g.conn.execute(
+                    &format!("UPDATE {table} SET title_id = -1 - title_id WHERE title_id < 0"),
+                    [],
+                )?;
+            }
+            g.conn.execute(
+                "INSERT OR REPLACE INTO instance_flags(key, value)
+                 VALUES('title_shard_count', ?1)",
+                [new_count as i64],
+            )?;
+            g.conn.execute(
+                "INSERT OR REPLACE INTO instance_flags(key, value)
+                 VALUES('title_pool_generation', ?1)",
+                [generation as i64],
+            )?;
+            Ok(())
+        })();
+        match switched {
+            Ok(()) => {
+                g.conn.execute("COMMIT", [])?;
+            }
+            Err(e) => {
+                let _ = g.conn.execute("ROLLBACK", []);
+                return Err(e);
+            }
+        }
+
+        g.titles = new_pool;
+        self.title_shard_count.store(new_count, Ordering::Relaxed);
+        // The live handles and SQLite flags now select the new durable
+        // generation. Older generations are no longer rollback state: the
+        // transaction itself is the atomic old/new boundary.
+        gc_stale_title_generations(&self.root, generation)?;
+        Ok(())
+    }
+
     /// Make successfully committed pages durable after the source stream
     /// fails, without clearing the dirty fence. The next attempt/open repairs
     /// bookkeeping from the depot before deduplicating the salvaged prefix.
@@ -1305,7 +1445,7 @@ impl Instance {
         }
         let g = self.inner.lock().expect("instance mutex poisoned");
         g.depot.flush()?;
-        for sid in 0..self.title_shard_count {
+        for sid in 0..self.title_shard_count.load(Ordering::Relaxed) {
             g.titles.flush(sid)?;
         }
         g.conn
@@ -1521,9 +1661,9 @@ fn ensure_title_dictionary_schema(conn: &Connection) -> Result<()> {
 
 /// The shard count every store the pre-persistence CLI ever built
 /// used — the assumed truth for a LEGACY store (meta.db without the
-/// `title_shard_count` flag), and the creation default when a config
-/// says 0 (derive) against a fresh root.
+/// `title_shard_count` flag).
 const LEGACY_TITLE_SHARD_COUNT: u32 = 4;
+const FRESH_TITLE_SHARD_COUNT: u32 = 256;
 
 /// The titles-pool shard count persisted at instance creation
 /// (`instance_flags` key `title_shard_count`), or `None` on a legacy
@@ -1584,7 +1724,18 @@ fn resolve_title_shard_count(
             Ok(on_disk)
         }
         None => {
-            let n = if requested == 0 { LEGACY_TITLE_SHARD_COUNT } else { requested };
+            let has_titles: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM title_id_to_page LIMIT 1)",
+                [],
+                |r| r.get::<_, i64>(0),
+            )? != 0;
+            let n = if requested != 0 {
+                requested
+            } else if has_titles {
+                LEGACY_TITLE_SHARD_COUNT
+            } else {
+                FRESH_TITLE_SHARD_COUNT
+            };
             if may_persist {
                 conn.execute(
                     "INSERT OR REPLACE INTO instance_flags(key, value)
@@ -1593,6 +1744,100 @@ fn resolve_title_shard_count(
                 )?;
             }
             Ok(n)
+        }
+    }
+}
+
+fn persisted_title_pool_generation(conn: &Connection) -> Result<u32> {
+    let generation: Option<i64> = conn
+        .query_row(
+            "SELECT value FROM instance_flags WHERE key = 'title_pool_generation'",
+            [],
+            |r| r.get(0),
+        )
+        .map(Some)
+        .or_else(ignore_no_rows)?;
+    match generation {
+        None => Ok(0),
+        Some(v) if v < 1 || v > u32::MAX as i64 => {
+            Err(Error::Corrupt("title_pool_generation instance flag"))
+        }
+        Some(v) => Ok(v as u32),
+    }
+}
+
+fn title_pool_dir(root: &std::path::Path, generation: u32) -> PathBuf {
+    if generation == 0 {
+        root.join("titles")
+    } else {
+        root.join(format!("titles-g{generation}"))
+    }
+}
+
+fn title_generation_from_entry(entry: &std::fs::DirEntry) -> Option<u32> {
+    let file_type = entry.file_type().ok()?;
+    if !file_type.is_dir() {
+        return None;
+    }
+    let name = entry.file_name();
+    let name = name.to_str()?;
+    if name == "titles" {
+        return Some(0);
+    }
+    let suffix = name.strip_prefix("titles-g")?;
+    let generation: u32 = suffix.parse().ok()?;
+    (generation >= 1 && generation.to_string() == suffix).then_some(generation)
+}
+
+/// Remove only recognized, unselected immutable title-pool generations.
+/// The selected generation is never a deletion candidate. Symlinks and
+/// unrelated `titles-*` directories are deliberately ignored.
+fn gc_stale_title_generations(root: &std::path::Path, selected: u32) -> Result<()> {
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        let Some(generation) = title_generation_from_entry(&entry) else {
+            continue;
+        };
+        if generation != selected {
+            std::fs::remove_dir_all(entry.path())?;
+        }
+    }
+    sync_parent_dir(&title_pool_dir(root, selected));
+    Ok(())
+}
+
+fn next_title_pool_generation(root: &std::path::Path) -> Result<u32> {
+    let mut max_generation = 0u32;
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if let Some(raw) = name.strip_prefix("titles-g") {
+            if let Ok(n) = raw.parse::<u32>() {
+                max_generation = max_generation.max(n);
+            }
+        }
+    }
+    max_generation.checked_add(1).ok_or(Error::Corrupt("title pool generation overflow"))
+}
+
+fn title_pool_is_oversized(pool: &Pool, shard_count: u32, target: u64) -> Result<bool> {
+    if target == 0 {
+        return Ok(false);
+    }
+    for sid in 0..shard_count {
+        if pool.shard_file_size(sid)? > target {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn sync_parent_dir(path: &std::path::Path) {
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
         }
     }
 }
@@ -1617,15 +1862,17 @@ fn has_unmapped_interval_rows(conn: &Connection) -> Result<bool> {
 // cold frame is a sealed former accumulator, anchored on the OLDEST
 // record of the next-newer frame — exactly the last record this
 // newest-first walk yielded before crossing the frame boundary. The
-// walk therefore streams: ONE decompressed frame resident at a time,
-// plus the (record-sized) anchor carried across the boundary. Reads
+// walk therefore streams without materializing a decompressed frame.
+// It retains the compressed frame, zstd's window, the prior frame's
+// anchor, and the current record; that record becomes the next anchor
+// when it is the frame's oldest. Reads
 // that used to `collect_records` the whole decompressed history now pay
 // for the frames up to their early stop and nothing past it.
 // ---------------------------------------------------------------------
 
 /// Resumable newest-first record walk over one chain. Drive it with
 /// [`WalkState::next_record`]; the yielded slice borrows the walk's
-/// current frame buffer — decode it meta-only and copy out at most the
+/// current record buffer — decode it meta-only and copy out at most the
 /// ONE text the read wants.
 pub(crate) struct WalkState {
     chain_id: u64,
@@ -1641,13 +1888,14 @@ pub(crate) struct WalkState {
 enum WalkFrame {
     Start,
     InFrame {
-        /// Decompressed records of the current frame, newest-first.
-        raw: Vec<u8>,
-        /// Byte offset just past the last yielded record.
-        pos: usize,
-        /// Byte offset of the last yielded record — at frame end this
-        /// is the frame's oldest record, the next frame's anchor.
-        last: usize,
+        /// Incremental zstd decode state. The decompressed frame is
+        /// never materialized; the decoder retains its compressed
+        /// bytes and, where required, the preceding record as refPrefix.
+        decoder: wikimak_depot::OwnedFrameDecoder,
+        /// The current/last-yielded record. While the frame is active
+        /// this is the caller-visible buffer; at frame end its final
+        /// value becomes the next frame's refPrefix anchor.
+        record: Vec<u8>,
         /// Compressed f1 frame captured by an eager snapshot, not yet
         /// walked (Some only while still inside f0).
         pending_f1: Option<Vec<u8>>,
@@ -1687,40 +1935,39 @@ impl WalkState {
                         }
                         Err(e) => return Err(e.into()),
                     };
-                    let raw = crate::frames::decompress(&f0, None)?;
                     let (pending_f1, cold) = if self.eager {
                         (depot.read_f1(self.chain_id)?, Some(depot.cold_cursor(self.chain_id)?))
                     } else {
                         (None, None)
                     };
-                    self.frame = WalkFrame::InFrame { raw, pos: 0, last: 0, pending_f1, cold };
+                    let decoder = wikimak_depot::OwnedFrameDecoder::new(f0, None)
+                        .map_err(|_| Error::Codec("zstd decompress"))?;
+                    self.frame =
+                        WalkFrame::InFrame { decoder, record: Vec::new(), pending_f1, cold };
                 }
-                WalkFrame::InFrame { raw, pos, .. } if *pos < raw.len() => break,
-                WalkFrame::InFrame { .. } => self.advance_frame(depot)?,
+                WalkFrame::InFrame { decoder, record, .. } => {
+                    if read_revision_record(decoder, record)? {
+                        break;
+                    }
+                    self.advance_frame(depot)?;
+                }
             }
         }
-        // Yield phase, separated from the state mutation so the borrow
-        // of `raw` doesn't pin the whole loop.
-        let WalkFrame::InFrame { raw, pos, last, .. } = &mut self.frame else { unreachable!() };
-        let len = crate::revision::record_len(raw, *pos)?;
-        *last = *pos;
-        *pos += len;
-        let (last, pos) = (*last, *pos);
-        Ok(Some(&raw[last..pos]))
+        let WalkFrame::InFrame { record, .. } = &self.frame else { unreachable!() };
+        Ok(Some(record))
     }
 
     /// Cross a frame boundary: the current frame is exhausted; its
     /// oldest record anchors the next frame's refPrefix decode.
     fn advance_frame(&mut self, depot: &Depot) -> Result<()> {
-        let WalkFrame::InFrame { raw, last, pending_f1, cold, .. } =
+        let WalkFrame::InFrame { record, pending_f1, cold, .. } =
             std::mem::replace(&mut self.frame, WalkFrame::Done)
         else {
             return Ok(());
         };
-        // Keep only the oldest record as the anchor; the frame buffer
-        // itself is dropped before the next frame is decompressed.
-        let anchor = raw[last..].to_vec();
-        drop(raw);
+        // At EOF `record` is the oldest record yielded from this frame,
+        // exactly the refPrefix anchor for the next frame.
+        let anchor = record;
         // Where are we? `pending_f1 = Some` ⇔ eager walk still in f0
         // with a captured f1. `cold = None` ⇔ lazy walk still in f0
         // (f1 unread — a head read that stopped there never touched
@@ -1736,21 +1983,97 @@ impl WalkState {
             None => depot.cold_cursor(self.chain_id)?,
         };
         if let Some(f1) = pending_f1 {
-            let raw = crate::frames::decompress(&f1, Some(&anchor))?;
-            self.frame =
-                WalkFrame::InFrame { raw, pos: 0, last: 0, pending_f1: None, cold: Some(cold) };
+            let decoder = wikimak_depot::OwnedFrameDecoder::new(f1, Some(anchor))
+                .map_err(|_| Error::Codec("zstd decompress"))?;
+            self.frame = WalkFrame::InFrame {
+                decoder,
+                record: Vec::new(),
+                pending_f1: None,
+                cold: Some(cold),
+            };
             return Ok(());
         }
         match depot.cold_next(&mut cold)? {
             Some(frame) => {
-                let raw = crate::frames::decompress(&frame, Some(&anchor))?;
-                self.frame =
-                    WalkFrame::InFrame { raw, pos: 0, last: 0, pending_f1: None, cold: Some(cold) };
+                let decoder = wikimak_depot::OwnedFrameDecoder::new(frame, Some(anchor))
+                    .map_err(|_| Error::Codec("zstd decompress"))?;
+                self.frame = WalkFrame::InFrame {
+                    decoder,
+                    record: Vec::new(),
+                    pending_f1: None,
+                    cold: Some(cold),
+                };
             }
             None => self.frame = WalkFrame::Done,
         }
         Ok(())
     }
+}
+
+/// Decode one self-delimiting revision record from a zstd frame.
+/// `false` means clean frame EOF before any byte of another record;
+/// EOF inside a record is corruption. The buffer grows only to the
+/// largest single record, never to the decompressed frame size.
+fn read_revision_record(
+    decoder: &mut wikimak_depot::OwnedFrameDecoder,
+    record: &mut Vec<u8>,
+) -> Result<bool> {
+    const FIXED: usize = 4 + 4 + 8 + 8 + 8 + 8 + 1;
+    // Probe EOF before clearing the last record: at a frame boundary
+    // that record is still needed as the next frame's refPrefix.
+    let mut first = [0u8; 1];
+    if decoder.read(&mut first)? == 0 {
+        return Ok(false);
+    }
+    record.clear();
+    record.push(first[0]);
+    read_record_bytes(decoder, record, FIXED - 1)?;
+    for _ in 0..4 {
+        let mut len = 0u64;
+        let mut shift = 0u32;
+        loop {
+            read_record_bytes(decoder, record, 1)?;
+            let b = *record.last().expect("one byte appended");
+            if shift == 63 && b & 0xfe != 0 {
+                return Err(Error::Codec("record varint overflow"));
+            }
+            len |= ((b & 0x7f) as u64) << shift;
+            if b & 0x80 == 0 {
+                break;
+            }
+            shift += 7;
+            if shift >= 64 {
+                return Err(Error::Codec("record varint overflow"));
+            }
+        }
+        let len = usize::try_from(len).map_err(|_| Error::Codec("record field too large"))?;
+        read_record_bytes(decoder, record, len)?;
+    }
+    Ok(true)
+}
+
+/// Append exactly `len` decompressed bytes. EOF here is always
+/// corruption; clean frame EOF is probed before a record begins.
+fn read_record_bytes(
+    decoder: &mut wikimak_depot::OwnedFrameDecoder,
+    record: &mut Vec<u8>,
+    len: usize,
+) -> Result<()> {
+    record
+        .try_reserve(len)
+        .map_err(|_| Error::Codec("record field too large"))?;
+    let mut scratch = [0u8; 64 << 10];
+    let mut left = len;
+    while left > 0 {
+        let want = left.min(scratch.len());
+        let n = decoder.read(&mut scratch[..want])?;
+        if n == 0 {
+            return Err(Error::Codec("truncated revision record"));
+        }
+        record.extend_from_slice(&scratch[..n]);
+        left -= n;
+    }
+    Ok(())
 }
 
 /// Find `rev_id` on the chain: newest-first early-stopping walk,
@@ -1776,8 +2099,10 @@ pub(crate) fn find_revision(
 /// Stream the WHOLE chain and pick argmax over `(ts, rev_id)` among
 /// records with `ts ≤ τ` (all records for `None` τ) — the fallback for
 /// pages whose sqlite rows can't answer. `each` sees every record's
-/// `(rev_id, ts)` (the ts backfill hook). At most one frame plus the
-/// current best record's text (when `want_text`) is resident.
+/// `(rev_id, ts)` (the ts backfill hook). Besides zstd's decoder
+/// window, the current compressed frame and its optional preceding-record
+/// refPrefix, at most one decoded record plus the current best record's
+/// text (when `want_text`) is resident.
 pub(crate) fn scan_best(
     depot: &Depot,
     chain_id: u64,
@@ -1824,7 +2149,7 @@ impl Iterator for HistoryWalk {
                 Err(e) => return Some(Err(e)),
             };
             match crate::revision::decode_revision_view(rec) {
-                Ok((meta, _text)) => meta, // text stays in the frame buffer
+                Ok((meta, _text)) => meta, // text stays in the record buffer
                 Err(e) => return Some(Err(e)),
             }
         };
@@ -1839,5 +2164,49 @@ impl Iterator for HistoryWalk {
             }
         });
         Some(Ok(HistoryEntry { meta, fetch_text }))
+    }
+}
+
+#[cfg(test)]
+mod streaming_record_tests {
+    use super::read_revision_record;
+
+    fn record(text: &[u8]) -> Vec<u8> {
+        let mut out = vec![0u8; 4 + 4 + 8 + 8 + 8 + 8 + 1];
+        out.extend_from_slice(&[0, 0, 0]);
+        crate::revision::encode_varint(text.len() as u64, &mut out);
+        out.extend_from_slice(text);
+        out
+    }
+
+    #[test]
+    fn large_frame_does_not_accumulate_decompressed_records() {
+        let one = record(b"small immutable revision");
+        let count = 200_000usize;
+        let mut raw = Vec::with_capacity(one.len() * count);
+        for _ in 0..count {
+            raw.extend_from_slice(&one);
+        }
+        assert!(raw.len() > 10 << 20);
+        let frame = crate::frames::compress(&raw, None).unwrap();
+        let mut decoder = wikimak_depot::OwnedFrameDecoder::new(frame, None).unwrap();
+        let mut rec = Vec::new();
+        let mut seen = 0usize;
+        while read_revision_record(&mut decoder, &mut rec).unwrap() {
+            assert_eq!(rec, one);
+            assert!(rec.capacity() < 1024, "record buffer accumulated decompressed records");
+            seen += 1;
+        }
+        assert_eq!(seen, count);
+    }
+
+    #[test]
+    fn truncated_record_is_not_accepted_as_frame_eof() {
+        let mut raw = record(b"payload");
+        raw.pop();
+        let frame = crate::frames::compress(&raw, None).unwrap();
+        let mut decoder = wikimak_depot::OwnedFrameDecoder::new(frame, None).unwrap();
+        let err = read_revision_record(&mut decoder, &mut Vec::new()).unwrap_err();
+        assert!(matches!(err, crate::Error::Codec("truncated revision record")));
     }
 }

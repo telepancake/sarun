@@ -49,10 +49,9 @@ pub struct ImportStats {
   depot/              # wikimak_depot::Depot::open(this)
     index
     f0/  f1/  cold/
-  titles/             # strpool::Pool::open(this); shard count tuned per wiki,
-                      # persisted at creation (meta.db 'title_shard_count' flag
-                      # — lookups route by fnv % count, so it is store truth;
-                      # legacy stores without the flag count as 4)
+  titles/             # generation 0 (legacy-compatible)
+  titles-gN/          # immutable re-sharded generations; meta.db atomically
+                      # selects generation and count after dense-id remapping
     shard-NNNN
   meta.db             # rusqlite: title intervals, categories, part watermarks,
                       # siteinfo timeline, page id ↔ chain id map
@@ -61,9 +60,9 @@ pub struct ImportStats {
 ## Page → chain mapping
 
 The depot uses `u64 chain_id`. Wikipedia page ids are `i64`. Mapping:
-`chain_id = page_id as u64`. `max_chain_id` is only the fresh index's
-size hint: the depot's sparse index auto-grows for page ids beyond it,
-so there is no user-visible capacity knob. A page id at or above the
+`chain_id = page_id as u64`. The depot index starts at one slot and
+auto-grows geometrically for observed page ids, so there is no
+user-visible capacity knob. A page id at or above the
 depot's 2^40 sanity ceiling (a corrupt id, not a big wiki) is rejected
 LOUDLY at import time, before any write for that page. (No silent
 remapping, no silent skipping.)
@@ -90,13 +89,14 @@ data. The depot doesn't care.
 A FRESH page (empty chain — the bulk-import common case) is built
 FORWARD (depot SPEC §"Bulk forward construction"): the dump's
 oldest-first revisions stream through in ingest-RAM-bound batches, each
-full batch landing as ONE cold frame written ONCE (the batch's newest
+exceptional full batch landing as ONE cold frame written ONCE (the batch's newest
 record is excluded — it is the frame's refPrefix anchor and carries into
 the next batch as its oldest record, reproducing the newest-first read
-walk's anchor invariant in dump order), and the final tail lands as
-f0/f1 at the commit (the depot index flip). History write amplification
-is 1.0, measured in the forward_build tests. A page whose chain already
-exists (update mode) takes the prepend path.
+walk's anchor invariant in dump order). At commit, the newest revision
+lands alone in f0 and all older revisions in the final tail are sealed
+as one cold frame. Fresh construction never creates mutable f1. History
+write amplification is 1.0, measured in the forward_build tests. A page
+whose chain already exists (update mode) takes the prepend path.
 
 ## sqlite schema (sketch)
 

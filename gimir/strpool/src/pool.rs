@@ -73,6 +73,15 @@ impl Pool {
         Ok(g.entry_count)
     }
 
+    /// Current physical length of one shard file. Missing lazy shards are
+    /// zero bytes. Callers use this measured value to decide when a pool
+    /// should be rebuilt at a finer shard count.
+    pub fn shard_file_size(&self, shard_id: u32) -> Result<u64> {
+        let shard = self.shard(shard_id)?;
+        let g = shard.lock().expect("shard mutex poisoned");
+        Ok(g.file_size)
+    }
+
     pub fn append(&self, shard_id: u32, s: &[u8]) -> Result<u64> {
         let shard = self.shard(shard_id)?;
         let mut g = shard.lock().expect("shard mutex poisoned");

@@ -190,8 +190,9 @@ impl LuaInvoker {
             );
 
             let ret: Value = func.call(main_frame)?;
+            let output = coerce_return(ret);
             lua.remove_hook();
-            coerce_return(ret)
+            output
         })
     }
 }
@@ -294,6 +295,36 @@ fn coerce_return(v: Value) -> mlua::Result<String> {
         Value::Number(n) => n.to_string(),
         Value::Boolean(b) => b.to_string(),
         Value::Nil => String::new(),
+        Value::Table(t) => {
+            let tostring = t
+                .metatable()
+                .and_then(|mt| mt.raw_get::<Value>("__tostring").ok())
+                .and_then(|v| match v {
+                    Value::Function(f) => Some(f),
+                    _ => None,
+                });
+            match tostring {
+                Some(f) => f.call::<String>(t)?,
+                None => {
+                    return Err(LuaError::RuntimeError(
+                        "Script error: the invoked function returned a table value; it must return a string."
+                            .to_string(),
+                    ))
+                }
+            }
+        }
+        Value::UserData(u) => {
+            let tostring = u.metatable()?.get::<Value>("__tostring")?;
+            match tostring {
+                Value::Function(f) => f.call::<String>(u)?,
+                _ => {
+                    return Err(LuaError::RuntimeError(
+                        "Script error: the invoked function returned a userdata value; it must return a string."
+                            .to_string(),
+                    ))
+                }
+            }
+        }
         other => {
             return Err(LuaError::RuntimeError(format!(
                 "Script error: the invoked function returned a {} value; it must return a string.",

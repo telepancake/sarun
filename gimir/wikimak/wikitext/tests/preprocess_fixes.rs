@@ -62,6 +62,7 @@ fn localized_site() -> SiteConfig {
         ("switch", &["בחר", "switch"], false),
         ("invoke", &["invoke"], false),
         ("safesubst", &["ס בטוח:", "SAFESUBST:"], false),
+        ("redirect", &["PĀRADRESĀCIJA", "REDIRECT"], false),
         ("pagename", &["שם הדף", "PAGENAME"], true),
         ("!", &["!"], true),
     ]);
@@ -213,4 +214,39 @@ fn self_closing_nowiki_disappears_without_corrupting_later_nowiki() {
     // The paired nowiki is protected verbatim (restored after expansion);
     // the self-closing one vanished.
     assert_eq!(out, "ab <nowiki>{{x}}</nowiki> c");
+}
+
+#[test]
+fn single_braces_inside_large_template_arguments_stay_literal() {
+    let mut s = MockStore::new();
+    s.template("Wikidata list", "LIST:{{{section|missing}}}");
+    let invocation = r#"{{Wikidata list
+|sparql=SELECT ?item WHERE {
+  VALUES ?kind { wd:Q1 wd:Q2 } .
+  OPTIONAL { ?item wdt:P31 ?kind }
+}
+|section=Rīga
+}}"#;
+    assert_eq!(xt(&s, invocation), "LIST:Rīga");
+}
+
+#[test]
+fn template_redirects_follow_target_with_args() {
+    let mut s = MockStore::new();
+    s.template("Alias", "#REDIRECT [[Template:Target]]");
+    s.template("Target", "target={{{1|missing}}}");
+    assert_eq!(xt(&s, "{{Alias|ok}}"), "target=ok");
+}
+
+#[test]
+fn localized_template_redirect_and_redirect_loop() {
+    let mut s = MockStore::new();
+    s.site = localized_site();
+    s.template("Alias", "#PĀRADRESĀCIJA [[Template:Target]]");
+    s.template("Target", "localized");
+    assert_eq!(xt(&s, "{{Alias}}"), "localized");
+
+    s.template("A", "#REDIRECT [[Template:B]]");
+    s.template("B", "#PĀRADRESĀCIJA [[Template:A]]");
+    assert!(xt(&s, "{{A}}").contains("Template loop detected"));
 }

@@ -98,21 +98,32 @@ fn batch_import_equals_sequential_imports() {
     assert_eq!(ha.len(), N);
     assert_eq!(ha, hb, "batch and sequential stores decode differently");
 
-    // One batch = ONE prepend: sealing is decided BETWEEN prepends,
-    // so a single batch import must NOT have split itself into cold
-    // frames, however small the threshold.
+    // A fresh batch constructs immutable history directly: f0 holds
+    // the newest revision and the rest are sealed in cold, regardless
+    // of the mutable f1 threshold.
     let cold = tmp_a.path().join("depot/cold/cold");
-    assert_eq!(cold.metadata().map(|m| m.len()).unwrap_or(0), 0,
-               "single-batch import sealed mid-batch — batches must never split");
+    let cold_before = cold.metadata().map(|m| m.len()).unwrap_or(0);
+    assert!(cold_before > 0, "fresh batch history was not sealed to cold");
+    assert_eq!(
+        std::fs::read_dir(tmp_a.path().join("depot/f1"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .count(),
+        0,
+        "fresh batch must not leave an f1 accumulator"
+    );
 
-    // The NEXT prepend sees the oversized old accumulator and seals it
-    // whole: import one more revision.
+    // The next import creates the mutable update accumulator while the
+    // already sealed initial history remains intact.
     let mut stream = new_page_stream(Cursor::new(export_xml(N + 1, N + 1).into_bytes()));
     let stats = a.import(&mut stream).unwrap();
     assert_eq!(stats.revisions_new, 1);
     a.flush().unwrap();
-    assert!(cold.metadata().map(|m| m.len()).unwrap_or(0) > 0,
-            "oversized old accumulator not sealed at the next prepend");
+    assert_eq!(
+        cold.metadata().map(|m| m.len()).unwrap_or(0),
+        cold_before,
+        "an ordinary update must not rewrite initial cold history"
+    );
     let ha2 = history(&a);
     assert_eq!(ha2.len(), N + 1, "post-seal read-back lost records");
 }

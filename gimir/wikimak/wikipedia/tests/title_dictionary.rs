@@ -85,8 +85,9 @@ fn fixture_titles(n: u64) -> Vec<(String, u64)> {
 // exact_lookup_touches_exactly_one_shard
 //
 // An exact title lookup (τ and head form) walks the fnv-picked shard
-// ONCE, no other shard ever; the repeat lookup is served from the
-// bounded shard cache with ZERO pool walks. This also pins the
+// ONCE, no other shard ever. Repeated lookups deliberately rescan that
+// small shard: dynamic re-sharding bounds it, so there is no expanded
+// whole-shard cache. This also pins the
 // read-side fnv/shard-picker parity with import: a divergence would
 // look up the wrong shard and miss.
 // ---------------------------------------------------------------------------
@@ -112,18 +113,18 @@ fn exact_lookup_touches_exactly_one_shard() {
         "exact lookup walked exactly ONE shard, once (delta {delta:?})"
     );
 
-    // Same title again — cache hit, no pool I/O at all.
+    // Same title and head-form lookup each scan only their selected shard.
     let got = inst.page_id_by_title_at("Topic Page 7", Some(tau())).expect("lookup");
     assert_eq!(got, Some(7));
-    // Head-form (τ = None) exact resolution of a title in the SAME
-    // shard is a probe of the cached map too.
     let head = inst.page_id_by_title_at("Topic Page 7", None).expect("lookup");
     assert_eq!(head, Some(7));
     let after2 = inst.title_scan_counts();
-    assert_eq!(after2, after, "repeat lookups re-walk nothing");
+    let repeat_delta: Vec<u64> =
+        after2.iter().zip(&after).map(|(a, b)| a - b).collect();
+    assert_eq!(repeat_delta.iter().sum::<u64>(), 2);
+    assert_eq!(repeat_delta.iter().filter(|&&n| n != 0).count(), 1);
 
-    // A MISS in an already-cached shard also costs zero walks: at τ,
-    // an unknown title resolves to None without any pool scan.
+    // A miss also costs at most its one selected shard.
     let miss = inst.page_id_by_title_at("Topic Page 7 (disambiguation)", Some(tau()));
     let miss_delta: u64 = inst
         .title_scan_counts()
@@ -433,15 +434,14 @@ fn retitle_in_place_rekeys_the_interval() {
 }
 
 // ---------------------------------------------------------------------------
-// render_walks_each_touched_shard_at_most_once
+// render_resolves_links_with_direct_small_shard_scans
 //
 // A τ render of a page with many links resolves its whole link set
-// through the bounded shard cache: each touched shard is decompressed
-// at most ONCE for the render, and a repeat render re-walks nothing.
+// with direct one-shard exact lookups and no expanded dictionary cache.
 // ---------------------------------------------------------------------------
 #[cfg(feature = "serve")]
 #[test]
-fn render_walks_each_touched_shard_at_most_once() {
+fn render_resolves_links_with_direct_small_shard_scans() {
     use wikimak_wikipedia::asof::AsOfView;
     use wikimak_wikitext::{render, PageStore, RenderOptions, Title};
 
@@ -476,17 +476,9 @@ fn render_walks_each_touched_shard_at_most_once() {
     );
     let after = inst.title_scan_counts();
     let delta: Vec<u64> = after.iter().zip(&base).map(|(a, b)| a - b).collect();
-    assert!(
-        delta.iter().all(|&d| d <= 1),
-        "each touched shard decompressed at most once per render (delta {delta:?})"
-    );
-    assert!(delta.iter().sum::<u64>() >= 1, "the render did touch the pool");
+    assert!(delta.iter().sum::<u64>() >= 24, "links used direct shard scans");
 
-    // Second render: the shard cache is warm, zero pool walks.
+    // No expanded dictionary cache survives the render.
     let _ = render_at(Some(tau()));
-    assert_eq!(
-        inst.title_scan_counts(),
-        after,
-        "repeat render is served entirely from the shard cache"
-    );
+    assert!(inst.title_scan_counts().iter().zip(&after).any(|(a, b)| a > b));
 }

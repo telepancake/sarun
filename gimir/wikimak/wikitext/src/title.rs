@@ -44,7 +44,12 @@ impl Title {
 
     /// Full parse exposing the leading-colon flag as well.
     pub fn parse_full(raw: &str, site: &SiteConfig) -> (Title, Option<String>, bool) {
-        let mut s = raw.trim();
+        // Dump-generated wikitext (notably Listeria lists) sometimes carries
+        // URL-encoded title and file parameters. MediaWiki canonicalizes
+        // those before namespace/title parsing; without this pass the link
+        // renderer encodes `%` again and produces `%25C4%25AB`.
+        let decoded = percent_decode_utf8(raw.trim());
+        let mut s = decoded.as_str();
         let leading_colon = s.starts_with(':');
         if leading_colon {
             s = s[1..].trim_start();
@@ -97,6 +102,54 @@ impl Title {
             Some(ns) if !ns.canonical.is_empty() => format!("{}:{}", ns.canonical, self.text),
             _ => self.text.clone(),
         }
+    }
+}
+
+/// Decode valid `%HH` UTF-8 runs once, preserving malformed escapes and
+/// invalid UTF-8 byte runs verbatim. Title parsing is not URL parsing: `+`
+/// remains a literal plus.
+pub(crate) fn percent_decode_utf8(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = String::with_capacity(raw.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'%' || i + 2 >= bytes.len() {
+            let ch = raw[i..].chars().next().expect("i is a character boundary");
+            out.push(ch);
+            i += ch.len_utf8();
+            continue;
+        }
+
+        let start = i;
+        let mut decoded = Vec::new();
+        while i + 2 < bytes.len() && bytes[i] == b'%' {
+            let Some(hi) = hex_value(bytes[i + 1]) else {
+                break;
+            };
+            let Some(lo) = hex_value(bytes[i + 2]) else {
+                break;
+            };
+            decoded.push((hi << 4) | lo);
+            i += 3;
+        }
+        if decoded.is_empty() {
+            out.push('%');
+            i = start + 1;
+        } else if let Ok(text) = std::str::from_utf8(&decoded) {
+            out.push_str(text);
+        } else {
+            out.push_str(&raw[start..i]);
+        }
+    }
+    out
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
     }
 }
 

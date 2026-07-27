@@ -209,12 +209,10 @@ impl DepotInner {
             std::fs::write(&format_path, format!("{FORMAT_VERSION}\n"))?;
         }
 
-        // Index: sparse mmap'd array of 8-byte slots. `cfg.max_chain_id`
-        // is only the INITIAL size hint for a fresh depot; an existing
-        // index keeps the capacity its on-disk length records (the
-        // config is never a mismatch), and a write to a chain id beyond
-        // capacity grows the file — ftruncate, so it stays sparse. See
-        // SPEC §"Index".
+        // Index: mmap'd array of 8-byte slots. A fresh depot starts at
+        // one slot; the first write grows it geometrically to cover the
+        // actual chain id. Existing indexes retain their on-disk
+        // capacity for compatibility. See SPEC §"Index".
         let index_file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -223,9 +221,8 @@ impl DepotInner {
             .open(&index_path)?;
         let current = index_file.metadata()?.len();
         let slots = if current == 0 {
-            let hint = cfg.max_chain_id.clamp(1, crate::CHAIN_ID_CEILING);
-            index_file.set_len(hint * INDEX_ENTRY_LEN as u64)?;
-            hint
+            index_file.set_len(INDEX_ENTRY_LEN as u64)?;
+            1
         } else {
             if current % INDEX_ENTRY_LEN as u64 != 0 {
                 return Err(Error::IndexSizeMismatch);

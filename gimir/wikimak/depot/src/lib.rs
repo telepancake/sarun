@@ -89,10 +89,10 @@ pub enum Error {
 pub struct DepotConfig {
     /// Root directory holding `format`, `index`, `f0/`, `f1/`, `cold/cold`.
     pub root: PathBuf,
-    /// INITIAL chain-id capacity hint: a fresh depot's index is created
-    /// at `max_chain_id * 8` bytes (ftruncate — born and stays sparse).
-    /// An existing depot derives its capacity from the on-disk index
-    /// length; a write to a chain id beyond capacity GROWS the index
+    /// Legacy initial-capacity field, retained for API compatibility.
+    /// Fresh depots start with one slot regardless of this value.
+    /// Existing depots derive capacity from the on-disk index length;
+    /// a write to a chain id beyond capacity GROWS the index
     /// (to `next_power_of_two(id+1)`, at least doubling) under the
     /// depot lock. Only ids at or above [`CHAIN_ID_CEILING`] are
     /// rejected ([`Error::ChainIdOutOfRange`]) — a knob-free importer
@@ -701,6 +701,86 @@ impl<'a> FrameDecoder<'a> {
 }
 
 impl std::io::Read for FrameDecoder<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.done || buf.is_empty() {
+            return Ok(0);
+        }
+        let mut input = zstd::zstd_safe::InBuffer::around(&self.frame[self.pos..]);
+        let mut output = zstd::zstd_safe::OutBuffer::around(&mut buf[..]);
+        loop {
+            let hint = self
+                .dctx
+                .decompress_stream(&mut output, &mut input)
+                .map_err(|c| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        zstd::zstd_safe::get_error_name(c),
+                    )
+                })?;
+            if hint == 0 {
+                self.done = true;
+                break;
+            }
+            if output.pos() == output.capacity() || output.pos() > 0 && input.pos() == input.src.len()
+            {
+                break;
+            }
+            if input.pos() == input.src.len() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "truncated zstd frame",
+                ));
+            }
+        }
+        self.pos += input.pos();
+        Ok(output.pos())
+    }
+}
+
+/// Owned form of [`FrameDecoder`] for resumable readers that must keep
+/// decoder state beside the compressed frame and refPrefix. The regular
+/// decoder is preferable for a single lexical read; this form exists for
+/// state machines that yield between records without materializing the
+/// decompressed frame.
+pub struct OwnedFrameDecoder {
+    // Drop order is significant: the zstd context borrows `prefix`, so it
+    // must be destroyed before the backing allocation.
+    dctx: zstd::zstd_safe::DCtx<'static>,
+    _prefix: Option<Box<[u8]>>,
+    frame: Box<[u8]>,
+    pos: usize,
+    done: bool,
+}
+
+impl OwnedFrameDecoder {
+    pub fn new(
+        frame: Vec<u8>,
+        prefix: Option<Vec<u8>>,
+    ) -> std::result::Result<Self, String> {
+        let err = |c| zstd::zstd_safe::get_error_name(c).to_string();
+        let prefix = prefix.map(Vec::into_boxed_slice);
+        let mut dctx = zstd::zstd_safe::DCtx::create();
+        if let Some(p) = prefix.as_deref() {
+            // SAFETY: the bytes live in a boxed slice and are never mutated
+            // or replaced. `dctx` is declared before `prefix`, hence is
+            // dropped first. Moving this struct moves only the Box handle,
+            // not its allocation. The reference therefore remains valid for
+            // exactly as long as the zstd context can use it.
+            let stable: &'static [u8] =
+                unsafe { std::slice::from_raw_parts(p.as_ptr(), p.len()) };
+            dctx.ref_prefix(stable).map_err(err)?;
+        }
+        Ok(Self {
+            dctx,
+            _prefix: prefix,
+            frame: frame.into_boxed_slice(),
+            pos: 0,
+            done: false,
+        })
+    }
+}
+
+impl std::io::Read for OwnedFrameDecoder {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if self.done || buf.is_empty() {
             return Ok(0);

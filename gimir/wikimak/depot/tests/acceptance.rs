@@ -49,13 +49,14 @@ fn open_creates_layout() {
     })
     .expect("open should succeed on a fresh root");
 
-    // index file exists at exactly max_chain_id * 8 zero-bytes.
+    // A fresh index contains only slot zero; configuration does not
+    // reserve capacity.
     let index_path = root.join("index");
     let index_bytes = std::fs::read(&index_path).expect("index file must exist");
     assert_eq!(
         index_bytes.len() as u64,
-        max_chain_id * INDEX_ENTRY_LEN as u64,
-        "index file size must be max_chain_id * 8"
+        INDEX_ENTRY_LEN as u64,
+        "fresh index must contain one eight-byte slot"
     );
     assert!(index_bytes.iter().all(|&b| b == 0), "index must be zeroed");
 
@@ -380,11 +381,11 @@ fn no_flush_may_lose() {
 }
 
 // ---------------------------------------------------------------------------
-// index_entry_is_8_bytes
+// fresh_index_starts_small_and_grows
 // ---------------------------------------------------------------------------
 
 #[test]
-fn index_entry_is_8_bytes() {
+fn fresh_index_starts_small_and_grows() {
     let dir = TempDir::new().unwrap();
     let root = dir.path().to_path_buf();
     let max_chain_id: u64 = 1024;
@@ -397,14 +398,20 @@ fn index_entry_is_8_bytes() {
     })
     .unwrap();
 
+    assert_eq!(
+        std::fs::metadata(root.join("index")).unwrap().len(),
+        INDEX_ENTRY_LEN as u64,
+        "a fresh depot must not preallocate the configured capacity"
+    );
+
     depot.prepend(42, b"f0-bytes", None, false).unwrap();
     depot.flush().unwrap();
 
     let index = std::fs::read(root.join("index")).unwrap();
     assert_eq!(
         index.len() as u64,
-        max_chain_id * INDEX_ENTRY_LEN as u64,
-        "index file size = max_chain_id * 8"
+        64 * INDEX_ENTRY_LEN as u64,
+        "writing id 42 grows geometrically to the next power of two"
     );
 
     let entry_start = 42 * INDEX_ENTRY_LEN;
@@ -415,7 +422,7 @@ fn index_entry_is_8_bytes() {
     );
 
     // All other entries must remain zero.
-    for i in 0..max_chain_id as usize {
+    for i in 0..64 {
         if i == 42 {
             continue;
         }

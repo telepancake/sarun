@@ -135,17 +135,18 @@ fn discover_history(
         let width = first_partition.len();
         if !matches!(width, 4 | 7)
             || files.iter().any(|file| file.partition.len() != width)
-            || files.last().is_some_and(|file| {
-                if width == 7 {
-                    file.partition.as_str() > snapshot.as_str()
-                } else {
-                    file.partition.as_str() > &snapshot[..4]
-                }
+            || files.last().is_none_or(|file| {
+                file.partition
+                    != if width == 7 { snapshot.as_str() } else { &snapshot[..4] }
+            })
+            || files.windows(2).any(|pair| {
+                partition_successor(&pair[0].partition).as_deref()
+                    != Some(pair[1].partition.as_str())
             })
         {
             return Err(crate::error::Error::Mediawiki(
                 wikimak_mediawiki::Error::Parse(format!(
-                    "invalid or mixed MediaWiki History partition scheme for {dbname} in {snapshot}"
+                    "incomplete, invalid, or mixed MediaWiki History partition scheme for {dbname} in {snapshot}"
                 )),
             ));
         }
@@ -153,7 +154,30 @@ fn discover_history(
     Ok((snapshot, files))
 }
 
-fn unescape_tsv(value: &str) -> String {
+fn partition_successor(partition: &str) -> Option<String> {
+    match partition.len() {
+        4 => partition.parse::<u32>().ok()?.checked_add(1).map(|year| format!("{year:04}")),
+        7 if partition.as_bytes().get(4) == Some(&b'-') => {
+            let year = partition[..4].parse::<u32>().ok()?;
+            let month = partition[5..].parse::<u32>().ok()?;
+            match month {
+                1..=11 => Some(format!("{year:04}-{:02}", month + 1)),
+                12 => year.checked_add(1).map(|year| format!("{year:04}-01")),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn history_parse_error(file: &HistoryFile, line: usize, message: String) -> crate::error::Error {
+    crate::error::Error::Mediawiki(wikimak_mediawiki::Error::Parse(format!(
+        "{}:{line} {message}",
+        file.part.filename
+    )))
+}
+
+fn unescape_tsv(file: &HistoryFile, line: usize, field: &str, value: &str) -> Result<String> {
     let mut out = String::with_capacity(value.len());
     let mut chars = value.chars();
     while let Some(ch) = chars.next() {
@@ -166,14 +190,33 @@ fn unescape_tsv(value: &str) -> String {
             Some('n') => out.push('\n'),
             Some('r') => out.push('\r'),
             Some('\\') => out.push('\\'),
-            Some(other) => {
-                out.push('\\');
-                out.push(other);
-            }
-            None => out.push('\\'),
+            Some(other) => return Err(history_parse_error(
+                file,
+                line,
+                format!("has invalid escape \\\\{other} in {field}"),
+            )),
+            None => return Err(history_parse_error(
+                file,
+                line,
+                format!("has a dangling escape in {field}"),
+            )),
         }
     }
-    out
+    Ok(out)
+}
+
+fn optional_i64(
+    file: &HistoryFile,
+    line: usize,
+    field: &str,
+    value: &str,
+) -> Result<Option<i64>> {
+    if value.is_empty() {
+        return Ok(None);
+    }
+    value.parse::<i64>().map(Some).map_err(|_| {
+        history_parse_error(file, line, format!("has invalid {field} integer {value:?}"))
+    })
 }
 
 fn history_bool(file: &HistoryFile, line: usize, field: &str, value: &str) -> Result<bool> {
@@ -208,7 +251,7 @@ fn import_history_file<R: Read + Send + 'static>(
          ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
     )?;
     let mut insert_visibility = tx.prepare(
-        "INSERT OR REPLACE INTO revision_visibility(
+        "INSERT INTO revision_visibility(
             revision_id,page_id,source_partition,deleted_parts,
             parts_are_suppressed,deleted_by_page_deletion,page_deletion_timestamp
          ) VALUES(?1,?2,?3,?4,?5,?6,?7)",
@@ -243,8 +286,23 @@ fn import_history_file<R: Read + Send + 'static>(
                 )),
             ));
         }
-        if fields[2] != "page" && fields[2] != "revision" {
-            continue;
+        match fields[2] {
+            "page" | "revision" => {}
+            "user" => continue,
+            other => {
+                return Err(history_parse_error(
+                    file,
+                    line_number + 1,
+                    format!("has unsupported event entity {other:?}"),
+                ));
+            }
+        }
+        if fields[3].is_empty() || fields[4].is_empty() {
+            return Err(history_parse_error(
+                file,
+                line_number + 1,
+                "has an empty event type or timestamp".into(),
+            ));
         }
         let page_id = if fields[page].is_empty() || fields[page] == "0" {
             None
@@ -306,20 +364,44 @@ fn import_history_file<R: Read + Send + 'static>(
             fields[page + 8],
         )?;
         let source_key = format!("{}:{}", file.partition, line_number + 1);
+        let event_log_id = optional_i64(
+            file,
+            line_number + 1,
+            "event_log_id",
+            fields[1],
+        )?;
+        let actor_id = optional_i64(file, line_number + 1, "event_user_id", fields[6])?;
+        let namespace_historical = optional_i64(
+            file,
+            line_number + 1,
+            "page_namespace_historical",
+            fields[page + 3],
+        )?;
+        let namespace_current = optional_i64(
+            file,
+            line_number + 1,
+            "page_namespace_current",
+            fields[page + 5],
+        )?;
         insert.execute(params![
             source_key,
             file.partition,
-            fields[1].parse::<i64>().ok(),
+            event_log_id,
             fields[3],
             fields[4],
-            unescape_tsv(fields[5]),
-            fields[6].parse::<i64>().ok(),
-            unescape_tsv(if fields[9].is_empty() { fields[8] } else { fields[9] }),
+            unescape_tsv(file, line_number + 1, "event_comment", fields[5])?,
+            actor_id,
+            unescape_tsv(
+                file,
+                line_number + 1,
+                "event_user_text",
+                if fields[9].is_empty() { fields[8] } else { fields[9] },
+            )?,
             page_id,
-            unescape_tsv(fields[page + 1]),
-            unescape_tsv(fields[page + 2]),
-            fields[page + 3].parse::<i64>().ok(),
-            fields[page + 5].parse::<i64>().ok(),
+            unescape_tsv(file, line_number + 1, "page_title_historical", fields[page + 1])?,
+            unescape_tsv(file, line_number + 1, "page_title_current", fields[page + 2])?,
+            namespace_historical,
+            namespace_current,
             page_deleted as i64,
         ])?;
         imported += 1;
@@ -339,6 +421,14 @@ fn sync_page_actions(
 ) -> Result<(u64, u64)> {
     let (snapshot, files) = discover_history(client, cfg, dbname)?;
     let previous_snapshot = inst.sync_state("history_frontier_snapshot")?;
+    if previous_snapshot.as_deref().is_some_and(|previous| previous > snapshot.as_str()) {
+        return Err(crate::error::Error::Mediawiki(
+            wikimak_mediawiki::Error::Parse(format!(
+                "MediaWiki History snapshot regressed from {} to {snapshot}",
+                previous_snapshot.as_deref().unwrap_or_default()
+            )),
+        ));
+    }
     if !reconcile_all && previous_snapshot.as_deref() == Some(&snapshot) {
         return Ok((0, 0));
     }
@@ -686,6 +776,37 @@ mod tests {
             sha1: None,
             md5: None,
         }
+    }
+
+    fn history_file() -> HistoryFile {
+        HistoryFile {
+            partition: "all-time".into(),
+            part: part("testwiki.tsv.bz2"),
+        }
+    }
+
+    #[test]
+    fn malformed_history_scalars_are_not_coerced_to_null_or_text() {
+        let file = history_file();
+        let integer = optional_i64(&file, 7, "event_user_id", "not-a-number")
+            .unwrap_err()
+            .to_string();
+        assert!(integer.contains("testwiki.tsv.bz2:7"), "{integer}");
+        assert!(integer.contains("event_user_id"), "{integer}");
+
+        let escape = unescape_tsv(&file, 8, "event_comment", r"bad\qescape")
+            .unwrap_err()
+            .to_string();
+        assert!(escape.contains("testwiki.tsv.bz2:8"), "{escape}");
+        assert!(escape.contains("event_comment"), "{escape}");
+    }
+
+    #[test]
+    fn history_partition_successors_cross_year_boundaries() {
+        assert_eq!(partition_successor("2024").as_deref(), Some("2025"));
+        assert_eq!(partition_successor("2024-11").as_deref(), Some("2024-12"));
+        assert_eq!(partition_successor("2024-12").as_deref(), Some("2025-01"));
+        assert!(partition_successor("2024-13").is_none());
     }
 
     #[test]

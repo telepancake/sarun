@@ -14,6 +14,8 @@
 //! `rchar` is process-wide, and each integration-test file is its own
 //! process.
 
+#![cfg(target_os = "linux")]
+
 use tempfile::TempDir;
 use wikimak_depot::{Depot, DepotConfig};
 

@@ -163,9 +163,9 @@ fn explicit_mismatch_is_loud() {
 #[test]
 fn legacy_store_defaults_to_4_and_writer_backfills() {
     let tmp = TempDir::new().unwrap();
-    // Derive on a fresh root = the CLI default 4 (what every legacy
-    // store was actually built with).
-    let inst = Instance::open(cfg_with(&tmp, 0)).expect("create (derive → 4)");
+    // Build the historical four-shard shape explicitly, then remove its
+    // modern flag to simulate a store from before count persistence.
+    let inst = Instance::open(cfg_with(&tmp, 4)).expect("create with legacy layout");
     assert_eq!(inst.title_shard_count(), 4);
     import_titles(&inst, 32);
     drop(inst);
@@ -188,4 +188,127 @@ fn legacy_store_defaults_to_4_and_writer_backfills() {
     assert_eq!(w.title_shard_count(), 4);
     assert_eq!(persisted_flag(&tmp), Some(4), "the writer backfilled the flag");
     assert_exact_lookup_one_shard(&w);
+}
+
+#[test]
+fn fresh_derived_store_starts_with_256_small_shards() {
+    let tmp = TempDir::new().unwrap();
+    let inst = Instance::open(cfg_with(&tmp, 0)).expect("fresh derived open");
+    assert_eq!(inst.title_shard_count(), 256);
+    assert_eq!(persisted_flag(&tmp), Some(256));
+}
+
+#[test]
+fn oversized_shards_repeat_double_and_reopen_with_remapped_ids() {
+    let tmp = TempDir::new().unwrap();
+    let mut cfg = cfg_with(&tmp, 1);
+    cfg.title_seal_threshold_bytes = 100;
+    let inst = Instance::open(cfg).expect("create tiny-target pool");
+    import_titles(&inst, 200);
+    let grown = inst.title_shard_count();
+    assert!(grown >= 8, "one large shard should require repeated doubling: {grown}");
+    assert!(grown.is_power_of_two());
+    drop(inst);
+
+    let reopened = Instance::open_read(read_config(tmp.path().to_path_buf())).expect("reopen");
+    assert_eq!(reopened.title_shard_count(), grown);
+    for id in 1..=200 {
+        let title = format!("Topic Page {id}");
+        assert_eq!(
+            reopened.page_id_by_title_at(&title, None).expect("lookup"),
+            Some(id),
+            "{title} survived dense-id remap"
+        );
+    }
+    drop(reopened);
+
+    let conn = Connection::open(tmp.path().join("meta.db")).unwrap();
+    let generation: i64 = conn
+        .query_row(
+            "SELECT value FROM instance_flags WHERE key = 'title_pool_generation'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let generation_dir = tmp.path().join(format!("titles-g{generation}"));
+    assert!(generation_dir.is_dir(), "selected generation exists");
+    assert!(
+        !tmp.path().join("titles").exists(),
+        "generation zero was collected only after the committed switch"
+    );
+    let title_generations: Vec<_> = std::fs::read_dir(tmp.path())
+        .unwrap()
+        .flatten()
+        .filter(|entry| {
+            let name = entry.file_name();
+            name == "titles" || name.to_str().is_some_and(|n| n.starts_with("titles-g"))
+        })
+        .collect();
+    assert_eq!(title_generations.len(), 1, "only the selected generation remains");
+    for entry in std::fs::read_dir(generation_dir).unwrap() {
+        let entry = entry.unwrap();
+        assert!(
+            entry.metadata().unwrap().len() <= 100,
+            "final measured shard exceeds configured target: {:?}",
+            entry.path()
+        );
+    }
+    let dangling: i64 = conn
+        .query_row(
+            "SELECT
+               (SELECT COUNT(*) FROM page_to_title_id p
+                LEFT JOIN title_id_to_page t ON t.title_id=p.title_id
+                WHERE t.title_id IS NULL)
+             + (SELECT COUNT(*) FROM title_intervals i
+                LEFT JOIN title_id_to_page t ON t.title_id=i.title_id
+                WHERE i.title_id IS NOT NULL AND t.title_id IS NULL)",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(dangling, 0, "all dependent dense ids were remapped");
+}
+
+#[test]
+fn uncommitted_new_generation_is_ignored_on_reopen() {
+    let tmp = TempDir::new().unwrap();
+    let inst = Instance::open(cfg_with(&tmp, 4)).expect("create");
+    import_titles(&inst, 16);
+    drop(inst);
+
+    // This is the filesystem state immediately before the SQLite switch:
+    // a complete-or-partial new generation can exist, but no flag selects it.
+    std::fs::create_dir(tmp.path().join("titles-g99")).unwrap();
+    std::fs::write(tmp.path().join("titles-g99/shard-0000"), []).unwrap();
+    for name in ["titles-g0", "titles-g01", "titles-backup"] {
+        std::fs::create_dir(tmp.path().join(name)).unwrap();
+    }
+
+    let reopened = Instance::open_read(read_config(tmp.path().to_path_buf())).expect("old opens");
+    assert_eq!(reopened.title_shard_count(), 4);
+    assert_eq!(
+        reopened.page_id_by_title_at("Topic Page 7", None).unwrap(),
+        Some(7)
+    );
+    drop(reopened);
+    assert!(tmp.path().join("titles").is_dir(), "reader preserved selected generation");
+    assert!(
+        tmp.path().join("titles-g99").is_dir(),
+        "read-only reopen does not mutate orphan state"
+    );
+
+    let writer = Instance::open(cfg_with(&tmp, 0)).expect("writer reopens selected generation");
+    assert_eq!(writer.title_shard_count(), 4);
+    assert_eq!(writer.page_id_by_title_at("Topic Page 7", None).unwrap(), Some(7));
+    assert!(tmp.path().join("titles").is_dir(), "GC never removes selected generation");
+    assert!(
+        !tmp.path().join("titles-g99").exists(),
+        "writer reopen collects the uncommitted generation"
+    );
+    for name in ["titles-g0", "titles-g01", "titles-backup"] {
+        assert!(
+            tmp.path().join(name).is_dir(),
+            "GC ignores non-canonical or unrelated directory {name}"
+        );
+    }
 }

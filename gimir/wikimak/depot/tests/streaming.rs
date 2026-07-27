@@ -12,6 +12,7 @@ use std::io::Read as _;
 use tempfile::TempDir;
 use wikimak_depot::{
     compress_frame, decompress_frame, Depot, DepotConfig, Error, FrameDecoder, FrameEncoder,
+    OwnedFrameDecoder,
 };
 
 /// Deterministic compressible-but-not-trivial bytes: repeated phrases
@@ -26,6 +27,34 @@ fn corpus(len: usize, seed: u64) -> Vec<u8> {
     }
     out.truncate(len);
     out
+}
+
+#[test]
+fn owned_decoder_resumes_with_an_owned_prefix() {
+    let prefix = corpus(3 << 20, 11);
+    let raw = corpus(9 << 20, 12);
+    let frame = compress_frame(&raw, Some(&prefix), 3).unwrap();
+    let mut decoder = OwnedFrameDecoder::new(frame, Some(prefix)).unwrap();
+    let mut out = Vec::new();
+    let mut chunk = [0u8; 997];
+    loop {
+        let n = decoder.read(&mut chunk).unwrap();
+        if n == 0 {
+            break;
+        }
+        out.extend_from_slice(&chunk[..n]);
+    }
+    assert_eq!(out, raw);
+}
+
+#[test]
+fn owned_decoder_reports_truncated_frames() {
+    let raw = corpus(4 << 20, 21);
+    let mut frame = compress_frame(&raw, None, 3).unwrap();
+    frame.truncate(frame.len() - 7);
+    let mut decoder = OwnedFrameDecoder::new(frame, None).unwrap();
+    let err = std::io::copy(&mut decoder, &mut std::io::sink()).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
 }
 
 fn stream_compress(src: &[u8], prefix: Option<&[u8]>, level: i32, chunk: usize) -> Vec<u8> {

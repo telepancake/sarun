@@ -170,31 +170,6 @@ pub(crate) fn peek_ts(rec: &[u8]) -> Result<i64> {
     Ok(u64::from_le_bytes(rec[24..32].try_into().unwrap()) as i64)
 }
 
-/// Byte length of the record starting at `start` in a buffer of zero or
-/// more concatenated records (codec fixed prefix + four varint-prefixed
-/// blobs). Lets a frame walk step record-to-record without decoding —
-/// and without copying — anything.
-pub(crate) fn record_len(buf: &[u8], start: usize) -> Result<usize> {
-    // Fixed prefix: u32 + u32 + u64 + u64 + u64 + u64 + u8 = 41 bytes.
-    const FIXED: usize = 4 + 4 + 8 + 8 + 8 + 8 + 1;
-    let mut i = start;
-    if i + FIXED > buf.len() {
-        return Err(Error::Codec("truncated record fixed prefix"));
-    }
-    i += FIXED;
-    // Four length-prefixed byte fields (contributor, comment, sha1, text).
-    for _ in 0..4 {
-        let (len, n) = decode_varint(buf, i)?;
-        i += n;
-        let len = len as usize;
-        if i + len > buf.len() {
-            return Err(Error::Codec("truncated record payload"));
-        }
-        i += len;
-    }
-    Ok(i - start)
-}
-
 /// Encode an unsigned LEB128 varint. Exposed for codec tests.
 pub fn encode_varint(mut v: u64, out: &mut Vec<u8>) {
     loop {

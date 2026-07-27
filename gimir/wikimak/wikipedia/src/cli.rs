@@ -18,13 +18,10 @@ use std::path::PathBuf;
 use wikimak_mediawiki::new_page_stream;
 use crate::{Instance, InstanceConfig};
 
-/// Per-run index size HINT override (`--max-page-id N`), `None` =
-/// derive: an existing root reports its current on-disk capacity; a
-/// fresh root gets `DEFAULT_MAX_CHAIN_ID` (sized for enwiki — the
-/// index is 8 bytes/chain and created sparse, so the default costs no
-/// disk for small wikis). Purely a hint either way: the depot derives
-/// real capacity from disk and auto-grows for larger page ids, so no
-/// N can make an import overflow below the 2^40 sanity ceiling.
+/// Open an instance. `--max-page-id` remains accepted for command-line
+/// compatibility, but fresh indexes start at one slot and grow from
+/// actual page ids; no value can make an import overflow below the
+/// 2^40 sanity ceiling.
 fn open_instance(root: PathBuf, max_page_id: Option<u64>) -> Result<Instance, String> {
     let max_chain_id =
         max_page_id.unwrap_or_else(|| crate::instance::max_chain_id_for_root(&root));
@@ -38,11 +35,12 @@ fn open_instance(root: PathBuf, max_page_id: Option<u64>) -> Result<Instance, St
             file_size_threshold: 1 << 30,
             eviction_dead_ratio: 0.5,
         },
-        // Derive from the store's persisted count (fresh root: 4).
+        // Derive from the store's persisted count (fresh roots start small
+        // and grow by atomic title-pool re-sharding).
         // An explicit count here would refuse to open any store built
         // with a different one — the count is the store's property.
         title_shard_count: 0,
-        title_seal_threshold_bytes: 8 << 20,
+        title_seal_threshold_bytes: 64 << 10,
         f1_seal_threshold_bytes: 0, // default (256 KiB)
     })
     .map_err(|e| e.to_string())

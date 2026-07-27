@@ -84,7 +84,7 @@ fn page_id_beyond_the_hint_grows_the_index_sparse() {
     let index = tmp.path().join("depot").join("index");
     {
         let instance = make_instance(&tmp, 100);
-        assert_eq!(std::fs::metadata(&index).unwrap().len(), 100 * 8);
+        assert_eq!(std::fs::metadata(&index).unwrap().len(), 8);
 
         let mut stream = new_page_stream(Cursor::new(one_page_doc(500).into_bytes()));
         let stats = instance
@@ -139,7 +139,7 @@ fn ceiling_overflow_is_a_loud_error_before_any_write() {
     );
 
     // NO depot write: every tier is empty bytes on disk, and the index
-    // kept its hint size (no growth toward the corrupt id either).
+    // stayed at one slot (no growth toward the corrupt id either).
     for tier in ["depot/f0", "depot/f1", "depot/cold"] {
         assert_eq!(
             dir_bytes(&tmp.path().join(tier)),
@@ -149,7 +149,7 @@ fn ceiling_overflow_is_a_loud_error_before_any_write() {
     }
     assert_eq!(
         std::fs::metadata(tmp.path().join("depot/index")).unwrap().len(),
-        100 * 8,
+        8,
         "a rejected id must not grow the index"
     );
 
