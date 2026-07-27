@@ -179,31 +179,79 @@ fn history_parse_error(file: &HistoryFile, line: usize, message: String) -> crat
 }
 
 fn unescape_tsv(file: &HistoryFile, line: usize, field: &str, value: &str) -> Result<String> {
-    let mut out = String::with_capacity(value.len());
-    let mut chars = value.chars();
-    while let Some(ch) = chars.next() {
-        if ch != '\\' {
-            out.push(ch);
+    let input = value.as_bytes();
+    let mut out = Vec::with_capacity(input.len());
+    let mut cursor = 0;
+    while cursor < input.len() {
+        let byte = input[cursor];
+        cursor += 1;
+        if byte != b'\\' {
+            out.push(byte);
             continue;
         }
-        match chars.next() {
-            Some('t') => out.push('\t'),
-            Some('n') => out.push('\n'),
-            Some('r') => out.push('\r'),
-            Some('\\') => out.push('\\'),
-            Some(other) => return Err(history_parse_error(
-                file,
-                line,
-                format!("has invalid escape \\\\{other} in {field}"),
-            )),
-            None => return Err(history_parse_error(
+        let Some(&escape) = input.get(cursor) else {
+            return Err(history_parse_error(
                 file,
                 line,
                 format!("has a dangling escape in {field}"),
-            )),
+            ));
+        };
+        cursor += 1;
+        match escape {
+            b't' => out.push(b'\t'),
+            b'n' => out.push(b'\n'),
+            b'r' => out.push(b'\r'),
+            b'\\' => out.push(b'\\'),
+            b'x' => {
+                let Some(hex) = input.get(cursor..cursor + 2) else {
+                    return Err(history_parse_error(
+                        file,
+                        line,
+                        format!("has incomplete \\\\xHH escape in {field}"),
+                    ));
+                };
+                let Some(high) = hex_nibble(hex[0]) else {
+                    return Err(history_parse_error(
+                        file,
+                        line,
+                        format!("has invalid \\\\xHH escape in {field}"),
+                    ));
+                };
+                let Some(low) = hex_nibble(hex[1]) else {
+                    return Err(history_parse_error(
+                        file,
+                        line,
+                        format!("has invalid \\\\xHH escape in {field}"),
+                    ));
+                };
+                out.push((high << 4) | low);
+                cursor += 2;
+            }
+            other => {
+                return Err(history_parse_error(
+                    file,
+                    line,
+                    format!("has invalid escape \\\\{} in {field}", char::from(other)),
+                ));
+            }
         }
     }
-    Ok(out)
+    String::from_utf8(out).map_err(|_| {
+        history_parse_error(
+            file,
+            line,
+            format!("has invalid UTF-8 after unescaping {field}"),
+        )
+    })
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn optional_i64(
@@ -1163,6 +1211,32 @@ mod tests {
             .to_string();
         assert!(escape.contains("testwiki.tsv.bz2:8"), "{escape}");
         assert!(escape.contains("event_comment"), "{escape}");
+    }
+
+    #[test]
+    fn history_hex_escapes_decode_utf8_bytes_strictly() {
+        let file = history_file();
+        let decoded = unescape_tsv(
+            &file,
+            276_428,
+            "page_title_historical",
+            r"Broken/Port\xc4\x81ls\x3aZin\xc4\x81tne",
+        )
+        .unwrap();
+        assert_eq!(decoded, "Broken/Portāls:Zinātne");
+
+        for (value, expected) in [
+            (r"bad\x", "incomplete \\\\xHH"),
+            (r"bad\xG0", "invalid \\\\xHH"),
+            (r"bad\xC4", "invalid UTF-8"),
+        ] {
+            let error = unescape_tsv(&file, 276_428, "page_title_historical", value)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("testwiki.tsv.bz2:276428"), "{error}");
+            assert!(error.contains("page_title_historical"), "{error}");
+            assert!(error.contains(expected), "{error}");
+        }
     }
 
     #[test]
