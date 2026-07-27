@@ -56,7 +56,7 @@ fn history_body(event_type: &str) -> Vec<u8> {
     let mut orphan_page = fields.clone();
     orphan_page[1] = "124";
     orphan_page[3] = "delete";
-    orphan_page[28] = "";
+    orphan_page[28] = "0";
     orphan_page[29] = "Deleted title";
     orphan_page[30] = "Deleted title";
     orphan_page[36] = "true";

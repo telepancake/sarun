@@ -246,7 +246,7 @@ fn import_history_file<R: Read + Send + 'static>(
         if fields[2] != "page" && fields[2] != "revision" {
             continue;
         }
-        let page_id = if fields[page].is_empty() {
+        let page_id = if fields[page].is_empty() || fields[page] == "0" {
             None
         } else {
             Some(fields[page].parse::<i64>().ok().filter(|value| *value > 0)
