@@ -17,10 +17,9 @@ use crate::error::{Error, Result};
 use crate::import::do_import;
 use crate::schema::META_DDL;
 
-const REVISION_DICTIONARY_BYTES: usize = 64 << 10;
-const REVISION_SAMPLE_COUNT: usize = 2048;
-const REVISION_SAMPLE_BYTES: usize = 32 << 20;
-const REVISION_SAMPLE_RECORD_BYTES: usize = 16 << 10;
+const REVISION_DICTIONARY_BYTES: usize = 800 << 10;
+const REVISION_SAMPLE_COUNT: usize = 32 << 10;
+const REVISION_DICTIONARY_SAMPLE_RATIO: usize = 8;
 const REVISION_MIN_SAMPLES: usize = 128;
 const REVISION_MIN_SAMPLE_BYTES: usize = 1 << 20;
 const OCCUPIED_ID_BATCH: usize = 4096;
@@ -200,6 +199,9 @@ pub struct HistoryIter {
 pub struct RevisionDictionaryStats {
     pub dictionary_id: Option<u32>,
     pub trained: bool,
+    pub samples: u64,
+    pub sample_bytes: u64,
+    pub dictionary_bytes: u64,
     pub heads_repacked: u64,
 }
 
@@ -548,63 +550,64 @@ impl Instance {
     }
 
     /// Finalize the initial full-content seed: deterministically sample a
-    /// bounded cross-section of current f0 records, train exactly one
-    /// 64-KiB per-instance revision dictionary, publish it durably, and
-    /// repack f0 only. A rerun resumes a partially completed repack using
-    /// the already-active dictionary; it never trains a successor.
+    /// broad cross-section of complete current f0 records, train one
+    /// 800-KiB per-instance revision dictionary (scaled down only for a
+    /// small corpus), publish it durably, and repack f0 only. A rerun
+    /// resumes a partially completed repack using the already-active
+    /// dictionary; it never trains a successor.
     pub fn finalize_seed_revision_dictionary(&self) -> Result<RevisionDictionaryStats> {
         if self.read_only {
             return Err(Error::ReadOnly("finalize_seed_revision_dictionary"));
         }
-        self.finalize_seed_revision_dictionary_inner(None)
+        self.repack_revision_dictionary_inner(false, None)
     }
 
-    fn finalize_seed_revision_dictionary_inner(
+    /// Explicitly train a successor dictionary from the current complete
+    /// page heads and recompress every live f0 frame with it. Dictionary
+    /// files are immutable and frames carry their native dictionary id,
+    /// so interruption leaves a readable mixed generation; retrying trains
+    /// the same deterministic dictionary and resumes the repack.
+    pub fn retrain_revision_dictionary(&self) -> Result<RevisionDictionaryStats> {
+        if self.read_only {
+            return Err(Error::ReadOnly("retrain_revision_dictionary"));
+        }
+        self.repack_revision_dictionary_inner(true, None)
+    }
+
+    fn repack_revision_dictionary_inner(
         &self,
+        retrain: bool,
         repack_limit: Option<usize>,
     ) -> Result<RevisionDictionaryStats> {
         let g = self.inner.lock().expect("instance mutex poisoned");
         let mut stats = RevisionDictionaryStats::default();
-        let dict_id = match g.revision_dictionaries.current("revision")? {
-            Some(id) => id,
-            None => {
-                let ids = representative_chain_ids(&g.depot);
-                let mut samples = Vec::with_capacity(ids.len());
-                let mut total = 0usize;
-                for id in ids {
-                    if total >= REVISION_SAMPLE_BYTES {
-                        break;
-                    }
-                    let frame = g.depot.read_f0(id)?;
-                    let record = crate::frames::decompress_head(
-                        &frame,
-                        &g.revision_dictionaries,
-                        "revision",
-                    )?;
-                    let take = record
-                        .len()
-                        .min(REVISION_SAMPLE_RECORD_BYTES)
-                        .min(REVISION_SAMPLE_BYTES - total);
-                    if take != 0 {
-                        samples.push(record[..take].to_vec());
-                        total += take;
-                    }
-                }
-                if samples.len() < REVISION_MIN_SAMPLES
-                    || total < REVISION_MIN_SAMPLE_BYTES
-                {
-                    return Ok(stats);
-                }
-                let dictionary =
-                    crate::frames::train_dictionary(&samples, REVISION_DICTIONARY_BYTES)?;
-                let id = g.revision_dictionaries.persist("revision", &dictionary)?;
-                g.revision_dictionaries.activate("revision", id)?;
-                stats.trained = true;
-                id
+        let active = g.revision_dictionaries.current("revision")?;
+        let dict_id = if retrain || active.is_none() {
+            let samples = revision_dictionary_samples(&g)?;
+            let total = samples.iter().try_fold(0usize, |sum, sample| {
+                sum.checked_add(sample.len())
+                    .ok_or(Error::Corrupt("revision dictionary sample size overflow"))
+            })?;
+            stats.samples = samples.len() as u64;
+            stats.sample_bytes = total as u64;
+            if samples.len() < REVISION_MIN_SAMPLES || total < REVISION_MIN_SAMPLE_BYTES {
+                stats.dictionary_id = active;
+                return Ok(stats);
             }
+            let capacity =
+                REVISION_DICTIONARY_BYTES.min(total / REVISION_DICTIONARY_SAMPLE_RATIO);
+            let dictionary = crate::frames::train_dictionary(&samples, capacity)?;
+            let id = g.revision_dictionaries.persist("revision", &dictionary)?;
+            g.revision_dictionaries.activate("revision", id)?;
+            stats.trained = true;
+            stats.dictionary_bytes = dictionary.len() as u64;
+            id
+        } else {
+            active.expect("checked above")
         };
         stats.dictionary_id = Some(dict_id);
         let dictionary = g.revision_dictionaries.load("revision", dict_id)?;
+        stats.dictionary_bytes = dictionary.len() as u64;
 
         let mut after = None;
         'pages: loop {
@@ -1572,6 +1575,20 @@ fn representative_chain_ids(depot: &Depot) -> Vec<u64> {
     ids
 }
 
+fn revision_dictionary_samples(g: &InstanceInner) -> Result<Vec<Vec<u8>>> {
+    let ids = representative_chain_ids(&g.depot);
+    let mut samples = Vec::with_capacity(ids.len());
+    for id in ids {
+        let frame = g.depot.read_f0(id)?;
+        let record =
+            crate::frames::decompress_head(&frame, &g.revision_dictionaries, "revision")?;
+        if !record.is_empty() {
+            samples.push(record);
+        }
+    }
+    Ok(samples)
+}
+
 fn sample_hash(mut value: u64) -> u64 {
     value = value.wrapping_add(0x9e3779b97f4a7c15);
     value = (value ^ (value >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
@@ -2060,7 +2077,7 @@ mod dictionary_lifecycle_tests {
         assert!(!cold_before.is_empty());
 
         let first = instance
-            .finalize_seed_revision_dictionary_inner(Some(7))
+            .repack_revision_dictionary_inner(false, Some(7))
             .unwrap();
         assert!(first.trained);
         assert_eq!(first.heads_repacked, 7);
@@ -2079,8 +2096,10 @@ mod dictionary_lifecycle_tests {
             assert_eq!((encoded, plain), (7, 153));
         }
 
-        let resumed = instance.finalize_seed_revision_dictionary().unwrap();
-        assert!(!resumed.trained);
+        let resumed = instance
+            .repack_revision_dictionary_inner(true, None)
+            .unwrap();
+        assert!(resumed.trained);
         assert_eq!(resumed.dictionary_id, Some(dict_id));
         assert_eq!(resumed.heads_repacked, 153);
         assert_eq!(std::fs::read(root.join("depot/cold/cold")).unwrap(), cold_before);
@@ -2117,14 +2136,30 @@ mod dictionary_lifecycle_tests {
     }
 
     #[test]
+    fn dictionary_samples_keep_complete_revision_records() {
+        let tmp = TempDir::new().unwrap();
+        let instance = Instance::open(cfg(tmp.path().to_path_buf())).unwrap();
+        seed_pages(&instance, 160, 40 << 10);
+        let g = instance.inner.lock().unwrap();
+        let samples = revision_dictionary_samples(&g).unwrap();
+        assert_eq!(samples.len(), 160);
+        assert!(
+            samples.iter().all(|sample| sample.len() > (40 << 10)),
+            "metadata plus the complete 40-KiB text must be retained"
+        );
+    }
+
+    #[test]
     fn tiny_seed_does_not_train_a_dictionary() {
         let tmp = TempDir::new().unwrap();
         let instance = Instance::open(cfg(tmp.path().to_path_buf())).unwrap();
         seed_pages(&instance, 2, 1024);
-        assert_eq!(
-            instance.finalize_seed_revision_dictionary().unwrap(),
-            RevisionDictionaryStats::default()
-        );
+        let stats = instance.finalize_seed_revision_dictionary().unwrap();
+        assert_eq!(stats.dictionary_id, None);
+        assert!(!stats.trained);
+        assert_eq!(stats.samples, 2);
+        assert!(stats.sample_bytes > 0);
+        assert_eq!(stats.heads_repacked, 0);
         assert!(!tmp.path().join("dictionaries/revision.current").exists());
     }
 

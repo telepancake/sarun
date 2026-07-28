@@ -83,11 +83,13 @@ CONTRIBUTOR_HIDDEN, SUPPRESSED, SHA1_MISMATCH. The depot sees this as
 opaque bytes; the wikipedia layer is the only thing that decodes it.
 
 After a successful first full-content import, a deterministic min-hash
-sample of at most 2,048 current f0 records is read. Each sample contributes
-at most 16 KiB and the total is capped at 32 MiB. At least 128 records and
-1 MiB are required; smaller mirrors remain plain. The sample trains exactly
-one 64 KiB `revision` dictionary per instance. This seed finalization is not
-run by daily updates.
+sample of at most 32,768 current f0 records is read. Every selected revision
+record is used in full; samples are never truncated. At least 128 records and
+1 MiB are required; smaller mirrors remain plain. The sample trains one
+800 KiB `revision` dictionary per instance, scaled down when the complete
+sample corpus is less than eight times that size. Seed finalization is not
+run by daily updates. `wikimak repack-f0` explicitly trains a successor from
+the current heads and recompresses every live f0 frame.
 
 Dictionary-compressed f0 frames carry the trained dictionary's native
 zstd dictionary id; dictionary id zero means a provisional plain f0.

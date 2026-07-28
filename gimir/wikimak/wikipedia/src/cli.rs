@@ -4,6 +4,7 @@
 //!   wikimak fetch <dbname> <root>               discover + fetch + import
 //!   wikimak refresh-full <dbname> <root>        explicit full snapshot ingest
 //!   wikimak reconcile-history <dbname> <root>   explicit metadata rebuild
+//!   wikimak repack-f0 <root>                    retrain dictionary + repack heads
 //!   wikimak import <dump.xml[.bz2]> <root>     import/refresh a dump
 //!   wikimak head <root> <page_id>              newest revision meta
 //!   wikimak text <root> <page_id>              newest revision text
@@ -130,6 +131,22 @@ fn cmd_refresh_full(dbname: &str, root: &str, max_page_id: Option<u64>) -> Resul
     Ok(())
 }
 
+fn cmd_repack_f0(root: &str, max_page_id: Option<u64>) -> Result<(), String> {
+    let inst = open_instance(PathBuf::from(root), max_page_id)?;
+    let stats = inst.retrain_revision_dictionary().map_err(|e| e.to_string())?;
+    let Some(dictionary_id) = stats.dictionary_id else {
+        return Err(format!(
+            "not enough revision data to train a dictionary ({} complete records, {} bytes)",
+            stats.samples, stats.sample_bytes
+        ));
+    };
+    println!(
+        "f0 dictionary {dictionary_id:08x}: {} bytes trained from {} complete revisions ({} bytes); heads repacked {}",
+        stats.dictionary_bytes, stats.samples, stats.sample_bytes, stats.heads_repacked
+    );
+    Ok(())
+}
+
 fn cmd_reconcile_history(
     dbname: &str,
     root: &str,
@@ -237,6 +254,7 @@ pub fn cli_main(args: &[String]) -> i32 {
         ["discover", dbname] => cmd_discover(dbname),
         ["fetch", dbname, root] => cmd_fetch(dbname, root, max_page_id),
         ["refresh-full", dbname, root] => cmd_refresh_full(dbname, root, max_page_id),
+        ["repack-f0", root] => cmd_repack_f0(root, max_page_id),
         ["reconcile-history", dbname, root] => {
             cmd_reconcile_history(dbname, root, max_page_id)
         }
@@ -260,6 +278,7 @@ pub fn cli_main(args: &[String]) -> i32 {
                   \x20      wikimak pages <root> [filter]\n\
                   \x20      wikimak fetch <dbname> <root> [--max-page-id N]\n\
                   \x20      wikimak refresh-full <dbname> <root> [--max-page-id N]\n\
+                  \x20      wikimak repack-f0 <root> [--max-page-id N]\n\
                   \x20      wikimak reconcile-history <dbname> <root> [--max-page-id N]\n\
                   \x20      wikimak import <dump.xml[.bz2]> <root> [--max-page-id N]\n\
                   \x20      wikimak serve <root> [addr]        (default 127.0.0.1:8642)\n\
