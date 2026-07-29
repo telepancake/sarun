@@ -1,80 +1,96 @@
 # Portable Wikipedia event stream
 
-Version 1 is a research/export format independent of the live mirror layout.
+This is a research/export format independent of the live mirror layout.
 It is intended to make storage experiments ordinary ordered stream filters.
 
 - Entity groups are ordered by kind (`page`, then `user`, then `global`) and
   then by entity ID.
 - Within one entity ID, records are newest to oldest. Equal timestamps use a
-  deterministic source-specific tie order.
-- Revision records contain metadata and wikitext, but not SHA-1.
-- A revision may carry its complete MediaWiki History visibility annotation.
-- Page-action records preserve every imported denormalized-history column.
-- User events are grouped by their subject user ID, not by the actor who
-  performed the action. Their complete original source fields are retained so
-  additions to the upstream denormalized schema are not silently discarded.
-- A page-state record preserves the current title once per page.
-- Unknown typed records can be skipped using their payload length.
+  deterministic typed tie sequence.
+- XML is parsed into typed revision records. Its serialization is never stored.
+- MediaWiki History TSV rows are normalized immediately. Source column arrays
+  and redundant current/analytical fields are never stored.
+- A TSV revision row enriches the matching XML revision record. It is not a
+  second copy of the revision metadata.
+- Page and user actions use typed variants with an explicit `other(name)`
+  escape for previously unseen event types.
+- An unsupported TSV column count or entity class is a loud import error until
+  the schema mapper is updated.
+- Revision records contain metadata and optional wikitext, but not SHA-1.
+- Page and user state records preserve current state once per entity.
+- A manifest preserves the wiki, snapshot identifiers, and source filenames
+  once per archive.
+- Unknown future record kinds can be skipped using their payload length.
 
-The fixed 24-byte file header is followed by 48-byte frame headers and zstd
-frames. A writer starts a new frame at the next page boundary after compressed
-output reaches the target (4 MiB by default). Thus a page is never split, and a
-single exceptionally large page may produce a frame larger than the target.
-Each frame header stores its page range, record count, raw length, and
-compressed length. Independent filters may process frames in parallel and
-write their results in original frame order.
+The fixed 24-byte file header is followed by 64-byte frame headers and zstd
+frames. A writer checks actual emitted zstd bytes at every entity boundary and
+starts a new frame when the target (4 MiB by default) has been reached. Thus an
+entity is never split, and a single exceptionally large page may produce a
+frame larger than the target.
+
+Each independently streamed upstream dump part produces page-aligned frames.
+Disjoint content segments are consolidated by copying their compressed frames
+in page-range order. Parts whose page ranges overlap remain in one sequential
+group. Typed metadata runs require an ordered merge because their entity ranges
+overlap.
 
 There is no whole-file checksum. A `DONE` header distinguishes a clean finish,
 but every completely written preceding frame remains readable if a later frame
-or the completion marker is truncated. Zstd's own structural validation is
-local to each frame and never invalidates an earlier frame.
+or the completion marker is truncated. Zstd structural validation is local to
+each frame and never invalidates an earlier frame.
 
-## Version 1 wire layout
+## Wire layout
 
 All fixed-width integers are little-endian. `varint` is unsigned LEB128.
 
-The file header is:
-
 ```text
 [ magic "SWDUMP\0\0":8 | version:u32 | flags:u32 | frame_target:u64 ]
-```
 
-Each 64-byte frame header is:
-
-```text
 [ magic "FRM1":4 | header_len:u32
 | first_entity_kind:u8 | last_entity_kind:u8 | reserved:6
 | first_entity_id:u64 | last_entity_id:u64
 | record_count:u64 | raw_bytes:u64 | compressed_bytes:u64 | reserved:8 ]
-```
 
-The following `compressed_bytes` bytes are one independent zstd frame. Its raw
-stream contains:
-
-```text
 [ entity_kind:u8 | entity_id:varint | timestamp_micros:i64
 | record_kind:u8 | payload_len:varint | payload:payload_len ] ...
 ```
 
-Entity kinds are page `1`, user `2`, and global/unbound `3`. Record kinds are
-page state `1`, revision `2`, selected legacy page action `3`, and complete
-MediaWiki History source event `4`. Payload lengths make future record kinds
-skippable. Revision payloads deliberately omit SHA-1.
+Entity kinds are page `1`, user `2`, and global/unbound `3`. Record kinds are:
 
-A clean file ends with a 64-byte `DONE` header. It contains no counts or digest:
-those would turn an independently recoverable frame prefix into an
-all-or-nothing object.
+1. page state
+2. revision
+3. page action
+4. user state
+5. user action
+6. manifest
 
-## MediaWiki History user events
+A clean file ends with a 64-byte `DONE` header.
 
-MediaWiki History mixes page, revision, and subject-user events in source
-partition order. During reconciliation, user rows are accumulated in bounded
-64-MiB runs, sorted, and merged into
-`history-users-<snapshot>.swdump`. This immutable sidecar contains user groups
-in ID order and newest-to-oldest events within each user. It preserves every
-original TSV field (including fields unknown to the current renderer) and is
-published in the same metadata transaction through `history_user_archive`.
+`wikimak archive-repack` is the first generic stream filter. It decodes records
+in order and writes the same records using the requested compressed frame-size
+target, zstd level, checksum, long-distance matching, window log, and target
+compressed-block size. Frame boundaries remain entity-aligned.
 
-The sidecar is not a SQLite event ledger. A full portable export appends its
-user/global groups after all page groups. Superseded snapshot sidecars are
-removed only after the new metadata transaction commits.
+## Normalized metadata
+
+Page actions retain their event kind, log ID, performer, comment, historical
+title/namespace, resulting deletion state, and a tie sequence. Current title is
+stored once in page state. Counts, elapsed-time values, content-namespace
+booleans, and other derivable analytical columns are discarded.
+
+Revision annotations retain visibility, minor-edit state, content model and
+format, identity-revert relations, before-page-creation state, and tags.
+Revision SHA-1, duplicated contributor/comment/timestamp, text byte counts, and
+page/user activity counters are discarded. A TSV-only revision is represented
+as a typed text-absent revision shell; the ordered merge coalesces it with XML
+by `(page_id, revision_id)`.
+
+User actions retain their event kind, log ID, performer, comment, historical
+subject state, account creation origin, and relevant timestamps. Current user
+state is stored once per user. Current values repeated across old rows are not
+retained.
+
+Performer identity is a compact tuple of optional local and central IDs,
+historical name/IP, and account class. Lists such as groups, blocks, bot
+classifications, and revision tags are decoded into length-delimited string
+arrays rather than retained in TSV escaping.

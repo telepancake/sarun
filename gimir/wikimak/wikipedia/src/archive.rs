@@ -9,7 +9,7 @@
 use std::collections::BinaryHeap;
 use std::collections::HashMap;
 use std::io::{self, BufReader, Read, Seek, SeekFrom, Take, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, NaiveDateTime, Utc};
 
@@ -26,7 +26,9 @@ pub const DEFAULT_FRAME_TARGET: usize = 4 << 20;
 const KIND_PAGE_STATE: u8 = 1;
 const KIND_REVISION: u8 = 2;
 const KIND_PAGE_ACTION: u8 = 3;
-const KIND_HISTORY_EVENT: u8 = 4;
+const KIND_USER_STATE: u8 = 4;
+const KIND_USER_ACTION: u8 = 5;
+const KIND_MANIFEST: u8 = 6;
 const PAGE_TEXT_MEMORY_LIMIT: usize = 16 << 20;
 const HISTORY_SORT_RUN_BYTES: usize = 64 << 20;
 
@@ -85,68 +87,158 @@ pub type Result<T> = std::result::Result<T, ArchiveError>;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RevisionVisibilityRecord {
-    pub source_partition: String,
-    pub deleted_parts: String,
+    pub deleted_parts: u8,
     pub parts_are_suppressed: bool,
     pub deleted_by_page_deletion: bool,
-    pub page_deletion_timestamp: String,
+    pub page_deletion_timestamp_micros: Option<i64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum AccountClass {
+    Unknown = 0,
+    Anonymous = 1,
+    Temporary = 2,
+    Permanent = 3,
+    Hidden = 4,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PerformerRecord {
+    pub local_user_id: Option<u64>,
+    pub central_user_id: Option<u64>,
+    pub historical_name: Option<String>,
+    pub account_class: AccountClass,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PageActionKind {
+    Create,
+    LoggedCreate,
+    Move,
+    Delete,
+    Restore,
+    Merge,
+    Other(String),
+}
+
+impl PageActionKind {
+    pub fn from_name(name: &str) -> Self {
+        match name {
+            "create" => Self::Create,
+            "create-page" => Self::LoggedCreate,
+            "move" => Self::Move,
+            "delete" => Self::Delete,
+            "restore" => Self::Restore,
+            "merge" => Self::Merge,
+            other => Self::Other(other.to_owned()),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PageActionRecord {
-    pub source_key: String,
-    pub source_partition: String,
-    pub event_log_id: Option<i64>,
-    pub source_ordinal: u64,
-    pub event_type: String,
-    pub timestamp: String,
+    pub log_id: Option<u64>,
+    pub tie_sequence: u64,
+    pub kind: PageActionKind,
+    pub performer: PerformerRecord,
     pub comment: String,
-    pub actor_id: Option<i64>,
-    pub actor_name: String,
-    pub historical_title: String,
-    pub current_title: String,
-    pub historical_namespace: Option<i64>,
-    pub current_namespace: Option<i64>,
-    pub page_deleted: bool,
+    pub title_at_event: String,
+    pub namespace_at_event: Option<i64>,
+    pub resulting_deleted: Option<bool>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RevisionRecord {
     pub meta: RevisionMeta,
+    pub has_text: bool,
     pub text: Vec<u8>,
     pub visibility: Option<RevisionVisibilityRecord>,
+    pub history: Option<RevisionHistoryRecord>,
 }
 
-/// A complete row from a MediaWiki History user event.
-///
-/// The common entity key and timestamp live in the record envelope. The
-/// remaining original TSV columns are retained in schema order. `None` is an
-/// upstream null/empty field; non-empty fields are unescaped UTF-8 bytes.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct HistoryEventRecord {
-    pub source_partition: String,
-    pub source_ordinal: u64,
-    pub schema_columns: u16,
-    pub fields: Vec<Option<Vec<u8>>>,
+pub struct RevisionHistoryRecord {
+    pub minor: Option<bool>,
+    pub content_model: Option<String>,
+    pub content_format: Option<String>,
+    pub identity_reverted: Option<bool>,
+    pub first_reverting_revision_id: Option<u64>,
+    pub seconds_to_revert: Option<u64>,
+    pub identity_revert: Option<bool>,
+    pub before_page_creation: Option<bool>,
+    pub tags: Vec<String>,
 }
 
-struct PendingHistoryEvent {
-    entity: EntityKey,
-    timestamp_micros: i64,
-    event: HistoryEventRecord,
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UserStateRecord {
+    pub current_name: Option<String>,
+    pub central_user_id: Option<u64>,
+    pub account_class: AccountClass,
+    pub groups: Vec<String>,
+    pub blocks: Vec<String>,
+    pub bot_by: Vec<String>,
 }
 
-/// Bounded external sorter used while ingesting MediaWiki History user rows.
-/// Runs are temporary zstd streams; the final output is an ordinary archive
-/// containing user/global entity groups in canonical order.
-pub(crate) struct HistoryEventSorter {
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum UserActionKind {
+    Create,
+    Rename,
+    GroupsChanged,
+    BlocksChanged,
+    Other(String),
+}
+
+impl UserActionKind {
+    pub fn from_name(name: &str) -> Self {
+        match name {
+            "create" => Self::Create,
+            "rename" => Self::Rename,
+            "altergroups" => Self::GroupsChanged,
+            "alterblocks" => Self::BlocksChanged,
+            other => Self::Other(other.to_owned()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UserActionRecord {
+    pub log_id: Option<u64>,
+    pub tie_sequence: u64,
+    pub kind: UserActionKind,
+    pub performer: PerformerRecord,
+    pub comment: String,
+    pub historical_name: Option<String>,
+    pub groups: Vec<String>,
+    pub blocks: Vec<String>,
+    pub bot_by: Vec<String>,
+    pub created_by: u8,
+    pub registration_timestamp_micros: Option<i64>,
+    pub creation_timestamp_micros: Option<i64>,
+    pub first_edit_timestamp_micros: Option<i64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManifestRecord {
+    pub wiki_db: String,
+    pub content_snapshot: String,
+    pub metadata_snapshot: String,
+    pub source_files: Vec<String>,
+}
+
+struct PendingRecord {
+    record: Record,
+}
+
+/// Bounded external sorter for typed archive records.
+pub(crate) struct RecordSorter {
     temporary: tempfile::TempDir,
-    buffered: Vec<PendingHistoryEvent>,
+    buffered: Vec<PendingRecord>,
     buffered_bytes: usize,
     runs: Vec<std::path::PathBuf>,
 }
 
-impl HistoryEventSorter {
+impl RecordSorter {
     pub(crate) fn new_in(root: &Path) -> Result<Self> {
         Ok(Self {
             temporary: tempfile::TempDir::new_in(root)?,
@@ -156,26 +248,13 @@ impl HistoryEventSorter {
         })
     }
 
-    pub(crate) fn push(
-        &mut self,
-        entity: EntityKey,
-        timestamp_micros: i64,
-        event: HistoryEventRecord,
-    ) -> Result<()> {
-        self.buffered_bytes = self.buffered_bytes.saturating_add(
-            event
-                .fields
-                .iter()
-                .filter_map(Option::as_ref)
-                .map(Vec::len)
-                .sum::<usize>()
-                .saturating_add(128),
-        );
-        self.buffered.push(PendingHistoryEvent {
-            entity,
-            timestamp_micros,
-            event,
-        });
+    pub(crate) fn push(&mut self, record: Record) -> Result<()> {
+        let (_, payload) = record_wire_size(&record)?;
+        self.buffered_bytes = self
+            .buffered_bytes
+            .saturating_add(usize::try_from(payload).unwrap_or(usize::MAX))
+            .saturating_add(32);
+        self.buffered.push(PendingRecord { record });
         if self.buffered_bytes >= HISTORY_SORT_RUN_BYTES {
             self.flush_run()?;
         }
@@ -186,7 +265,8 @@ impl HistoryEventSorter {
         if self.buffered.is_empty() {
             return Ok(());
         }
-        self.buffered.sort_by(history_event_order);
+        self.buffered
+            .sort_by(|left, right| record_order(&left.record, &right.record));
         let path = self
             .temporary
             .path()
@@ -194,7 +274,7 @@ impl HistoryEventSorter {
         let file = std::fs::File::create(&path)?;
         let mut encoder = zstd::stream::write::Encoder::new(file, 1)?;
         for pending in self.buffered.drain(..) {
-            write_history_run_record(&mut encoder, &pending)?;
+            write_sort_run_record(&mut encoder, &pending.record)?;
         }
         encoder.finish()?.sync_all()?;
         self.runs.push(path);
@@ -211,115 +291,116 @@ impl HistoryEventSorter {
         let mut readers = self
             .runs
             .iter()
-            .map(|path| HistoryRunReader::open(path))
+            .map(|path| SortRunReader::open(path))
             .collect::<Result<Vec<_>>>()?;
         let mut heads = BinaryHeap::new();
         for (run, reader) in readers.iter_mut().enumerate() {
-            if let Some(event) = reader.next_event()? {
-                heads.push(HistoryRunHead { run, event });
+            if let Some(record) = reader.next_record()? {
+                heads.push(SortRunHead { run, record });
             }
         }
         let mut writer = ArchiveWriter::new(output, frame_target)?;
-        let mut events = 0_u64;
+        let mut user_actions = 0_u64;
         while let Some(head) = heads.pop() {
-            writer.write(&Record::HistoryEvent {
-                entity: head.event.entity,
-                timestamp_micros: head.event.timestamp_micros,
-                event: head.event.event,
-            })?;
-            events += 1;
-            if let Some(event) = readers[head.run].next_event()? {
-                heads.push(HistoryRunHead {
+            let mut record = head.record;
+            if let Some(next) = readers[head.run].next_record()? {
+                heads.push(SortRunHead {
                     run: head.run,
-                    event,
+                    record: next,
                 });
             }
+            while heads
+                .peek()
+                .is_some_and(|other| records_coalesce(&record, &other.record))
+            {
+                let other = heads.pop().expect("peeked");
+                record = coalesce_records(record, other.record)?;
+                if let Some(next) = readers[other.run].next_record()? {
+                    heads.push(SortRunHead {
+                        run: other.run,
+                        record: next,
+                    });
+                }
+            }
+            user_actions += u64::from(matches!(record, Record::UserAction { .. }));
+            writer.write(&record)?;
         }
         let (output, frames) = writer.finish()?;
-        Ok((output, frames, events))
+        Ok((output, frames, user_actions))
     }
 }
 
-fn history_event_order(
-    left: &PendingHistoryEvent,
-    right: &PendingHistoryEvent,
-) -> std::cmp::Ordering {
-    left.entity
-        .cmp(&right.entity)
-        .then_with(|| right.timestamp_micros.cmp(&left.timestamp_micros))
-        .then_with(|| right.event.source_ordinal.cmp(&left.event.source_ordinal))
-}
-
-fn write_history_run_record(output: &mut impl Write, pending: &PendingHistoryEvent) -> Result<()> {
-    output.write_all(&[pending.entity.kind as u8])?;
-    output.write_all(&pending.entity.id.to_le_bytes())?;
-    output.write_all(&pending.timestamp_micros.to_le_bytes())?;
-    let payload_len = history_event_wire_len(&pending.event)?;
+fn write_sort_run_record(output: &mut impl Write, record: &Record) -> Result<()> {
+    let entity = record.entity();
+    output.write_all(&[entity.kind as u8])?;
+    output.write_all(&entity.id.to_le_bytes())?;
+    output.write_all(&record.timestamp_micros().to_le_bytes())?;
+    let (kind, payload_len) = record_wire_size(record)?;
+    output.write_all(&[kind])?;
     output.write_all(&payload_len.to_le_bytes())?;
-    write_history_event(output, &pending.event)
+    write_record_payload(output, record)
 }
 
-struct HistoryRunReader {
+struct SortRunReader {
     decoder: zstd::stream::read::Decoder<'static, BufReader<std::fs::File>>,
 }
 
-impl HistoryRunReader {
+impl SortRunReader {
     fn open(path: &Path) -> Result<Self> {
         Ok(Self {
             decoder: zstd::stream::read::Decoder::new(std::fs::File::open(path)?)?,
         })
     }
 
-    fn next_event(&mut self) -> Result<Option<PendingHistoryEvent>> {
+    fn next_record(&mut self) -> Result<Option<Record>> {
         let mut kind = [0_u8; 1];
         if self.decoder.read(&mut kind)? == 0 {
             return Ok(None);
         }
-        let kind = EntityKind::try_from(kind[0])?;
+        let entity_kind = EntityKind::try_from(kind[0])?;
         let id = read_u64_from(&mut self.decoder)?;
         let timestamp_micros = read_i64(&mut self.decoder)?;
+        let kind = read_u8(&mut self.decoder)?;
         let payload_len = read_u64_from(&mut self.decoder)?;
         let payload_len = usize::try_from(payload_len).map_err(|_| ArchiveError::FieldTooLarge)?;
         let mut payload = vec![0_u8; payload_len];
         self.decoder.read_exact(&mut payload)?;
-        let mut payload = payload.as_slice();
-        let event = read_history_event(&mut payload)?;
-        if !payload.is_empty() {
-            return Err(ArchiveError::Invalid(
-                "history run payload has trailing bytes",
-            ));
-        }
-        Ok(Some(PendingHistoryEvent {
-            entity: EntityKey { kind, id },
+        decode_record(
+            EntityKey {
+                kind: entity_kind,
+                id,
+            },
             timestamp_micros,
-            event,
-        }))
+            kind,
+            payload,
+        )
+        .map(Some)
     }
 }
 
-struct HistoryRunHead {
+struct SortRunHead {
     run: usize,
-    event: PendingHistoryEvent,
+    record: Record,
 }
 
-impl PartialEq for HistoryRunHead {
+impl PartialEq for SortRunHead {
     fn eq(&self, other: &Self) -> bool {
-        history_event_order(&self.event, &other.event) == std::cmp::Ordering::Equal
+        record_order(&self.record, &other.record) == std::cmp::Ordering::Equal
             && self.run == other.run
     }
 }
 
-impl Eq for HistoryRunHead {}
+impl Eq for SortRunHead {}
 
-impl PartialOrd for HistoryRunHead {
+impl PartialOrd for SortRunHead {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl Ord for HistoryRunHead {
+impl Ord for SortRunHead {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        history_event_order(&other.event, &self.event).then_with(|| other.run.cmp(&self.run))
+        record_order(&other.record, &self.record).then_with(|| other.run.cmp(&self.run))
     }
 }
 
@@ -335,14 +416,23 @@ pub enum Record {
         revision: RevisionRecord,
     },
     PageAction {
-        page_id: u64,
+        entity: EntityKey,
         timestamp_micros: i64,
         action: PageActionRecord,
     },
-    HistoryEvent {
+    UserState {
+        user_id: u64,
+        timestamp_micros: i64,
+        state: UserStateRecord,
+    },
+    UserAction {
         entity: EntityKey,
         timestamp_micros: i64,
-        event: HistoryEventRecord,
+        action: UserActionRecord,
+    },
+    Manifest {
+        timestamp_micros: i64,
+        manifest: ManifestRecord,
     },
     Unknown {
         entity: EntityKey,
@@ -356,12 +446,19 @@ impl Record {
     pub fn entity(&self) -> EntityKey {
         match self {
             Self::PageState { page_id, .. }
-            | Self::Revision { page_id, .. }
-            | Self::PageAction { page_id, .. } => EntityKey {
+            | Self::Revision { page_id, .. } => EntityKey {
                 kind: EntityKind::Page,
                 id: *page_id,
             },
-            Self::HistoryEvent { entity, .. } => *entity,
+            Self::PageAction { entity, .. } | Self::UserAction { entity, .. } => *entity,
+            Self::UserState { user_id, .. } => EntityKey {
+                kind: EntityKind::User,
+                id: *user_id,
+            },
+            Self::Manifest { .. } => EntityKey {
+                kind: EntityKind::Global,
+                id: 0,
+            },
             Self::Unknown { entity, .. } => *entity,
         }
     }
@@ -378,10 +475,16 @@ impl Record {
             | Self::PageAction {
                 timestamp_micros, ..
             }
-            | Self::Unknown {
+            | Self::UserState {
                 timestamp_micros, ..
-            } => *timestamp_micros,
-            Self::HistoryEvent {
+            }
+            | Self::UserAction {
+                timestamp_micros, ..
+            }
+            | Self::Manifest {
+                timestamp_micros, ..
+            }
+            | Self::Unknown {
                 timestamp_micros, ..
             } => *timestamp_micros,
             Self::Revision { revision, .. } => revision.meta.ts.timestamp_micros(),
@@ -413,24 +516,50 @@ pub struct FrameLocation {
     pub compressed_offset: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CompressionSettings {
+    pub level: i32,
+    pub checksum: bool,
+    pub long_distance_matching: bool,
+    pub window_log: Option<u32>,
+    pub target_block_size: Option<u32>,
+}
+
+impl Default for CompressionSettings {
+    fn default() -> Self {
+        Self {
+            level: 3,
+            checksum: false,
+            long_distance_matching: false,
+            window_log: None,
+            target_block_size: None,
+        }
+    }
+}
+
 struct FrameBuilder {
     encoder: zstd::stream::write::Encoder<'static, Vec<u8>>,
     first_entity: EntityKey,
     last_entity: EntityKey,
     records: u64,
     raw_bytes: u64,
-    next_probe_raw: u64,
 }
 
 impl FrameBuilder {
-    fn new(entity: EntityKey) -> Result<Self> {
+    fn new(entity: EntityKey, settings: CompressionSettings) -> Result<Self> {
+        let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), settings.level)?;
+        encoder.include_checksum(settings.checksum)?;
+        encoder.long_distance_matching(settings.long_distance_matching)?;
+        if let Some(window_log) = settings.window_log {
+            encoder.window_log(window_log)?;
+        }
+        encoder.set_target_cblock_size(settings.target_block_size)?;
         Ok(Self {
-            encoder: zstd::stream::write::Encoder::new(Vec::new(), 3)?,
+            encoder,
             first_entity: entity,
             last_entity: entity,
             records: 0,
             raw_bytes: 0,
-            next_probe_raw: 0,
         })
     }
 
@@ -442,6 +571,7 @@ impl FrameBuilder {
 pub struct ArchiveWriter<W: Write> {
     output: W,
     frame_target: usize,
+    compression: CompressionSettings,
     frame: Option<FrameBuilder>,
     last_entity: Option<EntityKey>,
     last_timestamp: i64,
@@ -449,7 +579,15 @@ pub struct ArchiveWriter<W: Write> {
 }
 
 impl<W: Write> ArchiveWriter<W> {
-    pub fn new(mut output: W, frame_target: usize) -> Result<Self> {
+    pub fn new(output: W, frame_target: usize) -> Result<Self> {
+        Self::with_compression(output, frame_target, CompressionSettings::default())
+    }
+
+    pub fn with_compression(
+        mut output: W,
+        frame_target: usize,
+        compression: CompressionSettings,
+    ) -> Result<Self> {
         if frame_target == 0 {
             return Err(ArchiveError::Invalid("zero frame target"));
         }
@@ -460,6 +598,7 @@ impl<W: Write> ArchiveWriter<W> {
         Ok(Self {
             output,
             frame_target,
+            compression,
             frame: None,
             last_entity: None,
             last_timestamp: i64::MAX,
@@ -483,30 +622,14 @@ impl<W: Write> ArchiveWriter<W> {
         }
         if new_entity {
             if let Some(frame) = self.frame.as_mut() {
-                if frame.compressed_so_far() < self.frame_target
-                    && frame.raw_bytes >= frame.next_probe_raw
-                {
-                    frame.encoder.flush()?;
-                    let compressed = frame.compressed_so_far() as u64;
-                    let deficit = (self.frame_target as u64).saturating_sub(compressed);
-                    let estimated_raw = if compressed == 0 {
-                        self.frame_target as u64
-                    } else {
-                        deficit
-                            .saturating_mul(frame.raw_bytes)
-                            .saturating_div(compressed)
-                    };
-                    frame.next_probe_raw = frame
-                        .raw_bytes
-                        .saturating_add(estimated_raw.max(self.frame_target as u64));
-                }
+                frame.encoder.flush()?;
                 if frame.compressed_so_far() >= self.frame_target {
                     self.seal_frame()?;
                 }
             }
         }
         if self.frame.is_none() {
-            self.frame = Some(FrameBuilder::new(entity)?);
+            self.frame = Some(FrameBuilder::new(entity, self.compression)?);
         }
 
         let frame = self.frame.as_mut().expect("created above");
@@ -703,6 +826,355 @@ pub fn visit_frame(
     Ok(())
 }
 
+type OwnedFrameDecoder = zstd::stream::read::Decoder<'static, BufReader<Take<std::fs::File>>>;
+
+pub struct ArchiveRecordReader {
+    path: PathBuf,
+    frames: std::vec::IntoIter<FrameLocation>,
+    current: Option<ArchiveFrameReader<OwnedFrameDecoder>>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RepackStats {
+    pub input_frames: u64,
+    pub output_frames: u64,
+    pub records: u64,
+    pub input_raw_bytes: u64,
+    pub input_compressed_bytes: u64,
+}
+
+pub fn repack<R: Read, W: Write>(
+    input: R,
+    output: W,
+    frame_target: usize,
+    compression: CompressionSettings,
+) -> Result<(W, RepackStats)> {
+    let mut reader = ArchiveReader::new(input)?;
+    let mut writer = ArchiveWriter::with_compression(output, frame_target, compression)?;
+    let mut stats = RepackStats::default();
+    while let Some(mut frame) = reader.next_frame()? {
+        let info = frame.info();
+        stats.input_frames += 1;
+        stats.input_raw_bytes = stats
+            .input_raw_bytes
+            .checked_add(info.raw_bytes)
+            .ok_or(ArchiveError::FieldTooLarge)?;
+        stats.input_compressed_bytes = stats
+            .input_compressed_bytes
+            .checked_add(info.compressed_bytes)
+            .ok_or(ArchiveError::FieldTooLarge)?;
+        while let Some(record) = frame.next_record()? {
+            writer.write(&record)?;
+            stats.records += 1;
+        }
+    }
+    if !reader.is_complete() {
+        return Err(ArchiveError::Invalid(
+            "archive has no clean completion marker",
+        ));
+    }
+    let (output, output_frames) = writer.finish()?;
+    stats.output_frames = output_frames;
+    Ok((output, stats))
+}
+
+impl ArchiveRecordReader {
+    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        let (_, frames, complete) = index_file(&path)?;
+        if !complete {
+            return Err(ArchiveError::Invalid(
+                "archive has no clean completion marker",
+            ));
+        }
+        Ok(Self {
+            path,
+            frames: frames.into_iter(),
+            current: None,
+        })
+    }
+
+    pub fn next_record(&mut self) -> Result<Option<Record>> {
+        loop {
+            if let Some(frame) = self.current.as_mut() {
+                if let Some(record) = frame.next_record()? {
+                    return Ok(Some(record));
+                }
+                self.current = None;
+            }
+            let Some(location) = self.frames.next() else {
+                return Ok(None);
+            };
+            self.current = Some(open_owned_frame(&self.path, &location)?);
+        }
+    }
+}
+
+fn open_owned_frame(
+    path: &Path,
+    location: &FrameLocation,
+) -> Result<ArchiveFrameReader<OwnedFrameDecoder>> {
+    let mut file = std::fs::File::open(path)?;
+    file.seek(SeekFrom::Start(location.compressed_offset))?;
+    let decoder =
+        zstd::stream::read::Decoder::new(file.take(location.info.compressed_bytes))?.single_frame();
+    Ok(ArchiveFrameReader {
+        decoder,
+        info: location.info,
+        records_read: 0,
+        raw_bytes_read: 0,
+        last_entity: None,
+        last_timestamp: i64::MAX,
+        finished: false,
+    })
+}
+
+pub fn concatenate_archives<W: Write>(
+    inputs: &[PathBuf],
+    mut output: W,
+    frame_target: usize,
+) -> Result<(W, u64)> {
+    output.write_all(&FILE_MAGIC)?;
+    output.write_all(&FILE_VERSION.to_le_bytes())?;
+    output.write_all(&0_u32.to_le_bytes())?;
+    output.write_all(&(frame_target as u64).to_le_bytes())?;
+    let mut previous = None;
+    let mut frame_count = 0_u64;
+    for input in inputs {
+        let (_, frames, complete) = index_file(input)?;
+        if !complete {
+            return Err(ArchiveError::Invalid(
+                "archive segment has no completion marker",
+            ));
+        }
+        let mut source = std::fs::File::open(input)?;
+        for location in frames {
+            if previous.is_some_and(|entity| entity >= location.info.first_entity) {
+                return Err(ArchiveError::Invalid(
+                    "archive segments overlap or are out of order",
+                ));
+            }
+            write_frame_header(&mut output, location.info)?;
+            source.seek(SeekFrom::Start(location.compressed_offset))?;
+            io::copy(
+                &mut (&mut source).take(location.info.compressed_bytes),
+                &mut output,
+            )?;
+            previous = Some(location.info.last_entity);
+            frame_count += 1;
+        }
+    }
+    output.write_all(&DONE_MAGIC)?;
+    output.write_all(&[0; FRAME_HEADER_LEN - 4])?;
+    output.flush()?;
+    Ok((output, frame_count))
+}
+
+pub fn merge_archives<W: Write>(
+    left: impl AsRef<Path>,
+    right: impl AsRef<Path>,
+    output: W,
+    frame_target: usize,
+) -> Result<(W, u64, u64)> {
+    merge_many_archives(
+        &[left.as_ref().to_path_buf(), right.as_ref().to_path_buf()],
+        output,
+        frame_target,
+    )
+}
+
+pub fn merge_many_archives<W: Write>(
+    inputs: &[PathBuf],
+    output: W,
+    frame_target: usize,
+) -> Result<(W, u64, u64)> {
+    let mut readers = inputs
+        .iter()
+        .map(ArchiveRecordReader::open)
+        .collect::<Result<Vec<_>>>()?;
+    let mut heads = BinaryHeap::new();
+    for (reader, input) in readers.iter_mut().enumerate() {
+        if let Some(record) = input.next_record()? {
+            heads.push(ArchiveMergeHead { reader, record });
+        }
+    }
+    let mut writer = ArchiveWriter::new(output, frame_target)?;
+    let mut records = 0_u64;
+    while let Some(head) = heads.pop() {
+        let mut record = head.record;
+        if let Some(next) = readers[head.reader].next_record()? {
+            heads.push(ArchiveMergeHead {
+                reader: head.reader,
+                record: next,
+            });
+        }
+        while heads
+            .peek()
+            .is_some_and(|other| records_coalesce(&record, &other.record))
+        {
+            let other = heads.pop().expect("peeked");
+            record = coalesce_records(record, other.record)?;
+            if let Some(next) = readers[other.reader].next_record()? {
+                heads.push(ArchiveMergeHead {
+                    reader: other.reader,
+                    record: next,
+                });
+            }
+        }
+        writer.write(&record)?;
+        records += 1;
+    }
+    let (output, frames) = writer.finish()?;
+    Ok((output, frames, records))
+}
+
+fn records_coalesce(left: &Record, right: &Record) -> bool {
+    match (left, right) {
+        (
+            Record::Revision {
+                page_id: left_page,
+                revision: left,
+            },
+            Record::Revision {
+                page_id: right_page,
+                revision: right,
+            },
+        ) => left_page == right_page && left.meta.rev_id == right.meta.rev_id,
+        (
+            Record::UserState {
+                user_id: left, ..
+            },
+            Record::UserState {
+                user_id: right, ..
+            },
+        ) => left == right,
+        _ => false,
+    }
+}
+
+fn coalesce_records(left: Record, right: Record) -> Result<Record> {
+    match (left, right) {
+        (
+            Record::Revision {
+                page_id,
+                revision: mut left,
+            },
+            Record::Revision {
+                revision: right, ..
+            },
+        ) => {
+            if left.has_text && right.has_text && left.text != right.text {
+                return Err(ArchiveError::Invalid(
+                    "conflicting text for one revision id",
+                ));
+            }
+            if !left.has_text && right.has_text {
+                let visibility = left.visibility.take();
+                let history = left.history.take();
+                left = right;
+                left.visibility = left.visibility.or(visibility);
+                left.history = left.history.or(history);
+            } else {
+                left.visibility = left.visibility.or(right.visibility);
+                left.history = left.history.or(right.history);
+                left.meta.flags |= right.meta.flags;
+            }
+            Ok(Record::Revision {
+                page_id,
+                revision: left,
+            })
+        }
+        (
+            Record::UserState {
+                user_id,
+                timestamp_micros,
+                state,
+            },
+            Record::UserState {
+                state: other, ..
+            },
+        ) if state == other => Ok(Record::UserState {
+            user_id,
+            timestamp_micros,
+            state,
+        }),
+        (Record::UserState { .. }, Record::UserState { .. }) => {
+            Err(ArchiveError::Invalid("conflicting current user states"))
+        }
+        _ => Err(ArchiveError::Invalid("records cannot be coalesced")),
+    }
+}
+
+struct ArchiveMergeHead {
+    reader: usize,
+    record: Record,
+}
+
+impl PartialEq for ArchiveMergeHead {
+    fn eq(&self, other: &Self) -> bool {
+        record_order(&self.record, &other.record) == std::cmp::Ordering::Equal
+            && self.reader == other.reader
+    }
+}
+
+impl Eq for ArchiveMergeHead {}
+
+impl PartialOrd for ArchiveMergeHead {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ArchiveMergeHead {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        record_order(&other.record, &self.record).then_with(|| other.reader.cmp(&self.reader))
+    }
+}
+
+fn record_order(left: &Record, right: &Record) -> std::cmp::Ordering {
+    left.entity()
+        .cmp(&right.entity())
+        .then_with(|| right.timestamp_micros().cmp(&left.timestamp_micros()))
+        .then_with(|| record_order_rank(left).cmp(&record_order_rank(right)))
+        .then_with(|| record_tie(right).cmp(&record_tie(left)))
+}
+
+fn record_order_rank(record: &Record) -> u8 {
+    match record {
+        Record::PageState { .. } => 0,
+        Record::Revision { .. } => 1,
+        Record::PageAction { .. } => 2,
+        Record::UserState { .. } => 0,
+        Record::UserAction { .. } => 1,
+        Record::Manifest { .. } => 0,
+        Record::Unknown { .. } => 255,
+    }
+}
+
+fn record_tie(record: &Record) -> u64 {
+    match record {
+        Record::Revision { revision, .. } => revision.meta.rev_id,
+        Record::PageAction { action, .. } => action.tie_sequence,
+        Record::UserAction { action, .. } => action.tie_sequence,
+        _ => 0,
+    }
+}
+
+fn write_frame_header(output: &mut impl Write, info: FrameInfo) -> Result<()> {
+    output.write_all(&FRAME_MAGIC)?;
+    output.write_all(&(FRAME_HEADER_LEN as u32).to_le_bytes())?;
+    output.write_all(&[info.first_entity.kind as u8])?;
+    output.write_all(&[info.last_entity.kind as u8])?;
+    output.write_all(&[0; 6])?;
+    output.write_all(&info.first_entity.id.to_le_bytes())?;
+    output.write_all(&info.last_entity.id.to_le_bytes())?;
+    output.write_all(&info.records.to_le_bytes())?;
+    output.write_all(&info.raw_bytes.to_le_bytes())?;
+    output.write_all(&info.compressed_bytes.to_le_bytes())?;
+    output.write_all(&[0; 8])?;
+    Ok(())
+}
+
 fn read_file_header(input: &mut impl Read) -> Result<u64> {
     let mut header = [0_u8; FILE_HEADER_LEN];
     input.read_exact(&mut header)?;
@@ -844,26 +1316,23 @@ pub fn export_instance<W: Write>(
     if let Some(name) = instance.sync_state("history_user_archive")? {
         let name_path = Path::new(&name);
         if name_path.file_name() != Some(name_path.as_os_str()) {
-            return Err(ArchiveError::Invalid("invalid history user archive name"));
+            return Err(ArchiveError::Invalid("invalid typed user archive name"));
         }
         let path = instance.root().join(name_path);
         let (_, frames, complete) = index_file(&path)?;
         if !complete {
             return Err(ArchiveError::Invalid(
-                "history user archive has no completion marker",
+                "typed user archive has no completion marker",
             ));
         }
         for frame in frames {
             visit_frame(&path, &frame, |record| match record {
-                Record::HistoryEvent { entity, .. }
-                    if matches!(entity.kind, EntityKind::User | EntityKind::Global) =>
-                {
-                    writer.write(&record)?;
-                    stats.user_actions += 1;
-                    Ok(())
+                Record::UserState { .. } | Record::UserAction { .. } => {
+                    stats.user_actions += u64::from(matches!(record, Record::UserAction { .. }));
+                    writer.write(&record)
                 }
                 _ => Err(ArchiveError::Invalid(
-                    "history user archive contains a non-user event",
+                    "typed user archive contains a non-user record",
                 )),
             })?;
         }
@@ -887,8 +1356,8 @@ fn export_page<W: Write>(
     let mut actions = instance
         .archive_page_actions(page_id)?
         .into_iter()
-        .map(|action| {
-            let timestamp = parse_timestamp_micros(&action.timestamp)?;
+        .map(|(action, timestamp)| {
+            let timestamp = parse_timestamp_micros(&timestamp)?;
             Ok((action, timestamp))
         })
         .collect::<Result<Vec<_>>>()?
@@ -918,7 +1387,7 @@ fn export_page<W: Write>(
         };
         let action_key = actions
             .peek()
-            .map(|(action, timestamp)| (*timestamp, 0_u8, action.source_ordinal));
+            .map(|(action, timestamp)| (*timestamp, 0_u8, action.tie_sequence));
         if revision_key.is_none() && action_key.is_none() {
             break;
         }
@@ -929,15 +1398,20 @@ fn export_page<W: Write>(
                 page_id,
                 revision: RevisionRecord {
                     meta: revision.meta,
+                    has_text: revision.has_text,
                     text: revision.text,
                     visibility: visibility.get(&revision_id).cloned(),
+                    history: None,
                 },
             })?;
             stats.revisions += 1;
         } else {
             let (action, timestamp_micros) = actions.next().expect("key exists");
             writer.write(&Record::PageAction {
-                page_id,
+                entity: EntityKey {
+                    kind: EntityKind::Page,
+                    id: page_id,
+                },
                 timestamp_micros,
                 action,
             })?;
@@ -968,12 +1442,17 @@ struct PageRevisionSpool {
 }
 
 impl PageRevisionSpool {
-    fn collect(revisions: ArchiveRevisionIter) -> Result<Self> {
+    fn collect<E>(
+        revisions: impl IntoIterator<Item = std::result::Result<RevisionRecord, E>>,
+    ) -> Result<Self>
+    where
+        ArchiveError: From<E>,
+    {
         let mut entries = Vec::new();
         let mut memory_bytes = 0_usize;
         let mut file = None;
         for revision in revisions {
-            let revision = revision?;
+            let revision = revision.map_err(ArchiveError::from)?;
             memory_bytes = memory_bytes.saturating_add(revision.text.len());
             entries.push(SpooledRevision {
                 meta: revision.meta,
@@ -1007,6 +1486,28 @@ impl PageRevisionSpool {
     }
 }
 
+pub(crate) fn write_content_page<W: Write>(
+    writer: &mut ArchiveWriter<W>,
+    page_id: u64,
+    current_title: String,
+    revisions: impl IntoIterator<Item = Result<RevisionRecord>>,
+) -> Result<u64> {
+    writer.write(&Record::PageState {
+        page_id,
+        timestamp_micros: i64::MAX,
+        current_title,
+    })?;
+    let mut count = 0_u64;
+    for revision in PageRevisionSpool::collect(revisions)? {
+        writer.write(&Record::Revision {
+            page_id,
+            revision: revision?,
+        })?;
+        count += 1;
+    }
+    Ok(count)
+}
+
 impl Iterator for PageRevisionSpool {
     type Item = Result<RevisionRecord>;
 
@@ -1031,8 +1532,10 @@ impl Iterator for PageRevisionSpool {
         };
         Some(Ok(RevisionRecord {
             meta: entry.meta,
+            has_text: true,
             text,
             visibility: None,
+            history: None,
         }))
     }
 }
@@ -1059,8 +1562,10 @@ impl Iterator for ArchiveRevisionIter {
             Ok(Some(record)) => Some(crate::revision::decode_revision(record).map(
                 |(meta, text)| RevisionRecord {
                     meta,
+                    has_text: true,
                     text,
                     visibility: None,
+                    history: None,
                 },
             )),
             Ok(None) => None,
@@ -1084,14 +1589,18 @@ fn record_wire_size(record: &Record) -> Result<(u8, u64)> {
         Record::PageState { current_title, .. } => string_wire_len(current_title),
         Record::Revision { revision, .. } => revision_wire_len(revision),
         Record::PageAction { action, .. } => action_wire_len(action),
-        Record::HistoryEvent { event, .. } => history_event_wire_len(event),
+        Record::UserState { state, .. } => user_state_wire_len(state),
+        Record::UserAction { action, .. } => user_action_wire_len(action),
+        Record::Manifest { manifest, .. } => manifest_wire_len(manifest),
         Record::Unknown { payload, kind, .. } => return Ok((*kind, payload.len() as u64)),
     }?;
     let kind = match record {
         Record::PageState { .. } => KIND_PAGE_STATE,
         Record::Revision { .. } => KIND_REVISION,
         Record::PageAction { .. } => KIND_PAGE_ACTION,
-        Record::HistoryEvent { .. } => KIND_HISTORY_EVENT,
+        Record::UserState { .. } => KIND_USER_STATE,
+        Record::UserAction { .. } => KIND_USER_ACTION,
+        Record::Manifest { .. } => KIND_MANIFEST,
         Record::Unknown { kind, .. } => *kind,
     };
     Ok((kind, size))
@@ -1102,7 +1611,9 @@ fn write_record_payload<W: Write>(out: &mut W, record: &Record) -> Result<()> {
         Record::PageState { current_title, .. } => write_string(out, current_title)?,
         Record::Revision { revision, .. } => write_revision(out, revision)?,
         Record::PageAction { action, .. } => write_action(out, action)?,
-        Record::HistoryEvent { event, .. } => write_history_event(out, event)?,
+        Record::UserState { state, .. } => write_user_state(out, state)?,
+        Record::UserAction { action, .. } => write_user_action(out, action)?,
+        Record::Manifest { manifest, .. } => write_manifest(out, manifest)?,
         Record::Unknown { payload, .. } => out.write_all(payload)?,
     }
     Ok(())
@@ -1118,12 +1629,20 @@ fn revision_wire_len(revision: &RevisionRecord) -> Result<u64> {
         1,
         string_wire_len(contributor)?,
         string_wire_len(&revision.meta.comment)?,
+        1,
         bytes_wire_len(&revision.text)?,
         1,
         revision
             .visibility
             .as_ref()
             .map(visibility_wire_len)
+            .transpose()?
+            .unwrap_or(0),
+        1,
+        revision
+            .history
+            .as_ref()
+            .map(revision_history_wire_len)
             .transpose()?
             .unwrap_or(0),
     ])
@@ -1138,6 +1657,7 @@ fn write_revision<W: Write>(out: &mut W, revision: &RevisionRecord) -> Result<()
     out.write_all(&[contributor_kind(&revision.meta.contributor)])?;
     write_string(out, contributor)?;
     write_string(out, &revision.meta.comment)?;
+    out.write_all(&[u8::from(revision.has_text)])?;
     write_bytes(out, &revision.text)?;
     match &revision.visibility {
         Some(visibility) => {
@@ -1146,107 +1666,218 @@ fn write_revision<W: Write>(out: &mut W, revision: &RevisionRecord) -> Result<()
         }
         None => out.write_all(&[0])?,
     }
+    match &revision.history {
+        Some(history) => {
+            out.write_all(&[1])?;
+            write_revision_history(out, history)?;
+        }
+        None => out.write_all(&[0])?,
+    }
     Ok(())
 }
 
 fn action_wire_len(action: &PageActionRecord) -> Result<u64> {
     checked_sum(&[
-        string_wire_len(&action.source_key)?,
-        string_wire_len(&action.source_partition)?,
-        option_i64_wire_len(action.event_log_id),
-        8,
-        string_wire_len(&action.event_type)?,
-        string_wire_len(&action.timestamp)?,
+        option_u64_wire_len(action.log_id),
+        varint_len(action.tie_sequence) as u64,
+        action_kind_wire_len(&action.kind)?,
+        performer_wire_len(&action.performer)?,
         string_wire_len(&action.comment)?,
-        option_i64_wire_len(action.actor_id),
-        string_wire_len(&action.actor_name)?,
-        string_wire_len(&action.historical_title)?,
-        string_wire_len(&action.current_title)?,
-        option_i64_wire_len(action.historical_namespace),
-        option_i64_wire_len(action.current_namespace),
-        1,
+        string_wire_len(&action.title_at_event)?,
+        option_i64_wire_len(action.namespace_at_event),
+        option_bool_wire_len(action.resulting_deleted),
     ])
 }
 
 fn write_action<W: Write>(out: &mut W, action: &PageActionRecord) -> Result<()> {
-    write_string(out, &action.source_key)?;
-    write_string(out, &action.source_partition)?;
-    write_option_i64(out, action.event_log_id)?;
-    out.write_all(&action.source_ordinal.to_le_bytes())?;
-    write_string(out, &action.event_type)?;
-    write_string(out, &action.timestamp)?;
+    write_option_u64(out, action.log_id)?;
+    write_varint(out, action.tie_sequence)?;
+    write_action_kind(out, &action.kind)?;
+    write_performer(out, &action.performer)?;
     write_string(out, &action.comment)?;
-    write_option_i64(out, action.actor_id)?;
-    write_string(out, &action.actor_name)?;
-    write_string(out, &action.historical_title)?;
-    write_string(out, &action.current_title)?;
-    write_option_i64(out, action.historical_namespace)?;
-    write_option_i64(out, action.current_namespace)?;
-    out.write_all(&[u8::from(action.page_deleted)])?;
-    Ok(())
-}
-
-fn history_event_wire_len(event: &HistoryEventRecord) -> Result<u64> {
-    if usize::from(event.schema_columns) != event.fields.len() {
-        return Err(ArchiveError::Invalid(
-            "user event column count does not match schema",
-        ));
-    }
-    let mut size = checked_sum(&[
-        string_wire_len(&event.source_partition)?,
-        8,
-        2,
-        varint_len(event.fields.len() as u64) as u64,
-    ])?;
-    for field in &event.fields {
-        size = size.checked_add(1).ok_or(ArchiveError::FieldTooLarge)?;
-        if let Some(value) = field {
-            size = size
-                .checked_add(bytes_wire_len(value)?)
-                .ok_or(ArchiveError::FieldTooLarge)?;
-        }
-    }
-    Ok(size)
-}
-
-fn write_history_event<W: Write>(out: &mut W, event: &HistoryEventRecord) -> Result<()> {
-    if usize::from(event.schema_columns) != event.fields.len() {
-        return Err(ArchiveError::Invalid(
-            "user event column count does not match schema",
-        ));
-    }
-    write_string(out, &event.source_partition)?;
-    out.write_all(&event.source_ordinal.to_le_bytes())?;
-    out.write_all(&event.schema_columns.to_le_bytes())?;
-    write_varint(out, event.fields.len() as u64)?;
-    for field in &event.fields {
-        match field {
-            Some(value) => {
-                out.write_all(&[1])?;
-                write_bytes(out, value)?;
-            }
-            None => out.write_all(&[0])?,
-        }
-    }
+    write_string(out, &action.title_at_event)?;
+    write_option_i64(out, action.namespace_at_event)?;
+    write_option_bool(out, action.resulting_deleted)?;
     Ok(())
 }
 
 fn visibility_wire_len(visibility: &RevisionVisibilityRecord) -> Result<u64> {
     checked_sum(&[
-        string_wire_len(&visibility.source_partition)?,
-        string_wire_len(&visibility.deleted_parts)?,
         1,
         1,
-        string_wire_len(&visibility.page_deletion_timestamp)?,
+        1,
+        option_i64_wire_len(visibility.page_deletion_timestamp_micros),
     ])
 }
 
 fn write_visibility<W: Write>(out: &mut W, visibility: &RevisionVisibilityRecord) -> Result<()> {
-    write_string(out, &visibility.source_partition)?;
-    write_string(out, &visibility.deleted_parts)?;
+    out.write_all(&[visibility.deleted_parts])?;
     out.write_all(&[u8::from(visibility.parts_are_suppressed)])?;
     out.write_all(&[u8::from(visibility.deleted_by_page_deletion)])?;
-    write_string(out, &visibility.page_deletion_timestamp)?;
+    write_option_i64(out, visibility.page_deletion_timestamp_micros)?;
+    Ok(())
+}
+
+fn performer_wire_len(performer: &PerformerRecord) -> Result<u64> {
+    checked_sum(&[
+        option_u64_wire_len(performer.local_user_id),
+        option_u64_wire_len(performer.central_user_id),
+        option_string_wire_len(performer.historical_name.as_deref())?,
+        1,
+    ])
+}
+
+fn write_performer(out: &mut impl Write, performer: &PerformerRecord) -> Result<()> {
+    write_option_u64(out, performer.local_user_id)?;
+    write_option_u64(out, performer.central_user_id)?;
+    write_option_string(out, performer.historical_name.as_deref())?;
+    out.write_all(&[performer.account_class as u8])?;
+    Ok(())
+}
+
+fn action_kind_wire_len(kind: &PageActionKind) -> Result<u64> {
+    match kind {
+        PageActionKind::Other(name) => checked_sum(&[1, string_wire_len(name)?]),
+        _ => Ok(1),
+    }
+}
+
+fn write_action_kind(out: &mut impl Write, kind: &PageActionKind) -> Result<()> {
+    let code = match kind {
+        PageActionKind::Create => 0,
+        PageActionKind::LoggedCreate => 1,
+        PageActionKind::Move => 2,
+        PageActionKind::Delete => 3,
+        PageActionKind::Restore => 4,
+        PageActionKind::Merge => 5,
+        PageActionKind::Other(_) => 255,
+    };
+    out.write_all(&[code])?;
+    if let PageActionKind::Other(name) = kind {
+        write_string(out, name)?;
+    }
+    Ok(())
+}
+
+fn revision_history_wire_len(history: &RevisionHistoryRecord) -> Result<u64> {
+    checked_sum(&[
+        option_bool_wire_len(history.minor),
+        option_string_wire_len(history.content_model.as_deref())?,
+        option_string_wire_len(history.content_format.as_deref())?,
+        option_bool_wire_len(history.identity_reverted),
+        option_u64_wire_len(history.first_reverting_revision_id),
+        option_u64_wire_len(history.seconds_to_revert),
+        option_bool_wire_len(history.identity_revert),
+        option_bool_wire_len(history.before_page_creation),
+        strings_wire_len(&history.tags)?,
+    ])
+}
+
+fn write_revision_history(out: &mut impl Write, history: &RevisionHistoryRecord) -> Result<()> {
+    write_option_bool(out, history.minor)?;
+    write_option_string(out, history.content_model.as_deref())?;
+    write_option_string(out, history.content_format.as_deref())?;
+    write_option_bool(out, history.identity_reverted)?;
+    write_option_u64(out, history.first_reverting_revision_id)?;
+    write_option_u64(out, history.seconds_to_revert)?;
+    write_option_bool(out, history.identity_revert)?;
+    write_option_bool(out, history.before_page_creation)?;
+    write_strings(out, &history.tags)?;
+    Ok(())
+}
+
+fn user_state_wire_len(state: &UserStateRecord) -> Result<u64> {
+    checked_sum(&[
+        option_string_wire_len(state.current_name.as_deref())?,
+        option_u64_wire_len(state.central_user_id),
+        1,
+        strings_wire_len(&state.groups)?,
+        strings_wire_len(&state.blocks)?,
+        strings_wire_len(&state.bot_by)?,
+    ])
+}
+
+fn write_user_state(out: &mut impl Write, state: &UserStateRecord) -> Result<()> {
+    write_option_string(out, state.current_name.as_deref())?;
+    write_option_u64(out, state.central_user_id)?;
+    out.write_all(&[state.account_class as u8])?;
+    write_strings(out, &state.groups)?;
+    write_strings(out, &state.blocks)?;
+    write_strings(out, &state.bot_by)?;
+    Ok(())
+}
+
+fn user_action_kind_wire_len(kind: &UserActionKind) -> Result<u64> {
+    match kind {
+        UserActionKind::Other(name) => checked_sum(&[1, string_wire_len(name)?]),
+        _ => Ok(1),
+    }
+}
+
+fn write_user_action_kind(out: &mut impl Write, kind: &UserActionKind) -> Result<()> {
+    let code = match kind {
+        UserActionKind::Create => 0,
+        UserActionKind::Rename => 1,
+        UserActionKind::GroupsChanged => 2,
+        UserActionKind::BlocksChanged => 3,
+        UserActionKind::Other(_) => 255,
+    };
+    out.write_all(&[code])?;
+    if let UserActionKind::Other(name) = kind {
+        write_string(out, name)?;
+    }
+    Ok(())
+}
+
+fn user_action_wire_len(action: &UserActionRecord) -> Result<u64> {
+    checked_sum(&[
+        option_u64_wire_len(action.log_id),
+        varint_len(action.tie_sequence) as u64,
+        user_action_kind_wire_len(&action.kind)?,
+        performer_wire_len(&action.performer)?,
+        string_wire_len(&action.comment)?,
+        option_string_wire_len(action.historical_name.as_deref())?,
+        strings_wire_len(&action.groups)?,
+        strings_wire_len(&action.blocks)?,
+        strings_wire_len(&action.bot_by)?,
+        1,
+        option_i64_wire_len(action.registration_timestamp_micros),
+        option_i64_wire_len(action.creation_timestamp_micros),
+        option_i64_wire_len(action.first_edit_timestamp_micros),
+    ])
+}
+
+fn write_user_action(out: &mut impl Write, action: &UserActionRecord) -> Result<()> {
+    write_option_u64(out, action.log_id)?;
+    write_varint(out, action.tie_sequence)?;
+    write_user_action_kind(out, &action.kind)?;
+    write_performer(out, &action.performer)?;
+    write_string(out, &action.comment)?;
+    write_option_string(out, action.historical_name.as_deref())?;
+    write_strings(out, &action.groups)?;
+    write_strings(out, &action.blocks)?;
+    write_strings(out, &action.bot_by)?;
+    out.write_all(&[action.created_by])?;
+    write_option_i64(out, action.registration_timestamp_micros)?;
+    write_option_i64(out, action.creation_timestamp_micros)?;
+    write_option_i64(out, action.first_edit_timestamp_micros)?;
+    Ok(())
+}
+
+fn manifest_wire_len(manifest: &ManifestRecord) -> Result<u64> {
+    checked_sum(&[
+        string_wire_len(&manifest.wiki_db)?,
+        string_wire_len(&manifest.content_snapshot)?,
+        string_wire_len(&manifest.metadata_snapshot)?,
+        strings_wire_len(&manifest.source_files)?,
+    ])
+}
+
+fn write_manifest(out: &mut impl Write, manifest: &ManifestRecord) -> Result<()> {
+    write_string(out, &manifest.wiki_db)?;
+    write_string(out, &manifest.content_snapshot)?;
+    write_string(out, &manifest.metadata_snapshot)?;
+    write_strings(out, &manifest.source_files)?;
     Ok(())
 }
 
@@ -1262,17 +1893,27 @@ fn decode_record(entity: EntityKey, timestamp: i64, kind: u8, payload: Vec<u8>) 
             page_id: entity.id,
             revision: read_revision(&mut input, timestamp)?,
         },
-        KIND_PAGE_ACTION if entity.kind == EntityKind::Page => Record::PageAction {
-            page_id: entity.id,
+        KIND_PAGE_ACTION if matches!(entity.kind, EntityKind::Page | EntityKind::Global) => Record::PageAction {
+            entity,
             timestamp_micros: timestamp,
             action: read_action(&mut input)?,
         },
-        KIND_HISTORY_EVENT => Record::HistoryEvent {
+        KIND_USER_STATE if entity.kind == EntityKind::User => Record::UserState {
+            user_id: entity.id,
+            timestamp_micros: timestamp,
+            state: read_user_state(&mut input)?,
+        },
+        KIND_USER_ACTION if matches!(entity.kind, EntityKind::User | EntityKind::Global) => Record::UserAction {
             entity,
             timestamp_micros: timestamp,
-            event: read_history_event(&mut input)?,
+            action: read_user_action(&mut input)?,
         },
-        KIND_PAGE_STATE | KIND_REVISION | KIND_PAGE_ACTION => {
+        KIND_MANIFEST if entity.kind == EntityKind::Global && entity.id == 0 => Record::Manifest {
+            timestamp_micros: timestamp,
+            manifest: read_manifest(&mut input)?,
+        },
+        KIND_PAGE_STATE | KIND_REVISION | KIND_PAGE_ACTION | KIND_USER_STATE
+        | KIND_USER_ACTION | KIND_MANIFEST => {
             return Err(ArchiveError::Invalid(
                 "record kind is incompatible with entity kind",
             ))
@@ -1290,32 +1931,6 @@ fn decode_record(entity: EntityKey, timestamp: i64, kind: u8, payload: Vec<u8>) 
         return Err(ArchiveError::Invalid("record payload has trailing bytes"));
     }
     Ok(record)
-}
-
-fn read_history_event(input: &mut &[u8]) -> Result<HistoryEventRecord> {
-    let source_partition = read_string(input)?;
-    let source_ordinal = read_u64(input)?;
-    let schema_columns = read_u16(input)?;
-    let (field_count, _) = read_varint(input)?;
-    if field_count != u64::from(schema_columns) {
-        return Err(ArchiveError::Invalid(
-            "user event column count does not match schema",
-        ));
-    }
-    let mut fields = Vec::with_capacity(usize::from(schema_columns));
-    for _ in 0..schema_columns {
-        fields.push(match read_u8(input)? {
-            0 => None,
-            1 => Some(read_bytes(input)?),
-            _ => return Err(ArchiveError::Invalid("invalid field marker")),
-        });
-    }
-    Ok(HistoryEventRecord {
-        source_partition,
-        source_ordinal,
-        schema_columns,
-        fields,
-    })
 }
 
 fn read_revision(input: &mut &[u8], timestamp: i64) -> Result<RevisionRecord> {
@@ -1337,11 +1952,17 @@ fn read_revision(input: &mut &[u8], timestamp: i64) -> Result<RevisionRecord> {
         _ => return Err(ArchiveError::Invalid("invalid contributor")),
     };
     let comment = read_string(input)?;
+    let has_text = read_bool(input)?;
     let text = read_bytes(input)?;
     let visibility = match read_u8(input)? {
         0 => None,
         1 => Some(read_visibility(input)?),
         _ => return Err(ArchiveError::Invalid("invalid visibility marker")),
+    };
+    let history = match read_u8(input)? {
+        0 => None,
+        1 => Some(read_revision_history(input)?),
+        _ => return Err(ArchiveError::Invalid("invalid revision history marker")),
     };
     let ts = DateTime::<Utc>::from_timestamp_micros(timestamp)
         .ok_or(ArchiveError::Invalid("revision timestamp out of range"))?;
@@ -1356,46 +1977,132 @@ fn read_revision(input: &mut &[u8], timestamp: i64) -> Result<RevisionRecord> {
             flags,
             text_len: text.len() as u64,
         },
+        has_text,
         text,
         visibility,
+        history,
     })
 }
 
 fn read_action(input: &mut &[u8]) -> Result<PageActionRecord> {
     Ok(PageActionRecord {
-        source_key: read_string(input)?,
-        source_partition: read_string(input)?,
-        event_log_id: read_option_i64(input)?,
-        source_ordinal: read_u64(input)?,
-        event_type: read_string(input)?,
-        timestamp: read_string(input)?,
+        log_id: read_option_u64(input)?,
+        tie_sequence: read_varint(input)?.0,
+        kind: read_action_kind(input)?,
+        performer: read_performer(input)?,
         comment: read_string(input)?,
-        actor_id: read_option_i64(input)?,
-        actor_name: read_string(input)?,
-        historical_title: read_string(input)?,
-        current_title: read_string(input)?,
-        historical_namespace: read_option_i64(input)?,
-        current_namespace: read_option_i64(input)?,
-        page_deleted: match read_u8(input)? {
-            0 => false,
-            1 => true,
-            _ => return Err(ArchiveError::Invalid("invalid page-deleted marker")),
-        },
+        title_at_event: read_string(input)?,
+        namespace_at_event: read_option_i64(input)?,
+        resulting_deleted: read_option_bool(input)?,
     })
 }
 
 fn read_visibility(input: &mut &[u8]) -> Result<RevisionVisibilityRecord> {
-    let source_partition = read_string(input)?;
-    let deleted_parts = read_string(input)?;
+    let deleted_parts = read_u8(input)?;
     let parts_are_suppressed = read_bool(input)?;
     let deleted_by_page_deletion = read_bool(input)?;
-    let page_deletion_timestamp = read_string(input)?;
+    let page_deletion_timestamp_micros = read_option_i64(input)?;
     Ok(RevisionVisibilityRecord {
-        source_partition,
         deleted_parts,
         parts_are_suppressed,
         deleted_by_page_deletion,
-        page_deletion_timestamp,
+        page_deletion_timestamp_micros,
+    })
+}
+
+fn read_account_class(input: &mut &[u8]) -> Result<AccountClass> {
+    match read_u8(input)? {
+        0 => Ok(AccountClass::Unknown),
+        1 => Ok(AccountClass::Anonymous),
+        2 => Ok(AccountClass::Temporary),
+        3 => Ok(AccountClass::Permanent),
+        4 => Ok(AccountClass::Hidden),
+        _ => Err(ArchiveError::Invalid("invalid account class")),
+    }
+}
+
+fn read_performer(input: &mut &[u8]) -> Result<PerformerRecord> {
+    Ok(PerformerRecord {
+        local_user_id: read_option_u64(input)?,
+        central_user_id: read_option_u64(input)?,
+        historical_name: read_option_string(input)?,
+        account_class: read_account_class(input)?,
+    })
+}
+
+fn read_action_kind(input: &mut &[u8]) -> Result<PageActionKind> {
+    match read_u8(input)? {
+        0 => Ok(PageActionKind::Create),
+        1 => Ok(PageActionKind::LoggedCreate),
+        2 => Ok(PageActionKind::Move),
+        3 => Ok(PageActionKind::Delete),
+        4 => Ok(PageActionKind::Restore),
+        5 => Ok(PageActionKind::Merge),
+        255 => Ok(PageActionKind::Other(read_string(input)?)),
+        _ => Err(ArchiveError::Invalid("invalid page action kind")),
+    }
+}
+
+fn read_revision_history(input: &mut &[u8]) -> Result<RevisionHistoryRecord> {
+    Ok(RevisionHistoryRecord {
+        minor: read_option_bool(input)?,
+        content_model: read_option_string(input)?,
+        content_format: read_option_string(input)?,
+        identity_reverted: read_option_bool(input)?,
+        first_reverting_revision_id: read_option_u64(input)?,
+        seconds_to_revert: read_option_u64(input)?,
+        identity_revert: read_option_bool(input)?,
+        before_page_creation: read_option_bool(input)?,
+        tags: read_strings(input)?,
+    })
+}
+
+fn read_user_state(input: &mut &[u8]) -> Result<UserStateRecord> {
+    Ok(UserStateRecord {
+        current_name: read_option_string(input)?,
+        central_user_id: read_option_u64(input)?,
+        account_class: read_account_class(input)?,
+        groups: read_strings(input)?,
+        blocks: read_strings(input)?,
+        bot_by: read_strings(input)?,
+    })
+}
+
+fn read_user_action_kind(input: &mut &[u8]) -> Result<UserActionKind> {
+    match read_u8(input)? {
+        0 => Ok(UserActionKind::Create),
+        1 => Ok(UserActionKind::Rename),
+        2 => Ok(UserActionKind::GroupsChanged),
+        3 => Ok(UserActionKind::BlocksChanged),
+        255 => Ok(UserActionKind::Other(read_string(input)?)),
+        _ => Err(ArchiveError::Invalid("invalid user action kind")),
+    }
+}
+
+fn read_user_action(input: &mut &[u8]) -> Result<UserActionRecord> {
+    Ok(UserActionRecord {
+        log_id: read_option_u64(input)?,
+        tie_sequence: read_varint(input)?.0,
+        kind: read_user_action_kind(input)?,
+        performer: read_performer(input)?,
+        comment: read_string(input)?,
+        historical_name: read_option_string(input)?,
+        groups: read_strings(input)?,
+        blocks: read_strings(input)?,
+        bot_by: read_strings(input)?,
+        created_by: read_u8(input)?,
+        registration_timestamp_micros: read_option_i64(input)?,
+        creation_timestamp_micros: read_option_i64(input)?,
+        first_edit_timestamp_micros: read_option_i64(input)?,
+    })
+}
+
+fn read_manifest(input: &mut &[u8]) -> Result<ManifestRecord> {
+    Ok(ManifestRecord {
+        wiki_db: read_string(input)?,
+        content_snapshot: read_string(input)?,
+        metadata_snapshot: read_string(input)?,
+        source_files: read_strings(input)?,
     })
 }
 
@@ -1438,6 +2145,28 @@ fn option_i64_wire_len(value: Option<i64>) -> u64 {
     }
 }
 
+fn option_u64_wire_len(value: Option<u64>) -> u64 {
+    1 + value.map_or(0, |value| varint_len(value) as u64)
+}
+
+fn option_bool_wire_len(_: Option<bool>) -> u64 {
+    1
+}
+
+fn option_string_wire_len(value: Option<&str>) -> Result<u64> {
+    Ok(1 + value.map(string_wire_len).transpose()?.unwrap_or(0))
+}
+
+fn strings_wire_len(values: &[String]) -> Result<u64> {
+    let mut size = varint_len(values.len() as u64) as u64;
+    for value in values {
+        size = size
+            .checked_add(string_wire_len(value)?)
+            .ok_or(ArchiveError::FieldTooLarge)?;
+    }
+    Ok(size)
+}
+
 fn write_string<W: Write>(out: &mut W, value: &str) -> Result<()> {
     write_bytes(out, value.as_bytes())
 }
@@ -1455,6 +2184,45 @@ fn write_option_i64<W: Write>(out: &mut W, value: Option<i64>) -> Result<()> {
             out.write_all(&value.to_le_bytes())?;
         }
         None => out.write_all(&[0])?,
+    }
+    Ok(())
+}
+
+fn write_option_u64(out: &mut impl Write, value: Option<u64>) -> Result<()> {
+    match value {
+        Some(value) => {
+            out.write_all(&[1])?;
+            write_varint(out, value)?;
+        }
+        None => out.write_all(&[0])?,
+    }
+    Ok(())
+}
+
+fn write_option_bool(out: &mut impl Write, value: Option<bool>) -> Result<()> {
+    out.write_all(&[match value {
+        None => 0,
+        Some(false) => 1,
+        Some(true) => 2,
+    }])?;
+    Ok(())
+}
+
+fn write_option_string(out: &mut impl Write, value: Option<&str>) -> Result<()> {
+    match value {
+        Some(value) => {
+            out.write_all(&[1])?;
+            write_string(out, value)?;
+        }
+        None => out.write_all(&[0])?,
+    }
+    Ok(())
+}
+
+fn write_strings(out: &mut impl Write, values: &[String]) -> Result<()> {
+    write_varint(out, values.len() as u64)?;
+    for value in values {
+        write_string(out, value)?;
     }
     Ok(())
 }
@@ -1520,11 +2288,6 @@ fn read_u32(input: &mut &[u8]) -> Result<u32> {
     Ok(u32::from_le_bytes(bytes.try_into().unwrap()))
 }
 
-fn read_u16(input: &mut &[u8]) -> Result<u16> {
-    let bytes = take_bytes(input, 2)?;
-    Ok(u16::from_le_bytes(bytes.try_into().unwrap()))
-}
-
 fn read_u64(input: &mut &[u8]) -> Result<u64> {
     let bytes = take_bytes(input, 8)?;
     Ok(u64::from_le_bytes(bytes.try_into().unwrap()))
@@ -1550,6 +2313,39 @@ fn read_option_i64(input: &mut &[u8]) -> Result<Option<i64>> {
         }
         _ => Err(ArchiveError::Invalid("invalid optional integer marker")),
     }
+}
+
+fn read_option_u64(input: &mut &[u8]) -> Result<Option<u64>> {
+    match read_u8(input)? {
+        0 => Ok(None),
+        1 => Ok(Some(read_varint(input)?.0)),
+        _ => Err(ArchiveError::Invalid("invalid optional integer marker")),
+    }
+}
+
+fn read_option_bool(input: &mut &[u8]) -> Result<Option<bool>> {
+    match read_u8(input)? {
+        0 => Ok(None),
+        1 => Ok(Some(false)),
+        2 => Ok(Some(true)),
+        _ => Err(ArchiveError::Invalid("invalid optional boolean marker")),
+    }
+}
+
+fn read_option_string(input: &mut &[u8]) -> Result<Option<String>> {
+    match read_u8(input)? {
+        0 => Ok(None),
+        1 => Ok(Some(read_string(input)?)),
+        _ => Err(ArchiveError::Invalid("invalid optional string marker")),
+    }
+}
+
+fn read_strings(input: &mut &[u8]) -> Result<Vec<String>> {
+    let count: usize = read_varint(input)?
+        .0
+        .try_into()
+        .map_err(|_| ArchiveError::FieldTooLarge)?;
+    (0..count).map(|_| read_string(input)).collect()
 }
 
 fn read_bool(input: &mut &[u8]) -> Result<bool> {
@@ -1594,8 +2390,10 @@ mod tests {
                     flags: 0,
                     text_len: text.len() as u64,
                 },
+                has_text: true,
                 text: text.to_vec(),
                 visibility: None,
+                history: None,
             },
         }
     }
@@ -1637,6 +2435,46 @@ mod tests {
     }
 
     #[test]
+    fn repack_preserves_records_and_uses_requested_frame_target() {
+        let records = vec![
+            revision(1, 2, 20, &vec![b'a'; 8192]),
+            revision(1, 1, 10, &vec![b'b'; 8192]),
+            revision(2, 3, 30, &vec![b'c'; 8192]),
+        ];
+        let mut source = ArchiveWriter::new(Vec::new(), 1 << 20).unwrap();
+        for record in &records {
+            source.write(record).unwrap();
+        }
+        let (source, source_frames) = source.finish().unwrap();
+        assert_eq!(source_frames, 1);
+
+        let (repacked, stats) = repack(
+            Cursor::new(source),
+            Vec::new(),
+            1,
+            CompressionSettings {
+                level: 7,
+                checksum: true,
+                ..CompressionSettings::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(stats.input_frames, 1);
+        assert_eq!(stats.output_frames, 2);
+        assert_eq!(stats.records, records.len() as u64);
+
+        let mut reader = ArchiveReader::new(Cursor::new(repacked)).unwrap();
+        let mut decoded = Vec::new();
+        while let Some(mut frame) = reader.next_frame().unwrap() {
+            while let Some(record) = frame.next_record().unwrap() {
+                decoded.push(record);
+            }
+        }
+        assert!(reader.is_complete());
+        assert_eq!(decoded, records);
+    }
+
+    #[test]
     fn rejects_bad_order() {
         let mut writer = ArchiveWriter::new(Vec::new(), 1024).unwrap();
         writer.write(&revision(2, 1, 10, b"x")).unwrap();
@@ -1668,17 +2506,31 @@ mod tests {
 
     #[test]
     fn user_events_round_trip_under_user_key() {
-        let record = Record::HistoryEvent {
+        let record = Record::UserAction {
             entity: EntityKey {
                 kind: EntityKind::User,
                 id: 42,
             },
             timestamp_micros: 123,
-            event: HistoryEventRecord {
-                source_partition: "2026-06".into(),
-                source_ordinal: 9,
-                schema_columns: 3,
-                fields: vec![Some(b"wiki".to_vec()), None, Some(b"rename".to_vec())],
+            action: UserActionRecord {
+                log_id: Some(9),
+                tie_sequence: 9,
+                kind: UserActionKind::Rename,
+                performer: PerformerRecord {
+                    local_user_id: Some(7),
+                    central_user_id: None,
+                    historical_name: Some("Admin".into()),
+                    account_class: AccountClass::Permanent,
+                },
+                comment: String::new(),
+                historical_name: Some("Old name".into()),
+                groups: Vec::new(),
+                blocks: Vec::new(),
+                bot_by: Vec::new(),
+                created_by: 0,
+                registration_timestamp_micros: None,
+                creation_timestamp_micros: None,
+                first_edit_timestamp_micros: None,
             },
         };
         let mut writer = ArchiveWriter::new(Vec::new(), 1024).unwrap();
@@ -1720,24 +2572,38 @@ mod tests {
     }
 
     #[test]
-    fn history_event_sorter_orders_user_groups_and_time() {
+    fn record_sorter_orders_user_groups_and_time() {
         let temporary = tempfile::TempDir::new().unwrap();
-        let mut sorter = HistoryEventSorter::new_in(temporary.path()).unwrap();
+        let mut sorter = RecordSorter::new_in(temporary.path()).unwrap();
         for (user, timestamp, ordinal) in [(2, 10, 1), (1, 10, 2), (1, 20, 3)] {
             sorter
-                .push(
-                    EntityKey {
+                .push(Record::UserAction {
+                    entity: EntityKey {
                         kind: EntityKind::User,
                         id: user,
                     },
-                    timestamp,
-                    HistoryEventRecord {
-                        source_partition: "all-time".into(),
-                        source_ordinal: ordinal,
-                        schema_columns: 1,
-                        fields: vec![Some(b"user".to_vec())],
+                    timestamp_micros: timestamp,
+                    action: UserActionRecord {
+                        log_id: None,
+                        tie_sequence: ordinal,
+                        kind: UserActionKind::Rename,
+                        performer: PerformerRecord {
+                            local_user_id: None,
+                            central_user_id: None,
+                            historical_name: None,
+                            account_class: AccountClass::Unknown,
+                        },
+                        comment: String::new(),
+                        historical_name: None,
+                        groups: Vec::new(),
+                        blocks: Vec::new(),
+                        bot_by: Vec::new(),
+                        created_by: 0,
+                        registration_timestamp_micros: None,
+                        creation_timestamp_micros: None,
+                        first_edit_timestamp_micros: None,
                     },
-                )
+                })
                 .unwrap();
             sorter.flush_run().unwrap();
         }
@@ -1776,5 +2642,152 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn compressed_segments_concatenate_and_archives_merge() {
+        let temporary = tempfile::TempDir::new().unwrap();
+        let first = temporary.path().join("first.swdump");
+        let second = temporary.path().join("second.swdump");
+        for (path, record) in [
+            (&first, revision(1, 1, 10, b"one")),
+            (&second, revision(2, 2, 20, b"two")),
+        ] {
+            let mut writer = ArchiveWriter::new(std::fs::File::create(path).unwrap(), 1).unwrap();
+            writer.write(&record).unwrap();
+            writer.finish().unwrap();
+        }
+        let joined = temporary.path().join("joined.swdump");
+        concatenate_archives(&[first, second], std::fs::File::create(&joined).unwrap(), 1).unwrap();
+        let history = temporary.path().join("history.swdump");
+        let mut writer =
+            ArchiveWriter::new(std::fs::File::create(&history).unwrap(), 1024).unwrap();
+        writer
+            .write(&Record::PageAction {
+                entity: EntityKey {
+                    kind: EntityKind::Page,
+                    id: 1,
+                },
+                timestamp_micros: 9,
+                action: PageActionRecord {
+                    log_id: None,
+                    tie_sequence: 1,
+                    kind: PageActionKind::Move,
+                    performer: PerformerRecord {
+                        local_user_id: None,
+                        central_user_id: None,
+                        historical_name: None,
+                        account_class: AccountClass::Unknown,
+                    },
+                    comment: String::new(),
+                    title_at_event: "One".into(),
+                    namespace_at_event: Some(0),
+                    resulting_deleted: Some(false),
+                },
+            })
+            .unwrap();
+        writer.finish().unwrap();
+        let merged = temporary.path().join("merged.swdump");
+        merge_archives(
+            &joined,
+            &history,
+            std::fs::File::create(&merged).unwrap(),
+            1024,
+        )
+        .unwrap();
+        let mut reader = ArchiveRecordReader::open(&merged).unwrap();
+        let mut keys = Vec::new();
+        while let Some(record) = reader.next_record().unwrap() {
+            keys.push((record.entity(), record.timestamp_micros()));
+        }
+        assert_eq!(
+            keys,
+            [
+                (
+                    EntityKey {
+                        kind: EntityKind::Page,
+                        id: 1
+                    },
+                    10
+                ),
+                (
+                    EntityKey {
+                        kind: EntityKind::Page,
+                        id: 1
+                    },
+                    9
+                ),
+                (
+                    EntityKey {
+                        kind: EntityKind::Page,
+                        id: 2
+                    },
+                    20
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn merge_coalesces_typed_revision_annotation_with_xml_text() {
+        let temporary = tempfile::TempDir::new().unwrap();
+        let content = temporary.path().join("content.swdump");
+        let metadata = temporary.path().join("metadata.swdump");
+        let base = revision(7, 11, 123, b"archived text");
+        let Record::Revision {
+            revision: base_revision,
+            ..
+        } = &base
+        else {
+            unreachable!()
+        };
+        let mut shell = base_revision.clone();
+        shell.has_text = false;
+        shell.text.clear();
+        shell.history = Some(RevisionHistoryRecord {
+            minor: Some(true),
+            content_model: Some("wikitext".into()),
+            content_format: Some("text/x-wiki".into()),
+            identity_reverted: Some(false),
+            first_reverting_revision_id: None,
+            seconds_to_revert: None,
+            identity_revert: Some(false),
+            before_page_creation: Some(false),
+            tags: vec!["visualeditor".into()],
+        });
+        for (path, record) in [
+            (&content, base),
+            (
+                &metadata,
+                Record::Revision {
+                    page_id: 7,
+                    revision: shell,
+                },
+            ),
+        ] {
+            let mut writer =
+                ArchiveWriter::new(std::fs::File::create(path).unwrap(), 1024).unwrap();
+            writer.write(&record).unwrap();
+            writer.finish().unwrap();
+        }
+        let merged = temporary.path().join("merged.swdump");
+        merge_archives(
+            &content,
+            &metadata,
+            std::fs::File::create(&merged).unwrap(),
+            1024,
+        )
+        .unwrap();
+        let mut reader = ArchiveRecordReader::open(&merged).unwrap();
+        let Record::Revision { revision, .. } = reader.next_record().unwrap().unwrap() else {
+            panic!("revision")
+        };
+        assert!(revision.has_text);
+        assert_eq!(revision.text, b"archived text");
+        assert_eq!(
+            revision.history.unwrap().tags,
+            ["visualeditor".to_string()]
+        );
+        assert!(reader.next_record().unwrap().is_none());
     }
 }

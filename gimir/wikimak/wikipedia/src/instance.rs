@@ -1395,45 +1395,49 @@ impl Instance {
     pub(crate) fn archive_page_actions(
         &self,
         page_id: u64,
-    ) -> Result<Vec<crate::archive::PageActionRecord>> {
+    ) -> Result<Vec<(crate::archive::PageActionRecord, String)>> {
         let g = self.inner.lock().expect("instance mutex poisoned");
         let sql = if page_id == 0 {
-            "SELECT source_key,source_partition,event_log_id,source_ordinal,
-                    event_type,event_timestamp,event_comment,actor_id,actor_name,
-                    title_historical,title_current,namespace_historical,
-                    namespace_current,page_deleted
+            "SELECT event_log_id,source_ordinal,event_type,event_timestamp,
+                    event_comment,actor_id,actor_name,title_historical,
+                    namespace_historical,page_deleted
              FROM page_actions WHERE page_id IS NULL
              ORDER BY event_timestamp DESC,source_ordinal DESC"
         } else {
-            "SELECT source_key,source_partition,event_log_id,source_ordinal,
-                    event_type,event_timestamp,event_comment,actor_id,actor_name,
-                    title_historical,title_current,namespace_historical,
-                    namespace_current,page_deleted
+            "SELECT event_log_id,source_ordinal,event_type,event_timestamp,
+                    event_comment,actor_id,actor_name,title_historical,
+                    namespace_historical,page_deleted
              FROM page_actions WHERE page_id = ?1
              ORDER BY event_timestamp DESC,source_ordinal DESC"
         };
         let mut statement = g.conn.prepare(sql)?;
         let map = |row: &rusqlite::Row<'_>| {
-            let source_ordinal = row.get::<_, i64>(3)?;
+            let source_ordinal = row.get::<_, i64>(1)?;
             if source_ordinal < 0 {
-                return Err(rusqlite::Error::IntegralValueOutOfRange(3, source_ordinal));
+                return Err(rusqlite::Error::IntegralValueOutOfRange(1, source_ordinal));
             }
-            Ok(crate::archive::PageActionRecord {
-                source_key: row.get(0)?,
-                source_partition: row.get(1)?,
-                event_log_id: row.get(2)?,
-                source_ordinal: source_ordinal as u64,
-                event_type: row.get(4)?,
-                timestamp: row.get(5)?,
-                comment: row.get(6)?,
-                actor_id: row.get(7)?,
-                actor_name: row.get(8)?,
-                historical_title: row.get(9)?,
-                current_title: row.get(10)?,
-                historical_namespace: row.get(11)?,
-                current_namespace: row.get(12)?,
-                page_deleted: row.get::<_, i64>(13)? != 0,
-            })
+            let event_type: String = row.get(2)?;
+            let actor_id: Option<i64> = row.get(5)?;
+            let actor_name: String = row.get(6)?;
+            let log_id: Option<i64> = row.get(0)?;
+            Ok((
+                crate::archive::PageActionRecord {
+                    log_id: log_id.and_then(|id| u64::try_from(id).ok()),
+                    tie_sequence: source_ordinal as u64,
+                    kind: crate::archive::PageActionKind::from_name(&event_type),
+                    performer: crate::archive::PerformerRecord {
+                        local_user_id: actor_id.and_then(|id| u64::try_from(id).ok()),
+                        central_user_id: None,
+                        historical_name: (!actor_name.is_empty()).then_some(actor_name),
+                        account_class: crate::archive::AccountClass::Unknown,
+                    },
+                    comment: row.get(4)?,
+                    title_at_event: row.get(7)?,
+                    namespace_at_event: row.get(8)?,
+                    resulting_deleted: Some(row.get::<_, i64>(9)? != 0),
+                },
+                row.get(3)?,
+            ))
         };
         let rows = if page_id == 0 {
             statement.query_map([], map)?
@@ -1462,11 +1466,32 @@ impl Instance {
             Ok((
                 revision_id as u64,
                 crate::archive::RevisionVisibilityRecord {
-                    source_partition: row.get(1)?,
-                    deleted_parts: row.get(2)?,
+                    deleted_parts: {
+                        let parts: String = row.get(2)?;
+                        parts.split(',').fold(0, |bits, part| {
+                            bits | match part.trim() {
+                                "text" => 1,
+                                "comment" => 2,
+                                "user" => 4,
+                                _ => 0,
+                            }
+                        })
+                    },
                     parts_are_suppressed: row.get::<_, i64>(3)? != 0,
                     deleted_by_page_deletion: row.get::<_, i64>(4)? != 0,
-                    page_deletion_timestamp: row.get(5)?,
+                    page_deletion_timestamp_micros: {
+                        let timestamp: String = row.get(5)?;
+                        if timestamp.is_empty() {
+                            None
+                        } else {
+                            chrono::NaiveDateTime::parse_from_str(
+                                &timestamp,
+                                "%Y-%m-%d %H:%M:%S%.f",
+                            )
+                            .ok()
+                            .map(|timestamp| timestamp.and_utc().timestamp_micros())
+                        }
+                    },
                 },
             ))
         })?;

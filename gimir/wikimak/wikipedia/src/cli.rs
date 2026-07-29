@@ -10,6 +10,8 @@
 //!   wikimak text <root> <page_id>              newest revision text
 //!   wikimak history <root> <page_id>           all revisions, newest-first
 //!   wikimak archive-export <root> <file>        portable ordered event stream
+//!   wikimak archive-build-direct <db> <file> <scratch>
+//!   wikimak archive-repack <input> <output> <frame-bytes> <level> [settings]
 //!   wikimak archive-inspect <file>              validate and summarize stream
 //!
 //! The instance lives under <root>/ (depot chains + titles pool +
@@ -469,6 +471,12 @@ fn cmd_archive_export(root: &str, output: &str) -> Result<(), String> {
     temporary
         .persist(output_path)
         .map_err(|e| format!("{output}: {}", e.error))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(output_path, std::fs::Permissions::from_mode(0o644))
+            .map_err(|e| format!("{output}: {e}"))?;
+    }
     let bytes = std::fs::metadata(output)
         .map_err(|e| format!("{output}: {e}"))?
         .len();
@@ -484,6 +492,121 @@ fn cmd_archive_export(root: &str, output: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn cmd_archive_build_direct(dbname: &str, output: &str, scratch: &str) -> Result<(), String> {
+    let client = http_client()?;
+    let stats = crate::build_direct_archive(
+        &client, &wikimak_mediawiki::Config::default(), dbname,
+        output, scratch, |message| eprintln!("{message}"),
+    ).map_err(|error| error.to_string())?;
+    println!(
+        "content: {} parts, {} pages, {} revisions, {} bytes, {} frames",
+        stats.content_parts, stats.pages, stats.revisions,
+        stats.content_archive_bytes, stats.content_frames,
+    );
+    println!(
+        "history: {} parts, {} events (page/user/global {}/{}/{}), {} bytes, {} frames",
+        stats.history_parts, stats.history_events, stats.page_history_events,
+        stats.user_history_events, stats.global_history_events,
+        stats.history_archive_bytes, stats.history_frames,
+    );
+    println!(
+        "output: {} bytes, {} frames; scratch peak {} bytes; elapsed {}.{:03}s",
+        stats.output_bytes, stats.output_frames, stats.scratch_peak_bytes,
+        stats.elapsed_millis / 1000, stats.elapsed_millis % 1000,
+    );
+    Ok(())
+}
+
+fn cmd_archive_repack(args: &[&str]) -> Result<(), String> {
+    let [input, output, frame_target, level, settings @ ..] = args else {
+        return Err(
+            "archive-repack wants <input> <output> <frame-bytes> <zstd-level> \
+             [--checksum] [--long-distance] [--window-log N] [--target-block-size N]"
+                .into(),
+        );
+    };
+    let frame_target = frame_target
+        .parse::<usize>()
+        .map_err(|error| format!("frame bytes: {error}"))?;
+    if frame_target == 0 {
+        return Err("frame bytes must be positive".into());
+    }
+    let mut compression = crate::archive::CompressionSettings {
+        level: level
+            .parse::<i32>()
+            .map_err(|error| format!("zstd level: {error}"))?,
+        ..crate::archive::CompressionSettings::default()
+    };
+    let mut options = settings.iter();
+    while let Some(option) = options.next() {
+        match *option {
+            "--checksum" => compression.checksum = true,
+            "--long-distance" => compression.long_distance_matching = true,
+            "--window-log" => {
+                compression.window_log = Some(
+                    options
+                        .next()
+                        .ok_or("--window-log wants an integer")?
+                        .parse()
+                        .map_err(|error| format!("window log: {error}"))?,
+                );
+            }
+            "--target-block-size" => {
+                compression.target_block_size = Some(
+                    options
+                        .next()
+                        .ok_or("--target-block-size wants an integer")?
+                        .parse()
+                        .map_err(|error| format!("target block size: {error}"))?,
+                );
+            }
+            unknown => return Err(format!("unknown archive-repack setting {unknown}")),
+        }
+    }
+
+    let input_file = std::fs::File::open(input).map_err(|error| format!("{input}: {error}"))?;
+    let output_path = std::path::Path::new(output);
+    let parent = output_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let mut temporary =
+        tempfile::NamedTempFile::new_in(parent).map_err(|error| format!("{}: {error}", parent.display()))?;
+    let (_, stats) = crate::archive::repack(
+        std::io::BufReader::new(input_file),
+        temporary.as_file_mut(),
+        frame_target,
+        compression,
+    )
+    .map_err(|error| error.to_string())?;
+    temporary
+        .as_file()
+        .sync_all()
+        .map_err(|error| format!("{}: {error}", temporary.path().display()))?;
+    temporary
+        .persist(output_path)
+        .map_err(|error| format!("{output}: {}", error.error))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(output_path, std::fs::Permissions::from_mode(0o644))
+            .map_err(|error| format!("{output}: {error}"))?;
+    }
+    let output_bytes = std::fs::metadata(output_path)
+        .map_err(|error| format!("{output}: {error}"))?
+        .len();
+    println!(
+        "repacked {} records, frames {} -> {}, input compressed payload {} bytes, \
+         output file {} bytes",
+        stats.records,
+        stats.input_frames,
+        stats.output_frames,
+        stats.input_compressed_bytes,
+        output_bytes,
+    );
+    Ok(())
+}
+
 fn cmd_archive_inspect(path: &str) -> Result<(), String> {
     let file = std::fs::File::open(path).map_err(|e| format!("{path}: {e}"))?;
     let mut reader = crate::archive::ArchiveReader::new(file).map_err(|e| e.to_string())?;
@@ -492,6 +615,7 @@ fn cmd_archive_inspect(path: &str) -> Result<(), String> {
     let mut revisions = 0_u64;
     let mut page_actions = 0_u64;
     let mut user_actions = 0_u64;
+    let mut user_states = 0_u64;
     let mut unknown = 0_u64;
     let mut raw_bytes = 0_u64;
     let mut compressed_bytes = 0_u64;
@@ -517,21 +641,18 @@ fn cmd_archive_inspect(path: &str) -> Result<(), String> {
             match record {
                 crate::archive::Record::Revision { .. } => revisions += 1,
                 crate::archive::Record::PageAction { .. } => page_actions += 1,
-                crate::archive::Record::HistoryEvent { entity, .. } => {
-                    if entity.kind == crate::archive::EntityKind::User {
-                        user_actions += 1;
-                    } else {
-                        unknown += 1;
-                    }
-                }
+                crate::archive::Record::UserAction { .. } => user_actions += 1,
+                crate::archive::Record::UserState { .. } => user_states += 1,
                 crate::archive::Record::Unknown { .. } => unknown += 1,
-                crate::archive::Record::PageState { .. } => {}
+                crate::archive::Record::PageState { .. }
+                | crate::archive::Record::Manifest { .. } => {}
             }
         }
     }
     println!(
         "archive frames {frames}  records {records}  revisions {revisions}  \
-         page actions {page_actions}  user actions {user_actions}  unknown {unknown}  complete {}",
+         page actions {page_actions}  user actions/states {user_actions}/{user_states}  \
+         unknown {unknown}  complete {}",
         reader.is_complete()
     );
     println!(
@@ -759,6 +880,9 @@ pub fn cli_main(args: &[String]) -> i32 {
         ["history", root, page] => page.parse().map_err(|e| format!("{e}"))
             .and_then(|p| cmd_history(root, p)),
         ["archive-export", root, output] => cmd_archive_export(root, output),
+        ["archive-build-direct", dbname, output, scratch] =>
+            cmd_archive_build_direct(dbname, output, scratch),
+        ["archive-repack", args @ ..] => cmd_archive_repack(args),
         ["archive-inspect", path] => cmd_archive_inspect(path),
         ["archive-histogram", path] => cmd_archive_histogram(
             path,
@@ -781,6 +905,8 @@ pub fn cli_main(args: &[String]) -> i32 {
                   \x20      wikimak head|history <root> <page_id>\n\
                   \x20      wikimak text <root> <page_id> [asof-unix-micros]\n\
                   \x20      wikimak archive-export <root> <file>\n\
+                  \x20      wikimak archive-build-direct <dbname> <file> <scratch-dir>\n\
+                  \x20      wikimak archive-repack <input> <output> <frame-bytes> <zstd-level> [settings]\n\
                   \x20      wikimak archive-inspect|archive-histogram <file>".into()),
     };
     match r {

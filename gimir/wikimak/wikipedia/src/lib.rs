@@ -12,6 +12,8 @@
 pub mod asof;
 pub mod archive;
 #[cfg(feature = "fetch")]
+pub mod direct;
+#[cfg(feature = "fetch")]
 mod cli;
 #[cfg(feature = "fetch")]
 pub use cli::cli_main;
@@ -32,6 +34,8 @@ pub mod sync;
 pub(crate) mod titles;
 
 pub use error::{Error, Result};
+#[cfg(feature = "fetch")]
+pub use direct::{build_direct_archive, DirectArchiveStats};
 pub use instance::{
     max_chain_id_for_root, read_config, ContributorMeta, HistoryEntry, HistoryIter, ImportStats,
     Instance, InstanceConfig, PackedF0StorageStats, PageAction, RevisionCorrection, RevisionDictionaryStats,

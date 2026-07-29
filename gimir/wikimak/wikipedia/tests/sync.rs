@@ -20,7 +20,8 @@ use sha1::{Digest as _, Sha1};
 use md5::Md5;
 use tempfile::TempDir;
 use wikimak_mediawiki::Config;
-use wikimak_wikipedia::{maintain, reconcile_history, sync};
+use wikimak_wikipedia::archive::{ArchiveReader, EntityKind, Record};
+use wikimak_wikipedia::{build_direct_archive, maintain, reconcile_history, sync};
 
 use common::{fixture, make_instance};
 
@@ -68,8 +69,15 @@ fn history_body_with_schema(event_type: &str, columns: usize) -> Vec<u8> {
     user_fields[3] = "rename";
     user_fields[4] = "2024-06-01 12:30:00.0";
     user_fields[page + 13] = "44";
+    user_fields[page + 14] = "4044";
     user_fields[page + 15] = "Old editor";
     user_fields[page + 16] = "New editor";
+    user_fields[page + 26] = "false";
+    user_fields[page + 27] = "false";
+    user_fields[page + 28] = "true";
+    user_fields[page + 29] = "2020-01-01 00:00:00.0";
+    user_fields[page + 30] = "2020-01-02 00:00:00.0";
+    user_fields[page + 31] = "2020-01-03 00:00:00.0";
     writeln!(encoder, "{}", user_fields.join("\t")).unwrap();
     // Old deletion log events can retain their titles but have no page id.
     let mut orphan_page = fields.clone();
@@ -257,6 +265,77 @@ fn sync_fetches_then_skips() {
         .unwrap_err()
         .to_string();
     assert!(wrong.contains("belongs to testwiki"), "{wrong}");
+}
+
+#[test]
+fn direct_archive_preserves_content_and_every_history_entity() {
+    let server = MockServer::start();
+    let xml = fixture("export_three_pages.xml");
+    let sha1_hex = hex::encode(Sha1::digest(&xml));
+    mount(&server, &xml, &sha1_hex);
+
+    let tmp = TempDir::new().unwrap();
+    let output = tmp.path().join("testwiki.swdump");
+    let scratch = tmp.path().join("scratch");
+    let cfg = Config { base_url: server.base_url() };
+    let stats = build_direct_archive(
+        &Client::new(), &cfg, "testwiki", &output, &scratch, |_| (),
+    ).unwrap();
+
+    assert!(stats.pages >= 3);
+    assert!(stats.revisions >= 3);
+    assert_eq!(stats.history_events, 6);
+    assert_eq!(stats.page_history_events, 3);
+    assert_eq!(stats.user_history_events, 1);
+    assert_eq!(stats.global_history_events, 2);
+
+    let mut reader = ArchiveReader::new(std::fs::File::open(&output).unwrap()).unwrap();
+    let mut revisions = 0;
+    let mut annotated_revisions = 0;
+    let mut page_actions = 0;
+    let mut user_events = 0;
+    let mut unbound_page_actions = 0;
+    let mut saw_user_rename = false;
+    let mut saw_manifest = false;
+    while let Some(mut frame) = reader.next_frame().unwrap() {
+        while let Some(record) = frame.next_record().unwrap() {
+            match record {
+                Record::Revision { revision, .. } => {
+                    revisions += 1;
+                    assert!(revision.meta.sha1.is_empty());
+                    annotated_revisions += u64::from(revision.history.is_some());
+                }
+                Record::PageAction { entity, .. } => {
+                    page_actions += 1;
+                    unbound_page_actions += u64::from(entity.kind == EntityKind::Global);
+                }
+                Record::UserAction { action, .. } => {
+                    user_events += 1;
+                    saw_user_rename |=
+                        action.kind == wikimak_wikipedia::archive::UserActionKind::Rename
+                            && action.historical_name.as_deref() == Some("Old editor");
+                    assert_eq!(
+                        action.registration_timestamp_micros,
+                        Some(1_577_836_800_000_000)
+                    );
+                }
+                Record::Manifest { manifest, .. } => {
+                    saw_manifest = manifest.wiki_db == "testwiki"
+                        && !manifest.content_snapshot.is_empty()
+                        && manifest.metadata_snapshot == "2024-06";
+                }
+                _ => {}
+            }
+        }
+    }
+    assert!(reader.is_complete());
+    assert!(revisions >= stats.revisions);
+    assert_eq!(annotated_revisions, 3);
+    assert_eq!(page_actions, 2);
+    assert_eq!(unbound_page_actions, 1);
+    assert_eq!(user_events, 1);
+    assert!(saw_user_rename);
+    assert!(saw_manifest);
 }
 
 #[test]

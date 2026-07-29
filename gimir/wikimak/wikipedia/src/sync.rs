@@ -43,9 +43,9 @@ pub struct SyncStats {
 }
 
 #[derive(Debug, Clone)]
-struct HistoryFile {
-    partition: String,
-    part: wikimak_mediawiki::Part,
+pub(crate) struct HistoryFile {
+    pub(crate) partition: String,
+    pub(crate) part: wikimak_mediawiki::Part,
 }
 
 fn history_listing(client: &Client, url: &str) -> Result<String> {
@@ -74,7 +74,7 @@ fn history_listing(client: &Client, url: &str) -> Result<String> {
     unreachable!("history listing retry loop returns")
 }
 
-fn discover_history(
+pub(crate) fn discover_history(
     client: &Client,
     cfg: &Config,
     dbname: &str,
@@ -314,6 +314,453 @@ fn parse_history_timestamp_micros(value: &str) -> Option<i64> {
         .ok()
 }
 
+fn optional_unescaped(
+    file: &HistoryFile,
+    line: usize,
+    field: &str,
+    value: &str,
+) -> Result<Option<String>> {
+    if value.is_empty() {
+        Ok(None)
+    } else {
+        unescape_tsv(file, line, field, value).map(Some)
+    }
+}
+
+fn optional_history_bool(
+    file: &HistoryFile,
+    line: usize,
+    field: &str,
+    value: &str,
+) -> Result<Option<bool>> {
+    if value.is_empty() {
+        Ok(None)
+    } else {
+        history_bool(file, line, field, value).map(Some)
+    }
+}
+
+fn optional_history_micros(
+    file: &HistoryFile,
+    line: usize,
+    field: &str,
+    value: &str,
+) -> Result<Option<i64>> {
+    if value.is_empty() {
+        return Ok(None);
+    }
+    parse_history_timestamp_micros(value).map(Some).ok_or_else(|| {
+        history_parse_error(file, line, format!("has invalid {field} timestamp {value:?}"))
+    })
+}
+
+fn history_array(
+    file: &HistoryFile,
+    line: usize,
+    field: &str,
+    value: &str,
+) -> Result<Vec<String>> {
+    if value.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut values = Vec::new();
+    let mut item = Vec::new();
+    let bytes = value.as_bytes();
+    let mut cursor = 0;
+    while cursor < bytes.len() {
+        match bytes[cursor] {
+            b',' => {
+                values.push(unescape_tsv(
+                    file,
+                    line,
+                    field,
+                    std::str::from_utf8(&item).map_err(|_| {
+                        history_parse_error(file, line, format!("has invalid UTF-8 in {field}"))
+                    })?,
+                )?);
+                item.clear();
+                cursor += 1;
+            }
+            b'\\' if bytes.get(cursor + 1) == Some(&b',') => {
+                item.push(b',');
+                cursor += 2;
+            }
+            byte => {
+                item.push(byte);
+                cursor += 1;
+                if byte == b'\\' {
+                    if let Some(&next) = bytes.get(cursor) {
+                        item.push(next);
+                        cursor += 1;
+                    }
+                }
+            }
+        }
+    }
+    values.push(unescape_tsv(
+        file,
+        line,
+        field,
+        std::str::from_utf8(&item).map_err(|_| {
+            history_parse_error(file, line, format!("has invalid UTF-8 in {field}"))
+        })?,
+    )?);
+    Ok(values)
+}
+
+fn history_account_class(
+    file: &HistoryFile,
+    line: usize,
+    fields: &[&str],
+    anonymous_index: usize,
+    subject: bool,
+) -> Result<crate::archive::AccountClass> {
+    let anonymous = optional_history_bool(
+        file, line, "user_is_anonymous", fields[anonymous_index],
+    )?;
+    let (temporary, permanent) = if subject {
+        (
+            optional_history_bool(
+                file, line, "user_is_temporary", fields[anonymous_index + 1],
+            )?,
+            optional_history_bool(
+                file, line, "user_is_permanent", fields[anonymous_index + 2],
+            )?,
+        )
+    } else if fields.len() == 78 {
+        (
+            optional_history_bool(
+                file, line, "event_user_is_temporary", fields[anonymous_index + 1],
+            )?,
+            optional_history_bool(
+                file, line, "event_user_is_permanent", fields[anonymous_index + 2],
+            )?,
+        )
+    } else {
+        (None, None)
+    };
+    Ok(if permanent == Some(true) {
+        crate::archive::AccountClass::Permanent
+    } else if temporary == Some(true) {
+        crate::archive::AccountClass::Temporary
+    } else if anonymous == Some(true) {
+        crate::archive::AccountClass::Anonymous
+    } else {
+        crate::archive::AccountClass::Unknown
+    })
+}
+
+fn history_performer(
+    file: &HistoryFile,
+    line: usize,
+    fields: &[&str],
+    _page: usize,
+) -> Result<crate::archive::PerformerRecord> {
+    Ok(crate::archive::PerformerRecord {
+        local_user_id: optional_i64(file, line, "event_user_id", fields[6])?
+            .and_then(|id| u64::try_from(id).ok()),
+        central_user_id: optional_i64(file, line, "event_user_central_id", fields[7])?
+            .and_then(|id| u64::try_from(id).ok()),
+        historical_name: optional_unescaped(
+            file, line, "event_user_text_historical", fields[8],
+        )?,
+        account_class: history_account_class(file, line, fields, 19, false)?,
+    })
+}
+
+fn history_created_by(
+    file: &HistoryFile,
+    line: usize,
+    fields: &[&str],
+    user: usize,
+) -> Result<u8> {
+    let mut flags = 0;
+    if optional_history_bool(file, line, "user_is_created_by_self", fields[user + 10])?
+        == Some(true)
+    {
+        flags |= 1;
+    }
+    if optional_history_bool(file, line, "user_is_created_by_system", fields[user + 11])?
+        == Some(true)
+    {
+        flags |= 2;
+    }
+    if optional_history_bool(file, line, "user_is_created_by_peer", fields[user + 12])?
+        == Some(true)
+    {
+        flags |= 4;
+    }
+    Ok(flags)
+}
+
+pub(crate) fn typed_history_records(
+    file: &HistoryFile,
+    line: usize,
+    fields: &[&str],
+    page: usize,
+    revision: usize,
+    ordinal: u64,
+) -> Result<Vec<crate::archive::Record>> {
+    let timestamp_micros = parse_history_timestamp_micros(fields[4]).ok_or_else(|| {
+        history_parse_error(
+            file,
+            line,
+            format!("has invalid event timestamp {:?}", fields[4]),
+        )
+    })?;
+    let performer = history_performer(file, line, fields, page)?;
+    let log_id = optional_i64(file, line, "event_log_id", fields[1])?
+        .and_then(|id| u64::try_from(id).ok());
+    let comment = unescape_tsv(file, line, "event_comment", fields[5])?;
+    match fields[2] {
+        "page" => {
+            let page_id = optional_i64(file, line, "page_id", fields[page])?
+                .and_then(|id| u64::try_from(id).ok())
+                .filter(|id| *id > 0);
+            Ok(vec![crate::archive::Record::PageAction {
+                entity: crate::archive::EntityKey {
+                    kind: page_id.map_or(
+                        crate::archive::EntityKind::Global,
+                        |_| crate::archive::EntityKind::Page,
+                    ),
+                    id: page_id.unwrap_or(0),
+                },
+                timestamp_micros,
+                action: crate::archive::PageActionRecord {
+                    log_id,
+                    tie_sequence: ordinal,
+                    kind: crate::archive::PageActionKind::from_name(fields[3]),
+                    performer,
+                    comment,
+                    title_at_event: unescape_tsv(
+                        file, line, "page_title_historical", fields[page + 1],
+                    )?,
+                    namespace_at_event: optional_i64(
+                        file, line, "page_namespace_historical", fields[page + 3],
+                    )?,
+                    resulting_deleted: optional_history_bool(
+                        file, line, "page_is_deleted", fields[page + 8],
+                    )?,
+                },
+            }])
+        }
+        "user" => {
+            let user = page + 13;
+            let user_id = optional_i64(file, line, "user_id", fields[user])?
+                .and_then(|id| u64::try_from(id).ok())
+                .filter(|id| *id > 0);
+            let entity = crate::archive::EntityKey {
+                kind: user_id.map_or(
+                    crate::archive::EntityKind::Global,
+                    |_| crate::archive::EntityKind::User,
+                ),
+                id: user_id.unwrap_or(0),
+            };
+            let mut records = vec![crate::archive::Record::UserAction {
+                entity,
+                timestamp_micros,
+                action: crate::archive::UserActionRecord {
+                    log_id,
+                    tie_sequence: ordinal,
+                    kind: crate::archive::UserActionKind::from_name(fields[3]),
+                    performer,
+                    comment,
+                    historical_name: optional_unescaped(
+                        file, line, "user_text_historical", fields[user + 2],
+                    )?,
+                    blocks: history_array(
+                        file, line, "user_blocks_historical", fields[user + 4],
+                    )?,
+                    groups: history_array(
+                        file, line, "user_groups_historical", fields[user + 6],
+                    )?,
+                    bot_by: history_array(
+                        file, line, "user_is_bot_by_historical", fields[user + 8],
+                    )?,
+                    created_by: history_created_by(file, line, fields, user)?,
+                    registration_timestamp_micros: optional_history_micros(
+                        file, line, "user_registration_timestamp", fields[user + 16],
+                    )?,
+                    creation_timestamp_micros: optional_history_micros(
+                        file, line, "user_creation_timestamp", fields[user + 17],
+                    )?,
+                    first_edit_timestamp_micros: optional_history_micros(
+                        file, line, "user_first_edit_timestamp", fields[user + 18],
+                    )?,
+                },
+            }];
+            if let Some(user_id) = user_id {
+                records.push(crate::archive::Record::UserState {
+                    user_id,
+                    timestamp_micros: i64::MAX,
+                    state: crate::archive::UserStateRecord {
+                        current_name: optional_unescaped(
+                            file, line, "user_text", fields[user + 3],
+                        )?,
+                        central_user_id: optional_i64(
+                            file, line, "user_central_id", fields[user + 1],
+                        )?.and_then(|id| u64::try_from(id).ok()),
+                        account_class: history_account_class(
+                            file, line, fields, user + 13, true,
+                        )?,
+                        groups: history_array(
+                            file, line, "user_groups", fields[user + 7],
+                        )?,
+                        blocks: history_array(
+                            file, line, "user_blocks", fields[user + 5],
+                        )?,
+                        bot_by: history_array(
+                            file, line, "user_is_bot_by", fields[user + 9],
+                        )?,
+                    },
+                });
+            }
+            Ok(records)
+        }
+        "revision" => {
+            if fields[3] != "create" {
+                return Err(history_parse_error(
+                    file,
+                    line,
+                    format!("has unsupported revision event type {:?}", fields[3]),
+                ));
+            }
+            let page_id = optional_i64(file, line, "page_id", fields[page])?
+                .and_then(|id| u64::try_from(id).ok())
+                .unwrap_or(0);
+            let rev_id = optional_i64(file, line, "revision_id", fields[revision])?
+                .and_then(|id| u64::try_from(id).ok())
+                .ok_or_else(|| history_parse_error(file, line, "has no revision id".into()))?;
+            let parent_id = optional_i64(
+                file, line, "revision_parent_id", fields[revision + 1],
+            )?.and_then(|id| u64::try_from(id).ok()).unwrap_or(0);
+            let deleted_parts = history_array(
+                file, line, "revision_deleted_parts", fields[revision + 3],
+            )?;
+            let deleted_part_bits = deleted_parts.iter().try_fold(0_u8, |bits, part| {
+                Ok(bits | match part.as_str() {
+                    "text" => 1,
+                    "comment" => 2,
+                    "user" => 4,
+                    other => {
+                        return Err(history_parse_error(
+                            file,
+                            line,
+                            format!("has unknown deleted revision part {other:?}"),
+                        ))
+                    }
+                })
+            })?;
+            let suppressed = optional_history_bool(
+                file, line, "revision_deleted_parts_are_suppressed", fields[revision + 4],
+            )?.unwrap_or(false);
+            let page_deleted = optional_history_bool(
+                file, line, "revision_is_deleted_by_page_deletion", fields[revision + 10],
+            )?.unwrap_or(false);
+            let visibility = if deleted_part_bits != 0
+                || suppressed
+                || page_deleted
+                || !fields[revision + 11].is_empty()
+            {
+                Some(crate::archive::RevisionVisibilityRecord {
+                        deleted_parts: deleted_part_bits,
+                        parts_are_suppressed: suppressed,
+                        deleted_by_page_deletion: page_deleted,
+                        page_deletion_timestamp_micros: optional_history_micros(
+                            file,
+                            line,
+                            "revision_deleted_by_page_deletion_timestamp",
+                            fields[revision + 11],
+                        )?,
+                    })
+            } else {
+                None
+            };
+            let contributor = match (
+                performer.local_user_id,
+                performer.historical_name.as_deref(),
+                performer.account_class,
+            ) {
+                (_, _, crate::archive::AccountClass::Hidden) | (_, None, _) => {
+                    crate::ContributorMeta::Hidden
+                }
+                (Some(user_id), Some(username), _) => crate::ContributorMeta::Named {
+                    username: username.to_owned(),
+                    user_id,
+                },
+                (None, Some(ip), _) => crate::ContributorMeta::Anonymous {
+                    ip: ip.to_owned(),
+                },
+            };
+            let flags = (u32::from(deleted_part_bits & 1 != 0) * crate::FLAG_TEXT_HIDDEN)
+                | (u32::from(deleted_part_bits & 2 != 0) * crate::FLAG_COMMENT_HIDDEN)
+                | (u32::from(deleted_part_bits & 4 != 0) * crate::FLAG_CONTRIBUTOR_HIDDEN)
+                | (u32::from(suppressed) * crate::FLAG_SUPPRESSED);
+            let ts = chrono::DateTime::from_timestamp_micros(timestamp_micros)
+                .ok_or_else(|| history_parse_error(file, line, "timestamp out of range".into()))?;
+            Ok(vec![crate::archive::Record::Revision {
+                page_id,
+                revision: crate::archive::RevisionRecord {
+                    meta: crate::RevisionMeta {
+                        rev_id,
+                        parent_id,
+                        ts,
+                        contributor,
+                        comment,
+                        sha1: String::new(),
+                        flags,
+                        text_len: 0,
+                    },
+                    has_text: false,
+                    text: Vec::new(),
+                    visibility,
+                    history: Some(crate::archive::RevisionHistoryRecord {
+                        minor: optional_history_bool(
+                            file, line, "revision_minor_edit", fields[revision + 2],
+                        )?,
+                        content_model: optional_unescaped(
+                            file, line, "revision_content_model", fields[revision + 8],
+                        )?,
+                        content_format: optional_unescaped(
+                            file, line, "revision_content_format", fields[revision + 9],
+                        )?,
+                        identity_reverted: optional_history_bool(
+                            file, line, "revision_is_identity_reverted", fields[revision + 12],
+                        )?,
+                        first_reverting_revision_id: optional_i64(
+                            file,
+                            line,
+                            "revision_first_identity_reverting_revision_id",
+                            fields[revision + 13],
+                        )?.and_then(|id| u64::try_from(id).ok()),
+                        seconds_to_revert: optional_i64(
+                            file, line, "revision_seconds_to_identity_revert",
+                            fields[revision + 14],
+                        )?.and_then(|seconds| u64::try_from(seconds).ok()),
+                        identity_revert: optional_history_bool(
+                            file, line, "revision_is_identity_revert", fields[revision + 15],
+                        )?,
+                        before_page_creation: optional_history_bool(
+                            file,
+                            line,
+                            "revision_is_from_before_page_creation",
+                            fields[revision + 16],
+                        )?,
+                        tags: history_array(
+                            file, line, "revision_tags", fields[revision + 17],
+                        )?,
+                    }),
+                },
+            }])
+        }
+        other => Err(history_parse_error(
+            file,
+            line,
+            format!("has unsupported event entity {other:?}"),
+        )),
+    }
+}
+
 fn history_archive_error(error: crate::archive::ArchiveError) -> crate::error::Error {
     crate::error::Error::Mediawiki(wikimak_mediawiki::Error::Parse(format!(
         "portable history archive: {error}"
@@ -326,7 +773,7 @@ fn import_history_file<R: Read + Send + 'static>(
     expected_dbname: &str,
     input: R,
     source_ordinal: &mut u64,
-    user_events: &mut crate::archive::HistoryEventSorter,
+    user_events: &mut crate::archive::RecordSorter,
 ) -> Result<u64> {
     let decoder = wikimak_mediawiki::bz2::new_bz2_reader(
         input,
@@ -383,55 +830,16 @@ fn import_history_file<R: Read + Send + 'static>(
         match fields[2] {
             "page" | "revision" => {}
             "user" => {
-                let user = page + 13;
-                let user_id = optional_i64(
+                for record in typed_history_records(
                     file,
                     line_number + 1,
-                    "user_id",
-                    fields[user],
-                )?;
-                if user_id.is_some_and(|id| id <= 0) {
-                    return Err(history_parse_error(
-                        file,
-                        line_number + 1,
-                        format!("has invalid user id {:?}", fields[user]),
-                    ));
+                    &fields,
+                    page,
+                    revision,
+                    ordinal,
+                )? {
+                    user_events.push(record).map_err(history_archive_error)?;
                 }
-                let entity = user_id.map_or(
-                    crate::archive::EntityKey {
-                        kind: crate::archive::EntityKind::Global,
-                        id: 0,
-                    },
-                    |id| crate::archive::EntityKey {
-                        kind: crate::archive::EntityKind::User,
-                        id: id as u64,
-                    },
-                );
-                let timestamp_micros = parse_history_timestamp_micros(fields[4])
-                    .ok_or_else(|| {
-                        history_parse_error(
-                            file,
-                            line_number + 1,
-                            format!("has invalid timestamp {:?}", fields[4]),
-                        )
-                    })?;
-                user_events
-                    .push(
-                        entity,
-                        timestamp_micros,
-                        crate::archive::HistoryEventRecord {
-                            source_partition: file.partition.clone(),
-                            source_ordinal: ordinal,
-                            schema_columns: fields.len() as u16,
-                            fields: fields
-                                .iter()
-                                .map(|field| {
-                                    (!field.is_empty()).then(|| field.as_bytes().to_vec())
-                                })
-                                .collect(),
-                        },
-                    )
-                    .map_err(history_archive_error)?;
                 continue;
             }
             other => {
@@ -888,7 +1296,7 @@ fn sync_page_actions(
     // change after later moves, renames, and reverts, so a new release must
     // replace the complete derived metadata set.
     let mut user_events =
-        crate::archive::HistoryEventSorter::new_in(&inst.root).map_err(history_archive_error)?;
+        crate::archive::RecordSorter::new_in(&inst.root).map_err(history_archive_error)?;
     let mut g = inst.inner.lock().expect("instance mutex poisoned");
     let crate::instance::InstanceInner { conn, titles, .. } = &mut *g;
     let tx = conn.transaction()?;
@@ -1174,7 +1582,7 @@ fn import_part(
     inst.import(&mut stream)
 }
 
-fn part_groups(parts: Vec<wikimak_mediawiki::Part>) -> Vec<Vec<wikimak_mediawiki::Part>> {
+pub(crate) fn part_groups(parts: Vec<wikimak_mediawiki::Part>) -> Vec<Vec<wikimak_mediawiki::Part>> {
     let spans: Option<Vec<_>> = parts
         .iter()
         .map(|part| part_page_span(&part.filename))
