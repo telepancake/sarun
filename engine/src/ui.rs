@@ -681,9 +681,19 @@ struct ReaderSearchJob {
             String,
         >,
     >,
-    pattern: String,
-    kind: wikimak_wikipedia::archive_browse::ArchiveSearchKind,
+    request: ReaderSearchRequest,
     spin: usize,
+}
+
+#[derive(Clone)]
+enum ReaderSearchRequest {
+    Regexp {
+        pattern: String,
+        kind: wikimak_wikipedia::archive_browse::ArchiveSearchKind,
+    },
+    Contributor {
+        label: String,
+    },
 }
 
 /// One pickable local model in the ModelPicker (mirrors the engine's
@@ -1839,11 +1849,50 @@ impl App {
         });
         self.reader_search_job = Some(ReaderSearchJob {
             rx,
-            pattern: pattern.clone(),
-            kind,
+            request: ReaderSearchRequest::Regexp {
+                pattern: pattern.clone(),
+                kind,
+            },
             spin: 0,
         });
         self.status = format!("searching Wikipedia for /{pattern}/ …");
+    }
+
+    fn start_contributor_edits(
+        &mut self,
+        contributor: wikimak_wikipedia::ContributorMeta,
+        label: String,
+    ) {
+        if self.reader_search_job.is_some() {
+            self.status = "a Wikipedia search is already running".into();
+            return;
+        }
+        let archive = self
+            .reader
+            .borrow()
+            .as_ref()
+            .and_then(crate::reader::Reader::archive_search_index);
+        let Some(archive) = archive else {
+            self.status = "contributor edits require an open wiki archive".into();
+            return;
+        };
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let result = archive
+                .contributor_edits(&contributor, 500)
+                .map(|results| (results, started.elapsed()))
+                .map_err(|error| error.to_string());
+            let _ = tx.send(result);
+        });
+        self.reader_search_job = Some(ReaderSearchJob {
+            rx,
+            request: ReaderSearchRequest::Contributor {
+                label: label.clone(),
+            },
+            spin: 0,
+        });
+        self.status = format!("finding edits by {label} …");
     }
 
     fn pump_reader_search(&mut self) {
@@ -1852,18 +1901,20 @@ impl App {
         };
         match job.rx.try_recv() {
             Ok(Ok((results, elapsed))) => {
-                let pattern = job.pattern.clone();
-                let kind = job.kind;
+                let request = job.request.clone();
                 self.reader_search_job = None;
                 let outcome = self
                     .reader
                     .borrow_mut()
                     .as_mut()
                     .ok_or_else(|| "reader was closed while search ran".to_string())
-                    .and_then(|reader| {
-                        reader
-                            .show_archive_search(&pattern, kind, &results, elapsed)
-                            .map_err(|error| error.to_string())
+                    .and_then(|reader| match &request {
+                        ReaderSearchRequest::Regexp { pattern, kind } => reader
+                            .show_archive_search(pattern, *kind, &results, elapsed)
+                            .map_err(|error| error.to_string()),
+                        ReaderSearchRequest::Contributor { label } => reader
+                            .show_contributor_edits(label, &results, elapsed)
+                            .map_err(|error| error.to_string()),
                     });
                 self.status = match outcome {
                     Ok(()) => format!(
@@ -1881,10 +1932,17 @@ impl App {
             Err(mpsc::TryRecvError::Empty) => {
                 job.spin = job.spin.wrapping_add(1);
                 let frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧'];
+                let subject = match &job.request {
+                    ReaderSearchRequest::Regexp { pattern, .. } => {
+                        format!("Wikipedia for /{pattern}/")
+                    }
+                    ReaderSearchRequest::Contributor { label } => {
+                        format!("edits by {label}")
+                    }
+                };
                 let message = format!(
-                    "{} searching Wikipedia for /{}/ …",
-                    frames[job.spin / 2 % frames.len()],
-                    job.pattern
+                    "{} searching {subject} …",
+                    frames[job.spin / 2 % frames.len()]
                 );
                 self.status = message.clone();
                 if let Some(reader) = self.reader.borrow_mut().as_mut() {
@@ -9332,7 +9390,11 @@ fn mirror_detail_lines(app: &App) -> Vec<Line<'static>> {
     if !j.last_detail.is_empty() {
         out.push(Line::from(""));
         out.push(Line::from(Span::styled(
-            "LAST DETAIL",
+            if j.state == "running" {
+                "PROGRESS"
+            } else {
+                "LAST DETAIL"
+            },
             Style::default()
                 .add_modifier(Modifier::BOLD)
                 .fg(Color::Yellow),
@@ -11208,6 +11270,10 @@ fn handle_reader_key(
         }
         KeyResult::ArchiveSearch { pattern, kind } => {
             app.start_reader_search(pattern, kind);
+            true
+        }
+        KeyResult::ContributorEdits { contributor, label } => {
+            app.start_contributor_edits(contributor, label);
             true
         }
         KeyResult::Close => {

@@ -1186,6 +1186,16 @@ type OwnedFrameDecoder = zstd::stream::read::Decoder<
     BufReader<std::io::Chain<Cursor<Vec<u8>>, Take<std::fs::File>>>,
 >;
 
+pub(crate) struct FrameRecordCursor {
+    inner: ArchiveFrameReader<OwnedFrameDecoder>,
+}
+
+impl FrameRecordCursor {
+    pub(crate) fn next_record(&mut self) -> Result<Option<Record>> {
+        self.inner.next_record()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RepackStats {
     pub input_frames: u64,
@@ -1575,6 +1585,15 @@ fn open_owned_frame(
         last_entity: None,
         last_timestamp: i64::MAX,
         finished: false,
+    })
+}
+
+pub(crate) fn open_frame_cursor(
+    path: &Path,
+    location: &FrameLocation,
+) -> Result<FrameRecordCursor> {
+    Ok(FrameRecordCursor {
+        inner: open_owned_frame(path, location)?,
     })
 }
 

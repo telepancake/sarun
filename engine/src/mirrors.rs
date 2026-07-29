@@ -507,9 +507,10 @@ fn stream_stderr(
             Ok(l) => l,
             Err(_) => break,
         };
+        let first_line = lines.is_empty();
         pending.push_str(&line);
         pending.push('\n');
-        if last_flush.elapsed() >= Duration::from_secs(2) {
+        if first_line || last_flush.elapsed() >= Duration::from_secs(2) {
             let tail = tail_2k(&pending);
             if let Ok(conn) = db() {
                 let _ = conn.execute(
@@ -523,17 +524,17 @@ fn stream_stderr(
     }
     let exit = child.wait();
     let all = lines.join("\n");
-    let tail = if all.len() > 2048 {
-        all[all.len() - 2048..].to_string()
-    } else {
-        all
-    };
+    let tail = tail_2k(&all);
     (exit, tail)
 }
 
 fn tail_2k(s: &str) -> String {
     if s.len() > 2048 {
-        s[s.len() - 2048..].to_string()
+        let mut start = s.len() - 2048;
+        while !s.is_char_boundary(start) {
+            start += 1;
+        }
+        s[start..].to_string()
     } else {
         s.to_string()
     }
@@ -600,6 +601,14 @@ mod tests {
         assert_eq!(sig, 9);
         // The signal-name logic is now inline in stream_stderr's caller;
         // this test just proves the signal is observable on the ExitStatus.
+    }
+
+    #[test]
+    fn progress_tail_keeps_utf8_boundaries() {
+        let input = "ā".repeat(2049);
+        let tail = tail_2k(&input);
+        assert!(tail.len() <= 2048);
+        assert!(tail.chars().all(|character| character == 'ā'));
     }
 
     #[test]

@@ -227,6 +227,46 @@ impl Doc {
         }
     }
 
+    fn from_diff(raw: &[u8], width: usize) -> Doc {
+        let text = String::from_utf8_lossy(raw);
+        let width = width.max(1);
+        let mut lines = Vec::new();
+        let mut plain = Vec::new();
+        for source in text.lines() {
+            let source = source.trim_end_matches('\r');
+            let style = if source.starts_with("+ ") || source.starts_with("+++") {
+                Style::default().fg(Color::Green)
+            } else if source.starts_with("- ") || source.starts_with("---") {
+                Style::default().fg(Color::Red)
+            } else {
+                Style::default().add_modifier(Modifier::DIM)
+            };
+            let mut rest = source;
+            loop {
+                let cut = rest
+                    .char_indices()
+                    .nth(width)
+                    .map(|(index, _)| index)
+                    .unwrap_or(rest.len());
+                let (head, tail) = rest.split_at(cut);
+                plain.push(head.to_string());
+                lines.push(Line::from(Span::styled(head.to_string(), style)));
+                if tail.is_empty() {
+                    break;
+                }
+                rest = tail;
+            }
+        }
+        Doc {
+            lines,
+            links: Vec::new(),
+            headings: Vec::new(),
+            fragments: HashMap::new(),
+            plain,
+            width,
+        }
+    }
+
     /// Toggle the REVERSED (focus) modifier on one link's spans — O(spans of
     /// that link), never a document rebuild.
     fn set_link_focused(&mut self, link: usize, on: bool) {
@@ -322,6 +362,7 @@ enum Kind {
     Html,
     Markdown,
     Text,
+    Diff,
 }
 
 fn kind_for_name(name: &str) -> Kind {
@@ -341,6 +382,7 @@ fn build(kind: Kind, raw: &[u8], width: usize) -> anyhow::Result<Doc> {
         Kind::Html => Doc::from_html(raw, width),
         Kind::Markdown => Doc::from_markdown(raw, width),
         Kind::Text => Ok(Doc::from_text(raw, width)),
+        Kind::Diff => Ok(Doc::from_diff(raw, width)),
     }
 }
 
@@ -395,6 +437,7 @@ fn format_timestamp(timestamp_micros: i64) -> String {
 /// Follow `#REDIRECT` chains at head, loop-capped — the same contract as
 /// serve.rs `resolve_page` (which is private to that module).
 const MAX_REDIRECT_HOPS: usize = 10;
+const WIKI_REVISION_TEXT_CACHE_BYTES: usize = 64 << 20;
 
 fn resolve_wiki_page(
     archive: &wikimak_wikipedia::archive_browse::ArchiveBrowseIndex,
@@ -433,9 +476,7 @@ fn wiki_page_html(
     timestamp_micros: Option<i64>,
     page_id: Option<u64>,
 ) -> anyhow::Result<(String, String, u64)> {
-    use wikimak_wikitext::PageStore;
     let at = timestamp_micros.unwrap_or(i64::MAX);
-    let view = archive.view(timestamp_micros);
     let (pid, resolved) = match page_id {
         Some(page_id) => (
             page_id,
@@ -446,14 +487,27 @@ fn wiki_page_html(
         ),
         None => resolve_wiki_page(archive, title, at)?,
     };
-    let site = view.site();
-    let title_obj = wikimak_wikitext::Title::parse(&resolved, site);
-    let display = title_obj.prefixed(site);
     let text = archive
         .page_text_at(pid, at)
         .map_err(|e| anyhow::anyhow!("wiki page text: {e}"))?
         .ok_or_else(|| anyhow::anyhow!("wiki: no text at {resolved:?}"))?;
+    let (html, display) =
+        wiki_wikitext_html(archive, &resolved, timestamp_micros, &text);
+    Ok((html, display, pid))
+}
+
+fn wiki_wikitext_html(
+    archive: &wikimak_wikipedia::archive_browse::ArchiveBrowseIndex,
+    resolved: &str,
+    timestamp_micros: Option<i64>,
+    text: &[u8],
+) -> (String, String) {
+    use wikimak_wikitext::PageStore;
+    let view = archive.view(timestamp_micros);
     let wikitext = String::from_utf8_lossy(&text);
+    let site = view.site();
+    let title_obj = wikimak_wikitext::Title::parse(resolved, site);
+    let display = title_obj.prefixed(site);
     let invoker = wikimak_scribunto::LuaInvoker::new().ok();
     let opts = wikimak_wikitext::RenderOptions {
         invoker: invoker
@@ -471,7 +525,65 @@ fn wiki_page_html(
         wikimak_wikitext::html::escape(&display),
         out.html
     );
-    Ok((html, display, pid))
+    (html, display)
+}
+
+fn raw_wikitext_html(title: &str, text: &[u8]) -> Vec<u8> {
+    let text = String::from_utf8_lossy(text);
+    let mut html = format!(
+        "<h1>{} · raw wikitext</h1><pre>",
+        wikimak_wikitext::html::escape(title)
+    );
+    let mut rest = text.as_ref();
+    while let Some(open) = rest.find("[[") {
+        html.push_str(&wikimak_wikitext::html::escape(&rest[..open]));
+        let link = &rest[open..];
+        let Some(close) = link.find("]]") else {
+            html.push_str(&wikimak_wikitext::html::escape(link));
+            rest = "";
+            break;
+        };
+        let original = &link[..close + 2];
+        let target = link[2..close]
+            .split('|')
+            .next()
+            .unwrap_or_default()
+            .trim();
+        if target.is_empty() {
+            html.push_str(&wikimak_wikitext::html::escape(original));
+        } else {
+            html.push_str(&format!(
+                "<a href=\"/wiki/{}\">{}</a>",
+                percent_encode_title(target),
+                wikimak_wikitext::html::escape(original)
+            ));
+        }
+        rest = &link[close + 2..];
+    }
+    html.push_str(&wikimak_wikitext::html::escape(rest));
+    html.push_str("</pre>");
+    html.into_bytes()
+}
+
+fn revision_diff(previous: &[u8], current: &[u8]) -> Vec<u8> {
+    use similar::ChangeTag;
+    let previous = String::from_utf8_lossy(previous);
+    let current = String::from_utf8_lossy(current);
+    let diff = similar::TextDiff::from_lines(previous.as_ref(), current.as_ref());
+    let mut output = String::from("--- previous\n+++ selected\n");
+    for change in diff.iter_all_changes() {
+        let marker = match change.tag() {
+            ChangeTag::Delete => "- ",
+            ChangeTag::Insert => "+ ",
+            ChangeTag::Equal => "  ",
+        };
+        output.push_str(marker);
+        output.push_str(change.value());
+        if !change.value().ends_with('\n') {
+            output.push('\n');
+        }
+    }
+    output.into_bytes()
 }
 
 /// Pick a page to land on when a wiki mirror is opened without a title:
@@ -648,12 +760,19 @@ pub enum KeyResult {
         pattern: String,
         kind: wikimak_wikipedia::archive_browse::ArchiveSearchKind,
     },
+    ContributorEdits {
+        contributor: wikimak_wikipedia::ContributorMeta,
+        label: String,
+    },
 }
 
 struct WikiReader {
     archive: std::sync::Arc<wikimak_wikipedia::archive_browse::ArchiveBrowseIndex>,
     page_id: u64,
+    page_title: String,
     revisions: Vec<wikimak_wikipedia::archive_browse::PageRevisionSummary>,
+    revision_texts: wikimak_wikipedia::archive_browse::PageRevisionTextCursor,
+    view_mode: WikiViewMode,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -661,6 +780,31 @@ enum SearchMode {
     Document,
     ArchiveTitle,
     ArchiveFullText,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WikiViewMode {
+    Rendered,
+    Raw,
+    Diff,
+}
+
+impl WikiViewMode {
+    fn next(self) -> Self {
+        match self {
+            Self::Rendered => Self::Raw,
+            Self::Raw => Self::Diff,
+            Self::Diff => Self::Rendered,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Rendered => "rendered",
+            Self::Raw => "raw wikitext",
+            Self::Diff => "revision diff",
+        }
+    }
 }
 
 /// The document reader pane state: one open document, its scroll / link
@@ -689,6 +833,7 @@ pub struct Reader {
     history_selected: usize,
     history_scroll: usize,
     history_view_h: usize,
+    history_origin: Option<(Source, usize)>,
     /// Link rectangles from the most recently rendered terminal grid.
     screen_links: Vec<ScreenLink>,
     pub status: String,
@@ -718,8 +863,9 @@ impl Reader {
             history_selected: 0,
             history_scroll: 0,
             history_view_h: 1,
+            history_origin: None,
             screen_links: Vec::new(),
-            status: "arrows links · h history · [/] back/forward · j/k scroll · / page search · T title regexp · F full-text regexp · F6 select".into(),
+            status: "arrows links · h history · v rendered/raw/diff · [/] back/forward · j/k scroll · / page search · T title regexp · F full-text regexp".into(),
             view_h: 20,
         })
     }
@@ -757,11 +903,18 @@ impl Reader {
         let revisions = archive
             .page_revisions(page_id)
             .map_err(|e| anyhow::anyhow!("wiki page history: {e}"))?;
-        let mut reader = Reader::new(source, html.into_bytes(), Kind::Html, display)?;
+        let revision_texts = archive
+            .page_revision_text_cursor(page_id, WIKI_REVISION_TEXT_CACHE_BYTES)
+            .map_err(|e| anyhow::anyhow!("wiki page revision stream: {e}"))?
+            .ok_or_else(|| anyhow::anyhow!("wiki page frame is missing"))?;
+        let mut reader = Reader::new(source, html.into_bytes(), Kind::Html, display.clone())?;
         reader.wiki = Some(WikiReader {
             archive,
             page_id,
+            page_title: display,
             revisions,
+            revision_texts,
+            view_mode: WikiViewMode::Rendered,
         });
         Ok(reader)
     }
@@ -838,11 +991,16 @@ impl Reader {
                     .archive
                     .page_revisions(page_id)
                     .map_err(|e| anyhow::anyhow!("wiki page history: {e}"))?;
+                let revision_texts = wiki
+                    .archive
+                    .page_revision_text_cursor(page_id, WIKI_REVISION_TEXT_CACHE_BYTES)
+                    .map_err(|e| anyhow::anyhow!("wiki page revision stream: {e}"))?
+                    .ok_or_else(|| anyhow::anyhow!("wiki page frame is missing"))?;
                 (
                     html.into_bytes(),
                     Kind::Html,
                     display,
-                    Some((page_id, revisions)),
+                    Some((page_id, revisions, revision_texts)),
                 )
             }
             _ => {
@@ -861,13 +1019,15 @@ impl Reader {
         self.matches.clear();
         self.query.clear();
         self.screen_links.clear();
-        if let Some((page_id, revisions)) = wiki_page {
+        if let Some((page_id, revisions, revision_texts)) = wiki_page {
             let wiki = self
                 .wiki
                 .as_mut()
                 .expect("wiki source was loaded through an open wiki session");
             wiki.page_id = page_id;
+            wiki.page_title = self.display.clone();
             wiki.revisions = revisions;
+            wiki.revision_texts = revision_texts;
             self.history_selected = match &self.source {
                 Source::Wiki {
                     timestamp_micros: Some(timestamp),
@@ -880,6 +1040,9 @@ impl Reader {
                 _ => 0,
             };
             self.history_scroll = self.history_selected;
+            if wiki.view_mode != WikiViewMode::Rendered {
+                self.apply_wiki_view(self.history_selected)?;
+            }
         } else if matches!(self.source, Source::WikiSearch { .. }) {
             if let Some(wiki) = self.wiki.as_mut() {
                 wiki.revisions.clear();
@@ -958,6 +1121,62 @@ impl Reader {
         self.future.clear();
         self.status = format!(
             "{} matches · {shown} shown · {:.2?} · Backspace goes back",
+            results.match_count, elapsed
+        );
+        Ok(())
+    }
+
+    pub fn show_contributor_edits(
+        &mut self,
+        contributor: &str,
+        results: &wikimak_wikipedia::archive_browse::ArchiveSearchResults,
+        elapsed: std::time::Duration,
+    ) -> anyhow::Result<()> {
+        let root = match &self.source {
+            Source::Wiki { root, .. } | Source::WikiSearch { root, .. } => root.clone(),
+            _ => anyhow::bail!("contributor edits require an open wiki archive"),
+        };
+        let escaped_contributor = wikimak_wikitext::html::escape(contributor);
+        let shown = results.hits.len();
+        let mut html = format!(
+            "<h1>Edits by {escaped_contributor}</h1><p>{} edits; showing {shown}. \
+             Scanned {} frames with {} workers in {:.2?}.</p><ol>",
+            results.match_count, results.searched_frames, results.workers, elapsed
+        );
+        for hit in &results.hits {
+            let title = wikimak_wikitext::html::escape(&hit.title);
+            let encoded = percent_encode_title(&hit.title);
+            let timestamp = hit.timestamp_micros.unwrap_or(i64::MAX);
+            html.push_str(&format!(
+                "<li><a href=\"/wiki/{encoded}?pageid={}&at={timestamp}\">{title}</a>",
+                hit.page_id
+            ));
+            if let Some(revision_id) = hit.revision_id {
+                html.push_str(&format!(
+                    " <small>revision {revision_id} · {}</small>",
+                    format_timestamp(timestamp)
+                ));
+            }
+            if let Some(comment) = &hit.snippet {
+                html.push_str(&format!(
+                    "<blockquote>{}</blockquote>",
+                    wikimak_wikitext::html::escape(comment)
+                ));
+            }
+            html.push_str("</li>");
+        }
+        html.push_str("</ol>");
+        let label = format!("wiki:edits:{contributor}");
+        let from = (self.source.clone(), self.scroll);
+        self.load_into(Source::WikiSearch {
+            root,
+            label,
+            html: std::sync::Arc::from(html.into_bytes()),
+        })?;
+        self.history.push(from);
+        self.future.clear();
+        self.status = format!(
+            "{} edits · {shown} shown · {:.2?} · Backspace goes back",
             results.match_count, elapsed
         );
         Ok(())
@@ -1092,11 +1311,29 @@ impl Reader {
             self.scroll += 1;
             self.status = "scrolled down".into();
         } else if dx < 0 && self.wiki.as_ref().is_some_and(|wiki| !wiki.revisions.is_empty()) {
-            self.history_focused = true;
-            self.status = "page history · Up/Down select · Enter opens · Right returns".into();
+            self.focus_history();
+            self.status =
+                "page history · Up/Down select · Enter revision · u user page · e edits".into();
         } else {
             self.status = "no link or content in that direction".into();
         }
+    }
+
+    fn focus_history(&mut self) {
+        if !self.history_focused {
+            self.history_origin = Some((self.source.clone(), self.scroll));
+        }
+        self.history_focused = true;
+    }
+
+    fn finish_history_focus(&mut self) {
+        if let Some(origin) = self.history_origin.take() {
+            if origin.0 != self.source || origin.1 != self.scroll {
+                self.history.push(origin);
+                self.future.clear();
+            }
+        }
+        self.history_focused = false;
     }
 
     fn move_history(&mut self, amount: isize) {
@@ -1118,46 +1355,200 @@ impl Reader {
                 .saturating_sub(self.history_view_h.max(1));
         }
         self.status = format!(
-            "revision {}/{} · Enter opens · Right returns",
+            "revision {}/{} · Enter opens · u user page · e edits · Right returns",
             self.history_selected + 1,
             count
         );
+        if let Err(error) = self.apply_wiki_view(self.history_selected) {
+            self.status = error.to_string();
+        }
+    }
+
+    fn apply_wiki_view(&mut self, revision_index: usize) -> anyhow::Result<()> {
+        let width = self.doc.width;
+        let (archive, page_title, timestamp_micros, page_id, mode, current, previous) = {
+            let wiki = self
+                .wiki
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("wiki session is not open"))?;
+            let revision = wiki
+                .revisions
+                .get(revision_index)
+                .ok_or_else(|| anyhow::anyhow!("revision is not cached"))?;
+            if !revision.has_text {
+                anyhow::bail!("selected revision has no retained wikitext");
+            }
+            let timestamp_micros = revision.timestamp_micros;
+            let has_previous = wiki.view_mode == WikiViewMode::Diff
+                && wiki
+                    .revisions
+                    .get(revision_index + 1)
+                    .is_some_and(|previous| previous.has_text);
+            let current = wiki
+                .revision_texts
+                .text(revision_index)
+                .map_err(|error| anyhow::anyhow!("wiki revision stream: {error}"))?
+                .ok_or_else(|| anyhow::anyhow!("selected revision has no retained wikitext"))?;
+            let previous = if has_previous {
+                wiki.revision_texts
+                    .text(revision_index + 1)
+                    .map_err(|error| anyhow::anyhow!("wiki revision stream: {error}"))?
+            } else {
+                None
+            };
+            (
+                wiki.archive.clone(),
+                wiki.page_title.clone(),
+                timestamp_micros,
+                wiki.page_id,
+                wiki.view_mode,
+                current,
+                previous,
+            )
+        };
+        let (raw, kind) = match mode {
+            WikiViewMode::Rendered => {
+                let (html, _) = wiki_wikitext_html(
+                    &archive,
+                    &page_title,
+                    Some(timestamp_micros),
+                    &current,
+                );
+                (html.into_bytes(), Kind::Html)
+            }
+            WikiViewMode::Raw => (raw_wikitext_html(&page_title, &current), Kind::Html),
+            WikiViewMode::Diff => (
+                previous.map_or_else(
+                    || b"(no earlier retained wikitext to compare)\n".to_vec(),
+                    |previous| revision_diff(&previous, &current),
+                ),
+                Kind::Diff,
+            ),
+        };
+        let display = format!("{} · {}", page_title, mode.label());
+        let doc = build(kind, &raw, width)?;
+        if let Source::Wiki {
+            timestamp_micros: timestamp,
+            page_id: source_page_id,
+            ..
+        } = &mut self.source
+        {
+            *timestamp = Some(timestamp_micros);
+            *source_page_id = Some(page_id);
+        }
+        self.raw = raw;
+        self.kind = kind;
+        self.doc = doc;
+        self.display = display;
+        self.scroll = 0;
+        self.focus_link = None;
+        self.matches.clear();
+        self.query.clear();
+        self.screen_links.clear();
+        self.history_selected = revision_index;
+        self.status = format!(
+            "{} · revision {}/{} · v cycles rendered/raw/diff",
+            mode.label(),
+            revision_index + 1,
+            self.revision_count()
+        );
+        Ok(())
+    }
+
+    fn set_wiki_view_mode(&mut self, mode: WikiViewMode) {
+        let Some(wiki) = self.wiki.as_mut() else {
+            self.status = "wikitext views are only available for wiki pages".into();
+            return;
+        };
+        wiki.view_mode = mode;
+        if let Err(error) = self.apply_wiki_view(self.history_selected) {
+            self.status = error.to_string();
+        }
     }
 
     fn open_history_revision(&mut self) {
-        let Some(wiki) = self.wiki.as_ref() else {
-            return;
-        };
-        let Some(revision) = wiki.revisions.get(self.history_selected) else {
+        let Some(revision_id) = self
+            .wiki
+            .as_ref()
+            .and_then(|wiki| wiki.revisions.get(self.history_selected))
+            .map(|revision| revision.revision_id)
+        else {
             self.status = "no revision selected".into();
             return;
         };
-        let revision_timestamp = revision.timestamp_micros;
-        let revision_id = revision.revision_id;
-        let page_id = wiki.page_id;
-        let (root, title) = match &self.source {
-            Source::Wiki { root, title, .. } => (root.clone(), title.clone()),
-            _ => {
-                self.status = "history belongs to a wiki page".into();
-                return;
+        if let Err(error) = self.apply_wiki_view(self.history_selected) {
+            self.status = error.to_string();
+            return;
+        }
+        self.finish_history_focus();
+        self.status = format!(
+            "revision {} · Left at edge returns to page history",
+            revision_id
+        );
+    }
+
+    fn selected_contributor(&self) -> Option<wikimak_wikipedia::ContributorMeta> {
+        self.wiki
+            .as_ref()?
+            .revisions
+            .get(self.history_selected)
+            .map(|revision| revision.contributor.clone())
+    }
+
+    fn contributor_label(contributor: &wikimak_wikipedia::ContributorMeta) -> Option<String> {
+        match contributor {
+            wikimak_wikipedia::ContributorMeta::Named { username, .. } => {
+                Some(username.clone())
             }
+            wikimak_wikipedia::ContributorMeta::Anonymous { ip } => Some(ip.clone()),
+            wikimak_wikipedia::ContributorMeta::Hidden => None,
+        }
+    }
+
+    fn open_contributor_page(&mut self) {
+        let Some(contributor) = self.selected_contributor() else {
+            self.status = "no contributor selected".into();
+            return;
+        };
+        let Some(name) = Self::contributor_label(&contributor) else {
+            self.status = "this revision's contributor is hidden".into();
+            return;
+        };
+        let Some(wiki) = self.wiki.as_ref() else {
+            return;
+        };
+        let namespace = wiki
+            .archive
+            .site_info()
+            .namespaces
+            .iter()
+            .find(|namespace| namespace.id == 2)
+            .map(|namespace| namespace.localized_name.as_str())
+            .filter(|namespace| !namespace.is_empty())
+            .unwrap_or("User");
+        let title = format!("{namespace}:{name}");
+        let Some(page_id) = wiki.archive.page_id_by_title(&title, i64::MAX) else {
+            self.status = format!("{name} has no local user page");
+            return;
+        };
+        let root = match &self.source {
+            Source::Wiki { root, .. } => root.clone(),
+            _ => return,
         };
         let target = Source::Wiki {
             root,
             title,
-            timestamp_micros: Some(revision_timestamp),
+            timestamp_micros: None,
             page_id: Some(page_id),
         };
+        self.finish_history_focus();
         let from = (self.source.clone(), self.scroll);
         match self.load_into(target) {
             Ok(()) => {
                 self.history.push(from);
                 self.future.clear();
                 self.history_focused = false;
-                self.status = format!(
-                    "revision {} · Left at edge returns to page history",
-                    revision_id
-                );
+                self.status = format!("user page for {name} · Backspace goes back");
             }
             Err(error) => self.status = error.to_string(),
         }
@@ -1522,22 +1913,53 @@ impl Reader {
                 KeyCode::Home | KeyCode::Char('g') => {
                     self.history_selected = 0;
                     self.history_scroll = 0;
+                    self.move_history(0);
                 }
                 KeyCode::End | KeyCode::Char('G') => {
                     self.history_selected = self.revision_count().saturating_sub(1);
                     self.move_history(0);
                 }
                 KeyCode::Enter => self.open_history_revision(),
+                KeyCode::Char('u') => self.open_contributor_page(),
+                KeyCode::Char('e') => {
+                    let Some(contributor) = self.selected_contributor() else {
+                        self.status = "no contributor selected".into();
+                        return KeyResult::Consumed;
+                    };
+                    let Some(label) = Self::contributor_label(&contributor) else {
+                        self.status = "this revision's contributor is hidden".into();
+                        return KeyResult::Consumed;
+                    };
+                    self.finish_history_focus();
+                    return KeyResult::ContributorEdits { contributor, label };
+                }
+                KeyCode::Char('v') => {
+                    let next = self
+                        .wiki
+                        .as_ref()
+                        .map(|wiki| wiki.view_mode.next())
+                        .unwrap_or(WikiViewMode::Rendered);
+                    self.set_wiki_view_mode(next);
+                }
+                KeyCode::Char('1') => self.set_wiki_view_mode(WikiViewMode::Rendered),
+                KeyCode::Char('2') => self.set_wiki_view_mode(WikiViewMode::Raw),
+                KeyCode::Char('3') => self.set_wiki_view_mode(WikiViewMode::Diff),
                 KeyCode::Right | KeyCode::Char('l') | KeyCode::Tab | KeyCode::Esc => {
-                    self.history_focused = false;
+                    self.finish_history_focus();
                     self.status = "document · arrows navigate links".into();
                 }
                 KeyCode::Char('z') => {
-                    self.history_focused = false;
+                    self.finish_history_focus();
                     return KeyResult::ToggleFull;
                 }
-                KeyCode::Backspace | KeyCode::Char('[') => self.back(),
-                KeyCode::Char(']') => self.forward(),
+                KeyCode::Backspace | KeyCode::Char('[') => {
+                    self.finish_history_focus();
+                    self.back();
+                }
+                KeyCode::Char(']') => {
+                    self.finish_history_focus();
+                    self.forward();
+                }
                 _ => return KeyResult::NotHandled,
             }
             return KeyResult::Consumed;
@@ -1547,11 +1969,22 @@ impl Reader {
             KeyCode::Char('k') => self.scroll = self.scroll.saturating_sub(1),
             KeyCode::Char('h') => {
                 if self.wiki.as_ref().is_some_and(|wiki| !wiki.revisions.is_empty()) {
-                    self.history_focused = true;
+                    self.focus_history();
                     self.status =
-                        "page history · Up/Down select · Enter opens · Right returns".into();
+                        "page history · v view · Enter revision · u user page · e edits".into();
                 }
             }
+            KeyCode::Char('v') => {
+                let next = self
+                    .wiki
+                    .as_ref()
+                    .map(|wiki| wiki.view_mode.next())
+                    .unwrap_or(WikiViewMode::Rendered);
+                self.set_wiki_view_mode(next);
+            }
+            KeyCode::Char('1') => self.set_wiki_view_mode(WikiViewMode::Rendered),
+            KeyCode::Char('2') => self.set_wiki_view_mode(WikiViewMode::Raw),
+            KeyCode::Char('3') => self.set_wiki_view_mode(WikiViewMode::Diff),
             KeyCode::Left => self.focus_spatial(-1, 0),
             KeyCode::Right => self.focus_spatial(1, 0),
             KeyCode::Up => self.focus_spatial(0, -1),
@@ -1628,6 +2061,17 @@ impl Reader {
         } else if self.history_selected >= self.history_scroll + self.history_view_h {
             self.history_scroll = self.history_selected + 1 - self.history_view_h;
         }
+        let displayed = match &self.source {
+            Source::Wiki {
+                timestamp_micros: Some(timestamp),
+                ..
+            } => wiki
+                .revisions
+                .iter()
+                .position(|revision| revision.timestamp_micros <= *timestamp),
+            Source::Wiki { .. } => (!wiki.revisions.is_empty()).then_some(0),
+            _ => None,
+        };
         wiki.revisions
             .iter()
             .enumerate()
@@ -1664,7 +2108,18 @@ impl Reader {
                     flags.push_str(" no-text");
                 }
                 let comment = revision.comment.replace(['\r', '\n'], " ");
+                let is_displayed = displayed == Some(index);
                 let line = Line::from(vec![
+                    Span::styled(
+                        if is_displayed { "▶ " } else { "  " },
+                        if is_displayed {
+                            Style::default()
+                                .fg(Color::Yellow)
+                                .add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default()
+                        },
+                    ),
                     Span::styled(
                         format!("{timestamp}  "),
                         Style::default().fg(Color::Cyan),
@@ -1685,6 +2140,12 @@ impl Reader {
                 ]);
                 if self.history_focused && index == self.history_selected {
                     line.style(Style::default().add_modifier(Modifier::REVERSED))
+                } else if is_displayed {
+                    line.style(
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    )
                 } else {
                     line
                 }
@@ -1718,10 +2179,12 @@ impl Reader {
         }
         match kind {
             MouseEventKind::Moved | MouseEventKind::Down(MouseButton::Left) => {
-                self.history_focused = true;
+                self.focus_history();
                 self.history_selected = index;
                 if matches!(kind, MouseEventKind::Down(MouseButton::Left)) {
                     self.open_history_revision();
+                } else if let Err(error) = self.apply_wiki_view(index) {
+                    self.status = error.to_string();
                 }
             }
             MouseEventKind::ScrollUp => self.move_history(-3),
@@ -2131,26 +2594,29 @@ mod tests {
         let timestamp = chrono::DateTime::parse_from_rfc3339("2022-01-01T00:00:00Z")
             .unwrap()
             .with_timezone(&chrono::Utc);
-        for (page_id, revision_id, title, text) in [
+        for (page_id, revision_id, title, namespace, text) in [
             (
                 1,
                 11,
                 "Alpha Article",
+                0,
                 "== Overview ==\nAlpha body linking [[Beta Article]] and [https://example.org outside].",
             ),
             (
                 2,
                 21,
                 "Beta Article",
+                0,
                 "Beta body, back to [[Alpha Article]].",
             ),
+            (3, 31, "Ed", 2, "Ed's local user page."),
         ] {
             writer
                 .write(&Record::PageState {
                     page_id,
                     timestamp_micros: timestamp.timestamp_micros(),
                     title: title.into(),
-                    namespace: Some(0),
+                    namespace: Some(namespace),
                     deleted: false,
                 })
                 .unwrap();
@@ -2178,6 +2644,33 @@ mod tests {
                     },
                 })
                 .unwrap();
+            if page_id == 1 {
+                let older_text = "Alpha old body linking [[Beta Article]].";
+                writer
+                    .write(&Record::Revision {
+                        page_id,
+                        revision: RevisionRecord {
+                            meta: RevisionMeta {
+                                rev_id: 10,
+                                parent_id: 0,
+                                ts: timestamp - chrono::Duration::days(1),
+                                contributor: ContributorMeta::Named {
+                                    username: "Ed".into(),
+                                    user_id: 1,
+                                },
+                                comment: "initial version".into(),
+                                sha1: String::new(),
+                                flags: 0,
+                                text_len: older_text.len() as u64,
+                            },
+                            has_text: true,
+                            text: older_text.as_bytes().to_vec(),
+                            visibility: None,
+                            history: None,
+                        },
+                    })
+                    .unwrap();
+            }
         }
         writer
             .write(&Record::Manifest {
@@ -2215,6 +2708,12 @@ mod tests {
                             case: "first-letter".into(),
                             localized_name: "Template".into(),
                             aliases: Vec::new(),
+                        },
+                        SiteNamespaceRecord {
+                            id: 2,
+                            case: "first-letter".into(),
+                            localized_name: "Dalībnieks".into(),
+                            aliases: vec!["User".into()],
                         },
                     ],
                     interwiki: Vec::new(),
@@ -2412,6 +2911,10 @@ mod tests {
             lines[0].style.add_modifier.contains(Modifier::REVERSED),
             "selected history row is visibly focused"
         );
+        assert!(
+            lines[0].to_string().starts_with('▶'),
+            "displayed revision has a persistent marker"
+        );
         reader.handle_key(KeyCode::Enter);
         assert!(!reader.history_focused());
         assert!(matches!(
@@ -2419,6 +2922,87 @@ mod tests {
             Source::Wiki {
                 timestamp_micros: Some(_),
                 page_id: Some(1),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn history_opens_contributor_page_and_requests_edit_list() {
+        let tmp = tempfile::tempdir().unwrap();
+        let archive_path = build_wiki_store(tmp.path());
+        let mut reader =
+            Reader::open_wiki(archive_path, Some("Alpha Article".into())).unwrap();
+
+        reader.handle_key(KeyCode::Char('h'));
+        let contributor = wikimak_wikipedia::ContributorMeta::Named {
+            username: "Ed".into(),
+            user_id: 1,
+        };
+        assert_eq!(
+            reader.handle_key(KeyCode::Char('e')),
+            KeyResult::ContributorEdits {
+                contributor: contributor.clone(),
+                label: "Ed".into(),
+            }
+        );
+        let edits = reader
+            .archive_search_index()
+            .unwrap()
+            .contributor_edits(&contributor, 10)
+            .unwrap();
+        assert_eq!(edits.match_count, 4);
+        assert_eq!(edits.hits.len(), 4);
+        reader.handle_key(KeyCode::Char('h'));
+        reader.handle_key(KeyCode::Char('u'));
+        assert!(matches!(
+            &reader.source,
+            Source::Wiki { title, .. } if title == "Dalībnieks:Ed"
+        ));
+    }
+
+    #[test]
+    fn wiki_raw_and_diff_views_use_streaming_history_cursor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let archive_path = build_wiki_store(tmp.path());
+        let mut reader =
+            Reader::open_wiki(archive_path, Some("Alpha Article".into())).unwrap();
+        assert_eq!(reader.wiki.as_ref().unwrap().revisions.len(), 2);
+        assert!(
+            reader
+                .wiki
+                .as_ref()
+                .unwrap()
+                .revisions
+                .iter()
+                .all(|revision| revision.has_text),
+            "revision summaries retain availability without retaining text"
+        );
+
+        reader.handle_key(KeyCode::Char('h'));
+        reader.handle_key(KeyCode::Char('2'));
+        assert!(
+            String::from_utf8_lossy(&reader.raw).contains("[[Beta Article]]"),
+            "raw mode preserves original link markup"
+        );
+        assert!(!reader.doc.links.is_empty(), "raw links remain navigable");
+
+        reader.handle_key(KeyCode::Char('3'));
+        let diff = String::from_utf8_lossy(&reader.raw);
+        assert!(diff.contains("--- previous"));
+        assert!(diff.contains("- Alpha old body"));
+        assert!(diff.contains("+ == Overview =="));
+
+        reader.handle_key(KeyCode::Down);
+        assert!(
+            String::from_utf8_lossy(&reader.raw)
+                .contains("(no earlier retained wikitext to compare)"),
+            "moving through history refreshes the document immediately"
+        );
+        assert!(matches!(
+            reader.source,
+            Source::Wiki {
+                timestamp_micros: Some(_),
                 ..
             }
         ));

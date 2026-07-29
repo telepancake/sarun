@@ -61,6 +61,100 @@ pub struct ArchiveSearchResults {
     pub workers: usize,
 }
 
+/// Bounded, restartable text reader for one page's newest-to-oldest revision
+/// stream. Sequential older-revision reads continue from the live zstd
+/// decoder. A small byte-bounded cache makes short backward moves cheap;
+/// neither metadata discovery nor browsing retains the page's entire text
+/// history.
+pub struct PageRevisionTextCursor {
+    path: PathBuf,
+    location: FrameLocation,
+    page_id: u64,
+    frame: crate::archive::FrameRecordCursor,
+    next_revision: usize,
+    cache: std::collections::VecDeque<(usize, std::sync::Arc<[u8]>)>,
+    cache_bytes: usize,
+    cache_limit: usize,
+}
+
+impl PageRevisionTextCursor {
+    const NEWEST_CACHE_ENTRIES: usize = 3;
+    const TRAIL_CACHE_ENTRIES: usize = 5;
+
+    fn restart(&mut self) -> crate::archive::Result<()> {
+        self.frame = crate::archive::open_frame_cursor(&self.path, &self.location)?;
+        self.next_revision = 0;
+        Ok(())
+    }
+
+    fn cached(&mut self, index: usize) -> Option<std::sync::Arc<[u8]>> {
+        let position = self.cache.iter().position(|(cached, _)| *cached == index)?;
+        let entry = self.cache.remove(position)?;
+        let text = entry.1.clone();
+        self.cache.push_back(entry);
+        Some(text)
+    }
+
+    fn remember(&mut self, index: usize, text: Vec<u8>) -> std::sync::Arc<[u8]> {
+        let text = std::sync::Arc::<[u8]>::from(text);
+        if text.len() > self.cache_limit {
+            return text;
+        }
+        let entry_limit = Self::NEWEST_CACHE_ENTRIES + Self::TRAIL_CACHE_ENTRIES;
+        while self.cache.len() >= entry_limit
+            || self.cache_bytes.saturating_add(text.len()) > self.cache_limit
+        {
+            let position = self
+                .cache
+                .iter()
+                .position(|(cached, _)| *cached >= Self::NEWEST_CACHE_ENTRIES)
+                .unwrap_or(0);
+            let Some((_, removed)) = self.cache.remove(position) else {
+                break;
+            };
+            self.cache_bytes = self.cache_bytes.saturating_sub(removed.len());
+        }
+        self.cache_bytes = self.cache_bytes.saturating_add(text.len());
+        self.cache.push_back((index, text.clone()));
+        text
+    }
+
+    pub fn text(
+        &mut self,
+        revision_index: usize,
+    ) -> crate::archive::Result<Option<std::sync::Arc<[u8]>>> {
+        if let Some(text) = self.cached(revision_index) {
+            return Ok(Some(text));
+        }
+        if revision_index < self.next_revision {
+            self.restart()?;
+        }
+        while let Some(record) = self.frame.next_record()? {
+            let Some(record_page_id) = record.page_id() else {
+                continue;
+            };
+            if record_page_id < self.page_id {
+                continue;
+            }
+            if record_page_id > self.page_id {
+                return Ok(None);
+            }
+            let Record::Revision { revision, .. } = record else {
+                continue;
+            };
+            let index = self.next_revision;
+            self.next_revision = self.next_revision.saturating_add(1);
+            let text = revision
+                .has_text
+                .then(|| self.remember(index, revision.text));
+            if index == revision_index {
+                return Ok(text);
+            }
+        }
+        Ok(None)
+    }
+}
+
 impl ArchiveBrowseIndex {
     pub fn open(
         path: impl AsRef<Path>,
@@ -379,6 +473,27 @@ impl ArchiveBrowseIndex {
         Ok(revisions)
     }
 
+    pub fn page_revision_text_cursor(
+        &self,
+        page_id: u64,
+        cache_limit: usize,
+    ) -> crate::archive::Result<Option<PageRevisionTextCursor>> {
+        let Some(location) = self.page_frame(page_id).cloned() else {
+            return Ok(None);
+        };
+        let frame = crate::archive::open_frame_cursor(&self.path, &location)?;
+        Ok(Some(PageRevisionTextCursor {
+            path: self.path.clone(),
+            location,
+            page_id,
+            frame,
+            next_revision: 0,
+            cache: std::collections::VecDeque::new(),
+            cache_bytes: 0,
+            cache_limit,
+        }))
+    }
+
     /// Search page frames directly. Work is claimed one frame at a time, so
     /// compressed-frame decoding and regex matching use all available cores.
     ///
@@ -540,6 +655,146 @@ impl ArchiveBrowseIndex {
         })
     }
 
+    /// Find edits made by one revision contributor. Page frames are
+    /// independent, so this has the same all-core scan shape as regexp
+    /// full-text search. A registered account is matched by local user id;
+    /// anonymous contributors are matched by their recorded IP.
+    pub fn contributor_edits(
+        &self,
+        contributor: &crate::ContributorMeta,
+        limit: usize,
+    ) -> crate::archive::Result<ArchiveSearchResults> {
+        let page_frames = self
+            .frames
+            .iter()
+            .take_while(|location| location.info.first_entity.kind == EntityKind::Page)
+            .collect::<Vec<_>>();
+        let workers = std::thread::available_parallelism()
+            .map_or(1, usize::from)
+            .min(page_frames.len().max(1));
+        let next = AtomicUsize::new(0);
+        let keep = limit.max(1);
+
+        let partials = std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(workers);
+            for _ in 0..workers {
+                handles.push(scope.spawn(|| -> crate::archive::Result<_> {
+                    let mut file = std::fs::File::open(&self.path)?;
+                    let mut found = Vec::new();
+                    let mut match_count = 0_u64;
+                    loop {
+                        let frame_index = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(location) = page_frames.get(frame_index) else {
+                            break;
+                        };
+                        let mut titles = std::collections::HashMap::<u64, String>::new();
+                        let mut edits = Vec::new();
+                        let mut sequence = 0_usize;
+                        visit_frame_while_file(&mut file, location, |record| {
+                            let record_sequence = sequence;
+                            sequence += 1;
+                            match record {
+                                Record::PageState {
+                                    page_id,
+                                    title,
+                                    namespace,
+                                    ..
+                                } => {
+                                    titles.entry(page_id).or_insert_with(|| {
+                                        namespace.map_or(title.clone(), |namespace| {
+                                            crate::title_index::title_in_namespace(
+                                                &title,
+                                                namespace,
+                                                &self.site_info,
+                                            )
+                                        })
+                                    });
+                                }
+                                Record::Revision { page_id, revision }
+                                    if same_contributor(
+                                        &revision.meta.contributor,
+                                        contributor,
+                                    ) =>
+                                {
+                                    match_count = match_count.saturating_add(1);
+                                    edits.push((
+                                        record_sequence,
+                                        page_id,
+                                        revision.meta.rev_id,
+                                        revision.meta.ts.timestamp_micros(),
+                                        revision.meta.comment,
+                                    ));
+                                }
+                                _ => {}
+                            }
+                            Ok(true)
+                        })?;
+                        for (record_sequence, page_id, revision_id, timestamp, comment) in edits {
+                            let Some(title) = titles.get(&page_id) else {
+                                continue;
+                            };
+                            found.push((
+                                frame_index,
+                                record_sequence,
+                                ArchiveSearchHit {
+                                    page_id,
+                                    title: title.clone(),
+                                    revision_id: Some(revision_id),
+                                    timestamp_micros: Some(timestamp),
+                                    snippet: (!comment.is_empty()).then_some(comment),
+                                },
+                            ));
+                        }
+                        if found.len() > keep {
+                            found.sort_by(|left, right| {
+                                right
+                                    .2
+                                    .timestamp_micros
+                                    .cmp(&left.2.timestamp_micros)
+                                    .then_with(|| left.0.cmp(&right.0))
+                                    .then_with(|| left.1.cmp(&right.1))
+                            });
+                            found.truncate(keep);
+                        }
+                    }
+                    Ok((found, match_count))
+                }));
+            }
+            handles
+                .into_iter()
+                .map(|handle| {
+                    handle.join().map_err(|_| {
+                        crate::archive::ArchiveError::Invalid(
+                            "contributor edit-search worker panicked",
+                        )
+                    })?
+                })
+                .collect::<crate::archive::Result<Vec<_>>>()
+        })?;
+
+        let mut hits = Vec::with_capacity(keep.saturating_mul(workers));
+        let mut match_count = 0_u64;
+        for (mut worker_hits, worker_count) in partials {
+            hits.append(&mut worker_hits);
+            match_count = match_count.saturating_add(worker_count);
+        }
+        hits.sort_by(|left, right| {
+            right
+                .2
+                .timestamp_micros
+                .cmp(&left.2.timestamp_micros)
+                .then_with(|| left.0.cmp(&right.0))
+                .then_with(|| left.1.cmp(&right.1))
+        });
+        hits.truncate(limit);
+        Ok(ArchiveSearchResults {
+            hits: hits.into_iter().map(|(_, _, hit)| hit).collect(),
+            match_count,
+            searched_frames: page_frames.len(),
+            workers,
+        })
+    }
+
     fn page_frame(&self, page_id: u64) -> Option<&FrameLocation> {
         let page_frame_count = self.frames.partition_point(|location| {
             location.info.first_entity.kind == EntityKind::Page
@@ -616,6 +871,36 @@ impl ArchiveBrowseIndex {
                 .unwrap_or_else(|| chrono::Utc::now().timestamp_micros()),
             site,
         }
+    }
+}
+
+fn same_contributor(
+    candidate: &crate::ContributorMeta,
+    wanted: &crate::ContributorMeta,
+) -> bool {
+    match (candidate, wanted) {
+        (
+            crate::ContributorMeta::Named {
+                user_id: candidate_id,
+                username: candidate_name,
+            },
+            crate::ContributorMeta::Named {
+                user_id: wanted_id,
+                username: wanted_name,
+            },
+        ) => {
+            if *wanted_id != 0 {
+                candidate_id == wanted_id
+            } else {
+                candidate_name == wanted_name
+            }
+        }
+        (
+            crate::ContributorMeta::Anonymous { ip: candidate },
+            crate::ContributorMeta::Anonymous { ip: wanted },
+        ) => candidate == wanted,
+        (crate::ContributorMeta::Hidden, crate::ContributorMeta::Hidden) => false,
+        _ => false,
     }
 }
 
@@ -809,6 +1094,22 @@ mod tests {
             Some(b"old".to_vec())
         );
         assert_eq!(index.page_text_at(7, 1).unwrap(), None);
+        let mut cursor = index
+            .page_revision_text_cursor(7, 1024)
+            .unwrap()
+            .unwrap();
+        assert_eq!(cursor.text(0).unwrap().unwrap().as_ref(), b"hello");
+        assert_eq!(
+            cursor.next_revision, 1,
+            "the live zstd cursor must not prefetch older revisions"
+        );
+        assert_eq!(cursor.text(1).unwrap().unwrap().as_ref(), b"old");
+        assert_eq!(cursor.next_revision, 2);
+        assert_eq!(cursor.text(0).unwrap().unwrap().as_ref(), b"hello");
+        assert_eq!(
+            cursor.next_revision, 2,
+            "a short newer move uses the bounded cache without restarting"
+        );
 
         let titles = index
             .search_regex(

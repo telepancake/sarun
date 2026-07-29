@@ -48,6 +48,7 @@ fn install_archive(source: &Path, destination: &Path) -> Result<(), String> {
 
     let input = std::fs::File::open(source)
         .map_err(|error| format!("{}: {error}", source.display()))?;
+    eprintln!("repacking archive with the mirror refPrefix");
     let mut archive = tempfile::NamedTempFile::new_in(parent)
         .map_err(|error| format!("{}: {error}", parent.display()))?;
     let (_, stats) = crate::archive::repack_with_ref_prefix(
@@ -65,6 +66,7 @@ fn install_archive(source: &Path, destination: &Path) -> Result<(), String> {
         .map_err(|error| format!("{}: {error}", archive.path().display()))?;
 
     let title_path = destination.with_extension("swtitle");
+    eprintln!("building title history index");
     let mut titles = tempfile::NamedTempFile::new_in(parent)
         .map_err(|error| format!("{}: {error}", parent.display()))?;
     let title_entries = crate::title_index::build(archive.path(), titles.path())
@@ -74,13 +76,14 @@ fn install_archive(source: &Path, destination: &Path) -> Result<(), String> {
         .sync_all()
         .map_err(|error| format!("{}: {error}", titles.path().display()))?;
 
+    eprintln!("installing completed archive and title index");
     archive
         .persist(destination)
         .map_err(|error| format!("{}: {}", destination.display(), error.error))?;
     titles
         .persist(&title_path)
         .map_err(|error| format!("{}: {}", title_path.display(), error.error))?;
-    println!(
+    eprintln!(
         "{} records, {} frames, {} title intervals, {}-byte refPrefix",
         stats.records, stats.output_frames, title_entries, stats.ref_prefix_bytes
     );
@@ -138,6 +141,7 @@ fn cmd_fetch(dbname: &str, archive: &str) -> Result<(), String> {
     .map_err(|error| error.to_string())?;
 
     let merged = scratch.path().join("merged.swdump");
+    eprintln!("merging current archive with the incremental content and history records");
     let inputs = vec![archive.to_path_buf(), partial];
     let output = std::fs::File::create(&merged)
         .map_err(|error| format!("{}: {error}", merged.display()))?;
@@ -149,6 +153,7 @@ fn cmd_fetch(dbname: &str, archive: &str) -> Result<(), String> {
         scratch.path(),
     )
     .map_err(|error| error.to_string())?;
+    eprintln!("record merge complete");
     install_archive(&merged, archive)
 }
 
