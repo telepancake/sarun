@@ -4103,14 +4103,11 @@ impl App {
     fn open_wiki_mirror_setup(&mut self) {
         let destination = self
             .mirror_jobs
-            .iter()
-            .find(|job| job.kind == "wiki")
-            .and_then(|job| {
-                let path = std::path::Path::new(&job.dest);
-                (path.file_name().and_then(|name| name.to_str()) == Some(job.src.as_str()))
-                    .then(|| path.parent())
-                    .flatten()
-            })
+            .get(self.sel_mirror)
+            .filter(|job| job.kind == "wiki")
+            .or_else(|| self.mirror_jobs.iter().find(|job| job.kind == "wiki"))
+            .and_then(|job| std::path::Path::new(&job.dest).parent())
+            .filter(|path| !path.as_os_str().is_empty())
             .map(|path| path.to_string_lossy().into_owned())
             .unwrap_or_default();
         self.modal = Some(Modal::WikiMirrorSetup {
@@ -23707,6 +23704,15 @@ mod tests {
                 .any(|job| job.src == "lvwiki" && job.dest == "/mirror-library/lvwiki.swdump")
         );
         assert!(app.status.contains("started 2 mirrors"), "{}", app.status);
+
+        app.open_wiki_mirror_setup();
+        assert!(matches!(
+            app.modal,
+            Some(Modal::WikiMirrorSetup {
+                ref destination,
+                ..
+            }) if destination == "/mirror-library"
+        ));
     }
 
     #[test]
