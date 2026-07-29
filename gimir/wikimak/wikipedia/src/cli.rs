@@ -656,7 +656,8 @@ fn cmd_archive_repack(args: &[&str]) -> Result<(), String> {
     let [input, output, frame_target, level, settings @ ..] = args else {
         return Err(
             "archive-repack wants <input> <output> <frame-bytes> <zstd-level> \
-             [--checksum] [--long-distance] [--window-log N] [--target-block-size N]"
+             [--dictionary-bytes N] [--checksum] [--long-distance] \
+             [--window-log N] [--target-block-size N]"
                 .into(),
         );
     };
@@ -672,9 +673,21 @@ fn cmd_archive_repack(args: &[&str]) -> Result<(), String> {
             .map_err(|error| format!("zstd level: {error}"))?,
         ..crate::archive::CompressionSettings::default()
     };
+    let mut dictionary_bytes = None;
     let mut options = settings.iter();
     while let Some(option) = options.next() {
         match *option {
+            "--dictionary-bytes" => {
+                let bytes = options
+                    .next()
+                    .ok_or("--dictionary-bytes wants an integer")?
+                    .parse::<usize>()
+                    .map_err(|error| format!("dictionary bytes: {error}"))?;
+                if bytes == 0 {
+                    return Err("dictionary bytes must be positive".into());
+                }
+                dictionary_bytes = Some(bytes);
+            }
             "--checksum" => compression.checksum = true,
             "--long-distance" => compression.long_distance_matching = true,
             "--window-log" => {
@@ -707,12 +720,21 @@ fn cmd_archive_repack(args: &[&str]) -> Result<(), String> {
         .unwrap_or_else(|| std::path::Path::new("."));
     let mut temporary =
         tempfile::NamedTempFile::new_in(parent).map_err(|error| format!("{}: {error}", parent.display()))?;
-    let (_, stats) = crate::archive::repack(
-        std::io::BufReader::new(input_file),
-        temporary.as_file_mut(),
-        frame_target,
-        compression,
-    )
+    let (_, stats) = match dictionary_bytes {
+        Some(bytes) => crate::archive::repack_with_dictionary(
+            std::io::BufReader::new(input_file),
+            temporary.as_file_mut(),
+            frame_target,
+            compression,
+            bytes,
+        ),
+        None => crate::archive::repack(
+            std::io::BufReader::new(input_file),
+            temporary.as_file_mut(),
+            frame_target,
+            compression,
+        ),
+    }
     .map_err(|error| error.to_string())?;
     temporary
         .as_file()
@@ -732,11 +754,13 @@ fn cmd_archive_repack(args: &[&str]) -> Result<(), String> {
         .len();
     println!(
         "repacked {} records, frames {} -> {}, input compressed payload {} bytes, \
-         output file {} bytes",
+         dictionary {}/{} raw/compressed bytes, output file {} bytes",
         stats.records,
         stats.input_frames,
         stats.output_frames,
         stats.input_compressed_bytes,
+        stats.dictionary_bytes,
+        stats.compressed_dictionary_bytes,
         output_bytes,
     );
     Ok(())
@@ -1155,7 +1179,7 @@ pub fn cli_main(args: &[String]) -> i32 {
                   \x20      wikimak archive-build-update <dbname> <base-dump> <file> <scratch-dir>\n\
                   \x20      wikimak archive-fetch-siteinfo <api-url> <file>\n\
                   \x20      wikimak archive-title-index <archive> <index>\n\
-                  \x20      wikimak archive-repack <input> <output> <frame-bytes> <zstd-level> [settings]\n\
+                  \x20      wikimak archive-repack <input> <output> <frame-bytes> <zstd-level> [--dictionary-bytes N] [settings]\n\
                   \x20      wikimak archive-merge <output> <frame-bytes> <zstd-level> [settings] <input>...\n\
                   \x20      wikimak archive-inspect|archive-histogram <file>".into()),
     };
