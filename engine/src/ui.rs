@@ -11176,13 +11176,17 @@ const READER_EMPTY_HINT: &str = "no document open — 'o' opens a host path (.ht
 /// Returns true when the key was consumed — false falls through to the pane
 /// accelerators / action table like any other pane. A standalone fn (not a
 /// main-loop block) so the headless tests can drive it.
-fn handle_reader_key(app: &mut App, code: crossterm::event::KeyCode) -> bool {
+fn handle_reader_key(
+    app: &mut App,
+    code: crossterm::event::KeyCode,
+    modifiers: crossterm::event::KeyModifiers,
+) -> bool {
     use crate::reader::KeyResult;
     use crossterm::event::KeyCode;
     let res = {
         let mut rd = app.reader.borrow_mut();
         match rd.as_mut() {
-            Some(r) => r.handle_key(code),
+            Some(r) => r.handle_key_with_modifiers(code, modifiers),
             // Empty pane: only the open prompt and leaving make sense.
             None => match code {
                 KeyCode::Char('o') => KeyResult::OpenPrompt,
@@ -14482,14 +14486,18 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                         // Left: revision history for the current wiki page;
                         // right: the document — the same widget 'z' zooms.
                         let history_title =
-                            format!("PAGE HISTORY · {} revisions", r.revision_count());
+                            format!("PAGE HISTORY [h] · {} revisions", r.revision_count());
+                        let history_focused = r.history_focused();
                         let p = Paragraph::new(Text::from(
                             r.page_history_lines(left.height.saturating_sub(2) as usize),
                         ))
-                        .block(block(title(&history_title, false), false));
+                        .block(block(
+                            title(&history_title, history_focused),
+                            history_focused,
+                        ));
                         f.render_widget(p, left);
                         if !skip_right {
-                            r.render(f, right, true);
+                            r.render(f, right, !history_focused);
                         }
                     }
                     None => {
@@ -17155,9 +17163,13 @@ fn pty_grid_rect(app: &App, term_cols: u16, term_rows: u16) -> Option<Rect> {
     Some(split[1])
 }
 
-/// Screen rectangle occupied by the Reader's document grid. This mirrors
-/// draw(): fullscreen uses the whole body; normal mode uses the right 55%.
-fn reader_document_rect(app: &App, term_cols: u16, term_rows: u16) -> Option<Rect> {
+/// Screen rectangles occupied by the Reader history and document. Fullscreen
+/// has no visible history rectangle.
+fn reader_rects(
+    app: &App,
+    term_cols: u16,
+    term_rows: u16,
+) -> Option<(Option<Rect>, Rect)> {
     if app.focus != Pane::Reader
         || app.reader.borrow().is_none()
         || (app.pty_in_right && !app.ptys.is_empty() && !app.reader_full)
@@ -17180,14 +17192,21 @@ fn reader_document_rect(app: &App, term_cols: u16, term_rows: u16) -> Option<Rec
             height: term_rows,
         });
     if app.reader_full {
-        Some(root[1])
+        Some((None, root[1]))
     } else {
         let columns = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
             .split(root[1]);
-        Some(columns[1])
+        Some((Some(columns[0]), columns[1]))
     }
+}
+
+fn rect_contains(rect: Rect, column: u16, row: u16) -> bool {
+    rect.x <= column
+        && column < rect.x.saturating_add(rect.width)
+        && rect.y <= row
+        && row < rect.y.saturating_add(rect.height)
 }
 
 /// crossterm mouse event → the emulator's event, grid-local. None when the
@@ -18840,7 +18859,7 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                 let pty_focused = app.focus == Pane::Pty
                     || (app.pty_in_right && app.right_focused && !app.ptys.is_empty());
                 !app.mouse_release
-                    && (reader_document_rect(&app, tc, tr).is_some()
+                    && (reader_rects(&app, tc, tr).is_some()
                         || (pty_focused
                             && pty_grid_rect(&app, tc, tr).is_some()
                             && app.cur_pty().is_some_and(|p| p.mouse_grabbed())))
@@ -18861,9 +18880,17 @@ fn run_interactive(sock: &str) -> Result<(), String> {
             let ev = event::read().map_err(|e| e.to_string())?;
             if let Event::Mouse(m) = ev {
                 let (tc, tr) = terminal::size().unwrap_or((80, 24));
-                if reader_document_rect(&app, tc, tr).is_some() {
+                if let Some((history, document)) = reader_rects(&app, tc, tr) {
                     if let Some(reader) = app.reader.borrow_mut().as_mut() {
-                        reader.handle_mouse(m.column, m.row, m.kind);
+                        if history.is_some_and(|area| rect_contains(area, m.column, m.row)) {
+                            reader.handle_history_mouse(
+                                m.row,
+                                history.expect("history rectangle was present"),
+                                m.kind,
+                            );
+                        } else if rect_contains(document, m.column, m.row) {
+                            reader.handle_mouse(m.column, m.row, m.kind);
+                        }
                     }
                     continue;
                 }
@@ -19330,7 +19357,9 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                 // headings, search, zoom) consumes first; anything it does
                 // not know falls through to the accelerators / action table
                 // below, so pane switching and 'q' still work.
-                if app.focus == Pane::Reader && handle_reader_key(&mut app, k.code) {
+                if app.focus == Pane::Reader
+                    && handle_reader_key(&mut app, k.code, k.modifiers)
+                {
                     continue;
                 }
                 // Editor pane: same shape — an open buffer's keymap (vim
@@ -23836,7 +23865,7 @@ mod tests {
     /// 'z' zooms the SAME document widget over the whole body.
     #[test]
     fn reader_pane_renders_page_history_and_zoom() {
-        use crossterm::event::KeyCode;
+        use crossterm::event::{KeyCode, KeyModifiers};
         let mut app = headless_app();
         let r = crate::reader::Reader::open_bytes(
             "guide.md".into(),
@@ -23855,7 +23884,11 @@ mod tests {
         );
         assert!(buf.contains("body text"), "document body renders:\n{buf}");
         assert!(buf.contains("guide.md"), "document title renders:\n{buf}");
-        assert!(handle_reader_key(&mut app, KeyCode::Char('z')));
+        assert!(handle_reader_key(
+            &mut app,
+            KeyCode::Char('z'),
+            KeyModifiers::NONE,
+        ));
         assert!(app.reader_full, "'z' zooms");
         let buf = render_to_string(&app, 100, 30).unwrap();
         assert!(
@@ -23863,13 +23896,21 @@ mod tests {
             "zoom drops page history:\n{buf}"
         );
         assert!(buf.contains("body text"), "zoomed document renders:\n{buf}");
-        assert!(handle_reader_key(&mut app, KeyCode::Esc));
+        assert!(handle_reader_key(
+            &mut app,
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        ));
         assert!(!app.reader_full, "Esc unwinds the zoom first");
         // j (scroll) is consumed by the reader, so it never moves a list
         // cursor; an unbound key falls through for the accelerators.
-        assert!(handle_reader_key(&mut app, KeyCode::Char('j')));
+        assert!(handle_reader_key(
+            &mut app,
+            KeyCode::Char('j'),
+            KeyModifiers::NONE,
+        ));
         assert!(
-            !handle_reader_key(&mut app, KeyCode::Char('c')),
+            !handle_reader_key(&mut app, KeyCode::Char('c'), KeyModifiers::NONE),
             "letter chips fall through to pane switching"
         );
     }
@@ -23889,7 +23930,7 @@ mod tests {
         let buf = render_to_string(&app, 100, 30).unwrap();
         assert!(buf.contains("no document open"), "empty-state hint:\n{buf}");
         assert!(
-            handle_reader_key(&mut app, KeyCode::Char('o')),
+            handle_reader_key(&mut app, KeyCode::Char('o'), KeyModifiers::NONE),
             "'o' reopens the prompt"
         );
         assert!(matches!(app.modal, Some(Modal::ReaderOpen { .. })));

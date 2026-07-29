@@ -684,6 +684,11 @@ pub struct Reader {
     future: Vec<(Source, usize)>,
     /// One archive/index instance for the entire wiki-reading session.
     wiki: Option<WikiReader>,
+    /// Which half of the split Reader has keyboard focus.
+    history_focused: bool,
+    history_selected: usize,
+    history_scroll: usize,
+    history_view_h: usize,
     /// Link rectangles from the most recently rendered terminal grid.
     screen_links: Vec<ScreenLink>,
     pub status: String,
@@ -709,8 +714,12 @@ impl Reader {
             history: Vec::new(),
             future: Vec::new(),
             wiki: None,
+            history_focused: false,
+            history_selected: 0,
+            history_scroll: 0,
+            history_view_h: 1,
             screen_links: Vec::new(),
-            status: "arrows links · click follow · [/] back/forward · j/k scroll · / page search · T title regexp · F full-text regexp · F6 select · Esc close".into(),
+            status: "arrows links · h history · [/] back/forward · j/k scroll · / page search · T title regexp · F full-text regexp · F6 select".into(),
             view_h: 20,
         })
     }
@@ -859,10 +868,25 @@ impl Reader {
                 .expect("wiki source was loaded through an open wiki session");
             wiki.page_id = page_id;
             wiki.revisions = revisions;
+            self.history_selected = match &self.source {
+                Source::Wiki {
+                    timestamp_micros: Some(timestamp),
+                    ..
+                } => wiki
+                    .revisions
+                    .iter()
+                    .position(|revision| revision.timestamp_micros <= *timestamp)
+                    .unwrap_or(0),
+                _ => 0,
+            };
+            self.history_scroll = self.history_selected;
         } else if matches!(self.source, Source::WikiSearch { .. }) {
             if let Some(wiki) = self.wiki.as_mut() {
                 wiki.revisions.clear();
             }
+            self.history_focused = false;
+            self.history_selected = 0;
+            self.history_scroll = 0;
         }
         Ok(())
     }
@@ -1005,7 +1029,7 @@ impl Reader {
     /// terminal grid. Only links actually visible on that grid participate.
     fn focus_spatial(&mut self, dx: i32, dy: i32) {
         if self.screen_links.is_empty() {
-            self.status = "no visible links".into();
+            self.spatial_edge(dx, dy);
             return;
         }
         let current = self
@@ -1046,7 +1070,7 @@ impl Reader {
             }
         };
         let Some(next) = next else {
-            self.status = "no link in that direction".into();
+            self.spatial_edge(dx, dy);
             return;
         };
         self.set_focus(next.link);
@@ -1056,6 +1080,87 @@ impl Reader {
             self.doc.links.len(),
             self.doc.links[next.link].url
         );
+    }
+
+    fn spatial_edge(&mut self, dx: i32, dy: i32) {
+        if dy < 0 && self.scroll > 0 {
+            self.scroll = self.scroll.saturating_sub(1);
+            self.status = "scrolled up".into();
+        } else if dy > 0
+            && self.scroll + self.view_h.max(1) < self.doc.lines.len()
+        {
+            self.scroll += 1;
+            self.status = "scrolled down".into();
+        } else if dx < 0 && self.wiki.as_ref().is_some_and(|wiki| !wiki.revisions.is_empty()) {
+            self.history_focused = true;
+            self.status = "page history · Up/Down select · Enter opens · Right returns".into();
+        } else {
+            self.status = "no link or content in that direction".into();
+        }
+    }
+
+    fn move_history(&mut self, amount: isize) {
+        let count = self.revision_count();
+        if count == 0 {
+            self.status = "this page has no revisions".into();
+            return;
+        }
+        self.history_selected = self
+            .history_selected
+            .saturating_add_signed(amount)
+            .min(count - 1);
+        if self.history_selected < self.history_scroll {
+            self.history_scroll = self.history_selected;
+        } else if self.history_selected >= self.history_scroll + self.history_view_h.max(1) {
+            self.history_scroll = self
+                .history_selected
+                .saturating_add(1)
+                .saturating_sub(self.history_view_h.max(1));
+        }
+        self.status = format!(
+            "revision {}/{} · Enter opens · Right returns",
+            self.history_selected + 1,
+            count
+        );
+    }
+
+    fn open_history_revision(&mut self) {
+        let Some(wiki) = self.wiki.as_ref() else {
+            return;
+        };
+        let Some(revision) = wiki.revisions.get(self.history_selected) else {
+            self.status = "no revision selected".into();
+            return;
+        };
+        let revision_timestamp = revision.timestamp_micros;
+        let revision_id = revision.revision_id;
+        let page_id = wiki.page_id;
+        let (root, title) = match &self.source {
+            Source::Wiki { root, title, .. } => (root.clone(), title.clone()),
+            _ => {
+                self.status = "history belongs to a wiki page".into();
+                return;
+            }
+        };
+        let target = Source::Wiki {
+            root,
+            title,
+            timestamp_micros: Some(revision_timestamp),
+            page_id: Some(page_id),
+        };
+        let from = (self.source.clone(), self.scroll);
+        match self.load_into(target) {
+            Ok(()) => {
+                self.history.push(from);
+                self.future.clear();
+                self.history_focused = false;
+                self.status = format!(
+                    "revision {} · Left at edge returns to page history",
+                    revision_id
+                );
+            }
+            Err(error) => self.status = error.to_string(),
+        }
     }
 
     pub fn handle_mouse(
@@ -1318,6 +1423,55 @@ impl Reader {
 
     /// Handle one key. The caller (ui.rs) has already taken the F-keys; the
     /// pane accelerators come back as `NotHandled` so pane switching works.
+    pub fn handle_key_with_modifiers(
+        &mut self,
+        code: crossterm::event::KeyCode,
+        modifiers: crossterm::event::KeyModifiers,
+    ) -> KeyResult {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let code = match code {
+            KeyCode::Char(character)
+                if self.searching && modifiers.contains(KeyModifiers::ALT) =>
+            {
+                KeyCode::Char(self.localized_alt_character(
+                    character,
+                    modifiers.contains(KeyModifiers::SHIFT),
+                ))
+            }
+            other => other,
+        };
+        self.handle_key(code)
+    }
+
+    fn localized_alt_character(&self, character: char, shifted: bool) -> char {
+        let language = self
+            .wiki
+            .as_ref()
+            .map(|wiki| wiki.archive.site_info().language.as_str());
+        if language != Some("lv") {
+            return character;
+        }
+        let mapped = match character.to_ascii_lowercase() {
+            'a' => 'ā',
+            'c' => 'č',
+            'e' => 'ē',
+            'g' => 'ģ',
+            'i' => 'ī',
+            'k' => 'ķ',
+            'l' => 'ļ',
+            'n' => 'ņ',
+            's' => 'š',
+            'u' => 'ū',
+            'z' => 'ž',
+            _ => return character,
+        };
+        if shifted || character.is_uppercase() {
+            mapped.to_uppercase().next().unwrap_or(mapped)
+        } else {
+            mapped
+        }
+    }
+
     pub fn handle_key(&mut self, code: crossterm::event::KeyCode) -> KeyResult {
         use crossterm::event::KeyCode;
         if self.searching {
@@ -1359,9 +1513,45 @@ impl Reader {
             }
             return KeyResult::Consumed;
         }
+        if self.history_focused {
+            match code {
+                KeyCode::Up | KeyCode::Char('k') => self.move_history(-1),
+                KeyCode::Down | KeyCode::Char('j') => self.move_history(1),
+                KeyCode::PageUp => self.move_history(-(self.history_view_h.max(1) as isize)),
+                KeyCode::PageDown => self.move_history(self.history_view_h.max(1) as isize),
+                KeyCode::Home | KeyCode::Char('g') => {
+                    self.history_selected = 0;
+                    self.history_scroll = 0;
+                }
+                KeyCode::End | KeyCode::Char('G') => {
+                    self.history_selected = self.revision_count().saturating_sub(1);
+                    self.move_history(0);
+                }
+                KeyCode::Enter => self.open_history_revision(),
+                KeyCode::Right | KeyCode::Char('l') | KeyCode::Tab | KeyCode::Esc => {
+                    self.history_focused = false;
+                    self.status = "document · arrows navigate links".into();
+                }
+                KeyCode::Char('z') => {
+                    self.history_focused = false;
+                    return KeyResult::ToggleFull;
+                }
+                KeyCode::Backspace | KeyCode::Char('[') => self.back(),
+                KeyCode::Char(']') => self.forward(),
+                _ => return KeyResult::NotHandled,
+            }
+            return KeyResult::Consumed;
+        }
         match code {
             KeyCode::Char('j') => self.scroll += 1,
             KeyCode::Char('k') => self.scroll = self.scroll.saturating_sub(1),
+            KeyCode::Char('h') => {
+                if self.wiki.as_ref().is_some_and(|wiki| !wiki.revisions.is_empty()) {
+                    self.history_focused = true;
+                    self.status =
+                        "page history · Up/Down select · Enter opens · Right returns".into();
+                }
+            }
             KeyCode::Left => self.focus_spatial(-1, 0),
             KeyCode::Right => self.focus_spatial(1, 0),
             KeyCode::Up => self.focus_spatial(0, -1),
@@ -1415,7 +1605,8 @@ impl Reader {
         KeyResult::Consumed
     }
 
-    pub fn page_history_lines(&self, limit: usize) -> Vec<Line<'static>> {
+    pub fn page_history_lines(&mut self, limit: usize) -> Vec<Line<'static>> {
+        self.history_view_h = limit.max(1);
         let Some(wiki) = &self.wiki else {
             return vec![Line::from(Span::styled(
                 "(page history is available for wiki pages)",
@@ -1428,10 +1619,21 @@ impl Reader {
                 Style::default().add_modifier(Modifier::DIM),
             ))];
         }
+        self.history_selected = self.history_selected.min(wiki.revisions.len() - 1);
+        self.history_scroll = self
+            .history_scroll
+            .min(wiki.revisions.len().saturating_sub(self.history_view_h));
+        if self.history_selected < self.history_scroll {
+            self.history_scroll = self.history_selected;
+        } else if self.history_selected >= self.history_scroll + self.history_view_h {
+            self.history_scroll = self.history_selected + 1 - self.history_view_h;
+        }
         wiki.revisions
             .iter()
-            .take(limit.max(1))
-            .map(|revision| {
+            .enumerate()
+            .skip(self.history_scroll)
+            .take(self.history_view_h)
+            .map(|(index, revision)| {
                 let timestamp = time::OffsetDateTime::from_unix_timestamp(
                     revision.timestamp_micros.div_euclid(1_000_000),
                 )
@@ -1462,7 +1664,7 @@ impl Reader {
                     flags.push_str(" no-text");
                 }
                 let comment = revision.comment.replace(['\r', '\n'], " ");
-                Line::from(vec![
+                let line = Line::from(vec![
                     Span::styled(
                         format!("{timestamp}  "),
                         Style::default().fg(Color::Cyan),
@@ -1480,7 +1682,12 @@ impl Reader {
                         },
                         Style::default().add_modifier(Modifier::DIM),
                     ),
-                ])
+                ]);
+                if self.history_focused && index == self.history_selected {
+                    line.style(Style::default().add_modifier(Modifier::REVERSED))
+                } else {
+                    line
+                }
             })
             .collect()
     }
@@ -1489,6 +1696,38 @@ impl Reader {
         self.wiki
             .as_ref()
             .map_or(0, |wiki| wiki.revisions.len())
+    }
+
+    pub fn history_focused(&self) -> bool {
+        self.history_focused
+    }
+
+    pub fn handle_history_mouse(
+        &mut self,
+        row: u16,
+        area: ratatui::layout::Rect,
+        kind: crossterm::event::MouseEventKind,
+    ) {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        if row <= area.y || row >= area.y.saturating_add(area.height).saturating_sub(1) {
+            return;
+        }
+        let index = self.history_scroll + usize::from(row - area.y - 1);
+        if index >= self.revision_count() {
+            return;
+        }
+        match kind {
+            MouseEventKind::Moved | MouseEventKind::Down(MouseButton::Left) => {
+                self.history_focused = true;
+                self.history_selected = index;
+                if matches!(kind, MouseEventKind::Down(MouseButton::Left)) {
+                    self.open_history_revision();
+                }
+            }
+            MouseEventKind::ScrollUp => self.move_history(-3),
+            MouseEventKind::ScrollDown => self.move_history(3),
+            _ => {}
+        }
     }
 
     /// Draw the document into `area` — the ONE widget both the right-pane
@@ -1960,7 +2199,7 @@ mod tests {
                     base: "http://reader.test/wiki/Main_Page".into(),
                     generator: "g".into(),
                     case: "first-letter".into(),
-                    language: "en".into(),
+                    language: "lv".into(),
                     rtl: false,
                     server: "http://reader.test".into(),
                     script_path: "/w".into(),
@@ -2156,5 +2395,69 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn history_pane_focuses_and_opens_selected_revision() {
+        let tmp = tempfile::tempdir().unwrap();
+        let archive_path = build_wiki_store(tmp.path());
+        let mut reader =
+            Reader::open_wiki(archive_path, Some("Alpha Article".into())).unwrap();
+
+        assert!(!reader.history_focused());
+        reader.handle_key(KeyCode::Char('h'));
+        assert!(reader.history_focused());
+        let lines = reader.page_history_lines(5);
+        assert!(
+            lines[0].style.add_modifier.contains(Modifier::REVERSED),
+            "selected history row is visibly focused"
+        );
+        reader.handle_key(KeyCode::Enter);
+        assert!(!reader.history_focused());
+        assert!(matches!(
+            reader.source,
+            Source::Wiki {
+                timestamp_micros: Some(_),
+                page_id: Some(1),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn vertical_spatial_navigation_scrolls_at_viewport_edge() {
+        let html = format!(
+            "<p><a href=\"first\">first</a></p>{}",
+            "<p>more text</p>".repeat(40)
+        );
+        let mut reader = Reader::open_bytes("long.html".into(), html.into_bytes()).unwrap();
+        frame(&mut reader, 50, 8);
+        reader.handle_key(KeyCode::Tab);
+        assert_eq!(reader.scroll, 0);
+        reader.handle_key(KeyCode::Down);
+        assert_eq!(reader.scroll, 1, "Down scrolls past the last visible link");
+    }
+
+    #[test]
+    fn latvian_alt_letters_are_preserved_in_search_input() {
+        use crossterm::event::KeyModifiers;
+        use wikimak_wikipedia::archive_browse::ArchiveSearchKind;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let archive_path = build_wiki_store(tmp.path());
+        let mut reader =
+            Reader::open_wiki(archive_path, Some("Alpha Article".into())).unwrap();
+        reader.handle_key(KeyCode::Char('T'));
+        reader.handle_key_with_modifiers(KeyCode::Char('r'), KeyModifiers::NONE);
+        reader.handle_key_with_modifiers(KeyCode::Char('i'), KeyModifiers::ALT);
+        reader.handle_key_with_modifiers(KeyCode::Char('g'), KeyModifiers::ALT);
+        reader.handle_key_with_modifiers(KeyCode::Char('a'), KeyModifiers::ALT);
+        assert_eq!(
+            reader.handle_key(KeyCode::Enter),
+            KeyResult::ArchiveSearch {
+                pattern: "rīģā".into(),
+                kind: ArchiveSearchKind::Title,
+            }
+        );
     }
 }
