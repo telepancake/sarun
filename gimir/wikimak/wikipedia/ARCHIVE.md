@@ -64,3 +64,17 @@ skippable. Revision payloads deliberately omit SHA-1.
 A clean file ends with a 64-byte `DONE` header. It contains no counts or digest:
 those would turn an independently recoverable frame prefix into an
 all-or-nothing object.
+
+## MediaWiki History user events
+
+MediaWiki History mixes page, revision, and subject-user events in source
+partition order. During reconciliation, user rows are accumulated in bounded
+64-MiB runs, sorted, and merged into
+`history-users-<snapshot>.swdump`. This immutable sidecar contains user groups
+in ID order and newest-to-oldest events within each user. It preserves every
+original TSV field (including fields unknown to the current renderer) and is
+published in the same metadata transaction through `history_user_archive`.
+
+The sidecar is not a SQLite event ledger. A full portable export appends its
+user/global groups after all page groups. Superseded snapshot sidecars are
+removed only after the new metadata transaction commits.

@@ -61,6 +61,16 @@ fn history_body_with_schema(event_type: &str, columns: usize) -> Vec<u8> {
     fields[page + 8] = "false";
     let mut encoder = BzEncoder::new(Vec::new(), Compression::default());
     writeln!(encoder, "{}", fields.join("\t")).unwrap();
+    let mut user_fields = vec![""; columns];
+    user_fields[0] = "testwiki";
+    user_fields[1] = "125";
+    user_fields[2] = "user";
+    user_fields[3] = "rename";
+    user_fields[4] = "2024-06-01 12:30:00.0";
+    user_fields[page + 13] = "44";
+    user_fields[page + 15] = "Old editor";
+    user_fields[page + 16] = "New editor";
+    writeln!(encoder, "{}", user_fields.join("\t")).unwrap();
     // Old deletion log events can retain their titles but have no page id.
     let mut orphan_page = fields.clone();
     orphan_page[1] = "124";
@@ -446,6 +456,16 @@ fn history_import_accepts_legacy_76_column_schema() {
     let stats =
         reconcile_history(&inst, &Client::new(), &cfg, "testwiki", |_, _| ()).unwrap();
     assert_eq!(stats.history_parts_fetched, 1);
+    assert_eq!(stats.user_actions, 1);
+    assert!(
+        inst.sync_state("history_user_archive")
+            .unwrap()
+            .is_some(),
+        "user events must be published outside SQLite"
+    );
+    let archive_stats =
+        wikimak_wikipedia::archive::export_instance(&inst, Vec::new(), 1024).unwrap();
+    assert_eq!(archive_stats.user_actions, 1);
     assert_eq!(inst.page_actions(1).unwrap().len(), 1);
     assert!(inst.revision_visibility(100).unwrap().unwrap().parts_are_suppressed);
 }

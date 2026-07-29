@@ -38,6 +38,7 @@ pub struct SyncStats {
     pub parts_skipped: u64,
     pub history_parts_fetched: u64,
     pub page_actions: u64,
+    pub user_actions: u64,
     pub import: ImportStats,
 }
 
@@ -303,12 +304,29 @@ fn parse_history_timestamp(value: &str) -> Option<i64> {
         .ok()
 }
 
+fn parse_history_timestamp_micros(value: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .map(|timestamp| timestamp.timestamp_micros())
+        .or_else(|_| {
+            chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f")
+                .map(|timestamp| timestamp.and_utc().timestamp_micros())
+        })
+        .ok()
+}
+
+fn history_archive_error(error: crate::archive::ArchiveError) -> crate::error::Error {
+    crate::error::Error::Mediawiki(wikimak_mediawiki::Error::Parse(format!(
+        "portable history archive: {error}"
+    )))
+}
+
 fn import_history_file<R: Read + Send + 'static>(
     tx: &rusqlite::Transaction<'_>,
     file: &HistoryFile,
     expected_dbname: &str,
     input: R,
     source_ordinal: &mut u64,
+    user_events: &mut crate::archive::HistoryEventSorter,
 ) -> Result<u64> {
     let decoder = wikimak_mediawiki::bz2::new_bz2_reader(
         input,
@@ -364,7 +382,58 @@ fn import_history_file<R: Read + Send + 'static>(
         }
         match fields[2] {
             "page" | "revision" => {}
-            "user" => continue,
+            "user" => {
+                let user = page + 13;
+                let user_id = optional_i64(
+                    file,
+                    line_number + 1,
+                    "user_id",
+                    fields[user],
+                )?;
+                if user_id.is_some_and(|id| id <= 0) {
+                    return Err(history_parse_error(
+                        file,
+                        line_number + 1,
+                        format!("has invalid user id {:?}", fields[user]),
+                    ));
+                }
+                let entity = user_id.map_or(
+                    crate::archive::EntityKey {
+                        kind: crate::archive::EntityKind::Global,
+                        id: 0,
+                    },
+                    |id| crate::archive::EntityKey {
+                        kind: crate::archive::EntityKind::User,
+                        id: id as u64,
+                    },
+                );
+                let timestamp_micros = parse_history_timestamp_micros(fields[4])
+                    .ok_or_else(|| {
+                        history_parse_error(
+                            file,
+                            line_number + 1,
+                            format!("has invalid timestamp {:?}", fields[4]),
+                        )
+                    })?;
+                user_events
+                    .push(
+                        entity,
+                        timestamp_micros,
+                        crate::archive::HistoryEventRecord {
+                            source_partition: file.partition.clone(),
+                            source_ordinal: ordinal,
+                            schema_columns: fields.len() as u16,
+                            fields: fields
+                                .iter()
+                                .map(|field| {
+                                    (!field.is_empty()).then(|| field.as_bytes().to_vec())
+                                })
+                                .collect(),
+                        },
+                    )
+                    .map_err(history_archive_error)?;
+                continue;
+            }
             other => {
                 return Err(history_parse_error(
                     file,
@@ -799,7 +868,7 @@ fn sync_page_actions(
     dbname: &str,
     reconcile_all: bool,
     progress: &mut impl FnMut(&str, bool),
-) -> Result<(u64, u64)> {
+) -> Result<(u64, u64, u64)> {
     let (snapshot, files) = discover_history(client, cfg, dbname)?;
     let previous_snapshot = inst.sync_state("history_frontier_snapshot")?;
     if previous_snapshot.as_deref().is_some_and(|previous| previous > snapshot.as_str()) {
@@ -811,13 +880,15 @@ fn sync_page_actions(
         ));
     }
     if !reconcile_all && previous_snapshot.as_deref() == Some(&snapshot) {
-        return Ok((0, 0));
+        return Ok((0, 0, 0));
     }
 
     // Every MediaWiki History release is a reconstructed snapshot, not an
     // append-only continuation of the preceding month. Old partitions can
     // change after later moves, renames, and reverts, so a new release must
     // replace the complete derived metadata set.
+    let mut user_events =
+        crate::archive::HistoryEventSorter::new_in(&inst.root).map_err(history_archive_error)?;
     let mut g = inst.inner.lock().expect("instance mutex poisoned");
     let crate::instance::InstanceInner { conn, titles, .. } = &mut *g;
     let tx = conn.transaction()?;
@@ -839,8 +910,31 @@ fn sync_page_actions(
     for file in &files {
         progress(&file.part.filename, true);
         let source = fetch(client, &file.part)?;
-        actions += import_history_file(&tx, file, dbname, source, &mut source_ordinal)?;
+        actions += import_history_file(
+            &tx,
+            file,
+            dbname,
+            source,
+            &mut source_ordinal,
+            &mut user_events,
+        )?;
     }
+    let archive_name = format!("history-users-{snapshot}.swdump");
+    let archive_path = inst.root.join(&archive_name);
+    let mut archive_temporary = tempfile::NamedTempFile::new_in(&inst.root)?;
+    let user_action_count = {
+        let (_, _, events) = user_events
+            .finish(
+                archive_temporary.as_file_mut(),
+                crate::archive::DEFAULT_FRAME_TARGET,
+            )
+            .map_err(history_archive_error)?;
+        events
+    };
+    archive_temporary.as_file().sync_all()?;
+    archive_temporary
+        .persist(&archive_path)
+        .map_err(|error| crate::error::Error::Io(error.error))?;
     let title_generation = rebuild_title_history(&inst.root, titles, &tx)?;
     let frontier = files
         .last()
@@ -851,6 +945,7 @@ fn sync_page_actions(
         ("history_frontier_snapshot", snapshot.as_str()),
         ("history_frontier_partition", frontier),
         ("history_reconciled_snapshot", snapshot.as_str()),
+        ("history_user_archive", archive_name.as_str()),
     ] {
         tx.execute(
             "INSERT OR REPLACE INTO sync_state(key, value) VALUES(?1, ?2)",
@@ -858,6 +953,18 @@ fn sync_page_actions(
         )?;
     }
     tx.commit()?;
+    for entry in std::fs::read_dir(&inst.root)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name != archive_name
+            && name.starts_with("history-users-")
+            && name.ends_with(".swdump")
+            && entry.file_type()?.is_file()
+        {
+            std::fs::remove_file(entry.path())?;
+        }
+    }
     g.title_slots =
         crate::title_slots::TitleSlotGenerations::open_selected(&inst.root, &g.conn)?;
     g.page_titles =
@@ -870,7 +977,7 @@ fn sync_page_actions(
         crate::title_slots::TitleSlotGenerations::selected(&g.conn)?,
         title_generation
     );
-    Ok((files.len() as u64, actions))
+    Ok((files.len() as u64, actions, user_action_count))
 }
 
 fn add_import(into: &mut ImportStats, s: &ImportStats) {
@@ -935,11 +1042,12 @@ pub fn reconcile_history(
     mut progress: impl FnMut(&str, bool),
 ) -> Result<SyncStats> {
     ensure_dbname(inst, dbname)?;
-    let (history_parts, page_actions) =
+    let (history_parts, page_actions, user_actions) =
         sync_page_actions(inst, client, cfg, dbname, true, &mut progress)?;
     Ok(SyncStats {
         history_parts_fetched: history_parts,
         page_actions,
+        user_actions,
         ..Default::default()
     })
 }
@@ -1168,10 +1276,11 @@ pub fn maintain(
         add_import(&mut total.import, &stats.import);
         inst.set_sync_state("incremental_date", &run.date.to_string())?;
     }
-    let (history_parts, page_actions) =
+    let (history_parts, page_actions, user_actions) =
         sync_page_actions(inst, client, cfg, dbname, false, &mut progress)?;
     total.history_parts_fetched = history_parts;
     total.page_actions = page_actions;
+    total.user_actions = user_actions;
     Ok(total)
 }
 

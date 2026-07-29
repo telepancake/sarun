@@ -6,6 +6,7 @@
 //! a depot format: it is a compact source for experiments, conversions, and
 //! recovery without depending on the current live storage layout.
 
+use std::collections::BinaryHeap;
 use std::collections::HashMap;
 use std::io::{self, BufReader, Read, Seek, SeekFrom, Take, Write};
 use std::path::Path;
@@ -27,6 +28,7 @@ const KIND_REVISION: u8 = 2;
 const KIND_PAGE_ACTION: u8 = 3;
 const KIND_HISTORY_EVENT: u8 = 4;
 const PAGE_TEXT_MEMORY_LIMIT: usize = 16 << 20;
+const HISTORY_SORT_RUN_BYTES: usize = 64 << 20;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 #[repr(u8)]
@@ -128,6 +130,199 @@ pub struct HistoryEventRecord {
     pub fields: Vec<Option<Vec<u8>>>,
 }
 
+struct PendingHistoryEvent {
+    entity: EntityKey,
+    timestamp_micros: i64,
+    event: HistoryEventRecord,
+}
+
+/// Bounded external sorter used while ingesting MediaWiki History user rows.
+/// Runs are temporary zstd streams; the final output is an ordinary archive
+/// containing user/global entity groups in canonical order.
+pub(crate) struct HistoryEventSorter {
+    temporary: tempfile::TempDir,
+    buffered: Vec<PendingHistoryEvent>,
+    buffered_bytes: usize,
+    runs: Vec<std::path::PathBuf>,
+}
+
+impl HistoryEventSorter {
+    pub(crate) fn new_in(root: &Path) -> Result<Self> {
+        Ok(Self {
+            temporary: tempfile::TempDir::new_in(root)?,
+            buffered: Vec::new(),
+            buffered_bytes: 0,
+            runs: Vec::new(),
+        })
+    }
+
+    pub(crate) fn push(
+        &mut self,
+        entity: EntityKey,
+        timestamp_micros: i64,
+        event: HistoryEventRecord,
+    ) -> Result<()> {
+        self.buffered_bytes = self.buffered_bytes.saturating_add(
+            event
+                .fields
+                .iter()
+                .filter_map(Option::as_ref)
+                .map(Vec::len)
+                .sum::<usize>()
+                .saturating_add(128),
+        );
+        self.buffered.push(PendingHistoryEvent {
+            entity,
+            timestamp_micros,
+            event,
+        });
+        if self.buffered_bytes >= HISTORY_SORT_RUN_BYTES {
+            self.flush_run()?;
+        }
+        Ok(())
+    }
+
+    fn flush_run(&mut self) -> Result<()> {
+        if self.buffered.is_empty() {
+            return Ok(());
+        }
+        self.buffered.sort_by(history_event_order);
+        let path = self
+            .temporary
+            .path()
+            .join(format!("run-{:08}.zst", self.runs.len()));
+        let file = std::fs::File::create(&path)?;
+        let mut encoder = zstd::stream::write::Encoder::new(file, 1)?;
+        for pending in self.buffered.drain(..) {
+            write_history_run_record(&mut encoder, &pending)?;
+        }
+        encoder.finish()?.sync_all()?;
+        self.runs.push(path);
+        self.buffered_bytes = 0;
+        Ok(())
+    }
+
+    pub(crate) fn finish<W: Write>(
+        mut self,
+        output: W,
+        frame_target: usize,
+    ) -> Result<(W, u64, u64)> {
+        self.flush_run()?;
+        let mut readers = self
+            .runs
+            .iter()
+            .map(|path| HistoryRunReader::open(path))
+            .collect::<Result<Vec<_>>>()?;
+        let mut heads = BinaryHeap::new();
+        for (run, reader) in readers.iter_mut().enumerate() {
+            if let Some(event) = reader.next_event()? {
+                heads.push(HistoryRunHead { run, event });
+            }
+        }
+        let mut writer = ArchiveWriter::new(output, frame_target)?;
+        let mut events = 0_u64;
+        while let Some(head) = heads.pop() {
+            writer.write(&Record::HistoryEvent {
+                entity: head.event.entity,
+                timestamp_micros: head.event.timestamp_micros,
+                event: head.event.event,
+            })?;
+            events += 1;
+            if let Some(event) = readers[head.run].next_event()? {
+                heads.push(HistoryRunHead {
+                    run: head.run,
+                    event,
+                });
+            }
+        }
+        let (output, frames) = writer.finish()?;
+        Ok((output, frames, events))
+    }
+}
+
+fn history_event_order(
+    left: &PendingHistoryEvent,
+    right: &PendingHistoryEvent,
+) -> std::cmp::Ordering {
+    left.entity
+        .cmp(&right.entity)
+        .then_with(|| right.timestamp_micros.cmp(&left.timestamp_micros))
+        .then_with(|| right.event.source_ordinal.cmp(&left.event.source_ordinal))
+}
+
+fn write_history_run_record(output: &mut impl Write, pending: &PendingHistoryEvent) -> Result<()> {
+    output.write_all(&[pending.entity.kind as u8])?;
+    output.write_all(&pending.entity.id.to_le_bytes())?;
+    output.write_all(&pending.timestamp_micros.to_le_bytes())?;
+    let payload_len = history_event_wire_len(&pending.event)?;
+    output.write_all(&payload_len.to_le_bytes())?;
+    write_history_event(output, &pending.event)
+}
+
+struct HistoryRunReader {
+    decoder: zstd::stream::read::Decoder<'static, BufReader<std::fs::File>>,
+}
+
+impl HistoryRunReader {
+    fn open(path: &Path) -> Result<Self> {
+        Ok(Self {
+            decoder: zstd::stream::read::Decoder::new(std::fs::File::open(path)?)?,
+        })
+    }
+
+    fn next_event(&mut self) -> Result<Option<PendingHistoryEvent>> {
+        let mut kind = [0_u8; 1];
+        if self.decoder.read(&mut kind)? == 0 {
+            return Ok(None);
+        }
+        let kind = EntityKind::try_from(kind[0])?;
+        let id = read_u64_from(&mut self.decoder)?;
+        let timestamp_micros = read_i64(&mut self.decoder)?;
+        let payload_len = read_u64_from(&mut self.decoder)?;
+        let payload_len = usize::try_from(payload_len).map_err(|_| ArchiveError::FieldTooLarge)?;
+        let mut payload = vec![0_u8; payload_len];
+        self.decoder.read_exact(&mut payload)?;
+        let mut payload = payload.as_slice();
+        let event = read_history_event(&mut payload)?;
+        if !payload.is_empty() {
+            return Err(ArchiveError::Invalid(
+                "history run payload has trailing bytes",
+            ));
+        }
+        Ok(Some(PendingHistoryEvent {
+            entity: EntityKey { kind, id },
+            timestamp_micros,
+            event,
+        }))
+    }
+}
+
+struct HistoryRunHead {
+    run: usize,
+    event: PendingHistoryEvent,
+}
+
+impl PartialEq for HistoryRunHead {
+    fn eq(&self, other: &Self) -> bool {
+        history_event_order(&self.event, &other.event) == std::cmp::Ordering::Equal
+            && self.run == other.run
+    }
+}
+
+impl Eq for HistoryRunHead {}
+
+impl PartialOrd for HistoryRunHead {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for HistoryRunHead {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        history_event_order(&other.event, &self.event).then_with(|| other.run.cmp(&self.run))
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Record {
     PageState {
@@ -199,6 +394,7 @@ pub struct ExportStats {
     pub pages: u64,
     pub revisions: u64,
     pub page_actions: u64,
+    pub user_actions: u64,
     pub frames: u64,
 }
 
@@ -643,6 +839,33 @@ pub fn export_instance<W: Write>(
         for page_id in page_ids {
             after = Some(page_id);
             export_page(instance, &mut writer, page_id, &mut stats)?;
+        }
+    }
+    if let Some(name) = instance.sync_state("history_user_archive")? {
+        let name_path = Path::new(&name);
+        if name_path.file_name() != Some(name_path.as_os_str()) {
+            return Err(ArchiveError::Invalid("invalid history user archive name"));
+        }
+        let path = instance.root().join(name_path);
+        let (_, frames, complete) = index_file(&path)?;
+        if !complete {
+            return Err(ArchiveError::Invalid(
+                "history user archive has no completion marker",
+            ));
+        }
+        for frame in frames {
+            visit_frame(&path, &frame, |record| match record {
+                Record::HistoryEvent { entity, .. }
+                    if matches!(entity.kind, EntityKind::User | EntityKind::Global) =>
+                {
+                    writer.write(&record)?;
+                    stats.user_actions += 1;
+                    Ok(())
+                }
+                _ => Err(ArchiveError::Invalid(
+                    "history user archive contains a non-user event",
+                )),
+            })?;
         }
     }
     let (_, frames) = writer.finish()?;
@@ -1286,6 +1509,12 @@ fn read_i64<R: Read>(input: &mut R) -> Result<i64> {
     Ok(i64::from_le_bytes(value))
 }
 
+fn read_u64_from(input: &mut impl Read) -> Result<u64> {
+    let mut value = [0_u8; 8];
+    input.read_exact(&mut value)?;
+    Ok(u64::from_le_bytes(value))
+}
+
 fn read_u32(input: &mut &[u8]) -> Result<u32> {
     let bytes = take_bytes(input, 4)?;
     Ok(u32::from_le_bytes(bytes.try_into().unwrap()))
@@ -1488,5 +1717,64 @@ mod tests {
             .unwrap();
         }
         assert_eq!(filtered, records);
+    }
+
+    #[test]
+    fn history_event_sorter_orders_user_groups_and_time() {
+        let temporary = tempfile::TempDir::new().unwrap();
+        let mut sorter = HistoryEventSorter::new_in(temporary.path()).unwrap();
+        for (user, timestamp, ordinal) in [(2, 10, 1), (1, 10, 2), (1, 20, 3)] {
+            sorter
+                .push(
+                    EntityKey {
+                        kind: EntityKind::User,
+                        id: user,
+                    },
+                    timestamp,
+                    HistoryEventRecord {
+                        source_partition: "all-time".into(),
+                        source_ordinal: ordinal,
+                        schema_columns: 1,
+                        fields: vec![Some(b"user".to_vec())],
+                    },
+                )
+                .unwrap();
+            sorter.flush_run().unwrap();
+        }
+        let (bytes, _, events) = sorter.finish(Vec::new(), 1024).unwrap();
+        assert_eq!(events, 3);
+        let mut reader = ArchiveReader::new(Cursor::new(bytes)).unwrap();
+        let mut keys = Vec::new();
+        while let Some(mut frame) = reader.next_frame().unwrap() {
+            while let Some(record) = frame.next_record().unwrap() {
+                keys.push((record.entity(), record.timestamp_micros()));
+            }
+        }
+        assert_eq!(
+            keys,
+            [
+                (
+                    EntityKey {
+                        kind: EntityKind::User,
+                        id: 1
+                    },
+                    20
+                ),
+                (
+                    EntityKey {
+                        kind: EntityKind::User,
+                        id: 1
+                    },
+                    10
+                ),
+                (
+                    EntityKey {
+                        kind: EntityKind::User,
+                        id: 2
+                    },
+                    10
+                ),
+            ]
+        );
     }
 }

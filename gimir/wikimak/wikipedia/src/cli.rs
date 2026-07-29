@@ -110,10 +110,10 @@ fn cmd_fetch(dbname: &str, root: &str, max_page_id: Option<u64>) -> Result<(), S
         |name, fetched| eprintln!("{} {}", if fetched { "fetch" } else { "skip " }, name),
     ).map_err(|e| e.to_string())?;
     println!(
-        "daily maintenance: content parts {}/{} fetched ({} skipped)  pages {}  revisions new {}  deduped {}  history parts {}  page actions {}",
+        "daily maintenance: content parts {}/{} fetched ({} skipped)  pages {}  revisions new {}  deduped {}  history parts {}  page/user actions {}/{}",
         stats.parts_fetched, stats.parts_total, stats.parts_skipped,
         stats.import.pages, stats.import.revisions_new, stats.import.revisions_deduped,
-        stats.history_parts_fetched, stats.page_actions
+        stats.history_parts_fetched, stats.page_actions, stats.user_actions
     );
     Ok(())
 }
@@ -380,8 +380,8 @@ fn cmd_reconcile_history(
         |name, fetched| eprintln!("{} {}", if fetched { "fetch" } else { "skip " }, name),
     ).map_err(|e| e.to_string())?;
     println!(
-        "MediaWiki History reconciliation: parts {}  page actions {}",
-        stats.history_parts_fetched, stats.page_actions
+        "MediaWiki History reconciliation: parts {}  page/user actions {}/{}",
+        stats.history_parts_fetched, stats.page_actions, stats.user_actions
     );
     Ok(())
 }
@@ -473,8 +473,13 @@ fn cmd_archive_export(root: &str, output: &str) -> Result<(), String> {
         .map_err(|e| format!("{output}: {e}"))?
         .len();
     println!(
-        "archive pages {}  revisions {}  page actions {}  frames {}  bytes {}",
-        stats.pages, stats.revisions, stats.page_actions, stats.frames, bytes
+        "archive pages {}  revisions {}  page actions {}  user actions {}  frames {}  bytes {}",
+        stats.pages,
+        stats.revisions,
+        stats.page_actions,
+        stats.user_actions,
+        stats.frames,
+        bytes
     );
     Ok(())
 }
