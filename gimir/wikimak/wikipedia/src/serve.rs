@@ -33,6 +33,7 @@ use wikimak_wikitext::html::escape;
 use wikimak_wikitext::{render, ModuleInvoker, PageStore, RenderOptions, RenderOutput, Title};
 
 use crate::asof::AsOfView;
+use crate::archive_browse::{ArchiveAsOfView, ArchiveBrowseIndex};
 use crate::Instance;
 
 /// Route prefix for lazily-materialized media; kept in sync with the
@@ -56,13 +57,206 @@ pub struct ServeConfig {
 type Resp = Response<std::io::Cursor<Vec<u8>>>;
 
 struct App {
-    inst: Instance,
+    source: AppSource,
     media: Arc<MediaStore>,
 }
 
+enum AppSource {
+    Depot(Instance),
+    Archive(Arc<ArchiveBrowseIndex>),
+}
+
+enum PageView<'a> {
+    Depot(AsOfView<'a>),
+    Archive(ArchiveAsOfView<'a>),
+}
+
+impl PageStore for PageView<'_> {
+    fn page_text(&self, title: &Title) -> Option<String> {
+        match self {
+            Self::Depot(view) => view.page_text(title),
+            Self::Archive(view) => view.page_text(title),
+        }
+    }
+
+    fn page_exists(&self, title: &Title) -> bool {
+        match self {
+            Self::Depot(view) => view.page_exists(title),
+            Self::Archive(view) => view.page_exists(title),
+        }
+    }
+
+    fn page_id(&self, title: &Title) -> Option<u64> {
+        match self {
+            Self::Depot(view) => view.page_id(title),
+            Self::Archive(view) => view.page_id(title),
+        }
+    }
+
+    fn page_count(&self, namespace: Option<i32>) -> Option<u64> {
+        match self {
+            Self::Depot(view) => view.page_count(namespace),
+            Self::Archive(view) => view.page_count(namespace),
+        }
+    }
+
+    fn site(&self) -> &wikimak_wikitext::SiteConfig {
+        match self {
+            Self::Depot(view) => view.site(),
+            Self::Archive(view) => view.site(),
+        }
+    }
+
+    fn timestamp_micros(&self) -> i64 {
+        match self {
+            Self::Depot(view) => view.timestamp_micros(),
+            Self::Archive(view) => view.timestamp_micros(),
+        }
+    }
+}
+
+enum ServerSource {
+    Depot(PathBuf),
+    Archive(Arc<ArchiveBrowseIndex>),
+}
+
 struct ServerApp {
-    root: PathBuf,
+    source: ServerSource,
     media: Arc<MediaStore>,
+}
+
+struct BrowseRevision {
+    meta: crate::RevisionMeta,
+    visibility: Option<BrowseVisibility>,
+}
+
+struct BrowseVisibility {
+    deleted_parts: String,
+    parts_are_suppressed: bool,
+    deleted_by_page_deletion: bool,
+    page_deletion_timestamp: String,
+}
+
+struct BrowseAction {
+    event_type: String,
+    timestamp: String,
+    comment: String,
+    actor: String,
+    historical_title: String,
+    current_title: String,
+}
+
+impl App {
+    fn view(&self, timestamp_micros: Option<i64>) -> Result<PageView<'_>, String> {
+        match &self.source {
+            AppSource::Depot(inst) => AsOfView::new(inst, timestamp_micros)
+                .map(PageView::Depot)
+                .map_err(|error| error.to_string()),
+            AppSource::Archive(archive) => {
+                Ok(PageView::Archive(archive.view(timestamp_micros)))
+            }
+        }
+    }
+
+    fn page_id_by_title(&self, title: &str, timestamp_micros: Option<i64>) -> Option<u64> {
+        match &self.source {
+            AppSource::Depot(inst) => inst
+                .page_id_by_title_at(title, timestamp_micros)
+                .ok()
+                .flatten(),
+            AppSource::Archive(archive) => archive.page_id_by_title(title),
+        }
+    }
+
+    fn page_text_at(&self, page_id: u64, timestamp_micros: Option<i64>) -> Option<Vec<u8>> {
+        match &self.source {
+            AppSource::Depot(inst) => inst
+                .page_text_at(page_id, timestamp_micros)
+                .ok()
+                .flatten(),
+            AppSource::Archive(archive) => archive
+                .page_text_at(page_id, timestamp_micros.unwrap_or(i64::MAX))
+                .ok()
+                .flatten(),
+        }
+    }
+
+    fn pages(&self, filter: Option<&str>, limit: usize) -> Vec<(u64, String)> {
+        match &self.source {
+            AppSource::Depot(inst) => inst.pages(filter, limit).unwrap_or_default(),
+            AppSource::Archive(archive) => archive.pages(filter, limit),
+        }
+    }
+
+    fn page_history(
+        &self,
+        page_id: u64,
+        timestamp_micros: Option<i64>,
+    ) -> Vec<BrowseRevision> {
+        match &self.source {
+            AppSource::Depot(inst) => {
+                let Ok(history) = inst.page_history(page_id) else {
+                    return Vec::new();
+                };
+                history
+                    .filter_map(Result::ok)
+                    .map(|entry| {
+                        let visibility = inst
+                            .revision_visibility(entry.meta.rev_id)
+                            .ok()
+                            .flatten()
+                            .map(|state| BrowseVisibility {
+                                deleted_parts: state.deleted_parts,
+                                parts_are_suppressed: state.parts_are_suppressed,
+                                deleted_by_page_deletion: state.deleted_by_page_deletion,
+                                page_deletion_timestamp: state.page_deletion_timestamp,
+                            });
+                        BrowseRevision {
+                            meta: entry.meta,
+                            visibility,
+                        }
+                    })
+                    .collect()
+            }
+            AppSource::Archive(archive) => archive
+                .revision_at(page_id, timestamp_micros.unwrap_or(i64::MAX))
+                .ok()
+                .flatten()
+                .map(|revision| BrowseRevision {
+                    meta: revision.meta,
+                    visibility: revision.visibility.map(|state| BrowseVisibility {
+                        deleted_parts: format!("mask 0x{:02x}", state.deleted_parts),
+                        parts_are_suppressed: state.parts_are_suppressed,
+                        deleted_by_page_deletion: state.deleted_by_page_deletion,
+                        page_deletion_timestamp: state
+                            .page_deletion_timestamp_micros
+                            .map(micros_to_datetime)
+                            .unwrap_or_default(),
+                    }),
+                })
+                .into_iter()
+                .collect(),
+        }
+    }
+
+    fn page_actions(&self, page_id: u64) -> Vec<BrowseAction> {
+        match &self.source {
+            AppSource::Depot(inst) => inst
+                .page_actions(page_id)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|action| BrowseAction {
+                    event_type: action.event_type,
+                    timestamp: action.timestamp,
+                    comment: action.comment,
+                    actor: action.actor,
+                    historical_title: action.historical_title,
+                    current_title: action.current_title,
+                })
+                .collect(),
+            AppSource::Archive(_) => Vec::new(),
+        }
+    }
 }
 
 /// Start the server and block, dispatching requests across the pool.
@@ -77,12 +271,30 @@ pub fn serve(inst: Instance, cfg: ServeConfig) -> Result<(), String> {
     // (inline placeholder). A prefetch driver could pass a commons chain.
     let media = MediaStore::new(cfg.media_cache, Vec::new());
     let app = Arc::new(ServerApp {
-        root: cfg.root,
+        source: ServerSource::Depot(cfg.root),
         media: Arc::new(media),
     });
 
-    eprintln!("wikimak serve: listening on http://{}", cfg.addr);
+    serve_http(server, app, &cfg.addr)
+}
 
+pub fn serve_archive(
+    archive: Arc<ArchiveBrowseIndex>,
+    addr: String,
+    media_cache: PathBuf,
+) -> Result<(), String> {
+    let server = Server::http(&addr).map_err(|e| format!("bind {addr}: {e}"))?;
+    let server = Arc::new(server);
+    let media = MediaStore::new(media_cache, Vec::new());
+    let app = Arc::new(ServerApp {
+        source: ServerSource::Archive(archive),
+        media: Arc::new(media),
+    });
+    serve_http(server, app, &addr)
+}
+
+fn serve_http(server: Arc<Server>, app: Arc<ServerApp>, addr: &str) -> Result<(), String> {
+    eprintln!("wikimak serve: listening on http://{addr}");
     let mut handles = Vec::new();
     for _ in 0..POOL_THREADS {
         let server = Arc::clone(&server);
@@ -104,12 +316,22 @@ fn handle(server: &ServerApp, req: &Request) -> Resp {
     if *req.method() != Method::Get {
         return text_resp(405, "method not allowed");
     }
-    let inst = match Instance::open_read(crate::instance::read_config(server.root.clone())) {
-        Ok(inst) => inst,
-        Err(error) => return text_resp(503, &format!("mirror temporarily unavailable: {error}")),
+    let source = match &server.source {
+        ServerSource::Depot(root) => {
+            match Instance::open_read(crate::instance::read_config(root.clone())) {
+                Ok(inst) => AppSource::Depot(inst),
+                Err(error) => {
+                    return text_resp(
+                        503,
+                        &format!("mirror temporarily unavailable: {error}"),
+                    )
+                }
+            }
+        }
+        ServerSource::Archive(archive) => AppSource::Archive(Arc::clone(archive)),
     };
     let app = App {
-        inst,
+        source,
         media: Arc::clone(&server.media),
     };
     let url = req.url();
@@ -138,20 +360,22 @@ fn handle(server: &ServerApp, req: &Request) -> Resp {
 }
 
 fn home_response(app: &App) -> Resp {
-    let main_page = app
-        .inst
-        .site_config_at(None)
-        .ok()
-        .flatten()
-        .and_then(|snapshot| {
-            snapshot
-                .get("base")
-                .and_then(|base| base.as_str())
-                .map(str::to_string)
-        })
-        .and_then(|base| base.split_once("/wiki/").map(|(_, title)| title.to_string()))
-        .map(|title| percent_decode(title.split(['?', '#']).next().unwrap_or(&title)))
-        .filter(|title| !title.is_empty());
+    let main_page = match &app.source {
+        AppSource::Depot(inst) => inst
+            .site_config_at(None)
+            .ok()
+            .flatten()
+            .and_then(|snapshot| {
+                snapshot
+                    .get("base")
+                    .and_then(|base| base.as_str())
+                    .map(str::to_string)
+            })
+            .and_then(|base| base.split_once("/wiki/").map(|(_, title)| title.to_string()))
+            .map(|title| percent_decode(title.split(['?', '#']).next().unwrap_or(&title)))
+            .filter(|title| !title.is_empty()),
+        AppSource::Archive(_) => None,
+    };
     match main_page {
         Some(title) => redirect(&format!(
             "/wiki/{}",
@@ -222,25 +446,25 @@ fn micros_to_datetime(ts: i64) -> String {
 /// folded to spaces to match import's space-form title keys (fuller
 /// normalization — first-letter case — is the documented import-time gap).
 fn resolve_page(
-    inst: &Instance,
+    app: &App,
     raw: &str,
     ts: Option<i64>,
-) -> (Option<u64>, String, Option<String>) {
+) -> (Option<u64>, String, Option<String>, Option<Vec<u8>>) {
     let original = raw.replace('_', " ").trim().to_string();
     let mut current = original.clone();
     let mut redirected_from = None;
     let mut seen = std::collections::HashSet::new();
     for _ in 0..=MAX_REDIRECT_HOPS {
-        let pid = match inst.page_id_by_title_at(&current, ts).ok().flatten() {
+        let pid = match app.page_id_by_title(&current, ts) {
             Some(id) => id,
-            None => return (None, current, redirected_from),
+            None => return (None, current, redirected_from, None),
         };
         if !seen.insert(pid) {
-            return (Some(pid), current, redirected_from);
+            return (Some(pid), current, redirected_from, None);
         }
-        let text = match inst.page_text_at(pid, ts).ok().flatten() {
+        let text = match app.page_text_at(pid, ts) {
             Some(t) => t,
-            None => return (Some(pid), current, redirected_from),
+            None => return (Some(pid), current, redirected_from, None),
         };
         match wikimak_wikitext::parse_redirect(&String::from_utf8_lossy(&text)) {
             Some(target) => {
@@ -249,27 +473,24 @@ fn resolve_page(
                 }
                 current = target.replace('_', " ").trim().to_string();
             }
-            None => return (Some(pid), current, redirected_from),
+            None => return (Some(pid), current, redirected_from, Some(text)),
         }
     }
-    (None, current, redirected_from)
+    (None, current, redirected_from, None)
 }
 
 fn page_response(app: &App, raw_title: &str, query: &HashMap<String, String>) -> Resp {
     let (ts, asof_query) = asof_from_query(query);
-    let inst: &Instance = &app.inst;
-    let view = match AsOfView::new(inst, ts) {
+    let view = match app.view(ts) {
         Ok(v) => v,
         Err(e) => return html_resp(500, &error_shell(&format!("site config: {e}"))),
     };
     let site = view.site();
 
-    let (page_id, resolved_title, redirected_from) = resolve_page(inst, raw_title, ts);
+    let (_page_id, resolved_title, redirected_from, text) = resolve_page(app, raw_title, ts);
     let title_obj = Title::parse(&resolved_title, site);
     let display = title_obj.prefixed(site);
     let page_path = format!("/wiki/{}", wikimak_wikitext::html::encode_path(&display));
-
-    let text = page_id.and_then(|pid| inst.page_text_at(pid, ts).ok().flatten());
 
     let (content, out): (String, Option<RenderOutput>) = match text {
         Some(bytes) => {
@@ -325,8 +546,7 @@ fn page_response(app: &App, raw_title: &str, query: &HashMap<String, String>) ->
 
 fn history_response(app: &App, raw_title: &str, query: &HashMap<String, String>) -> Resp {
     let (ts, asof_query) = asof_from_query(query);
-    let inst: &Instance = &app.inst;
-    let view = match AsOfView::new(inst, ts) {
+    let view = match app.view(ts) {
         Ok(v) => v,
         Err(e) => return html_resp(500, &error_shell(&format!("site config: {e}"))),
     };
@@ -335,26 +555,19 @@ fn history_response(app: &App, raw_title: &str, query: &HashMap<String, String>)
     let display = Title::parse(&key, site).prefixed(site);
     let page_path = format!("/wiki/{}", wikimak_wikitext::html::encode_path(&display));
 
-    let page_id = inst.page_id_by_title_at(&key, ts).ok().flatten();
+    let page_id = app.page_id_by_title(&key, ts);
 
     let mut rows = String::new();
     if let Some(pid) = page_id {
-        if let Ok(hist) = inst.page_history(pid) {
-            for entry in hist {
-                let e = match entry {
-                    Ok(e) => e,
-                    Err(_) => continue,
-                };
+        for e in app.page_history(pid, ts) {
                 let micros = e.meta.ts.timestamp_micros();
                 let who = match &e.meta.contributor {
                     crate::ContributorMeta::Named { username, .. } => username.clone(),
                     crate::ContributorMeta::Anonymous { ip } => ip.clone(),
                     crate::ContributorMeta::Hidden => "(hidden)".to_string(),
                 };
-                let visibility = inst
-                    .revision_visibility(e.meta.rev_id)
-                    .ok()
-                    .flatten()
+                let visibility = e
+                    .visibility
                     .map(|state| {
                         let mut notes = Vec::new();
                         if !state.deleted_parts.is_empty() {
@@ -403,7 +616,6 @@ fn history_response(app: &App, raw_title: &str, query: &HashMap<String, String>)
                     },
                     visibility = visibility,
                 ));
-            }
         }
     }
     if rows.is_empty() {
@@ -412,8 +624,7 @@ fn history_response(app: &App, raw_title: &str, query: &HashMap<String, String>)
 
     let mut actions = String::new();
     if let Some(pid) = page_id {
-        if let Ok(page_actions) = inst.page_actions(pid) {
-            for action in page_actions {
+        for action in app.page_actions(pid) {
                 let titles = match (
                     action.historical_title.is_empty(),
                     action.current_title.is_empty(),
@@ -443,7 +654,6 @@ fn history_response(app: &App, raw_title: &str, query: &HashMap<String, String>)
                         format!(" · <span class=\"comment\">{}</span>", escape(&action.comment))
                     },
                 ));
-            }
         }
     }
 
@@ -471,8 +681,7 @@ fn history_response(app: &App, raw_title: &str, query: &HashMap<String, String>)
 
 fn allpages_response(app: &App, query: &HashMap<String, String>) -> Resp {
     let (ts, asof_query) = asof_from_query(query);
-    let inst: &Instance = &app.inst;
-    let view = match AsOfView::new(inst, ts) {
+    let view = match app.view(ts) {
         Ok(v) => v,
         Err(e) => return html_resp(500, &error_shell(&format!("site config: {e}"))),
     };
@@ -480,7 +689,7 @@ fn allpages_response(app: &App, query: &HashMap<String, String>) -> Resp {
     let filter = query.get("filter").map(String::as_str).filter(|s| !s.is_empty());
 
     const PAGE_LIMIT: usize = 500;
-    let pages = inst.pages(filter, PAGE_LIMIT + 1).unwrap_or_default();
+    let pages = app.pages(filter, PAGE_LIMIT + 1);
     let truncated = pages.len() > PAGE_LIMIT;
 
     let mut rows = String::new();
@@ -740,7 +949,7 @@ fn instance_footer(
 
 fn not_found_page(app: &App, query: &HashMap<String, String>) -> Resp {
     let (ts, _asof) = asof_from_query(query);
-    let body = match AsOfView::new(&app.inst, ts) {
+    let body = match app.view(ts) {
         Ok(view) => {
             let site = view.site();
             format!(

@@ -437,6 +437,23 @@ fn cmd_serve(root: &str, addr: &str) -> Result<(), String> {
     crate::serve::serve(inst, cfg)
 }
 
+#[cfg(feature = "serve")]
+fn cmd_archive_serve(path: &str, addr: &str) -> Result<(), String> {
+    let started = std::time::Instant::now();
+    let archive = crate::archive_browse::ArchiveBrowseIndex::open(path)
+        .map_err(|error| error.to_string())?;
+    eprintln!(
+        "wikimak archive-serve: indexed {} pages, {} titles, {} frames in {:.3}s",
+        archive.page_count(),
+        archive.title_count(),
+        archive.frame_count(),
+        started.elapsed().as_secs_f64(),
+    );
+    let path = PathBuf::from(path);
+    let media_cache = path.with_extension("media");
+    crate::serve::serve_archive(std::sync::Arc::new(archive), addr.to_string(), media_cache)
+}
+
 fn cmd_history(root: &str, page: u64) -> Result<(), String> {
     let inst = open_instance(PathBuf::from(root), None)?;
     for entry in inst.page_history(page).map_err(|e| e.to_string())? {
@@ -1010,6 +1027,10 @@ pub fn cli_main(args: &[String]) -> i32 {
         ["serve", root] => cmd_serve(root, "127.0.0.1:8642"),
         #[cfg(feature = "serve")]
         ["serve", root, addr] => cmd_serve(root, addr),
+        #[cfg(feature = "serve")]
+        ["archive-serve", path] => cmd_archive_serve(path, "127.0.0.1:8642"),
+        #[cfg(feature = "serve")]
+        ["archive-serve", path, addr] => cmd_archive_serve(path, addr),
         ["head", root, page] => page.parse().map_err(|e| format!("{e}"))
             .and_then(|p| cmd_head(root, p)),
         ["text", root, page] => page.parse().map_err(|e| format!("{e}"))
@@ -1045,6 +1066,7 @@ pub fn cli_main(args: &[String]) -> i32 {
                   \x20      wikimak reconcile-history <dbname> <root> [--max-page-id N]\n\
                   \x20      wikimak import <dump.xml[.bz2]> <root> [--max-page-id N]\n\
                   \x20      wikimak serve <root> [addr]        (default 127.0.0.1:8642)\n\
+                  \x20      wikimak archive-serve <file> [addr] (default 127.0.0.1:8642)\n\
                   \x20      wikimak head|history <root> <page_id>\n\
                   \x20      wikimak text <root> <page_id> [asof-unix-micros]\n\
                   \x20      wikimak archive-export <root> <file>\n\

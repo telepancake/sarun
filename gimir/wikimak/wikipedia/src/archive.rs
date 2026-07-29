@@ -895,6 +895,17 @@ pub fn visit_frame(
     location: &FrameLocation,
     mut visitor: impl FnMut(Record) -> Result<()>,
 ) -> Result<()> {
+    visit_frame_while(path, location, |record| {
+        visitor(record)?;
+        Ok(true)
+    })
+}
+
+pub fn visit_frame_while(
+    path: impl AsRef<Path>,
+    location: &FrameLocation,
+    mut visitor: impl FnMut(Record) -> Result<bool>,
+) -> Result<()> {
     let mut file = std::fs::File::open(path)?;
     file.seek(SeekFrom::Start(location.compressed_offset))?;
     let decoder =
@@ -909,7 +920,9 @@ pub fn visit_frame(
         finished: false,
     };
     while let Some(record) = frame.next_record()? {
-        visitor(record)?;
+        if !visitor(record)? {
+            return Ok(());
+        }
     }
     Ok(())
 }

@@ -11,6 +11,8 @@
 
 pub mod asof;
 pub mod archive;
+#[cfg(feature = "serve")]
+pub mod archive_browse;
 #[cfg(feature = "fetch")]
 pub mod direct;
 #[cfg(feature = "fetch")]

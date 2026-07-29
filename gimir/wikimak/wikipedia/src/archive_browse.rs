@@ -1,0 +1,505 @@
+//! Read-only browsing directly from a portable Wikipedia archive.
+
+use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use crate::archive::{
+    index_file, visit_frame, visit_frame_while, EntityKind, FrameLocation, ManifestRecord,
+    Record, RevisionRecord,
+};
+use crate::asof::{seed_interwiki, RTL_LANGS};
+
+const NO_FRAME: u32 = u32::MAX;
+
+#[derive(Debug)]
+pub struct ArchiveBrowseIndex {
+    path: PathBuf,
+    frames: Vec<FrameLocation>,
+    page_frames: Vec<u32>,
+    titles: HashMap<String, u64>,
+    pages: Vec<(u64, String)>,
+    namespaces: BTreeMap<i32, String>,
+    manifest: Option<ManifestRecord>,
+}
+
+pub struct ArchiveAsOfView<'a> {
+    archive: &'a ArchiveBrowseIndex,
+    timestamp_micros: Option<i64>,
+    render_timestamp_micros: i64,
+    site: wikimak_wikitext::SiteConfig,
+}
+
+struct FrameScan {
+    pages: Vec<(u64, Vec<String>, HashMap<i32, u64>)>,
+}
+
+impl ArchiveBrowseIndex {
+    pub fn open(path: impl AsRef<Path>) -> crate::archive::Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        let (_, frames, complete) = index_file(&path)?;
+        if !complete {
+            return Err(crate::archive::ArchiveError::Invalid(
+                "archive has no clean completion marker",
+            ));
+        }
+        if frames.len() >= NO_FRAME as usize {
+            return Err(crate::archive::ArchiveError::Invalid(
+                "archive has too many frames",
+            ));
+        }
+
+        let mut page_frames = Vec::<u32>::new();
+        let mut titles = HashMap::<String, u64>::new();
+        let mut page_titles = BTreeMap::<u64, String>::new();
+        let mut namespace_prefixes = HashMap::<(i32, String), u64>::new();
+        let mut manifest = None;
+
+        let page_frame_numbers: Vec<usize> = frames
+            .iter()
+            .enumerate()
+            .filter_map(|(frame_number, location)| {
+                (location.info.first_entity.kind == EntityKind::Page).then_some(frame_number)
+            })
+            .collect();
+        let next_frame = AtomicUsize::new(0);
+        let worker_count = std::thread::available_parallelism()
+            .map_or(1, usize::from)
+            .min(page_frame_numbers.len().max(1));
+        let scanned = std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(worker_count);
+            for _ in 0..worker_count {
+                handles.push(scope.spawn(|| {
+                    let mut output = Vec::new();
+                    loop {
+                        let job = next_frame.fetch_add(1, Ordering::Relaxed);
+                        let Some(&frame_number) = page_frame_numbers.get(job) else {
+                            break;
+                        };
+                        output.push((
+                            frame_number,
+                            scan_page_frame(&path, &frames[frame_number])?,
+                        ));
+                    }
+                    crate::archive::Result::Ok(output)
+                }));
+            }
+            let mut output = Vec::new();
+            for handle in handles {
+                output.extend(
+                    handle
+                        .join()
+                        .map_err(|_| {
+                            crate::archive::ArchiveError::Invalid(
+                                "archive index worker panicked",
+                            )
+                        })??,
+                );
+            }
+            crate::archive::Result::Ok(output)
+        })?;
+
+        for (frame_number, scan) in scanned {
+            for (page_id, current_titles, namespace_ids) in scan.pages {
+                let slot = usize::try_from(page_id)
+                    .map_err(|_| crate::archive::ArchiveError::FieldTooLarge)?;
+                if page_frames.len() <= slot {
+                    page_frames.resize(slot + 1, NO_FRAME);
+                }
+                page_frames[slot] = frame_number as u32;
+                for current_title in &current_titles {
+                    let Some((prefix, _)) = current_title.split_once(':') else {
+                        continue;
+                    };
+                    for (&namespace, &count) in &namespace_ids {
+                        if namespace != 0 {
+                            *namespace_prefixes
+                                .entry((namespace, prefix.to_string()))
+                                .or_default() += count;
+                        }
+                    }
+                }
+                for current_title in current_titles {
+                    titles.insert(normalize_title_key(&current_title), page_id);
+                    page_titles
+                        .entry(page_id)
+                        .and_modify(|title| {
+                            if current_title < *title {
+                                *title = current_title.clone();
+                            }
+                        })
+                        .or_insert(current_title);
+                }
+            }
+        }
+        let mut namespaces = BTreeMap::<i32, (String, u64)>::new();
+        for ((namespace, prefix), count) in namespace_prefixes {
+            namespaces
+                .entry(namespace)
+                .and_modify(|(current_prefix, current_count)| {
+                    if count > *current_count
+                        || (count == *current_count && prefix < *current_prefix)
+                    {
+                        *current_prefix = prefix.clone();
+                        *current_count = count;
+                    }
+                })
+                .or_insert((prefix, count));
+        }
+
+        for location in &frames {
+            if location.info.first_entity.kind != EntityKind::Global {
+                continue;
+            }
+            visit_frame(&path, location, |record| {
+                if let Record::Manifest {
+                    manifest: record, ..
+                } = record
+                {
+                    manifest = Some(record);
+                }
+                Ok(())
+            })?;
+        }
+
+        Ok(Self {
+            path,
+            frames,
+            page_frames,
+            titles,
+            pages: page_titles.into_iter().collect(),
+            namespaces: namespaces
+                .into_iter()
+                .map(|(id, (prefix, _))| (id, prefix))
+                .collect(),
+            manifest,
+        })
+    }
+
+    pub fn page_count(&self) -> usize {
+        self.pages.len()
+    }
+
+    pub fn title_count(&self) -> usize {
+        self.titles.len()
+    }
+
+    pub fn frame_count(&self) -> usize {
+        self.frames.len()
+    }
+
+    pub fn manifest(&self) -> Option<&ManifestRecord> {
+        self.manifest.as_ref()
+    }
+
+    pub fn page_id_by_title(&self, title: &str) -> Option<u64> {
+        self.titles.get(&normalize_title_key(title)).copied()
+    }
+
+    pub fn pages(&self, filter: Option<&str>, limit: usize) -> Vec<(u64, String)> {
+        let filter = filter.map(|value| value.to_lowercase());
+        self.pages
+            .iter()
+            .filter(|(_, title)| {
+                filter
+                    .as_ref()
+                    .is_none_or(|needle| title.to_lowercase().contains(needle))
+            })
+            .take(limit)
+            .cloned()
+            .collect()
+    }
+
+    pub fn revision_at(
+        &self,
+        page_id: u64,
+        timestamp_micros: i64,
+    ) -> crate::archive::Result<Option<RevisionRecord>> {
+        let Some(frame_number) = usize::try_from(page_id)
+            .ok()
+            .and_then(|slot| self.page_frames.get(slot))
+            .copied()
+            .filter(|frame| *frame != NO_FRAME)
+            .map(|frame| frame as usize)
+        else {
+            return Ok(None);
+        };
+        let mut selected = None;
+        visit_frame_while(&self.path, &self.frames[frame_number], |record| {
+            if record.page_id() != Some(page_id) {
+                return Ok(true);
+            }
+            let Record::Revision { revision, .. } = record else {
+                return Ok(true);
+            };
+            if revision.meta.ts.timestamp_micros() > timestamp_micros {
+                return Ok(true);
+            }
+            selected = Some(revision);
+            Ok(false)
+        })?;
+        Ok(selected)
+    }
+
+    pub fn page_text_at(
+        &self,
+        page_id: u64,
+        timestamp_micros: i64,
+    ) -> crate::archive::Result<Option<Vec<u8>>> {
+        Ok(self
+            .revision_at(page_id, timestamp_micros)?
+            .and_then(|revision| revision.has_text.then_some(revision.text)))
+    }
+
+    pub fn view(&self, timestamp_micros: Option<i64>) -> ArchiveAsOfView<'_> {
+        let db_name = self
+            .manifest
+            .as_ref()
+            .map(|manifest| manifest.wiki_db.clone())
+            .unwrap_or_default();
+        let lang = db_name
+            .strip_suffix("wiki")
+            .filter(|lang| !lang.is_empty())
+            .unwrap_or(&db_name)
+            .to_string();
+        let mut site = wikimak_wikitext::SiteConfig {
+            site_name: if db_name.is_empty() {
+                "Wikipedia archive".to_string()
+            } else {
+                db_name.clone()
+            },
+            db_name,
+            lang: lang.clone(),
+            rtl: RTL_LANGS.contains(&lang.as_str()),
+            server: if lang.is_empty() {
+                String::new()
+            } else {
+                format!("https://{lang}.wikipedia.org")
+            },
+            script_path: "/w".to_string(),
+            ..wikimak_wikitext::SiteConfig::default()
+        };
+        site.interwiki = seed_interwiki()
+            .into_iter()
+            .map(|row| {
+                (
+                    row.prefix.to_lowercase(),
+                    wikimak_wikitext::InterwikiEntry {
+                        prefix: row.prefix,
+                        url: row.url,
+                        local_instance: None,
+                    },
+                )
+            })
+            .collect();
+        site.namespaces.insert(
+            0,
+            wikimak_wikitext::NamespaceInfo {
+                id: 0,
+                canonical: String::new(),
+                localized: String::new(),
+                aliases: Vec::new(),
+                case_first_letter: true,
+            },
+        );
+        for (&id, localized) in &self.namespaces {
+            site.namespaces.insert(
+                id,
+                wikimak_wikitext::NamespaceInfo {
+                    id,
+                    canonical: canonical_namespace_name(id).to_string(),
+                    localized: localized.clone(),
+                    aliases: Vec::new(),
+                    case_first_letter: true,
+                },
+            );
+        }
+        ArchiveAsOfView {
+            archive: self,
+            timestamp_micros,
+            render_timestamp_micros: timestamp_micros
+                .unwrap_or_else(|| chrono::Utc::now().timestamp_micros()),
+            site,
+        }
+    }
+}
+
+fn scan_page_frame(
+    path: &Path,
+    location: &FrameLocation,
+) -> crate::archive::Result<FrameScan> {
+    let mut pages = Vec::<(u64, Vec<String>, HashMap<i32, u64>)>::new();
+    visit_frame(path, location, |record| {
+        let page_id = record.page_id().expect("page frame contains page records");
+        if pages.last().is_none_or(|(last, _, _)| *last != page_id) {
+            pages.push((page_id, Vec::new(), HashMap::new()));
+        }
+        match record {
+            Record::PageState { current_title, .. } => {
+                pages.last_mut().expect("inserted above").1.push(current_title);
+            }
+            Record::PageAction { action, .. } => {
+                if let Some(namespace) = action
+                    .namespace_at_event
+                    .and_then(|id| i32::try_from(id).ok())
+                {
+                    *pages
+                        .last_mut()
+                        .expect("inserted above")
+                        .2
+                        .entry(namespace)
+                        .or_default() += 1;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    })?;
+    Ok(FrameScan { pages })
+}
+
+fn canonical_namespace_name(id: i32) -> &'static str {
+    match id {
+        1 => "Talk",
+        2 => "User",
+        3 => "User talk",
+        4 => "Project",
+        5 => "Project talk",
+        6 => "File",
+        7 => "File talk",
+        8 => "MediaWiki",
+        9 => "MediaWiki talk",
+        10 => "Template",
+        11 => "Template talk",
+        12 => "Help",
+        13 => "Help talk",
+        14 => "Category",
+        15 => "Category talk",
+        828 => "Module",
+        829 => "Module talk",
+        _ => "",
+    }
+}
+
+fn normalize_title_key(title: &str) -> String {
+    title.replace('_', " ").trim().to_string()
+}
+
+impl wikimak_wikitext::PageStore for ArchiveAsOfView<'_> {
+    fn page_text(&self, title: &wikimak_wikitext::Title) -> Option<String> {
+        let title = title.prefixed(&self.site);
+        let page_id = self.archive.page_id_by_title(&title)?;
+        let text = self
+            .archive
+            .page_text_at(
+                page_id,
+                self.timestamp_micros.unwrap_or(i64::MAX),
+            )
+            .ok()
+            .flatten()?;
+        Some(String::from_utf8_lossy(&text).into_owned())
+    }
+
+    fn page_exists(&self, title: &wikimak_wikitext::Title) -> bool {
+        self.archive
+            .page_id_by_title(&title.prefixed(&self.site))
+            .is_some()
+    }
+
+    fn page_id(&self, title: &wikimak_wikitext::Title) -> Option<u64> {
+        self.archive
+            .page_id_by_title(&title.prefixed(&self.site))
+    }
+
+    fn page_count(&self, namespace: Option<i32>) -> Option<u64> {
+        namespace
+            .is_none()
+            .then_some(self.archive.page_count() as u64)
+    }
+
+    fn site(&self) -> &wikimak_wikitext::SiteConfig {
+        &self.site
+    }
+
+    fn timestamp_micros(&self) -> i64 {
+        self.render_timestamp_micros
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::archive::{ArchiveWriter, Record};
+    use crate::{ContributorMeta, RevisionMeta};
+    use chrono::{TimeZone, Utc};
+
+    #[test]
+    fn indexes_titles_and_reads_one_page_from_its_frame() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("sample.swdump");
+        let mut writer = ArchiveWriter::new(std::fs::File::create(&path).unwrap(), 1).unwrap();
+        writer
+            .write(&Record::PageState {
+                page_id: 7,
+                timestamp_micros: i64::MAX,
+                current_title: "Testa lapa".into(),
+            })
+            .unwrap();
+        writer
+            .write(&Record::Revision {
+                page_id: 7,
+                revision: RevisionRecord {
+                    meta: RevisionMeta {
+                        rev_id: 11,
+                        parent_id: 0,
+                        ts: Utc.timestamp_opt(123, 0).unwrap(),
+                        contributor: ContributorMeta::Hidden,
+                        comment: String::new(),
+                        sha1: String::new(),
+                        flags: 0,
+                        text_len: 5,
+                    },
+                    has_text: true,
+                    text: b"hello".to_vec(),
+                    visibility: None,
+                    history: None,
+                },
+            })
+            .unwrap();
+        writer
+            .write(&Record::Revision {
+                page_id: 7,
+                revision: RevisionRecord {
+                    meta: RevisionMeta {
+                        rev_id: 10,
+                        parent_id: 0,
+                        ts: Utc.timestamp_opt(100, 0).unwrap(),
+                        contributor: ContributorMeta::Hidden,
+                        comment: String::new(),
+                        sha1: String::new(),
+                        flags: 0,
+                        text_len: 3,
+                    },
+                    has_text: true,
+                    text: b"old".to_vec(),
+                    visibility: None,
+                    history: None,
+                },
+            })
+            .unwrap();
+        writer.finish().unwrap();
+
+        let index = ArchiveBrowseIndex::open(&path).unwrap();
+        assert_eq!(index.page_count(), 1);
+        assert_eq!(index.page_id_by_title("Testa_lapa"), Some(7));
+        assert_eq!(
+            index.page_text_at(7, i64::MAX).unwrap(),
+            Some(b"hello".to_vec())
+        );
+        assert_eq!(
+            index.page_text_at(7, 110_000_000).unwrap(),
+            Some(b"old".to_vec())
+        );
+        assert_eq!(index.page_text_at(7, 1).unwrap(), None);
+    }
+}
