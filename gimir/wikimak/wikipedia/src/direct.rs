@@ -128,7 +128,7 @@ pub fn build_update_archive(
     progress: impl Fn(&str) + Sync,
 ) -> Result<UpdateArchiveStats> {
     let started = Instant::now();
-    let content_from = archive_content_date(base_archive.as_ref(), dbname)?;
+    let frontier = archive_frontier(base_archive.as_ref(), dbname)?;
     std::fs::create_dir_all(scratch_parent.as_ref())?;
     let scratch = tempfile::TempDir::new_in(scratch_parent)?;
     let peak = Arc::new(AtomicU64::new(0));
@@ -153,7 +153,7 @@ pub fn build_update_archive(
         client,
         config,
         dbname,
-        content_from,
+        frontier,
         output.as_ref(),
         scratch.path(),
         overlap_days,
@@ -169,9 +169,15 @@ pub fn build_update_archive(
     Ok(stats)
 }
 
-fn archive_content_date(path: &Path, dbname: &str) -> Result<chrono::NaiveDate> {
+struct ArchiveFrontier {
+    content: chrono::NaiveDate,
+    metadata: String,
+}
+
+fn archive_frontier(path: &Path, dbname: &str) -> Result<ArchiveFrontier> {
     let mut reader = ArchiveRecordReader::open(path).map_err(map_archive)?;
-    let mut date = None;
+    let mut content = None;
+    let mut metadata = None;
     while let Some(record) = reader.next_record().map_err(map_archive)? {
         if let Record::Manifest { manifest, .. } = record {
             if manifest.wiki_db != dbname {
@@ -182,10 +188,17 @@ fn archive_content_date(path: &Path, dbname: &str) -> Result<chrono::NaiveDate> 
                 "%Y-%m-%d",
             )
             .map_err(|_| Error::Corrupt("invalid archive content snapshot date"))?;
-            date = Some(date.map_or(parsed, |current: chrono::NaiveDate| current.max(parsed)));
+            content =
+                Some(content.map_or(parsed, |current: chrono::NaiveDate| current.max(parsed)));
+            metadata = Some(metadata.map_or(manifest.metadata_snapshot.clone(), |current: String| {
+                current.max(manifest.metadata_snapshot)
+            }));
         }
     }
-    date.ok_or(Error::Corrupt("base archive has no manifest"))
+    Ok(ArchiveFrontier {
+        content: content.ok_or(Error::Corrupt("base archive has no manifest"))?,
+        metadata: metadata.ok_or(Error::Corrupt("base archive has no metadata frontier"))?,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -193,7 +206,7 @@ fn build_update_inner(
     client: &Client,
     config: &wikimak_mediawiki::Config,
     dbname: &str,
-    content_from: chrono::NaiveDate,
+    frontier: ArchiveFrontier,
     output: &Path,
     scratch: &Path,
     overlap_days: u64,
@@ -201,6 +214,10 @@ fn build_update_inner(
     compression: CompressionSettings,
     progress: &(impl Fn(&str) + Sync),
 ) -> Result<UpdateArchiveStats> {
+    let content_from = frontier.content;
+    progress(&format!(
+        "discovering daily updates after {content_from} with {overlap_days} days of overlap"
+    ));
     let discovery_after = content_from
         .checked_sub_signed(chrono::Duration::days(
             i64::try_from(overlap_days.saturating_add(1))
@@ -226,6 +243,10 @@ fn build_update_inner(
         .last()
         .map(|run| run.date)
         .unwrap_or(content_from);
+    progress(&format!(
+        "{} daily update runs cover through {content_through}",
+        runs.len()
+    ));
     let cores = std::thread::available_parallelism().map_or(1, usize::from);
     let mut content_results = Vec::new();
     for run in &runs {
@@ -243,8 +264,27 @@ fn build_update_inner(
 
     let (metadata_snapshot, mut history_files) =
         crate::sync::discover_history(client, config, dbname)?;
-    if history_files.len() > 2 {
+    if metadata_snapshot < frontier.metadata {
+        return Err(Error::Mediawiki(wikimak_mediawiki::Error::Parse(
+            format!(
+                "MediaWiki History snapshot regressed from {} to {metadata_snapshot}",
+                frontier.metadata
+            ),
+        )));
+    }
+    if metadata_snapshot == frontier.metadata {
+        history_files.clear();
+        progress(&format!(
+            "MediaWiki History {metadata_snapshot} is already present"
+        ));
+    } else if history_files.len() > 2 {
         history_files = history_files.split_off(history_files.len() - 2);
+    }
+    if !history_files.is_empty() {
+        progress(&format!(
+            "ingesting {} partitions from MediaWiki History {metadata_snapshot}",
+            history_files.len()
+        ));
     }
     let history_results =
         build_history_parts(client, dbname, &history_files, scratch, cores, progress)?;
@@ -283,6 +323,7 @@ fn build_update_inner(
         .chain(history_results.iter().map(|(path, _)| path.clone()))
         .collect::<Vec<_>>();
     inputs.push(manifest_archive);
+    progress("assembling the sorted update record stream");
     let output_parent = output
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
@@ -290,12 +331,11 @@ fn build_update_inner(
     std::fs::create_dir_all(output_parent)?;
     let mut temporary = tempfile::NamedTempFile::new_in(output_parent)?;
     let (_, output_frames, output_records) =
-        crate::archive::merge_many_archives_with_compression_in(
+        crate::archive::merge_many_archives_with_compression(
             &inputs,
             temporary.as_file_mut(),
             frame_target,
             compression,
-            scratch,
         )
         .map_err(map_archive)?;
     temporary.as_file().sync_all()?;
@@ -356,12 +396,11 @@ fn build_direct_inner(
         std::fs::rename(&history_paths[0], &history_archive)?;
         frames.len() as u64
     } else {
-        let (_, frames, _) = crate::archive::merge_many_archives_with_compression_in(
+        let (_, frames, _) = crate::archive::merge_many_archives_with_compression(
             &history_paths,
             std::fs::File::create(&history_archive)?,
             DEFAULT_FRAME_TARGET,
             CompressionSettings::default(),
-            scratch,
         )
         .map_err(map_archive)?;
         for path in &history_paths {
@@ -434,12 +473,11 @@ fn build_direct_inner(
         })
         .map_err(map_archive)?;
     manifest_writer.finish().map_err(map_archive)?;
-    let (file, output_frames, _) = crate::archive::merge_many_archives_with_compression_in(
+    let (file, output_frames, _) = crate::archive::merge_many_archives_with_compression(
         &[content_archive.clone(), history_archive.clone(), manifest_archive],
         temporary,
         DEFAULT_FRAME_TARGET,
         CompressionSettings::default(),
-        scratch,
     )
     .map_err(map_archive)?;
     file.as_file().sync_all()?;

@@ -39,6 +39,129 @@ fn mirror_scratch(archive: &Path) -> PathBuf {
         .join(".wikimak-scratch")
 }
 
+fn install_sidecar(destination: &Path, suffix: &str) -> Result<PathBuf, String> {
+    let parent = destination
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut name = destination
+        .file_name()
+        .ok_or_else(|| format!("{} has no file name", destination.display()))?
+        .to_os_string();
+    name.push(suffix);
+    Ok(parent.join(name))
+}
+
+fn sync_parent(destination: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        let parent = destination
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        std::fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| format!("{}: {error}", parent.display()))?;
+    }
+    Ok(())
+}
+
+fn recover_interrupted_install(destination: &Path) -> Result<(), String> {
+    let marker = install_sidecar(destination, ".installing")?;
+    if !marker.exists() {
+        return Ok(());
+    }
+    let title = destination.with_extension("swtitle");
+    let old_archive = install_sidecar(destination, ".previous")?;
+    let old_title = install_sidecar(&title, ".previous")?;
+    match (old_archive.exists(), old_title.exists()) {
+        (true, true) => {
+            std::fs::rename(&old_archive, destination)
+                .map_err(|error| format!("{}: {error}", destination.display()))?;
+            std::fs::rename(&old_title, &title)
+                .map_err(|error| format!("{}: {error}", title.display()))?;
+        }
+        (false, false) => {}
+        (archive_backup, title_backup) => {
+            if archive_backup {
+                std::fs::remove_file(&old_archive)
+                    .map_err(|error| format!("{}: {error}", old_archive.display()))?;
+            }
+            if title_backup {
+                std::fs::remove_file(&old_title)
+                    .map_err(|error| format!("{}: {error}", old_title.display()))?;
+            }
+        }
+    }
+    std::fs::remove_file(&marker)
+        .map_err(|error| format!("{}: {error}", marker.display()))?;
+    sync_parent(destination)
+}
+
+fn persist_archive_pair(
+    archive: tempfile::NamedTempFile,
+    titles: tempfile::NamedTempFile,
+    destination: &Path,
+) -> Result<(), String> {
+    let title = destination.with_extension("swtitle");
+    if !destination.exists() && !title.exists() {
+        archive
+            .persist(destination)
+            .map_err(|error| format!("{}: {}", destination.display(), error.error))?;
+        titles
+            .persist(&title)
+            .map_err(|error| format!("{}: {}", title.display(), error.error))?;
+        return sync_parent(destination);
+    }
+    if !destination.exists() || !title.exists() {
+        return Err(format!(
+            "{} and {} must either both exist or both be absent",
+            destination.display(),
+            title.display()
+        ));
+    }
+
+    let marker = install_sidecar(destination, ".installing")?;
+    let old_archive = install_sidecar(destination, ".previous")?;
+    let old_title = install_sidecar(&title, ".previous")?;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&marker)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| format!("{}: {error}", marker.display()))?;
+    std::fs::hard_link(destination, &old_archive)
+        .map_err(|error| format!("{}: {error}", old_archive.display()))?;
+    if let Err(error) = std::fs::hard_link(&title, &old_title) {
+        let _ = std::fs::remove_file(&old_archive);
+        let _ = std::fs::remove_file(&marker);
+        return Err(format!("{}: {error}", old_title.display()));
+    }
+    sync_parent(destination)?;
+
+    let install = archive
+        .persist(destination)
+        .map_err(|error| format!("{}: {}", destination.display(), error.error))
+        .and_then(|_| {
+            titles
+                .persist(&title)
+                .map_err(|error| format!("{}: {}", title.display(), error.error))
+        })
+        .and_then(|_| sync_parent(destination));
+    if let Err(error) = install {
+        recover_interrupted_install(destination)?;
+        return Err(error);
+    }
+
+    std::fs::remove_file(&old_archive)
+        .map_err(|error| format!("{}: {error}", old_archive.display()))?;
+    std::fs::remove_file(&old_title)
+        .map_err(|error| format!("{}: {error}", old_title.display()))?;
+    std::fs::remove_file(&marker)
+        .map_err(|error| format!("{}: {error}", marker.display()))?;
+    sync_parent(destination)
+}
+
 fn install_archive(source: &Path, destination: &Path) -> Result<(), String> {
     let parent = destination
         .parent()
@@ -65,7 +188,6 @@ fn install_archive(source: &Path, destination: &Path) -> Result<(), String> {
         .sync_all()
         .map_err(|error| format!("{}: {error}", archive.path().display()))?;
 
-    let title_path = destination.with_extension("swtitle");
     eprintln!("building title history index");
     let mut titles = tempfile::NamedTempFile::new_in(parent)
         .map_err(|error| format!("{}: {error}", parent.display()))?;
@@ -77,12 +199,7 @@ fn install_archive(source: &Path, destination: &Path) -> Result<(), String> {
         .map_err(|error| format!("{}: {error}", titles.path().display()))?;
 
     eprintln!("installing completed archive and title index");
-    archive
-        .persist(destination)
-        .map_err(|error| format!("{}: {}", destination.display(), error.error))?;
-    titles
-        .persist(&title_path)
-        .map_err(|error| format!("{}: {}", title_path.display(), error.error))?;
+    persist_archive_pair(archive, titles, destination)?;
     eprintln!(
         "{} records, {} frames, {} title intervals, {}-byte refPrefix",
         stats.records, stats.output_frames, title_entries, stats.ref_prefix_bytes
@@ -96,6 +213,7 @@ fn build_full(
     archive: &Path,
     scratch_parent: &Path,
 ) -> Result<(), String> {
+    recover_interrupted_install(archive)?;
     std::fs::create_dir_all(scratch_parent)
         .map_err(|error| format!("{}: {error}", scratch_parent.display()))?;
     let scratch = tempfile::TempDir::new_in(scratch_parent)
@@ -115,6 +233,7 @@ fn build_full(
 
 fn cmd_fetch(dbname: &str, archive: &str) -> Result<(), String> {
     let archive = Path::new(archive);
+    recover_interrupted_install(archive)?;
     let scratch_parent = mirror_scratch(archive);
     let client = http_client()?;
     if !archive.exists() {
@@ -140,21 +259,41 @@ fn cmd_fetch(dbname: &str, archive: &str) -> Result<(), String> {
     )
     .map_err(|error| error.to_string())?;
 
-    let merged = scratch.path().join("merged.swdump");
-    eprintln!("merging current archive with the incremental content and history records");
+    eprintln!("streaming current archive and update records into the final archive");
     let inputs = vec![archive.to_path_buf(), partial];
-    let output = std::fs::File::create(&merged)
-        .map_err(|error| format!("{}: {error}", merged.display()))?;
-    crate::archive::merge_many_archives_with_compression_in(
+    let parent = archive
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut merged = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|error| format!("{}: {error}", parent.display()))?;
+    let (_, frames, records) = crate::archive::merge_many_archives_reusing_ref_prefix(
+        archive,
         &inputs,
-        output,
+        merged.as_file_mut(),
         MIRROR_FRAME_TARGET,
         mirror_compression(),
-        scratch.path(),
     )
     .map_err(|error| error.to_string())?;
-    eprintln!("record merge complete");
-    install_archive(&merged, archive)
+    merged
+        .as_file()
+        .sync_all()
+        .map_err(|error| format!("{}: {error}", merged.path().display()))?;
+
+    eprintln!("building title history index from the completed candidate");
+    let mut titles = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|error| format!("{}: {error}", parent.display()))?;
+    let title_entries = crate::title_index::build(merged.path(), titles.path())
+        .map_err(|error| error.to_string())?;
+    titles
+        .as_file_mut()
+        .sync_all()
+        .map_err(|error| format!("{}: {error}", titles.path().display()))?;
+
+    eprintln!("installing completed archive and title index");
+    persist_archive_pair(merged, titles, archive)?;
+    eprintln!("{records} records, {frames} frames, {title_entries} title intervals");
+    Ok(())
 }
 
 fn cmd_refresh_full(dbname: &str, archive: &str) -> Result<(), String> {
@@ -181,6 +320,9 @@ fn cmd_discover(dbname: &str) -> Result<(), String> {
 fn cmd_serve(path: &str, addr: &str) -> Result<(), String> {
     let started = std::time::Instant::now();
     let path = PathBuf::from(path);
+    if install_sidecar(&path, ".installing")?.exists() {
+        return Err("Wikipedia archive generation switch is in progress".into());
+    }
     let archive = crate::archive_browse::ArchiveBrowseIndex::open(
         &path,
         path.with_extension("swtitle"),
@@ -326,12 +468,11 @@ fn cmd_merge(args: &[&str]) -> Result<(), String> {
     let parent = output_path.parent().unwrap_or_else(|| Path::new("."));
     let mut temporary = tempfile::NamedTempFile::new_in(parent)
         .map_err(|error| format!("{}: {error}", parent.display()))?;
-    let (_, frames, records) = crate::archive::merge_many_archives_with_compression_in(
+    let (_, frames, records) = crate::archive::merge_many_archives_with_compression(
         &input_paths,
         temporary.as_file_mut(),
         frame_target,
         compression(level)?,
-        parent,
     )
     .map_err(|error| error.to_string())?;
     temporary
@@ -397,5 +538,68 @@ pub fn cli_main(args: &[String]) -> i32 {
             eprintln!("wikimak: {error}");
             1
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    use super::*;
+
+    fn candidate(parent: &Path, bytes: &[u8]) -> tempfile::NamedTempFile {
+        let mut file = tempfile::NamedTempFile::new_in(parent).unwrap();
+        file.write_all(bytes).unwrap();
+        file.as_file().sync_all().unwrap();
+        file
+    }
+
+    #[test]
+    fn archive_pair_install_replaces_both_completed_files() {
+        let temporary = tempfile::tempdir().unwrap();
+        let archive = temporary.path().join("wiki.swdump");
+        let titles = archive.with_extension("swtitle");
+        std::fs::write(&archive, b"old archive").unwrap();
+        std::fs::write(&titles, b"old titles").unwrap();
+
+        persist_archive_pair(
+            candidate(temporary.path(), b"new archive"),
+            candidate(temporary.path(), b"new titles"),
+            &archive,
+        )
+        .unwrap();
+
+        assert_eq!(std::fs::read(&archive).unwrap(), b"new archive");
+        assert_eq!(std::fs::read(&titles).unwrap(), b"new titles");
+        assert!(!install_sidecar(&archive, ".installing").unwrap().exists());
+        assert!(!install_sidecar(&archive, ".previous").unwrap().exists());
+        assert!(!install_sidecar(&titles, ".previous").unwrap().exists());
+    }
+
+    #[test]
+    fn interrupted_pair_install_rolls_back_one_generation() {
+        let temporary = tempfile::tempdir().unwrap();
+        let archive = temporary.path().join("wiki.swdump");
+        let titles = archive.with_extension("swtitle");
+        std::fs::write(&archive, b"old archive").unwrap();
+        std::fs::write(&titles, b"old titles").unwrap();
+        let marker = install_sidecar(&archive, ".installing").unwrap();
+        let old_archive = install_sidecar(&archive, ".previous").unwrap();
+        let old_titles = install_sidecar(&titles, ".previous").unwrap();
+        std::fs::write(&marker, b"").unwrap();
+        std::fs::hard_link(&archive, &old_archive).unwrap();
+        std::fs::hard_link(&titles, &old_titles).unwrap();
+        candidate(temporary.path(), b"new archive")
+            .persist(&archive)
+            .unwrap();
+        candidate(temporary.path(), b"new titles")
+            .persist(&titles)
+            .unwrap();
+
+        recover_interrupted_install(&archive).unwrap();
+
+        assert_eq!(std::fs::read(&archive).unwrap(), b"old archive");
+        assert_eq!(std::fs::read(&titles).unwrap(), b"old titles");
+        assert!(!marker.exists());
     }
 }

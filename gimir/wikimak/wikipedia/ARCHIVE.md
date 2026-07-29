@@ -2,8 +2,8 @@
 
 This is the Wikipedia mirror storage format. The `.swdump` contains the
 portable event stream and any embedded compression reference. A generated
-`.swtitle` beside it provides title-and-time lookup; it can be rebuilt solely
-from the archive.
+`.swtitle` beside it provides title-and-time lookup and the frame-range
+directory; it can be rebuilt solely from the archive.
 
 - Entity groups are ordered by kind (`page`, then `user`, then `global`) and
   then by entity ID.
@@ -82,6 +82,17 @@ writer raises zstd's window to the next power of two above the prefix size so
 the prefix is not silently truncated to the compression level's default
 window.
 
+The generated `.swtitle` file has one small header followed by two fixed-width,
+sorted arrays. The first contains 16-byte `(coded title, time, page ID)`
+entries. The second contains 64-byte archive frame-directory entries: entity
+kind and ID range, compressed offset, record and byte counts, and dictionary
+ID. Both arrays are memory-mapped directly. Opening a mirror reads the archive
+header and compression reference, checks the final indexed frame against the
+`DONE` marker, locates the global site-information frames by binary search,
+and does not scan either array or the archive's frame headers. Page lookup
+binary-searches the mapped frame ranges and constructs only the selected
+frame location.
+
 `wikimak repack` decodes records
 in order and writes the same records using the requested compressed frame-size
 target, zstd level, checksum, long-distance matching, window log, and target
@@ -92,7 +103,8 @@ and embeds an `N`-byte raw prefix.
 
 `wikimak merge` performs a canonical set union over any number of
 archives and writes it through the same configurable compressor and framing
-code as `repack`. Records are externally sorted in bounded memory.
+code as `repack`. Archive inputs are already sorted by format, so merge is a
+bounded k-way stream merge and does not spill or re-sort them.
 Equal revision IDs are joined field by field; repeated actions are identified
 from their typed event content rather than their source-row ordinal. Exact
 records occur once. Consequently input order, grouping, and repetition do not
@@ -103,9 +115,13 @@ existing one. Updating reads the logical content date from the archive,
 fetches daily incremental content with three days of overlap, merges it, and
 regenerates the title index. For partitioned MediaWiki History releases it
 includes the newest completed partition and current partial partition; an
-all-time wiki necessarily contributes its one all-time file. `refresh-full`
-is the explicit operator request to download the current full snapshot and
-all History partitions again; it is never scheduled automatically.
+all-time wiki necessarily contributes its one all-time file. A History release
+already represented in the archive is not fetched again. The update stream is
+merged directly into final compression using the archive's existing refPrefix.
+The completed dump and regenerated title index retain the previous pair as a
+rollback generation until their durable switch finishes. `refresh-full` is the
+explicit operator request to download the current full snapshot and all
+History partitions again; it is never scheduled automatically.
 
 ## Normalized metadata
 

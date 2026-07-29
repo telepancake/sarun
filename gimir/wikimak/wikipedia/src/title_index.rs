@@ -1,4 +1,4 @@
-//! Immutable `(title, time) -> page_id` index generated from an archive.
+//! Immutable title-history and frame-range indexes generated from an archive.
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -6,7 +6,11 @@ use std::path::Path;
 
 use crate::archive::{ArchiveRecordReader, PageActionKind, Record, SiteInfoRecord};
 
+const FILE_MAGIC: [u8; 8] = *b"SWTITLE\0";
+const FILE_VERSION: u32 = 1;
+const HEADER_BYTES: usize = 48;
 const ENTRY_BYTES: usize = 16;
+const FRAME_ENTRY_BYTES: usize = 64;
 
 #[derive(Clone)]
 struct Interval {
@@ -25,12 +29,28 @@ struct Projection {
 #[derive(Debug)]
 pub struct TitleIndex {
     bytes: memmap2::Mmap,
+    title_offset: usize,
+    title_count: usize,
+    frame_offset: usize,
+    frame_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct FrameIndexEntry {
+    pub(crate) info: crate::archive::FrameInfo,
+    pub(crate) compressed_offset: u64,
 }
 
 pub fn build(
     archive: impl AsRef<Path>,
     output: impl AsRef<Path>,
 ) -> crate::archive::Result<u64> {
+    let (_, frames, complete) = crate::archive::index_file(archive.as_ref())?;
+    if !complete {
+        return Err(crate::archive::ArchiveError::Invalid(
+            "archive has no clean completion marker",
+        ));
+    }
     let mut reader = ArchiveRecordReader::open(archive)?;
     let mut site_info = None;
     let mut pages = BTreeMap::<
@@ -134,10 +154,42 @@ pub fn build(
         .filter(|path| !path.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    let title_count =
+        u64::try_from(changes.len()).map_err(|_| crate::archive::ArchiveError::FieldTooLarge)?;
+    let frame_count =
+        u64::try_from(frames.len()).map_err(|_| crate::archive::ArchiveError::FieldTooLarge)?;
+    let frame_offset = HEADER_BYTES
+        .checked_add(
+            changes
+                .len()
+                .checked_mul(ENTRY_BYTES)
+                .ok_or(crate::archive::ArchiveError::FieldTooLarge)?,
+        )
+        .ok_or(crate::archive::ArchiveError::FieldTooLarge)?;
+    temporary.write_all(&FILE_MAGIC)?;
+    temporary.write_all(&FILE_VERSION.to_le_bytes())?;
+    temporary.write_all(&(HEADER_BYTES as u32).to_le_bytes())?;
+    temporary.write_all(&title_count.to_le_bytes())?;
+    temporary.write_all(&frame_count.to_le_bytes())?;
+    temporary.write_all(&(HEADER_BYTES as u64).to_le_bytes())?;
+    temporary.write_all(&(frame_offset as u64).to_le_bytes())?;
     for ((title, time), page_id) in &changes {
         temporary.write_all(&title.to_le_bytes())?;
         temporary.write_all(&time.to_le_bytes())?;
         temporary.write_all(&page_id.to_le_bytes())?;
+    }
+    for frame in &frames {
+        temporary.write_all(&[frame.info.first_entity.kind as u8])?;
+        temporary.write_all(&[frame.info.last_entity.kind as u8])?;
+        temporary.write_all(&[0; 6])?;
+        temporary.write_all(&frame.info.first_entity.id.to_le_bytes())?;
+        temporary.write_all(&frame.info.last_entity.id.to_le_bytes())?;
+        temporary.write_all(&frame.compressed_offset.to_le_bytes())?;
+        temporary.write_all(&frame.info.records.to_le_bytes())?;
+        temporary.write_all(&frame.info.raw_bytes.to_le_bytes())?;
+        temporary.write_all(&frame.info.compressed_bytes.to_le_bytes())?;
+        temporary.write_all(&frame.info.dictionary_id.unwrap_or(0).to_le_bytes())?;
+        temporary.write_all(&[0; 4])?;
     }
     temporary.as_file_mut().sync_all()?;
     temporary
@@ -154,22 +206,68 @@ pub fn build(
 impl TitleIndex {
     pub fn open(path: impl AsRef<Path>) -> crate::archive::Result<Self> {
         let file = std::fs::File::open(path)?;
-        if file.metadata()?.len() % ENTRY_BYTES as u64 != 0 {
+        if file.metadata()?.len() < HEADER_BYTES as u64 {
             return Err(crate::archive::ArchiveError::Invalid(
-                "title index has a partial record",
+                "title index has no complete header",
             ));
         }
         // The mapping is read-only and remains valid for the lifetime of `file`.
         let bytes = unsafe { memmap2::MmapOptions::new().map(&file)? };
-        let index = Self { bytes };
-        for position in 1..index.len() {
-            if index.key_time(position - 1) >= index.key_time(position) {
-                return Err(crate::archive::ArchiveError::Invalid(
-                    "title index is not strictly sorted",
-                ));
-            }
+        if bytes[..8] != FILE_MAGIC
+            || u32::from_le_bytes(bytes[8..12].try_into().expect("version bytes"))
+                != FILE_VERSION
+            || u32::from_le_bytes(bytes[12..16].try_into().expect("header bytes")) as usize
+                != HEADER_BYTES
+        {
+            return Err(crate::archive::ArchiveError::Invalid(
+                "unknown title index format",
+            ));
         }
-        Ok(index)
+        let title_count = usize::try_from(u64::from_le_bytes(
+            bytes[16..24].try_into().expect("title count bytes"),
+        ))
+        .map_err(|_| crate::archive::ArchiveError::FieldTooLarge)?;
+        let frame_count = usize::try_from(u64::from_le_bytes(
+            bytes[24..32].try_into().expect("frame count bytes"),
+        ))
+        .map_err(|_| crate::archive::ArchiveError::FieldTooLarge)?;
+        let title_offset = usize::try_from(u64::from_le_bytes(
+            bytes[32..40].try_into().expect("title offset bytes"),
+        ))
+        .map_err(|_| crate::archive::ArchiveError::FieldTooLarge)?;
+        let frame_offset = usize::try_from(u64::from_le_bytes(
+            bytes[40..48].try_into().expect("frame offset bytes"),
+        ))
+        .map_err(|_| crate::archive::ArchiveError::FieldTooLarge)?;
+        let expected_frame_offset = title_offset
+            .checked_add(
+                title_count
+                    .checked_mul(ENTRY_BYTES)
+                    .ok_or(crate::archive::ArchiveError::FieldTooLarge)?,
+            )
+            .ok_or(crate::archive::ArchiveError::FieldTooLarge)?;
+        let expected_len = frame_offset
+            .checked_add(
+                frame_count
+                    .checked_mul(FRAME_ENTRY_BYTES)
+                    .ok_or(crate::archive::ArchiveError::FieldTooLarge)?,
+            )
+            .ok_or(crate::archive::ArchiveError::FieldTooLarge)?;
+        if title_offset != HEADER_BYTES
+            || frame_offset != expected_frame_offset
+            || bytes.len() != expected_len
+        {
+            return Err(crate::archive::ArchiveError::Invalid(
+                "title index arrays have invalid bounds",
+            ));
+        }
+        Ok(Self {
+            bytes,
+            title_offset,
+            title_count,
+            frame_offset,
+            frame_count,
+        })
     }
 
     pub fn lookup(
@@ -196,12 +294,63 @@ impl TitleIndex {
         self.len() as u64
     }
 
+    pub(crate) fn frame_count(&self) -> usize {
+        self.frame_count
+    }
+
+    pub(crate) fn frame(&self, position: usize) -> crate::archive::Result<FrameIndexEntry> {
+        let start = self
+            .frame_offset
+            .checked_add(
+                position
+                    .checked_mul(FRAME_ENTRY_BYTES)
+                    .ok_or(crate::archive::ArchiveError::FieldTooLarge)?,
+            )
+            .ok_or(crate::archive::ArchiveError::FieldTooLarge)?;
+        let entry = self
+            .bytes
+            .get(start..start + FRAME_ENTRY_BYTES)
+            .ok_or(crate::archive::ArchiveError::Invalid(
+                "frame index position is out of bounds",
+            ))?;
+        let first_kind = crate::archive::EntityKind::try_from(entry[0])?;
+        let last_kind = crate::archive::EntityKind::try_from(entry[1])?;
+        let dictionary_id =
+            u32::from_le_bytes(entry[56..60].try_into().expect("dictionary id bytes"));
+        Ok(FrameIndexEntry {
+            info: crate::archive::FrameInfo {
+                first_entity: crate::archive::EntityKey {
+                    kind: first_kind,
+                    id: u64::from_le_bytes(entry[8..16].try_into().expect("first id bytes")),
+                },
+                last_entity: crate::archive::EntityKey {
+                    kind: last_kind,
+                    id: u64::from_le_bytes(entry[16..24].try_into().expect("last id bytes")),
+                },
+                records: u64::from_le_bytes(
+                    entry[32..40].try_into().expect("record count bytes"),
+                ),
+                raw_bytes: u64::from_le_bytes(
+                    entry[40..48].try_into().expect("raw byte bytes"),
+                ),
+                compressed_bytes: u64::from_le_bytes(
+                    entry[48..56].try_into().expect("compressed byte bytes"),
+                ),
+                dictionary_id: (dictionary_id != 0).then_some(dictionary_id),
+            },
+            compressed_offset: u64::from_le_bytes(
+                entry[24..32].try_into().expect("compressed offset bytes"),
+            ),
+        })
+    }
+
     fn len(&self) -> usize {
-        self.bytes.len() / ENTRY_BYTES
+        self.title_count
     }
 
     fn key_time(&self, position: usize) -> (u64, u32) {
-        let entry = &self.bytes[position * ENTRY_BYTES..(position + 1) * ENTRY_BYTES];
+        let start = self.title_offset + position * ENTRY_BYTES;
+        let entry = &self.bytes[start..start + ENTRY_BYTES];
         (
             u64::from_le_bytes(entry[..8].try_into().expect("eight title bytes")),
             u32::from_le_bytes(entry[8..12].try_into().expect("four time bytes")),
@@ -209,7 +358,8 @@ impl TitleIndex {
     }
 
     fn page_id(&self, position: usize) -> u32 {
-        let entry = &self.bytes[position * ENTRY_BYTES..(position + 1) * ENTRY_BYTES];
+        let start = self.title_offset + position * ENTRY_BYTES;
+        let entry = &self.bytes[start..start + ENTRY_BYTES];
         u32::from_le_bytes(entry[12..].try_into().expect("four page-id bytes"))
     }
 

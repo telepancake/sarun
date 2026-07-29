@@ -1,18 +1,18 @@
 //! Read-only browsing directly from a portable Wikipedia archive.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::archive::{
-    index_file, visit_frame, visit_frame_while, visit_frame_while_file, EntityKind, FrameLocation,
-    ManifestRecord, Record, RevisionRecord, SiteInfoRecord,
+    visit_frame_while_file, EntityKind, FrameLocation, IndexedArchive, ManifestRecord, Record,
+    RevisionRecord, SiteInfoRecord,
 };
 
 #[derive(Debug)]
 pub struct ArchiveBrowseIndex {
-    path: PathBuf,
-    frames: Vec<FrameLocation>,
+    file: std::fs::File,
     titles: crate::title_index::TitleIndex,
+    indexed: IndexedArchive,
     site_info: SiteInfoRecord,
     manifest: Option<ManifestRecord>,
 }
@@ -67,7 +67,7 @@ pub struct ArchiveSearchResults {
 /// neither metadata discovery nor browsing retains the page's entire text
 /// history.
 pub struct PageRevisionTextCursor {
-    path: PathBuf,
+    file: std::fs::File,
     location: FrameLocation,
     page_id: u64,
     frame: crate::archive::FrameRecordCursor,
@@ -82,7 +82,7 @@ impl PageRevisionTextCursor {
     const TRAIL_CACHE_ENTRIES: usize = 5;
 
     fn restart(&mut self) -> crate::archive::Result<()> {
-        self.frame = crate::archive::open_frame_cursor(&self.path, &self.location)?;
+        self.frame = crate::archive::open_frame_cursor_file(&self.file, &self.location)?;
         self.next_revision = 0;
         Ok(())
     }
@@ -160,21 +160,34 @@ impl ArchiveBrowseIndex {
         path: impl AsRef<Path>,
         title_index: impl AsRef<Path>,
     ) -> crate::archive::Result<Self> {
-        let path = path.as_ref().to_path_buf();
-        let (_, frames, complete) = index_file(&path)?;
-        if !complete {
-            return Err(crate::archive::ArchiveError::Invalid(
-                "archive has no clean completion marker",
-            ));
-        }
+        let file = std::fs::File::open(path)?;
         let titles = crate::title_index::TitleIndex::open(title_index)?;
+        let frame_count = titles.frame_count();
+        let last = frame_count
+            .checked_sub(1)
+            .ok_or(crate::archive::ArchiveError::Invalid(
+                "title index contains no archive frames",
+            ))?;
+        let indexed = IndexedArchive::open(&file, titles.frame(last)?)?;
         let mut manifest = None;
         let mut site_info = None;
-        for location in &frames {
+        let mut left = 0;
+        let mut right = frame_count;
+        while left < right {
+            let middle = left + (right - left) / 2;
+            if titles.frame(middle)?.info.first_entity.kind < EntityKind::Global {
+                left = middle + 1;
+            } else {
+                right = middle;
+            }
+        }
+        for position in left..frame_count {
+            let location = indexed.location(titles.frame(position)?)?;
             if location.info.first_entity.kind != EntityKind::Global {
                 continue;
             }
-            visit_frame(&path, location, |record| {
+            let mut frame_file = file.try_clone()?;
+            visit_frame_while_file(&mut frame_file, &location, |record| {
                 match record {
                     Record::Manifest {
                         manifest: record, ..
@@ -184,7 +197,7 @@ impl ArchiveBrowseIndex {
                     } if site_info.is_none() => site_info = Some(record),
                     _ => {}
                 }
-                Ok(())
+                Ok(true)
             })?;
         }
         let site_info = site_info.ok_or(crate::archive::ArchiveError::Invalid(
@@ -192,12 +205,32 @@ impl ArchiveBrowseIndex {
         ))?;
 
         Ok(Self {
-            path,
-            frames,
+            file,
             titles,
+            indexed,
             site_info,
             manifest,
         })
+    }
+
+    fn visit_frame(
+        &self,
+        location: &FrameLocation,
+        mut visitor: impl FnMut(Record) -> crate::archive::Result<()>,
+    ) -> crate::archive::Result<()> {
+        self.visit_frame_while(location, |record| {
+            visitor(record)?;
+            Ok(true)
+        })
+    }
+
+    fn visit_frame_while(
+        &self,
+        location: &FrameLocation,
+        visitor: impl FnMut(Record) -> crate::archive::Result<bool>,
+    ) -> crate::archive::Result<()> {
+        let mut file = self.file.try_clone()?;
+        visit_frame_while_file(&mut file, location, visitor)
     }
 
     pub fn title_count(&self) -> u64 {
@@ -205,7 +238,7 @@ impl ArchiveBrowseIndex {
     }
 
     pub fn frame_count(&self) -> usize {
-        self.frames.len()
+        self.titles.frame_count()
     }
 
     pub fn manifest(&self) -> Option<&ManifestRecord> {
@@ -224,11 +257,14 @@ impl ArchiveBrowseIndex {
         let filter = filter.map(str::to_lowercase);
         let mut seen = std::collections::HashSet::new();
         let mut pages = Vec::new();
-        for location in &self.frames {
+        for position in 0..self.frame_count() {
+            let Ok(location) = self.frame(position) else {
+                break;
+            };
             if location.info.first_entity.kind != EntityKind::Page || pages.len() >= limit {
                 break;
             }
-            let result = visit_frame_while(&self.path, location, |record| {
+            let result = self.visit_frame_while(&location, |record| {
                 if let Record::PageState {
                     page_id,
                     title,
@@ -255,12 +291,13 @@ impl ArchiveBrowseIndex {
     }
 
     pub fn first_page(&self) -> crate::archive::Result<Option<(u64, String)>> {
-        for location in &self.frames {
+        for position in 0..self.frame_count() {
+            let location = self.frame(position)?;
             if location.info.first_entity.kind != EntityKind::Page {
                 break;
             }
             let mut found = None;
-            visit_frame_while(&self.path, location, |record| {
+            self.visit_frame_while(&location, |record| {
                 if let Record::PageState {
                     page_id,
                     title,
@@ -286,11 +323,11 @@ impl ArchiveBrowseIndex {
         &self,
         page_id: u64,
     ) -> crate::archive::Result<Option<String>> {
-        let Some(location) = self.page_frame(page_id) else {
+        let Some(location) = self.page_frame(page_id)? else {
             return Ok(None);
         };
         let mut title = None;
-        visit_frame_while(&self.path, location, |record| {
+        self.visit_frame_while(&location, |record| {
             if record.page_id() != Some(page_id) {
                 return Ok(true);
             }
@@ -315,12 +352,12 @@ impl ArchiveBrowseIndex {
         page_id: u64,
         timestamp_micros: i64,
     ) -> crate::archive::Result<Option<String>> {
-        let Some(location) = self.page_frame(page_id) else {
+        let Some(location) = self.page_frame(page_id)? else {
             return Ok(None);
         };
         let mut current = None;
         let mut actions = Vec::new();
-        visit_frame(&self.path, location, |record| {
+        self.visit_frame(&location, |record| {
             match record {
                 Record::PageState {
                     page_id: record_page_id,
@@ -396,11 +433,11 @@ impl ArchiveBrowseIndex {
         page_id: u64,
         revision_id: u64,
     ) -> crate::archive::Result<Option<RevisionRecord>> {
-        let Some(location) = self.page_frame(page_id) else {
+        let Some(location) = self.page_frame(page_id)? else {
             return Ok(None);
         };
         let mut selected = None;
-        visit_frame_while(&self.path, location, |record| {
+        self.visit_frame_while(&location, |record| {
             if record.page_id() != Some(page_id) {
                 return Ok(true);
             }
@@ -420,11 +457,11 @@ impl ArchiveBrowseIndex {
         page_id: u64,
         timestamp_micros: i64,
     ) -> crate::archive::Result<Option<RevisionRecord>> {
-        let Some(location) = self.page_frame(page_id) else {
+        let Some(location) = self.page_frame(page_id)? else {
             return Ok(None);
         };
         let mut selected = None;
-        visit_frame_while(&self.path, location, |record| {
+        self.visit_frame_while(&location, |record| {
             if record.page_id() != Some(page_id) {
                 return Ok(true);
             }
@@ -446,11 +483,11 @@ impl ArchiveBrowseIndex {
         &self,
         page_id: u64,
     ) -> crate::archive::Result<Vec<PageRevisionSummary>> {
-        let Some(location) = self.page_frame(page_id) else {
+        let Some(location) = self.page_frame(page_id)? else {
             return Ok(Vec::new());
         };
         let mut revisions = Vec::new();
-        visit_frame_while(&self.path, location, |record| {
+        self.visit_frame_while(&location, |record| {
             if record.page_id() != Some(page_id) {
                 return Ok(true);
             }
@@ -478,12 +515,12 @@ impl ArchiveBrowseIndex {
         page_id: u64,
         cache_limit: usize,
     ) -> crate::archive::Result<Option<PageRevisionTextCursor>> {
-        let Some(location) = self.page_frame(page_id).cloned() else {
+        let Some(location) = self.page_frame(page_id)? else {
             return Ok(None);
         };
-        let frame = crate::archive::open_frame_cursor(&self.path, &location)?;
+        let frame = crate::archive::open_frame_cursor_file(&self.file, &location)?;
         Ok(Some(PageRevisionTextCursor {
-            path: self.path.clone(),
+            file: self.file.try_clone()?,
             location,
             page_id,
             frame,
@@ -505,14 +542,10 @@ impl ArchiveBrowseIndex {
         kind: ArchiveSearchKind,
         limit: usize,
     ) -> crate::archive::Result<ArchiveSearchResults> {
-        let page_frames = self
-            .frames
-            .iter()
-            .take_while(|location| location.info.first_entity.kind == EntityKind::Page)
-            .collect::<Vec<_>>();
+        let page_frame_count = self.page_frame_count()?;
         let workers = std::thread::available_parallelism()
             .map_or(1, usize::from)
-            .min(page_frames.len().max(1));
+            .min(page_frame_count.max(1));
         let next = AtomicUsize::new(0);
         let keep = limit.max(1);
 
@@ -520,18 +553,19 @@ impl ArchiveBrowseIndex {
             let mut handles = Vec::with_capacity(workers);
             for _ in 0..workers {
                 handles.push(scope.spawn(|| -> crate::archive::Result<_> {
-                    let mut file = std::fs::File::open(&self.path)?;
+                    let mut file = self.file.try_clone()?;
                     let mut found = Vec::new();
                     let mut match_count = 0_u64;
                     loop {
                         let frame_index = next.fetch_add(1, Ordering::Relaxed);
-                        let Some(location) = page_frames.get(frame_index) else {
+                        if frame_index >= page_frame_count {
                             break;
-                        };
+                        }
+                        let location = self.frame(frame_index)?;
                         let mut states = std::collections::HashMap::<u64, Option<String>>::new();
                         let mut revisions = Vec::new();
                         let mut sequence = 0_usize;
-                        visit_frame_while_file(&mut file, location, |record| {
+                        visit_frame_while_file(&mut file, &location, |record| {
                             let record_sequence = sequence;
                             sequence += 1;
                             match record {
@@ -650,7 +684,7 @@ impl ArchiveBrowseIndex {
         Ok(ArchiveSearchResults {
             hits: hits.into_iter().map(|(_, _, hit)| hit).collect(),
             match_count,
-            searched_frames: page_frames.len(),
+            searched_frames: page_frame_count,
             workers,
         })
     }
@@ -664,14 +698,10 @@ impl ArchiveBrowseIndex {
         contributor: &crate::ContributorMeta,
         limit: usize,
     ) -> crate::archive::Result<ArchiveSearchResults> {
-        let page_frames = self
-            .frames
-            .iter()
-            .take_while(|location| location.info.first_entity.kind == EntityKind::Page)
-            .collect::<Vec<_>>();
+        let page_frame_count = self.page_frame_count()?;
         let workers = std::thread::available_parallelism()
             .map_or(1, usize::from)
-            .min(page_frames.len().max(1));
+            .min(page_frame_count.max(1));
         let next = AtomicUsize::new(0);
         let keep = limit.max(1);
 
@@ -679,18 +709,19 @@ impl ArchiveBrowseIndex {
             let mut handles = Vec::with_capacity(workers);
             for _ in 0..workers {
                 handles.push(scope.spawn(|| -> crate::archive::Result<_> {
-                    let mut file = std::fs::File::open(&self.path)?;
+                    let mut file = self.file.try_clone()?;
                     let mut found = Vec::new();
                     let mut match_count = 0_u64;
                     loop {
                         let frame_index = next.fetch_add(1, Ordering::Relaxed);
-                        let Some(location) = page_frames.get(frame_index) else {
+                        if frame_index >= page_frame_count {
                             break;
-                        };
+                        }
+                        let location = self.frame(frame_index)?;
                         let mut titles = std::collections::HashMap::<u64, String>::new();
                         let mut edits = Vec::new();
                         let mut sequence = 0_usize;
-                        visit_frame_while_file(&mut file, location, |record| {
+                        visit_frame_while_file(&mut file, &location, |record| {
                             let record_sequence = sequence;
                             sequence += 1;
                             match record {
@@ -790,21 +821,55 @@ impl ArchiveBrowseIndex {
         Ok(ArchiveSearchResults {
             hits: hits.into_iter().map(|(_, _, hit)| hit).collect(),
             match_count,
-            searched_frames: page_frames.len(),
+            searched_frames: page_frame_count,
             workers,
         })
     }
 
-    fn page_frame(&self, page_id: u64) -> Option<&FrameLocation> {
-        let page_frame_count = self.frames.partition_point(|location| {
-            location.info.first_entity.kind == EntityKind::Page
-        });
-        let frames = &self.frames[..page_frame_count];
-        let index = frames.partition_point(|location| location.info.last_entity.id < page_id);
-        frames.get(index).filter(|location| {
-            location.info.first_entity.id <= page_id
-                && page_id <= location.info.last_entity.id
-        })
+    fn frame(&self, position: usize) -> crate::archive::Result<FrameLocation> {
+        self.indexed.location(self.titles.frame(position)?)
+    }
+
+    fn first_frame_after_kind(
+        &self,
+        kind: EntityKind,
+    ) -> crate::archive::Result<usize> {
+        let mut left = 0;
+        let mut right = self.frame_count();
+        while left < right {
+            let middle = left + (right - left) / 2;
+            if self.titles.frame(middle)?.info.first_entity.kind <= kind {
+                left = middle + 1;
+            } else {
+                right = middle;
+            }
+        }
+        Ok(left)
+    }
+
+    fn page_frame_count(&self) -> crate::archive::Result<usize> {
+        self.first_frame_after_kind(EntityKind::Page)
+    }
+
+    fn page_frame(&self, page_id: u64) -> crate::archive::Result<Option<FrameLocation>> {
+        let page_frame_count = self.page_frame_count()?;
+        let mut left = 0;
+        let mut right = page_frame_count;
+        while left < right {
+            let middle = left + (right - left) / 2;
+            if self.titles.frame(middle)?.info.last_entity.id < page_id {
+                left = middle + 1;
+            } else {
+                right = middle;
+            }
+        }
+        if left >= page_frame_count {
+            return Ok(None);
+        }
+        let location = self.frame(left)?;
+        Ok((location.info.first_entity.id <= page_id
+            && page_id <= location.info.last_entity.id)
+            .then_some(location))
     }
 
     pub fn page_text_at(
@@ -1075,7 +1140,12 @@ mod tests {
 
         let title_index = temporary.path().join("sample.swtitle");
         crate::title_index::build(&path, &title_index).unwrap();
-        assert_eq!(std::fs::metadata(&title_index).unwrap().len(), 16);
+        let (_, archive_frames, complete) = crate::archive::index_file(&path).unwrap();
+        assert!(complete);
+        assert_eq!(
+            std::fs::metadata(&title_index).unwrap().len(),
+            48 + 16 + archive_frames.len() as u64 * 64
+        );
         let index = ArchiveBrowseIndex::open(&path, &title_index).unwrap();
         assert_eq!(index.page_id_by_title("Testa_lapa", i64::MAX), Some(7));
         assert_eq!(index.current_title(7).unwrap().as_deref(), Some("Testa lapa"));
@@ -1138,5 +1208,14 @@ mod tests {
             vec![11, 10]
         );
         assert_eq!(text.hits[0].snippet.as_deref(), Some("hello"));
+
+        let old_generation = temporary.path().join("old-generation.swdump");
+        std::fs::rename(&path, old_generation).unwrap();
+        std::fs::write(&path, b"replacement generation").unwrap();
+        assert_eq!(
+            index.page_text_at(7, i64::MAX).unwrap(),
+            Some(b"hello".to_vec()),
+            "an attached reader must keep reading its opened generation"
+        );
     }
 }

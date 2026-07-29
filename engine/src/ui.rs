@@ -503,8 +503,9 @@ enum Modal {
     /// Add one or more Wikipedia mirrors without exposing the generic
     /// mirror-driver CLI. Preset sites are toggled in the first field;
     /// `custom` accepts any other Wikimedia database name. `destination`
-    /// is a user-chosen BASE directory: every selected database gets its
-    /// own child (for example BASE/enwiki), so stores never collide.
+    /// is a user-chosen base directory: every selected database gets one
+    /// archive/index pair (for example BASE/enwiki.swdump and
+    /// BASE/enwiki.swtitle), so mirrors never collide.
     WikiMirrorSetup {
         selected: std::collections::BTreeSet<String>,
         site_cursor: usize,

@@ -669,7 +669,7 @@ pub struct FrameLocation {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum CompressionReference {
+pub(crate) enum CompressionReference {
     Dictionary(std::sync::Arc<[u8]>),
     RefPrefix(std::sync::Arc<[u8]>),
 }
@@ -1068,7 +1068,14 @@ pub struct ArchiveFrameReader<D: Read> {
 }
 
 pub fn index_file(path: impl AsRef<Path>) -> Result<(u64, Vec<FrameLocation>, bool)> {
-    let mut file = BufReader::new(std::fs::File::open(path)?);
+    let file = std::fs::File::open(path)?;
+    index_open_file(&file)
+}
+
+pub(crate) fn index_open_file(
+    file: &std::fs::File,
+) -> Result<(u64, Vec<FrameLocation>, bool)> {
+    let mut file = BufReader::new(file.try_clone()?);
     let frame_target = read_file_header(&mut file)?;
     let mut locations = Vec::new();
     let mut previous = None;
@@ -1120,6 +1127,92 @@ pub fn index_file(path: impl AsRef<Path>) -> Result<(u64, Vec<FrameLocation>, bo
                 .try_into()
                 .map_err(|_| ArchiveError::FieldTooLarge)?,
         ))?;
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct IndexedArchive {
+    file_len: u64,
+    reference: Option<CompressionReference>,
+    active_dictionary_id: Option<u32>,
+}
+
+impl IndexedArchive {
+    pub(crate) fn open(
+        file: &std::fs::File,
+        last: crate::title_index::FrameIndexEntry,
+    ) -> Result<Self> {
+        let file_len = file.metadata()?.len();
+        let mut input = BufReader::new(file.try_clone()?);
+        let _ = read_file_header(&mut input)?;
+        let pending_header = read_frame_header_or_eof(&mut input)?;
+        let mut reference = None;
+        let mut active_dictionary_id = None;
+        if let Some(header) = pending_header {
+            if let Some(info) = parse_dictionary_header(&header)? {
+                let bytes = read_dictionary_payload(&mut input, info)?;
+                reference = Some(CompressionReference::Dictionary(
+                    std::sync::Arc::<[u8]>::from(bytes),
+                ));
+                active_dictionary_id = Some(info.id);
+            } else if let Some(info) = parse_ref_prefix_header(&header)? {
+                let bytes = read_ref_prefix_payload(&mut input, info)?;
+                reference = Some(CompressionReference::RefPrefix(
+                    std::sync::Arc::<[u8]>::from(bytes),
+                ));
+            }
+        }
+        let indexed = Self {
+            file_len,
+            reference,
+            active_dictionary_id,
+        };
+        let last = indexed.location(last)?;
+        let done_offset = last
+            .compressed_offset
+            .checked_add(last.info.compressed_bytes)
+            .ok_or(ArchiveError::FieldTooLarge)?;
+        let mut done_file = file.try_clone()?;
+        done_file.seek(SeekFrom::Start(done_offset))?;
+        let done = read_frame_header_or_eof(&mut done_file)?
+            .ok_or(ArchiveError::Invalid("archive has no completion marker"))?;
+        if parse_frame_header(&done)?.is_some() {
+            return Err(ArchiveError::Invalid(
+                "title index does not cover every archive frame",
+            ));
+        }
+        Ok(indexed)
+    }
+
+    pub(crate) fn location(
+        &self,
+        entry: crate::title_index::FrameIndexEntry,
+    ) -> Result<FrameLocation> {
+        let info = entry.info;
+        if info.first_entity.kind != info.last_entity.kind
+            || info.first_entity > info.last_entity
+        {
+            return Err(ArchiveError::Invalid(
+                "title index has an invalid frame range",
+            ));
+        }
+        validate_frame_dictionary(info, self.active_dictionary_id)?;
+        let frame_end = entry
+            .compressed_offset
+            .checked_add(info.compressed_bytes)
+            .ok_or(ArchiveError::FieldTooLarge)?;
+        if entry.compressed_offset < FILE_HEADER_LEN as u64 + FRAME_HEADER_LEN as u64
+            || frame_end > self.file_len
+        {
+            return Err(ArchiveError::Invalid(
+                "title index frame points outside the archive",
+            ));
+        }
+        Ok(FrameLocation {
+            info,
+            compressed_offset: entry.compressed_offset,
+            reference: self.reference.clone(),
+        })
     }
 }
 
@@ -1566,7 +1659,13 @@ fn open_owned_frame(
     path: &Path,
     location: &FrameLocation,
 ) -> Result<ArchiveFrameReader<OwnedFrameDecoder>> {
-    let mut file = std::fs::File::open(path)?;
+    open_owned_frame_file(std::fs::File::open(path)?, location)
+}
+
+fn open_owned_frame_file(
+    mut file: std::fs::File,
+    location: &FrameLocation,
+) -> Result<ArchiveFrameReader<OwnedFrameDecoder>> {
     file.seek(SeekFrom::Start(location.compressed_offset))?;
     let compressed = compressed_frame_reader(
         file.take(location.info.compressed_bytes),
@@ -1588,12 +1687,12 @@ fn open_owned_frame(
     })
 }
 
-pub(crate) fn open_frame_cursor(
-    path: &Path,
+pub(crate) fn open_frame_cursor_file(
+    file: &std::fs::File,
     location: &FrameLocation,
 ) -> Result<FrameRecordCursor> {
     Ok(FrameRecordCursor {
-        inner: open_owned_frame(path, location)?,
+        inner: open_owned_frame_file(file.try_clone()?, location)?,
     })
 }
 
@@ -1713,31 +1812,88 @@ pub fn merge_many_archives_with_compression<W: Write>(
     frame_target: usize,
     compression: CompressionSettings,
 ) -> Result<(W, u64, u64)> {
-    merge_many_archives_with_compression_in(
-        inputs,
-        output,
-        frame_target,
-        compression,
-        std::env::temp_dir(),
-    )
+    let writer = ArchiveWriter::with_compression(output, frame_target, compression)?;
+    merge_sorted_archives(inputs, writer)
 }
 
-pub fn merge_many_archives_with_compression_in<W: Write>(
+/// Merge already-sorted archives directly into the final refPrefix-compressed
+/// representation. The reference prefix is reused from `reference_archive`;
+/// it is immutable compression context, not state derived from the update.
+pub fn merge_many_archives_reusing_ref_prefix<W: Write>(
+    reference_archive: impl AsRef<Path>,
     inputs: &[PathBuf],
     output: W,
     frame_target: usize,
     compression: CompressionSettings,
-    scratch_parent: impl AsRef<Path>,
 ) -> Result<(W, u64, u64)> {
-    let mut sorter = RecordSorter::new_in(scratch_parent.as_ref())?;
-    for input in inputs {
-        let mut reader = ArchiveRecordReader::open(input)?;
-        while let Some(record) = reader.next_record()? {
-            sorter.push(record)?;
+    let (_, frames, complete) = index_file(reference_archive)?;
+    if !complete {
+        return Err(ArchiveError::Invalid(
+            "reference archive has no clean completion marker",
+        ));
+    }
+    let prefix = frames
+        .first()
+        .and_then(|frame| frame.reference.as_ref())
+        .and_then(|reference| match reference {
+            CompressionReference::RefPrefix(prefix) => Some(prefix.clone()),
+            CompressionReference::Dictionary(_) => None,
+        })
+        .ok_or(ArchiveError::Invalid(
+            "reference archive has no reference prefix",
+        ))?;
+    let writer = ArchiveWriter::with_compression_and_ref_prefix(
+        output,
+        frame_target,
+        compression,
+        &prefix,
+    )?;
+    merge_sorted_archives(inputs, writer)
+}
+
+fn merge_sorted_archives<'a, W: Write>(
+    inputs: &[PathBuf],
+    mut writer: ArchiveWriter<'a, W>,
+) -> Result<(W, u64, u64)> {
+    let mut readers = inputs
+        .iter()
+        .map(ArchiveRecordReader::open)
+        .collect::<Result<Vec<_>>>()?;
+    let mut heads = BinaryHeap::new();
+    for (source, reader) in readers.iter_mut().enumerate() {
+        if let Some(record) = reader.next_record()? {
+            heads.push(SortRunHead {
+                run: source,
+                record,
+            });
         }
     }
-    let (output, frames, records, _) =
-        sorter.finish_with_compression(output, frame_target, compression)?;
+    let mut records = 0_u64;
+    while let Some(head) = heads.pop() {
+        let mut record = head.record;
+        if let Some(next) = readers[head.run].next_record()? {
+            heads.push(SortRunHead {
+                run: head.run,
+                record: next,
+            });
+        }
+        while heads
+            .peek()
+            .is_some_and(|other| records_coalesce(&record, &other.record))
+        {
+            let other = heads.pop().expect("peeked above");
+            record = coalesce_records(record, other.record)?;
+            if let Some(next) = readers[other.run].next_record()? {
+                heads.push(SortRunHead {
+                    run: other.run,
+                    record: next,
+                });
+            }
+        }
+        writer.write(&record)?;
+        records += 1;
+    }
+    let (output, frames) = writer.finish()?;
     Ok((output, frames, records))
 }
 
@@ -5185,6 +5341,46 @@ mod tests {
         };
         assert_eq!(action.tie_sequence, 2);
         assert_eq!(action.comment, "move with normalized detail");
+    }
+
+    #[test]
+    fn streaming_merge_reuses_reference_prefix() {
+        let temporary = tempfile::TempDir::new().unwrap();
+        let prefix = vec![b'x'; 1024];
+        let base = temporary.path().join("base.swdump");
+        let mut base_writer = ArchiveWriter::with_compression_and_ref_prefix(
+            std::fs::File::create(&base).unwrap(),
+            1024,
+            CompressionSettings::default(),
+            &prefix,
+        )
+        .unwrap();
+        base_writer
+            .write(&revision(7, 11, 123, b"archived text"))
+            .unwrap();
+        base_writer.finish().unwrap();
+
+        let update = temporary.path().join("update.swdump");
+        write_test_archive(&update, &[revision(8, 12, 124, b"new page")]);
+        let output = temporary.path().join("merged.swdump");
+        let (_, frames, records) = merge_many_archives_reusing_ref_prefix(
+            &base,
+            &[base.clone(), update],
+            std::fs::File::create(&output).unwrap(),
+            1024,
+            CompressionSettings::default(),
+        )
+        .unwrap();
+        assert_eq!(records, 2);
+        assert!(frames > 0);
+        let (_, locations, complete) = index_file(output).unwrap();
+        assert!(complete);
+        assert!(locations.iter().all(|location| {
+            matches!(
+                location.reference.as_ref(),
+                Some(CompressionReference::RefPrefix(stored)) if stored.as_ref() == prefix
+            )
+        }));
     }
 
     fn write_test_archive(path: &Path, records: &[Record]) {

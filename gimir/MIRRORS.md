@@ -6,7 +6,7 @@ each corpus's shape wants, served through sarun. Three mirrors first:
 
 | mirror | shape | store | state |
 |---|---|---|---|
-| **wikipedia** | revisions plus typed page/user/global actions | portable `.swdump` event stream with embedded dictionary + generated `.swtitle` lookup | `wikimak` CLI: full-snapshot bootstrap, daily adds/changes merge, MediaWiki History actions, direct local browse |
+| **wikipedia** | revisions plus typed page/user/global actions | portable `.swdump` event stream with embedded refPrefix + generated `.swtitle` lookup | `wikimak` CLI: full-snapshot bootstrap, daily adds/changes merge, MediaWiki History actions, direct local browse |
 | **IETF drafts** | revision chains per draft name (`draft-x-00..-NN`) — the tiered-VBF doc's other named workload | multi-chain `depot-vbf::VbfDepot` (canonical layers) + sqlite bookkeeping | `ietf-mirror` crate + `ietfmak` CLI: update (idempotent, incremental, 404-watermarked) / list / head / text / history |
 | **git repos** | DAG of tree snapshots, newest-first | `gitdepot` store (tiered four-chain wikimak-depot store — TREES/COMMITS/REFLOG/TAGS with stable indices; annotated tags stored as raw tag objects, nested chains included, tags at trees supported (deduped to a commit's tree or imported as a standalone TREES record; blob-target tags are the only refusal), refs resolve peeled; bounded prepend, proven by roundtrip.rs update_io_is_bounded_not_o_history; SHA-exact export, tag objects verbatim; no re-import path — a rewrite is new records + repointed refs) | import/export/`update` (incremental prepend, rewrites included) + `mirror` (bare-clone fetch loop) |
 
@@ -44,11 +44,14 @@ each corpus's shape wants, served through sarun. Three mirrors first:
    attachments, document rendering, and local HTTP browsing all read the
    archive format. A new mirror bootstraps from full revision XML and every
    MediaWiki History partition. Routine `fetch` merges daily adds/changes with
-   the newest completed and current partial History partitions, using three
-   days of overlap. The installed result is repacked at zstd level 9 into
-   128 KiB frames with an 800 KiB embedded dictionary, then `.swtitle` is
-   regenerated. `refresh-full` is an explicit full re-download and is never
-   scheduled automatically. Scratch-space reduction remains future work.
+   the newest completed and current partial partitions of a newly published
+   History release, using three days of content overlap. An already-ingested
+   History release is not downloaded again. The existing archive and the
+   update stream are coalesced directly into zstd level 9, 128 KiB frames
+   using the archive's 16 MiB refPrefix; no full merged scratch archive or
+   second repack is made. `.swtitle` is regenerated before the archive/index
+   pair is switched. `refresh-full` is an explicit full re-download and is
+   never scheduled automatically.
 2. **IETF drafts** (`ietf-mirror` crate): DONE — `all_id.txt` index →
    per-draft chains of full-snapshot canonical layers in a multi-chain
    `VbfDepot`; sqlite for series state; `update` idempotent + resumable

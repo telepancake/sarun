@@ -397,30 +397,34 @@ fn update_archive_overlaps_daily_runs_and_merges_with_full_archive() {
     }
     update_server.mock(|when, then| {
         when.method(GET).path("/other/mediawiki_history/");
-        then.status(200).body(r#"<a href="2024-06/">2024-06/</a>"#);
+        then.status(200).body(r#"<a href="2024-07/">2024-07/</a>"#);
     });
     update_server.mock(|when, then| {
         when.method(GET)
-            .path("/other/mediawiki_history/2024-06/testwiki/");
+            .path("/other/mediawiki_history/2024-07/testwiki/");
         then.status(200).body(
-            r#"<a href="2024-06.testwiki.2024-04.tsv.bz2">April</a>
-               <a href="2024-06.testwiki.2024-05.tsv.bz2">May</a>
-               <a href="2024-06.testwiki.2024-06.tsv.bz2">June</a>"#,
+            r#"<a href="2024-07.testwiki.2024-04.tsv.bz2">April</a>
+               <a href="2024-07.testwiki.2024-05.tsv.bz2">May</a>
+               <a href="2024-07.testwiki.2024-06.tsv.bz2">June</a>
+               <a href="2024-07.testwiki.2024-07.tsv.bz2">July</a>"#,
         );
     });
     let april = update_server.mock(|when, then| {
         when.method(GET)
-            .path("/other/mediawiki_history/2024-06/testwiki/2024-06.testwiki.2024-04.tsv.bz2");
+            .path("/other/mediawiki_history/2024-07/testwiki/2024-07.testwiki.2024-04.tsv.bz2");
         then.status(200).body(history_body("create"));
     });
-    for partition in ["2024-05", "2024-06"] {
-        update_server.mock(move |when, then| {
-            when.method(GET).path(format!(
-                "/other/mediawiki_history/2024-06/testwiki/2024-06.testwiki.{partition}.tsv.bz2"
-            ));
-            then.status(200).body(history_body("move"));
-        });
-    }
+    let recent_history = ["2024-06", "2024-07"]
+        .into_iter()
+        .map(|partition| {
+            update_server.mock(move |when, then| {
+                when.method(GET).path(format!(
+                    "/other/mediawiki_history/2024-07/testwiki/2024-07.testwiki.{partition}.tsv.bz2"
+                ));
+                then.status(200).body(history_body("move"));
+            })
+        })
+        .collect::<Vec<_>>();
 
     let update = tmp.path().join("update.swdump");
     let stats = build_update_archive(
@@ -451,7 +455,7 @@ fn update_archive_overlaps_daily_runs_and_merges_with_full_archive() {
         1024,
     )
     .unwrap();
-    let mut reader = ArchiveReader::new(std::fs::File::open(merged).unwrap()).unwrap();
+    let mut reader = ArchiveReader::new(std::fs::File::open(&merged).unwrap()).unwrap();
     let mut content_through = String::new();
     let mut revisions = 0;
     while let Some(mut frame) = reader.next_frame().unwrap() {
@@ -468,6 +472,28 @@ fn update_archive_overlaps_daily_runs_and_merges_with_full_archive() {
     assert!(reader.is_complete());
     assert_eq!(content_through, "2024-06-02");
     assert_eq!(revisions, 6, "overlapping daily revisions were not deduplicated");
+
+    let second_update = tmp.path().join("second-update.swdump");
+    let second = build_update_archive(
+        &Client::new(),
+        &Config {
+            base_url: update_server.base_url(),
+        },
+        "testwiki",
+        &merged,
+        &second_update,
+        tmp.path().join("second-update-scratch"),
+        3,
+        1024,
+        CompressionSettings::default(),
+        |_| (),
+    )
+    .unwrap();
+    assert_eq!(second.history_parts, 0);
+    assert!(
+        recent_history.iter().all(|history| history.hits() == 1),
+        "an already-ingested MediaWiki History release was downloaded again"
+    );
 }
 
 #[test]
