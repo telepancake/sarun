@@ -725,7 +725,6 @@ enum Action {
     MirrorRun,
     MirrorRunPending,
     MirrorFullRefresh,
-    MirrorHistoryReconcile,
     MirrorTogglePause,
     MirrorRemove,
     MirrorBrowse,
@@ -856,8 +855,6 @@ enum ConfirmAction {
     MirrorRemove(i64),
     /// Explicitly re-ingest Wikipedia's current full content snapshot.
     MirrorFullRefresh(i64),
-    /// Explicitly rebuild metadata from every MediaWiki History partition.
-    MirrorHistoryReconcile(i64),
 }
 
 /// State of the off-loop structural diff for the selected BINARY change. Mirrors
@@ -4086,7 +4083,10 @@ impl App {
                 skipped.push(site);
                 continue;
             }
-            let root = destination.join(&site).to_string_lossy().into_owned();
+            let root = destination
+                .join(format!("{site}.swdump"))
+                .to_string_lossy()
+                .into_owned();
             match self.mirror_verb("mirror_add", json!(["wiki", site, root, interval])) {
                 Ok(value) => {
                     let Some(id) = value.get("id").and_then(Value::as_i64) else {
@@ -4170,35 +4170,9 @@ impl App {
         self.load_mirrors();
     }
 
-    fn confirm_mirror_history_reconcile(&mut self) {
-        let Some(job) = self.mirror_jobs.get(self.sel_mirror) else {
-            self.status = "no mirror job selected".into();
-            return;
-        };
-        if job.kind != "wiki" {
-            self.status = "history reconciliation is only available for Wikipedia mirrors".into();
-            return;
-        }
-        self.modal = Some(Modal::Confirm {
-            prompt: format!(
-                "Reconcile all {} action/visibility history now? This downloads every History partition; it is never scheduled automatically.",
-                job.src
-            ),
-            action: ConfirmAction::MirrorHistoryReconcile(job.id),
-        });
-    }
-
-    fn mirror_history_reconcile(&mut self, id: i64) {
-        self.status = match self.mirror_verb("mirror_reconcile_history", json!([id])) {
-            Ok(_) => format!("Wikipedia mirror #{id}: full History reconciliation started"),
-            Err(error) => format!("Wikipedia mirror #{id}: {error}"),
-        };
-        self.load_mirrors();
-    }
-
     /// 'b' on Mirrors: browse the selected WIKI mirror in the in-box
     /// browser (MIRRORS.md §Serve/browse). Starts a host-side `wikimak
-    /// serve` over the mirror's depot root (reused if already running) and
+    /// serve` over the mirror archive (reused if already running) and
     /// opens the browser at its loopback address with `--net host` so the
     /// boxed browser can reach the host-side server. Plain HTTP to
     /// localhost, so no MITM SPKI is needed (unlike the replay path).
@@ -6282,7 +6256,6 @@ impl App {
             ConfirmAction::Dissolve => self.dissolve(),
             ConfirmAction::MirrorRemove(id) => self.mirror_remove(id),
             ConfirmAction::MirrorFullRefresh(id) => self.mirror_full_refresh(id),
-            ConfirmAction::MirrorHistoryReconcile(id) => self.mirror_history_reconcile(id),
         }
     }
 
@@ -8386,11 +8359,11 @@ fn open_replay_in_browser(app: &mut App, source_sid: &str, url: &str) {
 }
 
 /// Host-side `wikimak serve` children backing the in-box wiki reader
-/// (MIRRORS.md §Serve/browse). A wiki mirror's depot lives on the host
+/// (MIRRORS.md §Serve/browse). A wiki mirror archive lives on the host
 /// filesystem and the server binds host loopback, so serve runs as a child
 /// of THIS engine (a self-exec of the embedded `wikimak` driver), NOT in a
 /// box — the browser then reaches it with `--net host`. One server per
-/// depot root; the port is derived from the root so a re-browse reuses it.
+/// archive; the port is derived from its path so a re-browse reuses it.
 mod wiki_serve {
     use std::collections::HashMap;
     use std::process::Child;
@@ -8406,7 +8379,7 @@ mod wiki_serve {
         REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
     }
 
-    /// Deterministic loopback port for a depot root (FNV-1a → 8700..9500),
+    /// Deterministic loopback port for an archive path (8700..9500),
     /// so re-browsing the same mirror lands on the same server.
     fn port_for(root: &str) -> u16 {
         let mut h: u64 = 0xcbf29ce484222325;
@@ -8478,9 +8451,9 @@ mod wiki_serve {
 
         #[test]
         fn port_is_deterministic_and_in_range() {
-            let a = port_for("/depot/enwiki");
-            let b = port_for("/depot/enwiki");
-            let c = port_for("/depot/dewiki");
+            let a = port_for("/mirrors/enwiki.swdump");
+            let b = port_for("/mirrors/enwiki.swdump");
+            let c = port_for("/mirrors/dewiki.swdump");
             assert_eq!(a, b, "same root → same port (re-browse reuse)");
             assert_ne!(a, c, "different roots → different ports (typically)");
             assert!((8700..9500).contains(&a) && (8700..9500).contains(&c));
@@ -9021,49 +8994,31 @@ fn expand_user_path(input: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(input)
 }
 
-/// Find portable Wikipedia mirror roots without opening them through the
-/// writable instance API. A library may be either one mirror root or a
-/// directory whose immediate children are roots. The identity stored inside
-/// meta.db is authoritative; mount points and directory names may change.
+/// Find portable Wikipedia archives. The identity in the archive manifest is
+/// authoritative; mount points and filenames may change.
 fn discover_wiki_mirrors(
     library: &std::path::Path,
 ) -> Result<Vec<(String, std::path::PathBuf)>, String> {
-    if !library.is_dir() {
-        return Err(format!("{} is not a directory", library.display()));
-    }
-
-    fn inspect(root: &std::path::Path) -> Result<Option<String>, String> {
-        let meta = root.join("meta.db");
-        if !meta.is_file() {
+    fn inspect(archive: &std::path::Path) -> Result<Option<String>, String> {
+        if !archive.is_file()
+            || archive.extension().and_then(|value| value.to_str()) != Some("swdump")
+        {
             return Ok(None);
         }
-        if !root.join("depot").is_dir() || !root.join("titles").is_dir() {
-            return Err(format!(
-                "{} has meta.db but is missing depot/ or titles/",
-                root.display()
-            ));
-        }
-        let conn = rusqlite::Connection::open_with_flags(
-            &meta,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        let title_index = archive.with_extension("swtitle");
+        let mirror = wikimak_wikipedia::archive_browse::ArchiveBrowseIndex::open(
+            archive,
+            &title_index,
         )
-        .map_err(|error| format!("cannot read {}: {error}", meta.display()))?;
-        let dbname: String = conn
-            .query_row(
-                "SELECT value FROM sync_state WHERE key = 'wiki_dbname'",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(|error| {
-                format!(
-                    "{} has no readable wiki_dbname identity: {error}",
-                    meta.display()
-                )
-            })?;
+        .map_err(|error| format!("cannot open {}: {error}", archive.display()))?;
+        let dbname = mirror
+            .manifest()
+            .map(|manifest| manifest.wiki_db.clone())
+            .ok_or_else(|| format!("{} has no mirror manifest", archive.display()))?;
         if !valid_wiki_dbname(&dbname) {
             return Err(format!(
                 "{} contains invalid wiki_dbname {dbname:?}",
-                meta.display()
+                archive.display()
             ));
         }
         Ok(Some(dbname))
@@ -9071,23 +9026,25 @@ fn discover_wiki_mirrors(
 
     let mut found = Vec::new();
     if let Some(dbname) = inspect(library)? {
-        let root = std::fs::canonicalize(library)
+        let archive = std::fs::canonicalize(library)
             .map_err(|error| format!("resolve {}: {error}", library.display()))?;
-        found.push((dbname, root));
+        found.push((dbname, archive));
+    } else if !library.is_dir() {
+        return Err(format!(
+            "{} is neither a Wikipedia archive nor a directory",
+            library.display()
+        ));
     } else {
         let entries = std::fs::read_dir(library)
             .map_err(|error| format!("read {}: {error}", library.display()))?;
         for entry in entries {
             let entry = entry.map_err(|error| format!("read directory entry: {error}"))?;
-            let root = entry.path();
-            if !root.is_dir() {
-                continue;
-            }
-            match inspect(&root) {
+            let archive = entry.path();
+            match inspect(&archive) {
                 Ok(Some(dbname)) => {
-                    let root = std::fs::canonicalize(&root)
-                        .map_err(|error| format!("resolve {}: {error}", root.display()))?;
-                    found.push((dbname, root));
+                    let archive = std::fs::canonicalize(&archive)
+                        .map_err(|error| format!("resolve {}: {error}", archive.display()))?;
+                    found.push((dbname, archive));
                 }
                 Ok(None) => {}
                 Err(error) => return Err(error),
@@ -9793,7 +9750,7 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
                 },
             )));
             body.push(Line::from(Span::styled(
-                "   Each site is stored in FOLDER/dbname; full editions can require substantial space.",
+                "   Each site is stored as FOLDER/dbname.swdump plus its generated title index.",
                 Style::default().add_modifier(Modifier::DIM),
             )));
             body.push(Line::from(Span::styled(
@@ -9801,7 +9758,7 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
                 Style::default().fg(Color::Yellow),
             )));
             body.push(Line::from(Span::styled(
-                "   Later full content re-ingest and all-history reconciliation are separate explicit actions.",
+                "   A later full content re-download is a separate explicit action.",
                 Style::default().add_modifier(Modifier::DIM),
             )));
             body.push(Line::from(""));
@@ -9846,7 +9803,7 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
         Modal::WikiMirrorLibrary { path } => (
             " open existing Wikipedia mirror library ",
             vec![
-                Line::from("Folder containing enwiki/, lvwiki/, … — or one mirror root"),
+                Line::from("Folder containing *.swdump mirrors — or one .swdump file"),
                 Line::from(""),
                 Line::from(format!("{path}_")),
                 Line::from(""),
@@ -17384,11 +17341,6 @@ fn pane_action_menu(app: &App) -> Option<(String, Vec<ActionItem>)> {
                         Action::MirrorFullRefresh,
                     ),
                     mk(
-                        "Reconcile all Wikipedia action metadata…",
-                        "",
-                        Action::MirrorHistoryReconcile,
-                    ),
-                    mk(
                         if paused {
                             "Resume this job"
                         } else {
@@ -17498,7 +17450,6 @@ fn run_action(app: &mut App, a: Action) {
         Action::MirrorRun => app.mirror_run_selected(),
         Action::MirrorRunPending => app.mirror_run_pending(),
         Action::MirrorFullRefresh => app.confirm_mirror_full_refresh(),
-        Action::MirrorHistoryReconcile => app.confirm_mirror_history_reconcile(),
         Action::MirrorTogglePause => app.mirror_toggle_pause(),
         Action::MirrorRemove => app.confirm_mirror_remove(),
         Action::MirrorBrowse => app.mirror_browse_selected(),
@@ -23370,7 +23321,7 @@ mod tests {
                         }
                     }
                     "mirror_run" if fake_run => json!({"ok": true}),
-                    "mirror_run_full" | "mirror_reconcile_history" if fake_run => {
+                    "mirror_run_full" if fake_run => {
                         json!({"ok": true})
                     }
                     "mirror_run" => match crate::mirrors::job_run(id) {
@@ -23481,11 +23432,11 @@ mod tests {
         assert!(jobs.iter().all(|job| job.interval_secs == 7 * 24 * 3600));
         assert!(
             jobs.iter()
-                .any(|job| job.src == "enwiki" && job.dest == "/mirror-library/enwiki")
+                .any(|job| job.src == "enwiki" && job.dest == "/mirror-library/enwiki.swdump")
         );
         assert!(
             jobs.iter()
-                .any(|job| job.src == "lvwiki" && job.dest == "/mirror-library/lvwiki")
+                .any(|job| job.src == "lvwiki" && job.dest == "/mirror-library/lvwiki.swdump")
         );
         assert!(app.status.contains("started 2 mirrors"), "{}", app.status);
     }
@@ -23504,20 +23455,55 @@ mod tests {
         }
     }
 
-    fn make_portable_wiki_root(root: &std::path::Path, dbname: &str) {
-        std::fs::create_dir_all(root.join("depot")).unwrap();
-        std::fs::create_dir_all(root.join("titles")).unwrap();
-        let conn = rusqlite::Connection::open(root.join("meta.db")).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE sync_state (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-             );",
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO sync_state(key, value) VALUES('wiki_dbname', ?1)",
-            [dbname],
+    fn make_portable_wiki_archive(archive: &std::path::Path, dbname: &str) {
+        use wikimak_wikipedia::archive::{
+            ArchiveWriter, ManifestRecord, Record, SiteInfoRecord,
+        };
+        let mut writer =
+            ArchiveWriter::new(std::fs::File::create(archive).unwrap(), 1024).unwrap();
+        writer
+            .write(&Record::PageState {
+                page_id: 1,
+                timestamp_micros: 1,
+                title: "Main Page".into(),
+                namespace: Some(0),
+                deleted: false,
+            })
+            .unwrap();
+        writer
+            .write(&Record::Manifest {
+                timestamp_micros: 1,
+                manifest: ManifestRecord {
+                    wiki_db: dbname.into(),
+                    content_snapshot: "2026-01-01".into(),
+                    metadata_snapshot: "2026-01-01".into(),
+                    source_files: Vec::new(),
+                },
+            })
+            .unwrap();
+        writer
+            .write(&Record::SiteInfo {
+                timestamp_micros: 1,
+                site_info: SiteInfoRecord {
+                    site_name: dbname.into(),
+                    db_name: dbname.into(),
+                    base: "https://example.invalid/wiki/Main_Page".into(),
+                    generator: "MediaWiki".into(),
+                    case: "first-letter".into(),
+                    language: "en".into(),
+                    rtl: false,
+                    server: "https://example.invalid".into(),
+                    script_path: "/w".into(),
+                    namespaces: Vec::new(),
+                    interwiki: Vec::new(),
+                    magic_words: Vec::new(),
+                },
+            })
+            .unwrap();
+        writer.finish().unwrap();
+        wikimak_wikipedia::title_index::build(
+            archive,
+            archive.with_extension("swtitle"),
         )
         .unwrap();
     }
@@ -23530,9 +23516,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
         let state = tmp.join("state");
         let library = tmp.join("remounted-drive");
-        let root = library.join("directory-name-is-not-identity");
+        let root = library.join("directory-name-is-not-identity.swdump");
         std::fs::create_dir_all(&state).unwrap();
-        make_portable_wiki_root(&root, "lvwiki");
+        std::fs::create_dir_all(&library).unwrap();
+        make_portable_wiki_archive(&root, "lvwiki");
         unsafe {
             std::env::set_var("XDG_STATE_HOME", &state);
         }
@@ -23565,18 +23552,20 @@ mod tests {
             "{}",
             app.status
         );
-        assert!(root.join("meta.db").is_file());
+        assert!(root.with_extension("swtitle").is_file());
     }
 
     #[test]
     fn existing_wikipedia_library_accepts_one_mirror_root() {
         let tmp = std::env::temp_dir().join(format!("sarun-wikiroot-scan-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
-        make_portable_wiki_root(&tmp, "enwiki");
-        let found = discover_wiki_mirrors(&tmp).unwrap();
+        std::fs::create_dir_all(&tmp).unwrap();
+        let archive = tmp.join("renamed.swdump");
+        make_portable_wiki_archive(&archive, "enwiki");
+        let found = discover_wiki_mirrors(&archive).unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].0, "enwiki");
-        assert_eq!(found[0].1, std::fs::canonicalize(&tmp).unwrap());
+        assert_eq!(found[0].1, std::fs::canonicalize(&archive).unwrap());
     }
 
     /// 'D' on the Mirrors pane deletes the SELECTED JOB behind a y/n

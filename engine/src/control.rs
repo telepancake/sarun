@@ -3293,52 +3293,26 @@ fn dispatch_action(
                 .map(action_relative_path)
                 .transpose()?
                 .unwrap_or("");
-            let instance = open_wiki_instance(root)?;
-            let (page_id, resolved_title) = match page.as_str().parse::<u64>() {
-                Ok(id) => (id, None),
-                Err(_) => match instance
-                    .page_by_title(page.as_str())
-                    .map_err(|e| e.to_string())?
-                {
-                    (Some(id), hits) => {
-                        let title = hits
-                            .into_iter()
-                            .find(|(candidate, _)| *candidate == id)
-                            .map(|(_, title)| title);
-                        (id, title)
-                    }
-                    (None, hits) if hits.is_empty() => {
-                        return Err(format!("no page titled {:?}", page.as_str()));
-                    }
-                    (None, hits) => {
-                        let candidates = hits
-                            .into_iter()
-                            .map(|(id, title)| format!("{title} ({id})"))
-                            .collect::<Vec<_>>();
-                        return Err(format!(
-                            "title {:?} is ambiguous: {}",
-                            page.as_str(),
-                            candidates.join(", ")
-                        ));
-                    }
-                },
+            let archive = open_wiki_archive(root)?;
+            let page_id = match page.as_str().parse::<u64>() {
+                Ok(id) => id,
+                Err(_) => archive
+                    .page_id_by_title(page.as_str(), i64::MAX)
+                    .ok_or_else(|| format!("no page titled {:?}", page.as_str()))?,
             };
-            let title = match resolved_title {
-                Some(title) => title,
-                None => instance
-                    .page_current_title(page_id)
-                    .map_err(|e| e.to_string())?
-                    .unwrap_or_else(|| format!("page-{page_id}")),
-            };
-            let head = instance
-                .page_head(page_id)
+            let title = archive
+                .current_title(page_id)
+                .map_err(|e| e.to_string())?
+                .unwrap_or_else(|| format!("page-{page_id}"));
+            let head = archive
+                .revision_at(page_id, i64::MAX)
                 .map_err(|e| e.to_string())?
                 .ok_or_else(|| format!("no page {page_id}"))?;
             let wiki = std::path::Path::new(root)
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "wiki".into());
-            let name = format!("wiki:{wiki}/{title}@r{}", head.rev_id);
+            let name = format!("wiki:{wiki}/{title}@r{}", head.meta.rev_id);
             let value = crate::generated_wire::WikiAttachmentResult {
                 name: crate::wire::BoundedText::new(name.clone()).map_err(|error| {
                     format!("wiki attachment name exceeds relation bound: {error:?}")
@@ -3346,14 +3320,14 @@ fn dispatch_action(
                 page: page_id,
                 title: crate::wire::BoundedText::new(title.clone())
                     .map_err(|error| format!("wiki title exceeds relation bound: {error:?}"))?,
-                revision: head.rev_id,
+                revision: head.meta.rev_id,
             };
             let mut rows = owner.ro_attachment_list();
             rows.push(crate::capture::RoAttachment::Ext(crate::capture::ExtRef {
                 kind: "wiki".into(),
                 store: root.to_owned(),
                 refname: page_id.to_string(),
-                rev: head.rev_id.to_string(),
+                rev: head.meta.rev_id.to_string(),
                 prefix: prefix.to_owned(),
                 name: name.clone(),
             }));
@@ -8093,16 +8067,6 @@ macro_rules! ui_verbs {
                 Err(error) => json!({"ok": false, "error": error}),
             };
         }
-        // args: [id] — explicit all-partition MediaWiki History rebuild.
-        "mirror_reconcile_history" => {
-            let Some(id) = args.first().and_then(Value::as_i64) else {
-                return json!({"ok": false, "error": "need job id"});
-            };
-            return match crate::mirrors::job_reconcile_history(id) {
-                Ok(()) => json!({"ok": true}),
-                Err(error) => json!({"ok": false, "error": error}),
-            };
-        }
         // Start every due/stopped unpaused job.
         "mirror_run_pending" => {
             return legacy_ui_action_reply(dispatch_action(
@@ -10311,16 +10275,15 @@ fn git_checkout_typed(
     })
 }
 
-/// Open a wikimak instance READ-ONLY (shared flock, every write API
-/// refuses): sizing defaults come from `wikimak_wikipedia::read_config`
-/// (page-id bound derived from the existing depot's on-disk index).
-/// Coexists with hydrated attachments and other readers; only a
-/// writing `wikimak import`/`sync` briefly excludes it.
-fn open_wiki_instance(root: &str) -> Result<wikimak_wikipedia::Instance, String> {
-    wikimak_wikipedia::Instance::open_read(wikimak_wikipedia::read_config(
-        std::path::PathBuf::from(root),
-    ))
-    .map_err(|e| e.to_string())
+fn open_wiki_archive(
+    path: &str,
+) -> Result<wikimak_wikipedia::archive_browse::ArchiveBrowseIndex, String> {
+    let path = std::path::Path::new(path);
+    wikimak_wikipedia::archive_browse::ArchiveBrowseIndex::open(
+        path,
+        path.with_extension("swtitle"),
+    )
+    .map_err(|error| error.to_string())
 }
 
 // ── svc: engine-spliced host↔box service streams ────────────────────────────

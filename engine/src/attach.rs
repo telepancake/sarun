@@ -200,11 +200,9 @@ fn open_readout(ext: &ExtRef) -> Result<Arc<dyn Readout>, String> {
             ext.rev
         )),
         "wiki" => {
-            // Bookkeeping only: PageReadout opens the store read-side
-            // (SHARED flock) at first access, decodes ONLY the pinned
-            // revision (ext.rev), and drops the lock — a hydrated
-            // attachment neither blocks `wikimak import`/`sync` nor
-            // drifts to a newer head.
+            // Bookkeeping only: PageReadout opens the archive at first
+            // access and decodes only the pinned revision (ext.rev), so
+            // a later archive update cannot make the attachment drift.
             let page: u64 = ext
                 .refname
                 .parse()

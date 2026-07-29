@@ -1,7 +1,9 @@
 # Portable Wikipedia event stream
 
-This is a research/export format independent of the live mirror layout.
-It is intended to make storage experiments ordinary ordered stream filters.
+This is the Wikipedia mirror storage format. The `.swdump` contains the
+portable event stream and its embedded compression dictionary. A generated
+`.swtitle` beside it provides title-and-time lookup; it can be rebuilt solely
+from the archive.
 
 - Entity groups are ordered by kind (`page`, then `user`, then `global`) and
   then by entity ID.
@@ -24,7 +26,8 @@ It is intended to make storage experiments ordinary ordered stream filters.
 
 The fixed 24-byte file header is followed by 64-byte frame headers and zstd
 frames. A writer checks actual emitted zstd bytes at every entity boundary and
-starts a new frame when the target (4 MiB by default) has been reached. Page,
+starts a new frame when the target has been reached. Installed mirrors use
+128 KiB frames, zstd level 9, and an 800 KiB dictionary. Page,
 user, and global records are never mixed in one frame: changing entity kind
 always starts a new frame. The header identifies that kind and the minimum and
 maximum page ID or user ID in the frame. An entity is never split, so a single
@@ -68,27 +71,27 @@ Entity kinds are page `1`, user `2`, and global/unbound `3`. Record kinds are:
 
 A clean file ends with a 64-byte `DONE` header.
 
-`wikimak archive-repack` is the first generic stream filter. It decodes records
+`wikimak repack` decodes records
 in order and writes the same records using the requested compressed frame-size
 target, zstd level, checksum, long-distance matching, window log, and target
 compressed-block size. Frame boundaries remain entity-aligned.
 
-`wikimak archive-merge` performs a canonical set union over any number of
+`wikimak merge` performs a canonical set union over any number of
 archives and writes it through the same configurable compressor and framing
-code as `archive-repack`. Records are externally sorted in bounded memory.
-`--scratch-dir` places the bounded sort runs and hierarchical consolidation
-passes on caller-selected storage.
+code as `repack`. Records are externally sorted in bounded memory.
 Equal revision IDs are joined field by field; repeated actions are identified
 from their typed event content rather than their source-row ordinal. Exact
 records occur once. Consequently input order, grouping, and repetition do not
 change the result.
 
-`wikimak archive-build-update` reads the logical content date from a base
-archive, fetches daily incremental content beginning three days before that
-date, and emits a partial archive. The overlap makes late or repeated daily
-runs harmless under merge. For partitioned MediaWiki History releases it
+`wikimak fetch <dbname> <archive>` creates a missing mirror or updates an
+existing one. Updating reads the logical content date from the archive,
+fetches daily incremental content with three days of overlap, merges it, and
+regenerates the title index. For partitioned MediaWiki History releases it
 includes the newest completed partition and current partial partition; an
-all-time wiki necessarily contributes its one all-time file.
+all-time wiki necessarily contributes its one all-time file. `refresh-full`
+is the explicit operator request to download the current full snapshot and
+all History partitions again; it is never scheduled automatically.
 
 ## Normalized metadata
 

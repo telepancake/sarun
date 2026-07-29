@@ -343,22 +343,21 @@ fn percent_decode(s: &str) -> String {
 const MAX_REDIRECT_HOPS: usize = 10;
 
 fn resolve_wiki_page(
-    inst: &wikimak_wikipedia::Instance,
+    archive: &wikimak_wikipedia::archive_browse::ArchiveBrowseIndex,
     raw: &str,
 ) -> anyhow::Result<(u64, String)> {
     let original = raw.replace('_', " ").trim().to_string();
     let mut current = original.clone();
     let mut seen = std::collections::HashSet::new();
     for _ in 0..=MAX_REDIRECT_HOPS {
-        let pid = inst
-            .page_id_by_title_at(&current, None)
-            .map_err(|e| anyhow::anyhow!("wiki page lookup {current:?}: {e}"))?
+        let pid = archive
+            .page_id_by_title(&current, i64::MAX)
             .ok_or_else(|| anyhow::anyhow!("wiki: no page titled {current:?}"))?;
         if !seen.insert(pid) {
             return Ok((pid, current));
         }
-        let text = inst
-            .page_text_at(pid, None)
+        let text = archive
+            .page_text_at(pid, i64::MAX)
             .map_err(|e| anyhow::anyhow!("wiki page text {current:?}: {e}"))?
             .ok_or_else(|| anyhow::anyhow!("wiki: no text at {current:?}"))?;
         match wikimak_wikitext::parse_redirect(&String::from_utf8_lossy(&text)) {
@@ -369,24 +368,24 @@ fn resolve_wiki_page(
     anyhow::bail!("wiki: redirect loop from {original:?}")
 }
 
-/// Render one wiki page to HTML: open the store read-side (shared flock,
-/// DROPPED on return — holding it would block a mirror import elsewhere),
-/// resolve redirects, and run the same wikitext→HTML renderer `wikimak
+/// Render one wiki page to HTML directly from the archive, resolve redirects,
+/// and run the same wikitext→HTML renderer `wikimak
 /// serve` uses, with `/wiki/` hrefs so link-follow can recognize internal
 /// targets. Returns (html, resolved display title).
 fn wiki_page_html(root: &Path, title: &str) -> anyhow::Result<(String, String)> {
     use wikimak_wikitext::PageStore;
-    let inst =
-        wikimak_wikipedia::Instance::open_read(wikimak_wikipedia::read_config(root.to_path_buf()))
-            .map_err(|e| anyhow::anyhow!("wiki open {}: {e}", root.display()))?;
-    let view = wikimak_wikipedia::asof::AsOfView::new(&inst, None)
-        .map_err(|e| anyhow::anyhow!("wiki site config: {e}"))?;
-    let (pid, resolved) = resolve_wiki_page(&inst, title)?;
+    let archive = wikimak_wikipedia::archive_browse::ArchiveBrowseIndex::open(
+        root,
+        root.with_extension("swtitle"),
+    )
+    .map_err(|e| anyhow::anyhow!("wiki open {}: {e}", root.display()))?;
+    let view = archive.view(None);
+    let (pid, resolved) = resolve_wiki_page(&archive, title)?;
     let site = view.site();
     let title_obj = wikimak_wikitext::Title::parse(&resolved, site);
     let display = title_obj.prefixed(site);
-    let text = inst
-        .page_text_at(pid, None)
+    let text = archive
+        .page_text_at(pid, i64::MAX)
         .map_err(|e| anyhow::anyhow!("wiki page text: {e}"))?
         .ok_or_else(|| anyhow::anyhow!("wiki: no text at {resolved:?}"))?;
     let wikitext = String::from_utf8_lossy(&text);
@@ -411,24 +410,27 @@ fn wiki_page_html(root: &Path, title: &str) -> anyhow::Result<(String, String)> 
 /// Pick a page to land on when a wiki mirror is opened without a title:
 /// "Main Page" when the store has one, else the first page in title order.
 pub fn wiki_default_title(root: &Path) -> anyhow::Result<String> {
-    let inst =
-        wikimak_wikipedia::Instance::open_read(wikimak_wikipedia::read_config(root.to_path_buf()))
-            .map_err(|e| anyhow::anyhow!("wiki open {}: {e}", root.display()))?;
-    if inst
-        .page_id_by_title_at("Main Page", None)
-        .map_err(|e| anyhow::anyhow!("wiki lookup: {e}"))?
-        .is_some()
+    let archive = wikimak_wikipedia::archive_browse::ArchiveBrowseIndex::open(
+        root,
+        root.with_extension("swtitle"),
+    )
+    .map_err(|e| anyhow::anyhow!("wiki open {}: {e}", root.display()))?;
+    if let Some(title) = archive
+        .site_info()
+        .base
+        .split_once("/wiki/")
+        .map(|(_, title)| percent_decode(title.split(['?', '#']).next().unwrap_or(title)))
+        .filter(|title| !title.is_empty())
     {
-        return Ok("Main Page".into());
+        if archive.page_id_by_title(&title, i64::MAX).is_some() {
+            return Ok(title);
+        }
     }
-    let pages = inst
-        .pages(None, 1)
-        .map_err(|e| anyhow::anyhow!("wiki page listing: {e}"))?;
-    pages
-        .into_iter()
-        .next()
+    archive
+        .first_page()
+        .map_err(|e| anyhow::anyhow!("wiki page listing: {e}"))?
         .map(|(_, t)| t)
-        .ok_or_else(|| anyhow::anyhow!("wiki store at {} has no pages", root.display()))
+        .ok_or_else(|| anyhow::anyhow!("wiki archive at {} has no pages", root.display()))
 }
 
 fn ietf_draft_list_html(root: &Path, filter: &str) -> anyhow::Result<(String, String)> {
@@ -1324,72 +1326,127 @@ mod tests {
 
     // ── wiki store ──────────────────────────────────────────────────────────
 
-    const WIKI_XML: &str = r#"<mediawiki xmlns="http://www.mediawiki.org/xml/export-0.11/" version="0.11" xml:lang="en">
-  <siteinfo>
-    <sitename>Reader Test Wiki</sitename><dbname>readertest</dbname>
-    <base>http://reader.test/wiki/Main_Page</base>
-    <generator>g</generator><case>first-letter</case>
-    <namespaces>
-      <namespace key="0" case="first-letter"/>
-      <namespace key="10" case="first-letter">Template</namespace>
-    </namespaces>
-  </siteinfo>
-  <page>
-    <title>Alpha Article</title><ns>0</ns><id>1</id>
-    <revision>
-      <id>11</id><timestamp>2022-01-01T00:00:00Z</timestamp>
-      <contributor><username>Ed</username><id>1</id></contributor>
-      <model>wikitext</model><format>text/x-wiki</format>
-      <text xml:space="preserve">== Overview ==
-Alpha body linking [[Beta Article]] and [https://example.org outside].</text><sha1>a1</sha1>
-    </revision>
-  </page>
-  <page>
-    <title>Beta Article</title><ns>0</ns><id>2</id>
-    <revision>
-      <id>21</id><timestamp>2022-01-01T00:00:00Z</timestamp>
-      <contributor><username>Ed</username><id>1</id></contributor>
-      <model>wikitext</model><format>text/x-wiki</format>
-      <text xml:space="preserve">Beta body, back to [[Alpha Article]].</text><sha1>b1</sha1>
-    </revision>
-  </page>
-</mediawiki>"#;
-
-    /// Build a tiny wikimak store the same way the crate's own acceptance
-    /// tests do (Instance::open + import + flush) — with dbname "wiki" so
-    /// the reader's `read_config` open-read path (the same one the engine's
-    /// wiki_attach uses) finds it.
-    fn build_wiki_store(root: &Path) {
-        let cfg = wikimak_wikipedia::InstanceConfig {
-            root: root.to_path_buf(),
-            dbname: "wiki".into(),
-            max_chain_id: 4096,
-            depot: wikimak_depot::DepotConfig {
-                root: root.join("depot"),
-                max_chain_id: 4096,
-                file_size_threshold: 1 << 30,
-                eviction_dead_ratio: 0.5,
-            },
-            title_shard_count: 1,
-            title_seal_threshold_bytes: 1 << 20,
-            f1_seal_threshold_bytes: 0,
+    fn build_wiki_store(root: &Path) -> PathBuf {
+        use wikimak_wikipedia::archive::{
+            ArchiveWriter, ManifestRecord, Record, RevisionRecord, SiteInfoRecord,
+            SiteNamespaceRecord,
         };
-        let inst = wikimak_wikipedia::Instance::open(cfg).expect("create test wiki store");
-        let mut stream =
-            wikimak_mediawiki::new_page_stream(std::io::Cursor::new(WIKI_XML.as_bytes().to_vec()));
-        inst.import(&mut stream).expect("import fixture");
-        inst.flush().expect("flush");
+        use wikimak_wikipedia::{ContributorMeta, RevisionMeta};
+        let archive = root.join("readertest.swdump");
+        let mut writer =
+            ArchiveWriter::new(std::fs::File::create(&archive).unwrap(), 1024).unwrap();
+        let timestamp = chrono::DateTime::parse_from_rfc3339("2022-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        for (page_id, revision_id, title, text) in [
+            (
+                1,
+                11,
+                "Alpha Article",
+                "== Overview ==\nAlpha body linking [[Beta Article]] and [https://example.org outside].",
+            ),
+            (
+                2,
+                21,
+                "Beta Article",
+                "Beta body, back to [[Alpha Article]].",
+            ),
+        ] {
+            writer
+                .write(&Record::PageState {
+                    page_id,
+                    timestamp_micros: timestamp.timestamp_micros(),
+                    title: title.into(),
+                    namespace: Some(0),
+                    deleted: false,
+                })
+                .unwrap();
+            writer
+                .write(&Record::Revision {
+                    page_id,
+                    revision: RevisionRecord {
+                        meta: RevisionMeta {
+                            rev_id: revision_id,
+                            parent_id: 0,
+                            ts: timestamp,
+                            contributor: ContributorMeta::Named {
+                                username: "Ed".into(),
+                                user_id: 1,
+                            },
+                            comment: String::new(),
+                            sha1: String::new(),
+                            flags: 0,
+                            text_len: text.len() as u64,
+                        },
+                        has_text: true,
+                        text: text.as_bytes().to_vec(),
+                        visibility: None,
+                        history: None,
+                    },
+                })
+                .unwrap();
+        }
+        writer
+            .write(&Record::Manifest {
+                timestamp_micros: timestamp.timestamp_micros(),
+                manifest: ManifestRecord {
+                    wiki_db: "readertest".into(),
+                    content_snapshot: "2022-01-01".into(),
+                    metadata_snapshot: "2022-01-01".into(),
+                    source_files: Vec::new(),
+                },
+            })
+            .unwrap();
+        writer
+            .write(&Record::SiteInfo {
+                timestamp_micros: timestamp.timestamp_micros(),
+                site_info: SiteInfoRecord {
+                    site_name: "Reader Test Wiki".into(),
+                    db_name: "readertest".into(),
+                    base: "http://reader.test/wiki/Main_Page".into(),
+                    generator: "g".into(),
+                    case: "first-letter".into(),
+                    language: "en".into(),
+                    rtl: false,
+                    server: "http://reader.test".into(),
+                    script_path: "/w".into(),
+                    namespaces: vec![
+                        SiteNamespaceRecord {
+                            id: 0,
+                            case: "first-letter".into(),
+                            localized_name: String::new(),
+                            aliases: Vec::new(),
+                        },
+                        SiteNamespaceRecord {
+                            id: 10,
+                            case: "first-letter".into(),
+                            localized_name: "Template".into(),
+                            aliases: Vec::new(),
+                        },
+                    ],
+                    interwiki: Vec::new(),
+                    magic_words: Vec::new(),
+                },
+            })
+            .unwrap();
+        writer.finish().unwrap();
+        wikimak_wikipedia::title_index::build(
+            &archive,
+            archive.with_extension("swtitle"),
+        )
+        .unwrap();
+        archive
     }
 
     #[test]
     fn wiki_page_renders_and_internal_links_follow() {
         let tmp = tempfile::tempdir().unwrap();
-        build_wiki_store(tmp.path());
+        let archive = build_wiki_store(tmp.path());
         // No title → the default-page pick (no Main Page here: first title).
-        let picked = wiki_default_title(tmp.path()).unwrap();
+        let picked = wiki_default_title(&archive).unwrap();
         assert_eq!(picked, "Alpha Article");
         let mut r =
-            Reader::open_wiki(tmp.path().to_path_buf(), Some("Alpha Article".into())).unwrap();
+            Reader::open_wiki(archive.clone(), Some("Alpha Article".into())).unwrap();
         let buf = frame(&mut r, 70, 16);
         let text = buffer_text(&buf);
         assert!(
@@ -1450,7 +1507,7 @@ Alpha body linking [[Beta Article]] and [https://example.org outside].</text><sh
         r.handle_key(KeyCode::Enter);
         assert!(r.status.contains("external link"), "{}", r.status);
         // A dead wiki title refuses loudly.
-        let e = match Reader::open_wiki(tmp.path().to_path_buf(), Some("No Such Page".into())) {
+        let e = match Reader::open_wiki(archive, Some("No Such Page".into())) {
             Err(e) => e,
             Ok(_) => panic!("opening a missing wiki page must fail"),
         };

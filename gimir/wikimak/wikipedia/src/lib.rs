@@ -1,13 +1,8 @@
 //! # wikimak-wikipedia
 //!
-//! Wikipedia-specific glue. Per-instance depot binding, titles pool, page
-//! importer that feeds a `mediawiki::PageStream` into a `depot` chain.
-//!
-//! Scope of this crate: the domain layer. It pulls together depot
-//! (storage), mediawiki (dump I/O), and strpool (title bytes).
-//!
-//! See `SPEC.md` for the on-disk layout, per-revision codec, and
-//! crash-safety contract.
+//! Portable Wikipedia archive construction, update, lookup, and serving.
+//! The normal mirror path is one `.swdump` event stream plus its generated
+//! `.swtitle` lookup index.
 
 pub mod asof;
 pub mod archive;

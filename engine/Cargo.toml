@@ -33,7 +33,6 @@ gitdepot = { path = "../gimir/gitdepot" }
 # in a child process.
 ietf_mirror = { path = "../gimir/ietf-mirror", package = "ietf-mirror", default-features = false, features = ["fetch"] }
 wikimak_wikipedia = { path = "../gimir/wikimak/wikipedia", package = "wikimak-wikipedia", default-features = false, features = ["fetch", "serve"] }
-wikimak_depot = { path = "../gimir/wikimak/depot", package = "wikimak-depot" }
 base64 = "0.22.1"
 bytes = "1.10"
 brush-core = "0.5"
@@ -283,9 +282,7 @@ syntastica-themes = "0.6.1"
 # found (String, Registration<_>)" type-mismatch noise across builtin
 # registration). Once brush-core 0.6 ships to crates.io, drop this.
 [dev-dependencies]
-# reader.rs's wiki test builds a tiny wikimak store in-test (the crate's own
-# acceptance-test recipe: Instance::open + import(new_page_stream) + flush).
-wikimak_mediawiki = { path = "../gimir/wikimak/mediawiki", package = "wikimak-mediawiki", default-features = false }
+chrono = "0.4"
 tempfile = "3"
 
 [patch.crates-io]

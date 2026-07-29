@@ -5891,6 +5891,7 @@ dependencies = [
  "brush-parser",
  "bytes",
  "bzip2-rs",
+ "chrono",
  "clap",
  "crossterm",
  "depot",
@@ -5990,8 +5991,6 @@ dependencies = [
  "uu_whoami",
  "uucore 0.8.0",
  "virtiofsd",
- "wikimak-depot",
- "wikimak-mediawiki",
  "wikimak-scribunto",
  "wikimak-wikipedia",
  "wikimak-wikitext",
@@ -9368,6 +9367,7 @@ dependencies = [
  "depot",
  "hex",
  "libc",
+ "memmap2",
  "regex",
  "reqwest 0.12.28",
  "rusqlite",
@@ -9375,6 +9375,7 @@ dependencies = [
  "serde_json",
  "sha1",
  "strpool",
+ "tempfile",
  "thiserror 1.0.69",
  "tiny_http",
  "wikimak-depot",
@@ -9382,6 +9383,7 @@ dependencies = [
  "wikimak-mediawiki",
  "wikimak-scribunto",
  "wikimak-wikitext",
+ "xxhash-rust",
  "zstd",
 ]
 
@@ -9824,6 +9826,12 @@ dependencies = [
  "libc",
  "rustix",
 ]
+
+[[package]]
+name = "xxhash-rust"
+version = "0.8.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aee1b19627c7c60102ab80d3a9cbe18de90bfe03bfa6c3715447681f0e8c8af6"
 
 [[package]]
 name = "y4m"

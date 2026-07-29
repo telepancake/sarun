@@ -376,7 +376,12 @@ fn home_response(app: &App) -> Resp {
             .and_then(|base| base.split_once("/wiki/").map(|(_, title)| title.to_string()))
             .map(|title| percent_decode(title.split(['?', '#']).next().unwrap_or(&title)))
             .filter(|title| !title.is_empty()),
-        AppSource::Archive(_) => None,
+        AppSource::Archive(archive) => archive
+            .site_info()
+            .base
+            .split_once("/wiki/")
+            .map(|(_, title)| percent_decode(title.split(['?', '#']).next().unwrap_or(title)))
+            .filter(|title| !title.is_empty()),
     };
     match main_page {
         Some(title) => redirect(&format!(

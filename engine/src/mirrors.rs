@@ -320,21 +320,6 @@ pub fn job_run_full(id: i64) -> Result<(), String> {
     Ok(())
 }
 
-/// Explicitly reconcile every MediaWiki History partition. Kept separate
-/// from full XML content re-ingest because either operation can be enormous.
-pub fn job_reconcile_history(id: i64) -> Result<(), String> {
-    let jobs = jobs_list()?;
-    let job = jobs.into_iter().find(|j| j.id == id).ok_or("no such job")?;
-    if job.kind != "wiki" {
-        return Err("history reconciliation is only available for wiki mirrors".into());
-    }
-    if running_map(|m| m.contains_key(&id)) {
-        return Err("job is already running".into());
-    }
-    spawn_run(job, WikiRun::ReconcileHistory);
-    Ok(())
-}
-
 /// Start every due, unpaused, not-running job. Returns the started ids.
 pub fn run_pending() -> Result<Vec<i64>, String> {
     let mut started = Vec::new();
@@ -377,7 +362,6 @@ fn driver_argv(name: &str, self_exe: Option<std::path::PathBuf>) -> Vec<String> 
 enum WikiRun {
     Maintain,
     RefreshContent,
-    ReconcileHistory,
 }
 
 fn spawn_run(job: Job, wiki_run: WikiRun) {
@@ -394,7 +378,6 @@ fn spawn_run(job: Job, wiki_run: WikiRun) {
                 match wiki_run {
                     WikiRun::Maintain => "fetch",
                     WikiRun::RefreshContent => "refresh-full",
-                    WikiRun::ReconcileHistory => "reconcile-history",
                 }
                 .into(),
                 job.src.clone(),

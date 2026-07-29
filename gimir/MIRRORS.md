@@ -6,21 +6,21 @@ each corpus's shape wants, served through sarun. Three mirrors first:
 
 | mirror | shape | store | state |
 |---|---|---|---|
-| **wikipedia** | ~99%-identical revision chains per page, plus page actions | `wikimak/*` (depot chains, un-sabotaged 2026-07, 138× measured after session-end `collect`) | `wikimak` CLI: full-snapshot bootstrap, daily adds/changes maintenance, MediaWiki History page actions, local browse |
+| **wikipedia** | revisions plus typed page/user/global actions | portable `.swdump` event stream with embedded dictionary + generated `.swtitle` lookup | `wikimak` CLI: full-snapshot bootstrap, daily adds/changes merge, MediaWiki History actions, direct local browse |
 | **IETF drafts** | revision chains per draft name (`draft-x-00..-NN`) — the tiered-VBF doc's other named workload | multi-chain `depot-vbf::VbfDepot` (canonical layers) + sqlite bookkeeping | `ietf-mirror` crate + `ietfmak` CLI: update (idempotent, incremental, 404-watermarked) / list / head / text / history |
 | **git repos** | DAG of tree snapshots, newest-first | `gitdepot` store (tiered four-chain wikimak-depot store — TREES/COMMITS/REFLOG/TAGS with stable indices; annotated tags stored as raw tag objects, nested chains included, tags at trees supported (deduped to a commit's tree or imported as a standalone TREES record; blob-target tags are the only refusal), refs resolve peeled; bounded prepend, proven by roundtrip.rs update_io_is_bounded_not_o_history; SHA-exact export, tag objects verbatim; no re-import path — a rewrite is new records + repointed refs) | import/export/`update` (incremental prepend, rewrites included) + `mirror` (bare-clone fetch loop) |
 
 ## Common architecture (per DEPOT-DESIGN)
 
-- **Store**: each mirror's data in its shape-appropriate depot; bookkeeping
-  (fetch cooldowns, watermarks, dump/series state) in its own sqlite —
-  never in the depot (§3).
+- **Store**: each mirror uses a shape-appropriate format. Wikipedia keeps its
+  source identity and update frontier in the portable event stream; IETF and
+  git continue to use depots.
 - **Fetch**: eventually inside sarun tap boxes (SCOPING.md's mesh: flows
   visible, per-host limits, tokens host-side). First iterations may fetch
   host-side; the box move is mechanical later.
-- **Serve**: reads through the depot APIs; workspace access via RO
-  attachments (§8), materialized through the depot-cache (§7) — a wiki
-  snapshot or a git ref attaches to a box with no checkout.
+- **Serve**: Wikipedia reads frames directly from the archive; other mirrors
+  retain their depot APIs. A pinned wiki revision or git ref attaches to a box
+  with no checkout.
 - **Update**: incremental by design — chains prepend (newest-first; the new head is frame 0). Scheduled by the
   engine (`engine/src/mirrors.rs` + `sarun mirror` CLI + the Mirrors
   pane): jobs in `{state_home}/mirrors.db`, a minute tick starts due
@@ -30,39 +30,25 @@ each corpus's shape wants, served through sarun. Three mirrors first:
   or an argv[0] symlink); a run spawns the engine's own binary in driver
   mode, so the engine PROCESS still never dials out — fetch happens in
   the child. Interrupted runs surface as
-  `stopped` and auto-resume — safe because the stores self-repair
-  (chain-authoritative rerun/atomic index flips in wikimak,
-  watermark fences in ietf-mirror,
-  per-root flocks in both).
-- **Portable Wikipedia libraries**: the mirror root is self-identifying
-  (`wiki_dbname` in `meta.db`); its mount path and directory name are not
-  identity. In the Mirrors pane, `O` opens either one existing root or a
-  directory containing roots. Sarun validates `meta.db`, `depot/`, and
-  `titles/` read-only, then records the current absolute paths in this
-  host's `mirrors.db`. Attached jobs start paused—browsing is immediate,
+  `stopped` and auto-resume.
+- **Portable Wikipedia libraries**: each `.swdump` is self-identifying through
+  its manifest; its mount path and filename are not identity. In the Mirrors
+  pane, `O` opens one archive or a directory of archives. Sarun validates the
+  archive and adjacent `.swtitle`, then records the current absolute path in
+  this host's `mirrors.db`. Attached jobs start paused—browsing is immediate,
   while network upkeep requires an explicit resume.
 
 ## Phases
 
-1. **wikipedia driver** (`wikimak` CLI): DONE — import + head/history/
-   text and local HTTP browsing. A new mirror bootstraps once from a full
-   content-history XML snapshot. Routine `fetch` consumes only daily
-   adds/changes and MediaWiki History page-action TSVs: initially every
-   action partition, then the previous snapshot's frontier partition plus
-   every later partition from a newer History snapshot (the former frontier
-   is partial and expands in the next snapshot).
-   Full XML re-ingest is the separate explicit `refresh-full` command;
-   all-partition action/visibility reconciliation is the separate explicit
-   `reconcile-history` command. Neither is scheduled automatically.
-   Advertised XML SHA-256/SHA-1/MD5 is calculated during direct streaming:
-   a mismatch leaves complete pages recovered but refuses the part watermark,
-   so a later copy deduplicates the valid prefix and continues. History TSVs
-   have no adjacent advertised digest, so each bzip2 stream is imported in
-   one SQLite transaction and rolls back on decoding or parse failure.
-   History also records upstream revision visibility/suppression metadata;
-   it never removes archived revision content. Because Wikimedia may revise
-   arbitrary old partitions, the frontier update is recorded separately
-   from the last explicitly fully reconciled History snapshot.
+1. **wikipedia driver** (`wikimak` CLI): DONE — create/update, pinned revision
+   attachments, document rendering, and local HTTP browsing all read the
+   archive format. A new mirror bootstraps from full revision XML and every
+   MediaWiki History partition. Routine `fetch` merges daily adds/changes with
+   the newest completed and current partial History partitions, using three
+   days of overlap. The installed result is repacked at zstd level 9 into
+   128 KiB frames with an 800 KiB embedded dictionary, then `.swtitle` is
+   regenerated. `refresh-full` is an explicit full re-download and is never
+   scheduled automatically. Scratch-space reduction remains future work.
 2. **IETF drafts** (`ietf-mirror` crate): DONE — `all_id.txt` index →
    per-draft chains of full-snapshot canonical layers in a multi-chain
    `VbfDepot`; sqlite for series state; `update` idempotent + resumable

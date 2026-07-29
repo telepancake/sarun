@@ -80,12 +80,126 @@ impl ArchiveBrowseIndex {
         self.manifest.as_ref()
     }
 
+    pub fn site_info(&self) -> &SiteInfoRecord {
+        &self.site_info
+    }
+
     pub fn page_id_by_title(&self, title: &str, timestamp: i64) -> Option<u64> {
         self.titles.lookup(title, timestamp, &self.site_info)
     }
 
-    pub fn pages(&self, _filter: Option<&str>, _limit: usize) -> Vec<(u64, String)> {
-        Vec::new()
+    pub fn pages(&self, filter: Option<&str>, limit: usize) -> Vec<(u64, String)> {
+        let filter = filter.map(str::to_lowercase);
+        let mut seen = std::collections::HashSet::new();
+        let mut pages = Vec::new();
+        for location in &self.frames {
+            if location.info.first_entity.kind != EntityKind::Page || pages.len() >= limit {
+                break;
+            }
+            let result = visit_frame_while(&self.path, location, |record| {
+                if let Record::PageState {
+                    page_id,
+                    title,
+                    deleted,
+                    ..
+                } = record
+                {
+                    if seen.insert(page_id)
+                        && !deleted
+                        && filter
+                            .as_ref()
+                            .is_none_or(|needle| title.to_lowercase().contains(needle))
+                    {
+                        pages.push((page_id, title));
+                    }
+                }
+                Ok(pages.len() < limit)
+            });
+            if result.is_err() {
+                break;
+            }
+        }
+        pages
+    }
+
+    pub fn first_page(&self) -> crate::archive::Result<Option<(u64, String)>> {
+        for location in &self.frames {
+            if location.info.first_entity.kind != EntityKind::Page {
+                break;
+            }
+            let mut found = None;
+            visit_frame_while(&self.path, location, |record| {
+                if let Record::PageState {
+                    page_id,
+                    title,
+                    deleted,
+                    ..
+                } = record
+                {
+                    if !deleted {
+                        found = Some((page_id, title));
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            })?;
+            if found.is_some() {
+                return Ok(found);
+            }
+        }
+        Ok(None)
+    }
+
+    pub fn current_title(
+        &self,
+        page_id: u64,
+    ) -> crate::archive::Result<Option<String>> {
+        let Some(location) = self.page_frame(page_id) else {
+            return Ok(None);
+        };
+        let mut title = None;
+        visit_frame_while(&self.path, location, |record| {
+            if record.page_id() != Some(page_id) {
+                return Ok(true);
+            }
+            if let Record::PageState {
+                title: candidate,
+                deleted,
+                ..
+            } = record
+            {
+                if !deleted {
+                    title = Some(candidate);
+                }
+                return Ok(false);
+            }
+            Ok(true)
+        })?;
+        Ok(title)
+    }
+
+    pub fn revision(
+        &self,
+        page_id: u64,
+        revision_id: u64,
+    ) -> crate::archive::Result<Option<RevisionRecord>> {
+        let Some(location) = self.page_frame(page_id) else {
+            return Ok(None);
+        };
+        let mut selected = None;
+        visit_frame_while(&self.path, location, |record| {
+            if record.page_id() != Some(page_id) {
+                return Ok(true);
+            }
+            if let Record::Revision { revision, .. } = record {
+                if revision.meta.rev_id == revision_id {
+                    selected = Some(revision);
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        })?;
+        Ok(selected)
     }
 
     pub fn revision_at(
@@ -344,6 +458,13 @@ mod tests {
         assert_eq!(std::fs::metadata(&title_index).unwrap().len(), 16);
         let index = ArchiveBrowseIndex::open(&path, &title_index).unwrap();
         assert_eq!(index.page_id_by_title("Testa_lapa", i64::MAX), Some(7));
+        assert_eq!(index.current_title(7).unwrap().as_deref(), Some("Testa lapa"));
+        assert_eq!(
+            index.first_page().unwrap(),
+            Some((7, "Testa lapa".into()))
+        );
+        assert_eq!(index.pages(Some("LAPA"), 10), vec![(7, "Testa lapa".into())]);
+        assert_eq!(index.revision(7, 10).unwrap().unwrap().text, b"old");
         assert_eq!(
             index.page_text_at(7, i64::MAX).unwrap(),
             Some(b"hello".to_vec())
