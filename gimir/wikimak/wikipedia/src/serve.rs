@@ -164,7 +164,9 @@ impl App {
                 .page_id_by_title_at(title, timestamp_micros)
                 .ok()
                 .flatten(),
-            AppSource::Archive(archive) => archive.page_id_by_title(title),
+            AppSource::Archive(archive) => {
+                archive.page_id_by_title(title, timestamp_micros.unwrap_or(i64::MAX))
+            }
         }
     }
 

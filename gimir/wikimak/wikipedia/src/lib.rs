@@ -30,9 +30,12 @@ pub(crate) mod revision_merge;
 pub mod serve;
 pub mod schema;
 pub mod title_slots;
+pub mod title_index;
 pub(crate) mod title_history;
 #[cfg(feature = "fetch")]
 pub mod sync;
+#[cfg(feature = "fetch")]
+pub mod siteinfo;
 pub(crate) mod titles;
 
 pub use error::{Error, Result};

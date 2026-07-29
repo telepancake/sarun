@@ -515,7 +515,7 @@ pub(crate) fn typed_history_records(
             let page_id = optional_i64(file, line, "page_id", fields[page])?
                 .and_then(|id| u64::try_from(id).ok())
                 .filter(|id| *id > 0);
-            Ok(vec![crate::archive::Record::PageAction {
+            let mut records = vec![crate::archive::Record::PageAction {
                 entity: crate::archive::EntityKey {
                     kind: page_id.map_or(
                         crate::archive::EntityKind::Global,
@@ -540,7 +540,33 @@ pub(crate) fn typed_history_records(
                         file, line, "page_is_deleted", fields[page + 8],
                     )?,
                 },
-            }])
+            }];
+            let current_title =
+                unescape_tsv(file, line, "page_title_current", fields[page + 2])?;
+            let current_namespace = optional_i64(
+                file,
+                line,
+                "page_namespace_current",
+                fields[page + 5],
+            )?;
+            if let (Some(page_id), Some(namespace)) = (page_id, current_namespace) {
+                if !current_title.is_empty() {
+                    records.push(crate::archive::Record::PageState {
+                        page_id,
+                        timestamp_micros,
+                        title: current_title,
+                        namespace: Some(namespace),
+                        deleted: optional_history_bool(
+                            file,
+                            line,
+                            "page_is_deleted",
+                            fields[page + 8],
+                        )?
+                        .unwrap_or(false),
+                    });
+                }
+            }
+            Ok(records)
         }
         "user" => {
             let user = page + 13;

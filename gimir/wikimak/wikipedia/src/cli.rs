@@ -12,6 +12,8 @@
 //!   wikimak archive-export <root> <file>        portable ordered event stream
 //!   wikimak archive-build-direct <db> <file> <scratch>
 //!   wikimak archive-build-update <db> <base> <file> <scratch>
+//!   wikimak archive-fetch-siteinfo <api-url> <file>
+//!   wikimak archive-title-index <archive> <index>
 //!   wikimak archive-repack <input> <output> <frame-bytes> <level> [settings]
 //!   wikimak archive-merge <output> <frame-bytes> <level> <inputs...>
 //!   wikimak archive-inspect <file>              validate and summarize stream
@@ -440,11 +442,11 @@ fn cmd_serve(root: &str, addr: &str) -> Result<(), String> {
 #[cfg(feature = "serve")]
 fn cmd_archive_serve(path: &str, addr: &str) -> Result<(), String> {
     let started = std::time::Instant::now();
-    let archive = crate::archive_browse::ArchiveBrowseIndex::open(path)
+    let title_index = PathBuf::from(path).with_extension("swtitle");
+    let archive = crate::archive_browse::ArchiveBrowseIndex::open(path, &title_index)
         .map_err(|error| error.to_string())?;
     eprintln!(
-        "wikimak archive-serve: indexed {} pages, {} titles, {} frames in {:.3}s",
-        archive.page_count(),
+        "wikimak archive-serve: opened {} title intervals, {} frames in {:.3}s",
         archive.title_count(),
         archive.frame_count(),
         started.elapsed().as_secs_f64(),
@@ -574,6 +576,34 @@ fn cmd_archive_build_update(
         stats.scratch_peak_bytes,
         stats.elapsed_millis / 1000,
         stats.elapsed_millis % 1000,
+    );
+    Ok(())
+}
+
+fn cmd_archive_fetch_siteinfo(api_url: &str, output: &str) -> Result<(), String> {
+    let client = reqwest::blocking::Client::builder()
+        .user_agent("sarun-wikimak/0.1 (https://github.com/telepancake/sarun)")
+        .build()
+        .map_err(|error| error.to_string())?;
+    crate::siteinfo::fetch_siteinfo_archive(
+        &client,
+        api_url,
+        output,
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn cmd_archive_title_index(
+    archive: &str,
+    output: &str,
+) -> Result<(), String> {
+    let entries =
+        crate::title_index::build(archive, output).map_err(|error| error.to_string())?;
+    println!(
+        "title index {entries} entries, {} bytes",
+        std::fs::metadata(output)
+            .map_err(|error| error.to_string())?
+            .len()
     );
     Ok(())
 }
@@ -1046,6 +1076,10 @@ pub fn cli_main(args: &[String]) -> i32 {
             cmd_archive_build_direct(dbname, output, scratch),
         ["archive-build-update", dbname, base, output, scratch] =>
             cmd_archive_build_update(dbname, base, output, scratch),
+        ["archive-fetch-siteinfo", api_url, output] =>
+            cmd_archive_fetch_siteinfo(api_url, output),
+        ["archive-title-index", archive, output] =>
+            cmd_archive_title_index(archive, output),
         ["archive-repack", args @ ..] => cmd_archive_repack(args),
         ["archive-merge", args @ ..] => cmd_archive_merge(args),
         ["archive-inspect", path] => cmd_archive_inspect(path),
@@ -1073,6 +1107,8 @@ pub fn cli_main(args: &[String]) -> i32 {
                   \x20      wikimak archive-export <root> <file>\n\
                   \x20      wikimak archive-build-direct <dbname> <file> <scratch-dir>\n\
                   \x20      wikimak archive-build-update <dbname> <base-dump> <file> <scratch-dir>\n\
+                  \x20      wikimak archive-fetch-siteinfo <api-url> <file>\n\
+                  \x20      wikimak archive-title-index <archive> <index>\n\
                   \x20      wikimak archive-repack <input> <output> <frame-bytes> <zstd-level> [settings]\n\
                   \x20      wikimak archive-merge <output> <frame-bytes> <zstd-level> [settings] <input>...\n\
                   \x20      wikimak archive-inspect|archive-histogram <file>".into()),

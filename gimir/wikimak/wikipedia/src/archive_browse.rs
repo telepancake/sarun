@@ -1,8 +1,6 @@
 //! Read-only browsing directly from a portable Wikipedia archive.
 
-use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::archive::{
     index_file, visit_frame, visit_frame_while, EntityKind, FrameLocation, ManifestRecord,
@@ -13,8 +11,7 @@ use crate::archive::{
 pub struct ArchiveBrowseIndex {
     path: PathBuf,
     frames: Vec<FrameLocation>,
-    titles: HashMap<String, u64>,
-    pages: Vec<(u64, String)>,
+    titles: crate::title_index::TitleIndex,
     site_info: SiteInfoRecord,
     manifest: Option<ManifestRecord>,
 }
@@ -26,12 +23,11 @@ pub struct ArchiveAsOfView<'a> {
     site: wikimak_wikitext::SiteConfig,
 }
 
-struct FrameScan {
-    pages: Vec<(u64, Vec<String>)>,
-}
-
 impl ArchiveBrowseIndex {
-    pub fn open(path: impl AsRef<Path>) -> crate::archive::Result<Self> {
+    pub fn open(
+        path: impl AsRef<Path>,
+        title_index: impl AsRef<Path>,
+    ) -> crate::archive::Result<Self> {
         let path = path.as_ref().to_path_buf();
         let (_, frames, complete) = index_file(&path)?;
         if !complete {
@@ -39,67 +35,9 @@ impl ArchiveBrowseIndex {
                 "archive has no clean completion marker",
             ));
         }
-        let mut titles = HashMap::<String, u64>::new();
-        let mut page_titles = BTreeMap::<u64, String>::new();
+        let titles = crate::title_index::TitleIndex::open(title_index)?;
         let mut manifest = None;
         let mut site_info = None;
-
-        let page_frame_numbers: Vec<usize> = frames
-            .iter()
-            .enumerate()
-            .filter_map(|(frame_number, location)| {
-                (location.info.first_entity.kind == EntityKind::Page).then_some(frame_number)
-            })
-            .collect();
-        let next_frame = AtomicUsize::new(0);
-        let worker_count = std::thread::available_parallelism()
-            .map_or(1, usize::from)
-            .min(page_frame_numbers.len().max(1));
-        let scanned = std::thread::scope(|scope| {
-            let mut handles = Vec::with_capacity(worker_count);
-            for _ in 0..worker_count {
-                handles.push(scope.spawn(|| {
-                    let mut output = Vec::new();
-                    loop {
-                        let job = next_frame.fetch_add(1, Ordering::Relaxed);
-                        let Some(&frame_number) = page_frame_numbers.get(job) else {
-                            break;
-                        };
-                        output.push(scan_page_frame(&path, &frames[frame_number])?);
-                    }
-                    crate::archive::Result::Ok(output)
-                }));
-            }
-            let mut output = Vec::new();
-            for handle in handles {
-                output.extend(
-                    handle
-                        .join()
-                        .map_err(|_| {
-                            crate::archive::ArchiveError::Invalid(
-                                "archive index worker panicked",
-                            )
-                        })??,
-                );
-            }
-            crate::archive::Result::Ok(output)
-        })?;
-
-        for scan in scanned {
-            for (page_id, current_titles) in scan.pages {
-                for current_title in current_titles {
-                    titles.insert(normalize_title_key(&current_title), page_id);
-                    page_titles
-                        .entry(page_id)
-                        .and_modify(|title| {
-                            if current_title < *title {
-                                *title = current_title.clone();
-                            }
-                        })
-                        .or_insert(current_title);
-                }
-            }
-        }
         for location in &frames {
             if location.info.first_entity.kind != EntityKind::Global {
                 continue;
@@ -108,10 +46,10 @@ impl ArchiveBrowseIndex {
                 match record {
                     Record::Manifest {
                         manifest: record, ..
-                    } => manifest = Some(record),
+                    } if manifest.is_none() => manifest = Some(record),
                     Record::SiteInfo {
                         site_info: record, ..
-                    } => site_info = Some(record),
+                    } if site_info.is_none() => site_info = Some(record),
                     _ => {}
                 }
                 Ok(())
@@ -125,18 +63,13 @@ impl ArchiveBrowseIndex {
             path,
             frames,
             titles,
-            pages: page_titles.into_iter().collect(),
             site_info,
             manifest,
         })
     }
 
-    pub fn page_count(&self) -> usize {
-        self.pages.len()
-    }
-
-    pub fn title_count(&self) -> usize {
-        self.titles.len()
+    pub fn title_count(&self) -> u64 {
+        self.titles.entries()
     }
 
     pub fn frame_count(&self) -> usize {
@@ -147,22 +80,12 @@ impl ArchiveBrowseIndex {
         self.manifest.as_ref()
     }
 
-    pub fn page_id_by_title(&self, title: &str) -> Option<u64> {
-        self.titles.get(&normalize_title_key(title)).copied()
+    pub fn page_id_by_title(&self, title: &str, timestamp: i64) -> Option<u64> {
+        self.titles.lookup(title, timestamp, &self.site_info)
     }
 
-    pub fn pages(&self, filter: Option<&str>, limit: usize) -> Vec<(u64, String)> {
-        let filter = filter.map(|value| value.to_lowercase());
-        self.pages
-            .iter()
-            .filter(|(_, title)| {
-                filter
-                    .as_ref()
-                    .is_none_or(|needle| title.to_lowercase().contains(needle))
-            })
-            .take(limit)
-            .cloned()
-            .collect()
+    pub fn pages(&self, _filter: Option<&str>, _limit: usize) -> Vec<(u64, String)> {
+        Vec::new()
     }
 
     pub fn revision_at(
@@ -216,7 +139,10 @@ impl ArchiveBrowseIndex {
         let mut site = wikimak_wikitext::SiteConfig {
             site_name: self.site_info.site_name.clone(),
             db_name: self.site_info.db_name.clone(),
-            server: server_from_base(&self.site_info.base),
+            lang: self.site_info.language.clone(),
+            rtl: self.site_info.rtl,
+            server: self.site_info.server.clone(),
+            script_path: self.site_info.script_path.clone(),
             ..wikimak_wikitext::SiteConfig::default()
         };
         site.interwiki = self
@@ -246,6 +172,16 @@ impl ArchiveBrowseIndex {
                 },
             );
         }
+        for word in &self.site_info.magic_words {
+            for alias in &word.aliases {
+                site.magic_aliases
+                    .insert(alias.clone(), word.canonical_name.clone());
+                if !word.case_sensitive {
+                    site.magic_aliases
+                        .insert(alias.to_lowercase(), word.canonical_name.clone());
+                }
+            }
+        }
         ArchiveAsOfView {
             archive: self,
             timestamp_micros,
@@ -256,43 +192,11 @@ impl ArchiveBrowseIndex {
     }
 }
 
-fn scan_page_frame(
-    path: &Path,
-    location: &FrameLocation,
-) -> crate::archive::Result<FrameScan> {
-    let mut pages = Vec::<(u64, Vec<String>)>::new();
-    visit_frame(path, location, |record| {
-        let page_id = record.page_id().expect("page frame contains page records");
-        if pages.last().is_none_or(|(last, _)| *last != page_id) {
-            pages.push((page_id, Vec::new()));
-        }
-        if let Record::PageState { current_title, .. } = record {
-            pages.last_mut().expect("inserted above").1.push(current_title);
-        }
-        Ok(())
-    })?;
-    Ok(FrameScan { pages })
-}
-
-fn server_from_base(base: &str) -> String {
-    let Some(scheme_end) = base.find("://") else {
-        return String::new();
-    };
-    let host_start = scheme_end + 3;
-    let host_end = base[host_start..]
-        .find('/')
-        .map_or(base.len(), |offset| host_start + offset);
-    base[..host_end].to_string()
-}
-
-fn normalize_title_key(title: &str) -> String {
-    title.replace('_', " ").trim().to_string()
-}
-
 impl wikimak_wikitext::PageStore for ArchiveAsOfView<'_> {
     fn page_text(&self, title: &wikimak_wikitext::Title) -> Option<String> {
         let title = title.prefixed(&self.site);
-        let page_id = self.archive.page_id_by_title(&title)?;
+        let at = self.timestamp_micros.unwrap_or(i64::MAX);
+        let page_id = self.archive.page_id_by_title(&title, at)?;
         let text = self
             .archive
             .page_text_at(
@@ -306,19 +210,24 @@ impl wikimak_wikitext::PageStore for ArchiveAsOfView<'_> {
 
     fn page_exists(&self, title: &wikimak_wikitext::Title) -> bool {
         self.archive
-            .page_id_by_title(&title.prefixed(&self.site))
+            .page_id_by_title(
+                &title.prefixed(&self.site),
+                self.timestamp_micros.unwrap_or(i64::MAX),
+            )
             .is_some()
     }
 
     fn page_id(&self, title: &wikimak_wikitext::Title) -> Option<u64> {
         self.archive
-            .page_id_by_title(&title.prefixed(&self.site))
+            .page_id_by_title(
+                &title.prefixed(&self.site),
+                self.timestamp_micros.unwrap_or(i64::MAX),
+            )
     }
 
     fn page_count(&self, namespace: Option<i32>) -> Option<u64> {
-        namespace
-            .is_none()
-            .then_some(self.archive.page_count() as u64)
+        let _ = namespace;
+        None
     }
 
     fn site(&self) -> &wikimak_wikitext::SiteConfig {
@@ -345,8 +254,10 @@ mod tests {
         writer
             .write(&Record::PageState {
                 page_id: 7,
-                timestamp_micros: i64::MAX,
-                current_title: "Testa lapa".into(),
+                timestamp_micros: Utc.timestamp_opt(200, 0).unwrap().timestamp_micros(),
+                title: "Testa lapa".into(),
+                namespace: None,
+                deleted: false,
             })
             .unwrap();
         writer
@@ -392,6 +303,17 @@ mod tests {
             })
             .unwrap();
         writer
+            .write(&Record::Manifest {
+                timestamp_micros: i64::MAX,
+                manifest: crate::archive::ManifestRecord {
+                    wiki_db: "testwiki".into(),
+                    content_snapshot: "2026-07-29".into(),
+                    metadata_snapshot: "2026-07".into(),
+                    source_files: Vec::new(),
+                },
+            })
+            .unwrap();
+        writer
             .write(&Record::SiteInfo {
                 timestamp_micros: i64::MAX,
                 site_info: SiteInfoRecord {
@@ -400,6 +322,10 @@ mod tests {
                     base: "https://test.invalid/wiki/Main_Page".into(),
                     generator: "MediaWiki".into(),
                     case: "first-letter".into(),
+                    language: "lv".into(),
+                    rtl: false,
+                    server: "https://test.invalid".into(),
+                    script_path: "/w".into(),
                     namespaces: vec![crate::archive::SiteNamespaceRecord {
                         id: 0,
                         case: "first-letter".into(),
@@ -407,14 +333,17 @@ mod tests {
                         aliases: Vec::new(),
                     }],
                     interwiki: Vec::new(),
+                    magic_words: Vec::new(),
                 },
             })
             .unwrap();
         writer.finish().unwrap();
 
-        let index = ArchiveBrowseIndex::open(&path).unwrap();
-        assert_eq!(index.page_count(), 1);
-        assert_eq!(index.page_id_by_title("Testa_lapa"), Some(7));
+        let title_index = temporary.path().join("sample.swtitle");
+        crate::title_index::build(&path, &title_index).unwrap();
+        assert_eq!(std::fs::metadata(&title_index).unwrap().len(), 16);
+        let index = ArchiveBrowseIndex::open(&path, &title_index).unwrap();
+        assert_eq!(index.page_id_by_title("Testa_lapa", i64::MAX), Some(7));
         assert_eq!(
             index.page_text_at(7, i64::MAX).unwrap(),
             Some(b"hello".to_vec())

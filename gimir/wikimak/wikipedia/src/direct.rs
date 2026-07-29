@@ -236,6 +236,7 @@ fn build_update_inner(
             &run.parts,
             &run_scratch,
             cores,
+            snapshot_date_micros(run.date)?,
             progress,
         )?);
     }
@@ -254,7 +255,7 @@ fn build_update_inner(
             .map_err(map_archive)?;
     manifest_writer
         .write(&Record::Manifest {
-            timestamp_micros: i64::MAX,
+            timestamp_micros: snapshot_date_micros(content_through)?,
             manifest: ManifestRecord {
                 wiki_db: dbname.to_owned(),
                 content_snapshot: content_through.to_string(),
@@ -269,7 +270,7 @@ fn build_update_inner(
     {
         manifest_writer
             .write(&Record::SiteInfo {
-                timestamp_micros: i64::MAX,
+                timestamp_micros: snapshot_date_micros(content_through)?,
                 site_info,
             })
             .map_err(map_archive)?;
@@ -369,8 +370,14 @@ fn build_direct_inner(
         frames
     };
 
-    let content_results =
-        build_content_parts(client, &content_run.parts, scratch, cores, progress)?;
+    let content_results = build_content_parts(
+        client,
+        &content_run.parts,
+        scratch,
+        cores,
+        snapshot_date_micros(content_run.date)?,
+        progress,
+    )?;
     let content_paths: Vec<PathBuf> = content_results
         .iter()
         .map(|result| result.path.clone())
@@ -407,7 +414,7 @@ fn build_direct_inner(
     source_files.sort();
     manifest_writer
         .write(&Record::Manifest {
-            timestamp_micros: i64::MAX,
+            timestamp_micros: snapshot_date_micros(content_run.date)?,
             manifest: ManifestRecord {
                 wiki_db: dbname.to_owned(),
                 content_snapshot: content_run.date.to_string(),
@@ -422,7 +429,7 @@ fn build_direct_inner(
         .ok_or(Error::Corrupt("content dumps contain no siteinfo"))?;
     manifest_writer
         .write(&Record::SiteInfo {
-            timestamp_micros: i64::MAX,
+            timestamp_micros: snapshot_date_micros(content_run.date)?,
             site_info,
         })
         .map_err(map_archive)?;
@@ -588,6 +595,7 @@ fn build_content_parts(
     parts: &[wikimak_mediawiki::Part],
     scratch: &Path,
     cores: usize,
+    observed_at_micros: i64,
     progress: &(impl Fn(&str) + Sync),
 ) -> Result<Vec<ContentPartResult>> {
     let groups = crate::sync::part_groups(parts.to_vec());
@@ -610,7 +618,15 @@ fn build_content_parts(
                 let Some((index, group)) = queue.lock().expect("queue mutex").pop_front() else {
                     return;
                 };
-                match build_content_group(client, &group, index, scratch, bz2_workers, progress) {
+                match build_content_group(
+                    client,
+                    &group,
+                    index,
+                    scratch,
+                    bz2_workers,
+                    observed_at_micros,
+                    progress,
+                ) {
                     Ok(result) => results.lock().expect("results mutex").push((index, result)),
                     Err(error) => {
                         *failure.lock().expect("failure mutex") = Some(error);
@@ -634,6 +650,7 @@ fn build_content_group(
     index: usize,
     scratch: &Path,
     bz2_workers: usize,
+    observed_at_micros: i64,
     progress: &(impl Fn(&str) + Sync),
 ) -> Result<ContentPartResult> {
     let path = scratch.join(format!("content-{index:06}.swdump"));
@@ -673,9 +690,14 @@ fn build_content_group(
                         .map_err(ArchiveError::Mirror)
                 })
             });
-            let count =
-                crate::archive::write_content_page(&mut writer, page_id, header.title, records)
-                    .map_err(map_archive)?;
+            let count = crate::archive::write_content_page(
+                &mut writer,
+                page_id,
+                observed_at_micros,
+                header.title,
+                records,
+            )
+            .map_err(map_archive)?;
             stats.pages += 1;
             stats.revisions += count;
         }
@@ -695,6 +717,10 @@ fn convert_site_info(site_info: &wikimak_mediawiki::SiteInfo) -> SiteInfoRecord 
         base: site_info.base.clone(),
         generator: site_info.generator.clone(),
         case: site_info.case.clone(),
+        language: String::new(),
+        rtl: false,
+        server: String::new(),
+        script_path: String::new(),
         namespaces: site_info
             .namespaces
             .values()
@@ -714,7 +740,14 @@ fn convert_site_info(site_info: &wikimak_mediawiki::SiteInfo) -> SiteInfoRecord 
                 is_local: interwiki.is_local,
             })
             .collect(),
+        magic_words: Vec::new(),
     }
+}
+
+fn snapshot_date_micros(date: chrono::NaiveDate) -> Result<i64> {
+    date.and_hms_micro_opt(23, 59, 59, 999_999)
+        .map(|value| value.and_utc().timestamp_micros())
+        .ok_or(Error::Corrupt("invalid content snapshot date"))
 }
 
 fn convert_revision(revision: wikimak_mediawiki::Revision) -> Result<RevisionRecord> {

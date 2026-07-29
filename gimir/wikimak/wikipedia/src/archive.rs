@@ -246,14 +246,26 @@ pub struct SiteInterwikiRecord {
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct SiteMagicWordRecord {
+    pub canonical_name: String,
+    pub aliases: Vec<String>,
+    pub case_sensitive: bool,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct SiteInfoRecord {
     pub site_name: String,
     pub db_name: String,
     pub base: String,
     pub generator: String,
     pub case: String,
+    pub language: String,
+    pub rtl: bool,
+    pub server: String,
+    pub script_path: String,
     pub namespaces: Vec<SiteNamespaceRecord>,
     pub interwiki: Vec<SiteInterwikiRecord>,
+    pub magic_words: Vec<SiteMagicWordRecord>,
 }
 
 struct PendingRecord {
@@ -522,7 +534,9 @@ pub enum Record {
     PageState {
         page_id: u64,
         timestamp_micros: i64,
-        current_title: String,
+        title: String,
+        namespace: Option<i64>,
+        deleted: bool,
     },
     Revision {
         page_id: u64,
@@ -1532,14 +1546,22 @@ fn record_value_order(left: &Record, right: &Record) -> std::cmp::Ordering {
     match (left, right) {
         (
             Record::PageState {
-                current_title: left,
+                title: left_title,
+                namespace: left_namespace,
+                deleted: left_deleted,
                 ..
             },
             Record::PageState {
-                current_title: right,
+                title: right_title,
+                namespace: right_namespace,
+                deleted: right_deleted,
                 ..
             },
-        ) => left.cmp(right),
+        ) => (left_deleted, left_namespace, left_title).cmp(&(
+            right_deleted,
+            right_namespace,
+            right_title,
+        )),
         (
             Record::Revision { revision: left, .. },
             Record::Revision {
@@ -1874,11 +1896,13 @@ fn export_page<W: Write>(
         .archive_revision_visibility(page_id)?
         .into_iter()
         .collect();
-    if let Some(current_title) = instance.page_current_title(page_id)? {
+    if let Some(title) = instance.page_current_title(page_id)? {
         writer.write(&Record::PageState {
             page_id,
-            timestamp_micros: i64::MAX,
-            current_title,
+            timestamp_micros: chrono::Utc::now().timestamp_micros(),
+            title,
+            namespace: None,
+            deleted: false,
         })?;
     }
 
@@ -1996,13 +2020,16 @@ impl PageRevisionSpool {
 pub(crate) fn write_content_page<W: Write>(
     writer: &mut ArchiveWriter<W>,
     page_id: u64,
-    current_title: String,
+    observed_at_micros: i64,
+    title: String,
     revisions: impl IntoIterator<Item = Result<RevisionRecord>>,
 ) -> Result<u64> {
     writer.write(&Record::PageState {
         page_id,
-        timestamp_micros: i64::MAX,
-        current_title,
+        timestamp_micros: observed_at_micros,
+        title,
+        namespace: None,
+        deleted: false,
     })?;
     let mut count = 0_u64;
     for revision in PageRevisionSpool::collect(revisions)? {
@@ -2093,7 +2120,9 @@ fn parse_timestamp_micros(value: &str) -> Result<i64> {
 
 fn record_wire_size(record: &Record) -> Result<(u8, u64)> {
     let size = match record {
-        Record::PageState { current_title, .. } => string_wire_len(current_title),
+        Record::PageState {
+            title, namespace, ..
+        } => checked_sum(&[option_i64_wire_len(*namespace), string_wire_len(title)?, 1]),
         Record::Revision { revision, .. } => revision_wire_len(revision),
         Record::PageAction { action, .. } => action_wire_len(action),
         Record::UserState { state, .. } => user_state_wire_len(state),
@@ -2117,7 +2146,16 @@ fn record_wire_size(record: &Record) -> Result<(u8, u64)> {
 
 fn write_record_payload<W: Write>(out: &mut W, record: &Record) -> Result<()> {
     match record {
-        Record::PageState { current_title, .. } => write_string(out, current_title)?,
+        Record::PageState {
+            title,
+            namespace,
+            deleted,
+            ..
+        } => {
+            write_option_i64(out, *namespace)?;
+            write_string(out, title)?;
+            out.write_all(&[u8::from(*deleted)])?;
+        }
         Record::Revision { revision, .. } => write_revision(out, revision)?,
         Record::PageAction { action, .. } => write_action(out, action)?,
         Record::UserState { state, .. } => write_user_state(out, state)?,
@@ -2398,6 +2436,10 @@ fn site_info_wire_len(site_info: &SiteInfoRecord) -> Result<u64> {
         string_wire_len(&site_info.base)?,
         string_wire_len(&site_info.generator)?,
         string_wire_len(&site_info.case)?,
+        string_wire_len(&site_info.language)?,
+        1,
+        string_wire_len(&site_info.server)?,
+        string_wire_len(&site_info.script_path)?,
         varint_len(site_info.namespaces.len() as u64) as u64,
     ];
     for namespace in &site_info.namespaces {
@@ -2416,6 +2458,14 @@ fn site_info_wire_len(site_info: &SiteInfoRecord) -> Result<u64> {
             1,
         ]);
     }
+    parts.push(varint_len(site_info.magic_words.len() as u64) as u64);
+    for word in &site_info.magic_words {
+        parts.extend([
+            string_wire_len(&word.canonical_name)?,
+            strings_wire_len(&word.aliases)?,
+            1,
+        ]);
+    }
     checked_sum(&parts)
 }
 
@@ -2425,6 +2475,10 @@ fn write_site_info(out: &mut impl Write, site_info: &SiteInfoRecord) -> Result<(
     write_string(out, &site_info.base)?;
     write_string(out, &site_info.generator)?;
     write_string(out, &site_info.case)?;
+    write_string(out, &site_info.language)?;
+    out.write_all(&[u8::from(site_info.rtl)])?;
+    write_string(out, &site_info.server)?;
+    write_string(out, &site_info.script_path)?;
     write_varint(out, site_info.namespaces.len() as u64)?;
     for namespace in &site_info.namespaces {
         out.write_all(&namespace.id.to_le_bytes())?;
@@ -2438,6 +2492,12 @@ fn write_site_info(out: &mut impl Write, site_info: &SiteInfoRecord) -> Result<(
         write_string(out, &interwiki.url)?;
         out.write_all(&[u8::from(interwiki.is_local)])?;
     }
+    write_varint(out, site_info.magic_words.len() as u64)?;
+    for word in &site_info.magic_words {
+        write_string(out, &word.canonical_name)?;
+        write_strings(out, &word.aliases)?;
+        out.write_all(&[u8::from(word.case_sensitive)])?;
+    }
     Ok(())
 }
 
@@ -2447,7 +2507,9 @@ fn decode_record(entity: EntityKey, timestamp: i64, kind: u8, payload: Vec<u8>) 
         KIND_PAGE_STATE if entity.kind == EntityKind::Page => Record::PageState {
             page_id: entity.id,
             timestamp_micros: timestamp,
-            current_title: read_string(&mut input)?,
+            namespace: read_option_i64(&mut input)?,
+            title: read_string(&mut input)?,
+            deleted: read_bool(&mut input)?,
         },
         KIND_REVISION if entity.kind == EntityKind::Page => Record::Revision {
             page_id: entity.id,
@@ -2676,6 +2738,10 @@ fn read_site_info(input: &mut &[u8]) -> Result<SiteInfoRecord> {
     let base = read_string(input)?;
     let generator = read_string(input)?;
     let case = read_string(input)?;
+    let language = read_string(input)?;
+    let rtl = read_u8(input)? != 0;
+    let server = read_string(input)?;
+    let script_path = read_string(input)?;
     let namespace_count = usize::try_from(read_varint(input)?.0)
         .map_err(|_| ArchiveError::FieldTooLarge)?;
     let mut namespaces = Vec::with_capacity(namespace_count);
@@ -2697,14 +2763,29 @@ fn read_site_info(input: &mut &[u8]) -> Result<SiteInfoRecord> {
             is_local: read_u8(input)? != 0,
         });
     }
+    let magic_word_count = usize::try_from(read_varint(input)?.0)
+        .map_err(|_| ArchiveError::FieldTooLarge)?;
+    let mut magic_words = Vec::with_capacity(magic_word_count);
+    for _ in 0..magic_word_count {
+        magic_words.push(SiteMagicWordRecord {
+            canonical_name: read_string(input)?,
+            aliases: read_strings(input)?,
+            case_sensitive: read_u8(input)? != 0,
+        });
+    }
     Ok(SiteInfoRecord {
         site_name,
         db_name,
         base,
         generator,
         case,
+        language,
+        rtl,
+        server,
+        script_path,
         namespaces,
         interwiki,
+        magic_words,
     })
 }
 
@@ -3007,7 +3088,9 @@ mod tests {
             Record::PageState {
                 page_id: 1,
                 timestamp_micros: 20,
-                current_title: "One".into(),
+                title: "One".into(),
+                namespace: None,
+                deleted: false,
             },
             revision(1, 2, 20, b"new"),
             revision(1, 1, 10, b"old"),
