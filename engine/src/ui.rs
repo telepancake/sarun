@@ -671,6 +671,21 @@ struct LoadJob {
     spin: usize,
 }
 
+struct ReaderSearchJob {
+    rx: mpsc::Receiver<
+        Result<
+            (
+                wikimak_wikipedia::archive_browse::ArchiveSearchResults,
+                std::time::Duration,
+            ),
+            String,
+        >,
+    >,
+    pattern: String,
+    kind: wikimak_wikipedia::archive_browse::ArchiveSearchKind,
+    spin: usize,
+}
+
 /// One pickable local model in the ModelPicker (mirrors the engine's
 /// `oaita.models` entries): a display name, a ready-to-download Q4 GGUF
 /// URL, and a short note (size / source).
@@ -1031,6 +1046,9 @@ struct App {
     /// the viewport width changes but draw() only holds &App — the same
     /// interior-mutability convention as the scroll Cells above.
     reader: std::cell::RefCell<Option<crate::reader::Reader>>,
+    /// Parallel archive regexp scan. The archive index is immutable and
+    /// shared with the Reader; only the bounded result set crosses back.
+    reader_search_job: Option<ReaderSearchJob>,
     /// 'z' in the reader: draw the document over the whole body (the same
     /// widget, a bigger Rect) instead of the outline+document split.
     reader_full: bool,
@@ -1472,6 +1490,7 @@ impl App {
             mirror_jobs: vec![],
             mirrors_loaded_at: None,
             reader: std::cell::RefCell::new(None),
+            reader_search_job: None,
             reader_full: false,
             editor: std::cell::RefCell::new(None),
             editor_full: false,
@@ -1777,6 +1796,104 @@ impl App {
                 let label = job.label.clone();
                 self.load_job = None;
                 self.status = format!("oci load '{label}': worker died");
+            }
+        }
+    }
+
+    fn start_reader_search(
+        &mut self,
+        pattern: String,
+        kind: wikimak_wikipedia::archive_browse::ArchiveSearchKind,
+    ) {
+        if self.reader_search_job.is_some() {
+            self.status = "a Wikipedia search is already running".into();
+            return;
+        }
+        let regex = match regex::Regex::new(&pattern) {
+            Ok(regex) => regex,
+            Err(error) => {
+                self.status = format!("invalid regexp: {error}");
+                if let Some(reader) = self.reader.borrow_mut().as_mut() {
+                    reader.status = self.status.clone();
+                }
+                return;
+            }
+        };
+        let archive = self
+            .reader
+            .borrow()
+            .as_ref()
+            .and_then(crate::reader::Reader::archive_search_index);
+        let Some(archive) = archive else {
+            self.status = "Wikipedia search requires an open wiki archive".into();
+            return;
+        };
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let result = archive
+                .search_regex(&regex, kind, 500)
+                .map(|results| (results, started.elapsed()))
+                .map_err(|error| error.to_string());
+            let _ = tx.send(result);
+        });
+        self.reader_search_job = Some(ReaderSearchJob {
+            rx,
+            pattern: pattern.clone(),
+            kind,
+            spin: 0,
+        });
+        self.status = format!("searching Wikipedia for /{pattern}/ …");
+    }
+
+    fn pump_reader_search(&mut self) {
+        let Some(job) = self.reader_search_job.as_mut() else {
+            return;
+        };
+        match job.rx.try_recv() {
+            Ok(Ok((results, elapsed))) => {
+                let pattern = job.pattern.clone();
+                let kind = job.kind;
+                self.reader_search_job = None;
+                let outcome = self
+                    .reader
+                    .borrow_mut()
+                    .as_mut()
+                    .ok_or_else(|| "reader was closed while search ran".to_string())
+                    .and_then(|reader| {
+                        reader
+                            .show_archive_search(&pattern, kind, &results, elapsed)
+                            .map_err(|error| error.to_string())
+                    });
+                self.status = match outcome {
+                    Ok(()) => format!(
+                        "{} matches; showing {} ({elapsed:.2?})",
+                        results.match_count,
+                        results.hits.len()
+                    ),
+                    Err(error) => format!("Wikipedia search: {error}"),
+                };
+            }
+            Ok(Err(error)) => {
+                self.reader_search_job = None;
+                self.status = format!("Wikipedia search: {error}");
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                job.spin = job.spin.wrapping_add(1);
+                let frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧'];
+                let message = format!(
+                    "{} searching Wikipedia for /{}/ …",
+                    frames[job.spin / 2 % frames.len()],
+                    job.pattern
+                );
+                self.status = message.clone();
+                if let Some(reader) = self.reader.borrow_mut().as_mut() {
+                    reader.status = message;
+                }
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.reader_search_job = None;
+                self.status = "Wikipedia search worker died".into();
             }
         }
     }
@@ -4303,7 +4420,7 @@ impl App {
             self.focus = Pane::Reader;
         }
         self.status = format!(
-            "reading {label} · Tab/Enter links · n/p headings · / search · z zoom · Esc back"
+            "reading {label} · arrows/click links · j/k scroll · Enter follow · Backspace back"
         );
     }
 
@@ -11085,6 +11202,10 @@ fn handle_reader_key(app: &mut App, code: crossterm::event::KeyCode) -> bool {
             app.modal = Some(Modal::ReaderOpen { buf: String::new() });
             true
         }
+        KeyResult::ArchiveSearch { pattern, kind } => {
+            app.start_reader_search(pattern, kind);
+            true
+        }
         KeyResult::Close => {
             // Esc unwinds one layer at a time: zoom first, then the pane.
             if app.reader_full {
@@ -14358,10 +14479,14 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                 let mut rd = app.reader.borrow_mut();
                 match rd.as_mut() {
                     Some(r) => {
-                        // Left: the heading outline (position-highlighted);
+                        // Left: revision history for the current wiki page;
                         // right: the document — the same widget 'z' zooms.
-                        let p = Paragraph::new(Text::from(r.outline_lines()))
-                            .block(block(title("READER · outline", false), false));
+                        let history_title =
+                            format!("PAGE HISTORY · {} revisions", r.revision_count());
+                        let p = Paragraph::new(Text::from(
+                            r.page_history_lines(left.height.saturating_sub(2) as usize),
+                        ))
+                        .block(block(title(&history_title, false), false));
                         f.render_widget(p, left);
                         if !skip_right {
                             r.render(f, right, true);
@@ -14372,7 +14497,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                             "(no document)",
                             Style::default().add_modifier(Modifier::DIM),
                         ))
-                        .block(block(title("READER · outline", lf), lf));
+                        .block(block(title("PAGE HISTORY", lf), lf));
                         f.render_widget(p, left);
                         let detail = Paragraph::new(READER_EMPTY_HINT)
                             .block(block(title("DOCUMENT", rf), rf))
@@ -17030,6 +17155,41 @@ fn pty_grid_rect(app: &App, term_cols: u16, term_rows: u16) -> Option<Rect> {
     Some(split[1])
 }
 
+/// Screen rectangle occupied by the Reader's document grid. This mirrors
+/// draw(): fullscreen uses the whole body; normal mode uses the right 55%.
+fn reader_document_rect(app: &App, term_cols: u16, term_rows: u16) -> Option<Rect> {
+    if app.focus != Pane::Reader
+        || app.reader.borrow().is_none()
+        || (app.pty_in_right && !app.ptys.is_empty() && !app.reader_full)
+    {
+        return None;
+    }
+    let root = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(3),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .split(Rect {
+            x: 0,
+            y: 0,
+            width: term_cols,
+            height: term_rows,
+        });
+    if app.reader_full {
+        Some(root[1])
+    } else {
+        let columns = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+            .split(root[1]);
+        Some(columns[1])
+    }
+}
+
 /// crossterm mouse event → the emulator's event, grid-local. None when the
 /// event is outside the grid or of no interest (e.g. bare Moved without a
 /// button — children that want any-event tracking still get Drag moves).
@@ -18630,6 +18790,7 @@ fn run_interactive(sock: &str) -> Result<(), String> {
             app.pump_struct();
             // drain a finished background image pull (oci.load) the same way.
             app.pump_load();
+            app.pump_reader_search();
             app.pump_models();
             app.pump_probe();
             if app.structd.pending && app.structd.full_lines.is_none() {
@@ -18671,23 +18832,18 @@ fn run_interactive(sock: &str) -> Result<(), String> {
             if app.should_quit {
                 break;
             }
-            // Mouse capture is SMART: we steal the outer terminal's mouse only
-            // when ALL of (a) a PTY pane has keyboard focus, (b) that PTY is
-            // visible, and (c) its child actually asked for mouse reporting
-            // (carbonyl, vim-with-mouse). Otherwise native click-drag SELECTION
-            // + copy keeps working — including when an embedded carbonyl is
-            // still running but the user has Tab'd back to a list pane (mouse
-            // follows focus, exactly like the keyboard does). The F6 override
-            // (mouse_release) forces capture off even on a focused grabbing
-            // child, so you can select/copy from carbonyl itself.
+            // Capture the mouse for either an interested PTY child or the
+            // Reader's spatial link grid. F6 releases it to the outer
+            // terminal for native selection/copy.
             let want_mouse = {
                 let (tc, tr) = terminal::size().unwrap_or((80, 24));
                 let pty_focused = app.focus == Pane::Pty
                     || (app.pty_in_right && app.right_focused && !app.ptys.is_empty());
                 !app.mouse_release
-                    && pty_focused
-                    && pty_grid_rect(&app, tc, tr).is_some()
-                    && app.cur_pty().is_some_and(|p| p.mouse_grabbed())
+                    && (reader_document_rect(&app, tc, tr).is_some()
+                        || (pty_focused
+                            && pty_grid_rect(&app, tc, tr).is_some()
+                            && app.cur_pty().is_some_and(|p| p.mouse_grabbed())))
             };
             if want_mouse != mouse_captured {
                 let r = if want_mouse {
@@ -18705,6 +18861,12 @@ fn run_interactive(sock: &str) -> Result<(), String> {
             let ev = event::read().map_err(|e| e.to_string())?;
             if let Event::Mouse(m) = ev {
                 let (tc, tr) = terminal::size().unwrap_or((80, 24));
+                if reader_document_rect(&app, tc, tr).is_some() {
+                    if let Some(reader) = app.reader.borrow_mut().as_mut() {
+                        reader.handle_mouse(m.column, m.row, m.kind);
+                    }
+                    continue;
+                }
                 if let Some(grid) = pty_grid_rect(&app, tc, tr) {
                     if let Some(pev) = mouse_to_pty_event(m, grid) {
                         if let Some(pty) = app.cur_pty_mut() {
@@ -19033,7 +19195,16 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                             app.cycle_window(-1);
                         }
                         6 => {
-                            if app.focus == Pane::Sessions {
+                            if app.focus == Pane::Reader {
+                                app.mouse_release = !app.mouse_release;
+                                app.status = if app.mouse_release {
+                                    "reader mouse released — drag to select/copy · F6 to restore link navigation"
+                                        .into()
+                                } else {
+                                    "reader mouse active — click links, wheel scroll · F6 releases selection"
+                                        .into()
+                                };
+                            } else if app.focus == Pane::Sessions {
                                 app.renaming = Some(String::new());
                             }
                         }
@@ -21873,6 +22044,7 @@ mod tests {
         // pump until the (failing, no engine) job reports
         for _ in 0..500 {
             app.pump_load();
+            app.pump_reader_search();
             app.pump_models();
             app.pump_probe();
             if app.load_job.is_none() {
@@ -23660,11 +23832,10 @@ mod tests {
         }
     }
 
-    /// The Reader pane: a mounted document renders in the two-pane split
-    /// (outline left, document right), and 'z' zooms the SAME widget over
-    /// the whole body (the outline drops away); Esc unwinds the zoom first.
+    /// The Reader pane: a mounted document renders beside page history, and
+    /// 'z' zooms the SAME document widget over the whole body.
     #[test]
-    fn reader_pane_renders_document_outline_and_zoom() {
+    fn reader_pane_renders_page_history_and_zoom() {
         use crossterm::event::KeyCode;
         let mut app = headless_app();
         let r = crate::reader::Reader::open_bytes(
@@ -23677,20 +23848,19 @@ mod tests {
         app.reader.replace(Some(r));
         app.focus = Pane::Reader;
         let buf = render_to_string(&app, 100, 30).unwrap();
-        assert!(buf.contains("READER · outline"), "outline column:\n{buf}");
+        assert!(buf.contains("PAGE HISTORY"), "history column:\n{buf}");
         assert!(
-            buf.contains("Alpha Heading"),
-            "outline lists headings:\n{buf}"
+            buf.contains("page history is available for wiki pages"),
+            "non-wiki history explanation:\n{buf}"
         );
-        assert!(buf.contains("Beta Section"));
         assert!(buf.contains("body text"), "document body renders:\n{buf}");
         assert!(buf.contains("guide.md"), "document title renders:\n{buf}");
         assert!(handle_reader_key(&mut app, KeyCode::Char('z')));
         assert!(app.reader_full, "'z' zooms");
         let buf = render_to_string(&app, 100, 30).unwrap();
         assert!(
-            !buf.contains("READER · outline"),
-            "zoom drops the outline:\n{buf}"
+            !buf.contains("PAGE HISTORY"),
+            "zoom drops page history:\n{buf}"
         );
         assert!(buf.contains("body text"), "zoomed document renders:\n{buf}");
         assert!(handle_reader_key(&mut app, KeyCode::Esc));

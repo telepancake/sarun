@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 use html2text::render::{RichAnnotation, TaggedLine, TaggedLineElement};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use unicode_width::UnicodeWidthStr;
 
 /// One focusable link occurrence: the styled spans `span_range` on `lines[line]`.
 /// A link that wraps over several rows contributes one `LinkRef` per row (each
@@ -37,6 +38,14 @@ pub struct Heading {
     pub line: usize,
     pub level: usize,
     pub text: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ScreenLink {
+    link: usize,
+    x0: u16,
+    x1: u16,
+    y: u16,
 }
 
 /// A rendered document at one specific width.
@@ -257,6 +266,13 @@ pub enum Source {
     Wiki {
         root: PathBuf,
         title: String,
+        timestamp_micros: Option<i64>,
+        page_id: Option<u64>,
+    },
+    WikiSearch {
+        root: PathBuf,
+        label: String,
+        html: std::sync::Arc<[u8]>,
     },
     Ietf {
         root: PathBuf,
@@ -272,7 +288,17 @@ impl Source {
     fn label(&self) -> String {
         match self {
             Source::File(p) => p.display().to_string(),
-            Source::Wiki { title, .. } => format!("wiki:{title}"),
+            Source::Wiki {
+                title,
+                timestamp_micros: None,
+                ..
+            } => format!("wiki:{title}"),
+            Source::Wiki {
+                title,
+                timestamp_micros: Some(timestamp),
+                ..
+            } => format!("wiki:{title}@{timestamp}"),
+            Source::WikiSearch { label, .. } => label.clone(),
             Source::Ietf {
                 draft: None,
                 filter: None,
@@ -336,6 +362,34 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+fn percent_encode_title(title: &str) -> String {
+    let mut encoded = String::with_capacity(title.len());
+    for byte in title.replace(' ', "_").bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~' | b':' | b'/')
+        {
+            encoded.push(byte as char);
+        } else {
+            use std::fmt::Write;
+            let _ = write!(encoded, "%{byte:02X}");
+        }
+    }
+    encoded
+}
+
+fn format_timestamp(timestamp_micros: i64) -> String {
+    time::OffsetDateTime::from_unix_timestamp(timestamp_micros.div_euclid(1_000_000))
+        .map(|value| {
+            format!(
+                "{} {:02}:{:02}:{:02} UTC",
+                value.date(),
+                value.hour(),
+                value.minute(),
+                value.second()
+            )
+        })
+        .unwrap_or_else(|_| timestamp_micros.to_string())
+}
+
 // ── wiki page rendering (in-process `wikimak serve` page path) ──────────────
 
 /// Follow `#REDIRECT` chains at head, loop-capped — the same contract as
@@ -345,19 +399,20 @@ const MAX_REDIRECT_HOPS: usize = 10;
 fn resolve_wiki_page(
     archive: &wikimak_wikipedia::archive_browse::ArchiveBrowseIndex,
     raw: &str,
+    timestamp_micros: i64,
 ) -> anyhow::Result<(u64, String)> {
     let original = raw.replace('_', " ").trim().to_string();
     let mut current = original.clone();
     let mut seen = std::collections::HashSet::new();
     for _ in 0..=MAX_REDIRECT_HOPS {
         let pid = archive
-            .page_id_by_title(&current, i64::MAX)
+            .page_id_by_title(&current, timestamp_micros)
             .ok_or_else(|| anyhow::anyhow!("wiki: no page titled {current:?}"))?;
         if !seen.insert(pid) {
             return Ok((pid, current));
         }
         let text = archive
-            .page_text_at(pid, i64::MAX)
+            .page_text_at(pid, timestamp_micros)
             .map_err(|e| anyhow::anyhow!("wiki page text {current:?}: {e}"))?
             .ok_or_else(|| anyhow::anyhow!("wiki: no text at {current:?}"))?;
         match wikimak_wikitext::parse_redirect(&String::from_utf8_lossy(&text)) {
@@ -372,20 +427,30 @@ fn resolve_wiki_page(
 /// and run the same wikitext→HTML renderer `wikimak
 /// serve` uses, with `/wiki/` hrefs so link-follow can recognize internal
 /// targets. Returns (html, resolved display title).
-fn wiki_page_html(root: &Path, title: &str) -> anyhow::Result<(String, String)> {
+fn wiki_page_html(
+    archive: &wikimak_wikipedia::archive_browse::ArchiveBrowseIndex,
+    title: &str,
+    timestamp_micros: Option<i64>,
+    page_id: Option<u64>,
+) -> anyhow::Result<(String, String, u64)> {
     use wikimak_wikitext::PageStore;
-    let archive = wikimak_wikipedia::archive_browse::ArchiveBrowseIndex::open(
-        root,
-        root.with_extension("swtitle"),
-    )
-    .map_err(|e| anyhow::anyhow!("wiki open {}: {e}", root.display()))?;
-    let view = archive.view(None);
-    let (pid, resolved) = resolve_wiki_page(&archive, title)?;
+    let at = timestamp_micros.unwrap_or(i64::MAX);
+    let view = archive.view(timestamp_micros);
+    let (pid, resolved) = match page_id {
+        Some(page_id) => (
+            page_id,
+            archive
+                .page_title_at(page_id, at)
+                .map_err(|error| anyhow::anyhow!("wiki page title: {error}"))?
+                .unwrap_or_else(|| title.replace('_', " ")),
+        ),
+        None => resolve_wiki_page(archive, title, at)?,
+    };
     let site = view.site();
     let title_obj = wikimak_wikitext::Title::parse(&resolved, site);
     let display = title_obj.prefixed(site);
     let text = archive
-        .page_text_at(pid, i64::MAX)
+        .page_text_at(pid, at)
         .map_err(|e| anyhow::anyhow!("wiki page text: {e}"))?
         .ok_or_else(|| anyhow::anyhow!("wiki: no text at {resolved:?}"))?;
     let wikitext = String::from_utf8_lossy(&text);
@@ -396,7 +461,9 @@ fn wiki_page_html(root: &Path, title: &str) -> anyhow::Result<(String, String)> 
             .map(|i| i as &dyn wikimak_wikitext::ModuleInvoker),
         media: None,
         link_prefix: "/wiki/".into(),
-        asof_query: String::new(),
+        asof_query: timestamp_micros
+            .map(|timestamp| format!("?at={timestamp}"))
+            .unwrap_or_default(),
     };
     let out = wikimak_wikitext::render(&view, &title_obj, &wikitext, &opts);
     let html = format!(
@@ -404,7 +471,7 @@ fn wiki_page_html(root: &Path, title: &str) -> anyhow::Result<(String, String)> 
         wikimak_wikitext::html::escape(&display),
         out.html
     );
-    Ok((html, display))
+    Ok((html, display, pid))
 }
 
 /// Pick a page to land on when a wiki mirror is opened without a title:
@@ -415,6 +482,13 @@ pub fn wiki_default_title(root: &Path) -> anyhow::Result<String> {
         root.with_extension("swtitle"),
     )
     .map_err(|e| anyhow::anyhow!("wiki open {}: {e}", root.display()))?;
+    wiki_default_title_from(&archive, root)
+}
+
+fn wiki_default_title_from(
+    archive: &wikimak_wikipedia::archive_browse::ArchiveBrowseIndex,
+    root: &Path,
+) -> anyhow::Result<String> {
     if let Some(title) = archive
         .site_info()
         .base
@@ -531,9 +605,11 @@ fn load_source(source: &Source) -> anyhow::Result<(Vec<u8>, Kind, String)> {
             let kind = kind_for_name(&p.display().to_string());
             Ok((raw, kind, p.display().to_string()))
         }
-        Source::Wiki { root, title } => {
-            let (html, display) = wiki_page_html(root, title)?;
-            Ok((html.into_bytes(), Kind::Html, display))
+        Source::Wiki { .. } => {
+            anyhow::bail!("reader: wiki source requires an open archive session")
+        }
+        Source::WikiSearch { html, label, .. } => {
+            Ok((html.to_vec(), Kind::Html, label.clone()))
         }
         Source::Ietf {
             root,
@@ -568,6 +644,23 @@ pub enum KeyResult {
     Close,
     ToggleFull,
     OpenPrompt,
+    ArchiveSearch {
+        pattern: String,
+        kind: wikimak_wikipedia::archive_browse::ArchiveSearchKind,
+    },
+}
+
+struct WikiReader {
+    archive: std::sync::Arc<wikimak_wikipedia::archive_browse::ArchiveBrowseIndex>,
+    page_id: u64,
+    revisions: Vec<wikimak_wikipedia::archive_browse::PageRevisionSummary>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SearchMode {
+    Document,
+    ArchiveTitle,
+    ArchiveFullText,
 }
 
 /// The document reader pane state: one open document, its scroll / link
@@ -582,10 +675,17 @@ pub struct Reader {
     pub scroll: usize,
     focus_link: Option<usize>,
     searching: bool,
+    search_mode: SearchMode,
     query: String,
     matches: Vec<usize>,
     /// Follow history: the source we came from + its scroll position.
     history: Vec<(Source, usize)>,
+    /// Entries left by Back. A fresh follow or search clears this stack.
+    future: Vec<(Source, usize)>,
+    /// One archive/index instance for the entire wiki-reading session.
+    wiki: Option<WikiReader>,
+    /// Link rectangles from the most recently rendered terminal grid.
+    screen_links: Vec<ScreenLink>,
     pub status: String,
     /// Last rendered viewport height (page size for PgUp/PgDn and clamping).
     view_h: usize,
@@ -603,10 +703,14 @@ impl Reader {
             scroll: 0,
             focus_link: None,
             searching: false,
+            search_mode: SearchMode::Document,
             query: String::new(),
             matches: Vec::new(),
             history: Vec::new(),
-            status: "j/k scroll · Tab links · Enter follow · n/p headings · / search · z zoom · o open · Esc close".into(),
+            future: Vec::new(),
+            wiki: None,
+            screen_links: Vec::new(),
+            status: "arrows links · click follow · [/] back/forward · j/k scroll · / page search · T title regexp · F full-text regexp · F6 select · Esc close".into(),
             view_h: 20,
         })
     }
@@ -620,13 +724,37 @@ impl Reader {
 
     /// Open a wikimak store page; `title: None` lands on the default page.
     pub fn open_wiki(root: PathBuf, title: Option<String>) -> anyhow::Result<Reader> {
+        let archive = std::sync::Arc::new(
+            wikimak_wikipedia::archive_browse::ArchiveBrowseIndex::open(
+                &root,
+                root.with_extension("swtitle"),
+            )
+            .map_err(|e| anyhow::anyhow!("wiki open {}: {e}", root.display()))?,
+        );
         let title = match title {
             Some(t) => t,
-            None => wiki_default_title(&root)?,
+            None => wiki_default_title_from(&archive, &root)?,
         };
-        let source = Source::Wiki { root, title };
-        let (raw, kind, display) = load_source(&source)?;
-        Reader::new(source, raw, kind, display)
+        let source = Source::Wiki {
+            root,
+            title,
+            timestamp_micros: None,
+            page_id: None,
+        };
+        let Source::Wiki { title, .. } = &source else {
+            unreachable!()
+        };
+        let (html, display, page_id) = wiki_page_html(&archive, title, None, None)?;
+        let revisions = archive
+            .page_revisions(page_id)
+            .map_err(|e| anyhow::anyhow!("wiki page history: {e}"))?;
+        let mut reader = Reader::new(source, html.into_bytes(), Kind::Html, display)?;
+        reader.wiki = Some(WikiReader {
+            archive,
+            page_id,
+            revisions,
+        });
+        Ok(reader)
     }
 
     /// Open an IETF mirror: `draft: None` lands on the draft list,
@@ -684,7 +812,35 @@ impl Reader {
     /// On failure the current document stays and the error is LOUD on the
     /// status line at the caller.
     fn load_into(&mut self, source: Source) -> anyhow::Result<()> {
-        let (raw, kind, display) = load_source(&source)?;
+        let (raw, kind, display, wiki_page) = match &source {
+            Source::Wiki {
+                title,
+                timestamp_micros,
+                page_id,
+                ..
+            } => {
+                let wiki = self
+                    .wiki
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("reader: wiki session is not open"))?;
+                let (html, display, page_id) =
+                    wiki_page_html(&wiki.archive, title, *timestamp_micros, *page_id)?;
+                let revisions = wiki
+                    .archive
+                    .page_revisions(page_id)
+                    .map_err(|e| anyhow::anyhow!("wiki page history: {e}"))?;
+                (
+                    html.into_bytes(),
+                    Kind::Html,
+                    display,
+                    Some((page_id, revisions)),
+                )
+            }
+            _ => {
+                let (raw, kind, display) = load_source(&source)?;
+                (raw, kind, display, None)
+            }
+        };
         let doc = build(kind, &raw, self.doc.width)?;
         self.source = source;
         self.raw = raw;
@@ -695,6 +851,91 @@ impl Reader {
         self.focus_link = None;
         self.matches.clear();
         self.query.clear();
+        self.screen_links.clear();
+        if let Some((page_id, revisions)) = wiki_page {
+            let wiki = self
+                .wiki
+                .as_mut()
+                .expect("wiki source was loaded through an open wiki session");
+            wiki.page_id = page_id;
+            wiki.revisions = revisions;
+        } else if matches!(self.source, Source::WikiSearch { .. }) {
+            if let Some(wiki) = self.wiki.as_mut() {
+                wiki.revisions.clear();
+            }
+        }
+        Ok(())
+    }
+
+    pub fn archive_search_index(
+        &self,
+    ) -> Option<std::sync::Arc<wikimak_wikipedia::archive_browse::ArchiveBrowseIndex>> {
+        self.wiki.as_ref().map(|wiki| wiki.archive.clone())
+    }
+
+    pub fn show_archive_search(
+        &mut self,
+        pattern: &str,
+        kind: wikimak_wikipedia::archive_browse::ArchiveSearchKind,
+        results: &wikimak_wikipedia::archive_browse::ArchiveSearchResults,
+        elapsed: std::time::Duration,
+    ) -> anyhow::Result<()> {
+        use wikimak_wikipedia::archive_browse::ArchiveSearchKind;
+        let root = match &self.source {
+            Source::Wiki { root, .. } | Source::WikiSearch { root, .. } => root.clone(),
+            _ => anyhow::bail!("archive search is only available in a wiki reader"),
+        };
+        let escaped_pattern = wikimak_wikitext::html::escape(pattern);
+        let noun = match kind {
+            ArchiveSearchKind::Title => "title",
+            ArchiveSearchKind::FullText => "full-text",
+        };
+        let shown = results.hits.len();
+        let mut html = format!(
+            "<h1>Wikipedia {noun} regexp</h1><p><code>{escaped_pattern}</code>: \
+             {} matches; showing {shown}. Scanned {} frames with {} workers in {:.2?}.</p><ol>",
+            results.match_count, results.searched_frames, results.workers, elapsed
+        );
+        for hit in &results.hits {
+            let title = wikimak_wikitext::html::escape(&hit.title);
+            let encoded = percent_encode_title(&hit.title);
+            let at = hit.timestamp_micros.map_or_else(
+                String::new,
+                |timestamp| format!("?pageid={}&at={timestamp}", hit.page_id),
+            );
+            html.push_str(&format!(
+                "<li><a href=\"/wiki/{encoded}{at}\">{title}</a>"
+            ));
+            if let Some(revision_id) = hit.revision_id {
+                html.push_str(&format!(" <small>revision {revision_id}"));
+                if let Some(timestamp) = hit.timestamp_micros {
+                    html.push_str(&format!(" · {}</small>", format_timestamp(timestamp)));
+                } else {
+                    html.push_str("</small>");
+                }
+            }
+            if let Some(snippet) = &hit.snippet {
+                html.push_str(&format!(
+                    "<blockquote>{}</blockquote>",
+                    wikimak_wikitext::html::escape(snippet)
+                ));
+            }
+            html.push_str("</li>");
+        }
+        html.push_str("</ol>");
+        let label = format!("wiki:{noun} /{pattern}/");
+        let from = (self.source.clone(), self.scroll);
+        self.load_into(Source::WikiSearch {
+            root,
+            label,
+            html: std::sync::Arc::from(html.into_bytes()),
+        })?;
+        self.history.push(from);
+        self.future.clear();
+        self.status = format!(
+            "{} matches · {shown} shown · {:.2?} · Backspace goes back",
+            results.match_count, elapsed
+        );
         Ok(())
     }
 
@@ -738,11 +979,7 @@ impl Reader {
         let n = self.doc.links.len() as isize;
         let cur = self.focus_link.map(|f| f as isize).unwrap_or(-1);
         let next = ((cur + dir).rem_euclid(n)) as usize;
-        if let Some(old) = self.focus_link {
-            self.doc.set_link_focused(old, false);
-        }
-        self.doc.set_link_focused(next, true);
-        self.focus_link = Some(next);
+        self.set_focus(next);
         let line = self.doc.links[next].line;
         self.scroll_to(line);
         self.status = format!(
@@ -751,6 +988,115 @@ impl Reader {
             self.doc.links.len(),
             self.doc.links[next].url
         );
+    }
+
+    fn set_focus(&mut self, next: usize) {
+        if self.focus_link == Some(next) {
+            return;
+        }
+        if let Some(old) = self.focus_link {
+            self.doc.set_link_focused(old, false);
+        }
+        self.doc.set_link_focused(next, true);
+        self.focus_link = Some(next);
+    }
+
+    /// Move through the links as objects on the most recently rendered
+    /// terminal grid. Only links actually visible on that grid participate.
+    fn focus_spatial(&mut self, dx: i32, dy: i32) {
+        if self.screen_links.is_empty() {
+            self.status = "no visible links".into();
+            return;
+        }
+        let current = self
+            .focus_link
+            .and_then(|link| self.screen_links.iter().find(|item| item.link == link))
+            .copied();
+        let next = match current {
+            None => {
+                let key = |item: &&ScreenLink| match (dx, dy) {
+                    (-1, 0) | (0, -1) => {
+                        (u16::MAX - item.y, u16::MAX - item.x1, item.link)
+                    }
+                    _ => (item.y, item.x0, item.link),
+                };
+                self.screen_links.iter().min_by_key(key).copied()
+            }
+            Some(current) => {
+                let cx = (i32::from(current.x0) + i32::from(current.x1)) / 2;
+                let cy = i32::from(current.y);
+                self.screen_links
+                    .iter()
+                    .filter(|item| item.link != current.link)
+                    .filter_map(|item| {
+                        let x = (i32::from(item.x0) + i32::from(item.x1)) / 2;
+                        let y = i32::from(item.y);
+                        let along = (x - cx) * dx + (y - cy) * dy;
+                        if along <= 0 {
+                            return None;
+                        }
+                        let across = (x - cx) * dy - (y - cy) * dx;
+                        let distance = i64::from(along).pow(2) + i64::from(across).pow(2);
+                        Some((distance, along, across.abs(), item))
+                    })
+                    .min_by_key(|(distance, along, across, item)| {
+                        (*distance, *along, *across, item.link)
+                    })
+                    .map(|(_, _, _, item)| *item)
+            }
+        };
+        let Some(next) = next else {
+            self.status = "no link in that direction".into();
+            return;
+        };
+        self.set_focus(next.link);
+        self.status = format!(
+            "link {}/{}: {}",
+            next.link + 1,
+            self.doc.links.len(),
+            self.doc.links[next.link].url
+        );
+    }
+
+    pub fn handle_mouse(
+        &mut self,
+        column: u16,
+        row: u16,
+        kind: crossterm::event::MouseEventKind,
+    ) {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        match kind {
+            MouseEventKind::ScrollUp => {
+                self.scroll = self.scroll.saturating_sub(3);
+                self.clamp_scroll();
+            }
+            MouseEventKind::ScrollDown => {
+                self.scroll = self.scroll.saturating_add(3);
+                self.clamp_scroll();
+            }
+            MouseEventKind::Moved => {
+                if let Some(link) = self
+                    .screen_links
+                    .iter()
+                    .find(|link| link.y == row && link.x0 <= column && column < link.x1)
+                    .map(|link| link.link)
+                {
+                    self.set_focus(link);
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(link) = self
+                    .screen_links
+                    .iter()
+                    .find(|link| link.y == row && link.x0 <= column && column < link.x1)
+                    .map(|link| link.link)
+                {
+                    self.set_focus(link);
+                    self.follow();
+                }
+            }
+            _ => {}
+        }
     }
 
     /// n/p: next/previous search match while a query is live, else heading.
@@ -854,17 +1200,35 @@ impl Reader {
             Some((p, f)) => (p.to_string(), Some(f.to_string())),
             None => (url.clone(), None),
         };
+        let (path_part, query) = match path_part.split_once('?') {
+            Some((path, query)) => (path.to_string(), Some(query.to_string())),
+            None => (path_part, None),
+        };
+        let timestamp_micros = query.as_deref().and_then(|query| {
+            query
+                .split('&')
+                .find_map(|field| field.strip_prefix("at=")?.parse().ok())
+        });
+        let page_id = query.as_deref().and_then(|query| {
+            query
+                .split('&')
+                .find_map(|field| field.strip_prefix("pageid=")?.parse().ok())
+        });
         let target = match &self.source {
-            Source::Wiki { root, .. } => match path_part.strip_prefix("/wiki/") {
-                Some(t) => {
-                    let title = percent_decode(t).replace('_', " ");
-                    Some(Source::Wiki {
-                        root: root.clone(),
-                        title,
-                    })
+            Source::Wiki { root, .. } | Source::WikiSearch { root, .. } => {
+                match path_part.strip_prefix("/wiki/") {
+                    Some(t) => {
+                        let title = percent_decode(t).replace('_', " ");
+                        Some(Source::Wiki {
+                            root: root.clone(),
+                            title,
+                            timestamp_micros,
+                            page_id,
+                        })
+                    }
+                    None => None,
                 }
-                None => None,
-            },
+            }
             Source::File(p) => {
                 let resolved = if path_part.starts_with('/') {
                     PathBuf::from(&path_part)
@@ -894,6 +1258,7 @@ impl Reader {
         match self.load_into(target) {
             Ok(()) => {
                 self.history.push(from);
+                self.future.clear();
                 if let Some(f) = frag {
                     self.jump_fragment(&f);
                 }
@@ -908,18 +1273,47 @@ impl Reader {
             self.status = "history is empty".into();
             return;
         };
+        let current = (self.source.clone(), self.scroll);
         match self.load_into(source.clone()) {
             Ok(()) => {
                 self.scroll = scroll;
+                self.future.push(current);
                 self.status = format!("back to {}", source.label());
             }
-            Err(e) => self.status = e.to_string(),
+            Err(e) => {
+                self.history.push((source, scroll));
+                self.status = e.to_string();
+            }
+        }
+    }
+
+    fn forward(&mut self) {
+        let Some((source, scroll)) = self.future.pop() else {
+            self.status = "forward history is empty".into();
+            return;
+        };
+        let current = (self.source.clone(), self.scroll);
+        match self.load_into(source.clone()) {
+            Ok(()) => {
+                self.scroll = scroll;
+                self.history.push(current);
+                self.status = format!("forward to {}", source.label());
+            }
+            Err(e) => {
+                self.future.push((source, scroll));
+                self.status = e.to_string();
+            }
         }
     }
 
     #[cfg(test)]
     fn history_len(&self) -> usize {
         self.history.len()
+    }
+
+    #[cfg(test)]
+    fn future_len(&self) -> usize {
+        self.future.len()
     }
 
     /// Handle one key. The caller (ui.rs) has already taken the F-keys; the
@@ -930,10 +1324,33 @@ impl Reader {
             match code {
                 KeyCode::Esc => {
                     self.searching = false;
+                    self.search_mode = SearchMode::Document;
                     self.query.clear();
                     self.status.clear();
                 }
-                KeyCode::Enter => self.commit_search(),
+                KeyCode::Enter => {
+                    if self.query.is_empty() {
+                        self.searching = false;
+                    } else {
+                        match self.search_mode {
+                            SearchMode::Document => self.commit_search(),
+                            SearchMode::ArchiveTitle => {
+                                self.searching = false;
+                                return KeyResult::ArchiveSearch {
+                                    pattern: std::mem::take(&mut self.query),
+                                    kind: wikimak_wikipedia::archive_browse::ArchiveSearchKind::Title,
+                                };
+                            }
+                            SearchMode::ArchiveFullText => {
+                                self.searching = false;
+                                return KeyResult::ArchiveSearch {
+                                    pattern: std::mem::take(&mut self.query),
+                                    kind: wikimak_wikipedia::archive_browse::ArchiveSearchKind::FullText,
+                                };
+                            }
+                        }
+                    }
+                }
                 KeyCode::Backspace => {
                     self.query.pop();
                 }
@@ -943,8 +1360,12 @@ impl Reader {
             return KeyResult::Consumed;
         }
         match code {
-            KeyCode::Char('j') | KeyCode::Down => self.scroll += 1,
-            KeyCode::Char('k') | KeyCode::Up => self.scroll = self.scroll.saturating_sub(1),
+            KeyCode::Char('j') => self.scroll += 1,
+            KeyCode::Char('k') => self.scroll = self.scroll.saturating_sub(1),
+            KeyCode::Left => self.focus_spatial(-1, 0),
+            KeyCode::Right => self.focus_spatial(1, 0),
+            KeyCode::Up => self.focus_spatial(0, -1),
+            KeyCode::Down => self.focus_spatial(0, 1),
             KeyCode::PageDown => self.scroll += self.view_h.max(1),
             KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(self.view_h.max(1)),
             KeyCode::Home | KeyCode::Char('g') => self.scroll = 0,
@@ -955,11 +1376,27 @@ impl Reader {
             KeyCode::BackTab => self.focus_next(-1),
             KeyCode::Enter => self.follow(),
             KeyCode::Backspace => self.back(),
+            KeyCode::Char('[') => self.back(),
+            KeyCode::Char(']') => self.forward(),
             KeyCode::Char('n') => self.jump(1),
             KeyCode::Char('p') => self.jump(-1),
             KeyCode::Char('/') => {
                 self.searching = true;
+                self.search_mode = SearchMode::Document;
                 self.query.clear();
+            }
+            KeyCode::Char('T') | KeyCode::Char('F') => {
+                if self.wiki.is_none() {
+                    self.status = "archive regexp search is only available for wiki mirrors".into();
+                } else {
+                    self.searching = true;
+                    self.search_mode = if code == KeyCode::Char('T') {
+                        SearchMode::ArchiveTitle
+                    } else {
+                        SearchMode::ArchiveFullText
+                    };
+                    self.query.clear();
+                }
             }
             KeyCode::Char('z') => return KeyResult::ToggleFull,
             KeyCode::Char('o') => return KeyResult::OpenPrompt,
@@ -978,36 +1415,80 @@ impl Reader {
         KeyResult::Consumed
     }
 
-    /// Outline for the left column: one row per heading, indented by level,
-    /// the current position's section highlighted.
-    pub fn outline_lines(&self) -> Vec<Line<'static>> {
-        if self.doc.headings.is_empty() {
+    pub fn page_history_lines(&self, limit: usize) -> Vec<Line<'static>> {
+        let Some(wiki) = &self.wiki else {
             return vec![Line::from(Span::styled(
-                "(no headings)",
+                "(page history is available for wiki pages)",
+                Style::default().add_modifier(Modifier::DIM),
+            ))];
+        };
+        if wiki.revisions.is_empty() {
+            return vec![Line::from(Span::styled(
+                "(no revisions)",
                 Style::default().add_modifier(Modifier::DIM),
             ))];
         }
-        // The heading the viewport is inside: last one at/above scroll+2.
-        let here = self
-            .doc
-            .headings
+        wiki.revisions
             .iter()
-            .rev()
-            .find(|h| h.line <= self.scroll + 2)
-            .map(|h| h.line);
-        self.doc
-            .headings
-            .iter()
-            .map(|h| {
-                let pad = "  ".repeat(h.level.saturating_sub(1));
-                let mut st =
-                    Style::default().fg(HEADING_COLORS[h.level.min(HEADING_COLORS.len()) - 1]);
-                if Some(h.line) == here {
-                    st = st.add_modifier(Modifier::REVERSED);
+            .take(limit.max(1))
+            .map(|revision| {
+                let timestamp = time::OffsetDateTime::from_unix_timestamp(
+                    revision.timestamp_micros.div_euclid(1_000_000),
+                )
+                .map(|value| {
+                    format!(
+                        "{} {:02}:{:02}",
+                        value.date(),
+                        value.hour(),
+                        value.minute()
+                    )
+                })
+                .unwrap_or_else(|_| revision.timestamp_micros.to_string());
+                let contributor = match &revision.contributor {
+                    wikimak_wikipedia::ContributorMeta::Named { username, .. } => {
+                        username.as_str()
+                    }
+                    wikimak_wikipedia::ContributorMeta::Anonymous { ip } => ip.as_str(),
+                    wikimak_wikipedia::ContributorMeta::Hidden => "(hidden)",
+                };
+                let mut flags = String::new();
+                if revision.minor == Some(true) {
+                    flags.push_str(" m");
                 }
-                Line::from(Span::styled(format!("{pad}{}", h.text), st))
+                if revision.visibility.is_some() {
+                    flags.push_str(" hidden");
+                }
+                if !revision.has_text {
+                    flags.push_str(" no-text");
+                }
+                let comment = revision.comment.replace(['\r', '\n'], " ");
+                Line::from(vec![
+                    Span::styled(
+                        format!("{timestamp}  "),
+                        Style::default().fg(Color::Cyan),
+                    ),
+                    Span::styled(
+                        format!("r{} ", revision.revision_id),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(format!("{contributor}{flags}")),
+                    Span::styled(
+                        if comment.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" · {comment}")
+                        },
+                        Style::default().add_modifier(Modifier::DIM),
+                    ),
+                ])
             })
             .collect()
+    }
+
+    pub fn revision_count(&self) -> usize {
+        self.wiki
+            .as_ref()
+            .map_or(0, |wiki| wiki.revisions.len())
     }
 
     /// Draw the document into `area` — the ONE widget both the right-pane
@@ -1019,6 +1500,37 @@ impl Reader {
         self.ensure_width(inner_w);
         self.view_h = inner_h.max(1);
         self.clamp_scroll();
+        self.screen_links.clear();
+        for (index, link) in self.doc.links.iter().enumerate() {
+            if link.line < self.scroll || link.line >= self.scroll + inner_h {
+                continue;
+            }
+            let Some(line) = self.doc.lines.get(link.line) else {
+                continue;
+            };
+            let x0 = line.spans[..link.span_range.0]
+                .iter()
+                .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+                .sum::<usize>();
+            let width = line.spans[link.span_range.0..link.span_range.1]
+                .iter()
+                .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+                .sum::<usize>();
+            if width == 0 || x0 >= inner_w {
+                continue;
+            }
+            let x0 = x0.min(inner_w);
+            let x1 = (x0 + width).min(inner_w);
+            self.screen_links.push(ScreenLink {
+                link: index,
+                x0: area.x.saturating_add(1).saturating_add(x0 as u16),
+                x1: area.x.saturating_add(1).saturating_add(x1 as u16),
+                y: area
+                    .y
+                    .saturating_add(1)
+                    .saturating_add((link.line - self.scroll) as u16),
+            });
+        }
         let end = (self.scroll + inner_h).min(self.doc.lines.len());
         let visible: Vec<Line> = self.doc.lines[self.scroll.min(end)..end].to_vec();
         let title = format!(
@@ -1029,7 +1541,12 @@ impl Reader {
             self.doc.links.len()
         );
         let bottom = if self.searching {
-            format!("/{}_", self.query)
+            let prefix = match self.search_mode {
+                SearchMode::Document => "/",
+                SearchMode::ArchiveTitle => "title regexp /",
+                SearchMode::ArchiveFullText => "full-text regexp /",
+            };
+            format!("{prefix}{}_", self.query)
         } else {
             self.status.clone()
         };
@@ -1182,6 +1699,43 @@ mod tests {
         let buf = frame(&mut r, 60, 20);
         let rev = styled_text(&buf, |s| s.add_modifier.contains(Modifier::REVERSED));
         assert_eq!(rev, "jump link");
+    }
+
+    #[test]
+    fn arrows_and_mouse_use_rendered_link_positions() {
+        let html = br#"<p><a href="https://left.test">left</a> gap
+                         <a href="https://right.test">right</a></p>
+                       <p><a href="https://below.test">below</a></p>"#;
+        let mut r = Reader::open_bytes("grid.html".into(), html.to_vec()).unwrap();
+        frame(&mut r, 60, 15);
+        assert!(!r.screen_links.is_empty());
+
+        r.handle_key(KeyCode::Down);
+        let first = r.focus_link.expect("Down focuses a visible link");
+        assert_eq!(r.doc.links[first].url, "https://left.test");
+        r.handle_key(KeyCode::Right);
+        let right = r.focus_link.expect("Right keeps a link focused");
+        assert_eq!(r.doc.links[right].url, "https://right.test");
+        r.handle_key(KeyCode::Down);
+        let below = r.focus_link.expect("Down chooses the nearest lower link");
+        assert_eq!(r.doc.links[below].url, "https://below.test");
+
+        let left = r
+            .screen_links
+            .iter()
+            .find(|item| r.doc.links[item.link].url == "https://left.test")
+            .copied()
+            .unwrap();
+        r.handle_mouse(left.x0, left.y, crossterm::event::MouseEventKind::Moved);
+        assert_eq!(r.focus_link, Some(left.link), "hover follows screen cells");
+        r.handle_mouse(
+            left.x0,
+            left.y,
+            crossterm::event::MouseEventKind::Down(
+                crossterm::event::MouseButton::Left,
+            ),
+        );
+        assert!(r.status.contains("external link"), "click follows: {}", r.status);
     }
 
     #[test]
@@ -1447,6 +2001,16 @@ mod tests {
         assert_eq!(picked, "Alpha Article");
         let mut r =
             Reader::open_wiki(archive.clone(), Some("Alpha Article".into())).unwrap();
+        let archive_address = r
+            .wiki
+            .as_ref()
+            .map(|wiki| std::ptr::from_ref(&wiki.archive))
+            .unwrap();
+        assert!(r.revision_count() > 0);
+        assert!(
+            buffer_text(&frame(&mut r, 70, 16)).contains("Alpha Article"),
+            "initial page renders before persistence check"
+        );
         let buf = frame(&mut r, 70, 16);
         let text = buffer_text(&buf);
         assert!(
@@ -1480,6 +2044,14 @@ mod tests {
         }
         r.handle_key(KeyCode::Enter);
         assert_eq!(
+            r.wiki
+                .as_ref()
+                .map(|wiki| std::ptr::from_ref(&wiki.archive))
+                .unwrap(),
+            archive_address,
+            "link following retains the open archive/index"
+        );
+        assert_eq!(
             r.history_len(),
             1,
             "wiki follow pushed history: {}",
@@ -1512,5 +2084,77 @@ mod tests {
             Ok(_) => panic!("opening a missing wiki page must fail"),
         };
         assert!(e.to_string().contains("No Such Page"), "{e}");
+    }
+
+    #[test]
+    fn wiki_regexp_results_are_navigable() {
+        use wikimak_wikipedia::archive_browse::ArchiveSearchKind;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let archive_path = build_wiki_store(tmp.path());
+        let mut reader =
+            Reader::open_wiki(archive_path, Some("Alpha Article".into())).unwrap();
+
+        assert_eq!(reader.handle_key(KeyCode::Char('T')), KeyResult::Consumed);
+        for character in "Beta".chars() {
+            reader.handle_key(KeyCode::Char(character));
+        }
+        assert_eq!(
+            reader.handle_key(KeyCode::Enter),
+            KeyResult::ArchiveSearch {
+                pattern: "Beta".into(),
+                kind: ArchiveSearchKind::Title,
+            }
+        );
+
+        let archive = reader.archive_search_index().unwrap();
+        let results = archive
+            .search_regex(
+                &regex::Regex::new("Beta body").unwrap(),
+                ArchiveSearchKind::FullText,
+                500,
+            )
+            .unwrap();
+        assert_eq!(results.match_count, 1);
+        reader
+            .show_archive_search(
+                "Beta body",
+                ArchiveSearchKind::FullText,
+                &results,
+                std::time::Duration::from_millis(12),
+            )
+            .unwrap();
+        let search_payload = match &reader.source {
+            Source::WikiSearch { html, .. } => std::sync::Arc::as_ptr(html),
+            source => panic!("expected search result source, got {source:?}"),
+        };
+        assert_eq!(reader.doc.links.len(), 1);
+        reader.handle_key(KeyCode::Tab);
+        reader.handle_key(KeyCode::Enter);
+        assert!(matches!(
+            &reader.source,
+            Source::Wiki {
+                title,
+                timestamp_micros: Some(_),
+                page_id: Some(2),
+                ..
+            } if title == "Beta Article"
+        ));
+        assert!(reader.doc.plain.iter().any(|line| line.contains("Beta body")));
+        reader.handle_key(KeyCode::Char('['));
+        assert_eq!(reader.future_len(), 1);
+        assert!(matches!(
+            &reader.source,
+            Source::WikiSearch { html, .. }
+                if std::ptr::addr_eq(std::sync::Arc::as_ptr(html), search_payload)
+        ));
+        reader.handle_key(KeyCode::Char(']'));
+        assert!(matches!(
+            &reader.source,
+            Source::Wiki {
+                page_id: Some(2),
+                ..
+            }
+        ));
     }
 }

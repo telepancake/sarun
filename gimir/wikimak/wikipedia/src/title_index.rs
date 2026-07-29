@@ -490,7 +490,10 @@ fn split_title(title: &str, site: &SiteInfoRecord) -> (i64, String) {
     (0, title)
 }
 
-fn full_title(action: &crate::archive::PageActionRecord, site: &SiteInfoRecord) -> String {
+pub(crate) fn full_title(
+    action: &crate::archive::PageActionRecord,
+    site: &SiteInfoRecord,
+) -> String {
     title_in_namespace(
         &action.title_at_event,
         action.namespace_at_event.unwrap_or(0),
@@ -498,7 +501,11 @@ fn full_title(action: &crate::archive::PageActionRecord, site: &SiteInfoRecord) 
     )
 }
 
-fn title_in_namespace(title: &str, namespace: i64, site: &SiteInfoRecord) -> String {
+pub(crate) fn title_in_namespace(
+    title: &str,
+    namespace: i64,
+    site: &SiteInfoRecord,
+) -> String {
     let prefix = i32::try_from(namespace)
         .ok()
         .and_then(|id| site.namespaces.iter().find(|namespace| namespace.id == id))

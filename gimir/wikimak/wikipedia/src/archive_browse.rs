@@ -1,10 +1,11 @@
 //! Read-only browsing directly from a portable Wikipedia archive.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::archive::{
-    index_file, visit_frame, visit_frame_while, EntityKind, FrameLocation, ManifestRecord,
-    Record, RevisionRecord, SiteInfoRecord,
+    index_file, visit_frame, visit_frame_while, visit_frame_while_file, EntityKind, FrameLocation,
+    ManifestRecord, Record, RevisionRecord, SiteInfoRecord,
 };
 
 #[derive(Debug)]
@@ -21,6 +22,43 @@ pub struct ArchiveAsOfView<'a> {
     timestamp_micros: Option<i64>,
     render_timestamp_micros: i64,
     site: wikimak_wikitext::SiteConfig,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PageRevisionSummary {
+    pub revision_id: u64,
+    pub parent_id: u64,
+    pub timestamp_micros: i64,
+    pub contributor: crate::ContributorMeta,
+    pub comment: String,
+    pub flags: u32,
+    pub text_len: u64,
+    pub has_text: bool,
+    pub minor: Option<bool>,
+    pub visibility: Option<crate::archive::RevisionVisibilityRecord>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ArchiveSearchKind {
+    Title,
+    FullText,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArchiveSearchHit {
+    pub page_id: u64,
+    pub title: String,
+    pub revision_id: Option<u64>,
+    pub timestamp_micros: Option<i64>,
+    pub snippet: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArchiveSearchResults {
+    pub hits: Vec<ArchiveSearchHit>,
+    pub match_count: u64,
+    pub searched_frames: usize,
+    pub workers: usize,
 }
 
 impl ArchiveBrowseIndex {
@@ -178,6 +216,87 @@ impl ArchiveBrowseIndex {
         Ok(title)
     }
 
+    pub fn page_title_at(
+        &self,
+        page_id: u64,
+        timestamp_micros: i64,
+    ) -> crate::archive::Result<Option<String>> {
+        let Some(location) = self.page_frame(page_id) else {
+            return Ok(None);
+        };
+        let mut current = None;
+        let mut actions = Vec::new();
+        visit_frame(&self.path, location, |record| {
+            match record {
+                Record::PageState {
+                    page_id: record_page_id,
+                    timestamp_micros,
+                    title,
+                    namespace,
+                    deleted,
+                } if record_page_id == page_id && current.is_none() => {
+                    let title = namespace.map_or(title.clone(), |namespace| {
+                        crate::title_index::title_in_namespace(
+                            &title,
+                            namespace,
+                            &self.site_info,
+                        )
+                    });
+                    current = Some((timestamp_micros, title, deleted));
+                }
+                Record::PageAction {
+                    entity,
+                    timestamp_micros,
+                    action,
+                } if entity.kind == EntityKind::Page && entity.id == page_id => {
+                    actions.push((timestamp_micros, action));
+                }
+                _ => {}
+            }
+            Ok(())
+        })?;
+        if timestamp_micros == i64::MAX {
+            return Ok(current.and_then(|(_, title, deleted)| (!deleted).then_some(title)));
+        }
+
+        actions.sort_by_key(|(timestamp, action)| (*timestamp, action.tie_sequence));
+        let mut title = None;
+        let mut exists = false;
+        let mut observed_action = false;
+        for (timestamp, action) in actions {
+            if timestamp > timestamp_micros {
+                break;
+            }
+            observed_action = true;
+            let observed = crate::title_index::full_title(&action, &self.site_info);
+            match action.kind {
+                crate::archive::PageActionKind::Create
+                | crate::archive::PageActionKind::LoggedCreate
+                | crate::archive::PageActionKind::Move
+                | crate::archive::PageActionKind::Restore => {
+                    exists = true;
+                    title = Some(observed);
+                }
+                crate::archive::PageActionKind::Delete
+                    if action.resulting_deleted != Some(false) =>
+                {
+                    exists = false;
+                }
+                _ => {
+                    title = Some(observed);
+                    if let Some(deleted) = action.resulting_deleted {
+                        exists = !deleted;
+                    }
+                }
+            }
+        }
+        if observed_action {
+            Ok(exists.then_some(title).flatten())
+        } else {
+            Ok(current.and_then(|(_, title, deleted)| (!deleted).then_some(title)))
+        }
+    }
+
     pub fn revision(
         &self,
         page_id: u64,
@@ -225,6 +344,200 @@ impl ArchiveBrowseIndex {
             Ok(false)
         })?;
         Ok(selected)
+    }
+
+    /// Revision history for one page, in the archive's canonical
+    /// newest-to-oldest order, without retaining revision text.
+    pub fn page_revisions(
+        &self,
+        page_id: u64,
+    ) -> crate::archive::Result<Vec<PageRevisionSummary>> {
+        let Some(location) = self.page_frame(page_id) else {
+            return Ok(Vec::new());
+        };
+        let mut revisions = Vec::new();
+        visit_frame_while(&self.path, location, |record| {
+            if record.page_id() != Some(page_id) {
+                return Ok(true);
+            }
+            if let Record::Revision { revision, .. } = record {
+                revisions.push(PageRevisionSummary {
+                    revision_id: revision.meta.rev_id,
+                    parent_id: revision.meta.parent_id,
+                    timestamp_micros: revision.meta.ts.timestamp_micros(),
+                    contributor: revision.meta.contributor,
+                    comment: revision.meta.comment,
+                    flags: revision.meta.flags,
+                    text_len: revision.meta.text_len,
+                    has_text: revision.has_text,
+                    minor: revision.history.as_ref().and_then(|history| history.minor),
+                    visibility: revision.visibility,
+                });
+            }
+            Ok(true)
+        })?;
+        Ok(revisions)
+    }
+
+    /// Search page frames directly. Work is claimed one frame at a time, so
+    /// compressed-frame decoding and regex matching use all available cores.
+    ///
+    /// Title search considers the newest non-deleted PageState for each page.
+    /// Full-text search considers every retained revision with text.
+    pub fn search_regex(
+        &self,
+        regex: &regex::Regex,
+        kind: ArchiveSearchKind,
+        limit: usize,
+    ) -> crate::archive::Result<ArchiveSearchResults> {
+        let page_frames = self
+            .frames
+            .iter()
+            .take_while(|location| location.info.first_entity.kind == EntityKind::Page)
+            .collect::<Vec<_>>();
+        let workers = std::thread::available_parallelism()
+            .map_or(1, usize::from)
+            .min(page_frames.len().max(1));
+        let next = AtomicUsize::new(0);
+        let keep = limit.max(1);
+
+        let partials = std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(workers);
+            for _ in 0..workers {
+                handles.push(scope.spawn(|| -> crate::archive::Result<_> {
+                    let mut file = std::fs::File::open(&self.path)?;
+                    let mut found = Vec::new();
+                    let mut match_count = 0_u64;
+                    loop {
+                        let frame_index = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(location) = page_frames.get(frame_index) else {
+                            break;
+                        };
+                        let mut states = std::collections::HashMap::<u64, Option<String>>::new();
+                        let mut revisions = Vec::new();
+                        let mut sequence = 0_usize;
+                        visit_frame_while_file(&mut file, location, |record| {
+                            let record_sequence = sequence;
+                            sequence += 1;
+                            match record {
+                                Record::PageState {
+                                    page_id,
+                                    title,
+                                    namespace,
+                                    deleted,
+                                    ..
+                                } => {
+                                    if let std::collections::hash_map::Entry::Vacant(entry) =
+                                        states.entry(page_id)
+                                    {
+                                        let state = (!deleted).then(|| {
+                                            namespace.map_or(title.clone(), |namespace| {
+                                                crate::title_index::title_in_namespace(
+                                                    &title,
+                                                    namespace,
+                                                    &self.site_info,
+                                                )
+                                            })
+                                        });
+                                        if kind == ArchiveSearchKind::Title
+                                            && state
+                                                .as_ref()
+                                                .is_some_and(|title| regex.is_match(title))
+                                        {
+                                            match_count += 1;
+                                            if found.len() < keep * 2 {
+                                                found.push((
+                                                    frame_index,
+                                                    record_sequence,
+                                                    ArchiveSearchHit {
+                                                        page_id,
+                                                        title: state.clone().unwrap_or_default(),
+                                                        revision_id: None,
+                                                        timestamp_micros: None,
+                                                        snippet: None,
+                                                    },
+                                                ));
+                                            }
+                                        }
+                                        entry.insert(state);
+                                    }
+                                }
+                                Record::Revision { page_id, revision }
+                                    if kind == ArchiveSearchKind::FullText
+                                        && revision.has_text =>
+                                {
+                                    let text = String::from_utf8_lossy(&revision.text);
+                                    if let Some(matched) = regex.find(&text) {
+                                        match_count += 1;
+                                        if revisions.len() < keep * 2 {
+                                            revisions.push((
+                                                record_sequence,
+                                                page_id,
+                                                revision.meta.rev_id,
+                                                revision.meta.ts.timestamp_micros(),
+                                                search_snippet(&text, matched.start(), matched.end()),
+                                            ));
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                            Ok(true)
+                        })?;
+                        if kind == ArchiveSearchKind::FullText {
+                            for (record_sequence, page_id, revision_id, timestamp, snippet) in
+                                revisions
+                            {
+                                let Some(Some(title)) = states.get(&page_id) else {
+                                    continue;
+                                };
+                                if found.len() < keep * 2 {
+                                    found.push((
+                                        frame_index,
+                                        record_sequence,
+                                        ArchiveSearchHit {
+                                            page_id,
+                                            title: title.clone(),
+                                            revision_id: Some(revision_id),
+                                            timestamp_micros: Some(timestamp),
+                                            snippet: Some(snippet),
+                                        },
+                                    ));
+                                }
+                            }
+                        }
+                        if found.len() >= keep * 2 {
+                            found.sort_by_key(|(frame, sequence, _)| (*frame, *sequence));
+                            found.truncate(keep);
+                        }
+                    }
+                    Ok((found, match_count))
+                }));
+            }
+            handles
+                .into_iter()
+                .map(|handle| {
+                    handle.join().map_err(|_| {
+                        crate::archive::ArchiveError::Invalid("archive search worker panicked")
+                    })?
+                })
+                .collect::<crate::archive::Result<Vec<_>>>()
+        })?;
+
+        let mut hits = Vec::with_capacity(keep.saturating_mul(workers));
+        let mut match_count = 0_u64;
+        for (mut worker_hits, worker_count) in partials {
+            hits.append(&mut worker_hits);
+            match_count = match_count.saturating_add(worker_count);
+        }
+        hits.sort_by_key(|(frame, sequence, _)| (*frame, *sequence));
+        hits.truncate(limit);
+        Ok(ArchiveSearchResults {
+            hits: hits.into_iter().map(|(_, _, hit)| hit).collect(),
+            match_count,
+            searched_frames: page_frames.len(),
+            workers,
+        })
     }
 
     fn page_frame(&self, page_id: u64) -> Option<&FrameLocation> {
@@ -304,6 +617,28 @@ impl ArchiveBrowseIndex {
             site,
         }
     }
+}
+
+fn search_snippet(text: &str, start: usize, end: usize) -> String {
+    let prefix_chars = text[..start].chars().count();
+    let matched_chars = text[start..end].chars().count();
+    let first = prefix_chars.saturating_sub(60);
+    let last = (prefix_chars + matched_chars + 100).min(text.chars().count());
+    let mut snippet = text
+        .chars()
+        .skip(first)
+        .take(last - first)
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if first > 0 {
+        snippet.insert_str(0, "…");
+    }
+    if last < text.chars().count() {
+        snippet.push('…');
+    }
+    snippet
 }
 
 impl wikimak_wikitext::PageStore for ArchiveAsOfView<'_> {
@@ -474,5 +809,33 @@ mod tests {
             Some(b"old".to_vec())
         );
         assert_eq!(index.page_text_at(7, 1).unwrap(), None);
+
+        let titles = index
+            .search_regex(
+                &regex::Regex::new("(?i)testa").unwrap(),
+                ArchiveSearchKind::Title,
+                10,
+            )
+            .unwrap();
+        assert_eq!(titles.match_count, 1);
+        assert_eq!(titles.hits[0].title, "Testa lapa");
+        assert_eq!(titles.hits[0].revision_id, None);
+
+        let text = index
+            .search_regex(
+                &regex::Regex::new("hello|old").unwrap(),
+                ArchiveSearchKind::FullText,
+                10,
+            )
+            .unwrap();
+        assert_eq!(text.match_count, 2);
+        assert_eq!(
+            text.hits
+                .iter()
+                .map(|hit| hit.revision_id.unwrap())
+                .collect::<Vec<_>>(),
+            vec![11, 10]
+        );
+        assert_eq!(text.hits[0].snippet.as_deref(), Some("hello"));
     }
 }
