@@ -3,9 +3,7 @@
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 
-const MIRROR_FRAME_TARGET: usize = 128 << 10;
-const MIRROR_REF_PREFIX_BYTES: usize = 16 << 20;
-const MIRROR_REF_PREFIX_SAMPLE_BYTES: usize = 150 << 20;
+use crate::archive::MIRROR_FRAME_TARGET;
 
 fn http_client() -> Result<reqwest::blocking::Client, String> {
     let operator = std::env::var("SARUN_WIKIMEDIA_CONTACT")
@@ -162,27 +160,16 @@ fn persist_archive_pair(
     sync_parent(destination)
 }
 
-fn install_archive(source: &Path, destination: &Path) -> Result<(), String> {
+fn install_built_archive(
+    archive: tempfile::NamedTempFile,
+    destination: &Path,
+) -> Result<(), String> {
     let parent = destination
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(parent).map_err(|error| format!("{}: {error}", parent.display()))?;
 
-    let input = std::fs::File::open(source)
-        .map_err(|error| format!("{}: {error}", source.display()))?;
-    eprintln!("repacking archive with the mirror refPrefix");
-    let mut archive = tempfile::NamedTempFile::new_in(parent)
-        .map_err(|error| format!("{}: {error}", parent.display()))?;
-    let (_, stats) = crate::archive::repack_with_ref_prefix(
-        BufReader::new(input),
-        archive.as_file_mut(),
-        MIRROR_FRAME_TARGET,
-        mirror_compression(),
-        MIRROR_REF_PREFIX_SAMPLE_BYTES,
-        MIRROR_REF_PREFIX_BYTES,
-    )
-    .map_err(|error| error.to_string())?;
     archive
         .as_file()
         .sync_all()
@@ -200,10 +187,7 @@ fn install_archive(source: &Path, destination: &Path) -> Result<(), String> {
 
     eprintln!("installing completed archive and title index");
     persist_archive_pair(archive, titles, destination)?;
-    eprintln!(
-        "{} records, {} frames, {} title intervals, {}-byte refPrefix",
-        stats.records, stats.output_frames, title_entries, stats.ref_prefix_bytes
-    );
+    eprintln!("{title_entries} title intervals");
     Ok(())
 }
 
@@ -218,17 +202,22 @@ fn build_full(
         .map_err(|error| format!("{}: {error}", scratch_parent.display()))?;
     let scratch = tempfile::TempDir::new_in(scratch_parent)
         .map_err(|error| format!("{}: {error}", scratch_parent.display()))?;
-    let raw = scratch.path().join("full.swdump");
+    let parent = archive
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let built = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|error| format!("{}: {error}", parent.display()))?;
     crate::build_direct_archive(
         client,
         &wikimak_mediawiki::Config::default(),
         dbname,
-        &raw,
+        built.path(),
         scratch.path(),
         |message| eprintln!("{message}"),
     )
     .map_err(|error| error.to_string())?;
-    install_archive(&raw, archive)
+    install_built_archive(built, archive)
 }
 
 fn cmd_fetch(dbname: &str, archive: &str) -> Result<(), String> {

@@ -1,6 +1,6 @@
 //! Direct upstream-dump to portable-archive construction.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::{BufRead, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -11,8 +11,9 @@ use reqwest::blocking::Client;
 
 use crate::archive::{
     ArchiveError, ArchiveRecordReader, ArchiveWriter, CompressionSettings, ManifestRecord,
-    Record, RecordSorter, RevisionRecord, SiteInfoRecord, SiteInterwikiRecord,
-    SiteNamespaceRecord, DEFAULT_FRAME_TARGET,
+    Record, RecordSorter, RecordSource, RevisionRecord, SiteInfoRecord, SiteInterwikiRecord,
+    SiteNamespaceRecord, DEFAULT_FRAME_TARGET, MIRROR_FRAME_TARGET,
+    MIRROR_REF_PREFIX_BYTES, MIRROR_REF_PREFIX_SAMPLE_BYTES,
 };
 use crate::instance::{ContributorMeta, RevisionMeta};
 use crate::{Error, Result};
@@ -68,6 +69,108 @@ struct ContentPartResult {
     path: PathBuf,
     stats: PartialStats,
     site_info: Option<SiteInfoRecord>,
+}
+
+#[derive(Default)]
+struct ContentStreamStats {
+    pages: u64,
+    revisions: u64,
+    frames: u64,
+    bytes: u64,
+}
+
+struct ContentPartEnvelope {
+    result: Result<ContentPartResult>,
+    consumed: std::sync::mpsc::SyncSender<()>,
+}
+
+struct ContentArchiveSequence {
+    receiver: std::sync::mpsc::Receiver<(usize, ContentPartEnvelope)>,
+    pending: BTreeMap<usize, ContentPartEnvelope>,
+    next_index: usize,
+    total: usize,
+    current: Option<(
+        PathBuf,
+        ArchiveRecordReader,
+        std::sync::mpsc::SyncSender<()>,
+    )>,
+    stats: Arc<Mutex<ContentStreamStats>>,
+}
+
+impl ContentArchiveSequence {
+    fn next_result(&mut self) -> crate::archive::Result<Option<ContentPartResult>> {
+        if self.next_index == self.total {
+            return Ok(None);
+        }
+        let envelope = loop {
+            if let Some(envelope) = self.pending.remove(&self.next_index) {
+                break envelope;
+            }
+            let (index, envelope) = self.receiver.recv().map_err(|_| {
+                ArchiveError::Invalid("content workers stopped before completing the stream")
+            })?;
+            if index == self.next_index {
+                break envelope;
+            }
+            self.pending.insert(index, envelope);
+        };
+        self.next_index += 1;
+        let result = envelope.result.map_err(ArchiveError::Mirror)?;
+        self.current = Some((
+            result.path.clone(),
+            ArchiveRecordReader::open(&result.path)?,
+            envelope.consumed,
+        ));
+        Ok(Some(result))
+    }
+
+    fn open_next(&mut self) -> crate::archive::Result<Option<SiteInfoRecord>> {
+        let Some(result) = self.next_result()? else {
+            return Ok(None);
+        };
+        let (_, frames, complete) = crate::archive::index_file(&result.path)?;
+        if !complete {
+            return Err(ArchiveError::Invalid(
+                "typed content segment is incomplete",
+            ));
+        }
+        let bytes = std::fs::metadata(&result.path)?.len();
+        {
+            let mut stats = self.stats.lock().expect("content stats mutex");
+            stats.pages += result.stats.pages;
+            stats.revisions += result.stats.revisions;
+            stats.frames += frames.len() as u64;
+            stats.bytes += bytes;
+        }
+        let site_info = result.site_info;
+        Ok(site_info)
+    }
+
+    fn prefetch(&mut self) -> crate::archive::Result<Option<SiteInfoRecord>> {
+        if self.current.is_none() {
+            self.open_next()
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+impl RecordSource for ContentArchiveSequence {
+    fn next_record(&mut self) -> crate::archive::Result<Option<Record>> {
+        loop {
+            if let Some((_, reader, _)) = self.current.as_mut() {
+                if let Some(record) = reader.next_record()? {
+                    return Ok(Some(record));
+                }
+                let (path, _, consumed) = self.current.take().expect("current content part");
+                std::fs::remove_file(path)?;
+                let _ = consumed.send(());
+            }
+            if self.open_next()?.is_none() && self.current.is_none() {
+                return Ok(None);
+            }
+        }
+    }
 }
 
 pub fn build_direct_archive(
@@ -386,50 +489,15 @@ fn build_direct_inner(
         .iter()
         .map(|(path, _)| path.clone())
         .collect();
-    let history_archive = scratch.join("history-all.swdump");
-    let history_frames = if history_paths.len() == 1 {
-        let (_, frames, complete) =
-            crate::archive::index_file(&history_paths[0]).map_err(map_archive)?;
+    let mut history_frames = 0_u64;
+    let mut history_archive_bytes = 0_u64;
+    for path in &history_paths {
+        let (_, frames, complete) = crate::archive::index_file(path).map_err(map_archive)?;
         if !complete {
             return Err(Error::Corrupt("typed history segment is incomplete"));
         }
-        std::fs::rename(&history_paths[0], &history_archive)?;
-        frames.len() as u64
-    } else {
-        let (_, frames, _) = crate::archive::merge_many_archives_with_compression(
-            &history_paths,
-            std::fs::File::create(&history_archive)?,
-            DEFAULT_FRAME_TARGET,
-            CompressionSettings::default(),
-        )
-        .map_err(map_archive)?;
-        for path in &history_paths {
-            std::fs::remove_file(path)?;
-        }
-        frames
-    };
-
-    let content_results = build_content_parts(
-        client,
-        &content_run.parts,
-        scratch,
-        cores,
-        snapshot_date_micros(content_run.date)?,
-        progress,
-    )?;
-    let content_paths: Vec<PathBuf> = content_results
-        .iter()
-        .map(|result| result.path.clone())
-        .collect();
-    let content_archive = scratch.join("content-all.swdump");
-    let (_, content_frames) = crate::archive::concatenate_archives(
-        &content_paths,
-        std::fs::File::create(&content_archive)?,
-        DEFAULT_FRAME_TARGET,
-    )
-    .map_err(map_archive)?;
-    for path in &content_paths {
-        std::fs::remove_file(path)?;
+        history_frames += frames.len() as u64;
+        history_archive_bytes += std::fs::metadata(path)?.len();
     }
 
     let output_parent = output
@@ -438,12 +506,6 @@ fn build_direct_inner(
         .unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(output_parent)?;
     let temporary = tempfile::NamedTempFile::new_in(output_parent)?;
-    let manifest_archive = scratch.join("manifest.swdump");
-    let mut manifest_writer = ArchiveWriter::new(
-        std::fs::File::create(&manifest_archive)?,
-        DEFAULT_FRAME_TARGET,
-    )
-    .map_err(map_archive)?;
     let mut source_files = content_run
         .parts
         .iter()
@@ -451,35 +513,126 @@ fn build_direct_inner(
         .chain(history_files.iter().map(|file| file.part.filename.clone()))
         .collect::<Vec<_>>();
     source_files.sort();
-    manifest_writer
-        .write(&Record::Manifest {
-            timestamp_micros: snapshot_date_micros(content_run.date)?,
-            manifest: ManifestRecord {
-                wiki_db: dbname.to_owned(),
-                content_snapshot: content_run.date.to_string(),
-                metadata_snapshot: history_snapshot,
-                source_files,
+    let groups = crate::sync::part_groups(content_run.parts.clone());
+    if groups.is_empty() {
+        return Err(Error::Corrupt("content dump contains no parts"));
+    }
+    let group_count = groups.len();
+    let workers = groups.len().min(cores).min(3).max(1);
+    let bz2_workers = (cores / workers).max(1);
+    let queue = Arc::new(Mutex::new(VecDeque::from(
+        groups.into_iter().enumerate().collect::<Vec<_>>(),
+    )));
+    let failed = Arc::new(AtomicBool::new(false));
+    let (sender, receiver) = std::sync::mpsc::sync_channel(workers);
+    let content_stats = Arc::new(Mutex::new(ContentStreamStats::default()));
+    let observed_at_micros = snapshot_date_micros(content_run.date)?;
+    let (file, output_frames) = std::thread::scope(|scope| -> Result<_> {
+        for _ in 0..workers {
+            let queue = Arc::clone(&queue);
+            let failed = Arc::clone(&failed);
+            let sender = sender.clone();
+            scope.spawn(move || loop {
+                if failed.load(Ordering::Relaxed) {
+                    return;
+                }
+                let Some((index, group)) = queue.lock().expect("queue mutex").pop_front() else {
+                    return;
+                };
+                let result = build_content_group(
+                    client,
+                    &group,
+                    index,
+                    scratch,
+                    bz2_workers,
+                    observed_at_micros,
+                    progress,
+                );
+                if result.is_err() {
+                    failed.store(true, Ordering::Relaxed);
+                }
+                let (consumed, wait_consumed) = std::sync::mpsc::sync_channel(0);
+                if sender
+                    .send((
+                        index,
+                        ContentPartEnvelope {
+                            result,
+                            consumed,
+                        },
+                    ))
+                    .is_err()
+                {
+                    return;
+                }
+                if wait_consumed.recv().is_err() {
+                    return;
+                }
+            });
+        }
+        drop(sender);
+        let mut content = ContentArchiveSequence {
+            receiver,
+            pending: BTreeMap::new(),
+            next_index: 0,
+            total: group_count,
+            current: None,
+            stats: Arc::clone(&content_stats),
+        };
+        let site_info = content
+            .prefetch()
+            .map_err(map_archive)?
+            .ok_or(Error::Corrupt("content dumps contain no siteinfo"))?;
+
+        let manifest_archive = scratch.join("manifest.swdump");
+        let mut manifest_writer = ArchiveWriter::new(
+            std::fs::File::create(&manifest_archive)?,
+            DEFAULT_FRAME_TARGET,
+        )
+        .map_err(map_archive)?;
+        manifest_writer
+            .write(&Record::Manifest {
+                timestamp_micros: observed_at_micros,
+                manifest: ManifestRecord {
+                    wiki_db: dbname.to_owned(),
+                    content_snapshot: content_run.date.to_string(),
+                    metadata_snapshot: history_snapshot,
+                    source_files,
+                },
+            })
+            .map_err(map_archive)?;
+        manifest_writer
+            .write(&Record::SiteInfo {
+                timestamp_micros: observed_at_micros,
+                site_info,
+            })
+            .map_err(map_archive)?;
+        manifest_writer.finish().map_err(map_archive)?;
+
+        let mut inputs: Vec<Box<dyn RecordSource + '_>> = vec![Box::new(content)];
+        for path in &history_paths {
+            inputs.push(Box::new(ArchiveRecordReader::open(path).map_err(map_archive)?));
+        }
+        inputs.push(Box::new(
+            ArchiveRecordReader::open(manifest_archive).map_err(map_archive)?,
+        ));
+        progress("assembling final archive and sampling newest page revisions");
+        let bootstrap = tempfile::tempfile_in(scratch)?;
+        let (file, output_frames, _, _) =
+            crate::archive::merge_record_sources_bootstrapping_ref_prefix(
+            inputs,
+            temporary,
+            bootstrap,
+            MIRROR_FRAME_TARGET,
+            CompressionSettings {
+                level: 9,
+                ..CompressionSettings::default()
             },
-        })
+            MIRROR_REF_PREFIX_SAMPLE_BYTES,
+            MIRROR_REF_PREFIX_BYTES,
+        )
         .map_err(map_archive)?;
-    let site_info = content_results
-        .iter()
-        .find_map(|result| result.site_info.clone())
-        .ok_or(Error::Corrupt("content dumps contain no siteinfo"))?;
-    manifest_writer
-        .write(&Record::SiteInfo {
-            timestamp_micros: snapshot_date_micros(content_run.date)?,
-            site_info,
-        })
-        .map_err(map_archive)?;
-    manifest_writer.finish().map_err(map_archive)?;
-    let (file, output_frames, _) = crate::archive::merge_many_archives_with_compression(
-        &[content_archive.clone(), history_archive.clone(), manifest_archive],
-        temporary,
-        DEFAULT_FRAME_TARGET,
-        CompressionSettings::default(),
-    )
-    .map_err(map_archive)?;
+        Ok((file, output_frames))
+    })?;
     file.as_file().sync_all()?;
     file.persist(output)
         .map_err(|error| Error::Io(error.error))?;
@@ -489,21 +642,20 @@ fn build_direct_inner(
         std::fs::set_permissions(output, std::fs::Permissions::from_mode(0o644))?;
     }
 
+    let content_stats = content_stats.lock().expect("content stats mutex");
     let mut stats = DirectArchiveStats {
         content_parts: content_run.parts.len() as u64,
         history_parts: history_files.len() as u64,
-        content_archive_bytes: std::fs::metadata(&content_archive)?.len(),
-        history_archive_bytes: std::fs::metadata(&history_archive)?.len(),
+        content_archive_bytes: content_stats.bytes,
+        history_archive_bytes,
         output_bytes: std::fs::metadata(output)?.len(),
-        content_frames,
+        content_frames: content_stats.frames,
         history_frames,
         output_frames,
+        pages: content_stats.pages,
+        revisions: content_stats.revisions,
         ..Default::default()
     };
-    for result in content_results {
-        stats.pages += result.stats.pages;
-        stats.revisions += result.stats.revisions;
-    }
     for (_, partial) in history_results {
         stats.history_events += partial.events;
         stats.page_history_events += partial.page_events;

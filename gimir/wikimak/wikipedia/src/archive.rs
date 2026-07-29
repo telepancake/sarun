@@ -24,6 +24,9 @@ const REF_PREFIX_MAGIC: [u8; 4] = *b"PREF";
 const DONE_MAGIC: [u8; 4] = *b"DONE";
 const FRAME_HEADER_LEN: usize = 64;
 pub const DEFAULT_FRAME_TARGET: usize = 4 << 20;
+pub const MIRROR_FRAME_TARGET: usize = 128 << 10;
+pub const MIRROR_REF_PREFIX_BYTES: usize = 16 << 20;
+pub const MIRROR_REF_PREFIX_SAMPLE_BYTES: usize = 150 << 20;
 pub const DEFAULT_DICTIONARY_BYTES: usize = 800 << 10;
 const DICTIONARY_SAMPLE_COUNT: usize = 32 << 10;
 
@@ -1274,6 +1277,10 @@ pub struct ArchiveRecordReader {
     current: Option<ArchiveFrameReader<OwnedFrameDecoder>>,
 }
 
+pub(crate) trait RecordSource {
+    fn next_record(&mut self) -> Result<Option<Record>>;
+}
+
 type OwnedFrameDecoder = zstd::stream::read::Decoder<
     'static,
     BufReader<std::io::Chain<Cursor<Vec<u8>>, Take<std::fs::File>>>,
@@ -1623,6 +1630,76 @@ fn distill_ref_prefix(
     Ok(prefix)
 }
 
+struct NewestRevisionSamples {
+    target_bytes: usize,
+    samples: Vec<Vec<u8>>,
+    sample_bytes: usize,
+    page_id: Option<u64>,
+    newest: Option<RevisionRecord>,
+}
+
+impl NewestRevisionSamples {
+    fn new(target_bytes: usize) -> Result<Self> {
+        if target_bytes == 0 {
+            return Err(ArchiveError::Invalid("zero reference-prefix sample capacity"));
+        }
+        Ok(Self {
+            target_bytes,
+            samples: Vec::new(),
+            sample_bytes: 0,
+            page_id: None,
+            newest: None,
+        })
+    }
+
+    fn observe(&mut self, record: &Record) -> Result<()> {
+        let page_id = record.page_id();
+        if page_id != self.page_id {
+            self.finish_page()?;
+            self.page_id = page_id;
+        }
+        let Record::Revision { revision, .. } = record else {
+            return Ok(());
+        };
+        if !revision.has_text {
+            return Ok(());
+        }
+        let replace = self.newest.as_ref().map_or(true, |current| {
+            revision.meta.ts > current.meta.ts
+                || (revision.meta.ts == current.meta.ts
+                    && revision.meta.rev_id > current.meta.rev_id)
+        });
+        if replace {
+            self.newest = Some(revision.clone());
+        }
+        Ok(())
+    }
+
+    fn finish_page(&mut self) -> Result<()> {
+        let (Some(page_id), Some(revision)) = (self.page_id, self.newest.take()) else {
+            return Ok(());
+        };
+        let sample = encode_record_wire(&Record::Revision { page_id, revision })?;
+        if sample.len() <= self.target_bytes {
+            self.sample_bytes = self
+                .sample_bytes
+                .checked_add(sample.len())
+                .ok_or(ArchiveError::FieldTooLarge)?;
+            self.samples.push(sample);
+        }
+        Ok(())
+    }
+
+    fn ready(&self) -> bool {
+        self.sample_bytes >= self.target_bytes
+    }
+
+    fn finish(mut self) -> Result<(Vec<Vec<u8>>, usize)> {
+        self.finish_page()?;
+        Ok((self.samples, self.sample_bytes))
+    }
+}
+
 impl ArchiveRecordReader {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
@@ -1652,6 +1729,12 @@ impl ArchiveRecordReader {
             };
             self.current = Some(open_owned_frame(&self.path, &location)?);
         }
+    }
+}
+
+impl RecordSource for ArchiveRecordReader {
+    fn next_record(&mut self) -> Result<Option<Record>> {
+        ArchiveRecordReader::next_record(self)
     }
 }
 
@@ -1816,6 +1899,132 @@ pub fn merge_many_archives_with_compression<W: Write>(
     merge_sorted_archives(inputs, writer)
 }
 
+/// Merge sorted archives while bootstrapping a reference prefix from the
+/// newest text-bearing revision of each page.
+///
+/// Records written before enough complete page samples have been collected
+/// are kept in `bootstrap`, then replayed once into the final writer. Thus the
+/// amount repacked is bounded by the sample target rather than the archive.
+#[allow(clippy::too_many_arguments)]
+pub fn merge_many_archives_bootstrapping_ref_prefix<W: Write>(
+    inputs: &[PathBuf],
+    output: W,
+    bootstrap: std::fs::File,
+    frame_target: usize,
+    compression: CompressionSettings,
+    sample_capacity: usize,
+    prefix_capacity: usize,
+) -> Result<(W, u64, u64, RepackStats)> {
+    if prefix_capacity == 0 || sample_capacity <= prefix_capacity {
+        return Err(ArchiveError::Invalid(
+            "reference-prefix samples must be larger than the prefix",
+        ));
+    }
+    let sources = inputs
+        .iter()
+        .map(|path| {
+            ArchiveRecordReader::open(path)
+                .map(|reader| Box::new(reader) as Box<dyn RecordSource>)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    merge_record_sources_bootstrapping_ref_prefix(
+        sources,
+        output,
+        bootstrap,
+        frame_target,
+        compression,
+        sample_capacity,
+        prefix_capacity,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn merge_record_sources_bootstrapping_ref_prefix<'a, W: Write>(
+    inputs: Vec<Box<dyn RecordSource + 'a>>,
+    output: W,
+    bootstrap: std::fs::File,
+    frame_target: usize,
+    compression: CompressionSettings,
+    sample_capacity: usize,
+    prefix_capacity: usize,
+) -> Result<(W, u64, u64, RepackStats)> {
+    if prefix_capacity == 0 || sample_capacity <= prefix_capacity {
+        return Err(ArchiveError::Invalid(
+            "reference-prefix samples must be larger than the prefix",
+        ));
+    }
+    let mut merge = SortedArchiveMerge::new(inputs)?;
+    let mut bootstrap_writer =
+        ArchiveWriter::with_compression(bootstrap, frame_target, compression)?;
+    let mut sampler = NewestRevisionSamples::new(sample_capacity)?;
+    let mut records = 0_u64;
+
+    while !sampler.ready() {
+        let Some(record) = merge.next_record()? else {
+            break;
+        };
+        sampler.observe(&record)?;
+        bootstrap_writer.write(&record)?;
+        records = records
+            .checked_add(1)
+            .ok_or(ArchiveError::FieldTooLarge)?;
+    }
+    let (mut bootstrap, bootstrap_frames) = bootstrap_writer.finish()?;
+    bootstrap.seek(SeekFrom::Start(0))?;
+    let (samples, sample_bytes) = sampler.finish()?;
+    if sample_bytes == 0 {
+        return Err(ArchiveError::Invalid(
+            "archive has no text-bearing revisions for a reference prefix",
+        ));
+    }
+    let prefix = if sample_bytes >= prefix_capacity {
+        distill_ref_prefix(&samples, prefix_capacity, compression.level)?
+    } else {
+        let mut prefix = Vec::with_capacity(sample_bytes);
+        for sample in &samples {
+            prefix.extend_from_slice(sample);
+        }
+        prefix
+    };
+    drop(samples);
+
+    let mut writer = ArchiveWriter::with_compression_and_ref_prefix(
+        output,
+        frame_target,
+        compression,
+        &prefix,
+    )?;
+    let mut bootstrap_reader = ArchiveReader::new(bootstrap)?;
+    while let Some(mut frame) = bootstrap_reader.next_frame()? {
+        while let Some(record) = frame.next_record()? {
+            writer.write(&record)?;
+        }
+    }
+    if !bootstrap_reader.is_complete() {
+        return Err(ArchiveError::Invalid(
+            "bootstrap archive has no clean completion marker",
+        ));
+    }
+    drop(bootstrap_reader);
+    while let Some(record) = merge.next_record()? {
+        writer.write(&record)?;
+        records = records
+            .checked_add(1)
+            .ok_or(ArchiveError::FieldTooLarge)?;
+    }
+    let (output, output_frames) = writer.finish()?;
+    let stats = RepackStats {
+        input_frames: bootstrap_frames,
+        output_frames,
+        records,
+        ref_prefix_bytes: prefix.len() as u64,
+        compressed_ref_prefix_bytes: compressed_dictionary_size(&prefix, compression)? as u64,
+        sample_bytes: sample_bytes as u64,
+        ..RepackStats::default()
+    };
+    Ok((output, output_frames, records, stats))
+}
+
 /// Merge already-sorted archives directly into the final refPrefix-compressed
 /// representation. The reference prefix is reused from `reference_archive`;
 /// it is immutable compression context, not state derived from the update.
@@ -1855,46 +2064,75 @@ fn merge_sorted_archives<'a, W: Write>(
     inputs: &[PathBuf],
     mut writer: ArchiveWriter<'a, W>,
 ) -> Result<(W, u64, u64)> {
-    let mut readers = inputs
-        .iter()
-        .map(ArchiveRecordReader::open)
-        .collect::<Result<Vec<_>>>()?;
-    let mut heads = BinaryHeap::new();
-    for (source, reader) in readers.iter_mut().enumerate() {
-        if let Some(record) = reader.next_record()? {
-            heads.push(SortRunHead {
-                run: source,
-                record,
-            });
-        }
-    }
+    let mut merge = SortedArchiveMerge::open(inputs)?;
     let mut records = 0_u64;
-    while let Some(head) = heads.pop() {
-        let mut record = head.record;
-        if let Some(next) = readers[head.run].next_record()? {
-            heads.push(SortRunHead {
-                run: head.run,
-                record: next,
-            });
-        }
-        while heads
-            .peek()
-            .is_some_and(|other| records_coalesce(&record, &other.record))
-        {
-            let other = heads.pop().expect("peeked above");
-            record = coalesce_records(record, other.record)?;
-            if let Some(next) = readers[other.run].next_record()? {
-                heads.push(SortRunHead {
-                    run: other.run,
-                    record: next,
-                });
-            }
-        }
+    while let Some(record) = merge.next_record()? {
         writer.write(&record)?;
         records += 1;
     }
     let (output, frames) = writer.finish()?;
     Ok((output, frames, records))
+}
+
+struct SortedArchiveMerge<'a> {
+    readers: Vec<Box<dyn RecordSource + 'a>>,
+    heads: BinaryHeap<SortRunHead>,
+}
+
+impl SortedArchiveMerge<'static> {
+    fn open(inputs: &[PathBuf]) -> Result<Self> {
+        let readers = inputs
+            .iter()
+            .map(|path| {
+                ArchiveRecordReader::open(path)
+                    .map(|reader| Box::new(reader) as Box<dyn RecordSource>)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Self::new(readers)
+    }
+}
+
+impl<'a> SortedArchiveMerge<'a> {
+    fn new(mut readers: Vec<Box<dyn RecordSource + 'a>>) -> Result<Self> {
+        let mut heads = BinaryHeap::new();
+        for (source, reader) in readers.iter_mut().enumerate() {
+            if let Some(record) = reader.next_record()? {
+                heads.push(SortRunHead {
+                    run: source,
+                    record,
+                });
+            }
+        }
+        Ok(Self { readers, heads })
+    }
+
+    fn next_record(&mut self) -> Result<Option<Record>> {
+        let Some(head) = self.heads.pop() else {
+            return Ok(None);
+        };
+        let mut record = head.record;
+        if let Some(next) = self.readers[head.run].next_record()? {
+            self.heads.push(SortRunHead {
+                run: head.run,
+                record: next,
+            });
+        }
+        while self
+            .heads
+            .peek()
+            .is_some_and(|other| records_coalesce(&record, &other.record))
+        {
+            let other = self.heads.pop().expect("peeked above");
+            record = coalesce_records(record, other.record)?;
+            if let Some(next) = self.readers[other.run].next_record()? {
+                self.heads.push(SortRunHead {
+                    run: other.run,
+                    record: next,
+                });
+            }
+        }
+        Ok(Some(record))
+    }
 }
 
 fn records_coalesce(left: &Record, right: &Record) -> bool {
@@ -2714,7 +2952,9 @@ fn owned_frame_decoder<R: std::io::BufRead>(
 }
 
 fn ref_prefix_window_log(prefix_bytes: usize) -> u32 {
-    usize::BITS - prefix_bytes.leading_zeros()
+    // zstd rejects windowLog values below its format minimum even when the
+    // reference itself is smaller (notably for tiny test and private wikis).
+    (usize::BITS - prefix_bytes.leading_zeros()).max(10)
 }
 
 fn read_file_header(input: &mut impl Read) -> Result<u64> {
@@ -4656,6 +4896,82 @@ mod tests {
             panic!("revision");
         };
         assert!(revision.meta.sha1.is_empty());
+    }
+
+    #[test]
+    fn prefix_sampling_chooses_newest_revision_not_first_encountered() {
+        let old = revision(7, 10, 10, b"old");
+        let newest = revision(7, 12, 30, b"newest");
+        let middle = revision(7, 11, 20, b"middle");
+        let mut samples = NewestRevisionSamples::new(1 << 20).unwrap();
+        for record in [&old, &newest, &middle] {
+            samples.observe(record).unwrap();
+        }
+        samples
+            .observe(&Record::PageState {
+                page_id: 8,
+                timestamp_micros: 40,
+                title: "Next".into(),
+                namespace: None,
+                deleted: false,
+            })
+            .unwrap();
+        let (actual, _) = samples.finish().unwrap();
+        assert_eq!(actual, vec![encode_record_wire(&newest).unwrap()]);
+    }
+
+    #[test]
+    fn merge_bootstraps_prefix_then_continues_same_sorted_stream() {
+        let directory = tempfile::tempdir().unwrap();
+        let input_path = directory.path().join("input.swdump");
+        let mut input = ArchiveWriter::new(
+            std::fs::File::create(&input_path).unwrap(),
+            1 << 20,
+        )
+        .unwrap();
+        let mut expected = Vec::new();
+        for page_id in 1..=24 {
+            let newest_text = (0..8192)
+                .map(|offset| (page_id as u8).wrapping_add(offset as u8))
+                .collect::<Vec<_>>();
+            let records = [
+                revision(page_id, page_id * 2, 20, &newest_text),
+                revision(page_id, page_id * 2 - 1, 10, b"old"),
+            ];
+            for record in records {
+                input.write(&record).unwrap();
+                expected.push(record);
+            }
+        }
+        input.finish().unwrap();
+
+        let bootstrap = tempfile::tempfile_in(directory.path()).unwrap();
+        let (output, _, records, stats) = merge_many_archives_bootstrapping_ref_prefix(
+            &[input_path],
+            Vec::new(),
+            bootstrap,
+            4096,
+            CompressionSettings::default(),
+            64 << 10,
+            8 << 10,
+        )
+        .unwrap();
+        assert_eq!(records, expected.len() as u64);
+        assert_eq!(stats.ref_prefix_bytes, 8 << 10);
+
+        let mut reader = ArchiveReader::new(Cursor::new(output)).unwrap();
+        assert!(matches!(
+            reader.reference,
+            Some(CompressionReference::RefPrefix(_))
+        ));
+        let mut actual = Vec::new();
+        while let Some(mut frame) = reader.next_frame().unwrap() {
+            while let Some(record) = frame.next_record().unwrap() {
+                actual.push(record);
+            }
+        }
+        assert!(reader.is_complete());
+        assert_eq!(actual, expected);
     }
 
     #[test]
