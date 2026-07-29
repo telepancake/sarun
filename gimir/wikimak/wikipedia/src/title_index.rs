@@ -7,10 +7,11 @@ use std::path::Path;
 use crate::archive::{ArchiveRecordReader, PageActionKind, Record, SiteInfoRecord};
 
 const FILE_MAGIC: [u8; 8] = *b"SWTITLE\0";
-const FILE_VERSION: u32 = 1;
-const HEADER_BYTES: usize = 48;
+const FILE_VERSION: u32 = 2;
+const HEADER_BYTES: usize = 64;
 const ENTRY_BYTES: usize = 16;
 const FRAME_ENTRY_BYTES: usize = 64;
+const SEGMENT_ENTRY_BYTES: usize = 40;
 
 #[derive(Clone)]
 struct Interval {
@@ -33,12 +34,23 @@ pub struct TitleIndex {
     title_count: usize,
     frame_offset: usize,
     frame_count: usize,
+    segment_offset: usize,
+    segment_count: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct FrameIndexEntry {
     pub(crate) info: crate::archive::FrameInfo,
     pub(crate) compressed_offset: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SegmentIndexEntry {
+    pub(crate) role: u8,
+    pub(crate) first_id: u64,
+    pub(crate) last_id: u64,
+    pub(crate) virtual_start: u64,
+    pub(crate) bytes: u64,
 }
 
 pub fn build(
@@ -51,7 +63,7 @@ pub fn build(
             "archive has no clean completion marker",
         ));
     }
-    let mut reader = ArchiveRecordReader::open(archive)?;
+    let mut reader = ArchiveRecordReader::open(archive.as_ref())?;
     let mut site_info = None;
     let mut pages = BTreeMap::<
         u64,
@@ -158,6 +170,15 @@ pub fn build(
         u64::try_from(changes.len()).map_err(|_| crate::archive::ArchiveError::FieldTooLarge)?;
     let frame_count =
         u64::try_from(frames.len()).map_err(|_| crate::archive::ArchiveError::FieldTooLarge)?;
+    let segments = if archive.as_ref().is_dir() {
+        crate::archive_set::ArchiveSetReader::open(archive.as_ref())?
+            .segments()
+            .to_vec()
+    } else {
+        Vec::new()
+    };
+    let segment_count =
+        u64::try_from(segments.len()).map_err(|_| crate::archive::ArchiveError::FieldTooLarge)?;
     let frame_offset = HEADER_BYTES
         .checked_add(
             changes
@@ -166,13 +187,23 @@ pub fn build(
                 .ok_or(crate::archive::ArchiveError::FieldTooLarge)?,
         )
         .ok_or(crate::archive::ArchiveError::FieldTooLarge)?;
+    let segment_offset = frame_offset
+        .checked_add(
+            frames
+                .len()
+                .checked_mul(FRAME_ENTRY_BYTES)
+                .ok_or(crate::archive::ArchiveError::FieldTooLarge)?,
+        )
+        .ok_or(crate::archive::ArchiveError::FieldTooLarge)?;
     temporary.write_all(&FILE_MAGIC)?;
     temporary.write_all(&FILE_VERSION.to_le_bytes())?;
     temporary.write_all(&(HEADER_BYTES as u32).to_le_bytes())?;
     temporary.write_all(&title_count.to_le_bytes())?;
     temporary.write_all(&frame_count.to_le_bytes())?;
+    temporary.write_all(&segment_count.to_le_bytes())?;
     temporary.write_all(&(HEADER_BYTES as u64).to_le_bytes())?;
     temporary.write_all(&(frame_offset as u64).to_le_bytes())?;
+    temporary.write_all(&(segment_offset as u64).to_le_bytes())?;
     for ((title, time), page_id) in &changes {
         temporary.write_all(&title.to_le_bytes())?;
         temporary.write_all(&time.to_le_bytes())?;
@@ -190,6 +221,26 @@ pub fn build(
         temporary.write_all(&frame.info.compressed_bytes.to_le_bytes())?;
         temporary.write_all(&frame.info.dictionary_id.unwrap_or(0).to_le_bytes())?;
         temporary.write_all(&[0; 4])?;
+    }
+    for segment in &segments {
+        let role = match segment.kind {
+            Some(crate::archive::EntityKind::Page) => 1,
+            Some(crate::archive::EntityKind::User) => 2,
+            Some(crate::archive::EntityKind::Global) => 3,
+            None if segment.name.starts_with("0000-") => 0,
+            None if segment.name.starts_with("9999-") => 4,
+            None => {
+                return Err(crate::archive::ArchiveError::Invalid(
+                    "unknown archive-set segment role",
+                ))
+            }
+        };
+        temporary.write_all(&[role])?;
+        temporary.write_all(&[0; 7])?;
+        temporary.write_all(&segment.first_id.to_le_bytes())?;
+        temporary.write_all(&segment.last_id.to_le_bytes())?;
+        temporary.write_all(&segment.virtual_start.to_le_bytes())?;
+        temporary.write_all(&segment.bytes.to_le_bytes())?;
     }
     temporary.as_file_mut().sync_all()?;
     temporary
@@ -231,12 +282,20 @@ impl TitleIndex {
             bytes[24..32].try_into().expect("frame count bytes"),
         ))
         .map_err(|_| crate::archive::ArchiveError::FieldTooLarge)?;
+        let segment_count = usize::try_from(u64::from_le_bytes(
+            bytes[32..40].try_into().expect("segment count bytes"),
+        ))
+        .map_err(|_| crate::archive::ArchiveError::FieldTooLarge)?;
         let title_offset = usize::try_from(u64::from_le_bytes(
-            bytes[32..40].try_into().expect("title offset bytes"),
+            bytes[40..48].try_into().expect("title offset bytes"),
         ))
         .map_err(|_| crate::archive::ArchiveError::FieldTooLarge)?;
         let frame_offset = usize::try_from(u64::from_le_bytes(
-            bytes[40..48].try_into().expect("frame offset bytes"),
+            bytes[48..56].try_into().expect("frame offset bytes"),
+        ))
+        .map_err(|_| crate::archive::ArchiveError::FieldTooLarge)?;
+        let segment_offset = usize::try_from(u64::from_le_bytes(
+            bytes[56..64].try_into().expect("segment offset bytes"),
         ))
         .map_err(|_| crate::archive::ArchiveError::FieldTooLarge)?;
         let expected_frame_offset = title_offset
@@ -246,15 +305,23 @@ impl TitleIndex {
                     .ok_or(crate::archive::ArchiveError::FieldTooLarge)?,
             )
             .ok_or(crate::archive::ArchiveError::FieldTooLarge)?;
-        let expected_len = frame_offset
+        let expected_segment_offset = frame_offset
             .checked_add(
                 frame_count
                     .checked_mul(FRAME_ENTRY_BYTES)
                     .ok_or(crate::archive::ArchiveError::FieldTooLarge)?,
             )
             .ok_or(crate::archive::ArchiveError::FieldTooLarge)?;
+        let expected_len = segment_offset
+            .checked_add(
+                segment_count
+                    .checked_mul(SEGMENT_ENTRY_BYTES)
+                    .ok_or(crate::archive::ArchiveError::FieldTooLarge)?,
+            )
+            .ok_or(crate::archive::ArchiveError::FieldTooLarge)?;
         if title_offset != HEADER_BYTES
             || frame_offset != expected_frame_offset
+            || segment_offset != expected_segment_offset
             || bytes.len() != expected_len
         {
             return Err(crate::archive::ArchiveError::Invalid(
@@ -267,6 +334,8 @@ impl TitleIndex {
             title_count,
             frame_offset,
             frame_count,
+            segment_offset,
+            segment_count,
         })
     }
 
@@ -341,6 +410,42 @@ impl TitleIndex {
             compressed_offset: u64::from_le_bytes(
                 entry[24..32].try_into().expect("compressed offset bytes"),
             ),
+        })
+    }
+
+    pub(crate) fn segment_count(&self) -> usize {
+        self.segment_count
+    }
+
+    pub(crate) fn segment(
+        &self,
+        position: usize,
+    ) -> crate::archive::Result<SegmentIndexEntry> {
+        let start = self
+            .segment_offset
+            .checked_add(
+                position
+                    .checked_mul(SEGMENT_ENTRY_BYTES)
+                    .ok_or(crate::archive::ArchiveError::FieldTooLarge)?,
+            )
+            .ok_or(crate::archive::ArchiveError::FieldTooLarge)?;
+        let entry = self
+            .bytes
+            .get(start..start + SEGMENT_ENTRY_BYTES)
+            .ok_or(crate::archive::ArchiveError::Invalid(
+                "segment index position is out of bounds",
+            ))?;
+        if entry[1..8].iter().any(|byte| *byte != 0) || entry[0] > 4 {
+            return Err(crate::archive::ArchiveError::Invalid(
+                "segment index entry is malformed",
+            ));
+        }
+        Ok(SegmentIndexEntry {
+            role: entry[0],
+            first_id: u64::from_le_bytes(entry[8..16].try_into().unwrap()),
+            last_id: u64::from_le_bytes(entry[16..24].try_into().unwrap()),
+            virtual_start: u64::from_le_bytes(entry[24..32].try_into().unwrap()),
+            bytes: u64::from_le_bytes(entry[32..40].try_into().unwrap()),
         })
     }
 

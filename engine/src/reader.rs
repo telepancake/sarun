@@ -2584,13 +2584,23 @@ mod tests {
 
     fn build_wiki_store(root: &Path) -> PathBuf {
         use wikimak_wikipedia::archive::{
-            ArchiveWriter, ManifestRecord, Record, RevisionRecord, SiteInfoRecord,
+            ArchiveWriter, CompressionSettings, ManifestRecord, Record, RevisionRecord, SiteInfoRecord,
             SiteNamespaceRecord,
         };
         use wikimak_wikipedia::{ContributorMeta, RevisionMeta};
         let archive = root.join("readertest.swdump");
-        let mut writer =
-            ArchiveWriter::new(std::fs::File::create(&archive).unwrap(), 1024).unwrap();
+        let output = wikimak_wikipedia::archive_set::ArchiveSetOutput::new_in(
+            root,
+            1 << 20,
+        )
+        .unwrap();
+        let mut writer = ArchiveWriter::with_ref_prefix(
+            output,
+            1024,
+            CompressionSettings::default(),
+            b"reader wiki test reference prefix",
+        )
+        .unwrap();
         let timestamp = chrono::DateTime::parse_from_rfc3339("2022-01-01T00:00:00Z")
             .unwrap()
             .with_timezone(&chrono::Utc);
@@ -2721,7 +2731,8 @@ mod tests {
                 },
             })
             .unwrap();
-        writer.finish().unwrap();
+        let (output, _) = writer.finish().unwrap();
+        output.finish().unwrap().persist(&archive).unwrap();
         wikimak_wikipedia::title_index::build(
             &archive,
             archive.with_extension("swtitle"),

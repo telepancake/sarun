@@ -669,6 +669,7 @@ pub struct FrameLocation {
     pub info: FrameInfo,
     pub compressed_offset: u64,
     reference: Option<CompressionReference>,
+    physical_segment: Option<usize>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -770,6 +771,7 @@ pub struct ArchiveWriter<'a, W: Write> {
     dictionary: Option<std::sync::Arc<[u8]>>,
     ref_prefix: Option<&'a [u8]>,
     dictionary_id: Option<u32>,
+    range_boundaries: std::collections::VecDeque<EntityKey>,
 }
 
 impl<W: Write> ArchiveWriter<'static, W> {
@@ -819,11 +821,21 @@ impl<W: Write> ArchiveWriter<'static, W> {
             dictionary,
             ref_prefix: None,
             dictionary_id,
+            range_boundaries: std::collections::VecDeque::new(),
         })
     }
 }
 
 impl<'a, W: Write> ArchiveWriter<'a, W> {
+    pub fn with_ref_prefix(
+        output: W,
+        frame_target: usize,
+        compression: CompressionSettings,
+        prefix: &'a [u8],
+    ) -> Result<Self> {
+        Self::with_compression_and_ref_prefix(output, frame_target, compression, prefix)
+    }
+
     fn with_compression_and_ref_prefix(
         mut output: W,
         frame_target: usize,
@@ -852,6 +864,7 @@ impl<'a, W: Write> ArchiveWriter<'a, W> {
             dictionary: None,
             ref_prefix: Some(prefix),
             dictionary_id: None,
+            range_boundaries: std::collections::VecDeque::new(),
         })
     }
 
@@ -859,6 +872,32 @@ impl<'a, W: Write> ArchiveWriter<'a, W> {
         let entity = record.entity();
         let timestamp = record.timestamp_micros();
         let new_entity = self.last_entity != Some(entity);
+        if new_entity {
+            while let (Some(last), Some(boundary)) =
+                (self.last_entity, self.range_boundaries.front().copied())
+            {
+                if last.kind > boundary.kind
+                    || (last.kind == boundary.kind && last.id > boundary.id)
+                {
+                    return Err(ArchiveError::Invalid(
+                        "archive range boundary precedes written records",
+                    ));
+                }
+                if entity.kind > boundary.kind
+                    || (entity.kind == boundary.kind && entity.id > boundary.id)
+                {
+                    if last.kind != boundary.kind || last.id != boundary.id {
+                        return Err(ArchiveError::Invalid(
+                            "archive range boundary is not an entity boundary",
+                        ));
+                    }
+                    self.seal_frame()?;
+                    self.range_boundaries.pop_front();
+                    continue;
+                }
+                break;
+            }
+        }
         if let Some(last_entity) = self.last_entity {
             if entity < last_entity || (!new_entity && timestamp > self.last_timestamp) {
                 return Err(ArchiveError::OutOfOrder {
@@ -947,11 +986,37 @@ impl<'a, W: Write> ArchiveWriter<'a, W> {
     }
 
     pub fn finish(mut self) -> Result<(W, u64)> {
+        while let Some(boundary) = self.range_boundaries.pop_front() {
+            if self.last_entity != Some(boundary) {
+                return Err(ArchiveError::Invalid(
+                    "archive range boundary was not reached",
+                ));
+            }
+            self.seal_frame()?;
+        }
         self.seal_frame()?;
         self.output.write_all(&DONE_MAGIC)?;
         self.output.write_all(&[0; FRAME_HEADER_LEN - 4])?;
         self.output.flush()?;
         Ok((self.output, self.frames))
+    }
+
+    pub(crate) fn set_range_boundaries(&mut self, boundaries: Vec<EntityKey>) -> Result<()> {
+        if boundaries
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+        {
+            return Err(ArchiveError::Invalid(
+                "archive range boundaries are not strictly ordered",
+            ));
+        }
+        if self.last_entity.is_some() || self.frame.is_some() {
+            return Err(ArchiveError::Invalid(
+                "archive range boundaries were set after writing began",
+            ));
+        }
+        self.range_boundaries = boundaries.into();
+        Ok(())
     }
 }
 
@@ -1071,14 +1136,25 @@ pub struct ArchiveFrameReader<D: Read> {
 }
 
 pub fn index_file(path: impl AsRef<Path>) -> Result<(u64, Vec<FrameLocation>, bool)> {
-    let file = std::fs::File::open(path)?;
-    index_open_file(&file)
+    let path = path.as_ref();
+    if path.is_dir() {
+        index_reader(crate::archive_set::ArchiveSetReader::open(path)?)
+    } else {
+        let file = std::fs::File::open(path)?;
+        index_open_file(&file)
+    }
 }
 
 pub(crate) fn index_open_file(
     file: &std::fs::File,
 ) -> Result<(u64, Vec<FrameLocation>, bool)> {
-    let mut file = BufReader::new(file.try_clone()?);
+    index_reader(file.try_clone()?)
+}
+
+pub(crate) fn index_reader(
+    file: impl Read + Seek,
+) -> Result<(u64, Vec<FrameLocation>, bool)> {
+    let mut file = BufReader::new(file);
     let frame_target = read_file_header(&mut file)?;
     let mut locations = Vec::new();
     let mut previous = None;
@@ -1124,6 +1200,7 @@ pub(crate) fn index_open_file(
             info,
             compressed_offset,
             reference: reference.clone(),
+            physical_segment: None,
         });
         file.seek(SeekFrom::Current(
             info.compressed_bytes
@@ -1134,88 +1211,188 @@ pub(crate) fn index_open_file(
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct IndexedArchive {
-    file_len: u64,
+pub(crate) struct IndexedArchiveSet {
+    segments: Vec<(
+        crate::title_index::SegmentIndexEntry,
+        std::sync::Arc<std::fs::File>,
+    )>,
     reference: Option<CompressionReference>,
     active_dictionary_id: Option<u32>,
 }
 
-impl IndexedArchive {
+impl IndexedArchiveSet {
     pub(crate) fn open(
-        file: &std::fs::File,
-        last: crate::title_index::FrameIndexEntry,
+        root: impl AsRef<Path>,
+        titles: &crate::title_index::TitleIndex,
     ) -> Result<Self> {
-        let file_len = file.metadata()?.len();
-        let mut input = BufReader::new(file.try_clone()?);
-        let _ = read_file_header(&mut input)?;
-        let pending_header = read_frame_header_or_eof(&mut input)?;
-        let mut reference = None;
-        let mut active_dictionary_id = None;
-        if let Some(header) = pending_header {
-            if let Some(info) = parse_dictionary_header(&header)? {
-                let bytes = read_dictionary_payload(&mut input, info)?;
-                reference = Some(CompressionReference::Dictionary(
-                    std::sync::Arc::<[u8]>::from(bytes),
+        let root = root.as_ref().to_path_buf();
+        if !root.is_dir() || titles.segment_count() < 3 {
+            return Err(ArchiveError::Invalid(
+                "Wikipedia archive is not a range-file set",
+            ));
+        }
+        let mut segments = Vec::with_capacity(titles.segment_count());
+        let mut expected_start = 0_u64;
+        for position in 0..titles.segment_count() {
+            let segment = titles.segment(position)?;
+            if segment.virtual_start != expected_start {
+                return Err(ArchiveError::Invalid(
+                    "archive-set index has a virtual-offset gap",
                 ));
-                active_dictionary_id = Some(info.id);
-            } else if let Some(info) = parse_ref_prefix_header(&header)? {
-                let bytes = read_ref_prefix_payload(&mut input, info)?;
-                reference = Some(CompressionReference::RefPrefix(
-                    std::sync::Arc::<[u8]>::from(bytes),
+            }
+            let name = crate::archive_set::indexed_segment_name(segment)?;
+            let path = root.join(name);
+            if std::fs::metadata(&path)?.len() != segment.bytes {
+                return Err(ArchiveError::Invalid(
+                    "archive-set segment size does not match its index",
+                ));
+            }
+            expected_start = expected_start
+                .checked_add(segment.bytes)
+                .ok_or(ArchiveError::FieldTooLarge)?;
+            let file = std::fs::File::open(&path)?;
+            segments.push((segment, std::sync::Arc::new(file)));
+        }
+        if segments.first().map(|(segment, _)| segment.role) != Some(0)
+            || segments.last().map(|(segment, _)| segment.role) != Some(4)
+        {
+            return Err(ArchiveError::Invalid(
+                "archive-set index lacks reference or completion segment",
+            ));
+        }
+        let mut previous_data = None;
+        for (segment, _) in &segments {
+            if (1..=3).contains(&segment.role) {
+                if segment.first_id > segment.last_id
+                    || previous_data.is_some_and(|(role, last_id)| {
+                        segment.role < role
+                            || (segment.role == role && segment.first_id <= last_id)
+                    })
+                {
+                    return Err(ArchiveError::Invalid(
+                        "archive-set index has overlapping or unordered entity ranges",
+                    ));
+                }
+                previous_data = Some((segment.role, segment.last_id));
+            } else if segment.first_id != 0 || segment.last_id != 0 {
+                return Err(ArchiveError::Invalid(
+                    "archive-set control segment has an entity range",
                 ));
             }
         }
-        let indexed = Self {
-            file_len,
-            reference,
-            active_dictionary_id,
-        };
-        let last = indexed.location(last)?;
-        let done_offset = last
-            .compressed_offset
-            .checked_add(last.info.compressed_bytes)
-            .ok_or(ArchiveError::FieldTooLarge)?;
-        let mut done_file = file.try_clone()?;
-        done_file.seek(SeekFrom::Start(done_offset))?;
-        let done = read_frame_header_or_eof(&mut done_file)?
-            .ok_or(ArchiveError::Invalid("archive has no completion marker"))?;
-        if parse_frame_header(&done)?.is_some() {
+
+        let mut input = BufReader::new(segments[0].1.try_clone()?);
+        let _ = read_file_header(&mut input)?;
+        let header = read_frame_header_or_eof(&mut input)?.ok_or(
+            ArchiveError::Invalid("archive-set reference segment is empty"),
+        )?;
+        let (reference, active_dictionary_id) =
+            if let Some(info) = parse_dictionary_header(&header)? {
+                let bytes = read_dictionary_payload(&mut input, info)?;
+                (
+                    Some(CompressionReference::Dictionary(
+                        std::sync::Arc::<[u8]>::from(bytes),
+                    )),
+                    Some(info.id),
+                )
+            } else if let Some(info) = parse_ref_prefix_header(&header)? {
+                let bytes = read_ref_prefix_payload(&mut input, info)?;
+                (
+                    Some(CompressionReference::RefPrefix(
+                        std::sync::Arc::<[u8]>::from(bytes),
+                    )),
+                    None,
+                )
+            } else {
+                return Err(ArchiveError::Invalid(
+                    "archive-set reference segment has no compression reference",
+                ));
+            };
+        if read_frame_header_or_eof(&mut input)?.is_some() {
             return Err(ArchiveError::Invalid(
-                "title index does not cover every archive frame",
+                "archive-set reference segment contains data frames",
             ));
         }
-        Ok(indexed)
+
+        let mut completion = segments.last().expect("checked").1.try_clone()?;
+        let done = read_frame_header_or_eof(&mut completion)?
+            .ok_or(ArchiveError::Invalid("archive-set completion segment is empty"))?;
+        if parse_frame_header(&done)?.is_some()
+            || read_frame_header_or_eof(&mut completion)?.is_some()
+        {
+            return Err(ArchiveError::Invalid(
+                "archive-set completion segment is malformed",
+            ));
+        }
+        Ok(Self {
+            segments,
+            reference,
+            active_dictionary_id,
+        })
     }
 
     pub(crate) fn location(
         &self,
         entry: crate::title_index::FrameIndexEntry,
     ) -> Result<FrameLocation> {
-        let info = entry.info;
-        if info.first_entity.kind != info.last_entity.kind
-            || info.first_entity > info.last_entity
-        {
+        let position = self
+            .segments
+            .partition_point(|(segment, _)| segment.virtual_start <= entry.compressed_offset)
+            .checked_sub(1)
+            .ok_or(ArchiveError::Invalid(
+                "frame offset precedes archive-set segments",
+            ))?;
+        let (segment, _) = &self.segments[position];
+        if !(1..=3).contains(&segment.role) {
             return Err(ArchiveError::Invalid(
-                "title index has an invalid frame range",
+                "frame points into a non-data archive-set segment",
             ));
         }
-        validate_frame_dictionary(info, self.active_dictionary_id)?;
-        let frame_end = entry
-            .compressed_offset
-            .checked_add(info.compressed_bytes)
+        let expected_kind = match segment.role {
+            1 => EntityKind::Page,
+            2 => EntityKind::User,
+            3 => EntityKind::Global,
+            _ => unreachable!("checked above"),
+        };
+        if entry.info.first_entity.kind != expected_kind
+            || entry.info.last_entity.kind != expected_kind
+            || entry.info.first_entity.id < segment.first_id
+            || entry.info.last_entity.id > segment.last_id
+        {
+            return Err(ArchiveError::Invalid(
+                "frame entity range disagrees with its archive-set segment",
+            ));
+        }
+        let local = entry.compressed_offset - segment.virtual_start;
+        let end = local
+            .checked_add(entry.info.compressed_bytes)
             .ok_or(ArchiveError::FieldTooLarge)?;
-        if entry.compressed_offset < FILE_HEADER_LEN as u64 + FRAME_HEADER_LEN as u64
-            || frame_end > self.file_len
-        {
+        if local < FRAME_HEADER_LEN as u64 || end > segment.bytes {
             return Err(ArchiveError::Invalid(
-                "title index frame points outside the archive",
+                "frame points outside its archive-set segment",
             ));
         }
+        validate_frame_dictionary(entry.info, self.active_dictionary_id)?;
         Ok(FrameLocation {
-            info,
-            compressed_offset: entry.compressed_offset,
+            info: entry.info,
+            compressed_offset: local,
             reference: self.reference.clone(),
+            physical_segment: Some(position),
         })
+    }
+
+    pub(crate) fn open_file(&self, location: &FrameLocation) -> Result<std::fs::File> {
+        let position = location.physical_segment.ok_or(ArchiveError::Invalid(
+            "archive-set frame has no physical segment",
+        ))?;
+        self.segments
+            .get(position)
+            .ok_or(ArchiveError::Invalid(
+                "archive-set frame segment is out of bounds",
+            ))?
+            .1
+            .try_clone()
+            .map_err(ArchiveError::Io)
     }
 }
 
@@ -1272,18 +1449,27 @@ pub(crate) fn visit_frame_while_file(
 }
 
 pub struct ArchiveRecordReader {
-    path: PathBuf,
+    source: ArchiveRecordSource,
     frames: std::vec::IntoIter<FrameLocation>,
     current: Option<ArchiveFrameReader<OwnedFrameDecoder>>,
+}
+
+enum ArchiveRecordSource {
+    File(PathBuf),
+    Set(Vec<(u64, std::sync::Arc<std::fs::File>)>),
 }
 
 pub(crate) trait RecordSource {
     fn next_record(&mut self) -> Result<Option<Record>>;
 }
 
+trait ReadSeek: Read + Seek {}
+impl<T: Read + Seek> ReadSeek for T {}
+
+type OwnedInput = Box<dyn ReadSeek>;
 type OwnedFrameDecoder = zstd::stream::read::Decoder<
     'static,
-    BufReader<std::io::Chain<Cursor<Vec<u8>>, Take<std::fs::File>>>,
+    BufReader<std::io::Chain<Cursor<Vec<u8>>, Take<OwnedInput>>>,
 >;
 
 pub(crate) struct FrameRecordCursor {
@@ -1703,14 +1889,33 @@ impl NewestRevisionSamples {
 impl ArchiveRecordReader {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let (_, frames, complete) = index_file(&path)?;
+        let (frames, complete, source) = if path.is_dir() {
+            let set = crate::archive_set::ArchiveSetReader::open(&path)?;
+            let segments = set.segments().to_vec();
+            let (_, frames, complete) = index_reader(set)?;
+            let files = segments
+                .iter()
+                .map(|segment| {
+                    Ok((
+                        segment.virtual_start,
+                        std::sync::Arc::new(std::fs::File::open(
+                            path.join(&segment.name),
+                        )?),
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            (frames, complete, ArchiveRecordSource::Set(files))
+        } else {
+            let (_, frames, complete) = index_file(&path)?;
+            (frames, complete, ArchiveRecordSource::File(path))
+        };
         if !complete {
             return Err(ArchiveError::Invalid(
                 "archive has no clean completion marker",
             ));
         }
         Ok(Self {
-            path,
+            source,
             frames: frames.into_iter(),
             current: None,
         })
@@ -1727,7 +1932,7 @@ impl ArchiveRecordReader {
             let Some(location) = self.frames.next() else {
                 return Ok(None);
             };
-            self.current = Some(open_owned_frame(&self.path, &location)?);
+            self.current = Some(open_owned_frame(&self.source, &location)?);
         }
     }
 }
@@ -1739,19 +1944,47 @@ impl RecordSource for ArchiveRecordReader {
 }
 
 fn open_owned_frame(
-    path: &Path,
+    source: &ArchiveRecordSource,
     location: &FrameLocation,
 ) -> Result<ArchiveFrameReader<OwnedFrameDecoder>> {
-    open_owned_frame_file(std::fs::File::open(path)?, location)
+    let (input, offset): (OwnedInput, u64) = match source {
+        ArchiveRecordSource::File(path) => (
+            Box::new(std::fs::File::open(path)?),
+            location.compressed_offset,
+        ),
+        ArchiveRecordSource::Set(segments) => {
+            let position = segments
+                .partition_point(|(virtual_start, _)| {
+                    *virtual_start <= location.compressed_offset
+                })
+                .checked_sub(1)
+                .ok_or(ArchiveError::Invalid(
+                    "frame offset precedes archive-set segments",
+                ))?;
+            (
+                Box::new(segments[position].1.try_clone()?),
+                location.compressed_offset - segments[position].0,
+            )
+        }
+    };
+    open_owned_frame_input_at(input, location, offset)
 }
 
 fn open_owned_frame_file(
-    mut file: std::fs::File,
+    file: std::fs::File,
     location: &FrameLocation,
 ) -> Result<ArchiveFrameReader<OwnedFrameDecoder>> {
-    file.seek(SeekFrom::Start(location.compressed_offset))?;
+    open_owned_frame_input_at(Box::new(file), location, location.compressed_offset)
+}
+
+fn open_owned_frame_input_at(
+    mut input: OwnedInput,
+    location: &FrameLocation,
+    offset: u64,
+) -> Result<ArchiveFrameReader<OwnedFrameDecoder>> {
+    input.seek(SeekFrom::Start(offset))?;
     let compressed = compressed_frame_reader(
-        file.take(location.info.compressed_bytes),
+        input.take(location.info.compressed_bytes),
         location.info,
     )?;
     let decoder = owned_frame_decoder(
@@ -2057,6 +2290,40 @@ pub fn merge_many_archives_reusing_ref_prefix<W: Write>(
         compression,
         &prefix,
     )?;
+    merge_sorted_archives(inputs, writer)
+}
+
+pub fn merge_many_archives_reusing_ref_prefix_at_boundaries<W: Write>(
+    reference_archive: impl AsRef<Path>,
+    inputs: &[PathBuf],
+    output: W,
+    frame_target: usize,
+    compression: CompressionSettings,
+    boundaries: Vec<EntityKey>,
+) -> Result<(W, u64, u64)> {
+    let (_, frames, complete) = index_file(reference_archive)?;
+    if !complete {
+        return Err(ArchiveError::Invalid(
+            "reference archive has no clean completion marker",
+        ));
+    }
+    let prefix = frames
+        .first()
+        .and_then(|frame| frame.reference.as_ref())
+        .and_then(|reference| match reference {
+            CompressionReference::RefPrefix(prefix) => Some(prefix.clone()),
+            CompressionReference::Dictionary(_) => None,
+        })
+        .ok_or(ArchiveError::Invalid(
+            "reference archive has no reference prefix",
+        ))?;
+    let mut writer = ArchiveWriter::with_compression_and_ref_prefix(
+        output,
+        frame_target,
+        compression,
+        &prefix,
+    )?;
+    writer.set_range_boundaries(boundaries)?;
     merge_sorted_archives(inputs, writer)
 }
 

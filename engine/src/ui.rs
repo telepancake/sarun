@@ -504,7 +504,7 @@ enum Modal {
     /// mirror-driver CLI. Preset sites are toggled in the first field;
     /// `custom` accepts any other Wikimedia database name. `destination`
     /// is a user-chosen base directory: every selected database gets one
-    /// archive/index pair (for example BASE/enwiki.swdump and
+    /// range-file archive/index pair (for example BASE/enwiki.swdump and
     /// BASE/enwiki.swtitle), so mirrors never collide.
     WikiMirrorSetup {
         selected: std::collections::BTreeSet<String>,
@@ -9176,7 +9176,7 @@ fn discover_wiki_mirrors(
     library: &std::path::Path,
 ) -> Result<Vec<(String, std::path::PathBuf)>, String> {
     fn inspect(archive: &std::path::Path) -> Result<Option<String>, String> {
-        if !archive.is_file()
+        if !archive.is_dir()
             || archive.extension().and_then(|value| value.to_str()) != Some("swdump")
         {
             return Ok(None);
@@ -9930,7 +9930,7 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
                 },
             )));
             body.push(Line::from(Span::styled(
-                "   Each site is stored as FOLDER/dbname.swdump plus its generated title index.",
+                "   Each site is stored as a dbname.swdump range-file folder plus one title index.",
                 Style::default().add_modifier(Modifier::DIM),
             )));
             body.push(Line::from(Span::styled(
@@ -9983,7 +9983,7 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
         Modal::WikiMirrorLibrary { path } => (
             " open existing Wikipedia mirror library ",
             vec![
-                Line::from("Folder containing *.swdump mirrors — or one .swdump file"),
+                Line::from("Folder containing *.swdump mirrors — or one .swdump mirror folder"),
                 Line::from(""),
                 Line::from(format!("{path}_")),
                 Line::from(""),
@@ -23725,10 +23725,20 @@ mod tests {
 
     fn make_portable_wiki_archive(archive: &std::path::Path, dbname: &str) {
         use wikimak_wikipedia::archive::{
-            ArchiveWriter, ManifestRecord, Record, SiteInfoRecord,
+            ArchiveWriter, CompressionSettings, ManifestRecord, Record, SiteInfoRecord,
         };
-        let mut writer =
-            ArchiveWriter::new(std::fs::File::create(archive).unwrap(), 1024).unwrap();
+        let output = wikimak_wikipedia::archive_set::ArchiveSetOutput::new_in(
+            archive.parent().unwrap(),
+            1 << 20,
+        )
+        .unwrap();
+        let mut writer = ArchiveWriter::with_ref_prefix(
+            output,
+            1024,
+            CompressionSettings::default(),
+            b"portable wiki test reference prefix",
+        )
+        .unwrap();
         writer
             .write(&Record::PageState {
                 page_id: 1,
@@ -23768,7 +23778,8 @@ mod tests {
                 },
             })
             .unwrap();
-        writer.finish().unwrap();
+        let (output, _) = writer.finish().unwrap();
+        output.finish().unwrap().persist(archive).unwrap();
         wikimak_wikipedia::title_index::build(
             archive,
             archive.with_extension("swtitle"),

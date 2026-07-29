@@ -4,15 +4,14 @@ use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::archive::{
-    visit_frame_while_file, EntityKind, FrameLocation, IndexedArchive, ManifestRecord, Record,
+    visit_frame_while_file, EntityKind, FrameLocation, IndexedArchiveSet, ManifestRecord, Record,
     RevisionRecord, SiteInfoRecord,
 };
 
 #[derive(Debug)]
 pub struct ArchiveBrowseIndex {
-    file: std::fs::File,
     titles: crate::title_index::TitleIndex,
-    indexed: IndexedArchive,
+    indexed: IndexedArchiveSet,
     site_info: SiteInfoRecord,
     manifest: Option<ManifestRecord>,
 }
@@ -160,15 +159,15 @@ impl ArchiveBrowseIndex {
         path: impl AsRef<Path>,
         title_index: impl AsRef<Path>,
     ) -> crate::archive::Result<Self> {
-        let file = std::fs::File::open(path)?;
+        let path = path.as_ref();
         let titles = crate::title_index::TitleIndex::open(title_index)?;
         let frame_count = titles.frame_count();
-        let last = frame_count
-            .checked_sub(1)
-            .ok_or(crate::archive::ArchiveError::Invalid(
+        if frame_count == 0 {
+            return Err(crate::archive::ArchiveError::Invalid(
                 "title index contains no archive frames",
-            ))?;
-        let indexed = IndexedArchive::open(&file, titles.frame(last)?)?;
+            ));
+        }
+        let indexed = IndexedArchiveSet::open(path, &titles)?;
         let mut manifest = None;
         let mut site_info = None;
         let mut left = 0;
@@ -186,7 +185,7 @@ impl ArchiveBrowseIndex {
             if location.info.first_entity.kind != EntityKind::Global {
                 continue;
             }
-            let mut frame_file = file.try_clone()?;
+            let mut frame_file = indexed.open_file(&location)?;
             visit_frame_while_file(&mut frame_file, &location, |record| {
                 match record {
                     Record::Manifest {
@@ -205,7 +204,6 @@ impl ArchiveBrowseIndex {
         ))?;
 
         Ok(Self {
-            file,
             titles,
             indexed,
             site_info,
@@ -229,7 +227,7 @@ impl ArchiveBrowseIndex {
         location: &FrameLocation,
         visitor: impl FnMut(Record) -> crate::archive::Result<bool>,
     ) -> crate::archive::Result<()> {
-        let mut file = self.file.try_clone()?;
+        let mut file = self.indexed.open_file(location)?;
         visit_frame_while_file(&mut file, location, visitor)
     }
 
@@ -518,9 +516,10 @@ impl ArchiveBrowseIndex {
         let Some(location) = self.page_frame(page_id)? else {
             return Ok(None);
         };
-        let frame = crate::archive::open_frame_cursor_file(&self.file, &location)?;
+        let file = self.indexed.open_file(&location)?;
+        let frame = crate::archive::open_frame_cursor_file(&file, &location)?;
         Ok(Some(PageRevisionTextCursor {
-            file: self.file.try_clone()?,
+            file,
             location,
             page_id,
             frame,
@@ -553,7 +552,6 @@ impl ArchiveBrowseIndex {
             let mut handles = Vec::with_capacity(workers);
             for _ in 0..workers {
                 handles.push(scope.spawn(|| -> crate::archive::Result<_> {
-                    let mut file = self.file.try_clone()?;
                     let mut found = Vec::new();
                     let mut match_count = 0_u64;
                     loop {
@@ -562,6 +560,7 @@ impl ArchiveBrowseIndex {
                             break;
                         }
                         let location = self.frame(frame_index)?;
+                        let mut file = self.indexed.open_file(&location)?;
                         let mut states = std::collections::HashMap::<u64, Option<String>>::new();
                         let mut revisions = Vec::new();
                         let mut sequence = 0_usize;
@@ -709,7 +708,6 @@ impl ArchiveBrowseIndex {
             let mut handles = Vec::with_capacity(workers);
             for _ in 0..workers {
                 handles.push(scope.spawn(|| -> crate::archive::Result<_> {
-                    let mut file = self.file.try_clone()?;
                     let mut found = Vec::new();
                     let mut match_count = 0_u64;
                     loop {
@@ -718,6 +716,7 @@ impl ArchiveBrowseIndex {
                             break;
                         }
                         let location = self.frame(frame_index)?;
+                        let mut file = self.indexed.open_file(&location)?;
                         let mut titles = std::collections::HashMap::<u64, String>::new();
                         let mut edits = Vec::new();
                         let mut sequence = 0_usize;
@@ -1048,8 +1047,9 @@ mod tests {
     #[test]
     fn indexes_titles_and_reads_one_page_from_its_frame() {
         let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("source.swdump");
         let path = temporary.path().join("sample.swdump");
-        let mut writer = ArchiveWriter::new(std::fs::File::create(&path).unwrap(), 1).unwrap();
+        let mut writer = ArchiveWriter::new(std::fs::File::create(&source).unwrap(), 1).unwrap();
         writer
             .write(&Record::PageState {
                 page_id: 7,
@@ -1137,6 +1137,21 @@ mod tests {
             })
             .unwrap();
         writer.finish().unwrap();
+        let output =
+            crate::archive_set::ArchiveSetOutput::new_in(temporary.path(), 1024).unwrap();
+        let bootstrap = tempfile::tempfile_in(temporary.path()).unwrap();
+        let (output, _, _, _) =
+            crate::archive::merge_many_archives_bootstrapping_ref_prefix(
+                &[source],
+                output,
+                bootstrap,
+                128,
+                crate::archive::CompressionSettings::default(),
+                1 << 20,
+                512 << 10,
+            )
+            .unwrap();
+        output.finish().unwrap().persist(&path).unwrap();
 
         let title_index = temporary.path().join("sample.swtitle");
         crate::title_index::build(&path, &title_index).unwrap();
@@ -1144,7 +1159,13 @@ mod tests {
         assert!(complete);
         assert_eq!(
             std::fs::metadata(&title_index).unwrap().len(),
-            48 + 16 + archive_frames.len() as u64 * 64
+            64 + 16
+                + archive_frames.len() as u64 * 64
+                + crate::archive_set::ArchiveSetReader::open(&path)
+                    .unwrap()
+                    .segments()
+                    .len() as u64
+                    * 40
         );
         let index = ArchiveBrowseIndex::open(&path, &title_index).unwrap();
         assert_eq!(index.page_id_by_title("Testa_lapa", i64::MAX), Some(7));
@@ -1211,7 +1232,7 @@ mod tests {
 
         let old_generation = temporary.path().join("old-generation.swdump");
         std::fs::rename(&path, old_generation).unwrap();
-        std::fs::write(&path, b"replacement generation").unwrap();
+        std::fs::create_dir(&path).unwrap();
         assert_eq!(
             index.page_text_at(7, i64::MAX).unwrap(),
             Some(b"hello".to_vec()),

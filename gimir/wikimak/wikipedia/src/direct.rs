@@ -505,7 +505,11 @@ fn build_direct_inner(
         .filter(|path| !path.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(output_parent)?;
-    let temporary = tempfile::NamedTempFile::new_in(output_parent)?;
+    let temporary = crate::archive_set::ArchiveSetOutput::new_in(
+        output_parent,
+        crate::archive_set::DEFAULT_RANGE_TARGET,
+    )
+    .map_err(map_archive)?;
     let mut source_files = content_run
         .parts
         .iter()
@@ -633,13 +637,13 @@ fn build_direct_inner(
         .map_err(map_archive)?;
         Ok((file, output_frames))
     })?;
-    file.as_file().sync_all()?;
-    file.persist(output)
-        .map_err(|error| Error::Io(error.error))?;
+    let completed = file.finish().map_err(map_archive)?;
+    let output_bytes = completed.virtual_bytes;
+    completed.persist(output).map_err(map_archive)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(output, std::fs::Permissions::from_mode(0o644))?;
+        std::fs::set_permissions(output, std::fs::Permissions::from_mode(0o755))?;
     }
 
     let content_stats = content_stats.lock().expect("content stats mutex");
@@ -648,7 +652,7 @@ fn build_direct_inner(
         history_parts: history_files.len() as u64,
         content_archive_bytes: content_stats.bytes,
         history_archive_bytes,
-        output_bytes: std::fs::metadata(output)?.len(),
+        output_bytes,
         content_frames: content_stats.frames,
         history_frames,
         output_frames,

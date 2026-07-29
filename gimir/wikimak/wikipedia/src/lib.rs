@@ -1,11 +1,13 @@
 //! # wikimak-wikipedia
 //!
 //! Portable Wikipedia archive construction, update, lookup, and serving.
-//! The normal mirror path is one `.swdump` event stream plus its generated
-//! `.swtitle` lookup index.
+//! A `.swdump` mirror is a directory of bounded page-ID range files whose
+//! lexical concatenation is one event stream. One generated `.swtitle` file
+//! indexes titles, frames, and physical ranges.
 
 pub mod asof;
 pub mod archive;
+pub mod archive_set;
 #[cfg(feature = "serve")]
 pub mod archive_browse;
 #[cfg(feature = "fetch")]

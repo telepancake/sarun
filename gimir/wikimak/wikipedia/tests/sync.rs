@@ -293,7 +293,10 @@ fn direct_archive_preserves_content_and_every_history_entity() {
     assert_eq!(stats.user_history_events, 1);
     assert_eq!(stats.global_history_events, 2);
 
-    let mut reader = ArchiveReader::new(std::fs::File::open(&output).unwrap()).unwrap();
+    let mut reader = ArchiveReader::new(
+        wikimak_wikipedia::archive_set::ArchiveSetReader::open(&output).unwrap(),
+    )
+    .unwrap();
     let mut revisions = 0;
     let mut annotated_revisions = 0;
     let mut page_actions = 0;
