@@ -10,13 +10,10 @@ use crate::archive::{
 };
 use crate::asof::{seed_interwiki, RTL_LANGS};
 
-const NO_FRAME: u32 = u32::MAX;
-
 #[derive(Debug)]
 pub struct ArchiveBrowseIndex {
     path: PathBuf,
     frames: Vec<FrameLocation>,
-    page_frames: Vec<u32>,
     titles: HashMap<String, u64>,
     pages: Vec<(u64, String)>,
     namespaces: BTreeMap<i32, String>,
@@ -43,13 +40,6 @@ impl ArchiveBrowseIndex {
                 "archive has no clean completion marker",
             ));
         }
-        if frames.len() >= NO_FRAME as usize {
-            return Err(crate::archive::ArchiveError::Invalid(
-                "archive has too many frames",
-            ));
-        }
-
-        let mut page_frames = Vec::<u32>::new();
         let mut titles = HashMap::<String, u64>::new();
         let mut page_titles = BTreeMap::<u64, String>::new();
         let mut namespace_prefixes = HashMap::<(i32, String), u64>::new();
@@ -76,10 +66,7 @@ impl ArchiveBrowseIndex {
                         let Some(&frame_number) = page_frame_numbers.get(job) else {
                             break;
                         };
-                        output.push((
-                            frame_number,
-                            scan_page_frame(&path, &frames[frame_number])?,
-                        ));
+                        output.push(scan_page_frame(&path, &frames[frame_number])?);
                     }
                     crate::archive::Result::Ok(output)
                 }));
@@ -99,14 +86,8 @@ impl ArchiveBrowseIndex {
             crate::archive::Result::Ok(output)
         })?;
 
-        for (frame_number, scan) in scanned {
+        for scan in scanned {
             for (page_id, current_titles, namespace_ids) in scan.pages {
-                let slot = usize::try_from(page_id)
-                    .map_err(|_| crate::archive::ArchiveError::FieldTooLarge)?;
-                if page_frames.len() <= slot {
-                    page_frames.resize(slot + 1, NO_FRAME);
-                }
-                page_frames[slot] = frame_number as u32;
                 for current_title in &current_titles {
                     let Some((prefix, _)) = current_title.split_once(':') else {
                         continue;
@@ -165,7 +146,6 @@ impl ArchiveBrowseIndex {
         Ok(Self {
             path,
             frames,
-            page_frames,
             titles,
             pages: page_titles.into_iter().collect(),
             namespaces: namespaces
@@ -215,17 +195,11 @@ impl ArchiveBrowseIndex {
         page_id: u64,
         timestamp_micros: i64,
     ) -> crate::archive::Result<Option<RevisionRecord>> {
-        let Some(frame_number) = usize::try_from(page_id)
-            .ok()
-            .and_then(|slot| self.page_frames.get(slot))
-            .copied()
-            .filter(|frame| *frame != NO_FRAME)
-            .map(|frame| frame as usize)
-        else {
+        let Some(location) = self.page_frame(page_id) else {
             return Ok(None);
         };
         let mut selected = None;
-        visit_frame_while(&self.path, &self.frames[frame_number], |record| {
+        visit_frame_while(&self.path, location, |record| {
             if record.page_id() != Some(page_id) {
                 return Ok(true);
             }
@@ -239,6 +213,18 @@ impl ArchiveBrowseIndex {
             Ok(false)
         })?;
         Ok(selected)
+    }
+
+    fn page_frame(&self, page_id: u64) -> Option<&FrameLocation> {
+        let page_frame_count = self.frames.partition_point(|location| {
+            location.info.first_entity.kind == EntityKind::Page
+        });
+        let frames = &self.frames[..page_frame_count];
+        let index = frames.partition_point(|location| location.info.last_entity.id < page_id);
+        frames.get(index).filter(|location| {
+            location.info.first_entity.id <= page_id
+                && page_id <= location.info.last_entity.id
+        })
     }
 
     pub fn page_text_at(
