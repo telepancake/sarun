@@ -29,6 +29,7 @@ const KIND_PAGE_ACTION: u8 = 3;
 const KIND_USER_STATE: u8 = 4;
 const KIND_USER_ACTION: u8 = 5;
 const KIND_MANIFEST: u8 = 6;
+const KIND_SITE_INFO: u8 = 7;
 const PAGE_TEXT_MEMORY_LIMIT: usize = 16 << 20;
 const HISTORY_SORT_RUN_BYTES: usize = 64 << 20;
 const SORT_MERGE_FAN_IN: usize = 64;
@@ -227,6 +228,32 @@ pub struct ManifestRecord {
     pub content_snapshot: String,
     pub metadata_snapshot: String,
     pub source_files: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct SiteNamespaceRecord {
+    pub id: i32,
+    pub case: String,
+    pub localized_name: String,
+    pub aliases: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct SiteInterwikiRecord {
+    pub prefix: String,
+    pub url: String,
+    pub is_local: bool,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct SiteInfoRecord {
+    pub site_name: String,
+    pub db_name: String,
+    pub base: String,
+    pub generator: String,
+    pub case: String,
+    pub namespaces: Vec<SiteNamespaceRecord>,
+    pub interwiki: Vec<SiteInterwikiRecord>,
 }
 
 struct PendingRecord {
@@ -520,6 +547,10 @@ pub enum Record {
         timestamp_micros: i64,
         manifest: ManifestRecord,
     },
+    SiteInfo {
+        timestamp_micros: i64,
+        site_info: SiteInfoRecord,
+    },
     Unknown {
         entity: EntityKey,
         timestamp_micros: i64,
@@ -545,6 +576,10 @@ impl Record {
                 kind: EntityKind::Global,
                 id: 0,
             },
+            Self::SiteInfo { .. } => EntityKey {
+                kind: EntityKind::Global,
+                id: 1,
+            },
             Self::Unknown { entity, .. } => *entity,
         }
     }
@@ -568,6 +603,9 @@ impl Record {
                 timestamp_micros, ..
             }
             | Self::Manifest {
+                timestamp_micros, ..
+            }
+            | Self::SiteInfo {
                 timestamp_micros, ..
             }
             | Self::Unknown {
@@ -1485,6 +1523,7 @@ fn record_order_rank(record: &Record) -> u8 {
         Record::UserState { .. } => 0,
         Record::UserAction { .. } => 1,
         Record::Manifest { .. } => 0,
+        Record::SiteInfo { .. } => 0,
         Record::Unknown { .. } => 255,
     }
 }
@@ -1523,6 +1562,14 @@ fn record_value_order(left: &Record, right: &Record) -> std::cmp::Ordering {
             Record::Manifest { manifest: left, .. },
             Record::Manifest {
                 manifest: right, ..
+            },
+        ) => left.cmp(right),
+        (
+            Record::SiteInfo {
+                site_info: left, ..
+            },
+            Record::SiteInfo {
+                site_info: right, ..
             },
         ) => left.cmp(right),
         (
@@ -2052,6 +2099,7 @@ fn record_wire_size(record: &Record) -> Result<(u8, u64)> {
         Record::UserState { state, .. } => user_state_wire_len(state),
         Record::UserAction { action, .. } => user_action_wire_len(action),
         Record::Manifest { manifest, .. } => manifest_wire_len(manifest),
+        Record::SiteInfo { site_info, .. } => site_info_wire_len(site_info),
         Record::Unknown { payload, kind, .. } => return Ok((*kind, payload.len() as u64)),
     }?;
     let kind = match record {
@@ -2061,6 +2109,7 @@ fn record_wire_size(record: &Record) -> Result<(u8, u64)> {
         Record::UserState { .. } => KIND_USER_STATE,
         Record::UserAction { .. } => KIND_USER_ACTION,
         Record::Manifest { .. } => KIND_MANIFEST,
+        Record::SiteInfo { .. } => KIND_SITE_INFO,
         Record::Unknown { kind, .. } => *kind,
     };
     Ok((kind, size))
@@ -2074,6 +2123,7 @@ fn write_record_payload<W: Write>(out: &mut W, record: &Record) -> Result<()> {
         Record::UserState { state, .. } => write_user_state(out, state)?,
         Record::UserAction { action, .. } => write_user_action(out, action)?,
         Record::Manifest { manifest, .. } => write_manifest(out, manifest)?,
+        Record::SiteInfo { site_info, .. } => write_site_info(out, site_info)?,
         Record::Unknown { payload, .. } => out.write_all(payload)?,
     }
     Ok(())
@@ -2341,6 +2391,56 @@ fn write_manifest(out: &mut impl Write, manifest: &ManifestRecord) -> Result<()>
     Ok(())
 }
 
+fn site_info_wire_len(site_info: &SiteInfoRecord) -> Result<u64> {
+    let mut parts = vec![
+        string_wire_len(&site_info.site_name)?,
+        string_wire_len(&site_info.db_name)?,
+        string_wire_len(&site_info.base)?,
+        string_wire_len(&site_info.generator)?,
+        string_wire_len(&site_info.case)?,
+        varint_len(site_info.namespaces.len() as u64) as u64,
+    ];
+    for namespace in &site_info.namespaces {
+        parts.extend([
+            4,
+            string_wire_len(&namespace.case)?,
+            string_wire_len(&namespace.localized_name)?,
+            strings_wire_len(&namespace.aliases)?,
+        ]);
+    }
+    parts.push(varint_len(site_info.interwiki.len() as u64) as u64);
+    for interwiki in &site_info.interwiki {
+        parts.extend([
+            string_wire_len(&interwiki.prefix)?,
+            string_wire_len(&interwiki.url)?,
+            1,
+        ]);
+    }
+    checked_sum(&parts)
+}
+
+fn write_site_info(out: &mut impl Write, site_info: &SiteInfoRecord) -> Result<()> {
+    write_string(out, &site_info.site_name)?;
+    write_string(out, &site_info.db_name)?;
+    write_string(out, &site_info.base)?;
+    write_string(out, &site_info.generator)?;
+    write_string(out, &site_info.case)?;
+    write_varint(out, site_info.namespaces.len() as u64)?;
+    for namespace in &site_info.namespaces {
+        out.write_all(&namespace.id.to_le_bytes())?;
+        write_string(out, &namespace.case)?;
+        write_string(out, &namespace.localized_name)?;
+        write_strings(out, &namespace.aliases)?;
+    }
+    write_varint(out, site_info.interwiki.len() as u64)?;
+    for interwiki in &site_info.interwiki {
+        write_string(out, &interwiki.prefix)?;
+        write_string(out, &interwiki.url)?;
+        out.write_all(&[u8::from(interwiki.is_local)])?;
+    }
+    Ok(())
+}
+
 fn decode_record(entity: EntityKey, timestamp: i64, kind: u8, payload: Vec<u8>) -> Result<Record> {
     let mut input = payload.as_slice();
     let record = match kind {
@@ -2372,8 +2472,12 @@ fn decode_record(entity: EntityKey, timestamp: i64, kind: u8, payload: Vec<u8>) 
             timestamp_micros: timestamp,
             manifest: read_manifest(&mut input)?,
         },
+        KIND_SITE_INFO if entity.kind == EntityKind::Global && entity.id == 1 => Record::SiteInfo {
+            timestamp_micros: timestamp,
+            site_info: read_site_info(&mut input)?,
+        },
         KIND_PAGE_STATE | KIND_REVISION | KIND_PAGE_ACTION | KIND_USER_STATE
-        | KIND_USER_ACTION | KIND_MANIFEST => {
+        | KIND_USER_ACTION | KIND_MANIFEST | KIND_SITE_INFO => {
             return Err(ArchiveError::Invalid(
                 "record kind is incompatible with entity kind",
             ))
@@ -2563,6 +2667,44 @@ fn read_manifest(input: &mut &[u8]) -> Result<ManifestRecord> {
         content_snapshot: read_string(input)?,
         metadata_snapshot: read_string(input)?,
         source_files: read_strings(input)?,
+    })
+}
+
+fn read_site_info(input: &mut &[u8]) -> Result<SiteInfoRecord> {
+    let site_name = read_string(input)?;
+    let db_name = read_string(input)?;
+    let base = read_string(input)?;
+    let generator = read_string(input)?;
+    let case = read_string(input)?;
+    let namespace_count = usize::try_from(read_varint(input)?.0)
+        .map_err(|_| ArchiveError::FieldTooLarge)?;
+    let mut namespaces = Vec::with_capacity(namespace_count);
+    for _ in 0..namespace_count {
+        namespaces.push(SiteNamespaceRecord {
+            id: read_u32(input)? as i32,
+            case: read_string(input)?,
+            localized_name: read_string(input)?,
+            aliases: read_strings(input)?,
+        });
+    }
+    let interwiki_count = usize::try_from(read_varint(input)?.0)
+        .map_err(|_| ArchiveError::FieldTooLarge)?;
+    let mut interwiki = Vec::with_capacity(interwiki_count);
+    for _ in 0..interwiki_count {
+        interwiki.push(SiteInterwikiRecord {
+            prefix: read_string(input)?,
+            url: read_string(input)?,
+            is_local: read_u8(input)? != 0,
+        });
+    }
+    Ok(SiteInfoRecord {
+        site_name,
+        db_name,
+        base,
+        generator,
+        case,
+        namespaces,
+        interwiki,
     })
 }
 

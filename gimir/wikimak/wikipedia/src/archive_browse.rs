@@ -6,9 +6,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::archive::{
     index_file, visit_frame, visit_frame_while, EntityKind, FrameLocation, ManifestRecord,
-    Record, RevisionRecord,
+    Record, RevisionRecord, SiteInfoRecord,
 };
-use crate::asof::{seed_interwiki, RTL_LANGS};
 
 #[derive(Debug)]
 pub struct ArchiveBrowseIndex {
@@ -16,7 +15,7 @@ pub struct ArchiveBrowseIndex {
     frames: Vec<FrameLocation>,
     titles: HashMap<String, u64>,
     pages: Vec<(u64, String)>,
-    namespaces: BTreeMap<i32, String>,
+    site_info: SiteInfoRecord,
     manifest: Option<ManifestRecord>,
 }
 
@@ -28,7 +27,7 @@ pub struct ArchiveAsOfView<'a> {
 }
 
 struct FrameScan {
-    pages: Vec<(u64, Vec<String>, HashMap<i32, u64>)>,
+    pages: Vec<(u64, Vec<String>)>,
 }
 
 impl ArchiveBrowseIndex {
@@ -42,8 +41,8 @@ impl ArchiveBrowseIndex {
         }
         let mut titles = HashMap::<String, u64>::new();
         let mut page_titles = BTreeMap::<u64, String>::new();
-        let mut namespace_prefixes = HashMap::<(i32, String), u64>::new();
         let mut manifest = None;
+        let mut site_info = None;
 
         let page_frame_numbers: Vec<usize> = frames
             .iter()
@@ -87,19 +86,7 @@ impl ArchiveBrowseIndex {
         })?;
 
         for scan in scanned {
-            for (page_id, current_titles, namespace_ids) in scan.pages {
-                for current_title in &current_titles {
-                    let Some((prefix, _)) = current_title.split_once(':') else {
-                        continue;
-                    };
-                    for (&namespace, &count) in &namespace_ids {
-                        if namespace != 0 {
-                            *namespace_prefixes
-                                .entry((namespace, prefix.to_string()))
-                                .or_default() += count;
-                        }
-                    }
-                }
+            for (page_id, current_titles) in scan.pages {
                 for current_title in current_titles {
                     titles.insert(normalize_title_key(&current_title), page_id);
                     page_titles
@@ -113,45 +100,33 @@ impl ArchiveBrowseIndex {
                 }
             }
         }
-        let mut namespaces = BTreeMap::<i32, (String, u64)>::new();
-        for ((namespace, prefix), count) in namespace_prefixes {
-            namespaces
-                .entry(namespace)
-                .and_modify(|(current_prefix, current_count)| {
-                    if count > *current_count
-                        || (count == *current_count && prefix < *current_prefix)
-                    {
-                        *current_prefix = prefix.clone();
-                        *current_count = count;
-                    }
-                })
-                .or_insert((prefix, count));
-        }
-
         for location in &frames {
             if location.info.first_entity.kind != EntityKind::Global {
                 continue;
             }
             visit_frame(&path, location, |record| {
-                if let Record::Manifest {
-                    manifest: record, ..
-                } = record
-                {
-                    manifest = Some(record);
+                match record {
+                    Record::Manifest {
+                        manifest: record, ..
+                    } => manifest = Some(record),
+                    Record::SiteInfo {
+                        site_info: record, ..
+                    } => site_info = Some(record),
+                    _ => {}
                 }
                 Ok(())
             })?;
         }
+        let site_info = site_info.ok_or(crate::archive::ArchiveError::Invalid(
+            "archive has no siteinfo record",
+        ))?;
 
         Ok(Self {
             path,
             frames,
             titles,
             pages: page_titles.into_iter().collect(),
-            namespaces: namespaces
-                .into_iter()
-                .map(|(id, (prefix, _))| (id, prefix))
-                .collect(),
+            site_info,
             manifest,
         })
     }
@@ -238,65 +213,36 @@ impl ArchiveBrowseIndex {
     }
 
     pub fn view(&self, timestamp_micros: Option<i64>) -> ArchiveAsOfView<'_> {
-        let db_name = self
-            .manifest
-            .as_ref()
-            .map(|manifest| manifest.wiki_db.clone())
-            .unwrap_or_default();
-        let lang = db_name
-            .strip_suffix("wiki")
-            .filter(|lang| !lang.is_empty())
-            .unwrap_or(&db_name)
-            .to_string();
         let mut site = wikimak_wikitext::SiteConfig {
-            site_name: if db_name.is_empty() {
-                "Wikipedia archive".to_string()
-            } else {
-                db_name.clone()
-            },
-            db_name,
-            lang: lang.clone(),
-            rtl: RTL_LANGS.contains(&lang.as_str()),
-            server: if lang.is_empty() {
-                String::new()
-            } else {
-                format!("https://{lang}.wikipedia.org")
-            },
-            script_path: "/w".to_string(),
+            site_name: self.site_info.site_name.clone(),
+            db_name: self.site_info.db_name.clone(),
+            server: server_from_base(&self.site_info.base),
             ..wikimak_wikitext::SiteConfig::default()
         };
-        site.interwiki = seed_interwiki()
-            .into_iter()
-            .map(|row| {
+        site.interwiki = self
+            .site_info
+            .interwiki
+            .iter()
+            .map(|interwiki| {
                 (
-                    row.prefix.to_lowercase(),
+                    interwiki.prefix.to_lowercase(),
                     wikimak_wikitext::InterwikiEntry {
-                        prefix: row.prefix,
-                        url: row.url,
+                        prefix: interwiki.prefix.clone(),
+                        url: interwiki.url.clone(),
                         local_instance: None,
                     },
                 )
             })
             .collect();
-        site.namespaces.insert(
-            0,
-            wikimak_wikitext::NamespaceInfo {
-                id: 0,
-                canonical: String::new(),
-                localized: String::new(),
-                aliases: Vec::new(),
-                case_first_letter: true,
-            },
-        );
-        for (&id, localized) in &self.namespaces {
+        for namespace in &self.site_info.namespaces {
             site.namespaces.insert(
-                id,
+                namespace.id,
                 wikimak_wikitext::NamespaceInfo {
-                    id,
-                    canonical: canonical_namespace_name(id).to_string(),
-                    localized: localized.clone(),
-                    aliases: Vec::new(),
-                    case_first_letter: true,
+                    id: namespace.id,
+                    canonical: String::new(),
+                    localized: namespace.localized_name.clone(),
+                    aliases: namespace.aliases.clone(),
+                    case_first_letter: namespace.case == "first-letter",
                 },
             );
         }
@@ -314,57 +260,29 @@ fn scan_page_frame(
     path: &Path,
     location: &FrameLocation,
 ) -> crate::archive::Result<FrameScan> {
-    let mut pages = Vec::<(u64, Vec<String>, HashMap<i32, u64>)>::new();
+    let mut pages = Vec::<(u64, Vec<String>)>::new();
     visit_frame(path, location, |record| {
         let page_id = record.page_id().expect("page frame contains page records");
-        if pages.last().is_none_or(|(last, _, _)| *last != page_id) {
-            pages.push((page_id, Vec::new(), HashMap::new()));
+        if pages.last().is_none_or(|(last, _)| *last != page_id) {
+            pages.push((page_id, Vec::new()));
         }
-        match record {
-            Record::PageState { current_title, .. } => {
-                pages.last_mut().expect("inserted above").1.push(current_title);
-            }
-            Record::PageAction { action, .. } => {
-                if let Some(namespace) = action
-                    .namespace_at_event
-                    .and_then(|id| i32::try_from(id).ok())
-                {
-                    *pages
-                        .last_mut()
-                        .expect("inserted above")
-                        .2
-                        .entry(namespace)
-                        .or_default() += 1;
-                }
-            }
-            _ => {}
+        if let Record::PageState { current_title, .. } = record {
+            pages.last_mut().expect("inserted above").1.push(current_title);
         }
         Ok(())
     })?;
     Ok(FrameScan { pages })
 }
 
-fn canonical_namespace_name(id: i32) -> &'static str {
-    match id {
-        1 => "Talk",
-        2 => "User",
-        3 => "User talk",
-        4 => "Project",
-        5 => "Project talk",
-        6 => "File",
-        7 => "File talk",
-        8 => "MediaWiki",
-        9 => "MediaWiki talk",
-        10 => "Template",
-        11 => "Template talk",
-        12 => "Help",
-        13 => "Help talk",
-        14 => "Category",
-        15 => "Category talk",
-        828 => "Module",
-        829 => "Module talk",
-        _ => "",
-    }
+fn server_from_base(base: &str) -> String {
+    let Some(scheme_end) = base.find("://") else {
+        return String::new();
+    };
+    let host_start = scheme_end + 3;
+    let host_end = base[host_start..]
+        .find('/')
+        .map_or(base.len(), |offset| host_start + offset);
+    base[..host_end].to_string()
 }
 
 fn normalize_title_key(title: &str) -> String {
@@ -470,6 +388,25 @@ mod tests {
                     text: b"old".to_vec(),
                     visibility: None,
                     history: None,
+                },
+            })
+            .unwrap();
+        writer
+            .write(&Record::SiteInfo {
+                timestamp_micros: i64::MAX,
+                site_info: SiteInfoRecord {
+                    site_name: "Test".into(),
+                    db_name: "testwiki".into(),
+                    base: "https://test.invalid/wiki/Main_Page".into(),
+                    generator: "MediaWiki".into(),
+                    case: "first-letter".into(),
+                    namespaces: vec![crate::archive::SiteNamespaceRecord {
+                        id: 0,
+                        case: "first-letter".into(),
+                        localized_name: String::new(),
+                        aliases: Vec::new(),
+                    }],
+                    interwiki: Vec::new(),
                 },
             })
             .unwrap();

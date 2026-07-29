@@ -802,7 +802,8 @@ fn cmd_archive_inspect(path: &str) -> Result<(), String> {
                 crate::archive::Record::UserState { .. } => user_states += 1,
                 crate::archive::Record::Unknown { .. } => unknown += 1,
                 crate::archive::Record::PageState { .. }
-                | crate::archive::Record::Manifest { .. } => {}
+                | crate::archive::Record::Manifest { .. }
+                | crate::archive::Record::SiteInfo { .. } => {}
             }
         }
     }

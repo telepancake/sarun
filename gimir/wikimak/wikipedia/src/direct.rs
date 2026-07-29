@@ -11,7 +11,8 @@ use reqwest::blocking::Client;
 
 use crate::archive::{
     ArchiveError, ArchiveRecordReader, ArchiveWriter, CompressionSettings, ManifestRecord,
-    Record, RecordSorter, RevisionRecord, DEFAULT_FRAME_TARGET,
+    Record, RecordSorter, RevisionRecord, SiteInfoRecord, SiteInterwikiRecord,
+    SiteNamespaceRecord, DEFAULT_FRAME_TARGET,
 };
 use crate::instance::{ContributorMeta, RevisionMeta};
 use crate::{Error, Result};
@@ -61,6 +62,12 @@ struct PartialStats {
     page_events: u64,
     user_events: u64,
     global_events: u64,
+}
+
+struct ContentPartResult {
+    path: PathBuf,
+    stats: PartialStats,
+    site_info: Option<SiteInfoRecord>,
 }
 
 pub fn build_direct_archive(
@@ -256,11 +263,22 @@ fn build_update_inner(
             },
         })
         .map_err(map_archive)?;
+    if let Some(site_info) = content_results
+        .iter()
+        .find_map(|result| result.site_info.clone())
+    {
+        manifest_writer
+            .write(&Record::SiteInfo {
+                timestamp_micros: i64::MAX,
+                site_info,
+            })
+            .map_err(map_archive)?;
+    }
     manifest_writer.finish().map_err(map_archive)?;
 
     let mut inputs = content_results
         .iter()
-        .map(|(path, _)| path.clone())
+        .map(|result| result.path.clone())
         .chain(history_results.iter().map(|(path, _)| path.clone()))
         .collect::<Vec<_>>();
     inputs.push(manifest_archive);
@@ -301,9 +319,9 @@ fn build_update_inner(
         output_bytes: std::fs::metadata(output)?.len(),
         ..Default::default()
     };
-    for (_, partial) in content_results {
-        stats.pages += partial.pages;
-        stats.revisions += partial.revisions;
+    for result in content_results {
+        stats.pages += result.stats.pages;
+        stats.revisions += result.stats.revisions;
     }
     Ok(stats)
 }
@@ -355,7 +373,7 @@ fn build_direct_inner(
         build_content_parts(client, &content_run.parts, scratch, cores, progress)?;
     let content_paths: Vec<PathBuf> = content_results
         .iter()
-        .map(|(path, _)| path.clone())
+        .map(|result| result.path.clone())
         .collect();
     let content_archive = scratch.join("content-all.swdump");
     let (_, content_frames) = crate::archive::concatenate_archives(
@@ -398,6 +416,16 @@ fn build_direct_inner(
             },
         })
         .map_err(map_archive)?;
+    let site_info = content_results
+        .iter()
+        .find_map(|result| result.site_info.clone())
+        .ok_or(Error::Corrupt("content dumps contain no siteinfo"))?;
+    manifest_writer
+        .write(&Record::SiteInfo {
+            timestamp_micros: i64::MAX,
+            site_info,
+        })
+        .map_err(map_archive)?;
     manifest_writer.finish().map_err(map_archive)?;
     let (file, output_frames, _) = crate::archive::merge_many_archives_with_compression_in(
         &[content_archive.clone(), history_archive.clone(), manifest_archive],
@@ -427,9 +455,9 @@ fn build_direct_inner(
         output_frames,
         ..Default::default()
     };
-    for (_, partial) in content_results {
-        stats.pages += partial.pages;
-        stats.revisions += partial.revisions;
+    for result in content_results {
+        stats.pages += result.stats.pages;
+        stats.revisions += result.stats.revisions;
     }
     for (_, partial) in history_results {
         stats.history_events += partial.events;
@@ -561,7 +589,7 @@ fn build_content_parts(
     scratch: &Path,
     cores: usize,
     progress: &(impl Fn(&str) + Sync),
-) -> Result<Vec<(PathBuf, PartialStats)>> {
+) -> Result<Vec<ContentPartResult>> {
     let groups = crate::sync::part_groups(parts.to_vec());
     let workers = groups.len().min(cores).min(3).max(1);
     let bz2_workers = (cores / workers).max(1);
@@ -607,11 +635,12 @@ fn build_content_group(
     scratch: &Path,
     bz2_workers: usize,
     progress: &(impl Fn(&str) + Sync),
-) -> Result<(PathBuf, PartialStats)> {
+) -> Result<ContentPartResult> {
     let path = scratch.join(format!("content-{index:06}.swdump"));
     let mut writer = ArchiveWriter::new(std::fs::File::create(&path)?, DEFAULT_FRAME_TARGET)
         .map_err(map_archive)?;
     let mut stats = PartialStats::default();
+    let mut site_info = None;
     for part in parts {
         progress(&format!("content {}", part.filename));
         let source = wikimak_mediawiki::fetch(client, part)?;
@@ -629,6 +658,9 @@ fn build_content_group(
         let revisions = page_stream.revisions_mut();
         while let Some(header) = revisions.next_page() {
             let header = header?;
+            if site_info.is_none() {
+                site_info = revisions.site_info().map(convert_site_info);
+            }
             let page_id = u64::try_from(header.id)
                 .ok()
                 .filter(|id| *id > 0)
@@ -649,7 +681,40 @@ fn build_content_group(
         }
     }
     writer.finish().map_err(map_archive)?;
-    Ok((path, stats))
+    Ok(ContentPartResult {
+        path,
+        stats,
+        site_info,
+    })
+}
+
+fn convert_site_info(site_info: &wikimak_mediawiki::SiteInfo) -> SiteInfoRecord {
+    SiteInfoRecord {
+        site_name: site_info.site_name.clone(),
+        db_name: site_info.db_name.clone(),
+        base: site_info.base.clone(),
+        generator: site_info.generator.clone(),
+        case: site_info.case.clone(),
+        namespaces: site_info
+            .namespaces
+            .values()
+            .map(|namespace| SiteNamespaceRecord {
+                id: namespace.id,
+                case: namespace.case.clone(),
+                localized_name: namespace.name.clone(),
+                aliases: namespace.aliases.clone(),
+            })
+            .collect(),
+        interwiki: site_info
+            .interwiki
+            .iter()
+            .map(|interwiki| SiteInterwikiRecord {
+                prefix: interwiki.prefix.clone(),
+                url: interwiki.url.clone(),
+                is_local: interwiki.is_local,
+            })
+            .collect(),
+    }
 }
 
 fn convert_revision(revision: wikimak_mediawiki::Revision) -> Result<RevisionRecord> {
