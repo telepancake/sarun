@@ -639,6 +639,14 @@ pub struct ExportStats {
     pub frames: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DepotImportStats {
+    pub pages: u64,
+    pub revisions: u64,
+    pub page_actions: u64,
+    pub user_records: u64,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FrameInfo {
     pub first_entity: EntityKey,
@@ -1869,6 +1877,503 @@ pub fn export_instance<W: Write>(
     let (_, frames) = writer.finish()?;
     stats.frames = frames;
     Ok(stats)
+}
+
+#[derive(Default)]
+struct DepotImportPage {
+    page_id: u64,
+    saw_page_state: bool,
+    current_title: Option<(String, Option<i64>, i64)>,
+    revisions: Vec<RevisionRecord>,
+    actions: Vec<(i64, PageActionRecord)>,
+}
+
+pub fn import_instance(
+    instance: &Instance,
+    input: impl AsRef<Path>,
+    progress: impl Fn(DepotImportStats),
+) -> Result<DepotImportStats> {
+    let input = input.as_ref();
+    let dictionary_pretrained = if instance.has_active_revision_dictionary()? {
+        false
+    } else {
+        let samples = archive_revision_dictionary_samples(input)?;
+        instance.prepare_seed_revision_dictionary(&samples)?.trained
+    };
+    let mut reader = ArchiveRecordReader::open(input)?;
+    let mut page = DepotImportPage::default();
+    let mut stats = DepotImportStats::default();
+    let mut import_stats = crate::ImportStats::default();
+    let mut user_writer = None;
+    let mut manifest = None;
+    let mut site_info = None;
+
+    while let Some(record) = reader.next_record()? {
+        if record.entity().kind == EntityKind::Page {
+            let page_id = record.entity().id;
+            if page.page_id != page_id && !depot_import_page_empty(&page) {
+                import_depot_page(instance, std::mem::take(&mut page), &mut import_stats, &mut stats)?;
+                if stats.pages % 10_000 == 0 {
+                    progress(stats);
+                }
+            }
+            page.page_id = page_id;
+            match record {
+                Record::PageState {
+                    timestamp_micros,
+                    title,
+                    namespace,
+                    deleted,
+                    ..
+                } if !page.saw_page_state => {
+                    page.saw_page_state = true;
+                    page.current_title =
+                        (!deleted).then_some((title, namespace, timestamp_micros));
+                }
+                Record::Revision { revision, .. } => page.revisions.push(revision),
+                Record::PageAction {
+                    timestamp_micros,
+                    action,
+                    ..
+                } => page.actions.push((timestamp_micros, action)),
+                Record::PageState { .. } => {}
+                Record::Unknown { .. } => {
+                    return Err(ArchiveError::Invalid(
+                        "cannot project an unknown page record into the depot",
+                    ));
+                }
+                _ => unreachable!("page entity has a page record"),
+            }
+            continue;
+        }
+
+        if !depot_import_page_empty(&page) {
+            import_depot_page(instance, std::mem::take(&mut page), &mut import_stats, &mut stats)?;
+            progress(stats);
+        }
+        match record {
+            Record::UserState { .. } | Record::UserAction { .. } => {
+                let writer = match user_writer.take() {
+                    Some(writer) => writer,
+                    None => ArchiveWriter::new(
+                        tempfile::NamedTempFile::new_in(&instance.root)?,
+                        DEFAULT_FRAME_TARGET,
+                    )?,
+                };
+                let mut writer = writer;
+                writer.write(&record)?;
+                user_writer = Some(writer);
+                stats.user_records += 1;
+            }
+            Record::PageAction {
+                entity,
+                timestamp_micros,
+                action,
+            } if entity.kind == EntityKind::Global => {
+                let inner = instance.inner.lock().expect("instance mutex poisoned");
+                let transaction = inner
+                    .conn
+                    .unchecked_transaction()
+                    .map_err(crate::Error::from)?;
+                store_archive_action(
+                    &transaction,
+                    0,
+                    timestamp_micros,
+                    "",
+                    None,
+                    &action,
+                )?;
+                transaction.commit().map_err(crate::Error::from)?;
+                stats.page_actions += 1;
+            }
+            Record::Manifest {
+                timestamp_micros,
+                manifest: record,
+            } if manifest.is_none() => manifest = Some((timestamp_micros, record)),
+            Record::SiteInfo {
+                timestamp_micros,
+                site_info: record,
+            } if site_info.is_none() => site_info = Some((timestamp_micros, record)),
+            Record::Manifest { .. } | Record::SiteInfo { .. } => {}
+            Record::Unknown { .. } => {
+                return Err(ArchiveError::Invalid(
+                    "cannot project an unknown non-page record into the depot",
+                ));
+            }
+            _ => {
+                return Err(ArchiveError::Invalid(
+                    "record kind does not match its non-page entity",
+                ));
+            }
+        }
+    }
+
+    if !depot_import_page_empty(&page) {
+        import_depot_page(instance, page, &mut import_stats, &mut stats)?;
+    }
+    {
+        let mut inner = instance.inner.lock().expect("instance mutex poisoned");
+        crate::instance::finish_title_slot_intent(&instance.root, &mut inner)?;
+    }
+    if let Some(writer) = user_writer {
+        let (temporary, _) = writer.finish()?;
+        temporary.as_file().sync_all()?;
+        let name = "history-users-archive.swdump";
+        temporary
+            .persist(instance.root.join(name))
+            .map_err(|error| ArchiveError::Io(error.error))?;
+        instance.set_sync_state("history_user_archive", name)?;
+    }
+    if let Some((timestamp_micros, record)) = site_info {
+        store_archive_siteinfo(instance, timestamp_micros, &record)?;
+    }
+    if let Some((_, record)) = manifest {
+        instance.set_sync_state("wiki_dbname", &record.wiki_db)?;
+        instance.set_sync_state("full_snapshot_date", &record.content_snapshot)?;
+        instance.set_sync_state("incremental_date", &record.content_snapshot)?;
+        instance.set_sync_state("history_frontier_snapshot", &record.metadata_snapshot)?;
+    }
+    instance.flush()?;
+    if !dictionary_pretrained {
+        instance.finalize_seed_revision_dictionary()?;
+    }
+    instance.flush()?;
+    progress(stats);
+    Ok(stats)
+}
+
+fn archive_revision_dictionary_samples(input: &Path) -> Result<Vec<Vec<u8>>> {
+    let limit = crate::instance::REVISION_SAMPLE_COUNT;
+    let mut reader = ArchiveRecordReader::open(input)?;
+    let mut selected = std::collections::BTreeMap::<(u64, u64), Vec<u8>>::new();
+    let mut page_id = None;
+    let mut head = None;
+    while let Some(record) = reader.next_record()? {
+        if record.entity().kind != EntityKind::Page {
+            break;
+        }
+        let current_page = record.entity().id;
+        if page_id != Some(current_page) {
+            if let (Some(previous_page), Some(revision)) = (page_id, head.take()) {
+                select_archive_dictionary_sample(&mut selected, limit, previous_page, revision);
+            }
+            page_id = Some(current_page);
+        }
+        if let Record::Revision { revision, .. } = record {
+            // Page records are newest-first. Sample the record that will
+            // actually become f0, including a visibility-only head whose
+            // text is unavailable; revision ids are not an ordering key.
+            if head.is_none() {
+                head = Some(revision);
+            }
+        }
+    }
+    if let (Some(page_id), Some(revision)) = (page_id, head) {
+        select_archive_dictionary_sample(&mut selected, limit, page_id, revision);
+    }
+    Ok(selected.into_values().collect())
+}
+
+fn select_archive_dictionary_sample(
+    selected: &mut std::collections::BTreeMap<(u64, u64), Vec<u8>>,
+    limit: usize,
+    page_id: u64,
+    revision: RevisionRecord,
+) {
+    let key = (crate::instance::sample_hash(page_id), page_id);
+    if selected.len() < limit || selected.last_key_value().is_some_and(|(last, _)| key < *last) {
+        selected.insert(
+            key,
+            crate::revision::encode_revision(&revision.meta, &revision.text),
+        );
+        if selected.len() > limit {
+            selected.pop_last();
+        }
+    }
+}
+
+fn depot_import_page_empty(page: &DepotImportPage) -> bool {
+    !page.saw_page_state
+        && page.current_title.is_none()
+        && page.revisions.is_empty()
+        && page.actions.is_empty()
+}
+
+fn import_depot_page(
+    instance: &Instance,
+    page: DepotImportPage,
+    import_stats: &mut crate::ImportStats,
+    stats: &mut DepotImportStats,
+) -> Result<()> {
+    if page.page_id != 0 && (page.saw_page_state || !page.revisions.is_empty()) {
+        stats.pages += 1;
+    }
+    stats.revisions += page.revisions.len() as u64;
+    stats.page_actions += page.actions.len() as u64;
+    if depot_page_is_complete(instance, &page)? {
+        return Ok(());
+    }
+
+    let earliest_revision = page
+        .revisions
+        .iter()
+        .map(|revision| revision.meta.ts.timestamp_micros())
+        .min();
+    let current_title = page.current_title.as_ref().map(|(title, _, _)| title.as_str());
+    if page.page_id != 0 && (!page.revisions.is_empty() || current_title.is_some()) {
+        let already_imported = {
+            let inner = instance.inner.lock().expect("instance mutex poisoned");
+            inner
+                .depot
+                .has_chain(page.page_id)
+                .map_err(crate::Error::from)?
+        };
+        let records = if already_imported {
+            Vec::new()
+        } else {
+            page.revisions
+                .iter()
+                .map(|revision| crate::revision::encode_revision(&revision.meta, &revision.text))
+                .collect()
+        };
+        crate::import::import_encoded_page(
+            instance,
+            page.page_id,
+            current_title,
+            earliest_revision.or_else(|| page.current_title.as_ref().map(|entry| entry.2)),
+            records,
+            import_stats,
+        )?;
+    }
+
+    let current_namespace = page.current_title.as_ref().and_then(|entry| entry.1);
+    let current_title = page
+        .current_title
+        .as_ref()
+        .map(|entry| entry.0.as_str())
+        .unwrap_or("");
+    let inner = instance.inner.lock().expect("instance mutex poisoned");
+    let transaction = inner
+        .conn
+        .unchecked_transaction()
+        .map_err(crate::Error::from)?;
+    for revision in &page.revisions {
+        if let Some(visibility) = &revision.visibility {
+            store_archive_visibility(
+                &transaction,
+                page.page_id,
+                revision.meta.rev_id,
+                visibility,
+            )?;
+        }
+    }
+    for (timestamp_micros, action) in page.actions {
+        store_archive_action(
+            &transaction,
+            page.page_id,
+            timestamp_micros,
+            current_title,
+            current_namespace,
+            &action,
+        )?;
+    }
+    transaction.commit().map_err(crate::Error::from)?;
+    Ok(())
+}
+
+fn depot_page_is_complete(instance: &Instance, page: &DepotImportPage) -> Result<bool> {
+    let has_content = if page.revisions.is_empty() {
+        true
+    } else {
+        let inner = instance.inner.lock().expect("instance mutex poisoned");
+        inner
+            .depot
+            .has_chain(page.page_id)
+            .map_err(crate::Error::from)?
+    };
+    if !has_content {
+        return Ok(false);
+    }
+    let expected_title = page.current_title.as_ref().map(|entry| entry.0.as_str());
+    if instance.page_current_title(page.page_id)?.as_deref() != expected_title {
+        return Ok(false);
+    }
+    let expected_visibility = page
+        .revisions
+        .iter()
+        .filter(|revision| revision.visibility.is_some())
+        .count() as i64;
+    let inner = instance.inner.lock().expect("instance mutex poisoned");
+    let actions: i64 = inner
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM page_actions
+             WHERE source_partition='archive' AND page_id=?1",
+            [i64::try_from(page.page_id).map_err(|_| ArchiveError::FieldTooLarge)?],
+            |row| row.get(0),
+        )
+        .map_err(crate::Error::from)?;
+    let visibility: i64 = inner
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM revision_visibility
+             WHERE source_partition='archive' AND page_id=?1",
+            [i64::try_from(page.page_id).map_err(|_| ArchiveError::FieldTooLarge)?],
+            |row| row.get(0),
+        )
+        .map_err(crate::Error::from)?;
+    Ok(actions == page.actions.len() as i64 && visibility == expected_visibility)
+}
+
+fn store_archive_visibility(
+    transaction: &rusqlite::Transaction<'_>,
+    page_id: u64,
+    revision_id: u64,
+    visibility: &RevisionVisibilityRecord,
+) -> Result<()> {
+    let mut parts = Vec::new();
+    if visibility.deleted_parts & 1 != 0 {
+        parts.push("text");
+    }
+    if visibility.deleted_parts & 2 != 0 {
+        parts.push("comment");
+    }
+    if visibility.deleted_parts & 4 != 0 {
+        parts.push("user");
+    }
+    transaction
+        .execute(
+        "INSERT OR REPLACE INTO revision_visibility(
+            revision_id,page_id,source_partition,deleted_parts,
+            parts_are_suppressed,deleted_by_page_deletion,page_deletion_timestamp
+         ) VALUES(?1,?2,'archive',?3,?4,?5,?6)",
+        rusqlite::params![
+            i64::try_from(revision_id).map_err(|_| ArchiveError::FieldTooLarge)?,
+            i64::try_from(page_id).map_err(|_| ArchiveError::FieldTooLarge)?,
+            parts.join(","),
+            visibility.parts_are_suppressed,
+            visibility.deleted_by_page_deletion,
+            visibility
+                .page_deletion_timestamp_micros
+                .map(timestamp_string)
+                .transpose()?
+                .unwrap_or_default(),
+        ],
+        )
+        .map_err(crate::Error::from)?;
+    Ok(())
+}
+
+fn store_archive_action(
+    transaction: &rusqlite::Transaction<'_>,
+    page_id: u64,
+    timestamp_micros: i64,
+    current_title: &str,
+    current_namespace: Option<i64>,
+    action: &PageActionRecord,
+) -> Result<()> {
+    let event_type = match &action.kind {
+        PageActionKind::Create => "create",
+        PageActionKind::LoggedCreate => "create-page",
+        PageActionKind::Move => "move",
+        PageActionKind::Delete => "delete",
+        PageActionKind::Restore => "restore",
+        PageActionKind::Merge => "merge",
+        PageActionKind::Other(name) => name,
+    };
+    let source_key = match action.log_id {
+        Some(log_id) => format!("archive:log:{log_id}"),
+        None => format!(
+            "archive:page:{page_id}:{timestamp_micros}:{}:{event_type}",
+            action.tie_sequence
+        ),
+    };
+    transaction
+        .execute(
+        "INSERT OR REPLACE INTO page_actions(
+            source_key,source_partition,event_log_id,source_ordinal,event_type,event_timestamp,
+            event_comment,actor_id,actor_name,page_id,title_historical,title_current,
+            namespace_historical,namespace_current,page_deleted
+         ) VALUES(?1,'archive',?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+        rusqlite::params![
+            source_key,
+            action.log_id.and_then(|value| i64::try_from(value).ok()),
+            i64::try_from(action.tie_sequence).map_err(|_| ArchiveError::FieldTooLarge)?,
+            event_type,
+            timestamp_string(timestamp_micros)?,
+            action.comment,
+            action
+                .performer
+                .local_user_id
+                .and_then(|value| i64::try_from(value).ok()),
+            action.performer.historical_name.as_deref().unwrap_or(""),
+            (page_id != 0).then(|| i64::try_from(page_id).ok()).flatten(),
+            action.title_at_event,
+            current_title,
+            action.namespace_at_event,
+            current_namespace,
+            action.resulting_deleted.unwrap_or(false),
+        ],
+        )
+        .map_err(crate::Error::from)?;
+    Ok(())
+}
+
+fn timestamp_string(timestamp_micros: i64) -> Result<String> {
+    chrono::DateTime::from_timestamp_micros(timestamp_micros)
+        .map(|timestamp| timestamp.to_rfc3339_opts(chrono::SecondsFormat::Micros, true))
+        .ok_or_else(|| ArchiveError::InvalidTimestamp(timestamp_micros.to_string()))
+}
+
+fn store_archive_siteinfo(
+    instance: &Instance,
+    captured_at: i64,
+    site_info: &SiteInfoRecord,
+) -> Result<()> {
+    let namespaces = site_info
+        .namespaces
+        .iter()
+        .map(|namespace| {
+            serde_json::json!({
+                "id": namespace.id,
+                "canonical": "",
+                "localized": namespace.localized_name,
+                "case": namespace.case,
+                "aliases": namespace.aliases,
+            })
+        })
+        .collect::<Vec<_>>();
+    let payload = serde_json::to_vec(&serde_json::json!({
+        "site_name": site_info.site_name,
+        "db_name": site_info.db_name,
+        "base": site_info.base,
+        "generator": site_info.generator,
+        "case": site_info.case,
+        "namespaces": namespaces,
+    }))
+    .map_err(|_| ArchiveError::Invalid("cannot encode archive siteinfo"))?;
+    let inner = instance.inner.lock().expect("instance mutex poisoned");
+    let transaction = inner
+        .conn
+        .unchecked_transaction()
+        .map_err(crate::Error::from)?;
+    transaction
+        .execute(
+        "INSERT OR REPLACE INTO siteinfo_snapshots(captured_at,json) VALUES(?1,?2)",
+        rusqlite::params![captured_at, payload],
+        )
+        .map_err(crate::Error::from)?;
+    for interwiki in &site_info.interwiki {
+        transaction
+            .execute(
+            "INSERT OR REPLACE INTO interwiki_map(captured_at,prefix,url,is_local)
+             VALUES(?1,?2,?3,0)",
+            rusqlite::params![captured_at, interwiki.prefix, interwiki.url],
+            )
+            .map_err(crate::Error::from)?;
+    }
+    transaction.commit().map_err(crate::Error::from)?;
+    Ok(())
 }
 
 fn export_page<W: Write>(

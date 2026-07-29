@@ -143,6 +143,30 @@ fn import_one_page<R: Read>(
         earliest_ts = Some(earliest_ts.map_or(ts, |old: i64| old.min(ts)));
         incoming.push(encode_new_revision(revision, stats));
     }
+    import_encoded_page(
+        instance,
+        page_id,
+        Some(&header.title),
+        earliest_ts,
+        incoming,
+        stats,
+    )
+}
+
+pub(crate) fn import_encoded_page(
+    instance: &Instance,
+    page_id: u64,
+    title: Option<&str>,
+    earliest_ts: Option<i64>,
+    mut incoming: Vec<Vec<u8>>,
+    stats: &mut ImportStats,
+) -> Result<()> {
+    if page_id >= wikimak_depot::CHAIN_ID_CEILING {
+        return Err(crate::error::Error::PageIdOverflow {
+            page_id,
+            ceiling: wikimak_depot::CHAIN_ID_CEILING,
+        });
+    }
     incoming.sort_by(|a, b| revision_key(b).cmp(&revision_key(a)));
     let (incoming, conflicts) = dedup_incoming(incoming, stats);
     let likely_fresh = {
@@ -170,7 +194,7 @@ fn import_one_page<R: Read>(
         }
     }
     let had_chain = g.depot.has_chain(page_id)?;
-    let old_head_key = if had_chain {
+    let old_head_key = if had_chain && !incoming.is_empty() {
         let raw = crate::frames::decompress_head(
             &g.depot.read_f0(page_id)?,
             &g.revision_dictionaries,
@@ -211,14 +235,16 @@ fn import_one_page<R: Read>(
 
     g.conn.execute("BEGIN IMMEDIATE", [])?;
     let outcome = (|| -> Result<usize> {
-        ensure_current_title(
-            &mut g,
-            page_id,
-            header.title.as_bytes(),
-            instance.title_shard_count.load(std::sync::atomic::Ordering::Relaxed),
-            earliest_ts,
-            dump_extends_head,
-        )
+        title.map_or(Ok(0), |title| {
+            ensure_current_title(
+                &mut g,
+                page_id,
+                title.as_bytes(),
+                instance.title_shard_count.load(std::sync::atomic::Ordering::Relaxed),
+                earliest_ts,
+                dump_extends_head,
+            )
+        })
     })();
     match outcome {
         Ok(added_intents) => {
@@ -230,12 +256,14 @@ fn import_one_page<R: Read>(
             stats.revisions_new += new_this_page;
             stats.revisions_deduped += deduped;
             stats.pages += 1;
-            let normalized = crate::titles::normalize_title(header.title.as_bytes());
-            let count = instance
-                .title_shard_count
-                .load(std::sync::atomic::Ordering::Relaxed);
-            let sid = crate::titles::shard_for(&normalized, count);
-            instance.maintain_title_shard(&mut g, sid)?;
+            if let Some(title) = title {
+                let normalized = crate::titles::normalize_title(title.as_bytes());
+                let count = instance
+                    .title_shard_count
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                let sid = crate::titles::shard_for(&normalized, count);
+                instance.maintain_title_shard(&mut g, sid)?;
+            }
             Ok(())
         }
         Err(e) => {

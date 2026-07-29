@@ -10,6 +10,7 @@
 //!   wikimak text <root> <page_id>              newest revision text
 //!   wikimak history <root> <page_id>           all revisions, newest-first
 //!   wikimak archive-export <root> <file>        portable ordered event stream
+//!   wikimak archive-import <file> <root>        initialize depot from archive
 //!   wikimak archive-build-direct <db> <file> <scratch>
 //!   wikimak archive-build-update <db> <base> <file> <scratch>
 //!   wikimak archive-fetch-siteinfo <api-url> <file>
@@ -74,6 +75,49 @@ fn cmd_import(dump: &str, root: &str, max_page_id: Option<u64>) -> Result<(), St
         "pages {}  revisions new {}  deduped {}  sha1 ok/fudged/mismatch {}/{}/{}",
         stats.pages, stats.revisions_new, stats.revisions_deduped,
         stats.sha1_ok, stats.sha1_fudged, stats.sha1_mismatch
+    );
+    Ok(())
+}
+
+fn cmd_archive_import(
+    archive: &str,
+    root: &str,
+    max_page_id: Option<u64>,
+) -> Result<(), String> {
+    let root_path = PathBuf::from(root);
+    if !root_path.join("meta.db").exists()
+        && root_path.exists()
+        && std::fs::read_dir(&root_path)
+            .map_err(|error| format!("{}: {error}", root_path.display()))?
+            .next()
+            .is_some()
+    {
+        return Err(format!(
+            "archive-import initializes a new depot; {} is not empty",
+            root_path.display()
+        ));
+    }
+    let instance = open_instance(root_path, max_page_id)?;
+    if instance
+        .sync_state("full_snapshot_date")
+        .map_err(|error| error.to_string())?
+        .is_some()
+    {
+        return Err("archive-import initializes a new depot; this depot is complete".into());
+    }
+    let stats = crate::archive::import_instance(&instance, archive, |stats| {
+        if stats.pages != 0 {
+            eprintln!(
+                "archive import: {} pages, {} revisions, {} page actions, {} user records",
+                stats.pages, stats.revisions, stats.page_actions, stats.user_records
+            );
+        }
+    })
+    .map_err(|error| error.to_string())?;
+    instance.collect().map_err(|error| error.to_string())?;
+    println!(
+        "archive import complete: {} pages, {} revisions, {} page actions, {} user records",
+        stats.pages, stats.revisions, stats.page_actions, stats.user_records
     );
     Ok(())
 }
@@ -1072,6 +1116,7 @@ pub fn cli_main(args: &[String]) -> i32 {
         ["history", root, page] => page.parse().map_err(|e| format!("{e}"))
             .and_then(|p| cmd_history(root, p)),
         ["archive-export", root, output] => cmd_archive_export(root, output),
+        ["archive-import", archive, root] => cmd_archive_import(archive, root, max_page_id),
         ["archive-build-direct", dbname, output, scratch] =>
             cmd_archive_build_direct(dbname, output, scratch),
         ["archive-build-update", dbname, base, output, scratch] =>
@@ -1105,6 +1150,7 @@ pub fn cli_main(args: &[String]) -> i32 {
                   \x20      wikimak head|history <root> <page_id>\n\
                   \x20      wikimak text <root> <page_id> [asof-unix-micros]\n\
                   \x20      wikimak archive-export <root> <file>\n\
+                  \x20      wikimak archive-import <file> <root>\n\
                   \x20      wikimak archive-build-direct <dbname> <file> <scratch-dir>\n\
                   \x20      wikimak archive-build-update <dbname> <base-dump> <file> <scratch-dir>\n\
                   \x20      wikimak archive-fetch-siteinfo <api-url> <file>\n\

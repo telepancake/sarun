@@ -11,11 +11,13 @@
 //! * A sealed cold frame keeps its f1 bytes verbatim; its anchor is the
 //!   oldest record of the next-newer frame (depot SPEC chain walk).
 //!
-//! Dictionary scope is per (Wikipedia instance, lane), not per page:
-//! the seed import samples newest page revisions during its first pass,
-//! persists one trained dictionary, then repacks f0 heads in a second
-//! pass. Later updates keep using that dictionary until an explicit
-//! repack. f1/cold remain refPrefix frames and never use the dictionary.
+//! Dictionary scope is per (Wikipedia instance, lane), not per page.
+//! Archive initialization samples newest page revisions in a read-only
+//! prepass and publishes the dictionary before writing any f0 frame.
+//! Importers that cannot make a prepass may explicitly finalize and
+//! repack afterward. Later updates keep using the active dictionary
+//! until an explicit retraining. f1/cold remain refPrefix frames and
+//! never use the dictionary.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};

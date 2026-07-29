@@ -17,8 +17,8 @@ use crate::error::{Error, Result};
 use crate::import::do_import;
 use crate::schema::META_DDL;
 
-const REVISION_DICTIONARY_BYTES: usize = 800 << 10;
-const REVISION_SAMPLE_COUNT: usize = 32 << 10;
+pub(crate) const REVISION_DICTIONARY_BYTES: usize = 800 << 10;
+pub(crate) const REVISION_SAMPLE_COUNT: usize = 32 << 10;
 const REVISION_METADATA_SAMPLE_COUNT: usize = 128 << 10;
 const REVISION_DICTIONARY_SAMPLE_RATIO: usize = 8;
 const REVISION_MIN_SAMPLES: usize = 128;
@@ -658,17 +658,51 @@ impl Instance {
         self.inner.lock().expect("instance mutex poisoned").depot.bytes_written()
     }
 
-    /// Finalize the initial full-content seed: deterministically sample a
-    /// broad cross-section of complete current f0 records, train one
+    /// Finalize a seed written by an importer that could not pretrain:
+    /// deterministically sample complete current f0 records, train one
     /// 800-KiB per-instance revision dictionary (scaled down only for a
     /// small corpus), publish it durably, and repack f0 only. A rerun
     /// resumes a partially completed repack using the already-active
-    /// dictionary; it never trains a successor.
+    /// dictionary; it never trains a successor. Seekable archive imports
+    /// use `prepare_seed_revision_dictionary` before their first write.
     pub fn finalize_seed_revision_dictionary(&self) -> Result<RevisionDictionaryStats> {
         if self.read_only {
             return Err(Error::ReadOnly("finalize_seed_revision_dictionary"));
         }
         self.repack_revision_dictionary_inner(false, None)
+    }
+
+    pub(crate) fn prepare_seed_revision_dictionary(
+        &self,
+        samples: &[Vec<u8>],
+    ) -> Result<RevisionDictionaryStats> {
+        if self.read_only {
+            return Err(Error::ReadOnly("prepare_seed_revision_dictionary"));
+        }
+        let g = self.inner.lock().expect("instance mutex poisoned");
+        let mut stats = RevisionDictionaryStats::default();
+        let total = samples.iter().try_fold(0usize, |sum, sample| {
+            sum.checked_add(sample.len())
+                .ok_or(Error::Corrupt("revision dictionary sample size overflow"))
+        })?;
+        stats.samples = samples.len() as u64;
+        stats.sample_bytes = total as u64;
+        if samples.len() < REVISION_MIN_SAMPLES || total < REVISION_MIN_SAMPLE_BYTES {
+            return Ok(stats);
+        }
+        let capacity = REVISION_DICTIONARY_BYTES.min(total / REVISION_DICTIONARY_SAMPLE_RATIO);
+        let dictionary = crate::frames::train_dictionary(samples, capacity)?;
+        let id = g.revision_dictionaries.persist("revision", &dictionary)?;
+        g.revision_dictionaries.activate("revision", id)?;
+        stats.dictionary_id = Some(id);
+        stats.dictionary_bytes = dictionary.len() as u64;
+        stats.trained = true;
+        Ok(stats)
+    }
+
+    pub(crate) fn has_active_revision_dictionary(&self) -> Result<bool> {
+        let g = self.inner.lock().expect("instance mutex poisoned");
+        Ok(g.revision_dictionaries.current("revision")?.is_some())
     }
 
     /// Explicitly train a successor dictionary from the current complete
@@ -2870,7 +2904,7 @@ fn add_split_revision_stats(
         partial.packed_small_combined_frame_bytes;
 }
 
-fn sample_hash(mut value: u64) -> u64 {
+pub(crate) fn sample_hash(mut value: u64) -> u64 {
     value = value.wrapping_add(0x9e3779b97f4a7c15);
     value = (value ^ (value >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
     value = (value ^ (value >> 27)).wrapping_mul(0x94d049bb133111eb);
