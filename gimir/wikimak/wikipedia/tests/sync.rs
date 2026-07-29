@@ -20,8 +20,12 @@ use sha1::{Digest as _, Sha1};
 use md5::Md5;
 use tempfile::TempDir;
 use wikimak_mediawiki::Config;
-use wikimak_wikipedia::archive::{ArchiveReader, EntityKind, Record};
-use wikimak_wikipedia::{build_direct_archive, maintain, reconcile_history, sync};
+use wikimak_wikipedia::archive::{
+    merge_many_archives, ArchiveReader, CompressionSettings, EntityKind, Record,
+};
+use wikimak_wikipedia::{
+    build_direct_archive, build_update_archive, maintain, reconcile_history, sync,
+};
 
 use common::{fixture, make_instance};
 
@@ -92,7 +96,7 @@ fn history_body_with_schema(event_type: &str, columns: usize) -> Vec<u8> {
     revision_fields[0] = "testwiki";
     revision_fields[2] = "revision";
     revision_fields[3] = "create";
-    revision_fields[4] = "2024-06-01 12:00:00.0";
+    revision_fields[4] = "2024-01-01 00:00:00.0";
     revision_fields[page] = "1";
     revision_fields[revision] = "100";
     revision_fields[revision + 3] = "text,user";
@@ -336,6 +340,134 @@ fn direct_archive_preserves_content_and_every_history_entity() {
     assert_eq!(user_events, 1);
     assert!(saw_user_rename);
     assert!(saw_manifest);
+}
+
+#[test]
+fn update_archive_overlaps_daily_runs_and_merges_with_full_archive() {
+    let initial = MockServer::start();
+    let xml = fixture("export_three_pages.xml");
+    let sha1_hex = hex::encode(Sha1::digest(&xml));
+    mount(&initial, &xml, &sha1_hex);
+    let tmp = TempDir::new().unwrap();
+    let base = tmp.path().join("base.swdump");
+    build_direct_archive(
+        &Client::new(),
+        &Config {
+            base_url: initial.base_url(),
+        },
+        "testwiki",
+        &base,
+        tmp.path().join("base-scratch"),
+        |_| (),
+    )
+    .unwrap();
+
+    let update_server = MockServer::start();
+    update_server.mock(|when, then| {
+        when.method(GET).path("/other/incr/testwiki/");
+        then.status(200).body(
+            r#"<a href="20240530/">20240530/</a>
+               <a href="20240601/">20240601/</a>
+               <a href="20240602/">20240602/</a>"#,
+        );
+    });
+    let mut encoder = BzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&xml).unwrap();
+    let daily_bytes = encoder.finish().unwrap();
+    let daily_md5 = hex::encode(Md5::digest(&daily_bytes));
+    for date in ["20240530", "20240601", "20240602"] {
+        update_server.mock(move |when, then| {
+            when.method(GET)
+                .path(format!("/other/incr/testwiki/{date}/status.txt"));
+            then.status(200).body("done");
+        });
+        let filename = format!("testwiki-{date}-pages-meta-hist-incr.xml.bz2");
+        let sums = format!("{daily_md5}  {filename}\n");
+        update_server.mock(move |when, then| {
+            when.method(GET)
+                .path(format!("/other/incr/testwiki/{date}/testwiki-{date}-md5sums.txt"));
+            then.status(200).body(sums.clone());
+        });
+        let body = daily_bytes.clone();
+        update_server.mock(move |when, then| {
+            when.method(GET)
+                .path(format!("/other/incr/testwiki/{date}/{filename}"));
+            then.status(200).body(body.clone());
+        });
+    }
+    update_server.mock(|when, then| {
+        when.method(GET).path("/other/mediawiki_history/");
+        then.status(200).body(r#"<a href="2024-06/">2024-06/</a>"#);
+    });
+    update_server.mock(|when, then| {
+        when.method(GET)
+            .path("/other/mediawiki_history/2024-06/testwiki/");
+        then.status(200).body(
+            r#"<a href="2024-06.testwiki.2024-04.tsv.bz2">April</a>
+               <a href="2024-06.testwiki.2024-05.tsv.bz2">May</a>
+               <a href="2024-06.testwiki.2024-06.tsv.bz2">June</a>"#,
+        );
+    });
+    let april = update_server.mock(|when, then| {
+        when.method(GET)
+            .path("/other/mediawiki_history/2024-06/testwiki/2024-06.testwiki.2024-04.tsv.bz2");
+        then.status(200).body(history_body("create"));
+    });
+    for partition in ["2024-05", "2024-06"] {
+        update_server.mock(move |when, then| {
+            when.method(GET).path(format!(
+                "/other/mediawiki_history/2024-06/testwiki/2024-06.testwiki.{partition}.tsv.bz2"
+            ));
+            then.status(200).body(history_body("move"));
+        });
+    }
+
+    let update = tmp.path().join("update.swdump");
+    let stats = build_update_archive(
+        &Client::new(),
+        &Config {
+            base_url: update_server.base_url(),
+        },
+        "testwiki",
+        &base,
+        &update,
+        tmp.path().join("update-scratch"),
+        3,
+        1024,
+        CompressionSettings::default(),
+        |_| (),
+    )
+    .unwrap();
+    assert_eq!(stats.content_from, "2024-06-01");
+    assert_eq!(stats.content_through, "2024-06-02");
+    assert_eq!(stats.incremental_runs, 3);
+    assert_eq!(stats.history_parts, 2);
+    assert_eq!(april.hits(), 0, "old completed history partition was fetched");
+
+    let merged = tmp.path().join("merged.swdump");
+    merge_many_archives(
+        &[base, update],
+        std::fs::File::create(&merged).unwrap(),
+        1024,
+    )
+    .unwrap();
+    let mut reader = ArchiveReader::new(std::fs::File::open(merged).unwrap()).unwrap();
+    let mut content_through = String::new();
+    let mut revisions = 0;
+    while let Some(mut frame) = reader.next_frame().unwrap() {
+        while let Some(record) = frame.next_record().unwrap() {
+            match record {
+                Record::Revision { .. } => revisions += 1,
+                Record::Manifest { manifest, .. } => {
+                    content_through = content_through.max(manifest.content_snapshot);
+                }
+                _ => {}
+            }
+        }
+    }
+    assert!(reader.is_complete());
+    assert_eq!(content_through, "2024-06-02");
+    assert_eq!(revisions, 6, "overlapping daily revisions were not deduplicated");
 }
 
 #[test]

@@ -24,9 +24,11 @@ It is intended to make storage experiments ordinary ordered stream filters.
 
 The fixed 24-byte file header is followed by 64-byte frame headers and zstd
 frames. A writer checks actual emitted zstd bytes at every entity boundary and
-starts a new frame when the target (4 MiB by default) has been reached. Thus an
-entity is never split, and a single exceptionally large page may produce a
-frame larger than the target.
+starts a new frame when the target (4 MiB by default) has been reached. Page,
+user, and global records are never mixed in one frame: changing entity kind
+always starts a new frame. The header identifies that kind and the minimum and
+maximum page ID or user ID in the frame. An entity is never split, so a single
+exceptionally large page may produce a frame larger than the target.
 
 Each independently streamed upstream dump part produces page-aligned frames.
 Disjoint content segments are consolidated by copying their compressed frames
@@ -70,6 +72,23 @@ A clean file ends with a 64-byte `DONE` header.
 in order and writes the same records using the requested compressed frame-size
 target, zstd level, checksum, long-distance matching, window log, and target
 compressed-block size. Frame boundaries remain entity-aligned.
+
+`wikimak archive-merge` performs a canonical set union over any number of
+archives and writes it through the same configurable compressor and framing
+code as `archive-repack`. Records are externally sorted in bounded memory.
+`--scratch-dir` places the bounded sort runs and hierarchical consolidation
+passes on caller-selected storage.
+Equal revision IDs are joined field by field; repeated actions are identified
+from their typed event content rather than their source-row ordinal. Exact
+records occur once. Consequently input order, grouping, and repetition do not
+change the result.
+
+`wikimak archive-build-update` reads the logical content date from a base
+archive, fetches daily incremental content beginning three days before that
+date, and emits a partial archive. The overlap makes late or repeated daily
+runs harmless under merge. For partitioned MediaWiki History releases it
+includes the newest completed partition and current partial partition; an
+all-time wiki necessarily contributes its one all-time file.
 
 ## Normalized metadata
 

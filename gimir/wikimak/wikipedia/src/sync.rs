@@ -201,8 +201,6 @@ fn unescape_tsv(file: &HistoryFile, line: usize, field: &str, value: &str) -> Re
         match escape {
             b't' => out.push(b'\t'),
             b'n' => out.push(b'\n'),
-            b'r' => out.push(b'\r'),
-            b'\\' => out.push(b'\\'),
             b'x' => {
                 let Some(hex) = input.get(cursor..cursor + 2) else {
                     return Err(history_parse_error(
@@ -229,9 +227,9 @@ fn unescape_tsv(file: &HistoryFile, line: usize, field: &str, value: &str) -> Re
                 cursor += 2;
             }
             other => {
-                // Backslash is legal title content. MWH uses it as an
-                // introducer only for the structural escapes above; an
-                // unknown pair is therefore literal, not malformed.
+                // MediaWiki History does not consistently quote literal
+                // backslashes. In particular, interpreting \r in wikitext
+                // such as `\rightarrow` corrupts it into a carriage return.
                 out.push(b'\\');
                 out.push(other);
             }
@@ -1770,6 +1768,19 @@ mod tests {
         assert_eq!(
             unescape_tsv(&file, 1_402_387, "page_title_current", r"Broken ending\").unwrap(),
             r"Broken ending\"
+        );
+    }
+
+    #[test]
+    fn latex_backslash_sequences_are_never_interpreted_as_control_bytes() {
+        let file = history_file();
+        assert_eq!(
+            unescape_tsv(&file, 1, "event_comment", r"<math>x\rightarrow y</math>").unwrap(),
+            r"<math>x\rightarrow y</math>"
+        );
+        assert_eq!(
+            unescape_tsv(&file, 1, "event_comment", r"line\ncolumn\tmath\rho\\").unwrap(),
+            "line\ncolumn\tmath\\rho\\\\"
         );
     }
 

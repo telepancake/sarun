@@ -31,6 +31,7 @@ const KIND_USER_ACTION: u8 = 5;
 const KIND_MANIFEST: u8 = 6;
 const PAGE_TEXT_MEMORY_LIMIT: usize = 16 << 20;
 const HISTORY_SORT_RUN_BYTES: usize = 64 << 20;
+const SORT_MERGE_FAN_IN: usize = 64;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 #[repr(u8)]
@@ -81,11 +82,13 @@ pub enum ArchiveError {
     FieldTooLarge,
     #[error("invalid stored page-action timestamp {0:?}")]
     InvalidTimestamp(String),
+    #[error("archive merge conflict: {0}")]
+    Conflict(String),
 }
 
 pub type Result<T> = std::result::Result<T, ArchiveError>;
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
 pub struct RevisionVisibilityRecord {
     pub deleted_parts: u8,
     pub parts_are_suppressed: bool,
@@ -93,7 +96,7 @@ pub struct RevisionVisibilityRecord {
     pub page_deletion_timestamp_micros: Option<i64>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 #[repr(u8)]
 pub enum AccountClass {
     Unknown = 0,
@@ -103,7 +106,7 @@ pub enum AccountClass {
     Hidden = 4,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct PerformerRecord {
     pub local_user_id: Option<u64>,
     pub central_user_id: Option<u64>,
@@ -111,7 +114,7 @@ pub struct PerformerRecord {
     pub account_class: AccountClass,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum PageActionKind {
     Create,
     LoggedCreate,
@@ -136,7 +139,7 @@ impl PageActionKind {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct PageActionRecord {
     pub log_id: Option<u64>,
     pub tie_sequence: u64,
@@ -157,7 +160,7 @@ pub struct RevisionRecord {
     pub history: Option<RevisionHistoryRecord>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct RevisionHistoryRecord {
     pub minor: Option<bool>,
     pub content_model: Option<String>,
@@ -170,7 +173,7 @@ pub struct RevisionHistoryRecord {
     pub tags: Vec<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct UserStateRecord {
     pub current_name: Option<String>,
     pub central_user_id: Option<u64>,
@@ -180,7 +183,7 @@ pub struct UserStateRecord {
     pub bot_by: Vec<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum UserActionKind {
     Create,
     Rename,
@@ -201,7 +204,7 @@ impl UserActionKind {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct UserActionRecord {
     pub log_id: Option<u64>,
     pub tie_sequence: u64,
@@ -218,7 +221,7 @@ pub struct UserActionRecord {
     pub first_edit_timestamp_micros: Option<i64>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct ManifestRecord {
     pub wiki_db: String,
     pub content_snapshot: String,
@@ -283,11 +286,26 @@ impl RecordSorter {
     }
 
     pub(crate) fn finish<W: Write>(
-        mut self,
+        self,
         output: W,
         frame_target: usize,
     ) -> Result<(W, u64, u64)> {
+        let (output, frames, _, user_actions) = self.finish_with_compression(
+            output,
+            frame_target,
+            CompressionSettings::default(),
+        )?;
+        Ok((output, frames, user_actions))
+    }
+
+    fn finish_with_compression<W: Write>(
+        mut self,
+        output: W,
+        frame_target: usize,
+        compression: CompressionSettings,
+    ) -> Result<(W, u64, u64, u64)> {
         self.flush_run()?;
+        self.collapse_runs()?;
         let mut readers = self
             .runs
             .iter()
@@ -299,7 +317,8 @@ impl RecordSorter {
                 heads.push(SortRunHead { run, record });
             }
         }
-        let mut writer = ArchiveWriter::new(output, frame_target)?;
+        let mut writer = ArchiveWriter::with_compression(output, frame_target, compression)?;
+        let mut records = 0_u64;
         let mut user_actions = 0_u64;
         while let Some(head) = heads.pop() {
             let mut record = head.record;
@@ -324,10 +343,77 @@ impl RecordSorter {
             }
             user_actions += u64::from(matches!(record, Record::UserAction { .. }));
             writer.write(&record)?;
+            records += 1;
         }
         let (output, frames) = writer.finish()?;
-        Ok((output, frames, user_actions))
+        Ok((output, frames, records, user_actions))
     }
+
+    fn collapse_runs(&mut self) -> Result<()> {
+        let mut pass = 0_usize;
+        while self.runs.len() > SORT_MERGE_FAN_IN {
+            let previous = std::mem::take(&mut self.runs);
+            let mut next = Vec::with_capacity(previous.len().div_ceil(SORT_MERGE_FAN_IN));
+            for (batch, paths) in previous.chunks(SORT_MERGE_FAN_IN).enumerate() {
+                if paths.len() == 1 {
+                    next.push(paths[0].clone());
+                    continue;
+                }
+                let output = self
+                    .temporary
+                    .path()
+                    .join(format!("merge-{pass:04}-{batch:08}.zst"));
+                merge_sort_runs(paths, &output)?;
+                for path in paths {
+                    std::fs::remove_file(path)?;
+                }
+                next.push(output);
+            }
+            self.runs = next;
+            pass += 1;
+        }
+        Ok(())
+    }
+}
+
+fn merge_sort_runs(inputs: &[PathBuf], output: &Path) -> Result<()> {
+    let mut readers = inputs
+        .iter()
+        .map(|path| SortRunReader::open(path))
+        .collect::<Result<Vec<_>>>()?;
+    let mut heads = BinaryHeap::new();
+    for (run, reader) in readers.iter_mut().enumerate() {
+        if let Some(record) = reader.next_record()? {
+            heads.push(SortRunHead { run, record });
+        }
+    }
+    let file = std::fs::File::create(output)?;
+    let mut encoder = zstd::stream::write::Encoder::new(file, 1)?;
+    while let Some(head) = heads.pop() {
+        let mut record = head.record;
+        if let Some(next) = readers[head.run].next_record()? {
+            heads.push(SortRunHead {
+                run: head.run,
+                record: next,
+            });
+        }
+        while heads
+            .peek()
+            .is_some_and(|other| records_coalesce(&record, &other.record))
+        {
+            let other = heads.pop().expect("peeked");
+            record = coalesce_records(record, other.record)?;
+            if let Some(next) = readers[other.run].next_record()? {
+                heads.push(SortRunHead {
+                    run: other.run,
+                    record: next,
+                });
+            }
+        }
+        write_sort_run_record(&mut encoder, &record)?;
+    }
+    encoder.finish()?.sync_all()?;
+    Ok(())
 }
 
 fn write_sort_run_record(output: &mut impl Write, record: &Record) -> Result<()> {
@@ -623,7 +709,9 @@ impl<W: Write> ArchiveWriter<W> {
         if new_entity {
             if let Some(frame) = self.frame.as_mut() {
                 frame.encoder.flush()?;
-                if frame.compressed_so_far() >= self.frame_target {
+                if frame.last_entity.kind != entity.kind
+                    || frame.compressed_so_far() >= self.frame_target
+                {
                     self.seal_frame()?;
                 }
             }
@@ -988,43 +1076,45 @@ pub fn merge_many_archives<W: Write>(
     output: W,
     frame_target: usize,
 ) -> Result<(W, u64, u64)> {
-    let mut readers = inputs
-        .iter()
-        .map(ArchiveRecordReader::open)
-        .collect::<Result<Vec<_>>>()?;
-    let mut heads = BinaryHeap::new();
-    for (reader, input) in readers.iter_mut().enumerate() {
-        if let Some(record) = input.next_record()? {
-            heads.push(ArchiveMergeHead { reader, record });
+    merge_many_archives_with_compression(
+        inputs,
+        output,
+        frame_target,
+        CompressionSettings::default(),
+    )
+}
+
+pub fn merge_many_archives_with_compression<W: Write>(
+    inputs: &[PathBuf],
+    output: W,
+    frame_target: usize,
+    compression: CompressionSettings,
+) -> Result<(W, u64, u64)> {
+    merge_many_archives_with_compression_in(
+        inputs,
+        output,
+        frame_target,
+        compression,
+        std::env::temp_dir(),
+    )
+}
+
+pub fn merge_many_archives_with_compression_in<W: Write>(
+    inputs: &[PathBuf],
+    output: W,
+    frame_target: usize,
+    compression: CompressionSettings,
+    scratch_parent: impl AsRef<Path>,
+) -> Result<(W, u64, u64)> {
+    let mut sorter = RecordSorter::new_in(scratch_parent.as_ref())?;
+    for input in inputs {
+        let mut reader = ArchiveRecordReader::open(input)?;
+        while let Some(record) = reader.next_record()? {
+            sorter.push(record)?;
         }
     }
-    let mut writer = ArchiveWriter::new(output, frame_target)?;
-    let mut records = 0_u64;
-    while let Some(head) = heads.pop() {
-        let mut record = head.record;
-        if let Some(next) = readers[head.reader].next_record()? {
-            heads.push(ArchiveMergeHead {
-                reader: head.reader,
-                record: next,
-            });
-        }
-        while heads
-            .peek()
-            .is_some_and(|other| records_coalesce(&record, &other.record))
-        {
-            let other = heads.pop().expect("peeked");
-            record = coalesce_records(record, other.record)?;
-            if let Some(next) = readers[other.reader].next_record()? {
-                heads.push(ArchiveMergeHead {
-                    reader: other.reader,
-                    record: next,
-                });
-            }
-        }
-        writer.write(&record)?;
-        records += 1;
-    }
-    let (output, frames) = writer.finish()?;
+    let (output, frames, records, _) =
+        sorter.finish_with_compression(output, frame_target, compression)?;
     Ok((output, frames, records))
 }
 
@@ -1042,13 +1132,17 @@ fn records_coalesce(left: &Record, right: &Record) -> bool {
         ) => left_page == right_page && left.meta.rev_id == right.meta.rev_id,
         (
             Record::UserState {
-                user_id: left, ..
+                user_id: left_id,
+                timestamp_micros: left_timestamp,
+                ..
             },
             Record::UserState {
-                user_id: right, ..
+                user_id: right_id,
+                timestamp_micros: right_timestamp,
+                ..
             },
-        ) => left == right,
-        _ => false,
+        ) => left_id == right_id && left_timestamp == right_timestamp,
+        _ => record_order(left, right) == std::cmp::Ordering::Equal,
     }
 }
 
@@ -1063,25 +1157,66 @@ fn coalesce_records(left: Record, right: Record) -> Result<Record> {
                 revision: right, ..
             },
         ) => {
+            if left.meta.rev_id != right.meta.rev_id
+                || left.meta.parent_id != right.meta.parent_id
+                || left.meta.ts != right.meta.ts
+            {
+                return Err(ArchiveError::Invalid(
+                    "conflicting identity for one revision id",
+                ));
+            }
             if left.has_text && right.has_text && left.text != right.text {
                 return Err(ArchiveError::Invalid(
                     "conflicting text for one revision id",
                 ));
             }
+            left.meta.contributor = merge_contributor(
+                left.meta.rev_id,
+                left.meta.contributor,
+                right.meta.contributor,
+            )?;
+            left.meta.comment = merge_comment(left.meta.comment, right.meta.comment);
+            left.meta.flags |= right.meta.flags;
+            left.meta.text_len = left.meta.text_len.max(right.meta.text_len);
             if !left.has_text && right.has_text {
-                let visibility = left.visibility.take();
-                let history = left.history.take();
-                left = right;
-                left.visibility = left.visibility.or(visibility);
-                left.history = left.history.or(history);
-            } else {
-                left.visibility = left.visibility.or(right.visibility);
-                left.history = left.history.or(right.history);
-                left.meta.flags |= right.meta.flags;
+                left.has_text = true;
+                left.text = right.text;
             }
+            left.visibility = merge_visibility(left.visibility, right.visibility);
+            left.history = merge_revision_history(left.history, right.history)?;
             Ok(Record::Revision {
                 page_id,
                 revision: left,
+            })
+        }
+        (
+            Record::PageAction {
+                entity,
+                timestamp_micros,
+                mut action,
+            },
+            Record::PageAction { action: other, .. },
+        ) if page_actions_same_identity(&action, &other) => {
+            action = merge_page_action(action, other)?;
+            Ok(Record::PageAction {
+                entity,
+                timestamp_micros,
+                action,
+            })
+        }
+        (
+            Record::UserAction {
+                entity,
+                timestamp_micros,
+                mut action,
+            },
+            Record::UserAction { action: other, .. },
+        ) if user_actions_same_identity(&action, &other) => {
+            action = merge_user_action(action, other)?;
+            Ok(Record::UserAction {
+                entity,
+                timestamp_micros,
+                action,
             })
         }
         (
@@ -1090,45 +1225,235 @@ fn coalesce_records(left: Record, right: Record) -> Result<Record> {
                 timestamp_micros,
                 state,
             },
-            Record::UserState {
-                state: other, ..
-            },
-        ) if state == other => Ok(Record::UserState {
+            Record::UserState { state: other, .. },
+        ) => Ok(Record::UserState {
             user_id,
             timestamp_micros,
-            state,
+            state: merge_user_state(state, other)?,
         }),
-        (Record::UserState { .. }, Record::UserState { .. }) => {
-            Err(ArchiveError::Invalid("conflicting current user states"))
-        }
+        (left, right) if left == right => Ok(left),
         _ => Err(ArchiveError::Invalid("records cannot be coalesced")),
     }
 }
 
-struct ArchiveMergeHead {
-    reader: usize,
-    record: Record,
-}
-
-impl PartialEq for ArchiveMergeHead {
-    fn eq(&self, other: &Self) -> bool {
-        record_order(&self.record, &other.record) == std::cmp::Ordering::Equal
-            && self.reader == other.reader
+fn merge_contributor(
+    revision_id: u64,
+    left: ContributorMeta,
+    right: ContributorMeta,
+) -> Result<ContributorMeta> {
+    if left == right {
+        Ok(left)
+    } else {
+        match (left, right) {
+            (ContributorMeta::Hidden, right) => Ok(right),
+            (left, ContributorMeta::Hidden) => Ok(left),
+            (
+                ContributorMeta::Named {
+                    username: left,
+                    user_id: left_id,
+                },
+                ContributorMeta::Named {
+                    username: right,
+                    user_id: right_id,
+                },
+            ) if left_id == right_id => Ok(ContributorMeta::Named {
+                username: left.min(right),
+                user_id: left_id,
+            }),
+            (left, right) => Err(ArchiveError::Conflict(format!(
+                "revision {revision_id} has contributors {left:?} and {right:?}"
+            ))),
+        }
     }
 }
 
-impl Eq for ArchiveMergeHead {}
-
-impl PartialOrd for ArchiveMergeHead {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
+fn merge_comment(left: String, right: String) -> String {
+    match (left.is_empty(), right.is_empty()) {
+        (true, _) => right,
+        (_, true) => left,
+        _ => left.max(right),
     }
 }
 
-impl Ord for ArchiveMergeHead {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        record_order(&other.record, &self.record).then_with(|| other.reader.cmp(&self.reader))
+fn merge_visibility(
+    left: Option<RevisionVisibilityRecord>,
+    right: Option<RevisionVisibilityRecord>,
+) -> Option<RevisionVisibilityRecord> {
+    match (left, right) {
+        (None, value) | (value, None) => value,
+        (Some(left), Some(right)) => Some(RevisionVisibilityRecord {
+            deleted_parts: left.deleted_parts | right.deleted_parts,
+            parts_are_suppressed: left.parts_are_suppressed || right.parts_are_suppressed,
+            deleted_by_page_deletion: left.deleted_by_page_deletion
+                || right.deleted_by_page_deletion,
+            page_deletion_timestamp_micros: left
+                .page_deletion_timestamp_micros
+                .max(right.page_deletion_timestamp_micros),
+        }),
     }
+}
+
+fn merge_revision_history(
+    left: Option<RevisionHistoryRecord>,
+    right: Option<RevisionHistoryRecord>,
+) -> Result<Option<RevisionHistoryRecord>> {
+    let (left, right) = match (left, right) {
+        (Some(left), Some(right)) => (left, right),
+        (None, value) | (value, None) => return Ok(value),
+    };
+    let mut tags = left.tags;
+    tags.extend(right.tags);
+    tags.sort();
+    tags.dedup();
+    Ok(Some(RevisionHistoryRecord {
+        minor: merge_optional_bool(left.minor, right.minor),
+        content_model: merge_optional_string(left.content_model, right.content_model)?,
+        content_format: merge_optional_string(left.content_format, right.content_format)?,
+        identity_reverted: merge_optional_bool(
+            left.identity_reverted,
+            right.identity_reverted,
+        ),
+        first_reverting_revision_id: merge_optional_equal(
+            left.first_reverting_revision_id,
+            right.first_reverting_revision_id,
+        )?,
+        seconds_to_revert: merge_optional_equal(
+            left.seconds_to_revert,
+            right.seconds_to_revert,
+        )?,
+        identity_revert: merge_optional_bool(left.identity_revert, right.identity_revert),
+        before_page_creation: merge_optional_bool(
+            left.before_page_creation,
+            right.before_page_creation,
+        ),
+        tags,
+    }))
+}
+
+fn merge_optional_bool(left: Option<bool>, right: Option<bool>) -> Option<bool> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left || right),
+        (None, value) | (value, None) => value,
+    }
+}
+
+fn merge_optional_string(left: Option<String>, right: Option<String>) -> Result<Option<String>> {
+    match (left, right) {
+        (Some(left), Some(right)) if left != right => {
+            Err(ArchiveError::Invalid("conflicting revision history metadata"))
+        }
+        (Some(value), _) | (_, Some(value)) => Ok(Some(value)),
+        (None, None) => Ok(None),
+    }
+}
+
+fn merge_optional_equal<T: Eq>(left: Option<T>, right: Option<T>) -> Result<Option<T>> {
+    match (left, right) {
+        (Some(left), Some(right)) if left != right => {
+            Err(ArchiveError::Invalid("conflicting revision history metadata"))
+        }
+        (Some(value), _) | (_, Some(value)) => Ok(Some(value)),
+        (None, None) => Ok(None),
+    }
+}
+
+fn merge_page_action(
+    mut left: PageActionRecord,
+    right: PageActionRecord,
+) -> Result<PageActionRecord> {
+    left.tie_sequence = left.tie_sequence.min(right.tie_sequence);
+    left.kind = left.kind.min(right.kind);
+    left.performer = merge_performer(left.performer, right.performer)?;
+    left.comment = merge_comment(left.comment, right.comment);
+    left.title_at_event = left.title_at_event.max(right.title_at_event);
+    left.namespace_at_event = left.namespace_at_event.max(right.namespace_at_event);
+    left.resulting_deleted = merge_optional_bool(
+        left.resulting_deleted,
+        right.resulting_deleted,
+    );
+    Ok(left)
+}
+
+fn merge_user_action(
+    mut left: UserActionRecord,
+    right: UserActionRecord,
+) -> Result<UserActionRecord> {
+    left.tie_sequence = left.tie_sequence.min(right.tie_sequence);
+    left.kind = left.kind.min(right.kind);
+    left.performer = merge_performer(left.performer, right.performer)?;
+    left.comment = merge_comment(left.comment, right.comment);
+    left.historical_name = left.historical_name.max(right.historical_name);
+    merge_strings(&mut left.groups, right.groups);
+    merge_strings(&mut left.blocks, right.blocks);
+    merge_strings(&mut left.bot_by, right.bot_by);
+    left.created_by |= right.created_by;
+    left.registration_timestamp_micros = left
+        .registration_timestamp_micros
+        .max(right.registration_timestamp_micros);
+    left.creation_timestamp_micros = left
+        .creation_timestamp_micros
+        .max(right.creation_timestamp_micros);
+    left.first_edit_timestamp_micros = left
+        .first_edit_timestamp_micros
+        .max(right.first_edit_timestamp_micros);
+    Ok(left)
+}
+
+fn merge_user_state(
+    mut left: UserStateRecord,
+    right: UserStateRecord,
+) -> Result<UserStateRecord> {
+    left.current_name = left.current_name.max(right.current_name);
+    left.central_user_id = merge_optional_identity(
+        left.central_user_id,
+        right.central_user_id,
+        "conflicting central user ids",
+    )?;
+    left.account_class = left.account_class.max(right.account_class);
+    merge_strings(&mut left.groups, right.groups);
+    merge_strings(&mut left.blocks, right.blocks);
+    merge_strings(&mut left.bot_by, right.bot_by);
+    Ok(left)
+}
+
+fn merge_performer(
+    mut left: PerformerRecord,
+    right: PerformerRecord,
+) -> Result<PerformerRecord> {
+    left.local_user_id = merge_optional_identity(
+        left.local_user_id,
+        right.local_user_id,
+        "local performer id",
+    )?;
+    left.central_user_id = merge_optional_identity(
+        left.central_user_id,
+        right.central_user_id,
+        "central performer id",
+    )?;
+    left.historical_name = left.historical_name.max(right.historical_name);
+    left.account_class = left.account_class.max(right.account_class);
+    Ok(left)
+}
+
+fn merge_optional_identity<T: Eq + std::fmt::Debug>(
+    left: Option<T>,
+    right: Option<T>,
+    field: &'static str,
+) -> Result<Option<T>> {
+    match (left, right) {
+        (Some(left), Some(right)) if left == right => Ok(Some(left)),
+        (Some(left), Some(right)) => Err(ArchiveError::Conflict(format!(
+            "conflicting {field} values {left:?} and {right:?}"
+        ))),
+        (Some(value), _) | (_, Some(value)) => Ok(Some(value)),
+        (None, None) => Ok(None),
+    }
+}
+
+fn merge_strings(left: &mut Vec<String>, right: Vec<String>) {
+    left.extend(right);
+    left.sort();
+    left.dedup();
 }
 
 fn record_order(left: &Record, right: &Record) -> std::cmp::Ordering {
@@ -1136,7 +1461,7 @@ fn record_order(left: &Record, right: &Record) -> std::cmp::Ordering {
         .cmp(&right.entity())
         .then_with(|| right.timestamp_micros().cmp(&left.timestamp_micros()))
         .then_with(|| record_order_rank(left).cmp(&record_order_rank(right)))
-        .then_with(|| record_tie(right).cmp(&record_tie(left)))
+        .then_with(|| record_value_order(left, right))
 }
 
 fn record_order_rank(record: &Record) -> u8 {
@@ -1151,12 +1476,131 @@ fn record_order_rank(record: &Record) -> u8 {
     }
 }
 
-fn record_tie(record: &Record) -> u64 {
-    match record {
-        Record::Revision { revision, .. } => revision.meta.rev_id,
-        Record::PageAction { action, .. } => action.tie_sequence,
-        Record::UserAction { action, .. } => action.tie_sequence,
-        _ => 0,
+fn record_value_order(left: &Record, right: &Record) -> std::cmp::Ordering {
+    match (left, right) {
+        (
+            Record::PageState {
+                current_title: left,
+                ..
+            },
+            Record::PageState {
+                current_title: right,
+                ..
+            },
+        ) => left.cmp(right),
+        (
+            Record::Revision { revision: left, .. },
+            Record::Revision {
+                revision: right, ..
+            },
+        ) => right.meta.rev_id.cmp(&left.meta.rev_id),
+        (
+            Record::PageAction { action: left, .. },
+            Record::PageAction { action: right, .. },
+        ) => compare_page_actions(left, right),
+        (
+            Record::UserState { state: left, .. },
+            Record::UserState { state: right, .. },
+        ) => left.cmp(right),
+        (
+            Record::UserAction { action: left, .. },
+            Record::UserAction { action: right, .. },
+        ) => compare_user_actions(left, right),
+        (
+            Record::Manifest { manifest: left, .. },
+            Record::Manifest {
+                manifest: right, ..
+            },
+        ) => left.cmp(right),
+        (
+            Record::Unknown {
+                kind: left_kind,
+                payload: left_payload,
+                ..
+            },
+            Record::Unknown {
+                kind: right_kind,
+                payload: right_payload,
+                ..
+            },
+        ) => (left_kind, left_payload).cmp(&(right_kind, right_payload)),
+        _ => std::cmp::Ordering::Equal,
+    }
+}
+
+fn page_action_content(
+    action: &PageActionRecord,
+) -> (
+    &PageActionKind,
+    Option<u64>,
+    Option<u64>,
+    Option<i64>,
+) {
+    (
+        &action.kind,
+        action.performer.local_user_id,
+        action.performer.central_user_id,
+        action.namespace_at_event,
+    )
+}
+
+fn user_action_content(
+    action: &UserActionRecord,
+) -> (
+    &UserActionKind,
+    Option<u64>,
+    Option<u64>,
+    u8,
+) {
+    (
+        &action.kind,
+        action.performer.local_user_id,
+        action.performer.central_user_id,
+        action.created_by,
+    )
+}
+
+fn compare_page_actions(
+    left: &PageActionRecord,
+    right: &PageActionRecord,
+) -> std::cmp::Ordering {
+    match (left.log_id, right.log_id) {
+        (Some(left_id), Some(right_id)) => {
+            (left_id, &left.kind).cmp(&(right_id, &right.kind))
+        }
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => page_action_content(left).cmp(&page_action_content(right)),
+    }
+}
+
+fn compare_user_actions(
+    left: &UserActionRecord,
+    right: &UserActionRecord,
+) -> std::cmp::Ordering {
+    match (left.log_id, right.log_id) {
+        (Some(left_id), Some(right_id)) => {
+            (left_id, &left.kind).cmp(&(right_id, &right.kind))
+        }
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => user_action_content(left).cmp(&user_action_content(right)),
+    }
+}
+
+fn page_actions_same_identity(left: &PageActionRecord, right: &PageActionRecord) -> bool {
+    match (left.log_id, right.log_id) {
+        (Some(left_id), Some(right_id)) => left_id == right_id && left.kind == right.kind,
+        (None, None) => page_action_content(left) == page_action_content(right),
+        _ => false,
+    }
+}
+
+fn user_actions_same_identity(left: &UserActionRecord, right: &UserActionRecord) -> bool {
+    match (left.log_id, right.log_id) {
+        (Some(left_id), Some(right_id)) => left_id == right_id && left.kind == right.kind,
+        (None, None) => user_action_content(left) == user_action_content(right),
+        _ => false,
     }
 }
 
@@ -1222,6 +1666,9 @@ fn parse_frame_header(header: &[u8; FRAME_HEADER_LEN]) -> Result<Option<FrameInf
     }
     if info.first_entity > info.last_entity {
         return Err(ArchiveError::Invalid("reversed frame entity range"));
+    }
+    if info.first_entity.kind != info.last_entity.kind {
+        return Err(ArchiveError::Invalid("frame mixes entity kinds"));
     }
     Ok(Some(info))
 }
@@ -2475,6 +2922,56 @@ mod tests {
     }
 
     #[test]
+    fn frames_never_mix_page_user_and_global_records() {
+        let records = [
+            revision(1, 1, 10, b"page"),
+            Record::UserState {
+                user_id: 2,
+                timestamp_micros: 10,
+                state: UserStateRecord {
+                    current_name: Some("Editor".into()),
+                    central_user_id: None,
+                    account_class: AccountClass::Permanent,
+                    groups: Vec::new(),
+                    blocks: Vec::new(),
+                    bot_by: Vec::new(),
+                },
+            },
+            Record::Manifest {
+                timestamp_micros: 10,
+                manifest: ManifestRecord {
+                    wiki_db: "testwiki".into(),
+                    content_snapshot: "2026-07-29".into(),
+                    metadata_snapshot: "2026-07".into(),
+                    source_files: Vec::new(),
+                },
+            },
+        ];
+        let mut writer = ArchiveWriter::new(Vec::new(), 1 << 20).unwrap();
+        for record in &records {
+            writer.write(record).unwrap();
+        }
+        let (bytes, frames) = writer.finish().unwrap();
+        assert_eq!(frames, 3);
+
+        let mut reader = ArchiveReader::new(Cursor::new(bytes)).unwrap();
+        for expected in [EntityKind::Page, EntityKind::User, EntityKind::Global] {
+            let mut frame = reader.next_frame().unwrap().unwrap();
+            let info = frame.info();
+            assert_eq!(info.first_entity.kind, expected);
+            assert_eq!(info.last_entity.kind, expected);
+            while let Some(record) = frame.next_record().unwrap() {
+                assert_eq!(record.entity().kind, expected);
+                assert!(
+                    (info.first_entity.id..=info.last_entity.id).contains(&record.entity().id)
+                );
+            }
+        }
+        assert!(reader.next_frame().unwrap().is_none());
+        assert!(reader.is_complete());
+    }
+
+    #[test]
     fn rejects_bad_order() {
         let mut writer = ArchiveWriter::new(Vec::new(), 1024).unwrap();
         writer.write(&revision(2, 1, 10, b"x")).unwrap();
@@ -2645,6 +3142,28 @@ mod tests {
     }
 
     #[test]
+    fn record_sorter_hierarchically_merges_more_runs_than_open_file_limit() {
+        let temporary = tempfile::TempDir::new().unwrap();
+        let mut sorter = RecordSorter::new_in(temporary.path()).unwrap();
+        for page_id in (1..=130).rev() {
+            sorter
+                .push(revision(page_id, page_id, page_id as i64, b"x"))
+                .unwrap();
+            sorter.flush_run().unwrap();
+        }
+        let (bytes, _, _) = sorter.finish(Vec::new(), 1024).unwrap();
+        let mut archive = ArchiveReader::new(Cursor::new(bytes)).unwrap();
+        let mut page_ids = Vec::new();
+        while let Some(mut frame) = archive.next_frame().unwrap() {
+            while let Some(record) = frame.next_record().unwrap() {
+                page_ids.push(record.page_id().unwrap());
+            }
+        }
+        assert_eq!(page_ids, (1..=130).collect::<Vec<_>>());
+        assert!(archive.is_complete());
+    }
+
+    #[test]
     fn compressed_segments_concatenate_and_archives_merge() {
         let temporary = tempfile::TempDir::new().unwrap();
         let first = temporary.path().join("first.swdump");
@@ -2789,5 +3308,121 @@ mod tests {
             ["visualeditor".to_string()]
         );
         assert!(reader.next_record().unwrap().is_none());
+    }
+
+    #[test]
+    fn merge_is_commutative_associative_and_idempotent() {
+        let temporary = tempfile::TempDir::new().unwrap();
+        let action = |tie_sequence| Record::PageAction {
+            entity: EntityKey {
+                kind: EntityKind::Page,
+                id: 7,
+            },
+            timestamp_micros: 122,
+            action: PageActionRecord {
+                log_id: Some(44),
+                tie_sequence,
+                kind: PageActionKind::Move,
+                performer: PerformerRecord {
+                    local_user_id: Some(3),
+                    central_user_id: None,
+                    historical_name: Some("Mover".into()),
+                    account_class: AccountClass::Permanent,
+                },
+                comment: if tie_sequence == 2 {
+                    "move with normalized detail".into()
+                } else {
+                    "move".into()
+                },
+                title_at_event: "Old".into(),
+                namespace_at_event: Some(0),
+                resulting_deleted: Some(false),
+            },
+        };
+        let content = revision(7, 11, 123, b"archived text");
+        let shell = |minor, tag: &str| {
+            let Record::Revision {
+                revision: mut shell,
+                ..
+            } = revision(7, 11, 123, b"archived text")
+            else {
+                unreachable!()
+            };
+            shell.has_text = false;
+            shell.text.clear();
+            shell.history = Some(RevisionHistoryRecord {
+                minor: Some(minor),
+                content_model: Some("wikitext".into()),
+                content_format: Some("text/x-wiki".into()),
+                identity_reverted: None,
+                first_reverting_revision_id: None,
+                seconds_to_revert: None,
+                identity_revert: None,
+                before_page_creation: None,
+                tags: vec![tag.into()],
+            });
+            Record::Revision {
+                page_id: 7,
+                revision: shell,
+            }
+        };
+        let a = temporary.path().join("a.swdump");
+        let b = temporary.path().join("b.swdump");
+        let c = temporary.path().join("c.swdump");
+        write_test_archive(&a, &[content, action(9)]);
+        write_test_archive(&b, &[shell(false, "b"), action(2)]);
+        write_test_archive(&c, &[shell(true, "a"), revision(8, 12, 124, b"next")]);
+
+        let ab = temporary.path().join("ab.swdump");
+        let ba = temporary.path().join("ba.swdump");
+        merge_test_archives(&[a.clone(), b.clone()], &ab);
+        merge_test_archives(&[b.clone(), a.clone()], &ba);
+        assert_eq!(std::fs::read(&ab).unwrap(), std::fs::read(&ba).unwrap());
+
+        let aa = temporary.path().join("aa.swdump");
+        merge_test_archives(&[a.clone(), a.clone()], &aa);
+        assert_eq!(std::fs::read(&a).unwrap(), std::fs::read(&aa).unwrap());
+
+        let ab_c = temporary.path().join("ab-c.swdump");
+        merge_test_archives(&[ab, c.clone()], &ab_c);
+        let bc = temporary.path().join("bc.swdump");
+        merge_test_archives(&[b, c], &bc);
+        let a_bc = temporary.path().join("a-bc.swdump");
+        merge_test_archives(&[a, bc], &a_bc);
+        assert_eq!(
+            std::fs::read(&ab_c).unwrap(),
+            std::fs::read(&a_bc).unwrap()
+        );
+
+        let mut reader = ArchiveRecordReader::open(ab_c).unwrap();
+        let Record::Revision { revision, .. } = reader.next_record().unwrap().unwrap() else {
+            panic!("revision")
+        };
+        let history = revision.history.unwrap();
+        assert_eq!(history.minor, Some(true));
+        assert_eq!(history.tags, ["a".to_string(), "b".to_string()]);
+        let Record::PageAction { action, .. } = reader.next_record().unwrap().unwrap() else {
+            panic!("action")
+        };
+        assert_eq!(action.tie_sequence, 2);
+        assert_eq!(action.comment, "move with normalized detail");
+    }
+
+    fn write_test_archive(path: &Path, records: &[Record]) {
+        let mut writer =
+            ArchiveWriter::new(std::fs::File::create(path).unwrap(), 1024).unwrap();
+        for record in records {
+            writer.write(record).unwrap();
+        }
+        writer.finish().unwrap();
+    }
+
+    fn merge_test_archives(inputs: &[PathBuf], output: &Path) {
+        merge_many_archives(
+            inputs,
+            std::fs::File::create(output).unwrap(),
+            1024,
+        )
+        .unwrap();
     }
 }

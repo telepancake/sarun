@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 use reqwest::blocking::Client;
 
 use crate::archive::{
-    ArchiveError, ArchiveWriter, ManifestRecord, Record, RecordSorter, RevisionRecord,
-    DEFAULT_FRAME_TARGET,
+    ArchiveError, ArchiveRecordReader, ArchiveWriter, CompressionSettings, ManifestRecord,
+    Record, RecordSorter, RevisionRecord, DEFAULT_FRAME_TARGET,
 };
 use crate::instance::{ContributorMeta, RevisionMeta};
 use crate::{Error, Result};
@@ -33,6 +33,23 @@ pub struct DirectArchiveStats {
     pub content_frames: u64,
     pub history_frames: u64,
     pub output_frames: u64,
+    pub elapsed_millis: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct UpdateArchiveStats {
+    pub content_from: String,
+    pub content_through: String,
+    pub metadata_snapshot: String,
+    pub incremental_runs: u64,
+    pub content_parts: u64,
+    pub history_parts: u64,
+    pub pages: u64,
+    pub revisions: u64,
+    pub output_frames: u64,
+    pub output_records: u64,
+    pub output_bytes: u64,
+    pub scratch_peak_bytes: u64,
     pub elapsed_millis: u64,
 }
 
@@ -91,6 +108,206 @@ pub fn build_direct_archive(
     Ok(stats)
 }
 
+pub fn build_update_archive(
+    client: &Client,
+    config: &wikimak_mediawiki::Config,
+    dbname: &str,
+    base_archive: impl AsRef<Path>,
+    output: impl AsRef<Path>,
+    scratch_parent: impl AsRef<Path>,
+    overlap_days: u64,
+    frame_target: usize,
+    compression: CompressionSettings,
+    progress: impl Fn(&str) + Sync,
+) -> Result<UpdateArchiveStats> {
+    let started = Instant::now();
+    let content_from = archive_content_date(base_archive.as_ref(), dbname)?;
+    std::fs::create_dir_all(scratch_parent.as_ref())?;
+    let scratch = tempfile::TempDir::new_in(scratch_parent)?;
+    let peak = Arc::new(AtomicU64::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let monitor = {
+        let path = scratch.path().to_path_buf();
+        let peak = Arc::clone(&peak);
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                if let Ok(bytes) = directory_bytes(&path) {
+                    peak.fetch_max(bytes, Ordering::Relaxed);
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            if let Ok(bytes) = directory_bytes(&path) {
+                peak.fetch_max(bytes, Ordering::Relaxed);
+            }
+        })
+    };
+    let result = build_update_inner(
+        client,
+        config,
+        dbname,
+        content_from,
+        output.as_ref(),
+        scratch.path(),
+        overlap_days,
+        frame_target,
+        compression,
+        &progress,
+    );
+    stop.store(true, Ordering::Relaxed);
+    let _ = monitor.join();
+    let mut stats = result?;
+    stats.scratch_peak_bytes = peak.load(Ordering::Relaxed);
+    stats.elapsed_millis = started.elapsed().as_millis() as u64;
+    Ok(stats)
+}
+
+fn archive_content_date(path: &Path, dbname: &str) -> Result<chrono::NaiveDate> {
+    let mut reader = ArchiveRecordReader::open(path).map_err(map_archive)?;
+    let mut date = None;
+    while let Some(record) = reader.next_record().map_err(map_archive)? {
+        if let Record::Manifest { manifest, .. } = record {
+            if manifest.wiki_db != dbname {
+                return Err(Error::Corrupt("base archive belongs to another wiki"));
+            }
+            let parsed = chrono::NaiveDate::parse_from_str(
+                &manifest.content_snapshot,
+                "%Y-%m-%d",
+            )
+            .map_err(|_| Error::Corrupt("invalid archive content snapshot date"))?;
+            date = Some(date.map_or(parsed, |current: chrono::NaiveDate| current.max(parsed)));
+        }
+    }
+    date.ok_or(Error::Corrupt("base archive has no manifest"))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_update_inner(
+    client: &Client,
+    config: &wikimak_mediawiki::Config,
+    dbname: &str,
+    content_from: chrono::NaiveDate,
+    output: &Path,
+    scratch: &Path,
+    overlap_days: u64,
+    frame_target: usize,
+    compression: CompressionSettings,
+    progress: &(impl Fn(&str) + Sync),
+) -> Result<UpdateArchiveStats> {
+    let discovery_after = content_from
+        .checked_sub_signed(chrono::Duration::days(
+            i64::try_from(overlap_days.saturating_add(1))
+                .map_err(|_| Error::Corrupt("update overlap is too large"))?,
+        ))
+        .ok_or(Error::Corrupt("update overlap precedes the calendar"))?;
+    let runs = wikimak_mediawiki::discover_incremental_with(
+        client,
+        config,
+        dbname,
+        Some(discovery_after),
+    )?;
+    if let Some(first_after_base) = runs.iter().find(|run| run.date > content_from) {
+        if first_after_base.date > content_from.succ_opt().unwrap_or(content_from) {
+            return Err(Error::Mediawiki(wikimak_mediawiki::Error::Parse(
+                format!(
+                    "daily dump gap after {content_from}; explicit full refresh required"
+                ),
+            )));
+        }
+    }
+    let content_through = runs
+        .last()
+        .map(|run| run.date)
+        .unwrap_or(content_from);
+    let cores = std::thread::available_parallelism().map_or(1, usize::from);
+    let mut content_results = Vec::new();
+    for run in &runs {
+        let run_scratch = scratch.join(format!("incremental-{}", run.date));
+        std::fs::create_dir(&run_scratch)?;
+        content_results.extend(build_content_parts(
+            client,
+            &run.parts,
+            &run_scratch,
+            cores,
+            progress,
+        )?);
+    }
+
+    let (metadata_snapshot, mut history_files) =
+        crate::sync::discover_history(client, config, dbname)?;
+    if history_files.len() > 2 {
+        history_files = history_files.split_off(history_files.len() - 2);
+    }
+    let history_results =
+        build_history_parts(client, dbname, &history_files, scratch, cores, progress)?;
+
+    let manifest_archive = scratch.join("update-manifest.swdump");
+    let mut manifest_writer =
+        ArchiveWriter::new(std::fs::File::create(&manifest_archive)?, DEFAULT_FRAME_TARGET)
+            .map_err(map_archive)?;
+    manifest_writer
+        .write(&Record::Manifest {
+            timestamp_micros: i64::MAX,
+            manifest: ManifestRecord {
+                wiki_db: dbname.to_owned(),
+                content_snapshot: content_through.to_string(),
+                metadata_snapshot: metadata_snapshot.clone(),
+                source_files: Vec::new(),
+            },
+        })
+        .map_err(map_archive)?;
+    manifest_writer.finish().map_err(map_archive)?;
+
+    let mut inputs = content_results
+        .iter()
+        .map(|(path, _)| path.clone())
+        .chain(history_results.iter().map(|(path, _)| path.clone()))
+        .collect::<Vec<_>>();
+    inputs.push(manifest_archive);
+    let output_parent = output
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(output_parent)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(output_parent)?;
+    let (_, output_frames, output_records) =
+        crate::archive::merge_many_archives_with_compression_in(
+            &inputs,
+            temporary.as_file_mut(),
+            frame_target,
+            compression,
+            scratch,
+        )
+        .map_err(map_archive)?;
+    temporary.as_file().sync_all()?;
+    temporary
+        .persist(output)
+        .map_err(|error| Error::Io(error.error))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(output, std::fs::Permissions::from_mode(0o644))?;
+    }
+
+    let mut stats = UpdateArchiveStats {
+        content_from: content_from.to_string(),
+        content_through: content_through.to_string(),
+        metadata_snapshot,
+        incremental_runs: runs.len() as u64,
+        content_parts: runs.iter().map(|run| run.parts.len() as u64).sum(),
+        history_parts: history_files.len() as u64,
+        output_frames,
+        output_records,
+        output_bytes: std::fs::metadata(output)?.len(),
+        ..Default::default()
+    };
+    for (_, partial) in content_results {
+        stats.pages += partial.pages;
+        stats.revisions += partial.revisions;
+    }
+    Ok(stats)
+}
+
 fn build_direct_inner(
     client: &Client,
     config: &wikimak_mediawiki::Config,
@@ -120,10 +337,12 @@ fn build_direct_inner(
         std::fs::rename(&history_paths[0], &history_archive)?;
         frames.len() as u64
     } else {
-        let (_, frames, _) = crate::archive::merge_many_archives(
+        let (_, frames, _) = crate::archive::merge_many_archives_with_compression_in(
             &history_paths,
             std::fs::File::create(&history_archive)?,
             DEFAULT_FRAME_TARGET,
+            CompressionSettings::default(),
+            scratch,
         )
         .map_err(map_archive)?;
         for path in &history_paths {
@@ -180,10 +399,12 @@ fn build_direct_inner(
         })
         .map_err(map_archive)?;
     manifest_writer.finish().map_err(map_archive)?;
-    let (file, output_frames, _) = crate::archive::merge_many_archives(
+    let (file, output_frames, _) = crate::archive::merge_many_archives_with_compression_in(
         &[content_archive.clone(), history_archive.clone(), manifest_archive],
         temporary,
         DEFAULT_FRAME_TARGET,
+        CompressionSettings::default(),
+        scratch,
     )
     .map_err(map_archive)?;
     file.as_file().sync_all()?;
