@@ -439,10 +439,7 @@ fn coded_title(title: &str, site: &SiteInfoRecord) -> u64 {
         put_bits(&mut output, &mut used, 0b11, 2);
         output
     } else {
-        let mut hash = 0xcbf29ce484222325_u64;
-        for byte in namespace.to_le_bytes().iter().chain(title.as_bytes()) {
-            hash = (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3);
-        }
+        let hash = xxhash_rust::xxh3::xxh3_64_with_seed(title.as_bytes(), namespace as u64);
         (1_u64 << 63) | (hash & ((1_u64 << 63) - 1))
     }
 }
