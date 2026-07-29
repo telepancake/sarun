@@ -9,6 +9,8 @@
 //!   wikimak head <root> <page_id>              newest revision meta
 //!   wikimak text <root> <page_id>              newest revision text
 //!   wikimak history <root> <page_id>           all revisions, newest-first
+//!   wikimak archive-export <root> <file>        portable ordered event stream
+//!   wikimak archive-inspect <file>              validate and summarize stream
 //!
 //! The instance lives under <root>/ (depot chains + titles pool +
 //! meta.db). Import is idempotent: already-seen (page,rev) pairs dedup.
@@ -147,6 +149,225 @@ fn cmd_repack_f0(root: &str, max_page_id: Option<u64>) -> Result<(), String> {
     Ok(())
 }
 
+fn cmd_experiment_split_revisions(
+    root: &str,
+    workers: usize,
+    packed_shards: usize,
+) -> Result<(), String> {
+    let inst = Instance::open_read(crate::read_config(PathBuf::from(root)))
+        .map_err(|e| e.to_string())?;
+    let stats = inst
+        .experiment_split_revision_storage(workers, packed_shards)
+        .map_err(|e| e.to_string())?;
+    let current = stats.current_live_f0_bytes
+        + stats.current_live_f1_bytes
+        + stats.current_live_cold_bytes;
+    let split =
+        stats.metadata_frame_bytes + stats.head_text_frame_bytes + stats.history_text_frame_bytes;
+    let packed = split - stats.packed_small_split_frame_bytes + stats.packed_small_file_bytes;
+    let combined = stats.combined_f0_frame_bytes + stats.combined_history_frame_bytes;
+    let packed_combined =
+        combined - stats.packed_small_combined_frame_bytes + stats.packed_small_file_bytes;
+    println!(
+        "pages {}  revisions {}  workers {}\n\
+         revisions per page (1,2,3,4,5-7,8-15,...,4096-8191,8192+): {:?}\n\
+         text dictionary {:08x}: {} bytes from {} full heads ({} bytes)\n\
+         metadata dictionary {:08x}: {} bytes from {} full SHA-free metadata records ({} bytes)\n\
+         metadata raw/compressed/framed: {}/{}/{}\n\
+         head text raw/compressed/framed: {}/{}/{}\n\
+         head text length buckets (0,1-31,32-63,...,131072-262143,262144+): {:?}\n\
+         history text raw/compressed/framed: {}/{}/{} in {} frames\n\
+         combined dictionary {:08x}: {} bytes from {} full SHA-free records ({} bytes)\n\
+         combined f0 raw/compressed/framed: {}/{}/{}\n\
+         combined history raw/compressed/framed: {}/{}/{}\n\
+         combined standalone total: {}\n\
+         packed small (max 65536 decoded bytes per page group):\n\
+           pages/revisions/raw: {}/{}/{}\n\
+           compressed/file bytes: {}/{} in {} shards\n\
+           compressed shard p50/p95/p99/max: {}/{}/{}/{}\n\
+           replaced split bytes: {}  total with packed small: {}  delta from split: {:+}\n\
+           replaced combined bytes: {}  combined total with packed small: {}  delta: {:+}\n\
+           decoded shard scan mean/p50/p95/p99/max: {}/{}/{}/{}/{}\n\
+           representative shard pages/raw/compressed/iterations: {}/{}/{}/{}\n\
+           streaming extract first/middle/last ns: {}/{}/{}\n\
+           latest small head timestamp micros: {}\n\
+           dirty pages/shards/rewrite bytes in latest 1d: {}/{}/{}\n\
+           dirty pages/shards/rewrite bytes in latest 7d: {}/{}/{}\n\
+         current live f0/f1/cold/total: {}/{}/{}/{}\n\
+         experimental framed total: {}  delta: {:+}",
+        stats.pages,
+        stats.revisions,
+        workers,
+        stats.revision_count_buckets,
+        stats.text_dictionary_id,
+        stats.text_dictionary_bytes,
+        stats.text_samples,
+        stats.text_sample_bytes,
+        stats.metadata_dictionary_id,
+        stats.metadata_dictionary_bytes,
+        stats.metadata_samples,
+        stats.metadata_sample_bytes,
+        stats.metadata_raw_bytes,
+        stats.metadata_compressed_bytes,
+        stats.metadata_frame_bytes,
+        stats.head_text_raw_bytes,
+        stats.head_text_compressed_bytes,
+        stats.head_text_frame_bytes,
+        stats.head_text_length_buckets,
+        stats.history_text_raw_bytes,
+        stats.history_text_compressed_bytes,
+        stats.history_text_frame_bytes,
+        stats.history_text_frames,
+        stats.combined_dictionary_id,
+        stats.combined_dictionary_bytes,
+        stats.combined_samples,
+        stats.combined_sample_bytes,
+        stats.combined_f0_raw_bytes,
+        stats.combined_f0_compressed_bytes,
+        stats.combined_f0_frame_bytes,
+        stats.combined_history_raw_bytes,
+        stats.combined_history_compressed_bytes,
+        stats.combined_history_frame_bytes,
+        combined,
+        stats.packed_small_pages,
+        stats.packed_small_revisions,
+        stats.packed_small_raw_bytes,
+        stats.packed_small_compressed_bytes,
+        stats.packed_small_file_bytes,
+        stats.packed_small_materialized_shards,
+        stats.packed_small_p50_compressed_shard_bytes,
+        stats.packed_small_p95_compressed_shard_bytes,
+        stats.packed_small_p99_compressed_shard_bytes,
+        stats.packed_small_max_compressed_shard_bytes,
+        stats.packed_small_split_frame_bytes,
+        packed,
+        packed as i128 - split as i128,
+        stats.packed_small_combined_frame_bytes,
+        packed_combined,
+        packed_combined as i128 - combined as i128,
+        stats.packed_small_mean_scan_bytes,
+        stats.packed_small_p50_scan_bytes,
+        stats.packed_small_p95_scan_bytes,
+        stats.packed_small_p99_scan_bytes,
+        stats.packed_small_max_scan_bytes,
+        stats.packed_small_benchmark_pages,
+        stats.packed_small_benchmark_raw_bytes,
+        stats.packed_small_benchmark_compressed_bytes,
+        stats.packed_small_benchmark_iterations,
+        stats.packed_small_first_extract_ns,
+        stats.packed_small_middle_extract_ns,
+        stats.packed_small_last_extract_ns,
+        stats.packed_small_latest_head_ts_micros,
+        stats.packed_small_dirty_1d_pages,
+        stats.packed_small_dirty_1d_shards,
+        stats.packed_small_rewrite_1d_bytes,
+        stats.packed_small_dirty_7d_pages,
+        stats.packed_small_dirty_7d_shards,
+        stats.packed_small_rewrite_7d_bytes,
+        stats.current_live_f0_bytes,
+        stats.current_live_f1_bytes,
+        stats.current_live_cold_bytes,
+        current,
+        split,
+        split as i128 - current as i128,
+    );
+    Ok(())
+}
+
+fn cmd_experiment_packed_f0(
+    root: &str,
+    workers: usize,
+    packed_shards: usize,
+) -> Result<(), String> {
+    let inst = Instance::open_read(crate::read_config(PathBuf::from(root)))
+        .map_err(|e| e.to_string())?;
+    let stats = inst
+        .experiment_packed_f0(workers, packed_shards)
+        .map_err(|e| e.to_string())?;
+    let hybrid = stats.all_standalone_frame_bytes
+        - stats.replaced_standalone_frame_bytes
+        + stats.packed_file_bytes;
+    let standalone_total = stats.all_standalone_frame_bytes + stats.history_frame_bytes;
+    let hybrid_total = hybrid + stats.history_frame_bytes;
+    println!(
+        "pages/small/big: {}/{}/{}\n\
+         small raw bytes: {}\n\
+         all standalone/replaced/packed/hybrid bytes: {}/{}/{}/{}\n\
+         combined history raw/compressed/framed: {}/{}/{}\n\
+         standalone total/hybrid total/delta: {}/{}/{:+}\n\
+         packed compressed/file bytes in {} shards: {}/{}\n\
+         compressed shard p50/p95/p99/max: {}/{}/{}/{}\n\
+         shards over 1 MiB: {}\n\
+         decoded shard scan mean/p50/p95/p99/max: {}/{}/{}/{}/{}\n\
+         representative shard pages/raw/compressed/iterations: {}/{}/{}/{}\n\
+         streaming extract first/middle/last ns: {}/{}/{}\n\
+         hysteresis lower thresholds bytes: [65536,61440,57344,49152,32768]\n\
+         pages with transitions: {:?}\n\
+         total transitions: {:?}\n\
+         current small pages after replay: {:?}",
+        stats.pages,
+        stats.small_pages,
+        stats.big_pages,
+        stats.small_raw_bytes,
+        stats.all_standalone_frame_bytes,
+        stats.replaced_standalone_frame_bytes,
+        stats.packed_file_bytes,
+        hybrid,
+        stats.history_raw_bytes,
+        stats.history_compressed_bytes,
+        stats.history_frame_bytes,
+        standalone_total,
+        hybrid_total,
+        hybrid_total as i128 - standalone_total as i128,
+        stats.materialized_shards,
+        stats.packed_compressed_bytes,
+        stats.packed_file_bytes,
+        stats.p50_compressed_shard_bytes,
+        stats.p95_compressed_shard_bytes,
+        stats.p99_compressed_shard_bytes,
+        stats.max_compressed_shard_bytes,
+        stats.oversized_1m_shards,
+        stats.mean_scan_bytes,
+        stats.p50_scan_bytes,
+        stats.p95_scan_bytes,
+        stats.p99_scan_bytes,
+        stats.max_scan_bytes,
+        stats.benchmark_pages,
+        stats.benchmark_raw_bytes,
+        stats.benchmark_compressed_bytes,
+        stats.benchmark_iterations,
+        stats.first_extract_ns,
+        stats.middle_extract_ns,
+        stats.last_extract_ns,
+        stats.hysteresis_transition_pages,
+        stats.hysteresis_transitions,
+        stats.hysteresis_current_small_pages,
+    );
+    Ok(())
+}
+
+fn cmd_metadata_example(root: &str, page: u64) -> Result<(), String> {
+    let inst = Instance::open_read(crate::read_config(PathBuf::from(root)))
+        .map_err(|e| e.to_string())?;
+    let meta = inst
+        .page_head(page)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("no page {page}"))?;
+    let text = inst
+        .page_head_text(page)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("no text for page {page}"))?;
+    let record = crate::revision::encode_revision(&meta, &text);
+    let prefix = &record[..record.len() - text.len()];
+    println!(
+        "page {page}\nmeta {meta:?}\ntext bytes {}\nmetadata bytes {}\nhex {}",
+        text.len(),
+        prefix.len(),
+        hex::encode(prefix),
+    );
+    Ok(())
+}
+
 fn cmd_reconcile_history(
     dbname: &str,
     root: &str,
@@ -222,6 +443,228 @@ fn cmd_history(root: &str, page: u64) -> Result<(), String> {
     Ok(())
 }
 
+fn cmd_archive_export(root: &str, output: &str) -> Result<(), String> {
+    let inst = Instance::open_read(crate::read_config(PathBuf::from(root)))
+        .map_err(|e| e.to_string())?;
+    let output_path = std::path::Path::new(output);
+    let parent = output_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let mut temporary =
+        tempfile::NamedTempFile::new_in(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+    let stats = {
+        let buffered = std::io::BufWriter::new(temporary.as_file_mut());
+        crate::archive::export_instance(
+            &inst,
+            buffered,
+            crate::archive::DEFAULT_FRAME_TARGET,
+        )
+        .map_err(|e| e.to_string())?
+    };
+    temporary
+        .as_file()
+        .sync_all()
+        .map_err(|e| format!("{}: {e}", temporary.path().display()))?;
+    temporary
+        .persist(output_path)
+        .map_err(|e| format!("{output}: {}", e.error))?;
+    let bytes = std::fs::metadata(output)
+        .map_err(|e| format!("{output}: {e}"))?
+        .len();
+    println!(
+        "archive pages {}  revisions {}  page actions {}  frames {}  bytes {}",
+        stats.pages, stats.revisions, stats.page_actions, stats.frames, bytes
+    );
+    Ok(())
+}
+
+fn cmd_archive_inspect(path: &str) -> Result<(), String> {
+    let file = std::fs::File::open(path).map_err(|e| format!("{path}: {e}"))?;
+    let mut reader = crate::archive::ArchiveReader::new(file).map_err(|e| e.to_string())?;
+    let mut frames = 0_u64;
+    let mut records = 0_u64;
+    let mut revisions = 0_u64;
+    let mut page_actions = 0_u64;
+    let mut user_actions = 0_u64;
+    let mut unknown = 0_u64;
+    let mut raw_bytes = 0_u64;
+    let mut compressed_bytes = 0_u64;
+    let mut max_raw_frame = 0_u64;
+    let mut max_compressed_frame = 0_u64;
+    let mut max_raw_range = None;
+    let mut max_compressed_range = None;
+    while let Some(mut frame) = reader.next_frame().map_err(|e| e.to_string())? {
+        frames += 1;
+        let info = frame.info();
+        raw_bytes += info.raw_bytes;
+        compressed_bytes += info.compressed_bytes;
+        if info.raw_bytes > max_raw_frame {
+            max_raw_frame = info.raw_bytes;
+            max_raw_range = Some((info.first_entity, info.last_entity));
+        }
+        if info.compressed_bytes > max_compressed_frame {
+            max_compressed_frame = info.compressed_bytes;
+            max_compressed_range = Some((info.first_entity, info.last_entity));
+        }
+        while let Some(record) = frame.next_record().map_err(|e| e.to_string())? {
+            records += 1;
+            match record {
+                crate::archive::Record::Revision { .. } => revisions += 1,
+                crate::archive::Record::PageAction { .. } => page_actions += 1,
+                crate::archive::Record::HistoryEvent { entity, .. } => {
+                    if entity.kind == crate::archive::EntityKind::User {
+                        user_actions += 1;
+                    } else {
+                        unknown += 1;
+                    }
+                }
+                crate::archive::Record::Unknown { .. } => unknown += 1,
+                crate::archive::Record::PageState { .. } => {}
+            }
+        }
+    }
+    println!(
+        "archive frames {frames}  records {records}  revisions {revisions}  \
+         page actions {page_actions}  user actions {user_actions}  unknown {unknown}  complete {}",
+        reader.is_complete()
+    );
+    println!(
+        "raw/compressed bytes {raw_bytes}/{compressed_bytes}  \
+         max raw/compressed frame {max_raw_frame}/{max_compressed_frame}\n\
+         max raw range {max_raw_range:?}  max compressed range {max_compressed_range:?}"
+    );
+    Ok(())
+}
+
+#[derive(Default)]
+struct ArchiveHistogram {
+    revision_buckets: [u64; 16],
+    text_buckets: [u64; 16],
+}
+
+fn cmd_archive_histogram(path: &str, workers: usize) -> Result<(), String> {
+    if workers == 0 {
+        return Err("workers must be positive".into());
+    }
+    let (_, frames, complete) = crate::archive::index_file(path).map_err(|e| e.to_string())?;
+    if !complete {
+        return Err("archive has no clean completion marker".into());
+    }
+    if frames.is_empty() {
+        return Err("archive contains no frames".into());
+    }
+    let workers = workers.min(frames.len().max(1));
+    let next_frame = std::sync::atomic::AtomicUsize::new(0);
+    let partials = std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for _ in 0..workers {
+            let next_frame = &next_frame;
+            let frames = &frames;
+            handles.push(scope.spawn(move || {
+                let mut stats = ArchiveHistogram::default();
+                loop {
+                    let index = next_frame.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(location) = frames.get(index) else {
+                        break;
+                    };
+                    let mut current_page = None;
+                    let mut current_revisions = 0_u64;
+                    crate::archive::visit_frame(path, location, |record| {
+                        if record.entity().kind != crate::archive::EntityKind::Page {
+                            return Ok(());
+                        }
+                        let page_id = record.entity().id;
+                        if current_page != Some(page_id) {
+                            if current_revisions != 0 {
+                                stats.revision_buckets
+                                    [archive_revision_count_bucket(current_revisions)] += 1;
+                            }
+                            current_page = Some(page_id);
+                            current_revisions = 0;
+                        }
+                        if let crate::archive::Record::Revision { revision, .. } = record {
+                            current_revisions += 1;
+                            stats.text_buckets
+                                [archive_text_length_bucket(revision.text.len())] += 1;
+                        }
+                        Ok(())
+                    })
+                    .map_err(|e| e.to_string())?;
+                    if current_revisions != 0 {
+                        stats.revision_buckets
+                            [archive_revision_count_bucket(current_revisions)] += 1;
+                    }
+                }
+                Ok::<_, String>(stats)
+            }));
+        }
+        handles
+            .into_iter()
+            .map(|handle| {
+                handle
+                    .join()
+                    .map_err(|_| "archive histogram worker panicked".to_string())?
+            })
+            .collect::<Result<Vec<_>, _>>()
+    })?;
+    let mut total = ArchiveHistogram::default();
+    for partial in partials {
+        for (total, partial) in total
+            .revision_buckets
+            .iter_mut()
+            .zip(partial.revision_buckets)
+        {
+            *total += partial;
+        }
+        for (total, partial) in total.text_buckets.iter_mut().zip(partial.text_buckets) {
+            *total += partial;
+        }
+    }
+    println!("frames {}  workers {}", frames.len(), workers);
+    println!(
+        "revisions/page (1,2,3,4,5-7,8-15,...,4096-8191,8192+): {:?}",
+        total.revision_buckets
+    );
+    println!(
+        "revision text bytes (0,1-31,32-63,...,131072-262143,262144+): {:?}",
+        total.text_buckets
+    );
+    Ok(())
+}
+
+fn archive_revision_count_bucket(revisions: u64) -> usize {
+    match revisions {
+        1 => 0,
+        2 => 1,
+        3 => 2,
+        4 => 3,
+        5..=7 => 4,
+        8..=15 => 5,
+        16..=31 => 6,
+        32..=63 => 7,
+        64..=127 => 8,
+        128..=255 => 9,
+        256..=511 => 10,
+        512..=1023 => 11,
+        1024..=2047 => 12,
+        2048..=4095 => 13,
+        4096..=8191 => 14,
+        _ => 15,
+    }
+}
+
+fn archive_text_length_bucket(len: usize) -> usize {
+    const UPPER_BOUNDS: [usize; 16] = [
+        0, 31, 63, 127, 255, 511, 1023, 2047, 4095, 8191, 16383, 32767, 65535, 131071,
+        262143, usize::MAX,
+    ];
+    UPPER_BOUNDS
+        .iter()
+        .position(|upper| len <= *upper)
+        .expect("last bucket is unbounded")
+}
+
 /// The `wikimak` CLI entry, callable in-process: the sarun engine binary
 /// embeds this crate (with `fetch`) and dispatches here on
 /// `sarun wikimak …` / an argv[0] symlink named `wikimak`.
@@ -255,6 +698,42 @@ pub fn cli_main(args: &[String]) -> i32 {
         ["fetch", dbname, root] => cmd_fetch(dbname, root, max_page_id),
         ["refresh-full", dbname, root] => cmd_refresh_full(dbname, root, max_page_id),
         ["repack-f0", root] => cmd_repack_f0(root, max_page_id),
+        ["experiment-split-revisions", root] => cmd_experiment_split_revisions(root, 4, 4096),
+        ["experiment-split-revisions", root, workers] => workers
+            .parse::<usize>()
+            .map_err(|e| format!("workers: {e}"))
+            .and_then(|workers| cmd_experiment_split_revisions(root, workers, 4096)),
+        ["experiment-split-revisions", root, workers, packed_shards] => workers
+            .parse::<usize>()
+            .map_err(|e| format!("workers: {e}"))
+            .and_then(|workers| {
+                packed_shards
+                    .parse::<usize>()
+                    .map_err(|e| format!("packed shards: {e}"))
+                    .and_then(|packed_shards| {
+                        cmd_experiment_split_revisions(root, workers, packed_shards)
+                    })
+            }),
+        ["experiment-packed-f0", root] => cmd_experiment_packed_f0(root, 4, 256),
+        ["experiment-packed-f0", root, workers] => workers
+            .parse::<usize>()
+            .map_err(|e| format!("workers: {e}"))
+            .and_then(|workers| cmd_experiment_packed_f0(root, workers, 256)),
+        ["experiment-packed-f0", root, workers, packed_shards] => workers
+            .parse::<usize>()
+            .map_err(|e| format!("workers: {e}"))
+            .and_then(|workers| {
+                packed_shards
+                    .parse::<usize>()
+                    .map_err(|e| format!("packed shards: {e}"))
+                    .and_then(|packed_shards| {
+                        cmd_experiment_packed_f0(root, workers, packed_shards)
+                    })
+            }),
+        ["metadata-example", root, page] => page
+            .parse::<u64>()
+            .map_err(|e| format!("page: {e}"))
+            .and_then(|page| cmd_metadata_example(root, page)),
         ["reconcile-history", dbname, root] => {
             cmd_reconcile_history(dbname, root, max_page_id)
         }
@@ -274,16 +753,30 @@ pub fn cli_main(args: &[String]) -> i32 {
             .and_then(|(p, ts)| cmd_text(root, p, Some(ts))),
         ["history", root, page] => page.parse().map_err(|e| format!("{e}"))
             .and_then(|p| cmd_history(root, p)),
+        ["archive-export", root, output] => cmd_archive_export(root, output),
+        ["archive-inspect", path] => cmd_archive_inspect(path),
+        ["archive-histogram", path] => cmd_archive_histogram(
+            path,
+            std::thread::available_parallelism().map_or(1, usize::from),
+        ),
+        ["archive-histogram", path, workers] => workers
+            .parse::<usize>()
+            .map_err(|e| format!("workers: {e}"))
+            .and_then(|workers| cmd_archive_histogram(path, workers)),
         _ => Err("usage: wikimak discover <dbname>\n\
                   \x20      wikimak pages <root> [filter]\n\
                   \x20      wikimak fetch <dbname> <root> [--max-page-id N]\n\
                   \x20      wikimak refresh-full <dbname> <root> [--max-page-id N]\n\
                   \x20      wikimak repack-f0 <root> [--max-page-id N]\n\
+                  \x20      wikimak experiment-split-revisions <root> [workers] [packed-shards]\n\
+                  \x20      wikimak experiment-packed-f0 <root> [workers] [packed-shards]\n\
                   \x20      wikimak reconcile-history <dbname> <root> [--max-page-id N]\n\
                   \x20      wikimak import <dump.xml[.bz2]> <root> [--max-page-id N]\n\
                   \x20      wikimak serve <root> [addr]        (default 127.0.0.1:8642)\n\
                   \x20      wikimak head|history <root> <page_id>\n\
-                  \x20      wikimak text <root> <page_id> [asof-unix-micros]".into()),
+                  \x20      wikimak text <root> <page_id> [asof-unix-micros]\n\
+                  \x20      wikimak archive-export <root> <file>\n\
+                  \x20      wikimak archive-inspect|archive-histogram <file>".into()),
     };
     match r {
         Ok(()) => 0,

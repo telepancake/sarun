@@ -10,6 +10,7 @@
 //! crash-safety contract.
 
 pub mod asof;
+pub mod archive;
 #[cfg(feature = "fetch")]
 mod cli;
 #[cfg(feature = "fetch")]
@@ -33,8 +34,8 @@ pub(crate) mod titles;
 pub use error::{Error, Result};
 pub use instance::{
     max_chain_id_for_root, read_config, ContributorMeta, HistoryEntry, HistoryIter, ImportStats,
-    Instance, InstanceConfig, PageAction, RevisionCorrection, RevisionDictionaryStats,
-    RevisionMeta, RevisionVisibility, DEFAULT_MAX_CHAIN_ID,
+    Instance, InstanceConfig, PackedF0StorageStats, PageAction, RevisionCorrection, RevisionDictionaryStats,
+    RevisionMeta, RevisionVisibility, SplitRevisionStorageStats, DEFAULT_MAX_CHAIN_ID,
 };
 #[cfg(feature = "fetch")]
 pub use sync::{maintain, reconcile_history, sync, SyncStats};
