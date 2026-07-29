@@ -4,7 +4,8 @@ use std::io::BufReader;
 use std::path::{Path, PathBuf};
 
 const MIRROR_FRAME_TARGET: usize = 128 << 10;
-const MIRROR_DICTIONARY_BYTES: usize = 800 << 10;
+const MIRROR_REF_PREFIX_BYTES: usize = 16 << 20;
+const MIRROR_REF_PREFIX_SAMPLE_BYTES: usize = 150 << 20;
 
 fn http_client() -> Result<reqwest::blocking::Client, String> {
     let operator = std::env::var("SARUN_WIKIMEDIA_CONTACT")
@@ -49,12 +50,13 @@ fn install_archive(source: &Path, destination: &Path) -> Result<(), String> {
         .map_err(|error| format!("{}: {error}", source.display()))?;
     let mut archive = tempfile::NamedTempFile::new_in(parent)
         .map_err(|error| format!("{}: {error}", parent.display()))?;
-    let (_, stats) = crate::archive::repack_with_dictionary(
+    let (_, stats) = crate::archive::repack_with_ref_prefix(
         BufReader::new(input),
         archive.as_file_mut(),
         MIRROR_FRAME_TARGET,
         mirror_compression(),
-        MIRROR_DICTIONARY_BYTES,
+        MIRROR_REF_PREFIX_SAMPLE_BYTES,
+        MIRROR_REF_PREFIX_BYTES,
     )
     .map_err(|error| error.to_string())?;
     archive
@@ -79,8 +81,8 @@ fn install_archive(source: &Path, destination: &Path) -> Result<(), String> {
         .persist(&title_path)
         .map_err(|error| format!("{}: {}", title_path.display(), error.error))?;
     println!(
-        "{} records, {} frames, {} title intervals, {}-byte dictionary",
-        stats.records, stats.output_frames, title_entries, stats.dictionary_bytes
+        "{} records, {} frames, {} title intervals, {}-byte refPrefix",
+        stats.records, stats.output_frames, title_entries, stats.ref_prefix_bytes
     );
     Ok(())
 }
@@ -229,15 +231,30 @@ fn positive_size(value: &str, name: &str) -> Result<usize, String> {
 fn cmd_repack(args: &[&str]) -> Result<(), String> {
     let [input, output, frame_target, level, options @ ..] = args else {
         return Err(
-            "repack wants <input> <output> <frame-bytes> <zstd-level> [--dictionary-bytes N]"
+            "repack wants <input> <output> <frame-bytes> <zstd-level> \
+             [--dictionary-bytes N | --ref-prefix-bytes N --sample-bytes N]"
                 .into(),
         );
     };
     let frame_target = positive_size(frame_target, "frame bytes")?;
     let compression = compression(level)?;
-    let dictionary = match options {
-        [] => None,
-        ["--dictionary-bytes", bytes] => Some(positive_size(bytes, "dictionary bytes")?),
+    enum Reference {
+        None,
+        Dictionary(usize),
+        RefPrefix { bytes: usize, sample_bytes: usize },
+    }
+    let reference = match options {
+        [] => Reference::None,
+        ["--dictionary-bytes", bytes] => {
+            Reference::Dictionary(positive_size(bytes, "dictionary bytes")?)
+        }
+        ["--ref-prefix-bytes", bytes, "--sample-bytes", sample_bytes]
+        | ["--sample-bytes", sample_bytes, "--ref-prefix-bytes", bytes] => {
+            Reference::RefPrefix {
+                bytes: positive_size(bytes, "reference-prefix bytes")?,
+                sample_bytes: positive_size(sample_bytes, "sample bytes")?,
+            }
+        }
         _ => return Err("unknown repack options".into()),
     };
     let input_file =
@@ -246,15 +263,26 @@ fn cmd_repack(args: &[&str]) -> Result<(), String> {
     let parent = output_path.parent().unwrap_or_else(|| Path::new("."));
     let mut temporary = tempfile::NamedTempFile::new_in(parent)
         .map_err(|error| format!("{}: {error}", parent.display()))?;
-    let result = match dictionary {
-        Some(bytes) => crate::archive::repack_with_dictionary(
+    let result = match reference {
+        Reference::Dictionary(bytes) => crate::archive::repack_with_dictionary(
             BufReader::new(input_file),
             temporary.as_file_mut(),
             frame_target,
             compression,
             bytes,
         ),
-        None => crate::archive::repack(
+        Reference::RefPrefix {
+            bytes,
+            sample_bytes,
+        } => crate::archive::repack_with_ref_prefix(
+            BufReader::new(input_file),
+            temporary.as_file_mut(),
+            frame_target,
+            compression,
+            sample_bytes,
+            bytes,
+        ),
+        Reference::None => crate::archive::repack(
             BufReader::new(input_file),
             temporary.as_file_mut(),
             frame_target,
@@ -270,8 +298,12 @@ fn cmd_repack(args: &[&str]) -> Result<(), String> {
         .persist(output_path)
         .map_err(|error| format!("{output}: {}", error.error))?;
     println!(
-        "{} records, {} frames, dictionary {} bytes",
-        stats.records, stats.output_frames, stats.dictionary_bytes
+        "{} records, {} frames, dictionary {} bytes, refPrefix {} bytes from {} sample bytes",
+        stats.records,
+        stats.output_frames,
+        stats.dictionary_bytes,
+        stats.ref_prefix_bytes,
+        stats.sample_bytes,
     );
     Ok(())
 }
@@ -348,7 +380,7 @@ pub fn cli_main(args: &[String]) -> i32 {
              \x20      wikimak serve <archive.swdump> [addr]\n\
              \x20      wikimak siteinfo <api-url> <output.swdump>\n\
              \x20      wikimak title-index <archive.swdump> <output.swtitle>\n\
-             \x20      wikimak repack <input> <output> <frame-bytes> <zstd-level> [--dictionary-bytes N]\n\
+             \x20      wikimak repack <input> <output> <frame-bytes> <zstd-level> [--dictionary-bytes N | --ref-prefix-bytes N --sample-bytes N]\n\
              \x20      wikimak merge <output> <frame-bytes> <zstd-level> <input>...\n\
              \x20      wikimak inspect <archive.swdump>"
                 .into(),

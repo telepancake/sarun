@@ -1,7 +1,7 @@
 # Portable Wikipedia event stream
 
 This is the Wikipedia mirror storage format. The `.swdump` contains the
-portable event stream and its embedded compression dictionary. A generated
+portable event stream and any embedded compression reference. A generated
 `.swtitle` beside it provides title-and-time lookup; it can be rebuilt solely
 from the archive.
 
@@ -27,7 +27,8 @@ from the archive.
 The fixed 24-byte file header is followed by 64-byte frame headers and zstd
 frames. A writer checks actual emitted zstd bytes at every entity boundary and
 starts a new frame when the target has been reached. Installed mirrors use
-128 KiB frames, zstd level 9, and an 800 KiB dictionary. Page,
+128 KiB frames, zstd level 9, and a 16 MiB raw reference prefix distilled
+from a 150 MiB sample of complete revision records. Page,
 user, and global records are never mixed in one frame: changing entity kind
 always starts a new frame. The header identifies that kind and the minimum and
 maximum page ID or user ID in the frame. An entity is never split, so a single
@@ -68,13 +69,26 @@ Entity kinds are page `1`, user `2`, and global/unbound `3`. Record kinds are:
 4. user state
 5. user action
 6. manifest
+7. site information
 
 A clean file ends with a 64-byte `DONE` header.
+
+An optional first auxiliary frame is either a trained zstd dictionary (`DICT`)
+or raw reference-prefix content (`PREF`). The auxiliary payload is itself a
+plain zstd frame. Every following data frame uses that same compression
+reference. `PREF` data frames use zstd's raw `refPrefix` mode and therefore
+carry no dictionary ID. Unless a larger window is explicitly configured, the
+writer raises zstd's window to the next power of two above the prefix size so
+the prefix is not silently truncated to the compression level's default
+window.
 
 `wikimak repack` decodes records
 in order and writes the same records using the requested compressed frame-size
 target, zstd level, checksum, long-distance matching, window log, and target
 compressed-block size. Frame boundaries remain entity-aligned.
+`--ref-prefix-bytes N --sample-bytes M` deterministically selects approximately
+`M` bytes of complete random records, asks zstd to select recurring content,
+and embeds an `N`-byte raw prefix.
 
 `wikimak merge` performs a canonical set union over any number of
 archives and writes it through the same configurable compressor and framing

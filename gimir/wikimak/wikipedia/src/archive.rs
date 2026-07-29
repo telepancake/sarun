@@ -20,6 +20,7 @@ const FILE_VERSION: u32 = 1;
 const FILE_HEADER_LEN: usize = 24;
 const FRAME_MAGIC: [u8; 4] = *b"FRM1";
 const DICTIONARY_MAGIC: [u8; 4] = *b"DICT";
+const REF_PREFIX_MAGIC: [u8; 4] = *b"PREF";
 const DONE_MAGIC: [u8; 4] = *b"DONE";
 const FRAME_HEADER_LEN: usize = 64;
 pub const DEFAULT_FRAME_TARGET: usize = 4 << 20;
@@ -664,7 +665,13 @@ pub struct FrameInfo {
 pub struct FrameLocation {
     pub info: FrameInfo,
     pub compressed_offset: u64,
-    dictionary: Option<std::sync::Arc<[u8]>>,
+    reference: Option<CompressionReference>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum CompressionReference {
+    Dictionary(std::sync::Arc<[u8]>),
+    RefPrefix(std::sync::Arc<[u8]>),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -688,28 +695,50 @@ impl Default for CompressionSettings {
     }
 }
 
-struct FrameBuilder {
-    encoder: zstd::stream::write::Encoder<'static, Vec<u8>>,
+struct FrameBuilder<'a> {
+    encoder: zstd::stream::write::Encoder<'a, Vec<u8>>,
     first_entity: EntityKey,
     last_entity: EntityKey,
     records: u64,
     raw_bytes: u64,
 }
 
-impl FrameBuilder {
+impl<'a> FrameBuilder<'a> {
     fn new(
         entity: EntityKey,
         settings: CompressionSettings,
         dictionary: Option<&[u8]>,
+        ref_prefix: Option<&'a [u8]>,
     ) -> Result<Self> {
-        let mut encoder = zstd::stream::write::Encoder::with_dictionary(
-            Vec::new(),
-            settings.level,
-            dictionary.unwrap_or_default(),
-        )?;
+        let encoder = match (dictionary, ref_prefix) {
+            (Some(dictionary), None) => {
+                zstd::stream::write::Encoder::with_dictionary(
+                    Vec::new(),
+                    settings.level,
+                    dictionary,
+                )?
+            }
+            (None, Some(prefix)) => {
+                zstd::stream::write::Encoder::with_ref_prefix(
+                    Vec::new(),
+                    settings.level,
+                    prefix,
+                )?
+            }
+            (None, None) => zstd::stream::write::Encoder::new(Vec::new(), settings.level)?,
+            (Some(_), Some(_)) => {
+                return Err(ArchiveError::Invalid(
+                    "cannot use a dictionary and reference prefix together",
+                ))
+            }
+        };
+        let mut encoder = encoder;
         encoder.include_checksum(settings.checksum)?;
         encoder.long_distance_matching(settings.long_distance_matching)?;
-        if let Some(window_log) = settings.window_log {
+        let window_log = settings
+            .window_log
+            .or_else(|| ref_prefix.map(|prefix| ref_prefix_window_log(prefix.len())));
+        if let Some(window_log) = window_log {
             encoder.window_log(window_log)?;
         }
         encoder.set_target_cblock_size(settings.target_block_size)?;
@@ -727,19 +756,20 @@ impl FrameBuilder {
     }
 }
 
-pub struct ArchiveWriter<W: Write> {
+pub struct ArchiveWriter<'a, W: Write> {
     output: W,
     frame_target: usize,
     compression: CompressionSettings,
-    frame: Option<FrameBuilder>,
+    frame: Option<FrameBuilder<'a>>,
     last_entity: Option<EntityKey>,
     last_timestamp: i64,
     frames: u64,
     dictionary: Option<std::sync::Arc<[u8]>>,
+    ref_prefix: Option<&'a [u8]>,
     dictionary_id: Option<u32>,
 }
 
-impl<W: Write> ArchiveWriter<W> {
+impl<W: Write> ArchiveWriter<'static, W> {
     pub fn new(output: W, frame_target: usize) -> Result<Self> {
         Self::with_compression(output, frame_target, CompressionSettings::default())
     }
@@ -784,7 +814,41 @@ impl<W: Write> ArchiveWriter<W> {
             last_timestamp: i64::MAX,
             frames: 0,
             dictionary,
+            ref_prefix: None,
             dictionary_id,
+        })
+    }
+}
+
+impl<'a, W: Write> ArchiveWriter<'a, W> {
+    fn with_compression_and_ref_prefix(
+        mut output: W,
+        frame_target: usize,
+        compression: CompressionSettings,
+        prefix: &'a [u8],
+    ) -> Result<Self> {
+        if frame_target == 0 {
+            return Err(ArchiveError::Invalid("zero frame target"));
+        }
+        if prefix.is_empty() {
+            return Err(ArchiveError::Invalid("empty reference prefix"));
+        }
+        output.write_all(&FILE_MAGIC)?;
+        output.write_all(&FILE_VERSION.to_le_bytes())?;
+        output.write_all(&0_u32.to_le_bytes())?;
+        output.write_all(&(frame_target as u64).to_le_bytes())?;
+        write_ref_prefix_frame(&mut output, prefix, compression)?;
+        Ok(Self {
+            output,
+            frame_target,
+            compression,
+            frame: None,
+            last_entity: None,
+            last_timestamp: i64::MAX,
+            frames: 0,
+            dictionary: None,
+            ref_prefix: Some(prefix),
+            dictionary_id: None,
         })
     }
 
@@ -817,6 +881,7 @@ impl<W: Write> ArchiveWriter<W> {
                 entity,
                 self.compression,
                 self.dictionary.as_deref(),
+                self.ref_prefix,
             )?);
         }
 
@@ -893,7 +958,7 @@ pub struct ArchiveReader<R: Read> {
     complete: bool,
     last_frame_entity: Option<EntityKey>,
     pending_header: Option<[u8; FRAME_HEADER_LEN]>,
-    dictionary: Option<std::sync::Arc<[u8]>>,
+    reference: Option<CompressionReference>,
     dictionary_id: Option<u32>,
 }
 
@@ -902,11 +967,26 @@ impl<R: Read> ArchiveReader<R> {
         let mut input = BufReader::new(input);
         let frame_target = read_file_header(&mut input)?;
         let pending_header = read_frame_header_or_eof(&mut input)?;
-        let (pending_header, dictionary, dictionary_id) =
+        let (pending_header, reference, dictionary_id) =
             if let Some(header) = pending_header {
                 if let Some(info) = parse_dictionary_header(&header)? {
                     let dictionary = read_dictionary_payload(&mut input, info)?;
-                    (None, Some(std::sync::Arc::<[u8]>::from(dictionary)), Some(info.id))
+                    (
+                        None,
+                        Some(CompressionReference::Dictionary(
+                            std::sync::Arc::<[u8]>::from(dictionary),
+                        )),
+                        Some(info.id),
+                    )
+                } else if let Some(info) = parse_ref_prefix_header(&header)? {
+                    let prefix = read_ref_prefix_payload(&mut input, info)?;
+                    (
+                        None,
+                        Some(CompressionReference::RefPrefix(
+                            std::sync::Arc::<[u8]>::from(prefix),
+                        )),
+                        None,
+                    )
                 } else {
                     (Some(header), None, None)
                 }
@@ -919,7 +999,7 @@ impl<R: Read> ArchiveReader<R> {
             complete: false,
             last_frame_entity: None,
             pending_header,
-            dictionary,
+            reference,
             dictionary_id,
         })
     }
@@ -950,11 +1030,11 @@ impl<R: Read> ArchiveReader<R> {
         self.last_frame_entity = Some(info.last_entity);
         let limited = (&mut self.input).take(info.compressed_bytes);
         let compressed = compressed_frame_reader(limited, info)?;
-        let decoder = zstd::stream::read::Decoder::with_dictionary(
+        let decoder = frame_decoder(
             BufReader::new(compressed),
-            dictionary_for_frame(info, self.dictionary.as_deref())?,
-        )?
-        .single_frame();
+            info,
+            self.reference.as_ref(),
+        )?;
         Ok(Some(ArchiveFrameReader {
             decoder,
             info,
@@ -973,7 +1053,7 @@ impl<R: Read> ArchiveReader<R> {
 
 pub type BorrowedFrameDecoder<'a, R> =
     zstd::stream::read::Decoder<
-        'static,
+        'a,
         BufReader<std::io::Chain<Cursor<Vec<u8>>, Take<&'a mut BufReader<R>>>>,
     >;
 
@@ -993,13 +1073,21 @@ pub fn index_file(path: impl AsRef<Path>) -> Result<(u64, Vec<FrameLocation>, bo
     let mut locations = Vec::new();
     let mut previous = None;
     let mut pending_header = read_frame_header_or_eof(&mut file)?;
-    let mut dictionary = None;
+    let mut reference = None;
     let mut active_dictionary_id = None;
     if let Some(header) = pending_header {
         if let Some(info) = parse_dictionary_header(&header)? {
             let bytes = read_dictionary_payload(&mut file, info)?;
-            dictionary = Some(std::sync::Arc::<[u8]>::from(bytes));
+            reference = Some(CompressionReference::Dictionary(
+                std::sync::Arc::<[u8]>::from(bytes),
+            ));
             active_dictionary_id = Some(info.id);
+            pending_header = None;
+        } else if let Some(info) = parse_ref_prefix_header(&header)? {
+            let bytes = read_ref_prefix_payload(&mut file, info)?;
+            reference = Some(CompressionReference::RefPrefix(
+                std::sync::Arc::<[u8]>::from(bytes),
+            ));
             pending_header = None;
         }
     }
@@ -1025,7 +1113,7 @@ pub fn index_file(path: impl AsRef<Path>) -> Result<(u64, Vec<FrameLocation>, bo
         locations.push(FrameLocation {
             info,
             compressed_offset,
-            dictionary: dictionary.clone(),
+            reference: reference.clone(),
         });
         file.seek(SeekFrom::Current(
             info.compressed_bytes
@@ -1052,16 +1140,24 @@ pub fn visit_frame_while(
     mut visitor: impl FnMut(Record) -> Result<bool>,
 ) -> Result<()> {
     let mut file = std::fs::File::open(path)?;
+    visit_frame_while_file(&mut file, location, &mut visitor)
+}
+
+pub(crate) fn visit_frame_while_file(
+    file: &mut std::fs::File,
+    location: &FrameLocation,
+    mut visitor: impl FnMut(Record) -> Result<bool>,
+) -> Result<()> {
     file.seek(SeekFrom::Start(location.compressed_offset))?;
     let compressed = compressed_frame_reader(
-        file.take(location.info.compressed_bytes),
+        (&mut *file).take(location.info.compressed_bytes),
         location.info,
     )?;
-    let decoder = zstd::stream::read::Decoder::with_dictionary(
+    let decoder = frame_decoder(
         BufReader::new(compressed),
-        dictionary_for_frame(location.info, location.dictionary.as_deref())?,
-    )?
-    .single_frame();
+        location.info,
+        location.reference.as_ref(),
+    )?;
     let mut frame = ArchiveFrameReader {
         decoder,
         info: location.info,
@@ -1079,16 +1175,16 @@ pub fn visit_frame_while(
     Ok(())
 }
 
-type OwnedFrameDecoder = zstd::stream::read::Decoder<
-    'static,
-    BufReader<std::io::Chain<Cursor<Vec<u8>>, Take<std::fs::File>>>,
->;
-
 pub struct ArchiveRecordReader {
     path: PathBuf,
     frames: std::vec::IntoIter<FrameLocation>,
     current: Option<ArchiveFrameReader<OwnedFrameDecoder>>,
 }
+
+type OwnedFrameDecoder = zstd::stream::read::Decoder<
+    'static,
+    BufReader<std::io::Chain<Cursor<Vec<u8>>, Take<std::fs::File>>>,
+>;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RepackStats {
@@ -1099,6 +1195,9 @@ pub struct RepackStats {
     pub input_compressed_bytes: u64,
     pub dictionary_bytes: u64,
     pub compressed_dictionary_bytes: u64,
+    pub ref_prefix_bytes: u64,
+    pub compressed_ref_prefix_bytes: u64,
+    pub sample_bytes: u64,
 }
 
 pub fn repack<R: Read + Seek, W: Write>(
@@ -1129,6 +1228,56 @@ pub fn repack_with_dictionary<R: Read + Seek, W: Write>(
     )
 }
 
+pub fn repack_with_ref_prefix<R: Read + Seek, W: Write>(
+    mut input: R,
+    output: W,
+    frame_target: usize,
+    compression: CompressionSettings,
+    sample_capacity: usize,
+    prefix_capacity: usize,
+) -> Result<(W, RepackStats)> {
+    if sample_capacity == 0 || prefix_capacity == 0 {
+        return Err(ArchiveError::Invalid(
+            "zero reference-prefix sample or capacity",
+        ));
+    }
+    if sample_capacity <= prefix_capacity {
+        return Err(ArchiveError::Invalid(
+            "reference-prefix samples must be larger than the prefix",
+        ));
+    }
+    let samples = archive_ref_prefix_samples(&mut input, sample_capacity)?;
+    input.seek(SeekFrom::Start(0))?;
+    let sample_bytes = samples.iter().try_fold(0_usize, |total, sample| {
+        total
+            .checked_add(sample.len())
+            .ok_or(ArchiveError::FieldTooLarge)
+    })?;
+    if sample_bytes < prefix_capacity {
+        return Err(ArchiveError::Invalid(
+            "not enough archive data to distill requested reference prefix",
+        ));
+    }
+    let prefix = distill_ref_prefix(&samples, prefix_capacity, compression.level)?;
+    drop(samples);
+    let mut reader = ArchiveReader::new(input)?;
+    let writer = ArchiveWriter::with_compression_and_ref_prefix(
+        output,
+        frame_target,
+        compression,
+        &prefix,
+    )?;
+    let mut stats = RepackStats {
+        ref_prefix_bytes: prefix.len() as u64,
+        compressed_ref_prefix_bytes: compressed_dictionary_size(&prefix, compression)? as u64,
+        sample_bytes: sample_bytes as u64,
+        ..RepackStats::default()
+    };
+    let (output, output_frames) = repack_records(&mut reader, writer, &mut stats)?;
+    stats.output_frames = output_frames;
+    Ok((output, stats))
+}
+
 fn repack_inner<R: Read + Seek, W: Write>(
     mut input: R,
     output: W,
@@ -1154,7 +1303,7 @@ fn repack_inner<R: Read + Seek, W: Write>(
         None
     };
     let mut reader = ArchiveReader::new(input)?;
-    let mut writer = ArchiveWriter::with_compression_and_dictionary(
+    let writer = ArchiveWriter::with_compression_and_dictionary(
         output,
         frame_target,
         compression,
@@ -1166,6 +1315,16 @@ fn repack_inner<R: Read + Seek, W: Write>(
         stats.compressed_dictionary_bytes =
             compressed_dictionary_size(dictionary, compression)? as u64;
     }
+    let (output, output_frames) = repack_records(&mut reader, writer, &mut stats)?;
+    stats.output_frames = output_frames;
+    Ok((output, stats))
+}
+
+fn repack_records<'a, R: Read, W: Write>(
+    reader: &mut ArchiveReader<R>,
+    mut writer: ArchiveWriter<'a, W>,
+    stats: &mut RepackStats,
+) -> Result<(W, u64)> {
     while let Some(mut frame) = reader.next_frame()? {
         let info = frame.info();
         stats.input_frames += 1;
@@ -1187,9 +1346,7 @@ fn repack_inner<R: Read + Seek, W: Write>(
             "archive has no clean completion marker",
         ));
     }
-    let (output, output_frames) = writer.finish()?;
-    stats.output_frames = output_frames;
-    Ok((output, stats))
+    writer.finish()
 }
 
 fn archive_dictionary_samples(input: &mut (impl Read + Seek)) -> Result<Vec<Vec<u8>>> {
@@ -1222,6 +1379,145 @@ fn archive_dictionary_samples(input: &mut (impl Read + Seek)) -> Result<Vec<Vec<
         ));
     }
     Ok(selected.into_values().collect())
+}
+
+fn archive_ref_prefix_samples(
+    input: &mut (impl Read + Seek),
+    target_bytes: usize,
+) -> Result<Vec<Vec<u8>>> {
+    input.seek(SeekFrom::Start(0))?;
+    let mut reader = ArchiveReader::new(input)?;
+    let mut selected = std::collections::BTreeMap::<(u64, u64), Vec<u8>>::new();
+    let mut selected_bytes = 0_usize;
+    let mut ordinal = 0_u64;
+    while let Some(mut frame) = reader.next_frame()? {
+        while let Some(record) = frame.next_record()? {
+            let bytes = encode_record_wire(&record)?;
+            if bytes.len() <= target_bytes {
+                let key = (xxhash_rust::xxh3::xxh3_64(&bytes), ordinal);
+                let eligible = selected_bytes < target_bytes
+                    || selected
+                        .last_key_value()
+                        .is_some_and(|(last, _)| key < *last);
+                if eligible {
+                    selected_bytes = selected_bytes
+                        .checked_add(bytes.len())
+                        .ok_or(ArchiveError::FieldTooLarge)?;
+                    selected.insert(key, bytes);
+                    while selected_bytes > target_bytes {
+                        let (_, removed) = selected
+                            .pop_last()
+                            .ok_or(ArchiveError::Invalid("empty sample set"))?;
+                        selected_bytes -= removed.len();
+                    }
+                }
+            }
+            ordinal = ordinal
+                .checked_add(1)
+                .ok_or(ArchiveError::FieldTooLarge)?;
+        }
+    }
+    if !reader.is_complete() {
+        return Err(ArchiveError::Invalid(
+            "archive has no clean completion marker",
+        ));
+    }
+    Ok(selected.into_values().collect())
+}
+
+fn distill_ref_prefix(
+    samples: &[Vec<u8>],
+    capacity: usize,
+    compression_level: i32,
+) -> Result<Vec<u8>> {
+    const HEADER_ALLOWANCE: usize = 128 << 10;
+    let trained_capacity = capacity
+        .checked_add(HEADER_ALLOWANCE)
+        .ok_or(ArchiveError::FieldTooLarge)?;
+    let sample_sizes = samples.iter().map(Vec::len).collect::<Vec<_>>();
+    let sample_bytes = samples.iter().try_fold(Vec::new(), |mut output, sample| {
+        output
+            .try_reserve(sample.len())
+            .map_err(|_| ArchiveError::FieldTooLarge)?;
+        output.extend_from_slice(sample);
+        Ok::<_, ArchiveError>(output)
+    })?;
+    let mut trained = vec![0_u8; trained_capacity];
+    let mut parameters = zstd::zstd_safe::zstd_sys::ZDICT_fastCover_params_t {
+        k: 0,
+        d: 8,
+        f: 20,
+        steps: 4,
+        nbThreads: std::thread::available_parallelism()
+            .map(|threads| threads.get())
+            .unwrap_or(1)
+            .try_into()
+            .map_err(|_| ArchiveError::FieldTooLarge)?,
+        splitPoint: 0.0,
+        accel: 1,
+        shrinkDict: 0,
+        shrinkDictMaxRegression: 0,
+        zParams: zstd::zstd_safe::zstd_sys::ZDICT_params_t {
+            compressionLevel: compression_level,
+            notificationLevel: 0,
+            dictID: 0,
+        },
+    };
+    // SAFETY: all buffers and the size array remain live and immutable for
+    // the call, and the output pointer covers `trained.len()` writable bytes.
+    let trained_bytes = unsafe {
+        zstd::zstd_safe::zstd_sys::ZDICT_optimizeTrainFromBuffer_fastCover(
+            trained.as_mut_ptr().cast(),
+            trained.len(),
+            sample_bytes.as_ptr().cast(),
+            sample_sizes.as_ptr(),
+            sample_sizes
+                .len()
+                .try_into()
+                .map_err(|_| ArchiveError::FieldTooLarge)?,
+            &mut parameters,
+        )
+    };
+    if unsafe { zstd::zstd_safe::zstd_sys::ZDICT_isError(trained_bytes) } != 0 {
+        return Err(ArchiveError::Invalid(
+            "zstd could not distill a reference prefix",
+        ));
+    }
+    trained.truncate(trained_bytes);
+    // SAFETY: `trained` is the complete successful result from zstd's trainer.
+    let header_bytes = unsafe {
+        zstd::zstd_safe::zstd_sys::ZDICT_getDictHeaderSize(
+            trained.as_ptr().cast(),
+            trained.len(),
+        )
+    };
+    if unsafe { zstd::zstd_safe::zstd_sys::ZDICT_isError(header_bytes) } != 0 {
+        return Err(ArchiveError::Invalid(
+            "zstd produced an invalid trained dictionary",
+        ));
+    }
+    let content = trained
+        .get(header_bytes..)
+        .ok_or(ArchiveError::Invalid("invalid trained dictionary header"))?;
+    if content.len() >= capacity {
+        return Ok(content[content.len() - capacity..].to_vec());
+    }
+    let filler_bytes = capacity - content.len();
+    let mut prefix = Vec::with_capacity(capacity);
+    for sample in samples {
+        let remaining = filler_bytes - prefix.len();
+        if remaining == 0 {
+            break;
+        }
+        prefix.extend_from_slice(&sample[..sample.len().min(remaining)]);
+    }
+    if prefix.len() != filler_bytes {
+        return Err(ArchiveError::Invalid(
+            "not enough sample content to fill reference prefix",
+        ));
+    }
+    prefix.extend_from_slice(content);
+    Ok(prefix)
 }
 
 impl ArchiveRecordReader {
@@ -1266,11 +1562,11 @@ fn open_owned_frame(
         file.take(location.info.compressed_bytes),
         location.info,
     )?;
-    let decoder = zstd::stream::read::Decoder::with_dictionary(
+    let decoder = owned_frame_decoder(
         BufReader::new(compressed),
-        dictionary_for_frame(location.info, location.dictionary.as_deref())?,
-    )?
-    .single_frame();
+        location.info,
+        location.reference.as_ref(),
+    )?;
     Ok(ArchiveFrameReader {
         decoder,
         info: location.info,
@@ -1288,7 +1584,7 @@ pub fn concatenate_archives<W: Write>(
     frame_target: usize,
 ) -> Result<(W, u64)> {
     let mut indexed = Vec::with_capacity(inputs.len());
-    let mut dictionary: Option<std::sync::Arc<[u8]>> = None;
+    let mut reference: Option<Option<CompressionReference>> = None;
     for input in inputs {
         let (_, frames, complete) = index_file(input)?;
         if !complete {
@@ -1296,18 +1592,25 @@ pub fn concatenate_archives<W: Write>(
                 "archive segment has no completion marker",
             ));
         }
-        for location in &frames {
-            if let Some(candidate) = location.dictionary.as_ref() {
-                match dictionary.as_ref() {
-                    Some(current) if current.as_ref() != candidate.as_ref() => {
-                        return Err(ArchiveError::Invalid(
-                            "archive segments use different dictionaries",
-                        ));
-                    }
-                    None => dictionary = Some(candidate.clone()),
-                    _ => {}
-                }
+        let candidate = frames
+            .first()
+            .and_then(|location| location.reference.clone());
+        if frames
+            .iter()
+            .any(|location| location.reference != candidate)
+        {
+            return Err(ArchiveError::Invalid(
+                "archive changes compression reference between frames",
+            ));
+        }
+        match reference.as_ref() {
+            Some(current) if current != &candidate => {
+                return Err(ArchiveError::Invalid(
+                    "archive segments use different compression references",
+                ));
             }
+            None => reference = Some(candidate),
+            _ => {}
         }
         indexed.push((input, frames));
     }
@@ -1315,13 +1618,23 @@ pub fn concatenate_archives<W: Write>(
     output.write_all(&FILE_VERSION.to_le_bytes())?;
     output.write_all(&0_u32.to_le_bytes())?;
     output.write_all(&(frame_target as u64).to_le_bytes())?;
-    if let Some(dictionary) = dictionary.as_deref() {
-        write_dictionary_frame(
-            &mut output,
-            dictionary,
-            dictionary_id(dictionary)?,
-            CompressionSettings::default(),
-        )?;
+    match reference.as_ref().and_then(Option::as_ref) {
+        Some(CompressionReference::Dictionary(dictionary)) => {
+            write_dictionary_frame(
+                &mut output,
+                dictionary,
+                dictionary_id(dictionary)?,
+                CompressionSettings::default(),
+            )?;
+        }
+        Some(CompressionReference::RefPrefix(prefix)) => {
+            write_ref_prefix_frame(
+                &mut output,
+                prefix,
+                CompressionSettings::default(),
+            )?;
+        }
+        None => {}
     }
     let mut previous = None;
     let mut frame_count = 0_u64;
@@ -1935,6 +2248,13 @@ struct DictionaryFrameInfo {
     compressed_bytes: u64,
 }
 
+#[derive(Clone, Copy)]
+struct RefPrefixFrameInfo {
+    hash: u64,
+    raw_bytes: u64,
+    compressed_bytes: u64,
+}
+
 fn dictionary_id(dictionary: &[u8]) -> Result<u32> {
     zstd::zstd_safe::get_dict_id_from_dict(dictionary)
         .map(u32::from)
@@ -1989,6 +2309,22 @@ fn write_dictionary_frame(
     Ok(())
 }
 
+fn write_ref_prefix_frame(
+    output: &mut impl Write,
+    prefix: &[u8],
+    settings: CompressionSettings,
+) -> Result<()> {
+    let compressed = compress_dictionary(prefix, settings)?;
+    output.write_all(&REF_PREFIX_MAGIC)?;
+    output.write_all(&(FRAME_HEADER_LEN as u32).to_le_bytes())?;
+    output.write_all(&xxhash_rust::xxh3::xxh3_64(prefix).to_le_bytes())?;
+    output.write_all(&(prefix.len() as u64).to_le_bytes())?;
+    output.write_all(&(compressed.len() as u64).to_le_bytes())?;
+    output.write_all(&[0; 32])?;
+    output.write_all(&compressed)?;
+    Ok(())
+}
+
 fn read_frame_header_or_eof(
     input: &mut impl Read,
 ) -> Result<Option<[u8; FRAME_HEADER_LEN]>> {
@@ -2029,6 +2365,33 @@ fn parse_dictionary_header(
     Ok(Some(info))
 }
 
+fn parse_ref_prefix_header(
+    header: &[u8; FRAME_HEADER_LEN],
+) -> Result<Option<RefPrefixFrameInfo>> {
+    if header[..4] != REF_PREFIX_MAGIC {
+        return Ok(None);
+    }
+    if u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize != FRAME_HEADER_LEN {
+        return Err(ArchiveError::Invalid(
+            "unsupported reference-prefix frame header",
+        ));
+    }
+    let info = RefPrefixFrameInfo {
+        hash: u64::from_le_bytes(header[8..16].try_into().unwrap()),
+        raw_bytes: u64::from_le_bytes(header[16..24].try_into().unwrap()),
+        compressed_bytes: u64::from_le_bytes(header[24..32].try_into().unwrap()),
+    };
+    if info.raw_bytes == 0
+        || info.compressed_bytes == 0
+        || header[32..].iter().any(|byte| *byte != 0)
+    {
+        return Err(ArchiveError::Invalid(
+            "malformed reference-prefix frame",
+        ));
+    }
+    Ok(Some(info))
+}
+
 fn read_dictionary_payload(
     input: &mut impl Read,
     info: DictionaryFrameInfo,
@@ -2046,6 +2409,29 @@ fn read_dictionary_payload(
         return Err(ArchiveError::Invalid("dictionary frame id mismatch"));
     }
     Ok(dictionary)
+}
+
+fn read_ref_prefix_payload(
+    input: &mut impl Read,
+    info: RefPrefixFrameInfo,
+) -> Result<Vec<u8>> {
+    let mut decoder =
+        zstd::stream::read::Decoder::new(input.take(info.compressed_bytes))?.single_frame();
+    let mut prefix = Vec::with_capacity(
+        usize::try_from(info.raw_bytes).map_err(|_| ArchiveError::FieldTooLarge)?,
+    );
+    decoder.read_to_end(&mut prefix)?;
+    if prefix.len() as u64 != info.raw_bytes {
+        return Err(ArchiveError::Invalid(
+            "reference-prefix frame size mismatch",
+        ));
+    }
+    if xxhash_rust::xxh3::xxh3_64(&prefix) != info.hash {
+        return Err(ArchiveError::Invalid(
+            "reference-prefix frame hash mismatch",
+        ));
+    }
+    Ok(prefix)
 }
 
 fn validate_frame_dictionary(info: FrameInfo, active: Option<u32>) -> Result<()> {
@@ -2077,16 +2463,83 @@ fn compressed_frame_reader<R: Read>(
     Ok(Cursor::new(prefix).chain(compressed))
 }
 
-fn dictionary_for_frame<'a>(
+fn frame_decoder<'a, R: std::io::BufRead>(
+    input: R,
     info: FrameInfo,
-    dictionary: Option<&'a [u8]>,
-) -> Result<&'a [u8]> {
-    if info.dictionary_id.is_none() {
-        return Ok(&[]);
+    reference: Option<&'a CompressionReference>,
+) -> Result<zstd::stream::read::Decoder<'a, R>> {
+    let mut decoder = match reference {
+        Some(CompressionReference::Dictionary(dictionary)) => {
+            if info.dictionary_id.is_none() {
+                return Err(ArchiveError::Invalid(
+                    "data frame does not reference the archive dictionary",
+                ));
+            }
+            zstd::stream::read::Decoder::with_dictionary(input, dictionary)?
+        }
+        Some(CompressionReference::RefPrefix(prefix)) => {
+            if info.dictionary_id.is_some() {
+                return Err(ArchiveError::Invalid(
+                    "reference-prefix frame has a dictionary id",
+                ));
+            }
+            zstd::stream::read::Decoder::with_ref_prefix(input, prefix)?
+        }
+        None => {
+            if info.dictionary_id.is_some() {
+                return Err(ArchiveError::Invalid(
+                    "data frame references unavailable dictionary",
+                ));
+            }
+            zstd::stream::read::Decoder::with_dictionary(input, &[])?
+        }
+    };
+    if let Some(CompressionReference::RefPrefix(prefix)) = reference {
+        decoder.window_log_max(ref_prefix_window_log(prefix.len()))?;
     }
-    dictionary.ok_or(ArchiveError::Invalid(
-        "data frame references unavailable dictionary",
-    ))
+    Ok(decoder.single_frame())
+}
+
+fn owned_frame_decoder<R: std::io::BufRead>(
+    input: R,
+    info: FrameInfo,
+    reference: Option<&CompressionReference>,
+) -> Result<zstd::stream::read::Decoder<'static, R>> {
+    let dictionary = match reference {
+        Some(CompressionReference::Dictionary(dictionary)) => {
+            if info.dictionary_id.is_none() {
+                return Err(ArchiveError::Invalid(
+                    "data frame does not reference the archive dictionary",
+                ));
+            }
+            dictionary.as_ref()
+        }
+        Some(CompressionReference::RefPrefix(prefix)) => {
+            if info.dictionary_id.is_some() {
+                return Err(ArchiveError::Invalid(
+                    "reference-prefix frame has a dictionary id",
+                ));
+            }
+            prefix.as_ref()
+        }
+        None => {
+            if info.dictionary_id.is_some() {
+                return Err(ArchiveError::Invalid(
+                    "data frame references unavailable dictionary",
+                ));
+            }
+            &[]
+        }
+    };
+    let mut decoder = zstd::stream::read::Decoder::with_dictionary(input, dictionary)?;
+    if let Some(CompressionReference::RefPrefix(prefix)) = reference {
+        decoder.window_log_max(ref_prefix_window_log(prefix.len()))?;
+    }
+    Ok(decoder.single_frame())
+}
+
+fn ref_prefix_window_log(prefix_bytes: usize) -> u32 {
+    usize::BITS - prefix_bytes.leading_zeros()
 }
 
 fn read_file_header(input: &mut impl Read) -> Result<u64> {
@@ -4156,6 +4609,76 @@ mod tests {
                 "data frame dictionary header does not match zstd frame"
             ))
         ));
+    }
+
+    #[test]
+    fn ref_prefix_repack_stores_prefix_first_and_supports_random_reads() {
+        let records = (1..=384_u64)
+            .map(|page_id| {
+                let mut text = format!(
+                    "Page {page_id}: shared encyclopedia prose, [[links]], {{{{templates}}}}, \
+                     tables, dates, and Latvian words. "
+                )
+                .into_bytes();
+                let seed = xxhash_rust::xxh3::xxh3_64(&page_id.to_le_bytes());
+                while text.len() < 4096 {
+                    text.extend_from_slice(&seed.to_le_bytes());
+                    text.extend_from_slice(
+                        b" encyclopedia revision text with recurring MediaWiki syntax ",
+                    );
+                }
+                revision(page_id, page_id, page_id as i64, &text)
+            })
+            .collect::<Vec<_>>();
+        let mut source = ArchiveWriter::new(Vec::new(), 1 << 20).unwrap();
+        for record in &records {
+            source.write(record).unwrap();
+        }
+        let (source, _) = source.finish().unwrap();
+
+        let (repacked, stats) = repack_with_ref_prefix(
+            Cursor::new(source),
+            Vec::new(),
+            32 << 10,
+            CompressionSettings {
+                level: 7,
+                ..CompressionSettings::default()
+            },
+            1 << 20,
+            64 << 10,
+        )
+        .unwrap();
+        assert_eq!(
+            &repacked[FILE_HEADER_LEN..FILE_HEADER_LEN + 4],
+            &REF_PREFIX_MAGIC
+        );
+        assert_eq!(stats.ref_prefix_bytes, 64 << 10);
+        assert!(stats.compressed_ref_prefix_bytes > 0);
+        assert!(stats.sample_bytes <= 1 << 20);
+
+        let mut reader = ArchiveReader::new(Cursor::new(&repacked)).unwrap();
+        let mut decoded = Vec::new();
+        while let Some(mut frame) = reader.next_frame().unwrap() {
+            assert_eq!(frame.info().dictionary_id, None);
+            while let Some(record) = frame.next_record().unwrap() {
+                decoded.push(record);
+            }
+        }
+        assert!(reader.is_complete());
+        assert_eq!(decoded, records);
+
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), &repacked).unwrap();
+        let (_, frames, complete) = index_file(file.path()).unwrap();
+        assert!(complete);
+        let middle = &frames[frames.len() / 2];
+        let mut random = Vec::new();
+        visit_frame(file.path(), middle, |record| {
+            random.push(record);
+            Ok(())
+        })
+        .unwrap();
+        assert!(!random.is_empty());
     }
 
     #[test]
