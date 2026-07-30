@@ -3,9 +3,9 @@
 // /gmake BEFORE its normal dispatch and lands here, which:
 //   1. drives a vendored fork of kati (github.com/google/kati src-rs/) IN-PROCESS
 //      to PARSE the box's Makefile, run dependency analysis, and EXECUTE the dep
-//      graph via kati's OWN executor (src-rs/exec.rs) — sequential, declaration
-//      order, mtime-based staleness, i.e. standalone rkati semantics. NO ninja
-//      graph is generated and NO n2 is involved. (An earlier design had kati
+//      graph via kati's OWN executor (src-rs/exec.rs) — dependency ordered,
+//      parallel under -j, and mtime-based. NO ninja graph is generated and NO
+//      n2 is involved. (An earlier design had kati
 //      emit a ninja graph in-memory and handed it to the embedded n2 to run;
 //      that handoff is gone — kati executes directly now.)
 //   2. routes every recipe through embedded brush in THIS process via the
@@ -234,8 +234,8 @@ fn kati_argv(argv: &[String]) -> Result<Vec<OsString>, String> {
                     i += 1;
                 }
             }
-            // -jN parallelism: kati parses -j (used only to seed $(MAKE)); n2 runs
-            // serial anyway under the in-process executor. Pass numeric forms.
+            // -jN parallelism: Kati's dependency scheduler uses this worker cap
+            // and propagates it to recursive $(MAKE) through the jobserver.
             _ if a.starts_with("-j") => {
                 out.push(OsString::from(a));
                 i += 1;
@@ -1369,10 +1369,15 @@ fn install_make_recipe_runner() {
     // shows only the targets currently building and their wall time.
     kati::fileutil::install_edge_reporter(Arc::new(
         |output: &[u8], phase, code, excerpt: &[u8]| {
+            write_target_log(output, phase, excerpt);
+            if phase == kati::fileutil::EdgePhase::Output {
+                return;
+            }
             let out = String::from_utf8_lossy(output);
             let p = match phase {
                 kati::fileutil::EdgePhase::Start => "start",
                 kati::fileutil::EdgePhase::Done => "done",
+                kati::fileutil::EdgePhase::Output => unreachable!(),
             };
             // Tag this worker thread with the edge whose recipe is about to run
             // (cleared on Done): every pipeline the recipe spawns records
@@ -1381,6 +1386,7 @@ fn install_make_recipe_runner() {
             crate::brush::set_box_recipe_edge(match phase {
                 kati::fileutil::EdgePhase::Start => Some(out.to_string()),
                 kati::fileutil::EdgePhase::Done => None,
+                kati::fileutil::EdgePhase::Output => unreachable!(),
             });
             let ex = String::from_utf8_lossy(excerpt);
             crate::brush::send_build_edge_state(
@@ -1392,6 +1398,62 @@ fn install_make_recipe_runner() {
             );
         },
     ));
+}
+
+fn write_target_log(output: &[u8], phase: kati::fileutil::EdgePhase, bytes: &[u8]) {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    use std::io::Write;
+    use std::sync::OnceLock;
+
+    static LOGS: OnceLock<Mutex<std::collections::HashMap<Vec<u8>, std::fs::File>>> =
+        OnceLock::new();
+    let Some(directory) = std::env::var_os("SARUN_KATI_TARGET_LOG_DIR") else {
+        return;
+    };
+    let logs = LOGS.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    let mut logs = logs.lock();
+    match phase {
+        kati::fileutil::EdgePhase::Start => {
+            let directory = std::path::PathBuf::from(directory);
+            if std::fs::create_dir_all(&directory).is_err() {
+                return;
+            }
+            let mut hasher = DefaultHasher::new();
+            output.hash(&mut hasher);
+            let label = String::from_utf8_lossy(output);
+            let basename = label
+                .rsplit('/')
+                .next()
+                .unwrap_or("target")
+                .chars()
+                .map(|character| {
+                    if character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_') {
+                        character
+                    } else {
+                        '_'
+                    }
+                })
+                .take(80)
+                .collect::<String>();
+            let path = directory.join(format!("{basename}-{:016x}.log", hasher.finish()));
+            if let Ok(mut file) = std::fs::File::create(path) {
+                let _ = writeln!(file, "target: {label}");
+                logs.insert(output.to_vec(), file);
+            }
+        }
+        kati::fileutil::EdgePhase::Output => {
+            if let Some(file) = logs.get_mut(output) {
+                let _ = file.write_all(bytes);
+                let _ = file.flush();
+            }
+        }
+        kati::fileutil::EdgePhase::Done => {
+            if let Some(file) = logs.remove(output) {
+                let _ = file.sync_all();
+            }
+        }
+    }
 }
 
 /// GNU-shaped `make --help` text for the embedded make: the options the

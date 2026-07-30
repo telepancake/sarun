@@ -9480,6 +9480,40 @@ fn mirror_detail_lines(app: &App) -> Vec<Line<'static>> {
             .max(0);
         out.push(field("elapsed", format!("{}m {:02}s", elapsed / 60, elapsed % 60)));
     }
+    if let Some(phase) = &j.build_phase {
+        out.push(field("phase", phase.clone()));
+    }
+    if let Some(snapshot) = &j.build_snapshot {
+        out.push(field("snapshot", snapshot.clone()));
+    }
+    if let (Some(completed), Some(total)) = (j.targets_completed, j.targets_total) {
+        let active = j.targets_active.len() as u64;
+        let pending = total.saturating_sub(completed.saturating_add(active));
+        out.push(field(
+            "targets",
+            format!("{completed}/{total} done · {active} active · {pending} pending"),
+        ));
+    }
+    for target in &j.targets_active {
+        out.push(field("active", target.clone()));
+    }
+    if let (Some(completed), Some(total)) =
+        (j.source_bytes_completed, j.source_bytes_total)
+    {
+        let percent = if total == 0 {
+            String::new()
+        } else {
+            format!(" · {}%", completed.saturating_mul(100) / total)
+        };
+        out.push(field(
+            "source",
+            format!(
+                "{} / {}{percent}",
+                fmt_bytes(completed.min(i64::MAX as u64) as i64),
+                fmt_bytes(total.min(i64::MAX as u64) as i64),
+            ),
+        ));
+    }
     if let Some(bytes) = j.mirror_bytes {
         out.push(field(
             "mirror disk",
@@ -22529,6 +22563,45 @@ mod tests {
             app.right_scroll, manual_scroll,
             "manual mirror scrollback must not be pulled back to the bottom"
         );
+    }
+
+    #[test]
+    fn mirror_detail_shows_durable_build_graph_progress() {
+        let mut app = headless_app();
+        app.focus = Pane::Mirrors;
+        app.mirror_jobs = vec![serde_json::from_value(json!({
+            "id": 1,
+            "kind": "wiki",
+            "src": "ruwiki",
+            "dest": "/tmp/ruwiki.swdump",
+            "interval_secs": 86400,
+            "paused": false,
+            "last_start": 1,
+            "last_end": null,
+            "last_exit": null,
+            "last_detail": "",
+            "state": "running",
+            "next_due": null,
+            "build_phase": "fetching and parsing",
+            "build_snapshot": "2026-07-01",
+            "targets_total": 432,
+            "targets_completed": 120,
+            "targets_active": ["content-000120", "history-000003"],
+            "source_bytes_total": 256000000000_u64,
+            "source_bytes_completed": 71000000000_u64
+        }))
+        .unwrap()];
+
+        let text = mirror_detail_lines(&app)
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(text.contains("fetching and parsing"));
+        assert!(text.contains("120/432 done · 2 active · 310 pending"));
+        assert!(text.contains("content-000120"));
+        assert!(text.contains("history-000003"));
+        assert!(text.contains("27%"));
     }
 
     /// The Network/Web pane (DESIGN-web.md W4) renders the box's webcap rows:

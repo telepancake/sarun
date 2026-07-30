@@ -378,6 +378,7 @@ fn update_archive_overlaps_daily_runs_and_merges_with_full_archive() {
     encoder.write_all(&xml).unwrap();
     let daily_bytes = encoder.finish().unwrap();
     let daily_md5 = hex::encode(Md5::digest(&daily_bytes));
+    let mut daily_parts = Vec::new();
     for date in ["20240530", "20240601", "20240602"] {
         update_server.mock(move |when, then| {
             when.method(GET)
@@ -392,11 +393,11 @@ fn update_archive_overlaps_daily_runs_and_merges_with_full_archive() {
             then.status(200).body(sums.clone());
         });
         let body = daily_bytes.clone();
-        update_server.mock(move |when, then| {
+        daily_parts.push(update_server.mock(move |when, then| {
             when.method(GET)
                 .path(format!("/other/incr/testwiki/{date}/{filename}"));
             then.status(200).body(body.clone());
-        });
+        }));
     }
     update_server.mock(|when, then| {
         when.method(GET).path("/other/mediawiki_history/");
@@ -450,6 +451,40 @@ fn update_archive_overlaps_daily_runs_and_merges_with_full_archive() {
     assert_eq!(stats.incremental_runs, 3);
     assert_eq!(stats.history_parts, 2);
     assert_eq!(april.hits(), 0, "old completed history partition was fetched");
+    let daily_hits = daily_parts.iter().map(|part| part.hits()).collect::<Vec<_>>();
+    let history_hits = recent_history
+        .iter()
+        .map(|part| part.hits())
+        .collect::<Vec<_>>();
+    std::fs::remove_file(&update).unwrap();
+    build_update_archive(
+        &Client::new(),
+        &Config {
+            base_url: update_server.base_url(),
+        },
+        "testwiki",
+        &base,
+        &update,
+        tmp.path().join("update-scratch"),
+        3,
+        1024,
+        CompressionSettings::default(),
+        |_| (),
+    )
+    .unwrap();
+    assert_eq!(
+        daily_parts.iter().map(|part| part.hits()).collect::<Vec<_>>(),
+        daily_hits,
+        "durable daily targets were fetched again"
+    );
+    assert_eq!(
+        recent_history
+            .iter()
+            .map(|part| part.hits())
+            .collect::<Vec<_>>(),
+        history_hits,
+        "durable history targets were fetched again"
+    );
 
     let merged = tmp.path().join("merged.swdump");
     merge_many_archives(

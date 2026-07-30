@@ -89,3 +89,4 @@
 0890-Provide-GNU-default-ARFLAGS-variable.patch
 0900-Ignore-inline-comments-before-classifying-make-syntax.patch
 0910-Route-embedded-make-reads-through-scoped-filesystem-provider.patch
+0920-kati--expose-target-attributed-live-recipe-output.patch

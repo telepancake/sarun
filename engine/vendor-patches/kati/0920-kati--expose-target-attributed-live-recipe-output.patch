@@ -1,0 +1,42 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Thu, 30 Jul 2026 07:02:19 +0000
+Subject: [PATCH] kati: expose target-attributed live recipe output
+
+Report each live recipe chunk through the existing edge hook so embedders can retain independent per-target logs without changing ordinary make output ordering.
+
+---
+diff --git a/src-rs/exec.rs b/src-rs/exec.rs
+index 0f5debe..3974001 100644
+--- a/src-rs/exec.rs
++++ b/src-rs/exec.rs
+@@ -348,6 +348,8 @@ fn run_node_commands(
+             let overflow = x.len().saturating_sub(1024);
+             if overflow > 0 { x.drain(..overflow); }
+         }
++        crate::fileutil::report_edge(output.as_bytes().as_ref(),
++                                     crate::fileutil::EdgePhase::Output, 0, b);
+         emit(b)
+     };
+     let emit = &mut emit as &mut dyn FnMut(&[u8]);
+diff --git a/src-rs/fileutil.rs b/src-rs/fileutil.rs
+index 176ad44..0655813 100644
+--- a/src-rs/fileutil.rs
++++ b/src-rs/fileutil.rs
+@@ -159,13 +159,15 @@ pub fn run_with_installed_runner(
+ pub enum EdgePhase {
+     /// Recipe is about to run (its first concrete command is starting).
+     Start,
++    /// A chunk of this recipe's merged stdout/stderr became available.
++    Output,
+     /// Recipe finished; `code` is the exit status (0 = success).
+     Done,
+ }
+ 
+ pub type EdgeReporter = Arc<
+     dyn Fn(&[u8] /* output */, EdgePhase, i32 /* exit code */,
+-           &[u8] /* recipe output excerpt (tail ~1KB; empty on Start) */)
++           &[u8] /* output chunk, or tail ~1KB on Done; empty on Start */)
+         + Send + Sync + 'static,
+ >;
+ 

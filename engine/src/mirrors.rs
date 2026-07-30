@@ -110,6 +110,20 @@ pub struct Job {
     pub scratch_bytes: Option<u64>,
     #[serde(default)]
     pub available_bytes: Option<u64>,
+    #[serde(default)]
+    pub build_phase: Option<String>,
+    #[serde(default)]
+    pub build_snapshot: Option<String>,
+    #[serde(default)]
+    pub targets_total: Option<u64>,
+    #[serde(default)]
+    pub targets_completed: Option<u64>,
+    #[serde(default)]
+    pub targets_active: Vec<String>,
+    #[serde(default)]
+    pub source_bytes_total: Option<u64>,
+    #[serde(default)]
+    pub source_bytes_completed: Option<u64>,
 }
 
 fn derive(mut j: Job) -> Job {
@@ -148,6 +162,17 @@ fn derive(mut j: Job) -> Job {
         .then(|| cached_path_bytes(&wikimak_wikipedia::mirror_scratch_path(destination)))
         .flatten();
     j.available_bytes = destination.parent().and_then(available_bytes);
+    if j.kind == "wiki" {
+        if let Some(progress) = wikimak_wikipedia::mirror_build_progress(destination) {
+            j.build_phase = Some(progress.phase);
+            j.build_snapshot = Some(progress.snapshot);
+            j.targets_total = Some(progress.targets_total);
+            j.targets_completed = Some(progress.targets_completed);
+            j.targets_active = progress.targets_active;
+            j.source_bytes_total = Some(progress.source_bytes_total);
+            j.source_bytes_completed = Some(progress.source_bytes_completed);
+        }
+    }
     j
 }
 
@@ -235,6 +260,13 @@ pub fn jobs_list() -> Result<Vec<Job>, String> {
                 mirror_bytes: None,
                 scratch_bytes: None,
                 available_bytes: None,
+                build_phase: None,
+                build_snapshot: None,
+                targets_total: None,
+                targets_completed: None,
+                targets_active: Vec::new(),
+                source_bytes_total: None,
+                source_bytes_completed: None,
             })
         })
         .map_err(|e| e.to_string())?;

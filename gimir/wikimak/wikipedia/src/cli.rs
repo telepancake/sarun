@@ -5,6 +5,50 @@ use std::path::{Path, PathBuf};
 
 use crate::archive::MIRROR_FRAME_TARGET;
 
+struct MirrorBuildLock(std::fs::File);
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct UpdateCheckpointReceipt {
+    schema: u32,
+    wiki_db: String,
+    checkpoint_key: String,
+    overlap_days: u64,
+    frame_target: usize,
+    compression_level: i32,
+}
+
+impl MirrorBuildLock {
+    fn acquire(scratch: &Path) -> Result<Self, String> {
+        use std::os::fd::AsRawFd;
+        std::fs::create_dir_all(scratch)
+            .map_err(|error| format!("{}: {error}", scratch.display()))?;
+        let path = scratch.join("build.lock");
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|error| format!("{}: {error}", path.display()))?;
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            return Err(format!(
+                "{}: another mirror build is already running",
+                scratch.display()
+            ));
+        }
+        Ok(Self(file))
+    }
+}
+
+impl Drop for MirrorBuildLock {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+        unsafe {
+            libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
 fn http_client() -> Result<reqwest::blocking::Client, String> {
     let operator = std::env::var("SARUN_WIKIMEDIA_CONTACT")
         .ok()
@@ -86,14 +130,201 @@ pub fn mirror_auxiliary_paths(archive: &Path) -> Result<Vec<PathBuf>, String> {
     ])
 }
 
-fn reset_mirror_scratch(archive: &Path) -> Result<PathBuf, String> {
+fn ensure_mirror_scratch(archive: &Path) -> Result<PathBuf, String> {
     let scratch = mirror_scratch_path(archive);
-    if scratch.exists() {
-        remove_path(&scratch).map_err(|error| format!("{}: {error}", scratch.display()))?;
-    }
     std::fs::create_dir_all(&scratch)
         .map_err(|error| format!("{}: {error}", scratch.display()))?;
     Ok(scratch)
+}
+
+fn clear_mirror_scratch(scratch: &Path) -> Result<(), String> {
+    for entry in
+        std::fs::read_dir(scratch).map_err(|error| format!("{}: {error}", scratch.display()))?
+    {
+        let entry = entry.map_err(|error| format!("{}: {error}", scratch.display()))?;
+        if entry.file_name() == "build.lock" {
+            continue;
+        }
+        remove_path(&entry.path())
+            .map_err(|error| format!("{}: {error}", entry.path().display()))?;
+    }
+    sync_parent(&scratch.join("build.lock"))
+}
+
+fn persist_json(path: &Path, value: &impl serde::Serialize) -> Result<(), String> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|error| format!("{}: {error}", parent.display()))?;
+    serde_json::to_writer(&mut temporary, value)
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    use std::io::Write;
+    temporary
+        .write_all(b"\n")
+        .and_then(|_| temporary.as_file().sync_all())
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    temporary
+        .persist(path)
+        .map_err(|error| format!("{}: {}", path.display(), error.error))?;
+    sync_parent(path)
+}
+
+fn persist_text(path: &Path, text: &str) -> Result<(), String> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|error| format!("{}: {error}", parent.display()))?;
+    use std::io::Write;
+    temporary
+        .write_all(text.as_bytes())
+        .and_then(|_| temporary.as_file().sync_all())
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    temporary
+        .persist(path)
+        .map_err(|error| format!("{}: {}", path.display(), error.error))?;
+    sync_parent(path)
+}
+
+fn executable_is_standalone_wikimak(executable: &Path) -> bool {
+    executable
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == "wikimak")
+}
+
+fn prepare_build_tools(scratch: &Path) -> Result<(), String> {
+    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    let tool = scratch.join("wikimak-tool");
+    if std::fs::symlink_metadata(&tool).is_ok() {
+        std::fs::remove_file(&tool)
+            .map_err(|error| format!("{}: {error}", tool.display()))?;
+    }
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&executable, &tool)
+        .map_err(|error| format!("{}: {error}", tool.display()))?;
+    if !executable_is_standalone_wikimak(&executable) {
+        let make = scratch.join("make");
+        if std::fs::symlink_metadata(&make).is_ok() {
+            std::fs::remove_file(&make)
+                .map_err(|error| format!("{}: {error}", make.display()))?;
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(executable, &make)
+            .map_err(|error| format!("{}: {error}", make.display()))?;
+    }
+    Ok(())
+}
+
+fn build_tool_command() -> Result<&'static str, String> {
+    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    Ok(if executable_is_standalone_wikimak(&executable) {
+        "./wikimak-tool"
+    } else {
+        "./wikimak-tool wikimak"
+    })
+}
+
+fn recursive_make_command() -> Result<&'static str, String> {
+    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    Ok(if executable_is_standalone_wikimak(&executable) {
+        "$(MAKE)"
+    } else {
+        "./make"
+    })
+}
+
+fn make_program() -> Result<PathBuf, String> {
+    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    Ok(if executable_is_standalone_wikimak(&executable) {
+        PathBuf::from("make")
+    } else {
+        PathBuf::from("./make")
+    })
+}
+
+fn build_node_targets(plan: &crate::direct::DirectBuildPlan) -> Vec<String> {
+    (0..plan.content_groups.len())
+        .map(|index| format!("nodes/content-{index:06}.done"))
+        .chain(
+            (0..plan.history_files.len())
+                .map(|index| format!("nodes/history-{index:06}.done")),
+        )
+        .collect()
+}
+
+fn write_stage_one_makefile(
+    scratch: &Path,
+    plan: &crate::direct::DirectBuildPlan,
+) -> Result<(), String> {
+    let tool = build_tool_command()?;
+    let make = recursive_make_command()?;
+    let cores = std::thread::available_parallelism().map_or(1, usize::from);
+    let outer_workers = plan.target_count().min(cores).min(3).max(1);
+    let bz2_workers = (cores / outer_workers).max(1);
+    let targets = build_node_targets(plan);
+    let mut makefile = String::from(".PHONY: all\n");
+    makefile.push_str("ifneq ($(wildcard archive.complete),)\nall:\n");
+    makefile.push_str(&format!(
+        "else\nall: stage2.mk\n\t@{make} -f stage2.mk -j1\n\n"
+    ));
+    makefile.push_str("stage2.mk:");
+    for target in &targets {
+        makefile.push(' ');
+        makefile.push_str(target);
+    }
+    makefile.push_str(&format!(
+        "\n\t@{tool} build-stage2 . plan.json\n\n"
+    ));
+    for index in 0..plan.content_groups.len() {
+        makefile.push_str(&format!(
+            "nodes/content-{index:06}.done:\n\
+             \t@{tool} build-node . plan.json content {index} {bz2_workers}\n\n"
+        ));
+    }
+    for index in 0..plan.history_files.len() {
+        makefile.push_str(&format!(
+            "nodes/history-{index:06}.done:\n\
+             \t@{tool} build-node . plan.json history {index} {bz2_workers}\n\n"
+        ));
+    }
+    makefile.push_str("endif\n");
+    persist_text(&scratch.join("stage1.mk"), &makefile)
+}
+
+fn write_stage_two_makefile(
+    scratch: &Path,
+    plan: &crate::direct::DirectBuildPlan,
+) -> Result<(), String> {
+    let tool = build_tool_command()?;
+    let mut makefile = String::from(".PHONY: all\nall: archive.complete\n\narchive.complete:");
+    for target in build_node_targets(plan) {
+        makefile.push(' ');
+        makefile.push_str(&target);
+    }
+    makefile.push_str(&format!(
+        "\n\t@{tool} build-assemble . plan.json\n"
+    ));
+    persist_text(&scratch.join("stage2.mk"), &makefile)
+}
+
+fn run_build_make(scratch: &Path) -> Result<(), String> {
+    let log_directory = std::fs::canonicalize(scratch)
+        .map_err(|error| format!("{}: {error}", scratch.display()))?
+        .join("target-logs");
+    let status = std::process::Command::new(make_program()?)
+        .current_dir(scratch)
+        .env("SARUN_KATI_TARGET_LOG_DIR", log_directory)
+        .args(["-f", "stage1.mk", "-j3"])
+        .status()
+        .map_err(|error| format!("cannot start resumable build: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "resumable build stopped with {}",
+            status
+                .code()
+                .map_or_else(|| "a signal".to_owned(), |code| format!("exit {code}"))
+        ))
+    }
 }
 
 fn recover_interrupted_install(destination: &Path) -> Result<(), String> {
@@ -119,16 +350,24 @@ fn recover_interrupted_install(destination: &Path) -> Result<(), String> {
             std::fs::rename(&old_title, &title)
                 .map_err(|error| format!("{}: {error}", title.display()))?;
         }
-        (false, false) => {}
-        (archive_backup, title_backup) => {
-            if archive_backup {
-                remove_path(&old_archive)
-                    .map_err(|error| format!("{}: {error}", old_archive.display()))?;
+        (false, false) => match (destination.exists(), title.exists()) {
+            (true, false) => remove_path(destination)
+                .map_err(|error| format!("{}: {error}", destination.display()))?,
+            (false, true) => std::fs::remove_file(&title)
+                .map_err(|error| format!("{}: {error}", title.display()))?,
+            _ => {}
+        },
+        (true, false) => {
+            if destination.exists() {
+                remove_path(destination)
+                    .map_err(|error| format!("{}: {error}", destination.display()))?;
             }
-            if title_backup {
-                std::fs::remove_file(&old_title)
-                    .map_err(|error| format!("{}: {error}", old_title.display()))?;
-            }
+            std::fs::rename(&old_archive, destination)
+                .map_err(|error| format!("{}: {error}", destination.display()))?;
+        }
+        (false, true) => {
+            std::fs::remove_file(&old_title)
+                .map_err(|error| format!("{}: {error}", old_title.display()))?;
         }
     }
     std::fs::remove_file(&marker)
@@ -143,20 +382,28 @@ fn persist_archive_pair(
 ) -> Result<(), String> {
     let title = destination.with_extension("swtitle");
     if !destination.exists() && !title.exists() {
-        std::fs::rename(&archive, destination)
-            .map_err(|error| format!("{}: {error}", destination.display()))?;
-        if let Err(error) = titles.persist(&title) {
-            let cleanup = remove_path(destination);
-            return match cleanup {
-                Ok(()) => Err(format!("{}: {}", title.display(), error.error)),
-                Err(cleanup) => Err(format!(
-                    "{}: {}; could not remove incomplete {}: {cleanup}",
-                    title.display(),
-                    error.error,
-                    destination.display()
-                )),
-            };
+        let marker = install_sidecar(destination, ".installing")?;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&marker)
+            .and_then(|file| file.sync_all())
+            .map_err(|error| format!("{}: {error}", marker.display()))?;
+        sync_parent(destination)?;
+        let install = std::fs::rename(&archive, destination)
+            .map_err(|error| format!("{}: {error}", destination.display()))
+            .and_then(|_| {
+                titles
+                    .persist(&title)
+                    .map_err(|error| format!("{}: {}", title.display(), error.error))
+            })
+            .and_then(|_| sync_parent(destination));
+        if let Err(error) = install {
+            recover_interrupted_install(destination)?;
+            return Err(error);
         }
+        std::fs::remove_file(&marker)
+            .map_err(|error| format!("{}: {error}", marker.display()))?;
         return sync_parent(destination);
     }
     if !destination.exists() || !title.exists() {
@@ -238,56 +485,172 @@ fn build_full(
     client: &reqwest::blocking::Client,
     dbname: &str,
     archive: &Path,
-    scratch_parent: &Path,
+    scratch: &Path,
+    replace_plan: bool,
 ) -> Result<(), String> {
     recover_interrupted_install(archive)?;
-    std::fs::create_dir_all(scratch_parent)
-        .map_err(|error| format!("{}: {error}", scratch_parent.display()))?;
-    let scratch = tempfile::TempDir::new_in(scratch_parent)
-        .map_err(|error| format!("{}: {error}", scratch_parent.display()))?;
-    let build_root = tempfile::TempDir::new_in(scratch.path())
-        .map_err(|error| format!("{}: {error}", scratch.path().display()))?;
-    let built = build_root.path().join("archive.swdump");
-    crate::build_direct_archive(
-        client,
-        &wikimak_mediawiki::Config::default(),
-        dbname,
-        &built,
-        scratch.path(),
-        |message| eprintln!("{message}"),
-    )
-    .map_err(|error| error.to_string())?;
-    install_built_archive(built, archive, scratch.path())
+    std::fs::create_dir_all(scratch)
+        .map_err(|error| format!("{}: {error}", scratch.display()))?;
+    let _lock = MirrorBuildLock::acquire(scratch)?;
+    if replace_plan {
+        clear_mirror_scratch(scratch)?;
+    }
+    let plan_path = scratch.join("plan.json");
+    let plan = if plan_path.exists() {
+        let plan = crate::direct::read_direct_build_plan(&plan_path)
+            .map_err(|error| error.to_string())?;
+        if plan.wiki_db != dbname {
+            return Err(format!(
+                "{} belongs to {}, not {dbname}",
+                plan_path.display(),
+                plan.wiki_db,
+            ));
+        }
+        eprintln!(
+            "resuming snapshot {} with {} source targets",
+            plan.content_snapshot,
+            plan.target_count(),
+        );
+        plan
+    } else {
+        let plan = crate::direct::discover_direct_build_plan(
+            client,
+            &wikimak_mediawiki::Config::default(),
+            dbname,
+            &|message| eprintln!("{message}"),
+        )
+        .map_err(|error| error.to_string())?;
+        persist_json(&plan_path, &plan)?;
+        plan
+    };
+    let reusable = crate::direct::prune_invalid_build_nodes(scratch, &plan)
+        .map_err(|error| error.to_string())?;
+    crate::direct::recover_direct_build_completion(scratch, &plan)
+        .map_err(|error| error.to_string())?;
+    if reusable != 0 {
+        eprintln!(
+            "resuming with {reusable}/{} source targets already durable",
+            plan.target_count(),
+        );
+    }
+    prepare_build_tools(scratch)?;
+    write_stage_one_makefile(scratch, &plan)?;
+    run_build_make(scratch)?;
+    let built = scratch.join("archive.swdump");
+    crate::archive_set::ArchiveSetReader::open(&built)
+        .map_err(|error| error.to_string())?;
+    if !scratch.join("archive.complete").exists() {
+        return Err("resumable build stopped without a complete archive".into());
+    }
+    install_built_archive(built, archive, scratch)?;
+    remove_path(scratch).map_err(|error| format!("{}: {error}", scratch.display()))
 }
 
 fn cmd_fetch(dbname: &str, archive: &str) -> Result<(), String> {
     let archive = Path::new(archive);
     recover_interrupted_install(archive)?;
-    let scratch_parent = reset_mirror_scratch(archive)?;
     let client = http_client()?;
     if !archive.exists() {
-        return build_full(&client, dbname, archive, &scratch_parent);
+        return build_full(
+            &client,
+            dbname,
+            archive,
+            &ensure_mirror_scratch(archive)?,
+            false,
+        );
     }
-    std::fs::create_dir_all(&scratch_parent)
-        .map_err(|error| format!("{}: {error}", scratch_parent.display()))?;
-    let scratch = tempfile::TempDir::new_in(&scratch_parent)
-        .map_err(|error| format!("{}: {error}", scratch_parent.display()))?;
-    let partial = scratch.path().join("update.swdump");
-    crate::build_update_archive(
-        &client,
-        &wikimak_mediawiki::Config::default(),
-        dbname,
-        archive,
-        &partial,
-        scratch.path(),
-        3,
-        MIRROR_FRAME_TARGET,
-        mirror_compression(),
-        |message| eprintln!("{message}"),
-    )
-    .map_err(|error| error.to_string())?;
-
+    let scratch = ensure_mirror_scratch(archive)?;
+    let _lock = MirrorBuildLock::acquire(&scratch)?;
+    let partial = scratch.join("update.swdump");
+    let receipt_path = scratch.join("update.receipt.json");
     let update_marker = install_sidecar(archive, ".updating")?;
+    let overlap_days = 3;
+    let compression = mirror_compression();
+    let expected_checkpoint_key = (!update_marker.exists())
+        .then(|| {
+            crate::direct::update_checkpoint_key(
+                archive,
+                dbname,
+                overlap_days,
+                MIRROR_FRAME_TARGET,
+                compression,
+            )
+        })
+        .transpose()
+        .map_err(|error| error.to_string())?;
+    let receipt = std::fs::read(&receipt_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<UpdateCheckpointReceipt>(&bytes).ok());
+    let receipt_matches = receipt.as_ref().is_some_and(|receipt| {
+        receipt.schema == 1
+            && receipt.wiki_db == dbname
+            && receipt.overlap_days == overlap_days
+            && receipt.frame_target == MIRROR_FRAME_TARGET
+            && receipt.compression_level == compression.level
+            && expected_checkpoint_key
+                .as_ref()
+                .is_none_or(|expected| receipt.checkpoint_key == *expected)
+    });
+    let partial_complete = partial
+        .exists()
+        .then(|| crate::archive::index_file(&partial))
+        .transpose()
+        .map_err(|error| error.to_string())?
+        .is_some_and(|(_, _, complete)| complete)
+        && receipt_matches;
+    if (partial.exists() || receipt_path.exists()) && !partial_complete {
+        if update_marker.exists() {
+            return Err(format!(
+                "{} exists but its update checkpoint is missing or belongs to another build",
+                update_marker.display()
+            ));
+        }
+        if partial.exists() {
+            std::fs::remove_file(&partial)
+                .map_err(|error| format!("{}: {error}", partial.display()))?;
+        }
+        if receipt_path.exists() {
+            std::fs::remove_file(&receipt_path)
+                .map_err(|error| format!("{}: {error}", receipt_path.display()))?;
+        }
+    }
+    if update_marker.exists() && !partial_complete {
+        return Err(format!(
+            "{} exists but its durable update stream is missing; refusing to continue from a \
+             possibly mixed range generation",
+            update_marker.display()
+        ));
+    }
+    if partial_complete {
+        eprintln!("reusing durable sorted update stream");
+    } else {
+        crate::build_update_archive(
+            &client,
+            &wikimak_mediawiki::Config::default(),
+            dbname,
+            archive,
+            &partial,
+            &scratch,
+            overlap_days,
+            MIRROR_FRAME_TARGET,
+            compression,
+            |message| eprintln!("{message}"),
+        )
+        .map_err(|error| error.to_string())?;
+        persist_json(
+            &receipt_path,
+            &UpdateCheckpointReceipt {
+                schema: 1,
+                wiki_db: dbname.to_owned(),
+                checkpoint_key: expected_checkpoint_key
+                    .expect("computed before update mutation"),
+                overlap_days,
+                frame_target: MIRROR_FRAME_TARGET,
+                compression_level: compression.level,
+            },
+        )?;
+    }
+
     if !update_marker.exists() {
         std::fs::OpenOptions::new()
             .write(true)
@@ -333,8 +696,8 @@ fn cmd_fetch(dbname: &str, archive: &str) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
 
     eprintln!("rebuilding the single title and virtual-frame index");
-    let mut titles = tempfile::NamedTempFile::new_in(scratch.path())
-        .map_err(|error| format!("{}: {error}", scratch.path().display()))?;
+    let mut titles = tempfile::NamedTempFile::new_in(&scratch)
+        .map_err(|error| format!("{}: {error}", scratch.display()))?;
     let title_entries = crate::title_index::build(archive, titles.path())
         .map_err(|error| error.to_string())?;
     titles
@@ -349,7 +712,7 @@ fn cmd_fetch(dbname: &str, archive: &str) -> Result<(), String> {
         .map_err(|error| format!("{}: {error}", update_marker.display()))?;
     sync_parent(archive)?;
     eprintln!("{records} records, {frames} frames, {title_entries} title intervals");
-    Ok(())
+    remove_path(&scratch).map_err(|error| format!("{}: {error}", scratch.display()))
 }
 
 fn cmd_refresh_full(dbname: &str, archive: &str) -> Result<(), String> {
@@ -358,7 +721,8 @@ fn cmd_refresh_full(dbname: &str, archive: &str) -> Result<(), String> {
         &http_client()?,
         dbname,
         archive,
-        &reset_mirror_scratch(archive)?,
+        &ensure_mirror_scratch(archive)?,
+        true,
     )
 }
 
@@ -595,6 +959,48 @@ fn cmd_inspect(path: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn cmd_build_node(args: &[&str]) -> Result<(), String> {
+    let [root, plan, kind, index, bz2_workers] = args else {
+        return Err(
+            "build-node wants <root> <plan.json> <content|history> <index> <bz2-workers>"
+                .into(),
+        );
+    };
+    let root = Path::new(root);
+    let plan = crate::direct::read_direct_build_plan(&root.join(plan))
+        .map_err(|error| error.to_string())?;
+    let index = index
+        .parse::<usize>()
+        .map_err(|error| format!("target index: {error}"))?;
+    let bz2_workers = positive_size(bz2_workers, "bzip2 workers")?;
+    crate::direct::materialize_direct_build_node(
+        &http_client()?,
+        root,
+        &plan,
+        kind,
+        index,
+        bz2_workers,
+        &|message| eprintln!("{message}"),
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn cmd_build_stage_two(root: &str, plan: &str) -> Result<(), String> {
+    let root = Path::new(root);
+    let plan = crate::direct::read_direct_build_plan(&root.join(plan))
+        .map_err(|error| error.to_string())?;
+    write_stage_two_makefile(root, &plan)
+}
+
+fn cmd_build_assemble(root: &str, plan: &str) -> Result<(), String> {
+    let root = Path::new(root);
+    let plan = crate::direct::read_direct_build_plan(&root.join(plan))
+        .map_err(|error| error.to_string())?;
+    crate::direct::assemble_direct_build(root, &plan, &|message| eprintln!("{message}"))
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
 fn arm_parent_watchdog() {
     let Some(expected) = std::env::var("SARUN_MIRROR_PARENT_PID")
         .ok()
@@ -607,7 +1013,13 @@ fn arm_parent_watchdog() {
             std::thread::sleep(std::time::Duration::from_secs(2));
             if unsafe { libc::getppid() } != expected {
                 eprintln!("wikimak: supervising sarun engine exited; stopping mirror job");
-                std::process::exit(1);
+                unsafe {
+                    let group = libc::getpgrp();
+                    if group == libc::getpid() {
+                        libc::kill(-group, libc::SIGTERM);
+                    }
+                    libc::_exit(1);
+                }
             }
         }
     });
@@ -631,6 +1043,9 @@ pub fn cli_main(args: &[String]) -> i32 {
         ["repack", arguments @ ..] => cmd_repack(arguments),
         ["merge", arguments @ ..] => cmd_merge(arguments),
         ["inspect", archive] => cmd_inspect(archive),
+        ["build-node", arguments @ ..] => cmd_build_node(arguments),
+        ["build-stage2", root, plan] => cmd_build_stage_two(root, plan),
+        ["build-assemble", root, plan] => cmd_build_assemble(root, plan),
         _ => Err(
             "usage: wikimak discover <dbname>\n\
              \x20      wikimak fetch <dbname> <archive.swdump>\n\
@@ -723,6 +1138,60 @@ mod tests {
 
         assert_eq!(std::fs::read(archive.join("payload")).unwrap(), b"old archive");
         assert_eq!(std::fs::read(&titles).unwrap(), b"old titles");
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn interruption_between_archive_backup_and_title_backup_restores_archive() {
+        let temporary = tempfile::tempdir().unwrap();
+        let archive = temporary.path().join("wiki.swdump");
+        let titles = archive.with_extension("swtitle");
+        std::fs::create_dir(&archive).unwrap();
+        std::fs::write(archive.join("payload"), b"old archive").unwrap();
+        std::fs::write(&titles, b"old titles").unwrap();
+        let marker = install_sidecar(&archive, ".installing").unwrap();
+        let old_archive = install_sidecar(&archive, ".previous").unwrap();
+        std::fs::write(&marker, b"").unwrap();
+        std::fs::rename(&archive, &old_archive).unwrap();
+
+        recover_interrupted_install(&archive).unwrap();
+
+        assert_eq!(std::fs::read(archive.join("payload")).unwrap(), b"old archive");
+        assert_eq!(std::fs::read(&titles).unwrap(), b"old titles");
+        assert!(!marker.exists());
+        assert!(!old_archive.exists());
+    }
+
+    #[test]
+    fn interrupted_first_install_removes_an_unpaired_archive() {
+        let temporary = tempfile::tempdir().unwrap();
+        let archive = temporary.path().join("wiki.swdump");
+        let marker = install_sidecar(&archive, ".installing").unwrap();
+        std::fs::write(&marker, b"").unwrap();
+        std::fs::create_dir(&archive).unwrap();
+        std::fs::write(archive.join("payload"), b"incomplete").unwrap();
+
+        recover_interrupted_install(&archive).unwrap();
+
+        assert!(!archive.exists());
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn interrupted_first_install_keeps_a_complete_pair() {
+        let temporary = tempfile::tempdir().unwrap();
+        let archive = temporary.path().join("wiki.swdump");
+        let title = archive.with_extension("swtitle");
+        let marker = install_sidecar(&archive, ".installing").unwrap();
+        std::fs::write(&marker, b"").unwrap();
+        std::fs::create_dir(&archive).unwrap();
+        std::fs::write(archive.join("payload"), b"complete").unwrap();
+        std::fs::write(&title, b"complete titles").unwrap();
+
+        recover_interrupted_install(&archive).unwrap();
+
+        assert!(archive.exists());
+        assert!(title.exists());
         assert!(!marker.exists());
     }
 }

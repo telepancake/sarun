@@ -92,7 +92,7 @@ pub struct ArchiveSetOutput {
     state: WriteState,
     complete: bool,
     replace_root: Option<PathBuf>,
-    range_boundaries: VecDeque<(EntityKind, u64)>,
+    range_boundaries: VecDeque<(EntityKind, u64, String)>,
 }
 
 impl ArchiveSetOutput {
@@ -136,7 +136,11 @@ impl ArchiveSetOutput {
         output.replace_root = Some(destination.to_path_buf());
         output.range_boundaries = segments
             .iter()
-            .filter_map(|segment| segment.kind.map(|kind| (kind, segment.last_id)))
+            .filter_map(|segment| {
+                segment
+                    .kind
+                    .map(|kind| (kind, segment.last_id, segment.name.clone()))
+            })
             .collect();
         Ok(output)
     }
@@ -192,7 +196,7 @@ impl ArchiveSetOutput {
         let Some(part) = self.range.take() else {
             return Ok(());
         };
-        let name = match part.kind {
+        let generated_name = match part.kind {
             Some(EntityKind::Page) => format!(
                 "1000-p{:020}-p{:020}{PART_SUFFIX}",
                 part.first_id, part.last_id
@@ -207,6 +211,14 @@ impl ArchiveSetOutput {
             ),
             None => return Err(ArchiveError::Invalid("range part has no entity kind")),
         };
+        let name = self
+            .range_boundaries
+            .front()
+            .filter(|(kind, last_id, _)| {
+                part.kind == Some(*kind) && part.last_id == *last_id
+            })
+            .map(|(_, _, name)| name.clone())
+            .unwrap_or(generated_name);
         self.seal_part(part, name)
     }
 
@@ -263,10 +275,10 @@ impl ArchiveSetOutput {
             return Ok(PayloadDestination::Reference);
         }
         if magic == DONE_MAGIC {
-            if let (Some(part), Some((kind, last_id))) =
-                (self.range.as_ref(), self.range_boundaries.front().copied())
+            if let (Some(part), Some((kind, last_id, _))) =
+                (self.range.as_ref(), self.range_boundaries.front())
             {
-                if part.kind != Some(kind) || part.last_id != last_id {
+                if part.kind != Some(*kind) || part.last_id != *last_id {
                     return Err(ArchiveError::Invalid(
                         "replacement stream ended before a range boundary",
                     ));
@@ -294,15 +306,15 @@ impl ArchiveSetOutput {
         if first_id > last_id {
             return Err(ArchiveError::Invalid("archive frame has reversed entity range"));
         }
-        while let (Some(part), Some((boundary_kind, boundary_id))) =
-            (self.range.as_ref(), self.range_boundaries.front().copied())
+        while let (Some(part), Some((boundary_kind, boundary_id, _))) =
+            (self.range.as_ref(), self.range_boundaries.front())
         {
-            let crossed = kind > boundary_kind
-                || (kind == boundary_kind && first_id > boundary_id);
+            let crossed = kind > *boundary_kind
+                || (kind == *boundary_kind && first_id > *boundary_id);
             if !crossed {
                 break;
             }
-            if part.kind != Some(boundary_kind) || part.last_id != boundary_id {
+            if part.kind != Some(*boundary_kind) || part.last_id != *boundary_id {
                 return Err(ArchiveError::Invalid(
                     "replacement stream crossed a range boundary inside a frame",
                 ));
@@ -313,7 +325,7 @@ impl ArchiveSetOutput {
         let has_preserved_boundary = self
             .range_boundaries
             .front()
-            .is_some_and(|(boundary_kind, _)| *boundary_kind == kind);
+            .is_some_and(|(boundary_kind, _, _)| *boundary_kind == kind);
         let split = self.range.as_ref().is_some_and(|part| {
             part.kind != Some(kind)
                 || (!has_preserved_boundary && part.bytes >= self.range_target)
@@ -508,6 +520,12 @@ impl CompletedArchiveSet {
         #[allow(deprecated)]
         let path = self.root.into_path();
         std::fs::rename(path, destination)?;
+        sync_directory(
+            destination
+                .parent()
+                .filter(|path| !path.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new(".")),
+        )?;
         Ok(())
     }
 
