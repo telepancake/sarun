@@ -8,6 +8,8 @@
 pub mod asof;
 pub mod archive;
 pub mod archive_set;
+pub mod backrefs;
+mod backrefs_parse;
 #[cfg(feature = "serve")]
 pub mod archive_browse;
 #[cfg(feature = "fetch")]
