@@ -749,10 +749,12 @@ enum Action {
     WikiMirrorAdd,
     WikiMirrorOpenLibrary,
     MirrorRun,
+    MirrorCancel,
     MirrorRunPending,
     MirrorFullRefresh,
     MirrorTogglePause,
     MirrorRemove,
+    MirrorDeleteData,
     MirrorBrowse,
     MirrorRead,
     PtyNew,
@@ -879,6 +881,8 @@ enum ConfirmAction {
     Dissolve,
     /// Mirrors pane: delete the selected mirror job (by id).
     MirrorRemove(i64),
+    /// Delete the schedule and the selected Wikipedia mirror's owned files.
+    MirrorDeleteData(i64),
     /// Explicitly re-ingest Wikipedia's current full content snapshot.
     MirrorFullRefresh(i64),
 }
@@ -4316,6 +4320,18 @@ impl App {
         self.load_mirrors();
     }
 
+    fn mirror_cancel_selected(&mut self) {
+        let Some(job) = self.mirror_jobs.get(self.sel_mirror) else {
+            return;
+        };
+        let id = job.id;
+        self.status = match self.mirror_verb("mirror_cancel", json!([id])) {
+            Ok(_) => format!("mirror #{id}: stopping importer and transfer children"),
+            Err(error) => format!("mirror #{id}: {error}"),
+        };
+        self.load_mirrors();
+    }
+
     fn confirm_mirror_full_refresh(&mut self) {
         let Some(job) = self.mirror_jobs.get(self.sel_mirror) else {
             self.status = "no mirror job selected".into();
@@ -4447,6 +4463,35 @@ impl App {
             ),
             action: ConfirmAction::MirrorRemove(job.id),
         });
+    }
+
+    fn confirm_mirror_delete_data(&mut self) {
+        let Some(job) = self.mirror_jobs.get(self.sel_mirror) else {
+            self.status = "no mirror job selected".into();
+            return;
+        };
+        if job.kind != "wiki" {
+            self.status = "file deletion is only available for Wikipedia mirrors".into();
+            return;
+        }
+        self.modal = Some(Modal::Confirm {
+            prompt: format!(
+                "Permanently delete Wikipedia mirror #{} and files {} plus its .swtitle index and media cache?",
+                job.id, job.dest
+            ),
+            action: ConfirmAction::MirrorDeleteData(job.id),
+        });
+    }
+
+    fn mirror_delete_data(&mut self, id: i64) {
+        self.status = match self.mirror_verb("mirror_rm_data", json!([id])) {
+            Ok(value) => format!(
+                "mirror #{id}: {}",
+                value.get("note").and_then(Value::as_str).unwrap_or("deleted")
+            ),
+            Err(error) => format!("mirror #{id}: {error}"),
+        };
+        self.load_mirrors();
     }
 
     /// The confirmed mirror-job delete, via `mirror_rm` (the engine owns
@@ -6428,6 +6473,7 @@ impl App {
             ConfirmAction::Kill => self.kill(),
             ConfirmAction::Dissolve => self.dissolve(),
             ConfirmAction::MirrorRemove(id) => self.mirror_remove(id),
+            ConfirmAction::MirrorDeleteData(id) => self.mirror_delete_data(id),
             ConfirmAction::MirrorFullRefresh(id) => self.mirror_full_refresh(id),
         }
     }
@@ -9123,6 +9169,7 @@ fn rules_lines(app: &App) -> Vec<Line<'static>> {
 fn mirror_state_color(state: &str) -> Color {
     match state {
         "running" => Color::Cyan,
+        "stopping" => Color::Yellow,
         "paused" => Color::DarkGray,
         "pending" | "stopped" => Color::Yellow,
         "error" => Color::Red,
@@ -9272,7 +9319,7 @@ fn mirror_cadence_label(seconds: i64) -> String {
 /// MIRRORS pane: one row per mirror-update job.
 fn mirrors_lines(app: &App) -> Vec<Line<'static>> {
     let mut out = vec![Line::from(Span::styled(
-        "n add Wikipedia · O open existing library · Enter read · b browse · r update now · space pause",
+        "n add Wikipedia · O open library · Enter read · b browse · r update · c stop · space pause",
         Style::default().add_modifier(Modifier::BOLD),
     ))];
     if app.mirror_jobs.is_empty() {
@@ -9370,6 +9417,29 @@ fn mirror_detail_lines(app: &App) -> Vec<Line<'static>> {
     out.push(field("dest", j.dest.clone()));
     out.push(field("interval", mirror_cadence_label(j.interval_secs)));
     out.push(field("paused", j.paused.to_string()));
+    if let Some(pid) = j.pid {
+        out.push(field("pid", pid.to_string()));
+    }
+    if let Some(started) = j.last_start.filter(|_| j.state == "running" || j.state == "stopping") {
+        let elapsed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs() as i64 - started)
+            .unwrap_or(0)
+            .max(0);
+        out.push(field("elapsed", format!("{}m {:02}s", elapsed / 60, elapsed % 60)));
+    }
+    if let Some(bytes) = j.mirror_bytes {
+        out.push(field(
+            "mirror disk",
+            fmt_bytes(bytes.min(i64::MAX as u64) as i64),
+        ));
+    }
+    if let Some(bytes) = j.scratch_bytes {
+        out.push(field("scratch", fmt_bytes(bytes.min(i64::MAX as u64) as i64)));
+    }
+    if let Some(bytes) = j.available_bytes {
+        out.push(field("disk free", fmt_bytes(bytes.min(i64::MAX as u64) as i64)));
+    }
     out.push(field(
         "next due",
         format!("{} ({})", ts(j.next_due), mirror_due_label(j.next_due)),
@@ -9388,7 +9458,7 @@ fn mirror_detail_lines(app: &App) -> Vec<Line<'static>> {
     if !j.last_detail.is_empty() {
         out.push(Line::from(""));
         out.push(Line::from(Span::styled(
-            if j.state == "running" {
+            if j.state == "running" || j.state == "stopping" {
                 "PROGRESS"
             } else {
                 "LAST DETAIL"
@@ -10854,12 +10924,14 @@ enum PaneAction {
     ConfirmKill,
     ConfirmDissolve,
     ConfirmMirrorRemove,
+    ConfirmMirrorDeleteData,
     NewRule,
     DeleteRule,
     StartRename,
     WikiMirrorAdd,
     WikiMirrorOpenLibrary,
     MirrorRun,
+    MirrorCancel,
     MirrorRunPending,
     MirrorTogglePause,
     MirrorBrowse,
@@ -10972,6 +11044,12 @@ const PANE_ACTION_KEYS: &[(Key, PaneGate, PaneAction, Option<&str>)] = &[
     ),
     (
         Key::Char('X'),
+        PaneGate::On(Pane::Mirrors),
+        PaneAction::ConfirmMirrorDeleteData,
+        Some("permanently delete selected Wikipedia mirror and its files (on Mirrors, y/n)"),
+    ),
+    (
+        Key::Char('X'),
         PaneGate::Any,
         PaneAction::DiscardAll,
         Some("discard ALL the box's changes"),
@@ -11023,6 +11101,12 @@ const PANE_ACTION_KEYS: &[(Key, PaneGate, PaneAction, Option<&str>)] = &[
         PaneGate::On(Pane::Mirrors),
         PaneAction::MirrorRun,
         Some("force-run selected mirror job (on Mirrors)"),
+    ),
+    (
+        Key::Char('c'),
+        PaneGate::On(Pane::Mirrors),
+        PaneAction::MirrorCancel,
+        Some("stop selected running mirror job and its children (on Mirrors)"),
     ),
     (
         Key::Char('n'),
@@ -11189,6 +11273,7 @@ fn run_pane_action(app: &mut App, action: PaneAction) {
             }
         },
         PaneAction::ConfirmMirrorRemove => app.confirm_mirror_remove(),
+        PaneAction::ConfirmMirrorDeleteData => app.confirm_mirror_delete_data(),
         PaneAction::NewRule => {
             app.modal = Some(Modal::RuleForm {
                 buf: String::new(),
@@ -11199,6 +11284,7 @@ fn run_pane_action(app: &mut App, action: PaneAction) {
         PaneAction::WikiMirrorAdd => app.open_wiki_mirror_setup(),
         PaneAction::WikiMirrorOpenLibrary => app.open_wiki_mirror_library(),
         PaneAction::MirrorRun => app.mirror_run_selected(),
+        PaneAction::MirrorCancel => app.mirror_cancel_selected(),
         PaneAction::MirrorRunPending => app.mirror_run_pending(),
         PaneAction::MirrorBrowse => app.mirror_browse_selected(),
         PaneAction::MirrorRead => app.mirror_read_selected(),
@@ -17577,6 +17663,7 @@ fn pane_action_menu(app: &App) -> Option<(String, Vec<ActionItem>)> {
                     ),
                     mk("Add Wikipedia mirrors…", "n", Action::WikiMirrorAdd),
                     mk("Force-run this job", "r", Action::MirrorRun),
+                    mk("Stop this running job", "c", Action::MirrorCancel),
                     mk("Run all pending jobs", "R", Action::MirrorRunPending),
                     mk(
                         "Re-ingest full Wikipedia content snapshot…",
@@ -17593,6 +17680,11 @@ fn pane_action_menu(app: &App) -> Option<(String, Vec<ActionItem>)> {
                         Action::MirrorTogglePause,
                     ),
                     mk("Delete this job", "D", Action::MirrorRemove),
+                    mk(
+                        "Delete this Wikipedia mirror and its files…",
+                        "X",
+                        Action::MirrorDeleteData,
+                    ),
                     mk("Browse this wiki", "b", Action::MirrorBrowse),
                     mk("Read in document reader", "V", Action::MirrorRead),
                 ],
@@ -17691,10 +17783,12 @@ fn run_action(app: &mut App, a: Action) {
         Action::WikiMirrorAdd => app.open_wiki_mirror_setup(),
         Action::WikiMirrorOpenLibrary => app.open_wiki_mirror_library(),
         Action::MirrorRun => app.mirror_run_selected(),
+        Action::MirrorCancel => app.mirror_cancel_selected(),
         Action::MirrorRunPending => app.mirror_run_pending(),
         Action::MirrorFullRefresh => app.confirm_mirror_full_refresh(),
         Action::MirrorTogglePause => app.mirror_toggle_pause(),
         Action::MirrorRemove => app.confirm_mirror_remove(),
+        Action::MirrorDeleteData => app.confirm_mirror_delete_data(),
         Action::MirrorBrowse => app.mirror_browse_selected(),
         Action::MirrorRead => app.mirror_read_selected(),
         Action::PtyNew => open_pty_menu(app),
@@ -23608,6 +23702,14 @@ mod tests {
                         Ok(note) => json!({"ok": true, "note": note}),
                         Err(e) => json!({"ok": false, "error": e}),
                     },
+                    "mirror_cancel" => match crate::mirrors::job_cancel(id) {
+                        Ok(()) => json!({"ok": true}),
+                        Err(e) => json!({"ok": false, "error": e}),
+                    },
+                    "mirror_rm_data" => match crate::mirrors::job_remove_with_data(id) {
+                        Ok(note) => json!({"ok": true, "note": note}),
+                        Err(e) => json!({"ok": false, "error": e}),
+                    },
                     other => json!({"ok": false, "error": format!("unknown verb '{other}'")}),
                 };
                 let mut w = &conn;
@@ -23912,6 +24014,48 @@ mod tests {
                 .all(|j| j.id != id),
             "job must be gone from the store"
         );
+    }
+
+    #[test]
+    fn mirrors_pane_x_deletes_owned_wikipedia_files_with_confirm() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let _guard = crate::depot::TEST_STATE_HOME_LOCK.lock().unwrap();
+        let temporary =
+            std::env::temp_dir().join(format!("sarun-mirrors-data-rm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temporary);
+        std::fs::create_dir_all(&temporary).unwrap();
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", temporary.join("state"));
+        }
+        std::fs::create_dir_all(crate::paths::state_home()).unwrap();
+        let archive = temporary.join("testwiki.swdump");
+        std::fs::write(&archive, b"archive").unwrap();
+        std::fs::write(archive.with_extension("swtitle"), b"index").unwrap();
+        let id = crate::mirrors::job_add(
+            "wiki",
+            "testwiki",
+            archive.to_str().unwrap(),
+            86_400,
+        )
+        .unwrap();
+
+        let mut app = App::bare(mirror_verb_server("rm-data"));
+        app.go_to_pane(Pane::Mirrors);
+        assert!(dispatch_pane_key(&mut app, KeyCode::Char('X')));
+        match &app.modal {
+            Some(Modal::Confirm {
+                action: ConfirmAction::MirrorDeleteData(selected),
+                prompt,
+            }) => {
+                assert_eq!(*selected, id);
+                assert!(prompt.contains(archive.to_str().unwrap()), "{prompt}");
+            }
+            _ => panic!("'X' must open the mirror-data deletion confirmation"),
+        }
+        handle_modal_key(&mut app, KeyCode::Char('y'), KeyModifiers::empty());
+        assert!(!archive.exists());
+        assert!(!archive.with_extension("swtitle").exists());
+        assert!(app.mirror_jobs.iter().all(|job| job.id != id));
     }
 
     /// The destructive box ops (D dissolve / K kill) NO-OP with a status

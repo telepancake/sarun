@@ -365,6 +365,7 @@ fn build_update_inner(
         )?);
     }
 
+    progress("discovering MediaWiki History partitions");
     let (metadata_snapshot, mut history_files) =
         crate::sync::discover_history(client, config, dbname)?;
     if metadata_snapshot < frontier.metadata {
@@ -478,9 +479,26 @@ fn build_direct_inner(
     scratch: &Path,
     progress: &(impl Fn(&str) + Sync),
 ) -> Result<DirectArchiveStats> {
+    progress("discovering upstream content and MediaWiki History files");
     let content_run = wikimak_mediawiki::discover_with(client, config, dbname)?;
     let (history_snapshot, history_files) =
         crate::sync::discover_history(client, config, dbname)?;
+    let content_bytes = content_run
+        .parts
+        .iter()
+        .map(|part| part.size_bytes)
+        .sum::<u64>();
+    let history_bytes = history_files
+        .iter()
+        .map(|file| file.part.size_bytes)
+        .sum::<u64>();
+    progress(&format!(
+        "discovered {} content files ({} bytes) and {} history files ({} bytes)",
+        content_run.parts.len(),
+        content_bytes,
+        history_files.len(),
+        history_bytes,
+    ));
     let cores = std::thread::available_parallelism().map_or(1, usize::from);
 
     let history_results =
@@ -528,6 +546,8 @@ fn build_direct_inner(
         groups.into_iter().enumerate().collect::<Vec<_>>(),
     )));
     let failed = Arc::new(AtomicBool::new(false));
+    let completed_content_bytes = Arc::new(AtomicU64::new(0));
+    let completed_content_groups = Arc::new(AtomicU64::new(0));
     let (sender, receiver) = std::sync::mpsc::sync_channel(workers);
     let content_stats = Arc::new(Mutex::new(ContentStreamStats::default()));
     let observed_at_micros = snapshot_date_micros(content_run.date)?;
@@ -535,6 +555,8 @@ fn build_direct_inner(
         for _ in 0..workers {
             let queue = Arc::clone(&queue);
             let failed = Arc::clone(&failed);
+            let completed_content_bytes = Arc::clone(&completed_content_bytes);
+            let completed_content_groups = Arc::clone(&completed_content_groups);
             let sender = sender.clone();
             scope.spawn(move || loop {
                 if failed.load(Ordering::Relaxed) {
@@ -543,6 +565,7 @@ fn build_direct_inner(
                 let Some((index, group)) = queue.lock().expect("queue mutex").pop_front() else {
                     return;
                 };
+                let group_bytes = group.iter().map(|part| part.size_bytes).sum::<u64>();
                 let result = build_content_group(
                     client,
                     &group,
@@ -554,6 +577,19 @@ fn build_direct_inner(
                 );
                 if result.is_err() {
                     failed.store(true, Ordering::Relaxed);
+                } else {
+                    let completed = completed_content_bytes
+                        .fetch_add(group_bytes, Ordering::Relaxed)
+                        .saturating_add(group_bytes);
+                    let completed_groups = completed_content_groups
+                        .fetch_add(1, Ordering::Relaxed)
+                        .saturating_add(1);
+                    progress(&format!(
+                        "finished content group {}/{}; {}",
+                        completed_groups,
+                        group_count,
+                        byte_progress(completed, content_bytes)
+                    ));
                 }
                 let (consumed, wait_consumed) = std::sync::mpsc::sync_channel(0);
                 if sender
@@ -677,6 +713,7 @@ fn build_history_parts(
     cores: usize,
     progress: &(impl Fn(&str) + Sync),
 ) -> Result<Vec<(PathBuf, PartialStats)>> {
+    let total_bytes = files.iter().map(|file| file.part.size_bytes).sum::<u64>();
     let workers = files.len().min(cores).min(3).max(1);
     let bz2_workers = (cores / workers).max(1);
     let queue = Arc::new(Mutex::new(VecDeque::from(
@@ -684,11 +721,13 @@ fn build_history_parts(
     )));
     let results = Arc::new(Mutex::new(Vec::new()));
     let failure = Arc::new(Mutex::new(None));
+    let completed_bytes = Arc::new(AtomicU64::new(0));
     std::thread::scope(|scope| {
         for _ in 0..workers {
             let queue = Arc::clone(&queue);
             let results = Arc::clone(&results);
             let failure = Arc::clone(&failure);
+            let completed_bytes = Arc::clone(&completed_bytes);
             scope.spawn(move || loop {
                 if failure.lock().expect("failure mutex").is_some() {
                     return;
@@ -698,7 +737,17 @@ fn build_history_parts(
                 };
                 progress(&format!("history {}", file.part.filename));
                 match build_history_part(client, dbname, &file, index, scratch, bz2_workers) {
-                    Ok(result) => results.lock().expect("results mutex").push((index, result)),
+                    Ok(result) => {
+                        let completed = completed_bytes
+                            .fetch_add(file.part.size_bytes, Ordering::Relaxed)
+                            .saturating_add(file.part.size_bytes);
+                        progress(&format!(
+                            "finished history {}; {}",
+                            file.part.filename,
+                            byte_progress(completed, total_bytes)
+                        ));
+                        results.lock().expect("results mutex").push((index, result));
+                    }
                     Err(error) => {
                         *failure.lock().expect("failure mutex") = Some(error);
                         return;
@@ -793,6 +842,8 @@ fn build_content_parts(
     progress: &(impl Fn(&str) + Sync),
 ) -> Result<Vec<ContentPartResult>> {
     let groups = crate::sync::part_groups(parts.to_vec());
+    let total_groups = groups.len();
+    let total_bytes = parts.iter().map(|part| part.size_bytes).sum::<u64>();
     let workers = groups.len().min(cores).min(3).max(1);
     let bz2_workers = (cores / workers).max(1);
     let queue = Arc::new(Mutex::new(VecDeque::from(
@@ -800,11 +851,15 @@ fn build_content_parts(
     )));
     let results = Arc::new(Mutex::new(Vec::new()));
     let failure = Arc::new(Mutex::new(None));
+    let completed_bytes = Arc::new(AtomicU64::new(0));
+    let completed_groups = Arc::new(AtomicU64::new(0));
     std::thread::scope(|scope| {
         for _ in 0..workers {
             let queue = Arc::clone(&queue);
             let results = Arc::clone(&results);
             let failure = Arc::clone(&failure);
+            let completed_bytes = Arc::clone(&completed_bytes);
+            let completed_groups = Arc::clone(&completed_groups);
             scope.spawn(move || loop {
                 if failure.lock().expect("failure mutex").is_some() {
                     return;
@@ -821,7 +876,22 @@ fn build_content_parts(
                     observed_at_micros,
                     progress,
                 ) {
-                    Ok(result) => results.lock().expect("results mutex").push((index, result)),
+                    Ok(result) => {
+                        let bytes = group.iter().map(|part| part.size_bytes).sum::<u64>();
+                        let completed = completed_bytes
+                            .fetch_add(bytes, Ordering::Relaxed)
+                            .saturating_add(bytes);
+                        let completed_groups = completed_groups
+                            .fetch_add(1, Ordering::Relaxed)
+                            .saturating_add(1);
+                        progress(&format!(
+                            "finished content group {}/{}; {}",
+                            completed_groups,
+                            total_groups,
+                            byte_progress(completed, total_bytes)
+                        ));
+                        results.lock().expect("results mutex").push((index, result));
+                    }
                     Err(error) => {
                         *failure.lock().expect("failure mutex") = Some(error);
                         return;
@@ -836,6 +906,14 @@ fn build_content_parts(
     let mut results = std::mem::take(&mut *results.lock().expect("results mutex"));
     results.sort_by_key(|(index, _)| *index);
     Ok(results.into_iter().map(|(_, result)| result).collect())
+}
+
+fn byte_progress(completed: u64, total: u64) -> String {
+    if total == 0 {
+        return format!("{completed} bytes complete");
+    }
+    let percent = completed.saturating_mul(100).checked_div(total).unwrap_or(0);
+    format!("{completed}/{total} bytes ({percent}%)")
 }
 
 fn build_content_group(

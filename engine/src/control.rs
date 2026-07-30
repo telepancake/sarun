@@ -7970,9 +7970,10 @@ macro_rules! ui_verbs {
         }
         // Mirror-update jobs (mirrors.rs): the schedule surface.
         "mirror_jobs" => {
-            return legacy_ui_action_reply(dispatch_action(
-                state, crate::generated_wire::ActionRequest::MirrorJobs,
-            ));
+            return match crate::mirrors::jobs_list() {
+                Ok(jobs) => json!({"ok": true, "r": jobs}),
+                Err(error) => json!({"ok": false, "error": error}),
+            };
         }
         // args: [kind, src, dest, interval_secs]
         "mirror_add" => {
@@ -8064,6 +8065,26 @@ macro_rules! ui_verbs {
             };
             return match crate::mirrors::job_run_full(id) {
                 Ok(()) => json!({"ok": true}),
+                Err(error) => json!({"ok": false, "error": error}),
+            };
+        }
+        // args: [id] — stop the live driver and its whole process group.
+        "mirror_cancel" => {
+            let Some(id) = args.first().and_then(Value::as_i64) else {
+                return json!({"ok": false, "error": "need job id"});
+            };
+            return match crate::mirrors::job_cancel(id) {
+                Ok(()) => json!({"ok": true}),
+                Err(error) => json!({"ok": false, "error": error}),
+            };
+        }
+        // args: [id] — explicitly delete the Wikipedia archive and its row.
+        "mirror_rm_data" => {
+            let Some(id) = args.first().and_then(Value::as_i64) else {
+                return json!({"ok": false, "error": "need job id"});
+            };
+            return match crate::mirrors::job_remove_with_data(id) {
+                Ok(note) => json!({"ok": true, "note": note}),
                 Err(error) => json!({"ok": false, "error": error}),
             };
         }

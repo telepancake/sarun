@@ -203,6 +203,10 @@ fn unescape_tsv(file: &HistoryFile, line: usize, field: &str, value: &str) -> Re
             b'n' => out.push(b'\n'),
             b'x' => {
                 let Some(hex) = input.get(cursor..cursor + 2) else {
+                    if field == "event_comment" {
+                        out.extend_from_slice(b"\\x");
+                        continue;
+                    }
                     return Err(history_parse_error(
                         file,
                         line,
@@ -210,6 +214,10 @@ fn unescape_tsv(file: &HistoryFile, line: usize, field: &str, value: &str) -> Re
                     ));
                 };
                 let Some(high) = hex_nibble(hex[0]) else {
+                    if field == "event_comment" {
+                        out.extend_from_slice(b"\\x");
+                        continue;
+                    }
                     return Err(history_parse_error(
                         file,
                         line,
@@ -217,6 +225,10 @@ fn unescape_tsv(file: &HistoryFile, line: usize, field: &str, value: &str) -> Re
                     ));
                 };
                 let Some(low) = hex_nibble(hex[1]) else {
+                    if field == "event_comment" {
+                        out.extend_from_slice(b"\\x");
+                        continue;
+                    }
                     return Err(history_parse_error(
                         file,
                         line,
@@ -1777,6 +1789,15 @@ mod tests {
             assert!(error.contains("page_title_historical"), "{error}");
             assert!(error.contains(expected), "{error}");
         }
+    }
+
+    #[test]
+    fn malformed_comment_hex_escapes_are_preserved_literally() {
+        let file = history_file();
+        assert_eq!(
+            unescape_tsv(&file, 4_334_619, "event_comment", r"bad\xG0 and ending\x").unwrap(),
+            r"bad\xG0 and ending\x"
+        );
     }
 
     #[test]

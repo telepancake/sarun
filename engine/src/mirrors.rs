@@ -62,10 +62,23 @@ fn db() -> Result<Connection, String> {
     Ok(conn)
 }
 
-/// Jobs whose driver process is live right now: id → pid.
-static RUNNING: Mutex<Option<HashMap<i64, u32>>> = Mutex::new(None);
+#[derive(Clone, Copy)]
+struct RunningProcess {
+    pid: u32,
+    stopping: bool,
+}
 
-fn running_map<R>(f: impl FnOnce(&mut HashMap<i64, u32>) -> R) -> R {
+/// Jobs whose driver process is live right now.
+static RUNNING: Mutex<Option<HashMap<i64, RunningProcess>>> = Mutex::new(None);
+static PATH_BYTES: Mutex<Option<HashMap<std::path::PathBuf, PathMeasurement>>> = Mutex::new(None);
+
+struct PathMeasurement {
+    bytes: Option<u64>,
+    measured_at: Option<std::time::Instant>,
+    scanning: bool,
+}
+
+fn running_map<R>(f: impl FnOnce(&mut HashMap<i64, RunningProcess>) -> R) -> R {
     let mut g = RUNNING.lock().unwrap();
     f(g.get_or_insert_with(HashMap::new))
 }
@@ -89,12 +102,23 @@ pub struct Job {
     pub state: String,
     /// Unix seconds of the next auto run (None while paused/running).
     pub next_due: Option<i64>,
+    #[serde(default)]
+    pub pid: Option<u32>,
+    #[serde(default)]
+    pub mirror_bytes: Option<u64>,
+    #[serde(default)]
+    pub scratch_bytes: Option<u64>,
+    #[serde(default)]
+    pub available_bytes: Option<u64>,
 }
 
 fn derive(mut j: Job) -> Job {
-    let live = running_map(|m| m.contains_key(&j.id));
+    let running = running_map(|m| m.get(&j.id).copied());
+    let live = running.is_some();
     let due_at = j.last_start.map(|s| s + j.interval_secs);
-    j.state = if live {
+    j.state = if running.is_some_and(|process| process.stopping) {
+        "stopping".into()
+    } else if live {
         "running".into()
     } else if j.paused {
         "paused".into()
@@ -117,7 +141,74 @@ fn derive(mut j: Job) -> Job {
     } else {
         due_at.or(Some(now()))
     };
+    j.pid = running.map(|process| process.pid).filter(|pid| *pid != 0);
+    let destination = std::path::Path::new(&j.dest);
+    j.mirror_bytes = cached_path_bytes(destination);
+    j.scratch_bytes = destination
+        .parent()
+        .and_then(|parent| cached_path_bytes(&parent.join(".wikimak-scratch")));
+    j.available_bytes = destination.parent().and_then(available_bytes);
     j
+}
+
+fn cached_path_bytes(path: &std::path::Path) -> Option<u64> {
+    let path = path.to_path_buf();
+    let mut measurements = PATH_BYTES.lock().unwrap();
+    let measurements = measurements.get_or_insert_with(HashMap::new);
+    let measurement = measurements
+        .entry(path.clone())
+        .or_insert(PathMeasurement {
+            bytes: None,
+            measured_at: None,
+            scanning: false,
+        });
+    let stale = measurement
+        .measured_at
+        .is_none_or(|measured| measured.elapsed() >= std::time::Duration::from_secs(2));
+    if stale && !measurement.scanning {
+        measurement.scanning = true;
+        std::thread::spawn(move || {
+            let bytes = path_bytes(&path).ok();
+            let mut measurements = PATH_BYTES.lock().unwrap();
+            if let Some(measurement) = measurements
+                .as_mut()
+                .and_then(|measurements| measurements.get_mut(&path))
+            {
+                measurement.bytes = bytes;
+                measurement.measured_at = Some(std::time::Instant::now());
+                measurement.scanning = false;
+            }
+        });
+    }
+    measurement.bytes
+}
+
+fn path_bytes(path: &std::path::Path) -> std::io::Result<u64> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error),
+    };
+    if !metadata.is_dir() {
+        return Ok(metadata.blocks().saturating_mul(512));
+    }
+    let mut bytes = metadata.blocks().saturating_mul(512);
+    for entry in std::fs::read_dir(path)? {
+        bytes = bytes.saturating_add(path_bytes(&entry?.path())?);
+    }
+    Ok(bytes)
+}
+
+fn available_bytes(path: &std::path::Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    if unsafe { libc::statvfs(path.as_ptr(), stats.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    let stats = unsafe { stats.assume_init() };
+    Some((stats.f_bavail as u64).saturating_mul(stats.f_frsize as u64))
 }
 
 pub fn jobs_list() -> Result<Vec<Job>, String> {
@@ -140,6 +231,10 @@ pub fn jobs_list() -> Result<Vec<Job>, String> {
                 last_detail: r.get(9)?,
                 state: String::new(),
                 next_due: None,
+                pid: None,
+                mirror_bytes: None,
+                scratch_bytes: None,
+                available_bytes: None,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -153,7 +248,7 @@ pub fn jobs_list_typed() -> Result<Vec<crate::generated_wire::MirrorJob>, String
         .into_iter()
         .map(|job| {
             let state = match job.state.as_str() {
-                "running" => MirrorState::Running,
+                "running" | "stopping" => MirrorState::Running,
                 "paused" => MirrorState::Paused,
                 "pending" => MirrorState::Pending,
                 "stopped" => MirrorState::Stopped,
@@ -279,6 +374,59 @@ pub fn job_remove(id: i64) -> Result<String, String> {
     Ok(note)
 }
 
+fn remove_mirror_path(path: &std::path::Path) -> Result<(), String> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("{}: {error}", path.display())),
+    };
+    if metadata.file_type().is_symlink() || metadata.is_file() {
+        std::fs::remove_file(path)
+    } else if metadata.is_dir() {
+        std::fs::remove_dir_all(path)
+    } else {
+        return Err(format!("{} is not a regular mirror path", path.display()));
+    }
+    .map_err(|error| format!("{}: {error}", path.display()))
+}
+
+/// Delete a Wikipedia mirror's owned archive/index/media paths and then its
+/// schedule row. Scratch is library-wide and is deliberately not included.
+pub fn job_remove_with_data(id: i64) -> Result<String, String> {
+    if running_map(|running| running.contains_key(&id)) {
+        return Err("job is running; stop it first".into());
+    }
+    let conn = db()?;
+    let (kind, destination): (String, String) = conn
+        .query_row(
+            "SELECT kind,dest FROM jobs WHERE id = ?1",
+            [id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|_| "no such job".to_string())?;
+    if kind != "wiki" {
+        return Err("deleting mirrored files is currently restricted to Wikipedia jobs".into());
+    }
+    let archive = std::path::PathBuf::from(&destination);
+    if archive.extension().and_then(|extension| extension.to_str()) != Some("swdump") {
+        return Err(format!(
+            "refusing to delete unexpected Wikipedia destination {}",
+            archive.display()
+        ));
+    }
+    let titles = archive.with_extension("swtitle");
+    let media = archive.with_extension("media");
+    remove_mirror_path(&archive)?;
+    remove_mirror_path(&titles)?;
+    remove_mirror_path(&media)?;
+    conn.execute("DELETE FROM jobs WHERE id = ?1", [id])
+        .map_err(|error| error.to_string())?;
+    Ok(format!(
+        "archive, title index, and media cache removed from {}",
+        archive.display()
+    ))
+}
+
 pub fn job_set_paused(id: i64, paused: bool) -> Result<(), String> {
     let n = db()?
         .execute(
@@ -302,6 +450,37 @@ pub fn job_run(id: i64) -> Result<(), String> {
         return Err("job is already running".into());
     }
     spawn_run(job, WikiRun::Maintain);
+    Ok(())
+}
+
+/// Stop a live mirror driver and every transfer/decompressor process it
+/// spawned. The driver is a process-group leader, so one signal covers curl
+/// and any other descendants without relying on process-tree polling.
+pub fn job_cancel(id: i64) -> Result<(), String> {
+    let pid = running_map(|running| {
+        let process = running.get_mut(&id).ok_or("job is not running")?;
+        if process.pid == 0 {
+            return Err("job is still starting; try again");
+        }
+        process.stopping = true;
+        Ok(process.pid)
+    })?;
+    let group = i32::try_from(pid).map_err(|_| "mirror process id exceeds i32")?;
+    if unsafe { libc::kill(-group, libc::SIGTERM) } != 0 {
+        return Err(format!(
+            "stop mirror process group {pid}: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        // The driver may have exited while a transfer child remains in its
+        // process group, so RUNNING cannot be used as the escalation guard.
+        // ESRCH simply means the whole group stopped during the grace period.
+        unsafe {
+            libc::kill(-group, libc::SIGKILL);
+        }
+    });
     Ok(())
 }
 
@@ -399,7 +578,13 @@ fn spawn_run(job: Job, wiki_run: WikiRun) {
         if m.contains_key(&id) {
             false
         } else {
-            m.insert(id, 0);
+            m.insert(
+                id,
+                RunningProcess {
+                    pid: 0,
+                    stopping: false,
+                },
+            );
             true
         }
     }) {
@@ -421,6 +606,9 @@ fn spawn_run(job: Job, wiki_run: WikiRun) {
         unsafe {
             use std::os::unix::process::CommandExt;
             cmd.pre_exec(|| {
+                if libc::setpgid(0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
                 #[cfg(target_os = "linux")]
                 if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
                     return Err(std::io::Error::last_os_error());
@@ -435,7 +623,13 @@ fn spawn_run(job: Job, wiki_run: WikiRun) {
         let (exit, detail) = match child {
             Ok(mut c) => {
                 running_map(|m| {
-                    m.insert(id, c.id());
+                    m.insert(
+                        id,
+                        RunningProcess {
+                            pid: c.id(),
+                            stopping: false,
+                        },
+                    );
                 });
                 let stderr = c.stderr.take().expect("piped stderr");
                 let (exit, tail) = stream_stderr(id, stderr, &mut c);
@@ -609,6 +803,66 @@ mod tests {
         let tail = tail_2k(&input);
         assert!(tail.len() <= 2048);
         assert!(tail.chars().all(|character| character == 'ā'));
+    }
+
+    #[test]
+    fn cancel_stops_the_driver_process_group() {
+        use std::os::unix::process::CommandExt;
+        let mut command = std::process::Command::new("/bin/sh");
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            });
+        }
+        let mut child = command.arg("-c").arg("sleep 60").spawn().unwrap();
+        let id = -9_001;
+        running_map(|running| {
+            running.insert(
+                id,
+                RunningProcess {
+                    pid: child.id(),
+                    stopping: false,
+                },
+            );
+        });
+        job_cancel(id).unwrap();
+        let status = child.wait().unwrap();
+        running_map(|running| {
+            running.remove(&id);
+        });
+        assert!(!status.success());
+    }
+
+    #[test]
+    fn deleting_wikipedia_data_removes_only_owned_paths() {
+        let _guard = crate::depot::TEST_STATE_HOME_LOCK.lock().unwrap();
+        let temporary = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", temporary.path().join("state"));
+        }
+        std::fs::create_dir_all(crate::paths::state_home()).unwrap();
+        let library = temporary.path().join("library");
+        std::fs::create_dir(&library).unwrap();
+        let archive = library.join("testwiki.swdump");
+        std::fs::create_dir(&archive).unwrap();
+        std::fs::write(archive.join("range"), b"archive").unwrap();
+        std::fs::write(archive.with_extension("swtitle"), b"index").unwrap();
+        std::fs::create_dir(archive.with_extension("media")).unwrap();
+        let sibling = library.join("keep");
+        std::fs::write(&sibling, b"keep").unwrap();
+        let id = job_add("wiki", "testwiki", archive.to_str().unwrap(), 86400).unwrap();
+
+        job_remove_with_data(id).unwrap();
+
+        assert!(!archive.exists());
+        assert!(!archive.with_extension("swtitle").exists());
+        assert!(!archive.with_extension("media").exists());
+        assert!(sibling.exists());
+        assert!(jobs_list().unwrap().iter().all(|job| job.id != id));
     }
 
     #[test]
