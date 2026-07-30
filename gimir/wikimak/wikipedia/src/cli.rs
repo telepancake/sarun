@@ -776,6 +776,25 @@ fn cmd_title_index(archive: &str, output: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn cmd_backrefs(archive: &str, titles: &str, output: &str) -> Result<(), String> {
+    let stats = crate::backrefs::build(archive, titles, output)
+        .map_err(|error| error.to_string())?;
+    let bytes = std::fs::metadata(output)
+        .map_err(|error| format!("{output}: {error}"))?
+        .len();
+    println!(
+        "{} sets, {} source pages, {} static edges, {} unresolved static edges, {} unresolved dynamic targets, {} redirects, {} bytes",
+        stats.sets,
+        stats.source_pages,
+        stats.extracted_static_edges,
+        stats.unresolved_static_edges,
+        stats.unresolved_dynamic_targets,
+        stats.redirect_pages,
+        bytes,
+    );
+    Ok(())
+}
+
 fn compression(level: &str) -> Result<crate::archive::CompressionSettings, String> {
     Ok(crate::archive::CompressionSettings {
         level: level
@@ -1040,6 +1059,7 @@ pub fn cli_main(args: &[String]) -> i32 {
         ["serve", archive, addr] => cmd_serve(archive, addr),
         ["siteinfo", api_url, output] => cmd_siteinfo(api_url, output),
         ["title-index", archive, output] => cmd_title_index(archive, output),
+        ["backrefs", archive, titles, output] => cmd_backrefs(archive, titles, output),
         ["repack", arguments @ ..] => cmd_repack(arguments),
         ["merge", arguments @ ..] => cmd_merge(arguments),
         ["inspect", archive] => cmd_inspect(archive),
@@ -1053,6 +1073,7 @@ pub fn cli_main(args: &[String]) -> i32 {
              \x20      wikimak serve <archive.swdump> [addr]\n\
              \x20      wikimak siteinfo <api-url> <output.swdump>\n\
              \x20      wikimak title-index <archive.swdump> <output.swtitle>\n\
+             \x20      wikimak backrefs <archive.swdump> <titles.swtitle> <output.swrefs>\n\
              \x20      wikimak repack <input> <output> <frame-bytes> <zstd-level> [--dictionary-bytes N | --ref-prefix-bytes N --sample-bytes N]\n\
              \x20      wikimak merge <output> <frame-bytes> <zstd-level> <input>...\n\
              \x20      wikimak inspect <archive.swdump>"

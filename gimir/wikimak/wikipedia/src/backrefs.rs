@@ -469,6 +469,7 @@ impl DiskSets {
             return Ok(());
         }
         let bytes = encode_bitmap(bitmap);
+        self.file.seek(SeekFrom::Start(self.len))?;
         self.file.write_all(&bytes)?;
         debug_assert!(self
             .positions
@@ -1663,6 +1664,7 @@ impl BitmapStore {
 
     fn put(&mut self, target: u64, bitmap: &Bitmap) -> std::io::Result<()> {
         let bytes = encode_bitmap(bitmap);
+        self.file.seek(SeekFrom::Start(self.len))?;
         self.file.write_all(&bytes)?;
         let target = usize::try_from(target)
             .map_err(|_| invalid_data("bitmap-store key is too large"))?;
@@ -2834,6 +2836,30 @@ fn invalid_data(message: &'static str) -> std::io::Error {
 mod tests {
     use super::*;
     use chrono::{TimeZone, Utc};
+
+    #[test]
+    fn disk_bitmap_stores_append_after_reads() {
+        let mut first = Bitmap::default();
+        first.insert(11);
+        let mut second = Bitmap::default();
+        second.insert(29);
+
+        let mut sets = DiskSets::new().unwrap();
+        let first_key = (EdgeKind::Template, 1, Certainty::Definite);
+        let second_key = (EdgeKind::Template, 2, Certainty::Definite);
+        sets.put(first_key, &first).unwrap();
+        assert_eq!(sets.get(&first_key).unwrap(), Some(first.clone()));
+        sets.put(second_key, &second).unwrap();
+        assert_eq!(sets.get(&first_key).unwrap(), Some(first.clone()));
+        assert_eq!(sets.get(&second_key).unwrap(), Some(second.clone()));
+
+        let mut bitmaps = BitmapStore::new().unwrap();
+        bitmaps.put(1, &first).unwrap();
+        assert_eq!(bitmaps.get(1).unwrap(), Some(first.clone()));
+        bitmaps.put(2, &second).unwrap();
+        assert_eq!(bitmaps.get(1).unwrap(), Some(first));
+        assert_eq!(bitmaps.get(2).unwrap(), Some(second));
+    }
 
     fn page(page_id: u64, title: &str, text: &str) -> SourcePage {
         SourcePage {
