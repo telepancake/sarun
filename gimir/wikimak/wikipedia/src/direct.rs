@@ -1748,57 +1748,153 @@ fn build_content_group(
     progress: &(impl Fn(&str) + Sync),
 ) -> Result<ContentPartResult> {
     let path = scratch.join(format!("content-{index:06}.swdump"));
+    if parts.len() > 1 {
+        let workers = parts.len().min(bz2_workers).max(1);
+        let per_part_workers = (bz2_workers / workers).max(1);
+        let queue = Arc::new(Mutex::new(VecDeque::from(
+            parts.iter().cloned().enumerate().collect::<Vec<_>>(),
+        )));
+        let results = Arc::new(Mutex::new(Vec::new()));
+        let failure = Arc::new(Mutex::new(None));
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                let queue = Arc::clone(&queue);
+                let results = Arc::clone(&results);
+                let failure = Arc::clone(&failure);
+                scope.spawn(move || loop {
+                    if failure.lock().expect("failure mutex").is_some() {
+                        return;
+                    }
+                    let Some((part_index, part)) =
+                        queue.lock().expect("queue mutex").pop_front()
+                    else {
+                        return;
+                    };
+                    let part_path = scratch.join(format!(
+                        "content-{index:06}-source-{part_index:06}.swdump"
+                    ));
+                    match build_content_part(
+                        client,
+                        &part,
+                        &part_path,
+                        per_part_workers,
+                        observed_at_micros,
+                        progress,
+                    ) {
+                        Ok(result) => results
+                            .lock()
+                            .expect("results mutex")
+                            .push((part_index, result)),
+                        Err(error) => {
+                            *failure.lock().expect("failure mutex") = Some(error);
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        if let Some(error) = failure.lock().expect("failure mutex").take() {
+            return Err(error);
+        }
+        let mut results = std::mem::take(&mut *results.lock().expect("results mutex"));
+        results.sort_by_key(|(part_index, _)| *part_index);
+        let inputs = results
+            .iter()
+            .map(|(_, result)| result.path.clone())
+            .collect::<Vec<_>>();
+        let mut stats = PartialStats::default();
+        let mut site_info = None;
+        for (_, result) in &results {
+            stats.pages = stats.pages.saturating_add(result.stats.pages);
+            stats.revisions = stats.revisions.saturating_add(result.stats.revisions);
+            if site_info.is_none() {
+                site_info = result.site_info.clone();
+            }
+        }
+        crate::archive::merge_many_archives(
+            &inputs,
+            std::fs::File::create(&path)?,
+            DEFAULT_FRAME_TARGET,
+        )
+        .map_err(map_archive)?;
+        for input in inputs {
+            std::fs::remove_file(input)?;
+        }
+        return Ok(ContentPartResult {
+            path,
+            stats,
+            site_info,
+        });
+    }
+    build_content_part(
+        client,
+        parts
+            .first()
+            .ok_or(Error::Corrupt("content group contains no parts"))?,
+        &path,
+        bz2_workers,
+        observed_at_micros,
+        progress,
+    )
+}
+
+fn build_content_part(
+    client: &Client,
+    part: &wikimak_mediawiki::Part,
+    path: &Path,
+    bz2_workers: usize,
+    observed_at_micros: i64,
+    progress: &(impl Fn(&str) + Sync),
+) -> Result<ContentPartResult> {
     let mut writer = ArchiveWriter::new(std::fs::File::create(&path)?, DEFAULT_FRAME_TARGET)
         .map_err(map_archive)?;
     let mut stats = PartialStats::default();
     let mut site_info = None;
-    for part in parts {
-        progress(&format!("content {}", part.filename));
-        let source = wikimak_mediawiki::fetch(client, part)?;
-        let input: Box<dyn Read + Send> = if part.filename.ends_with(".bz2") {
-            Box::new(wikimak_mediawiki::new_bz2_reader(
-                source,
-                wikimak_mediawiki::Bz2Options {
-                    workers: bz2_workers,
-                },
-            ))
-        } else {
-            Box::new(source)
-        };
-        let mut page_stream = wikimak_mediawiki::new_page_stream(input);
-        let revisions = page_stream.revisions_mut();
-        while let Some(header) = revisions.next_page() {
-            let header = header?;
-            if site_info.is_none() {
-                site_info = revisions.site_info().map(convert_site_info);
-            }
-            let page_id = u64::try_from(header.id)
-                .ok()
-                .filter(|id| *id > 0)
-                .ok_or_else(|| parse_error(format!("invalid page id {}", header.id)))?;
-            let records = std::iter::from_fn(|| {
-                revisions.next_revision().map(|result| {
-                    result
-                        .map_err(Error::Mediawiki)
-                        .and_then(convert_revision)
-                        .map_err(ArchiveError::Mirror)
-                })
-            });
-            let count = crate::archive::write_content_page(
-                &mut writer,
-                page_id,
-                observed_at_micros,
-                header.title,
-                records,
-            )
-            .map_err(map_archive)?;
-            stats.pages += 1;
-            stats.revisions += count;
+    progress(&format!("content {}", part.filename));
+    let source = wikimak_mediawiki::fetch(client, part)?;
+    let input: Box<dyn Read + Send> = if part.filename.ends_with(".bz2") {
+        Box::new(wikimak_mediawiki::new_bz2_reader(
+            source,
+            wikimak_mediawiki::Bz2Options {
+                workers: bz2_workers,
+            },
+        ))
+    } else {
+        Box::new(source)
+    };
+    let mut page_stream = wikimak_mediawiki::new_page_stream(input);
+    let revisions = page_stream.revisions_mut();
+    while let Some(header) = revisions.next_page() {
+        let header = header?;
+        if site_info.is_none() {
+            site_info = revisions.site_info().map(convert_site_info);
         }
+        let page_id = u64::try_from(header.id)
+            .ok()
+            .filter(|id| *id > 0)
+            .ok_or_else(|| parse_error(format!("invalid page id {}", header.id)))?;
+        let records = std::iter::from_fn(|| {
+            revisions.next_revision().map(|result| {
+                result
+                    .map_err(Error::Mediawiki)
+                    .and_then(convert_revision)
+                    .map_err(ArchiveError::Mirror)
+            })
+        });
+        let count = crate::archive::write_content_page(
+            &mut writer,
+            page_id,
+            observed_at_micros,
+            header.title,
+            records,
+        )
+        .map_err(map_archive)?;
+        stats.pages += 1;
+        stats.revisions += count;
     }
     writer.finish().map_err(map_archive)?;
     Ok(ContentPartResult {
-        path,
+        path: path.to_path_buf(),
         stats,
         site_info,
     })
@@ -2116,5 +2212,56 @@ mod build_graph_tests {
                 .trim_end(),
             plan.plan_id
         );
+    }
+
+    #[test]
+    fn overlapping_content_parts_are_merged_instead_of_concatenated() {
+        let server = MockServer::start();
+        let content = include_bytes!("../tests/data/export_three_pages.xml");
+        let first = server.mock(|when, then| {
+            when.method(GET).path("/range.xml");
+            then.status(200).body(content);
+        });
+        let slice = server.mock(|when, then| {
+            when.method(GET).path("/slice.xml");
+            then.status(200).body(content);
+        });
+        let parts = [
+            wikimak_mediawiki::Part {
+                url: server.url("/range.xml"),
+                filename: "testwiki-p1p3.xml".into(),
+                size_bytes: content.len() as u64,
+                sha256: None,
+                sha1: None,
+                md5: None,
+            },
+            wikimak_mediawiki::Part {
+                url: server.url("/slice.xml"),
+                filename: "testwiki-p2r1r999.xml".into(),
+                size_bytes: content.len() as u64,
+                sha256: None,
+                sha1: None,
+                md5: None,
+            },
+        ];
+        let scratch = tempfile::tempdir().unwrap();
+        let result = build_content_group(
+            &Client::new(),
+            &parts,
+            0,
+            scratch.path(),
+            2,
+            snapshot_date_micros(
+                chrono::NaiveDate::from_ymd_opt(2024, 6, 1).unwrap(),
+            )
+            .unwrap(),
+            &|_| {},
+        )
+        .unwrap();
+
+        let (_, _, complete) = crate::archive::index_file(result.path).unwrap();
+        assert!(complete);
+        assert_eq!(first.hits(), 1);
+        assert_eq!(slice.hits(), 1);
     }
 }

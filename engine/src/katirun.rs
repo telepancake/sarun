@@ -1389,6 +1389,9 @@ fn install_make_recipe_runner() {
                 kati::fileutil::EdgePhase::Output => unreachable!(),
             });
             let ex = String::from_utf8_lossy(excerpt);
+            if phase == kati::fileutil::EdgePhase::Done && code != 0 && !ex.trim().is_empty() {
+                eprintln!("target {out} failed:\n{}", ex.trim_end());
+            }
             crate::brush::send_build_edge_state(
                 Some(&out),
                 None,
