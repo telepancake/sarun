@@ -24,6 +24,7 @@ serde_json.workspace = true
 sha1.workspace = true
 hex.workspace = true
 regex.workspace = true
+roaring.workspace = true
 # flock() for the one-process-per-root guard.
 libc.workspace = true
 memmap2 = "0.9"

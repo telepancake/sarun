@@ -18,14 +18,14 @@ use crate::backrefs_parse::{
     extract_report_with_namespaces, Certainty, InclusionContext, NamespaceMap, RawEdge,
 };
 
-const MAGIC: [u8; 8] = *b"SWREFS\0\0";
-const VERSION: u32 = 2;
-const HEADER_BYTES: usize = 56;
-const ENTRY_BYTES: usize = 40;
-const DIRECTORY_BYTES: usize = 24;
+const MAGIC: [u8; 8] = *b"SWREFOBJ";
+const HEADER_BYTES: usize = 80;
+const DIRECTORY_DESCRIPTOR_BYTES: usize = 40;
+const PRESENCE_WORD_BYTES: usize = 20;
 const MAX_XOR_OFFSET: usize = 160;
 const MAX_XOR_DEPTH: u8 = 10;
 const HEURISTIC_WINDOW: usize = 16;
+const MAX_RECENT_KEYS: usize = 1024;
 const RECENT_BITMAP_BUDGET: usize = 8 * 1024 * 1024;
 const EDGE_BYTES: usize = 24;
 const EDGE_RUN_RECORDS: usize =
@@ -173,39 +173,95 @@ fn merge_words(
     output
 }
 
-#[cfg(test)]
-#[derive(Clone, Debug)]
-struct EncodedSet {
-    key: SetKey,
-    base_offset: u16,
-    depth: u8,
-    payload: Vec<u8>,
-    resolved: Option<Bitmap>,
-}
-
 #[derive(Clone, Copy)]
 struct EncodedMeta {
-    key: SetKey,
-    base_offset: u16,
-    depth: u8,
+    base_offset: u8,
     payload_offset: u64,
-    payload_len: u64,
 }
 
 struct RecentSet {
     position: usize,
-    key: SetKey,
     depth: u8,
     members: Bitmap,
     bytes: usize,
+}
+
+struct DedupTable {
+    hashes: Vec<u64>,
+    object_ids: Vec<u32>,
+    collisions: Vec<(u64, u32)>,
+    len: usize,
+}
+
+impl DedupTable {
+    fn new() -> Self {
+        Self {
+            hashes: vec![0; 16],
+            object_ids: vec![u32::MAX; 16],
+            collisions: Vec::new(),
+            len: 0,
+        }
+    }
+
+    fn ensure_capacity(&mut self) {
+        if (self.len + 1) * 10 < self.object_ids.len() * 7 {
+            return;
+        }
+        let new_capacity = self.hashes.len() * 2;
+        let old_hashes = std::mem::replace(&mut self.hashes, vec![0; new_capacity]);
+        let old_ids = std::mem::replace(&mut self.object_ids, vec![u32::MAX; new_capacity]);
+        self.len = 0;
+        for (hash, object_id) in old_hashes.into_iter().zip(old_ids) {
+            if object_id != u32::MAX {
+                self.insert_primary(hash, object_id);
+            }
+        }
+    }
+
+    fn primary_and_vacant(&self, hash: u64) -> (Option<u32>, usize) {
+        let mask = self.object_ids.len() - 1;
+        let mut position = hash as usize & mask;
+        loop {
+            let object_id = self.object_ids[position];
+            if object_id == u32::MAX {
+                return (None, position);
+            }
+            if self.hashes[position] == hash {
+                return (Some(object_id), position);
+            }
+            position = (position + 1) & mask;
+        }
+    }
+
+    fn insert_at(&mut self, position: usize, hash: u64, object_id: u32) {
+        debug_assert_eq!(self.object_ids[position], u32::MAX);
+        self.hashes[position] = hash;
+        self.object_ids[position] = object_id;
+        self.len += 1;
+    }
+
+    fn insert_primary(&mut self, hash: u64, object_id: u32) {
+        let (existing, position) = self.primary_and_vacant(hash);
+        debug_assert!(existing.is_none());
+        self.insert_at(position, hash, object_id);
+    }
 }
 
 struct StreamingEncoder {
     payload: std::fs::File,
     payload_len: u64,
     entries: Vec<EncodedMeta>,
+    logical: Vec<Vec<(u64, u32)>>,
+    logical_count: usize,
+    canonical: std::fs::File,
+    canonical_len: u64,
+    canonical_offsets: Vec<(u64, u64)>,
+    dedup: DedupTable,
     recent: VecDeque<RecentSet>,
+    recent_keys: VecDeque<(SetKey, u32)>,
     recent_bytes: usize,
+    #[cfg(test)]
+    forced_hash: Option<u64>,
 }
 
 impl StreamingEncoder {
@@ -214,50 +270,105 @@ impl StreamingEncoder {
             payload: tempfile::tempfile()?,
             payload_len: 0,
             entries: Vec::new(),
+            logical: (0..16).map(|_| Vec::new()).collect(),
+            logical_count: 0,
+            canonical: tempfile::tempfile()?,
+            canonical_len: 0,
+            canonical_offsets: Vec::new(),
+            dedup: DedupTable::new(),
             recent: VecDeque::new(),
+            recent_keys: VecDeque::new(),
             recent_bytes: 0,
+            #[cfg(test)]
+            forced_hash: None,
         })
     }
 
     fn add(&mut self, set: LogicalSet) -> std::io::Result<()> {
-        let raw = encode_bitmap(&set.members);
+        if set.members.words.is_empty() {
+            return Ok(());
+        }
+        let raw = encode_sidecar_bitmap(&set.members);
+        let hash = xxhash_rust::xxh3::xxh3_64(&raw);
+        #[cfg(test)]
+        let hash = self.forced_hash.unwrap_or(hash);
+        self.dedup.ensure_capacity();
+        let (primary, vacant) = self.dedup.primary_and_vacant(hash);
+        if let Some(object_id) = primary {
+            if self.canonical_equals(object_id, &raw)? {
+                self.record_logical(set.key, object_id);
+                self.record_recent_key(set.key, object_id);
+                return Ok(());
+            }
+            for position in 0..self.dedup.collisions.len() {
+                let (collision_hash, collision_id) = self.dedup.collisions[position];
+                if collision_hash == hash && self.canonical_equals(collision_id, &raw)? {
+                    self.record_logical(set.key, collision_id);
+                    self.record_recent_key(set.key, collision_id);
+                    return Ok(());
+                }
+            }
+        }
+        let raw_len = raw.len() as u64;
+        let canonical_offset = self.canonical_len;
+        self.canonical.seek(SeekFrom::Start(canonical_offset))?;
+        self.canonical.write_all(&raw)?;
         let direct = matches!(
             set.key.class,
             SetClass::DirectUnconditional | SetClass::DirectPossible
         );
+        self.evict_stale_recent();
         let mut best = None::<(&RecentSet, Vec<u8>)>;
         if !direct {
             for key in &set.topology_bases {
-                if let Some(candidate) = self.recent.iter().find(|entry| entry.key == *key) {
-                    consider_recent(&set.members, candidate, &raw, &mut best);
+                if let Some((_, object_id)) =
+                    self.recent_keys.iter().rev().find(|entry| entry.0 == *key)
+                {
+                    if let Some(candidate) = self
+                        .recent
+                        .iter()
+                        .find(|entry| entry.position == *object_id as usize)
+                    {
+                        consider_recent(&set.members, candidate, &raw, &mut best);
+                    }
                 }
             }
             for candidate in self.recent.iter().rev().take(HEURISTIC_WINDOW) {
                 consider_recent(&set.members, candidate, &raw, &mut best);
             }
         }
-        let (base_offset, depth, payload) = best.map_or((0, 0, raw), |(base, payload)| {
-            (
-                (self.entries.len() - base.position) as u16,
-                base.depth + 1,
-                payload,
-            )
-        });
+        let (base_offset, depth, payload) = match best {
+            Some((base, payload)) => {
+                let distance = self.entries.len() - base.position;
+                let distance = u8::try_from(distance)
+                    .map_err(|_| invalid_data("backref XOR base distance overflow"))?;
+                (distance, base.depth + 1, payload)
+            }
+            None => (0, 0, raw),
+        };
+        let object_id = u32::try_from(self.entries.len())
+            .map_err(|_| invalid_data("too many backref bitmap objects"))?;
         self.payload.write_all(&payload)?;
         self.entries.push(EncodedMeta {
-            key: set.key,
             base_offset,
-            depth,
             payload_offset: self.payload_len,
-            payload_len: payload.len() as u64,
         });
         self.payload_len += payload.len() as u64;
+        self.canonical_offsets
+            .push((canonical_offset, raw_len));
+        self.canonical_len += raw_len;
+        if primary.is_some() {
+            self.dedup.collisions.push((hash, object_id));
+        } else {
+            self.dedup.insert_at(vacant, hash, object_id);
+        }
+        self.record_logical(set.key, object_id);
+        self.record_recent_key(set.key, object_id);
         let bitmap_bytes =
             set.members.words.capacity() * std::mem::size_of::<(u64, u64)>();
         if !direct && bitmap_bytes <= RECENT_BITMAP_BUDGET {
             self.recent.push_back(RecentSet {
                 position: self.entries.len() - 1,
-                key: set.key,
                 depth,
                 members: set.members,
                 bytes: bitmap_bytes,
@@ -274,44 +385,95 @@ impl StreamingEncoder {
         Ok(())
     }
 
+    fn canonical_equals(&mut self, object_id: u32, raw: &[u8]) -> std::io::Result<bool> {
+        let (offset, length) = self.canonical_offsets[object_id as usize];
+        if length != raw.len() as u64 {
+            return Ok(false);
+        }
+        let mut candidate = vec![0; raw.len()];
+        self.canonical.seek(SeekFrom::Start(offset))?;
+        self.canonical.read_exact(&mut candidate)?;
+        Ok(candidate == raw)
+    }
+
+    fn record_logical(&mut self, key: SetKey, object_id: u32) {
+        self.logical[directory_index(key.kind, key.class)]
+            .push((key.target_page_id, object_id));
+        self.logical_count += 1;
+    }
+
+    fn record_recent_key(&mut self, key: SetKey, object_id: u32) {
+        self.recent_keys.push_back((key, object_id));
+        while self.recent_keys.len() > MAX_RECENT_KEYS {
+            self.recent_keys.pop_front();
+        }
+    }
+
+    fn evict_stale_recent(&mut self) {
+        let current = self.entries.len();
+        while self
+            .recent
+            .front()
+            .is_some_and(|entry| current - entry.position > MAX_XOR_OFFSET)
+        {
+            if let Some(evicted) = self.recent.pop_front() {
+                self.recent_bytes -= evicted.bytes;
+            }
+        }
+        while self
+            .recent_keys
+            .front()
+            .is_some_and(|(_, object_id)| current - *object_id as usize > MAX_XOR_OFFSET)
+        {
+            self.recent_keys.pop_front();
+        }
+    }
+
     fn write(mut self, output: impl AsRef<Path>) -> crate::archive::Result<()> {
+        if self.logical_count > u32::MAX as usize {
+            return Err(ArchiveError::Invalid("too many backref logical sets"));
+        }
         let output = output.as_ref();
         let parent = output
             .parent()
             .filter(|path| !path.as_os_str().is_empty())
             .unwrap_or(Path::new("."));
         let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
-        let entries_offset = HEADER_BYTES as u64;
-        let directory_offset =
-            entries_offset + self.entries.len() as u64 * ENTRY_BYTES as u64;
-        let payload_offset =
-            directory_offset + self.entries.len() as u64 * DIRECTORY_BYTES as u64;
+        let directories = build_logical_directories(std::mem::take(&mut self.logical))?;
+        let logical_bytes = directories.iter().try_fold(
+            (directories.len() * DIRECTORY_DESCRIPTOR_BYTES) as u64,
+            |total, directory| {
+                total
+                    .checked_add(directory.words.len() as u64 * PRESENCE_WORD_BYTES as u64)
+                    .and_then(|total| {
+                        total.checked_add(directory.object_ids.len() as u64 * 4)
+                    })
+                    .ok_or(ArchiveError::FieldTooLarge)
+            },
+        )?;
+        let object_offsets_offset = HEADER_BYTES as u64 + logical_bytes;
+        let base_offsets_offset =
+            object_offsets_offset + (self.entries.len() as u64 + 1) * 8;
+        let payload_offset = base_offsets_offset + self.entries.len() as u64;
         temporary.write_all(&MAGIC)?;
-        temporary.write_all(&VERSION.to_le_bytes())?;
         temporary.write_all(&(HEADER_BYTES as u32).to_le_bytes())?;
+        temporary.write_all(&0_u32.to_le_bytes())?;
         temporary.write_all(&(self.entries.len() as u64).to_le_bytes())?;
-        temporary.write_all(&entries_offset.to_le_bytes())?;
-        temporary.write_all(&directory_offset.to_le_bytes())?;
+        temporary.write_all(&(self.logical_count as u64).to_le_bytes())?;
+        temporary.write_all(&(HEADER_BYTES as u64).to_le_bytes())?;
+        temporary.write_all(&object_offsets_offset.to_le_bytes())?;
+        temporary.write_all(&base_offsets_offset.to_le_bytes())?;
         temporary.write_all(&payload_offset.to_le_bytes())?;
+        temporary.write_all(&(directories.len() as u64).to_le_bytes())?;
         temporary.write_all(&0_u64.to_le_bytes())?;
+        write_logical_directories(temporary.as_file_mut(), &directories)?;
         for entry in &self.entries {
-            write_entry(
-                temporary.as_file_mut(),
-                entry.key,
-                entry.base_offset,
-                entry.depth,
-                payload_offset + entry.payload_offset,
-                entry.payload_len,
-            )?;
+            temporary.write_all(&(payload_offset + entry.payload_offset).to_le_bytes())?;
         }
-        let mut directory = self
-            .entries
-            .iter()
-            .enumerate()
-            .map(|(position, entry)| (entry.key, position as u64))
-            .collect::<Vec<_>>();
-        directory.sort_by_key(|entry| entry.0);
-        write_directory(temporary.as_file_mut(), &directory)?;
+        temporary.write_all(&(payload_offset + self.payload_len).to_le_bytes())?;
+        for entry in &self.entries {
+            temporary.write_all(&[entry.base_offset])?;
+        }
         self.payload.seek(SeekFrom::Start(0))?;
         std::io::copy(&mut self.payload, temporary.as_file_mut())?;
         temporary.as_file_mut().sync_all()?;
@@ -332,11 +494,122 @@ fn consider_recent<'a>(
     if candidate.depth >= MAX_XOR_DEPTH {
         return;
     }
-    let delta = encode_bitmap(&members.difference(&candidate.members));
+    let delta = encode_sidecar_bitmap(&members.difference(&candidate.members));
     let current_len = best.as_ref().map_or(raw.len(), |(_, bytes)| bytes.len());
     if delta.len() < current_len {
         *best = Some((candidate, delta));
     }
+}
+
+#[derive(Default)]
+struct LogicalDirectory {
+    kind: Option<EdgeKind>,
+    class: Option<SetClass>,
+    words: Vec<(u64, u64, u32)>,
+    object_ids: Vec<u32>,
+}
+
+fn directory_index(kind: EdgeKind, class: SetClass) -> usize {
+    let kind = match kind {
+        EdgeKind::Template => 0,
+        EdgeKind::Module => 1,
+        EdgeKind::Category => 2,
+        EdgeKind::File => 3,
+    };
+    let class = match class {
+        SetClass::DirectUnconditional => 0,
+        SetClass::DirectPossible => 1,
+        SetClass::TransitiveUnconditional => 2,
+        SetClass::TransitivePossible => 3,
+    };
+    kind * 4 + class
+}
+
+fn directory_identity(index: usize) -> (EdgeKind, SetClass) {
+    let kind = match index / 4 {
+        0 => EdgeKind::Template,
+        1 => EdgeKind::Module,
+        2 => EdgeKind::Category,
+        3 => EdgeKind::File,
+        _ => unreachable!(),
+    };
+    let class = match index % 4 {
+        0 => SetClass::DirectUnconditional,
+        1 => SetClass::DirectPossible,
+        2 => SetClass::TransitiveUnconditional,
+        3 => SetClass::TransitivePossible,
+        _ => unreachable!(),
+    };
+    (kind, class)
+}
+
+fn build_logical_directories(
+    mut logical: Vec<Vec<(u64, u32)>>,
+) -> std::io::Result<Vec<LogicalDirectory>> {
+    let mut directories = Vec::new();
+    for (index, entries) in logical.iter_mut().enumerate() {
+        if entries.is_empty() {
+            continue;
+        }
+        entries.sort_unstable();
+        let (kind, class) = directory_identity(index);
+        let mut directory = LogicalDirectory {
+            kind: Some(kind),
+            class: Some(class),
+            ..LogicalDirectory::default()
+        };
+        for (entry_index, (target_page_id, object_id)) in entries.iter().enumerate() {
+            if entry_index != 0 && entries[entry_index - 1].0 == *target_page_id {
+                return Err(invalid_data("duplicate backref logical key"));
+            }
+            let word_index = target_page_id / 64;
+            let bit = 1_u64 << (target_page_id % 64);
+            match directory.words.last_mut() {
+                Some((last_index, word, _)) if *last_index == word_index => *word |= bit,
+                _ => {
+                    let rank = u32::try_from(directory.object_ids.len())
+                        .map_err(|_| invalid_data("too many backref logical sets"))?;
+                    directory.words.push((word_index, bit, rank));
+                }
+            }
+            directory.object_ids.push(*object_id);
+        }
+        directories.push(directory);
+    }
+    Ok(directories)
+}
+
+fn write_logical_directories(
+    output: &mut (impl Write + Seek),
+    directories: &[LogicalDirectory],
+) -> std::io::Result<()> {
+    let mut cursor = (HEADER_BYTES + directories.len() * DIRECTORY_DESCRIPTOR_BYTES) as u64;
+    for directory in directories {
+        let words_offset = cursor;
+        cursor += directory.words.len() as u64 * PRESENCE_WORD_BYTES as u64;
+        let ids_offset = cursor;
+        cursor += directory.object_ids.len() as u64 * 4;
+        output.write_all(&[
+            kind_byte(directory.kind.expect("logical directory kind")),
+            class_byte(directory.class.expect("logical directory class")),
+        ])?;
+        output.write_all(&[0; 6])?;
+        output.write_all(&words_offset.to_le_bytes())?;
+        output.write_all(&(directory.words.len() as u64).to_le_bytes())?;
+        output.write_all(&ids_offset.to_le_bytes())?;
+        output.write_all(&(directory.object_ids.len() as u64).to_le_bytes())?;
+    }
+    for directory in directories {
+        for (word_index, word, rank) in &directory.words {
+            output.write_all(&word_index.to_le_bytes())?;
+            output.write_all(&word.to_le_bytes())?;
+            output.write_all(&rank.to_le_bytes())?;
+        }
+        for object_id in &directory.object_ids {
+            output.write_all(&object_id.to_le_bytes())?;
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -1905,7 +2178,7 @@ fn write_streaming_sidecar(
             Ok(())
         },
     )?;
-    let count = encoder.entries.len() as u64;
+    let count = encoder.logical_count as u64;
     encoder.write(output)?;
     Ok(count)
 }
@@ -2043,7 +2316,7 @@ fn visit_logical_sets(
             topology_bases: Vec::new(),
         })?;
     }
-    let mut category_pages = Vec::new();
+    let mut category_targets = Vec::new();
     for (kind, target, _) in direct
         .positions
         .iter()
@@ -2051,49 +2324,52 @@ fn visit_logical_sets(
         .chain(effect_sets.positions.iter().map(|(key, _)| key))
     {
         if *kind == EdgeKind::Category {
-            category_pages.push(*target);
+            category_targets.push(*target);
         }
     }
-    category_pages.sort_unstable();
-    category_pages.dedup();
-    let category_info = category_pages
-        .iter()
-        .map(|target| (*target, EdgeKind::Category))
-        .collect::<Vec<_>>();
-    let mut category_spool = tempfile::tempfile()?;
-    if let Some(map) = &graph.forward {
-        for index in 0..map.len() / EDGE_BYTES {
-            let edge = graph.edge_at(false, index);
-            if edge.kind != EdgeKind::Category {
-                continue;
+    category_targets.sort_unstable();
+    category_targets.dedup();
+    for target in category_targets {
+        let mut guaranteed = Bitmap::default();
+        for store in [&mut *direct, &mut effect_sets] {
+            if let Some(members) =
+                store.get(&(EdgeKind::Category, target, Certainty::Definite))?
+            {
+                guaranteed.union_with(&members);
             }
-            let Ok(source) = category_pages.binary_search(&edge.source) else {
-                continue;
-            };
-            let Ok(target) = category_pages.binary_search(&edge.target) else {
-                continue;
-            };
-            write_graph_edge(
-                &mut category_spool,
-                GraphEdge {
-                    source: source as u64,
-                    target: target as u64,
+        }
+        if !guaranteed.words.is_empty() {
+            visitor(LogicalSet {
+                key: SetKey {
+                    target_page_id: target,
                     kind: EdgeKind::Category,
-                    certainty: edge.certainty,
+                    class: SetClass::TransitiveUnconditional,
                 },
-            )?;
+                members: guaranteed.clone(),
+                topology_bases: Vec::new(),
+            })?;
+        }
+        let mut possible = Bitmap::default();
+        for store in [&mut *direct, &mut effect_sets] {
+            if let Some(members) =
+                store.get(&(EdgeKind::Category, target, Certainty::Possible))?
+            {
+                possible.union_with(&members);
+            }
+        }
+        possible.subtract(&guaranteed);
+        if !possible.words.is_empty() {
+            visitor(LogicalSet {
+                key: SetKey {
+                    target_page_id: target,
+                    kind: EdgeKind::Category,
+                    class: SetClass::TransitivePossible,
+                },
+                members: possible,
+                topology_bases: Vec::new(),
+            })?;
         }
     }
-    category_spool.seek(SeekFrom::Start(0))?;
-    let category_graph = build_disk_graph(category_spool, EDGE_RUN_RECORDS)?;
-    visit_transitive_sets(
-        &category_info,
-        &category_graph,
-        &[EdgeKind::Category],
-        direct,
-        &mut effect_sets,
-        visitor,
-    )?;
     Ok(())
 }
 
@@ -2269,87 +2545,31 @@ fn reverse_topological(dag: &[BTreeSet<usize>]) -> Vec<usize> {
     order
 }
 
-#[cfg(test)]
-fn encode_sets(mut sets: Vec<LogicalSet>) -> Vec<EncodedSet> {
-    sets.sort_by_key(|set| {
-        (
-            matches!(
-                set.key.class,
-                SetClass::TransitiveUnconditional | SetClass::TransitivePossible
-            ),
-            set.key.class,
-            set.key.kind,
-            set.members.len(),
-            set.key.target_page_id,
-        )
-    });
-    let mut encoded = Vec::<EncodedSet>::with_capacity(sets.len());
-    let mut positions = BTreeMap::<SetKey, usize>::new();
-    for set in sets {
-        let raw = encode_bitmap(&set.members);
-        let direct = matches!(
-            set.key.class,
-            SetClass::DirectUnconditional | SetClass::DirectPossible
-        );
-        let mut best = None::<(usize, Vec<u8>)>;
-        if !direct {
-            for candidate in &set.topology_bases {
-                let Some(position) = positions.get(candidate).copied() else {
-                    continue;
-                };
-                consider_base(&set, &encoded, position, &raw, &mut best);
-            }
-            let start = encoded.len().saturating_sub(HEURISTIC_WINDOW);
-            for position in start..encoded.len() {
-                consider_base(&set, &encoded, position, &raw, &mut best);
-            }
-        }
-        let (base_offset, depth, payload) = best.map_or((0, 0, raw), |(base, payload)| {
-            (
-                (encoded.len() - base) as u16,
-                encoded[base].depth + 1,
-                payload,
-            )
-        });
-        positions.insert(set.key, encoded.len());
-        encoded.push(EncodedSet {
-            key: set.key,
-            base_offset,
-            depth,
-            payload,
-            resolved: Some(set.members),
-        });
-        if encoded.len() > MAX_XOR_OFFSET {
-            let expired = encoded.len() - MAX_XOR_OFFSET - 1;
-            encoded[expired].resolved = None;
-        }
-    }
-    encoded
+fn encode_sidecar_bitmap(bitmap: &Bitmap) -> Vec<u8> {
+    let roaring = bitmap.members().collect::<roaring::RoaringTreemap>();
+    let mut output = Vec::with_capacity(roaring.serialized_size());
+    roaring
+        .serialize_into(&mut output)
+        .expect("writing a Roaring bitmap to memory cannot fail");
+    output
 }
 
-#[cfg(test)]
-fn consider_base(
-    set: &LogicalSet,
-    encoded: &[EncodedSet],
-    position: usize,
-    raw: &[u8],
-    best: &mut Option<(usize, Vec<u8>)>,
-) {
-    let distance = encoded.len().saturating_sub(position);
-    if distance == 0
-        || distance > MAX_XOR_OFFSET
-        || encoded[position].depth >= MAX_XOR_DEPTH
-    {
-        return;
+fn decode_sidecar_bitmap(bytes: &[u8]) -> std::io::Result<Bitmap> {
+    let mut input = std::io::Cursor::new(bytes);
+    let roaring = roaring::RoaringTreemap::deserialize_from(&mut input)?;
+    if input.position() != bytes.len() as u64 {
+        return Err(invalid_data("trailing Roaring bitmap bytes"));
     }
-    let Some(base) = encoded[position].resolved.as_ref() else {
-        return;
-    };
-    let delta = encode_bitmap(&set.members.difference(base));
-    let current_len = best.as_ref().map_or(raw.len(), |(_, bytes)| bytes.len());
-    if delta.len() < current_len {
-        *best = Some((position, delta));
+    let mut words = Vec::<(u64, u64)>::new();
+    for member in roaring {
+        let word_index = member / 64;
+        let bit = 1_u64 << (member % 64);
+        match words.last_mut() {
+            Some((last_index, word)) if *last_index == word_index => *word |= bit,
+            _ => words.push((word_index, bit)),
+        }
     }
+    Ok(Bitmap { words })
 }
 
 fn encode_bitmap(bitmap: &Bitmap) -> Vec<u8> {
@@ -2407,104 +2627,21 @@ fn write_sidecar(
     output: impl AsRef<Path>,
     logical: &[(SetKey, Vec<u64>)],
 ) -> crate::archive::Result<u64> {
-    let sets = logical
-        .iter()
-        .map(|(key, members)| {
-            let mut bitmap = Bitmap::default();
-            for member in members {
-                bitmap.insert(*member);
-            }
-            LogicalSet {
-                key: *key,
-                members: bitmap,
-                topology_bases: Vec::new(),
-            }
-        })
-        .collect();
-    let encoded = encode_sets(sets);
-    write_encoded(output, &encoded)?;
-    Ok(encoded.len() as u64)
-}
-
-#[cfg(test)]
-fn write_encoded(
-    output: impl AsRef<Path>,
-    encoded: &[EncodedSet],
-) -> crate::archive::Result<()> {
-    let output = output.as_ref();
-    let parent = output.parent().filter(|path| !path.as_os_str().is_empty()).unwrap_or(Path::new("."));
-    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
-    let entries_offset = HEADER_BYTES as u64;
-    let directory_offset = entries_offset + encoded.len() as u64 * ENTRY_BYTES as u64;
-    let payload_offset =
-        directory_offset + encoded.len() as u64 * DIRECTORY_BYTES as u64;
-    temporary.write_all(&MAGIC)?;
-    temporary.write_all(&VERSION.to_le_bytes())?;
-    temporary.write_all(&(HEADER_BYTES as u32).to_le_bytes())?;
-    temporary.write_all(&(encoded.len() as u64).to_le_bytes())?;
-    temporary.write_all(&entries_offset.to_le_bytes())?;
-    temporary.write_all(&directory_offset.to_le_bytes())?;
-    temporary.write_all(&payload_offset.to_le_bytes())?;
-    temporary.write_all(&0_u64.to_le_bytes())?;
-    let mut offset = payload_offset;
-    for entry in encoded {
-        temporary.write_all(&entry.key.target_page_id.to_le_bytes())?;
-        temporary.write_all(&[kind_byte(entry.key.kind), class_byte(entry.key.class), entry.depth, 0])?;
-        temporary.write_all(&entry.base_offset.to_le_bytes())?;
-        temporary.write_all(&[0; 2])?;
-        temporary.write_all(&offset.to_le_bytes())?;
-        temporary.write_all(&(entry.payload.len() as u64).to_le_bytes())?;
-        temporary.write_all(&[0; 8])?;
-        offset += entry.payload.len() as u64;
+    let mut encoder = StreamingEncoder::new()?;
+    for (key, members) in logical {
+        let mut bitmap = Bitmap::default();
+        for member in members {
+            bitmap.insert(*member);
+        }
+        encoder.add(LogicalSet {
+            key: *key,
+            members: bitmap,
+            topology_bases: Vec::new(),
+        })?;
     }
-    let mut directory = encoded
-        .iter()
-        .enumerate()
-        .map(|(position, entry)| (entry.key, position as u64))
-        .collect::<Vec<_>>();
-    directory.sort_by_key(|entry| entry.0);
-    for (key, position) in directory {
-        temporary.write_all(&key.target_page_id.to_le_bytes())?;
-        temporary.write_all(&[kind_byte(key.kind), class_byte(key.class)])?;
-        temporary.write_all(&[0; 6])?;
-        temporary.write_all(&position.to_le_bytes())?;
-    }
-    for entry in encoded {
-        temporary.write_all(&entry.payload)?;
-    }
-    temporary.as_file_mut().sync_all()?;
-    temporary.persist(output).map_err(|error| ArchiveError::Io(error.error))?;
-    Ok(())
-}
-
-fn write_entry(
-    output: &mut impl Write,
-    key: SetKey,
-    base_offset: u16,
-    depth: u8,
-    payload_offset: u64,
-    payload_len: u64,
-) -> std::io::Result<()> {
-    output.write_all(&key.target_page_id.to_le_bytes())?;
-    output.write_all(&[kind_byte(key.kind), class_byte(key.class), depth, 0])?;
-    output.write_all(&base_offset.to_le_bytes())?;
-    output.write_all(&[0; 2])?;
-    output.write_all(&payload_offset.to_le_bytes())?;
-    output.write_all(&payload_len.to_le_bytes())?;
-    output.write_all(&[0; 8])
-}
-
-fn write_directory(
-    output: &mut impl Write,
-    directory: &[(SetKey, u64)],
-) -> std::io::Result<()> {
-    for (key, position) in directory {
-        output.write_all(&key.target_page_id.to_le_bytes())?;
-        output.write_all(&[kind_byte(key.kind), class_byte(key.class)])?;
-        output.write_all(&[0; 6])?;
-        output.write_all(&position.to_le_bytes())?;
-    }
-    Ok(())
+    let objects = encoder.entries.len() as u64;
+    encoder.write(output)?;
+    Ok(objects)
 }
 
 fn set_readable_permissions(path: &Path) -> std::io::Result<()> {
@@ -2519,15 +2656,26 @@ fn set_readable_permissions(path: &Path) -> std::io::Result<()> {
 #[derive(Debug)]
 pub struct BackrefIndex {
     bytes: memmap2::Mmap,
-    entry_count: usize,
-    entries_offset: usize,
-    directory_offset: usize,
+    object_count: usize,
+    directories: Vec<DiskDirectory>,
+    object_offsets_offset: usize,
+    base_offsets_offset: usize,
     payload_offset: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
-struct DiskEntry {
-    base_offset: u16,
+struct DiskDirectory {
+    kind: EdgeKind,
+    class: SetClass,
+    words_offset: usize,
+    word_count: usize,
+    object_ids_offset: usize,
+    logical_count: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BitmapObject {
+    base_offset: u8,
     offset: usize,
     len: usize,
 }
@@ -2539,78 +2687,164 @@ impl BackrefIndex {
         if bytes.len() < HEADER_BYTES || bytes[..8] != MAGIC {
             return Err(ArchiveError::Invalid("bad backref sidecar magic"));
         }
-        if u32::from_le_bytes(bytes[8..12].try_into().unwrap()) != VERSION
-            || u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize != HEADER_BYTES
+        if u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize != HEADER_BYTES
+            || u32::from_le_bytes(bytes[12..16].try_into().unwrap()) != 0
         {
-            return Err(ArchiveError::Invalid("unsupported backref sidecar version"));
+            return Err(ArchiveError::Invalid("unsupported backref sidecar header"));
         }
-        let entry_count = u64::from_le_bytes(bytes[16..24].try_into().unwrap()) as usize;
-        let entries_offset = u64::from_le_bytes(bytes[24..32].try_into().unwrap()) as usize;
-        let directory_offset = u64::from_le_bytes(bytes[32..40].try_into().unwrap()) as usize;
-        let payload_offset = u64::from_le_bytes(bytes[40..48].try_into().unwrap()) as usize;
-        let reserved = u64::from_le_bytes(bytes[48..56].try_into().unwrap());
-        if reserved != 0 {
+        let usize_field = |start| {
+            usize::try_from(u64::from_le_bytes(
+                bytes[start..start + 8].try_into().unwrap(),
+            ))
+            .map_err(|_| ArchiveError::FieldTooLarge)
+        };
+        let object_count = usize_field(16)?;
+        let logical_count = usize_field(24)?;
+        let directories_offset = usize_field(32)?;
+        let object_offsets_offset = usize_field(40)?;
+        let base_offsets_offset = usize_field(48)?;
+        let payload_offset = usize_field(56)?;
+        let directory_count = usize_field(64)?;
+        if bytes[72..80] != [0; 8] {
             return Err(ArchiveError::Invalid("unknown backref sidecar header field"));
         }
-        let expected_directory = HEADER_BYTES
+        if object_count > u32::MAX as usize || logical_count > u32::MAX as usize {
+            return Err(ArchiveError::Invalid("backref count exceeds u32"));
+        }
+        let descriptor_end = HEADER_BYTES
             .checked_add(
-                entry_count
-                    .checked_mul(ENTRY_BYTES)
+                directory_count
+                    .checked_mul(DIRECTORY_DESCRIPTOR_BYTES)
                     .ok_or(ArchiveError::FieldTooLarge)?,
             )
             .ok_or(ArchiveError::FieldTooLarge)?;
-        let expected_payload = expected_directory
+        let expected_bases = object_offsets_offset
             .checked_add(
-                entry_count
-                    .checked_mul(DIRECTORY_BYTES)
+                object_count
+                    .checked_add(1)
+                    .and_then(|count| count.checked_mul(8))
                     .ok_or(ArchiveError::FieldTooLarge)?,
             )
             .ok_or(ArchiveError::FieldTooLarge)?;
-        if entries_offset != HEADER_BYTES
-            || directory_offset != expected_directory
+        let expected_payload = expected_bases
+            .checked_add(object_count)
+            .ok_or(ArchiveError::FieldTooLarge)?;
+        if directories_offset != HEADER_BYTES
+            || descriptor_end > object_offsets_offset
+            || base_offsets_offset != expected_bases
             || payload_offset != expected_payload
             || payload_offset > bytes.len()
         {
             return Err(ArchiveError::Invalid("invalid backref sidecar bounds"));
         }
-        let mut previous_key = None;
-        let mut seen_physical = vec![false; entry_count];
-        for position in 0..entry_count {
-            let start = directory_offset + position * DIRECTORY_BYTES;
-            let entry = &bytes[start..start + DIRECTORY_BYTES];
-            let key = SetKey {
-                target_page_id: u64::from_le_bytes(entry[..8].try_into().unwrap()),
-                kind: parse_kind(entry[8])?,
-                class: parse_class(entry[9])?,
-            };
-            let physical = u64::from_le_bytes(entry[16..24].try_into().unwrap()) as usize;
-            if previous_key.is_some_and(|previous| previous >= key) || physical >= entry_count {
-                return Err(ArchiveError::Invalid("invalid backref key directory"));
+        let mut directories = Vec::with_capacity(directory_count);
+        let mut expected_directory_data = descriptor_end;
+        let mut counted_logical = 0_usize;
+        let mut referenced = vec![false; object_count];
+        let mut previous_identity = None;
+        for directory_index in 0..directory_count {
+            let start = HEADER_BYTES + directory_index * DIRECTORY_DESCRIPTOR_BYTES;
+            let kind = parse_kind(bytes[start])?;
+            let class = parse_class(bytes[start + 1])?;
+            if bytes[start + 2..start + 8] != [0; 6]
+                || previous_identity.is_some_and(|previous| previous >= (kind, class))
+            {
+                return Err(ArchiveError::Invalid("invalid backref logical directory identity"));
             }
-            if std::mem::replace(&mut seen_physical[physical], true) {
-                return Err(ArchiveError::Invalid("duplicate backref physical entry"));
+            previous_identity = Some((kind, class));
+            let words_offset = usize_field(start + 8)?;
+            let word_count = usize_field(start + 16)?;
+            let object_ids_offset = usize_field(start + 24)?;
+            let directory_logical_count = usize_field(start + 32)?;
+            let words_end = words_offset
+                .checked_add(
+                    word_count
+                        .checked_mul(PRESENCE_WORD_BYTES)
+                        .ok_or(ArchiveError::FieldTooLarge)?,
+                )
+                .ok_or(ArchiveError::FieldTooLarge)?;
+            let ids_end = object_ids_offset
+                .checked_add(
+                    directory_logical_count
+                        .checked_mul(4)
+                        .ok_or(ArchiveError::FieldTooLarge)?,
+                )
+                .ok_or(ArchiveError::FieldTooLarge)?;
+            if words_offset != expected_directory_data
+                || object_ids_offset != words_end
+                || ids_end > object_offsets_offset
+            {
+                return Err(ArchiveError::Invalid("invalid backref logical directory bounds"));
             }
-            let physical_start = entries_offset + physical * ENTRY_BYTES;
-            let physical_entry = &bytes[physical_start..physical_start + ENTRY_BYTES];
-            let physical_key = SetKey {
-                target_page_id: u64::from_le_bytes(physical_entry[..8].try_into().unwrap()),
-                kind: parse_kind(physical_entry[8])?,
-                class: parse_class(physical_entry[9])?,
-            };
-            if physical_key != key {
-                return Err(ArchiveError::Invalid("backref directory key mismatch"));
+            let mut previous_word = None;
+            let mut rank = 0_u64;
+            for word_position in 0..word_count {
+                let word_start = words_offset + word_position * PRESENCE_WORD_BYTES;
+                let word_index =
+                    u64::from_le_bytes(bytes[word_start..word_start + 8].try_into().unwrap());
+                let word =
+                    u64::from_le_bytes(bytes[word_start + 8..word_start + 16].try_into().unwrap());
+                let stored_rank = u32::from_le_bytes(
+                    bytes[word_start + 16..word_start + 20].try_into().unwrap(),
+                );
+                if word == 0
+                    || previous_word.is_some_and(|previous| previous >= word_index)
+                    || u64::from(stored_rank) != rank
+                {
+                    return Err(ArchiveError::Invalid("invalid backref presence bitmap"));
+                }
+                rank = rank
+                    .checked_add(u64::from(word.count_ones()))
+                    .ok_or(ArchiveError::FieldTooLarge)?;
+                previous_word = Some(word_index);
             }
-            previous_key = Some(key);
+            if rank != directory_logical_count as u64 {
+                return Err(ArchiveError::Invalid("backref presence rank mismatch"));
+            }
+            for logical_position in 0..directory_logical_count {
+                let id_start = object_ids_offset + logical_position * 4;
+                let object_id =
+                    u32::from_le_bytes(bytes[id_start..id_start + 4].try_into().unwrap()) as usize;
+                if object_id >= object_count {
+                    return Err(ArchiveError::Invalid("invalid backref bitmap object id"));
+                }
+                referenced[object_id] = true;
+            }
+            counted_logical = counted_logical
+                .checked_add(directory_logical_count)
+                .ok_or(ArchiveError::FieldTooLarge)?;
+            expected_directory_data = ids_end;
+            directories.push(DiskDirectory {
+                kind,
+                class,
+                words_offset,
+                word_count,
+                object_ids_offset,
+                logical_count: directory_logical_count,
+            });
         }
-        let mut expected_payload_position = payload_offset;
-        let mut depths = Vec::with_capacity(entry_count);
-        for position in 0..entry_count {
-            let start = entries_offset + position * ENTRY_BYTES;
-            let entry = &bytes[start..start + ENTRY_BYTES];
-            let depth = entry[10];
-            let base = u16::from_le_bytes(entry[12..14].try_into().unwrap()) as usize;
-            let offset = u64::from_le_bytes(entry[16..24].try_into().unwrap()) as usize;
-            let len = u64::from_le_bytes(entry[24..32].try_into().unwrap()) as usize;
+        if expected_directory_data != object_offsets_offset || counted_logical != logical_count {
+            return Err(ArchiveError::Invalid("backref logical directory count mismatch"));
+        }
+        if referenced.iter().any(|referenced| !referenced) {
+            return Err(ArchiveError::Invalid("unreferenced backref bitmap object"));
+        }
+        let offset_at = |position: usize| -> crate::archive::Result<usize> {
+            let start = object_offsets_offset + position * 8;
+            usize::try_from(u64::from_le_bytes(
+                bytes[start..start + 8].try_into().unwrap(),
+            ))
+            .map_err(|_| ArchiveError::FieldTooLarge)
+        };
+        if offset_at(0)? != payload_offset || offset_at(object_count)? != bytes.len() {
+            return Err(ArchiveError::Invalid("invalid backref payload boundaries"));
+        }
+        let mut depths = Vec::with_capacity(object_count);
+        let mut previous_payload_position = payload_offset;
+        for position in 0..object_count {
+            let offset = offset_at(position)?;
+            let end = offset_at(position + 1)?;
+            let base = bytes[base_offsets_offset + position] as usize;
             let expected_depth = if base == 0 {
                 0
             } else if base <= position {
@@ -2620,34 +2854,28 @@ impl BackrefIndex {
             };
             if base > position
                 || base > MAX_XOR_OFFSET
-                || depth > MAX_XOR_DEPTH
-                || depth != expected_depth
-                || offset != expected_payload_position
+                || expected_depth > MAX_XOR_DEPTH
+                || offset != previous_payload_position
+                || end < offset
+                || end > bytes.len()
             {
-                return Err(ArchiveError::Invalid("invalid backref physical entry"));
+                return Err(ArchiveError::Invalid("invalid backref bitmap object"));
             }
-            expected_payload_position = offset
-                .checked_add(len)
-                .ok_or(ArchiveError::FieldTooLarge)?;
-            if expected_payload_position > bytes.len() {
-                return Err(ArchiveError::Invalid("invalid backref payload bounds"));
-            }
-            depths.push(depth);
-        }
-        if expected_payload_position != bytes.len() {
-            return Err(ArchiveError::Invalid("trailing backref sidecar bytes"));
+            previous_payload_position = end;
+            depths.push(expected_depth);
         }
         Ok(Self {
             bytes,
-            entry_count,
-            entries_offset,
-            directory_offset,
+            object_count,
+            directories,
+            object_offsets_offset,
+            base_offsets_offset,
             payload_offset,
         })
     }
 
     pub fn members(&self, key: SetKey) -> crate::archive::Result<Vec<u64>> {
-        let Some(position) = self.find_key(key)? else {
+        let Some(position) = self.find_object(key)? else {
             return Ok(Vec::new());
         };
         let mut cache = BTreeMap::new();
@@ -2667,7 +2895,7 @@ impl BackrefIndex {
                 return Err(ArchiveError::Invalid("backref XOR chain is too deep"));
             }
             chain.push(current);
-            let entry = self.entry(current)?;
+            let entry = self.object(current)?;
             if entry.base_offset == 0 {
                 break;
             }
@@ -2679,10 +2907,11 @@ impl BackrefIndex {
         }
         let mut bitmap = cache.get(&current).cloned();
         for entry_position in chain.into_iter().rev() {
-            let entry = self.entry(entry_position)?;
-            let delta =
-                decode_bitmap(&self.bytes[entry.offset..entry.offset + entry.len])
-                    .map_err(ArchiveError::Io)?;
+            let entry = self.object(entry_position)?;
+            let delta = decode_sidecar_bitmap(
+                &self.bytes[entry.offset..entry.offset + entry.len],
+            )
+            .map_err(ArchiveError::Io)?;
             bitmap = Some(match bitmap {
                 Some(base) if entry.base_offset != 0 => delta.difference(&base),
                 _ => delta,
@@ -2692,24 +2921,46 @@ impl BackrefIndex {
         bitmap.ok_or(ArchiveError::Invalid("empty backref XOR chain"))
     }
 
-    fn find_key(&self, key: SetKey) -> crate::archive::Result<Option<usize>> {
+    fn find_object(&self, key: SetKey) -> crate::archive::Result<Option<usize>> {
+        let Some(directory) = self
+            .directories
+            .iter()
+            .find(|directory| directory.kind == key.kind && directory.class == key.class)
+            .copied()
+        else {
+            return Ok(None);
+        };
+        let wanted_word = key.target_page_id / 64;
         let mut left = 0;
-        let mut right = self.entry_count;
+        let mut right = directory.word_count;
         while left < right {
             let middle = left + (right - left) / 2;
-            let start = self.directory_offset + middle * DIRECTORY_BYTES;
-            let entry = &self.bytes[start..start + DIRECTORY_BYTES];
-            let candidate = SetKey {
-                target_page_id: u64::from_le_bytes(entry[..8].try_into().unwrap()),
-                kind: parse_kind(entry[8])?,
-                class: parse_class(entry[9])?,
-            };
-            match candidate.cmp(&key) {
+            let start = directory.words_offset + middle * PRESENCE_WORD_BYTES;
+            let candidate =
+                u64::from_le_bytes(self.bytes[start..start + 8].try_into().unwrap());
+            match candidate.cmp(&wanted_word) {
                 std::cmp::Ordering::Less => left = middle + 1,
                 std::cmp::Ordering::Greater => right = middle,
                 std::cmp::Ordering::Equal => {
+                    let word = u64::from_le_bytes(
+                        self.bytes[start + 8..start + 16].try_into().unwrap(),
+                    );
+                    let bit = 1_u64 << (key.target_page_id % 64);
+                    if word & bit == 0 {
+                        return Ok(None);
+                    }
+                    let rank = u32::from_le_bytes(
+                        self.bytes[start + 16..start + 20].try_into().unwrap(),
+                    ) as usize
+                        + (word & (bit - 1)).count_ones() as usize;
+                    if rank >= directory.logical_count {
+                        return Err(ArchiveError::Invalid("invalid backref presence rank"));
+                    }
+                    let id_start = directory.object_ids_offset + rank * 4;
                     return Ok(Some(
-                        u64::from_le_bytes(entry[16..24].try_into().unwrap()) as usize,
+                        u32::from_le_bytes(
+                            self.bytes[id_start..id_start + 4].try_into().unwrap(),
+                        ) as usize,
                     ));
                 }
             }
@@ -2717,25 +2968,29 @@ impl BackrefIndex {
         Ok(None)
     }
 
-    fn entry(&self, position: usize) -> crate::archive::Result<DiskEntry> {
-        if position >= self.entry_count {
-            return Err(ArchiveError::Invalid("backref entry position is out of bounds"));
+    fn object(&self, position: usize) -> crate::archive::Result<BitmapObject> {
+        if position >= self.object_count {
+            return Err(ArchiveError::Invalid("backref bitmap object is out of bounds"));
         }
-        let start = self.entries_offset + position * ENTRY_BYTES;
-        let entry = &self.bytes[start..start + ENTRY_BYTES];
-        let offset = u64::from_le_bytes(entry[16..24].try_into().unwrap()) as usize;
-        let len = u64::from_le_bytes(entry[24..32].try_into().unwrap()) as usize;
+        let start = self.object_offsets_offset + position * 8;
+        let offset = usize::try_from(u64::from_le_bytes(
+            self.bytes[start..start + 8].try_into().unwrap(),
+        ))
+        .map_err(|_| ArchiveError::FieldTooLarge)?;
+        let end = usize::try_from(u64::from_le_bytes(
+            self.bytes[start + 8..start + 16].try_into().unwrap(),
+        ))
+        .map_err(|_| ArchiveError::FieldTooLarge)?;
         if offset < self.payload_offset
-            || offset
-                .checked_add(len)
-                .is_none_or(|end| end > self.bytes.len())
+            || end < offset
+            || end > self.bytes.len()
         {
             return Err(ArchiveError::Invalid("invalid backref payload bounds"));
         }
-        Ok(DiskEntry {
-            base_offset: u16::from_le_bytes(entry[12..14].try_into().unwrap()),
+        Ok(BitmapObject {
+            base_offset: self.bytes[self.base_offsets_offset + position],
             offset,
-            len,
+            len: end - offset,
         })
     }
 }
@@ -3031,7 +3286,7 @@ mod tests {
     }
 
     #[test]
-    fn category_membership_is_transitive_through_subcategories() {
+    fn effective_category_membership_does_not_expand_subcategories() {
         let pages = vec![
             page(1, "Category:Parent", ""),
             page(2, "Category:Child", "[[Category:Parent]]"),
@@ -3047,7 +3302,18 @@ mod tests {
                     class: SetClass::TransitiveUnconditional,
                 },
             ),
-            vec![2, 3],
+            vec![2],
+        );
+        assert_eq!(
+            set(
+                &sets,
+                SetKey {
+                    target_page_id: 2,
+                    kind: EdgeKind::Category,
+                    class: SetClass::TransitiveUnconditional,
+                },
+            ),
+            vec![3],
         );
     }
 
@@ -3182,10 +3448,11 @@ mod tests {
             page(1, "Category:Emitted", ""),
             page(
                 2,
-                "Template:Categorizer",
+                "Template:Inner",
                 "<includeonly>[[Category:Emitted]]</includeonly>",
             ),
-            page(3, "Article", "{{Categorizer}}"),
+            page(3, "Template:Outer", "{{Inner}}"),
+            page(4, "Article", "{{Outer}}"),
         ];
         let sets = build_sets(&pages, resolver(&pages));
         assert!(set(
@@ -3206,7 +3473,7 @@ mod tests {
                     class: SetClass::TransitiveUnconditional,
                 },
             ),
-            vec![3],
+            vec![3, 4],
         );
     }
 
@@ -3265,6 +3532,8 @@ mod tests {
         let encoded = encode_bitmap(&bitmap);
         assert!(encoded.len() < 32);
         assert_eq!(decode_bitmap(&encoded).unwrap(), bitmap);
+        let sidecar_encoded = encode_sidecar_bitmap(&bitmap);
+        assert_eq!(decode_sidecar_bitmap(&sidecar_encoded).unwrap(), bitmap);
     }
 
     #[test]
@@ -3386,27 +3655,96 @@ mod tests {
         base.insert(200);
         let mut target = base.clone();
         target.insert(300);
-        let encoded = encode_sets(vec![
-            LogicalSet {
-                key: target_key,
-                members: target,
-                topology_bases: vec![base_key],
-            },
-            LogicalSet {
+        let mut encoder = StreamingEncoder::new().unwrap();
+        encoder
+            .add(LogicalSet {
                 key: base_key,
                 members: base,
                 topology_bases: Vec::new(),
-            },
-        ]);
-        let target_position = encoded
-            .iter()
-            .position(|entry| entry.key == target_key)
+            })
             .unwrap();
-        assert!(encoded[target_position].base_offset > 0);
+        encoder
+            .add(LogicalSet {
+                key: target_key,
+                members: target,
+                topology_bases: vec![base_key],
+            })
+            .unwrap();
+        let directory =
+            &encoder.logical[directory_index(EdgeKind::Template, SetClass::TransitiveUnconditional)];
+        let target_position = directory
+            .iter()
+            .find(|entry| entry.0 == target_key.target_page_id)
+            .unwrap()
+            .1 as usize;
+        let base_position = directory
+            .iter()
+            .find(|entry| entry.0 == base_key.target_page_id)
+            .unwrap()
+            .1 as usize;
+        assert!(encoder.entries[target_position].base_offset > 0);
         assert_eq!(
-            encoded[target_position - encoded[target_position].base_offset as usize].key,
-            base_key,
+            target_position - encoder.entries[target_position].base_offset as usize,
+            base_position,
         );
+    }
+
+    #[test]
+    fn physically_stale_xor_candidates_are_not_truncated_to_u8() {
+        let base_key = SetKey {
+            target_page_id: 1,
+            kind: EdgeKind::Template,
+            class: SetClass::TransitiveUnconditional,
+        };
+        let mut base = Bitmap::default();
+        base.insert(100);
+        base.insert(200);
+        let mut encoder = StreamingEncoder::new().unwrap();
+        encoder
+            .add(LogicalSet {
+                key: base_key,
+                members: base.clone(),
+                topology_bases: Vec::new(),
+            })
+            .unwrap();
+        for page_id in 2..=302 {
+            let mut members = Bitmap::default();
+            members.insert(10_000 + page_id);
+            encoder
+                .add(LogicalSet {
+                    key: SetKey {
+                        target_page_id: page_id,
+                        kind: EdgeKind::Template,
+                        class: SetClass::DirectUnconditional,
+                    },
+                    members,
+                    topology_bases: Vec::new(),
+                })
+                .unwrap();
+        }
+        let mut target = base;
+        target.insert(300);
+        let target_key = SetKey {
+            target_page_id: 303,
+            kind: EdgeKind::Template,
+            class: SetClass::TransitiveUnconditional,
+        };
+        encoder
+            .add(LogicalSet {
+                key: target_key,
+                members: target,
+                topology_bases: vec![base_key],
+            })
+            .unwrap();
+        let target_position = encoder.logical[directory_index(
+            EdgeKind::Template,
+            SetClass::TransitiveUnconditional,
+        )]
+        .iter()
+        .find(|entry| entry.0 == target_key.target_page_id)
+        .unwrap()
+        .1 as usize;
+        assert_eq!(encoder.entries[target_position].base_offset, 0);
     }
 
     #[test]
@@ -3611,7 +3949,98 @@ mod tests {
     }
 
     #[test]
-    fn sidecar_rejects_forged_depths_and_absurd_bitmap_counts() {
+    fn logical_directories_rank_page_ids_and_share_bitmap_objects() {
+        let members = vec![2, 65, 9000];
+        let keys = [
+            SetKey {
+                target_page_id: 1,
+                kind: EdgeKind::Template,
+                class: SetClass::DirectUnconditional,
+            },
+            SetKey {
+                target_page_id: 63,
+                kind: EdgeKind::Template,
+                class: SetClass::DirectUnconditional,
+            },
+            SetKey {
+                target_page_id: 64,
+                kind: EdgeKind::Template,
+                class: SetClass::DirectUnconditional,
+            },
+            SetKey {
+                target_page_id: 1 << 39,
+                kind: EdgeKind::Category,
+                class: SetClass::TransitivePossible,
+            },
+        ];
+        let logical = keys
+            .iter()
+            .map(|key| (*key, members.clone()))
+            .collect::<Vec<_>>();
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("shared.swrefs");
+        assert_eq!(write_sidecar(&path, &logical).unwrap(), 1);
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(
+            u64::from_le_bytes(bytes[64..72].try_into().unwrap()),
+            2,
+        );
+        let index = BackrefIndex::open(&path).unwrap();
+        for key in keys {
+            assert_eq!(index.members(key).unwrap(), members);
+        }
+        assert!(index
+            .members(SetKey {
+                target_page_id: 62,
+                kind: EdgeKind::Template,
+                class: SetClass::DirectUnconditional,
+            })
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn dedup_hash_collisions_compare_exact_bitmap_bytes() {
+        let mut encoder = StreamingEncoder::new().unwrap();
+        encoder.forced_hash = Some(7);
+        for (page_id, member) in [(1, 10), (2, 20), (3, 20)] {
+            let mut members = Bitmap::default();
+            members.insert(member);
+            encoder
+                .add(LogicalSet {
+                    key: SetKey {
+                        target_page_id: page_id,
+                        kind: EdgeKind::File,
+                        class: SetClass::DirectUnconditional,
+                    },
+                    members,
+                    topology_bases: Vec::new(),
+                })
+                .unwrap();
+        }
+        assert_eq!(encoder.entries.len(), 2);
+        assert_eq!(encoder.dedup.collisions.len(), 1);
+        let directory = &encoder.logical
+            [directory_index(EdgeKind::File, SetClass::DirectUnconditional)];
+        assert_ne!(directory[0].1, directory[1].1);
+        assert_eq!(directory[1].1, directory[2].1);
+    }
+
+    #[test]
+    fn empty_logical_sets_are_absent() {
+        let key = SetKey {
+            target_page_id: 9,
+            kind: EdgeKind::File,
+            class: SetClass::DirectPossible,
+        };
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("empty.swrefs");
+        assert_eq!(write_sidecar(&path, &[(key, Vec::new())]).unwrap(), 0);
+        assert!(BackrefIndex::open(&path).unwrap().members(key).unwrap().is_empty());
+    }
+
+    #[test]
+    fn sidecar_rejects_bad_bases_and_malformed_roaring_payloads() {
         let logical = vec![(
             SetKey {
                 target_page_id: 9,
@@ -3625,17 +4054,37 @@ mod tests {
         write_sidecar(&path, &logical).unwrap();
         let original = std::fs::read(&path).unwrap();
 
-        let mut bad_depth = original.clone();
-        bad_depth[HEADER_BYTES + 10] = 1;
-        std::fs::write(&path, bad_depth).unwrap();
+        let mut bad_base = original.clone();
+        let base_offsets_offset =
+            u64::from_le_bytes(bad_base[48..56].try_into().unwrap()) as usize;
+        bad_base[base_offsets_offset] = 1;
+        std::fs::write(&path, bad_base).unwrap();
         assert!(BackrefIndex::open(&path).is_err());
 
-        let mut bad_count = original;
+        let mut bad_count = original.clone();
         let payload_offset =
-            u64::from_le_bytes(bad_count[40..48].try_into().unwrap()) as usize;
-        bad_count[payload_offset..payload_offset + 10]
-            .copy_from_slice(&[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02]);
+            u64::from_le_bytes(bad_count[56..64].try_into().unwrap()) as usize;
+        bad_count[payload_offset] = 0xff;
         std::fs::write(&path, bad_count).unwrap();
+        let index = BackrefIndex::open(&path).unwrap();
+        assert!(index.members(logical[0].0).is_err());
+
+        let mut truncated = original.clone();
+        truncated.pop();
+        std::fs::write(&path, truncated).unwrap();
+        assert!(BackrefIndex::open(&path).is_err());
+
+        let mut trailing = original;
+        trailing.push(0);
+        let object_count =
+            u64::from_le_bytes(trailing[16..24].try_into().unwrap()) as usize;
+        let object_offsets_offset =
+            u64::from_le_bytes(trailing[40..48].try_into().unwrap()) as usize;
+        let final_boundary = object_offsets_offset + object_count * 8;
+        let trailing_len = trailing.len() as u64;
+        trailing[final_boundary..final_boundary + 8]
+            .copy_from_slice(&trailing_len.to_le_bytes());
+        std::fs::write(&path, trailing).unwrap();
         let index = BackrefIndex::open(&path).unwrap();
         assert!(index.members(logical[0].0).is_err());
     }
