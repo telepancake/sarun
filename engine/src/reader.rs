@@ -1255,44 +1255,13 @@ impl Reader {
             .focus_link
             .and_then(|link| self.screen_links.iter().find(|item| item.link == link))
             .copied();
-        let next = match current {
-            None => {
-                let key = |item: &&ScreenLink| match (dx, dy) {
-                    (-1, 0) | (0, -1) => {
-                        (u16::MAX - item.y, u16::MAX - item.x1, item.link)
-                    }
-                    _ => (item.y, item.x0, item.link),
-                };
-                self.screen_links.iter().min_by_key(key).copied()
-            }
-            Some(current) => {
-                let cx = (i32::from(current.x0) + i32::from(current.x1)) / 2;
-                let cy = i32::from(current.y);
-                self.screen_links
-                    .iter()
-                    .filter(|item| item.link != current.link)
-                    .filter_map(|item| {
-                        let x = (i32::from(item.x0) + i32::from(item.x1)) / 2;
-                        let y = i32::from(item.y);
-                        let along = (x - cx) * dx + (y - cy) * dy;
-                        if along <= 0 {
-                            return None;
-                        }
-                        let across = (x - cx) * dy - (y - cy) * dx;
-                        let distance = i64::from(along).pow(2) + i64::from(across).pow(2);
-                        Some((distance, along, across.abs(), item))
-                    })
-                    .min_by_key(|(distance, along, across, item)| {
-                        (*distance, *along, *across, item.link)
-                    })
-                    .map(|(_, _, _, item)| *item)
-            }
-        };
+        let next = choose_spatial_link(&self.screen_links, current, dx, dy);
         let Some(next) = next else {
             self.spatial_edge(dx, dy);
             return;
         };
         self.set_focus(next.link);
+        self.scroll_to(self.doc.links[next.link].line);
         self.status = format!(
             "link {}/{}: {}",
             next.link + 1,
@@ -2278,6 +2247,85 @@ impl Reader {
     }
 }
 
+/// Pick the next link in one cardinal direction from the rendered terminal
+/// geometry.  A plain Euclidean-nearest search is surprisingly un-spatial:
+/// pressing Down can prefer a link one row below but far to the side over a
+/// link in the same column several rows below.  Prefer the aligned corridor
+/// first (same row for horizontal movement, overlapping x-range for vertical
+/// movement), then use the perpendicular gap and forward distance as stable
+/// tie breakers.  Only links in front of the current link are candidates.
+fn choose_spatial_link(
+    links: &[ScreenLink],
+    current: Option<ScreenLink>,
+    dx: i32,
+    dy: i32,
+) -> Option<ScreenLink> {
+    if links.is_empty() {
+        return None;
+    }
+    let Some(current) = current else {
+        let key = |item: &&ScreenLink| match (dx, dy) {
+            (-1, 0) | (0, -1) => {
+                (u16::MAX - item.y, u16::MAX - item.x1, item.link)
+            }
+            _ => (item.y, item.x0, item.link),
+        };
+        return links.iter().min_by_key(key).copied();
+    };
+
+    let cx = (i32::from(current.x0) + i32::from(current.x1)) / 2;
+    let cy = i32::from(current.y);
+    links
+        .iter()
+        .filter(|item| item.link != current.link)
+        .filter_map(|item| {
+            let x = (i32::from(item.x0) + i32::from(item.x1)) / 2;
+            let y = i32::from(item.y);
+            let along_center = (x - cx) * dx + (y - cy) * dy;
+            if along_center <= 0 {
+                return None;
+            }
+
+            let horizontal = dx != 0;
+            let aligned = if horizontal {
+                item.y == current.y
+            } else {
+                item.x0 < current.x1 && item.x1 > current.x0
+            };
+            let cross = if horizontal {
+                i64::from((y - cy).abs())
+            } else if item.x1 <= current.x0 {
+                i64::from(current.x0 - item.x1)
+            } else if item.x0 >= current.x1 {
+                i64::from(item.x0 - current.x1)
+            } else {
+                0
+            };
+            let forward = if dx > 0 {
+                i64::from(item.x0.saturating_sub(current.x1))
+            } else if dx < 0 {
+                i64::from(current.x0.saturating_sub(item.x1))
+            } else if dy > 0 {
+                i64::from(item.y.saturating_sub(current.y))
+            } else {
+                i64::from(current.y.saturating_sub(item.y))
+            };
+            let center_distance = i64::from(x - cx).abs() + i64::from(y - cy).abs();
+            Some((
+                if aligned { 0_u8 } else { 1_u8 },
+                cross,
+                forward,
+                center_distance,
+                item.link,
+                *item,
+            ))
+        })
+        .min_by_key(|(aligned, cross, forward, center_distance, link, _)| {
+            (*aligned, *cross, *forward, *center_distance, *link)
+        })
+        .map(|(_, _, _, _, _, item)| item)
+}
+
 fn find_matches(plain: &[String], query: &str) -> Vec<usize> {
     let q = query.to_lowercase();
     plain
@@ -2438,6 +2486,43 @@ mod tests {
             ),
         );
         assert!(r.status.contains("external link"), "click follows: {}", r.status);
+    }
+
+    #[test]
+    fn spatial_navigation_prefers_the_aligned_corridor() {
+        let links = [
+            ScreenLink {
+                link: 0,
+                x0: 10,
+                x1: 20,
+                y: 10,
+            },
+            // This is the adjacent link on the same row.  The old
+            // Euclidean-nearest rule could lose to a diagonal link.
+            ScreenLink {
+                link: 1,
+                x0: 20,
+                x1: 30,
+                y: 10,
+            },
+            ScreenLink {
+                link: 2,
+                x0: 20,
+                x1: 30,
+                y: 11,
+            },
+            // Same x corridor, deliberately farther away than the diagonal
+            // candidate above.  Down should still stay in this column.
+            ScreenLink {
+                link: 3,
+                x0: 10,
+                x1: 20,
+                y: 21,
+            },
+        ];
+        let current = Some(links[0]);
+        assert_eq!(choose_spatial_link(&links, current, 1, 0).unwrap().link, 1);
+        assert_eq!(choose_spatial_link(&links, current, 0, 1).unwrap().link, 3);
     }
 
     #[test]
