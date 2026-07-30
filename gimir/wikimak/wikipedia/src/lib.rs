@@ -15,7 +15,7 @@ pub mod direct;
 #[cfg(feature = "fetch")]
 mod cli;
 #[cfg(feature = "fetch")]
-pub use cli::cli_main;
+pub use cli::{cli_main, mirror_auxiliary_paths, mirror_scratch_path};
 pub mod error;
 pub(crate) mod frames;
 pub mod import;

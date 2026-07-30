@@ -48,6 +48,24 @@ pub(crate) struct HistoryFile {
     pub(crate) part: wikimak_mediawiki::Part,
 }
 
+fn history_listing_size(html: &str, match_end: usize) -> u64 {
+    let line_end = html[match_end..]
+        .find('\n')
+        .map_or(html.len(), |offset| match_end + offset);
+    let listing_tail = &html[match_end..line_end];
+    listing_tail
+        .find("</a>")
+        .map(|offset| &listing_tail[offset + "</a>".len()..])
+        .and_then(|metadata| {
+            let fields = metadata.split_whitespace().collect::<Vec<_>>();
+            (fields.len() >= 3)
+                .then(|| fields.last())
+                .flatten()
+                .and_then(|size| size.parse().ok())
+        })
+        .unwrap_or(0)
+}
+
 fn history_listing(client: &Client, url: &str) -> Result<String> {
     let mut delay = Duration::from_secs(1);
     for attempt in 0..4 {
@@ -102,12 +120,14 @@ pub(crate) fn discover_history(
         .captures_iter(&html)
         .map(|capture| {
             let filename = capture[1].to_string();
+            let size_bytes =
+                history_listing_size(&html, capture.get(0).expect("whole match").end());
             HistoryFile {
                 partition: capture[2].to_string(),
                 part: wikimak_mediawiki::Part {
                     url: format!("{dir}{filename}"),
                     filename,
-                    size_bytes: 0,
+                    size_bytes,
                     sha256: None,
                     sha1: None,
                     md5: None,
@@ -247,13 +267,43 @@ fn unescape_tsv(file: &HistoryFile, line: usize, field: &str, value: &str) -> Re
             }
         }
     }
-    String::from_utf8(out).map_err(|_| {
-        history_parse_error(
-            file,
-            line,
-            format!("has invalid UTF-8 after unescaping {field}"),
-        )
-    })
+    Ok(preserve_invalid_utf8(out))
+}
+
+/// Archive strings are UTF-8, but old MediaWiki History rows occasionally
+/// decode `\xHH` into malformed byte sequences. Keep valid spans as text and
+/// retain each malformed byte visibly and reversibly as `\xHH`.
+fn preserve_invalid_utf8(bytes: Vec<u8>) -> String {
+    let bytes = match String::from_utf8(bytes) {
+        Ok(text) => return text,
+        Err(error) => error.into_bytes(),
+    };
+    let mut text = String::with_capacity(bytes.len());
+    let mut cursor = 0;
+    while cursor < bytes.len() {
+        match std::str::from_utf8(&bytes[cursor..]) {
+            Ok(valid) => {
+                text.push_str(valid);
+                break;
+            }
+            Err(error) => {
+                let valid_end = cursor + error.valid_up_to();
+                text.push_str(
+                    std::str::from_utf8(&bytes[cursor..valid_end])
+                        .expect("valid_up_to identifies valid UTF-8"),
+                );
+                cursor = valid_end;
+                let invalid = error
+                    .error_len()
+                    .unwrap_or_else(|| bytes.len().saturating_sub(cursor));
+                for byte in &bytes[cursor..cursor + invalid] {
+                    text.push_str(&format!("\\x{byte:02X}"));
+                }
+                cursor += invalid;
+            }
+        }
+    }
+    text
 }
 
 fn hex_nibble(byte: u8) -> Option<u8> {
@@ -1732,6 +1782,26 @@ pub fn maintain(
 mod tests {
     use super::*;
 
+    #[test]
+    fn history_listing_uses_exact_sizes_and_keeps_missing_sizes_unknown() {
+        let html = concat!(
+            "<a href=\"2024-06.testwiki.2023.tsv.bz2\">",
+            "2024-06.testwiki.2023.tsv.bz2</a> 03-Jul-2024 05:57 808682528\n",
+            "<a href=\"2024-06.testwiki.2024.tsv.bz2\">history</a>\n",
+        );
+        let escaped_snapshot = regex::escape("2024-06");
+        let escaped_dbname = regex::escape("testwiki");
+        let file_re = Regex::new(&format!(
+            r#"href="({escaped_snapshot}\.{escaped_dbname}\.(all-time|[0-9]{{4}}(?:-[0-9]{{2}})?)\.tsv\.bz2)""#
+        ))
+        .unwrap();
+        let sizes = file_re
+            .captures_iter(html)
+            .map(|capture| history_listing_size(html, capture.get(0).unwrap().end()))
+            .collect::<Vec<_>>();
+        assert_eq!(sizes, [808_682_528, 0]);
+    }
+
     fn part(filename: &str) -> wikimak_mediawiki::Part {
         wikimak_mediawiki::Part {
             url: String::new(),
@@ -1766,7 +1836,7 @@ mod tests {
     }
 
     #[test]
-    fn history_hex_escapes_decode_utf8_bytes_strictly() {
+    fn history_hex_escapes_decode_utf8_and_preserve_malformed_bytes() {
         let file = history_file();
         let decoded = unescape_tsv(
             &file,
@@ -1780,7 +1850,6 @@ mod tests {
         for (value, expected) in [
             (r"bad\x", "incomplete \\\\xHH"),
             (r"bad\xG0", "invalid \\\\xHH"),
-            (r"bad\xC4", "invalid UTF-8"),
         ] {
             let error = unescape_tsv(&file, 276_428, "page_title_historical", value)
                 .unwrap_err()
@@ -1789,6 +1858,16 @@ mod tests {
             assert!(error.contains("page_title_historical"), "{error}");
             assert!(error.contains(expected), "{error}");
         }
+        assert_eq!(
+            unescape_tsv(
+                &file,
+                5_419_876,
+                "event_comment",
+                r"valid\xc4\x81:\xff:truncated\xc4",
+            )
+            .unwrap(),
+            r"validā:\xFF:truncated\xC4",
+        );
     }
 
     #[test]

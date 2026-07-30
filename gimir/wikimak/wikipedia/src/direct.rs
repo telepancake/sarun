@@ -84,6 +84,23 @@ struct ContentPartEnvelope {
     consumed: std::sync::mpsc::SyncSender<()>,
 }
 
+struct CancelReader<R> {
+    inner: R,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl<R: Read> Read for CancelReader<R> {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        if self.cancelled.load(Ordering::Relaxed) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "history import cancelled after another file failed",
+            ));
+        }
+        self.inner.read(output)
+    }
+}
+
 struct ContentArchiveSequence {
     receiver: std::sync::mpsc::Receiver<(usize, ContentPartEnvelope)>,
     pending: BTreeMap<usize, ContentPartEnvelope>,
@@ -492,12 +509,16 @@ fn build_direct_inner(
         .iter()
         .map(|file| file.part.size_bytes)
         .sum::<u64>();
+    let unknown_history_sizes = history_files
+        .iter()
+        .filter(|file| file.part.size_bytes == 0)
+        .count();
     progress(&format!(
-        "discovered {} content files ({} bytes) and {} history files ({} bytes)",
+        "discovered {} content files ({} bytes) and {} history files ({})",
         content_run.parts.len(),
         content_bytes,
         history_files.len(),
-        history_bytes,
+        byte_size_summary(history_bytes, unknown_history_sizes),
     ));
     let cores = std::thread::available_parallelism().map_or(1, usize::from);
 
@@ -721,35 +742,62 @@ fn build_history_parts(
     )));
     let results = Arc::new(Mutex::new(Vec::new()));
     let failure = Arc::new(Mutex::new(None));
+    let cancelled = Arc::new(AtomicBool::new(false));
     let completed_bytes = Arc::new(AtomicU64::new(0));
+    let completed_files = Arc::new(AtomicU64::new(0));
+    let unknown_sizes = files
+        .iter()
+        .filter(|file| file.part.size_bytes == 0)
+        .count();
     std::thread::scope(|scope| {
         for _ in 0..workers {
             let queue = Arc::clone(&queue);
             let results = Arc::clone(&results);
             let failure = Arc::clone(&failure);
+            let cancelled = Arc::clone(&cancelled);
             let completed_bytes = Arc::clone(&completed_bytes);
+            let completed_files = Arc::clone(&completed_files);
             scope.spawn(move || loop {
-                if failure.lock().expect("failure mutex").is_some() {
+                if cancelled.load(Ordering::Relaxed) {
                     return;
                 }
                 let Some((index, file)) = queue.lock().expect("queue mutex").pop_front() else {
                     return;
                 };
                 progress(&format!("history {}", file.part.filename));
-                match build_history_part(client, dbname, &file, index, scratch, bz2_workers) {
+                match build_history_part(
+                    client,
+                    dbname,
+                    &file,
+                    index,
+                    scratch,
+                    bz2_workers,
+                    Arc::clone(&cancelled),
+                ) {
                     Ok(result) => {
                         let completed = completed_bytes
                             .fetch_add(file.part.size_bytes, Ordering::Relaxed)
                             .saturating_add(file.part.size_bytes);
+                        let files_done = completed_files
+                            .fetch_add(1, Ordering::Relaxed)
+                            .saturating_add(1);
                         progress(&format!(
                             "finished history {}; {}",
                             file.part.filename,
-                            byte_progress(completed, total_bytes)
+                            history_progress(
+                                files_done,
+                                files.len() as u64,
+                                completed,
+                                total_bytes,
+                                unknown_sizes,
+                            )
                         ));
                         results.lock().expect("results mutex").push((index, result));
                     }
                     Err(error) => {
-                        *failure.lock().expect("failure mutex") = Some(error);
+                        if !cancelled.swap(true, Ordering::Relaxed) {
+                            *failure.lock().expect("failure mutex") = Some(error);
+                        }
                         return;
                     }
                 }
@@ -771,10 +819,14 @@ fn build_history_part(
     file_index: usize,
     scratch: &Path,
     bz2_workers: usize,
+    cancelled: Arc<AtomicBool>,
 ) -> Result<(PathBuf, PartialStats)> {
     let source = wikimak_mediawiki::fetch(client, &file.part)?;
     let decoder = wikimak_mediawiki::new_bz2_reader(
-        source,
+        CancelReader {
+            inner: source,
+            cancelled,
+        },
         wikimak_mediawiki::Bz2Options {
             workers: bz2_workers,
         },
@@ -910,10 +962,40 @@ fn build_content_parts(
 
 fn byte_progress(completed: u64, total: u64) -> String {
     if total == 0 {
-        return format!("{completed} bytes complete");
+        return "byte size unknown".into();
     }
     let percent = completed.saturating_mul(100).checked_div(total).unwrap_or(0);
     format!("{completed}/{total} bytes ({percent}%)")
+}
+
+fn byte_size_summary(known_bytes: u64, unknown_sizes: usize) -> String {
+    match (known_bytes, unknown_sizes) {
+        (bytes, 0) => format!("{bytes} bytes"),
+        (0, unknown) => format!("byte sizes unknown for {unknown}"),
+        (bytes, unknown) => format!("{bytes} known bytes; {unknown} sizes unknown"),
+    }
+}
+
+fn history_progress(
+    files_done: u64,
+    total_files: u64,
+    completed_bytes: u64,
+    total_bytes: u64,
+    unknown_sizes: usize,
+) -> String {
+    if unknown_sizes == 0 {
+        format!(
+            "{files_done}/{total_files} files; {}",
+            byte_progress(completed_bytes, total_bytes)
+        )
+    } else if total_bytes == 0 {
+        format!("{files_done}/{total_files} files; byte sizes unknown")
+    } else {
+        format!(
+            "{files_done}/{total_files} files; {completed_bytes}/{total_bytes} known bytes \
+             ({unknown_sizes} sizes unknown)"
+        )
+    }
 }
 
 fn build_content_group(

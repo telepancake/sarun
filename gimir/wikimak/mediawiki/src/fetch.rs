@@ -151,6 +151,19 @@ pub fn fetch(client: &Client, part: &Part) -> Result<VerifyingReader<Box<dyn Rea
 struct CurlAttempt {
     child: Child,
     stdout: ChildStdout,
+    stderr: Option<std::thread::JoinHandle<io::Result<Vec<u8>>>>,
+}
+
+#[cfg(target_os = "macos")]
+impl CurlAttempt {
+    fn stderr_text(&mut self) -> String {
+        self.stderr
+            .take()
+            .and_then(|reader| reader.join().ok())
+            .and_then(|result| result.ok())
+            .map(|bytes| String::from_utf8_lossy(&bytes).trim().to_string())
+            .unwrap_or_default()
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -160,13 +173,14 @@ const MAX_CURL_RESUMPTIONS: u32 = 16;
 struct CurlReader {
     url: String,
     user_agent: String,
-    attempt: CurlAttempt,
+    attempt: Option<CurlAttempt>,
     headers_ready: bool,
     buffered: Vec<u8>,
     buffered_at: usize,
     offset: u64,
     retries: u32,
     finished: bool,
+    last_failure: String,
 }
 
 #[cfg(target_os = "macos")]
@@ -176,13 +190,14 @@ impl CurlReader {
         Ok(Self {
             url,
             user_agent,
-            attempt,
+            attempt: Some(attempt),
             headers_ready: false,
             buffered: Vec::new(),
             buffered_at: 0,
             offset: 0,
             retries: 0,
             finished: false,
+            last_failure: "curl ended without a diagnostic".into(),
         })
     }
 
@@ -206,12 +221,38 @@ impl CurlReader {
         let mut child = command
             .args(["--url", url])
             .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .spawn()?;
         let stdout = child
             .stdout
             .take()
             .ok_or_else(|| io::Error::other("curl stdout unavailable"))?;
-        Ok(CurlAttempt { child, stdout })
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| io::Error::other("curl stderr unavailable"))?;
+        let stderr = std::thread::spawn(move || {
+            let mut stderr = stderr;
+            let mut bytes = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let count = stderr.read(&mut chunk)?;
+                if count == 0 {
+                    break;
+                }
+                bytes.extend_from_slice(&chunk[..count]);
+                if bytes.len() > 16 * 1024 {
+                    let excess = bytes.len() - 16 * 1024;
+                    bytes.drain(..excess);
+                }
+            }
+            Ok(bytes)
+        });
+        Ok(CurlAttempt {
+            child,
+            stdout,
+            stderr: Some(stderr),
+        })
     }
 
     fn prepare_body(&mut self) -> io::Result<()> {
@@ -227,7 +268,12 @@ impl CurlReader {
                     ));
                 }
                 let mut chunk = [0u8; 8192];
-                let n = self.attempt.stdout.read(&mut chunk)?;
+                let n = self
+                    .attempt
+                    .as_mut()
+                    .expect("active curl attempt")
+                    .stdout
+                    .read(&mut chunk)?;
                 if n == 0 {
                     return Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
@@ -269,25 +315,57 @@ impl CurlReader {
         Ok(())
     }
 
-    fn restart(&mut self) -> io::Result<()> {
-        if self.retries >= MAX_CURL_RESUMPTIONS {
-            return Err(io::Error::other(format!(
-                "curl transfer failed after {} resumptions",
-                self.retries
-            )));
+    fn stop_attempt(&mut self) {
+        if let Some(mut attempt) = self.attempt.take() {
+            let _ = attempt.child.kill();
+            let _ = attempt.child.wait();
+            let _ = attempt.stderr_text();
         }
-        let _ = self.attempt.child.kill();
-        let _ = self.attempt.child.wait();
+    }
+
+    fn finish_attempt(&mut self) -> io::Result<(std::process::ExitStatus, String)> {
+        let mut attempt = self
+            .attempt
+            .take()
+            .ok_or_else(|| io::Error::other("curl attempt unavailable"))?;
+        let status = attempt.child.wait();
+        let stderr = attempt.stderr_text();
+        status.map(|status| (status, stderr))
+    }
+
+    fn transfer_error(&self) -> io::Error {
+        io::Error::other(format!(
+            "curl transfer failed for {} at byte {} after {} resumptions: {}",
+            self.url, self.offset, self.retries, self.last_failure
+        ))
+    }
+
+    fn restart(&mut self) -> io::Result<()> {
+        self.stop_attempt();
+        if self.retries >= MAX_CURL_RESUMPTIONS {
+            return Err(self.transfer_error());
+        }
         let delay = 2u64
             .saturating_pow(self.retries.saturating_add(1))
             .min(30);
         std::thread::sleep(std::time::Duration::from_secs(delay));
         self.retries += 1;
-        self.attempt = Self::spawn(&self.url, &self.user_agent, self.offset)?;
+        self.attempt = Some(Self::spawn(&self.url, &self.user_agent, self.offset)?);
         self.headers_ready = false;
         self.buffered.clear();
         self.buffered_at = 0;
         Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for CurlReader {
+    fn drop(&mut self) {
+        // A downstream parser can finish or fail before curl has observed the
+        // closed stdout pipe. Stop and reap it while the pipe is still owned,
+        // avoiding curl's misleading secondary "failure writing output"
+        // diagnostic on the parent's stderr.
+        self.stop_attempt();
     }
 }
 
@@ -299,9 +377,7 @@ impl Read for CurlReader {
         }
         loop {
             if let Err(error) = self.prepare_body() {
-                if self.retries >= MAX_CURL_RESUMPTIONS {
-                    return Err(error);
-                }
+                self.last_failure = format!("response/read error: {error}");
                 self.restart()?;
                 continue;
             }
@@ -320,23 +396,32 @@ impl Read for CurlReader {
                 }
                 return Ok(n);
             }
-            match self.attempt.stdout.read(out) {
+            match self
+                .attempt
+                .as_mut()
+                .expect("active curl attempt")
+                .stdout
+                .read(out)
+            {
                 Ok(n) if n != 0 => {
                     self.offset += n as u64;
                     return Ok(n);
                 }
                 Ok(_) => {
-                    let status = self.attempt.child.wait()?;
+                    let (status, stderr) = self.finish_attempt()?;
                     if status.success() {
                         self.finished = true;
                         return Ok(0);
                     }
+                    self.last_failure = if stderr.is_empty() {
+                        format!("curl exited with {status}")
+                    } else {
+                        format!("curl exited with {status}: {stderr}")
+                    };
                     self.restart()?;
                 }
                 Err(error) => {
-                    if self.retries >= MAX_CURL_RESUMPTIONS {
-                        return Err(error);
-                    }
+                    self.last_failure = format!("stdout read error: {error}");
                     self.restart()?;
                 }
             }

@@ -144,9 +144,9 @@ fn derive(mut j: Job) -> Job {
     j.pid = running.map(|process| process.pid).filter(|pid| *pid != 0);
     let destination = std::path::Path::new(&j.dest);
     j.mirror_bytes = cached_path_bytes(destination);
-    j.scratch_bytes = destination
-        .parent()
-        .and_then(|parent| cached_path_bytes(&parent.join(".wikimak-scratch")));
+    j.scratch_bytes = (j.kind == "wiki")
+        .then(|| cached_path_bytes(&wikimak_wikipedia::mirror_scratch_path(destination)))
+        .flatten();
     j.available_bytes = destination.parent().and_then(available_bytes);
     j
 }
@@ -390,8 +390,9 @@ fn remove_mirror_path(path: &std::path::Path) -> Result<(), String> {
     .map_err(|error| format!("{}: {error}", path.display()))
 }
 
-/// Delete a Wikipedia mirror's owned archive/index/media paths and then its
-/// schedule row. Scratch is library-wide and is deliberately not included.
+/// Delete a Wikipedia mirror's owned archive/index/media paths, its
+/// destination-specific scratch, install/update sidecars, and then its
+/// schedule row.
 pub fn job_remove_with_data(id: i64) -> Result<String, String> {
     if running_map(|running| running.contains_key(&id)) {
         return Err("job is running; stop it first".into());
@@ -419,10 +420,13 @@ pub fn job_remove_with_data(id: i64) -> Result<String, String> {
     remove_mirror_path(&archive)?;
     remove_mirror_path(&titles)?;
     remove_mirror_path(&media)?;
+    for path in wikimak_wikipedia::mirror_auxiliary_paths(&archive)? {
+        remove_mirror_path(&path)?;
+    }
     conn.execute("DELETE FROM jobs WHERE id = ?1", [id])
         .map_err(|error| error.to_string())?;
     Ok(format!(
-        "archive, title index, and media cache removed from {}",
+        "archive, title index, media cache, and scratch removed from {}",
         archive.display()
     ))
 }
@@ -629,6 +633,7 @@ fn spawn_run(job: Job, wiki_run: WikiRun) {
         let mut cmd = std::process::Command::new(&argv[0]);
         cmd.args(&argv[1..])
             .env("SARUN_MIRROR_DEST", &job.dest)
+            .env("SARUN_MIRROR_PARENT_PID", std::process::id().to_string())
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped());
@@ -722,33 +727,31 @@ fn stream_stderr(
     use std::io::{BufRead, BufReader};
     use std::time::{Duration, Instant};
     let reader = BufReader::new(stderr);
-    let mut lines: Vec<String> = Vec::new();
     let mut last_flush = Instant::now();
-    let mut pending = String::new();
+    let mut tail = String::new();
     for line in reader.lines() {
         let line = match line {
             Ok(l) => l,
             Err(_) => break,
         };
-        let first_line = lines.is_empty();
-        pending.push_str(&line);
-        pending.push('\n');
+        let first_line = tail.is_empty();
+        tail.push_str(&line);
+        tail.push('\n');
+        if tail.len() > 4096 {
+            tail = tail_2k(&tail);
+        }
         if first_line || last_flush.elapsed() >= Duration::from_secs(2) {
-            let tail = tail_2k(&pending);
             if let Ok(conn) = db() {
                 let _ = conn.execute(
                     "UPDATE jobs SET last_detail = ?2 WHERE id = ?1",
-                    params![id, tail],
+                    params![id, tail_2k(&tail)],
                 );
             }
             last_flush = Instant::now();
         }
-        lines.push(line);
     }
     let exit = child.wait();
-    let all = lines.join("\n");
-    let tail = tail_2k(&all);
-    (exit, tail)
+    (exit, tail_2k(tail.trim_end()))
 }
 
 fn tail_2k(s: &str) -> String {
@@ -881,6 +884,12 @@ mod tests {
         std::fs::write(archive.join("range"), b"archive").unwrap();
         std::fs::write(archive.with_extension("swtitle"), b"index").unwrap();
         std::fs::create_dir(archive.with_extension("media")).unwrap();
+        let auxiliary = wikimak_wikipedia::mirror_auxiliary_paths(&archive).unwrap();
+        std::fs::create_dir_all(&auxiliary[0]).unwrap();
+        std::fs::write(auxiliary[0].join("partial"), b"scratch").unwrap();
+        for path in &auxiliary[1..] {
+            std::fs::write(path, b"sidecar").unwrap();
+        }
         let sibling = library.join("keep");
         std::fs::write(&sibling, b"keep").unwrap();
         let id = job_add("wiki", "testwiki", archive.to_str().unwrap(), 86400).unwrap();
@@ -890,6 +899,7 @@ mod tests {
         assert!(!archive.exists());
         assert!(!archive.with_extension("swtitle").exists());
         assert!(!archive.with_extension("media").exists());
+        assert!(auxiliary.iter().all(|path| !path.exists()));
         assert!(sibling.exists());
         assert!(jobs_list().unwrap().iter().all(|job| job.id != id));
     }

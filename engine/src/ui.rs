@@ -5532,6 +5532,11 @@ impl App {
                     // cursor-follow left the transcript — no jump to top.
                     if self.focus == Pane::Outputs {
                         self.right_scroll = self.out_follow_scroll.get();
+                    } else if self.focus == Pane::Mirrors {
+                        // Mirror progress follows its newest event while the
+                        // job list is active. Start manual scrollback at that
+                        // same bottom position when the user enters detail.
+                        self.right_scroll = self.right_scroll_max.get();
                     }
                 } else if self.focus != Pane::Outputs {
                     // Outputs keeps its scroll — the follow-mode render
@@ -14734,7 +14739,15 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                     .scroll((scroll, 0));
                 f.render_widget(p, left);
                 let dl = mirror_detail_lines(app);
-                let rs = clamp_rscroll(&dl);
+                let visible = (right.height as usize).saturating_sub(2);
+                let total = wrapped_rows(&dl, right.width.saturating_sub(2));
+                let max = total.saturating_sub(visible).min(u16::MAX as usize) as u16;
+                app.right_scroll_max.set(max);
+                let rs = if rf {
+                    app.right_scroll.min(max)
+                } else {
+                    max
+                };
                 let detail = Paragraph::new(Text::from(dl))
                     .block(block(title("JOB · DETAIL", rf), rf))
                     .scroll((rs, 0))
@@ -22473,6 +22486,49 @@ mod tests {
         assert_eq!(status_style("importing 3/10").fg, Some(Color::Green));
         assert_eq!(status_style("mirror update failed").fg, Some(Color::Red));
         assert_eq!(status_style("update paused").fg, Some(Color::Yellow));
+    }
+
+    #[test]
+    fn running_mirror_progress_follows_newest_event_until_manual_scrollback() {
+        let mut app = headless_app();
+        app.focus = Pane::Mirrors;
+        let progress = (0..40)
+            .map(|index| format!("progress event {index:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.mirror_jobs = vec![serde_json::from_value(json!({
+            "id": 1,
+            "kind": "wiki",
+            "src": "ruwiki",
+            "dest": "/tmp/ruwiki.swdump",
+            "interval_secs": 86400,
+            "paused": false,
+            "last_start": 1,
+            "last_end": null,
+            "last_exit": null,
+            "last_detail": progress,
+            "state": "running",
+            "next_due": null
+        }))
+        .unwrap()];
+
+        let rendered = render_to_string(&app, 100, 22).unwrap();
+        assert!(
+            rendered.contains("progress event 39"),
+            "unfocused progress pane must follow its newest event:\n{rendered}"
+        );
+        assert!(app.right_scroll_max.get() > 0);
+
+        app.next_pane();
+        assert!(app.right_focused);
+        assert_eq!(app.right_scroll, app.right_scroll_max.get());
+        app.move_up();
+        let manual_scroll = app.right_scroll;
+        let _ = render_to_string(&app, 100, 22).unwrap();
+        assert_eq!(
+            app.right_scroll, manual_scroll,
+            "manual mirror scrollback must not be pulled back to the bottom"
+        );
     }
 
     /// The Network/Web pane (DESIGN-web.md W4) renders the box's webcap rows:

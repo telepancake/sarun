@@ -29,12 +29,15 @@ fn mirror_compression() -> crate::archive::CompressionSettings {
     }
 }
 
-fn mirror_scratch(archive: &Path) -> PathBuf {
-    archive
+pub fn mirror_scratch_path(archive: &Path) -> PathBuf {
+    let parent = archive
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."))
-        .join(".wikimak-scratch")
+        .unwrap_or_else(|| Path::new("."));
+    let name = archive
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new("mirror"));
+    parent.join(".wikimak-scratch").join(name)
 }
 
 fn install_sidecar(destination: &Path, suffix: &str) -> Result<PathBuf, String> {
@@ -70,6 +73,27 @@ fn remove_path(path: &Path) -> std::io::Result<()> {
     } else {
         std::fs::remove_file(path)
     }
+}
+
+pub fn mirror_auxiliary_paths(archive: &Path) -> Result<Vec<PathBuf>, String> {
+    let title = archive.with_extension("swtitle");
+    Ok(vec![
+        mirror_scratch_path(archive),
+        install_sidecar(archive, ".installing")?,
+        install_sidecar(archive, ".previous")?,
+        install_sidecar(archive, ".updating")?,
+        install_sidecar(&title, ".previous")?,
+    ])
+}
+
+fn reset_mirror_scratch(archive: &Path) -> Result<PathBuf, String> {
+    let scratch = mirror_scratch_path(archive);
+    if scratch.exists() {
+        remove_path(&scratch).map_err(|error| format!("{}: {error}", scratch.display()))?;
+    }
+    std::fs::create_dir_all(&scratch)
+        .map_err(|error| format!("{}: {error}", scratch.display()))?;
+    Ok(scratch)
 }
 
 fn recover_interrupted_install(destination: &Path) -> Result<(), String> {
@@ -186,6 +210,7 @@ fn persist_archive_pair(
 fn install_built_archive(
     archive: PathBuf,
     destination: &Path,
+    scratch: &Path,
 ) -> Result<(), String> {
     let parent = destination
         .parent()
@@ -194,8 +219,8 @@ fn install_built_archive(
     std::fs::create_dir_all(parent).map_err(|error| format!("{}: {error}", parent.display()))?;
 
     eprintln!("building title history index");
-    let mut titles = tempfile::NamedTempFile::new_in(parent)
-        .map_err(|error| format!("{}: {error}", parent.display()))?;
+    let mut titles = tempfile::NamedTempFile::new_in(scratch)
+        .map_err(|error| format!("{}: {error}", scratch.display()))?;
     let title_entries = crate::title_index::build(&archive, titles.path())
         .map_err(|error| error.to_string())?;
     titles
@@ -220,12 +245,8 @@ fn build_full(
         .map_err(|error| format!("{}: {error}", scratch_parent.display()))?;
     let scratch = tempfile::TempDir::new_in(scratch_parent)
         .map_err(|error| format!("{}: {error}", scratch_parent.display()))?;
-    let parent = archive
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let build_root = tempfile::TempDir::new_in(parent)
-        .map_err(|error| format!("{}: {error}", parent.display()))?;
+    let build_root = tempfile::TempDir::new_in(scratch.path())
+        .map_err(|error| format!("{}: {error}", scratch.path().display()))?;
     let built = build_root.path().join("archive.swdump");
     crate::build_direct_archive(
         client,
@@ -236,13 +257,13 @@ fn build_full(
         |message| eprintln!("{message}"),
     )
     .map_err(|error| error.to_string())?;
-    install_built_archive(built, archive)
+    install_built_archive(built, archive, scratch.path())
 }
 
 fn cmd_fetch(dbname: &str, archive: &str) -> Result<(), String> {
     let archive = Path::new(archive);
     recover_interrupted_install(archive)?;
-    let scratch_parent = mirror_scratch(archive);
+    let scratch_parent = reset_mirror_scratch(archive)?;
     let client = http_client()?;
     if !archive.exists() {
         return build_full(&client, dbname, archive, &scratch_parent);
@@ -278,10 +299,6 @@ fn cmd_fetch(dbname: &str, archive: &str) -> Result<(), String> {
     }
     eprintln!("streaming current archive and updates through page-ID range files");
     let inputs = vec![archive.to_path_buf(), partial];
-    let parent = archive
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
     let set = crate::archive_set::ArchiveSetReader::open(archive)
         .map_err(|error| error.to_string())?;
     let boundaries = set
@@ -316,8 +333,8 @@ fn cmd_fetch(dbname: &str, archive: &str) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
 
     eprintln!("rebuilding the single title and virtual-frame index");
-    let mut titles = tempfile::NamedTempFile::new_in(parent)
-        .map_err(|error| format!("{}: {error}", parent.display()))?;
+    let mut titles = tempfile::NamedTempFile::new_in(scratch.path())
+        .map_err(|error| format!("{}: {error}", scratch.path().display()))?;
     let title_entries = crate::title_index::build(archive, titles.path())
         .map_err(|error| error.to_string())?;
     titles
@@ -341,7 +358,7 @@ fn cmd_refresh_full(dbname: &str, archive: &str) -> Result<(), String> {
         &http_client()?,
         dbname,
         archive,
-        &mirror_scratch(archive),
+        &reset_mirror_scratch(archive)?,
     )
 }
 
@@ -578,8 +595,29 @@ fn cmd_inspect(path: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn arm_parent_watchdog() {
+    let Some(expected) = std::env::var("SARUN_MIRROR_PARENT_PID")
+        .ok()
+        .and_then(|value| value.parse::<libc::pid_t>().ok())
+    else {
+        return;
+    };
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            if unsafe { libc::getppid() } != expected {
+                eprintln!("wikimak: supervising sarun engine exited; stopping mirror job");
+                std::process::exit(1);
+            }
+        }
+    });
+}
+
 pub fn cli_main(args: &[String]) -> i32 {
     let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+    if matches!(args.as_slice(), ["fetch" | "refresh-full", _, _]) {
+        arm_parent_watchdog();
+    }
     let result = match args.as_slice() {
         ["discover", dbname] => cmd_discover(dbname),
         ["fetch", dbname, archive] => cmd_fetch(dbname, archive),
