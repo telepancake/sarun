@@ -89,13 +89,19 @@ fn rpc(sock: &str, verb: &str, args: Value) -> Result<Value, String> {
     Ok(rep.get("r").cloned().unwrap_or(Value::Null))
 }
 
+pub(crate) fn engine_protocol(sock: &str) -> Result<u64, String> {
+    rpc(sock, "engine_protocol", json!([]))?
+        .as_u64()
+        .ok_or_else(|| "engine returned no protocol revision".to_string())
+}
+
 /// Ask the engine to terminate ('q' contract — quit stops the server, like
 /// the Python prototype). Top-level type, fire-and-forget: the engine acks
 /// then SIGTERMs itself, so a broken-pipe on the read side is normal and
 /// expected. No-op against an engine that doesn't speak `shutdown` (the
 /// Python prototype DOES, this branch is just for older Rust engines).
 #[cfg_attr(test, allow(dead_code))]
-fn shutdown_rpc(sock: &str) {
+pub(crate) fn shutdown_rpc(sock: &str) {
     let Ok(mut s) = UnixStream::connect(sock) else {
         return;
     };

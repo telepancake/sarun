@@ -484,6 +484,35 @@ pub fn job_cancel(id: i64) -> Result<(), String> {
     Ok(())
 }
 
+/// Stop all mirror drivers before the engine exits. This is synchronous
+/// because delayed escalation threads disappear with the engine process.
+pub fn stop_all() {
+    let groups = running_map(|running| {
+        running
+            .values_mut()
+            .filter_map(|process| {
+                process.stopping = true;
+                i32::try_from(process.pid).ok().filter(|pid| *pid > 0)
+            })
+            .collect::<Vec<_>>()
+    });
+    for group in &groups {
+        unsafe {
+            libc::kill(-*group, libc::SIGTERM);
+        }
+    }
+    if !groups.is_empty() {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        for group in groups {
+            if unsafe { libc::kill(-group, 0) } == 0 {
+                unsafe {
+                    libc::kill(-group, libc::SIGKILL);
+                }
+            }
+        }
+    }
+}
+
 /// Explicitly re-ingest the newest full Wikipedia snapshot. This is never
 /// scheduled: routine wiki jobs consume daily adds/changes through `fetch`.
 pub fn job_run_full(id: i64) -> Result<(), String> {

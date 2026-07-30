@@ -102,8 +102,9 @@ mod wire;
 // speaking the Python ChannelServer's protocol (single-instance guard, ui
 // verbs over on-disk box discovery, subscribe event feed). No boxes yet —
 // register is refused politely; the overlay arrives at m3.
-static LISTENER_FOR_SIGNAL: AtomicI32 = AtomicI32::new(-1);
+static TERMINATION_WAKE: AtomicI32 = AtomicI32::new(-1);
 static TERMINATING: AtomicBool = AtomicBool::new(false);
+pub(crate) const UI_ENGINE_PROTOCOL_REVISION: u64 = 1;
 
 extern "C" fn on_term(_sig: i32) {
     // Wake the blocking accept loop using only signal-safe operations.  FUSE
@@ -111,10 +112,11 @@ extern "C" fn on_term(_sig: i32) {
     // its private mount namespace and join the raw-FUSE workers. The old direct
     // umount2(2)+_exit leaked every such mount.
     TERMINATING.store(true, Ordering::Relaxed);
-    let listener = LISTENER_FOR_SIGNAL.load(Ordering::Relaxed);
-    if listener >= 0 {
+    let wake = TERMINATION_WAKE.load(Ordering::Relaxed);
+    if wake >= 0 {
+        let byte = [1_u8];
         unsafe {
-            libc::shutdown(listener, libc::SHUT_RDWR);
+            libc::write(wake, byte.as_ptr().cast(), byte.len());
         }
     }
 }
@@ -251,7 +253,35 @@ fn serve() -> i32 {
             return 1;
         }
     };
-    LISTENER_FOR_SIGNAL.store(listener.as_raw_fd(), Ordering::Release);
+    let mut termination_pipe = [-1_i32; 2];
+    if unsafe { libc::pipe(termination_pipe.as_mut_ptr()) } != 0 {
+        eprintln!(
+            "sarun-engine: cannot create termination wake pipe: {}",
+            std::io::Error::last_os_error()
+        );
+        return 1;
+    }
+    let wake_flags = unsafe { libc::fcntl(termination_pipe[1], libc::F_GETFL) };
+    if wake_flags < 0
+        || unsafe {
+            libc::fcntl(
+                termination_pipe[1],
+                libc::F_SETFL,
+                wake_flags | libc::O_NONBLOCK,
+            )
+        } < 0
+    {
+        eprintln!(
+            "sarun-engine: cannot configure termination wake pipe: {}",
+            std::io::Error::last_os_error()
+        );
+        unsafe {
+            libc::close(termination_pipe[0]);
+            libc::close(termination_pipe[1]);
+        }
+        return 1;
+    }
+    TERMINATION_WAKE.store(termination_pipe[1], Ordering::Release);
     unsafe {
         libc::signal(libc::SIGTERM, on_term as *const () as libc::sighandler_t);
         libc::signal(libc::SIGINT, on_term as *const () as libc::sighandler_t);
@@ -405,7 +435,7 @@ fn serve() -> i32 {
     // Mirror-update scheduler: a minute tick starting whatever jobs are
     // due (mirrors.db). No jobs → pure no-op loop.
     mirrors::scheduler_thread();
-    let rc = match control::serve(state.clone(), listener) {
+    let rc = match control::serve(state.clone(), listener, termination_pipe[0]) {
         Ok(()) => 0,
         Err(_) if TERMINATING.load(Ordering::Acquire) => 0,
         Err(e) => {
@@ -413,7 +443,12 @@ fn serve() -> i32 {
             1
         }
     };
-    LISTENER_FOR_SIGNAL.store(-1, Ordering::Release);
+    TERMINATION_WAKE.store(-1, Ordering::Release);
+    unsafe {
+        libc::close(termination_pipe[0]);
+        libc::close(termination_pipe[1]);
+    }
+    mirrors::stop_all();
     control::terminate_runners(&state);
     #[cfg(target_os = "linux")]
     if let Err(error) = session.unmount() {
@@ -426,8 +461,111 @@ fn serve() -> i32 {
 /// Launch the UI, auto-spawning a detached engine (`serve`) first if the
 /// control socket isn't already up. Mirrors Python's bare-`slopbox`/`attach`.
 fn ui_launch(args: &[String]) -> i32 {
-    let sock = paths::sock_path();
-    if std::os::unix::net::UnixStream::connect(&sock).is_err() {
+    let explicit_socket = args.iter().any(|argument| argument == "--sock")
+        || std::env::var_os("SARUN_SOCK").is_some();
+    let sock = args
+        .windows(2)
+        .find(|arguments| arguments[0] == "--sock")
+        .map(|arguments| PathBuf::from(&arguments[1]))
+        .or_else(|| std::env::var_os("SARUN_SOCK").map(PathBuf::from))
+        .unwrap_or_else(paths::sock_path);
+    let live_engine = std::os::unix::net::UnixStream::connect(&sock).ok();
+    let old_engine_pid = live_engine.as_ref().and_then(control_peer_pid);
+    let mut spawn_engine = live_engine.is_none();
+    drop(live_engine);
+    if !spawn_engine {
+        match ui::engine_protocol(sock.to_string_lossy().as_ref()) {
+            Ok(revision) if revision == UI_ENGINE_PROTOCOL_REVISION => {}
+            Ok(revision) if explicit_socket => {
+                eprintln!(
+                    "sarun: UI protocol {UI_ENGINE_PROTOCOL_REVISION} cannot attach to engine protocol {revision} at {}",
+                    sock.display()
+                );
+                return 1;
+            }
+            Err(error) if explicit_socket => {
+                eprintln!(
+                    "sarun: cannot verify engine compatibility at {}: {error}",
+                    sock.display()
+                );
+                return 1;
+            }
+            result => {
+                let detail = match result {
+                    Ok(revision) => format!("protocol {revision}"),
+                    Err(error) => error,
+                };
+                eprintln!("sarun: replacing incompatible engine ({detail})");
+                ui::shutdown_rpc(sock.to_string_lossy().as_ref());
+                let mut deadline = std::time::Instant::now() + Duration::from_secs(2);
+                while std::os::unix::net::UnixStream::connect(&sock).is_ok()
+                    && std::time::Instant::now() < deadline
+                {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                if std::os::unix::net::UnixStream::connect(&sock).is_ok() {
+                    let Some(pid) = old_engine_pid else {
+                        eprintln!(
+                            "sarun: incompatible engine did not stop at {} and its process ID is unavailable",
+                            sock.display()
+                        );
+                        return 1;
+                    };
+                    let same_engine = std::os::unix::net::UnixStream::connect(&sock)
+                        .ok()
+                        .and_then(|stream| control_peer_pid(&stream))
+                        == Some(pid);
+                    if !same_engine {
+                        eprintln!(
+                            "sarun: engine changed while replacing it at {}",
+                            sock.display()
+                        );
+                        return 1;
+                    }
+                    unsafe {
+                        libc::kill(pid, libc::SIGTERM);
+                    }
+                    deadline = std::time::Instant::now() + Duration::from_secs(2);
+                    while std::os::unix::net::UnixStream::connect(&sock).is_ok()
+                        && std::time::Instant::now() < deadline
+                    {
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                    let same_engine = std::os::unix::net::UnixStream::connect(&sock)
+                        .ok()
+                        .and_then(|stream| control_peer_pid(&stream))
+                        == Some(pid);
+                    if same_engine {
+                        unsafe {
+                            libc::kill(pid, libc::SIGKILL);
+                        }
+                    }
+                }
+                deadline = std::time::Instant::now() + Duration::from_secs(2);
+                while std::os::unix::net::UnixStream::connect(&sock).is_ok()
+                    && std::time::Instant::now() < deadline
+                {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                if std::os::unix::net::UnixStream::connect(&sock).is_ok() {
+                    eprintln!(
+                        "sarun: incompatible engine did not stop at {}",
+                        sock.display()
+                    );
+                    return 1;
+                }
+                spawn_engine = true;
+            }
+        }
+    }
+    if spawn_engine {
+        if explicit_socket {
+            eprintln!(
+                "sarun: no engine running at explicit control socket {}",
+                sock.display()
+            );
+            return 1;
+        }
         // No engine running — spawn one detached and wait (bounded) for the
         // control socket to appear. current_exe() is a path, so it keeps
         // working under the renamed `sarun` binary. The engine's stderr is
@@ -502,6 +640,42 @@ fn ui_launch(args: &[String]) -> i32 {
         }
     }
     ui::ui_main(args)
+}
+
+#[cfg(target_os = "macos")]
+fn control_peer_pid(stream: &std::os::unix::net::UnixStream) -> Option<i32> {
+    let mut pid = 0_i32;
+    let mut length = std::mem::size_of_val(&pid) as libc::socklen_t;
+    let result = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEERPID,
+            (&mut pid as *mut i32).cast(),
+            &mut length,
+        )
+    };
+    (result == 0 && pid > 0).then_some(pid)
+}
+
+#[cfg(target_os = "linux")]
+fn control_peer_pid(stream: &std::os::unix::net::UnixStream) -> Option<i32> {
+    let mut credentials = std::mem::MaybeUninit::<libc::ucred>::uninit();
+    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let result = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            credentials.as_mut_ptr().cast(),
+            &mut length,
+        )
+    };
+    if result != 0 {
+        return None;
+    }
+    let credentials = unsafe { credentials.assume_init() };
+    (credentials.pid > 0).then_some(credentials.pid)
 }
 
 /// Print the tail of `path` to stderr, for surfacing engine startup

@@ -7558,6 +7558,12 @@ pub fn write_api_box_net_shadows(net: &crate::net::Net) -> std::io::Result<()> {
 /// list so the emitted function's binders share the bodies' hygiene context.
 macro_rules! ui_verbs {
     ($emit:ident) => { $emit! { (state, verb, args, boxes)
+        "engine_protocol" => {
+            return json!({
+                "ok": true,
+                "r": crate::UI_ENGINE_PROTOCOL_REVISION,
+            });
+        }
         "session_dicts" => {
             return legacy_ui_action_reply(dispatch_action(
                 state, crate::generated_wire::ActionRequest::SessionDicts,
@@ -11519,8 +11525,37 @@ pub fn bind_listener(sock: &std::path::Path) -> std::io::Result<UnixListener> {
 }
 
 /// Run the accept loop on an already-bound listener (see [`bind_listener`]).
-pub fn serve(state: State, listener: UnixListener) -> std::io::Result<()> {
+pub fn serve(state: State, listener: UnixListener, termination_wake: i32) -> std::io::Result<()> {
     loop {
+        let mut ready = [
+            libc::pollfd {
+                fd: listener.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: termination_wake,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let polled = unsafe { libc::poll(ready.as_mut_ptr(), ready.len() as _, -1) };
+        if polled < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        if ready[1].revents & libc::POLLIN != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "engine termination requested",
+            ));
+        }
+        if ready[0].revents & libc::POLLIN == 0 {
+            continue;
+        }
         match listener.accept() {
             Ok((conn, _)) => {
                 let st = state.clone();
@@ -11961,6 +11996,18 @@ mod verb_tests {
         assert!(
             err.contains("unknown verb") && err.contains("see 'verbs'"),
             "got: {err}"
+        );
+    }
+
+    #[test]
+    fn engine_protocol_is_available_at_the_legacy_ui_boundary() {
+        let state: State = Default::default();
+        let boxes = std::collections::BTreeMap::new();
+        let reply = dispatch_ui_verb(&state, "engine_protocol", &[], &boxes);
+        assert_eq!(reply.get("ok").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            reply.get("r").and_then(Value::as_u64),
+            Some(crate::UI_ENGINE_PROTOCOL_REVISION)
         );
     }
 
