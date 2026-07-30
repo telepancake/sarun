@@ -7,6 +7,8 @@
 use std::io::{self, Read};
 #[cfg(target_os = "macos")]
 use std::process::{Child, ChildStdout, Command, Stdio};
+#[cfg(target_os = "macos")]
+use std::time::Duration;
 
 use reqwest::blocking::Client;
 use md5::Md5;
@@ -112,8 +114,7 @@ pub fn fetch(client: &Client, part: &Part) -> Result<VerifyingReader<Box<dyn Rea
                     .and_then(|value| value.to_str().ok())
                     .and_then(|value| value.parse::<u64>().ok());
                 let delay = retry_after
-                    .unwrap_or(2u64.saturating_pow(attempt + 1))
-                    .min(120);
+                    .unwrap_or(2u64.saturating_pow(attempt + 1));
                 std::thread::sleep(std::time::Duration::from_secs(delay));
                 attempt += 1;
             }
@@ -179,6 +180,7 @@ struct CurlReader {
     buffered_at: usize,
     offset: u64,
     retries: u32,
+    retry_after: Option<Duration>,
     finished: bool,
     last_failure: String,
 }
@@ -196,6 +198,7 @@ impl CurlReader {
             buffered_at: 0,
             offset: 0,
             retries: 0,
+            retry_after: None,
             finished: false,
             last_failure: "curl ended without a diagnostic".into(),
         })
@@ -307,6 +310,7 @@ impl CurlReader {
                     continue;
                 }
             }
+            self.retry_after = parse_retry_after(header_value(&header, b"retry-after:"));
             return Err(io::Error::other(format!(
                 "curl returned HTTP {status} while fetching {} at byte {}",
                 self.url, self.offset
@@ -345,10 +349,14 @@ impl CurlReader {
         if self.retries >= MAX_CURL_RESUMPTIONS {
             return Err(self.transfer_error());
         }
-        let delay = 2u64
-            .saturating_pow(self.retries.saturating_add(1))
-            .min(30);
-        std::thread::sleep(std::time::Duration::from_secs(delay));
+        let delay = self.retry_after.take().unwrap_or_else(|| {
+            Duration::from_secs(
+                2u64
+                    .saturating_pow(self.retries.saturating_add(1))
+                    .min(30),
+            )
+        });
+        std::thread::sleep(delay);
         self.retries += 1;
         self.attempt = Some(Self::spawn(&self.url, &self.user_agent, self.offset)?);
         self.headers_ready = false;
@@ -465,6 +473,17 @@ fn header_value<'a>(header: &'a [u8], name: &[u8]) -> Option<&'a str> {
 }
 
 #[cfg(target_os = "macos")]
+fn parse_retry_after(value: Option<&str>) -> Option<Duration> {
+    let value = value?.trim();
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(Duration::from_secs(seconds));
+    }
+    let date = chrono::DateTime::parse_from_rfc2822(value).ok()?;
+    let seconds = (date.with_timezone(&chrono::Utc) - chrono::Utc::now()).num_seconds();
+    Some(Duration::from_secs(seconds.max(0) as u64))
+}
+
+#[cfg(target_os = "macos")]
 fn fetch_with_curl(part: &Part) -> Result<VerifyingReader<Box<dyn Read + Send>>> {
     let reader = CurlReader::new(part.url.clone(), curl_user_agent())?;
     let (hasher, expected) = match (&part.sha256, &part.sha1, &part.md5) {
@@ -510,6 +529,17 @@ mod curl_tests {
         let range = b"HTTP/2 206 \r\nContent-Range: bytes 123-999/1000\r\n\r\n";
         assert_eq!(response_status(range), Some((206, "")));
         assert_eq!(header_value(range, b"content-range:"), Some("bytes 123-999/1000"));
+    }
+
+    #[test]
+    fn retry_after_accepts_delta_seconds_and_http_date() {
+        assert_eq!(parse_retry_after(Some("17")), Some(Duration::from_secs(17)));
+        assert!(parse_retry_after(Some("not-a-retry-delay")).is_none());
+        let future = (chrono::Utc::now() + chrono::Duration::seconds(20))
+            .to_rfc2822();
+        let parsed = parse_retry_after(Some(&future)).unwrap();
+        assert!(parsed <= Duration::from_secs(20));
+        assert!(parsed >= Duration::from_secs(15));
     }
 
     #[test]

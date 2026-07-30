@@ -783,13 +783,15 @@ fn cmd_backrefs(archive: &str, titles: &str, output: &str) -> Result<(), String>
         .map_err(|error| format!("{output}: {error}"))?
         .len();
     println!(
-        "{} sets, {} source pages, {} static edges, {} unresolved static edges, {} unresolved dynamic targets, {} redirects, {} bytes",
+        "{} sets, {} source pages, {} static edges, {} unresolved static edges, {} unresolved dynamic targets, {} redirects, {} users with edits, {} user-page memberships, {} bytes",
         stats.sets,
         stats.source_pages,
         stats.extracted_static_edges,
         stats.unresolved_static_edges,
         stats.unresolved_dynamic_targets,
         stats.redirect_pages,
+        stats.users_with_edits,
+        stats.user_page_memberships,
         bytes,
     );
     Ok(())

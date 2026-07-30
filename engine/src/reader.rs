@@ -2738,6 +2738,12 @@ mod tests {
             archive.with_extension("swtitle"),
         )
         .unwrap();
+        wikimak_wikipedia::backrefs::build(
+            &archive,
+            archive.with_extension("swtitle"),
+            archive.with_extension("swrefs"),
+        )
+        .unwrap();
         archive
     }
 

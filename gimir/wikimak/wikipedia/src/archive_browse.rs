@@ -12,6 +12,7 @@ use crate::archive::{
 pub struct ArchiveBrowseIndex {
     titles: crate::title_index::TitleIndex,
     indexed: IndexedArchiveSet,
+    backrefs: Option<crate::backrefs::BackrefIndex>,
     site_info: SiteInfoRecord,
     manifest: Option<ManifestRecord>,
 }
@@ -160,7 +161,17 @@ impl ArchiveBrowseIndex {
         title_index: impl AsRef<Path>,
     ) -> crate::archive::Result<Self> {
         let path = path.as_ref();
+        let title_index = title_index.as_ref();
         let titles = crate::title_index::TitleIndex::open(title_index)?;
+        let backref_path = path.with_extension("swrefs");
+        let backrefs = if backref_path.is_file() {
+            Some(crate::backrefs::BackrefIndex::open_for_title_index(
+                backref_path,
+                title_index,
+            )?)
+        } else {
+            None
+        };
         let frame_count = titles.frame_count();
         if frame_count == 0 {
             return Err(crate::archive::ArchiveError::Invalid(
@@ -206,6 +217,7 @@ impl ArchiveBrowseIndex {
         Ok(Self {
             titles,
             indexed,
+            backrefs,
             site_info,
             manifest,
         })
@@ -688,19 +700,54 @@ impl ArchiveBrowseIndex {
         })
     }
 
-    /// Find edits made by one revision contributor. Page frames are
-    /// independent, so this has the same all-core scan shape as regexp
-    /// full-text search. A registered account is matched by local user id;
-    /// anonymous contributors are matched by their recorded IP.
+    /// Find edits made by one registered revision contributor. The backref
+    /// sidecar first narrows the work to pages edited by the local user ID;
+    /// each selected page's linear history then supplies the exact edits.
     pub fn contributor_edits(
         &self,
         contributor: &crate::ContributorMeta,
         limit: usize,
     ) -> crate::archive::Result<ArchiveSearchResults> {
-        let page_frame_count = self.page_frame_count()?;
+        let crate::ContributorMeta::Named { user_id, .. } = contributor else {
+            return Err(crate::archive::ArchiveError::Invalid(
+                "contributor edit lookup requires a registered local user",
+            ));
+        };
+        if *user_id == 0 {
+            return Err(crate::archive::ArchiveError::Invalid(
+                "contributor edit lookup requires a nonzero local user id",
+            ));
+        }
+        let backrefs = self.backrefs.as_ref().ok_or(
+            crate::archive::ArchiveError::Invalid(
+                "archive has no backref sidecar",
+            ),
+        )?;
+        let page_ids = backrefs.pages_edited_by(*user_id)?;
+        let mut selected_frames = Vec::<(usize, Vec<u64>)>::new();
+        for page_id in page_ids {
+            let Some(frame_index) = self.page_frame_position(page_id)? else {
+                continue;
+            };
+            match selected_frames.last_mut() {
+                Some((last_frame, pages)) if *last_frame == frame_index => {
+                    pages.push(page_id);
+                }
+                _ => selected_frames.push((frame_index, vec![page_id])),
+            }
+        }
+        let selected_frame_count = selected_frames.len();
+        if selected_frame_count == 0 {
+            return Ok(ArchiveSearchResults {
+                hits: Vec::new(),
+                match_count: 0,
+                searched_frames: 0,
+                workers: 1,
+            });
+        }
         let workers = std::thread::available_parallelism()
             .map_or(1, usize::from)
-            .min(page_frame_count.max(1));
+            .min(selected_frame_count);
         let next = AtomicUsize::new(0);
         let keep = limit.max(1);
 
@@ -711,11 +758,13 @@ impl ArchiveBrowseIndex {
                     let mut found = Vec::new();
                     let mut match_count = 0_u64;
                     loop {
-                        let frame_index = next.fetch_add(1, Ordering::Relaxed);
-                        if frame_index >= page_frame_count {
+                        let selected_index = next.fetch_add(1, Ordering::Relaxed);
+                        let Some((frame_index, selected_pages)) =
+                            selected_frames.get(selected_index)
+                        else {
                             break;
-                        }
-                        let location = self.frame(frame_index)?;
+                        };
+                        let location = self.frame(*frame_index)?;
                         let mut file = self.indexed.open_file(&location)?;
                         let mut titles = std::collections::HashMap::<u64, String>::new();
                         let mut edits = Vec::new();
@@ -723,6 +772,12 @@ impl ArchiveBrowseIndex {
                         visit_frame_while_file(&mut file, &location, |record| {
                             let record_sequence = sequence;
                             sequence += 1;
+                            let Some(page_id) = record.page_id() else {
+                                return Ok(true);
+                            };
+                            if selected_pages.binary_search(&page_id).is_err() {
+                                return Ok(true);
+                            }
                             match record {
                                 Record::PageState {
                                     page_id,
@@ -764,7 +819,7 @@ impl ArchiveBrowseIndex {
                                 continue;
                             };
                             found.push((
-                                frame_index,
+                                *frame_index,
                                 record_sequence,
                                 ArchiveSearchHit {
                                     page_id,
@@ -820,7 +875,7 @@ impl ArchiveBrowseIndex {
         Ok(ArchiveSearchResults {
             hits: hits.into_iter().map(|(_, _, hit)| hit).collect(),
             match_count,
-            searched_frames: page_frame_count,
+            searched_frames: selected_frame_count,
             workers,
         })
     }
@@ -851,6 +906,13 @@ impl ArchiveBrowseIndex {
     }
 
     fn page_frame(&self, page_id: u64) -> crate::archive::Result<Option<FrameLocation>> {
+        let Some(position) = self.page_frame_position(page_id)? else {
+            return Ok(None);
+        };
+        Ok(Some(self.frame(position)?))
+    }
+
+    fn page_frame_position(&self, page_id: u64) -> crate::archive::Result<Option<usize>> {
         let page_frame_count = self.page_frame_count()?;
         let mut left = 0;
         let mut right = page_frame_count;
@@ -865,10 +927,10 @@ impl ArchiveBrowseIndex {
         if left >= page_frame_count {
             return Ok(None);
         }
-        let location = self.frame(left)?;
-        Ok((location.info.first_entity.id <= page_id
-            && page_id <= location.info.last_entity.id)
-            .then_some(location))
+        let frame = self.titles.frame(left)?;
+        Ok((frame.info.first_entity.id <= page_id
+            && page_id <= frame.info.last_entity.id)
+            .then_some(left))
     }
 
     pub fn page_text_at(

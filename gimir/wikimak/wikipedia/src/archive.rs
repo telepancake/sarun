@@ -1216,6 +1216,7 @@ pub(crate) struct IndexedArchiveSet {
         crate::title_index::SegmentIndexEntry,
         std::sync::Arc<std::fs::File>,
     )>,
+    direct_file: Option<std::sync::Arc<std::fs::File>>,
     reference: Option<CompressionReference>,
     active_dictionary_id: Option<u32>,
 }
@@ -1226,7 +1227,56 @@ impl IndexedArchiveSet {
         titles: &crate::title_index::TitleIndex,
     ) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
-        if !root.is_dir() || titles.segment_count() < 3 {
+        if !root.is_dir() {
+            if titles.segment_count() != 0 {
+                return Err(ArchiveError::Invalid(
+                    "single-file archive has archive-set segments",
+                ));
+            }
+            let file = std::sync::Arc::new(std::fs::File::open(&root)?);
+            let (_, locations, complete) = index_open_file(&file)?;
+            if !complete {
+                return Err(ArchiveError::Invalid(
+                    "single-file archive lacks completion marker",
+                ));
+            }
+            if locations.len() != titles.frame_count() {
+                return Err(ArchiveError::Invalid(
+                    "single-file archive frame count disagrees with title index",
+                ));
+            }
+            for (position, location) in locations.iter().enumerate() {
+                let indexed = titles.frame(position)?;
+                if indexed.info != location.info
+                    || indexed.compressed_offset != location.compressed_offset
+                {
+                    return Err(ArchiveError::Invalid(
+                        "single-file archive frame disagrees with title index",
+                    ));
+                }
+            }
+            let reference = locations
+                .first()
+                .and_then(|location| location.reference.clone());
+            if locations
+                .iter()
+                .any(|location| location.reference != reference)
+            {
+                return Err(ArchiveError::Invalid(
+                    "single-file archive changes compression reference",
+                ));
+            }
+            let active_dictionary_id = locations
+                .iter()
+                .find_map(|location| location.info.dictionary_id);
+            return Ok(Self {
+                segments: Vec::new(),
+                direct_file: Some(file),
+                reference,
+                active_dictionary_id,
+            });
+        }
+        if titles.segment_count() < 3 {
             return Err(ArchiveError::Invalid(
                 "Wikipedia archive is not a range-file set",
             ));
@@ -1326,6 +1376,7 @@ impl IndexedArchiveSet {
         }
         Ok(Self {
             segments,
+            direct_file: None,
             reference,
             active_dictionary_id,
         })
@@ -1335,6 +1386,15 @@ impl IndexedArchiveSet {
         &self,
         entry: crate::title_index::FrameIndexEntry,
     ) -> Result<FrameLocation> {
+        if self.direct_file.is_some() {
+            validate_frame_dictionary(entry.info, self.active_dictionary_id)?;
+            return Ok(FrameLocation {
+                info: entry.info,
+                compressed_offset: entry.compressed_offset,
+                reference: self.reference.clone(),
+                physical_segment: None,
+            });
+        }
         let position = self
             .segments
             .partition_point(|(segment, _)| segment.virtual_start <= entry.compressed_offset)
@@ -1382,9 +1442,16 @@ impl IndexedArchiveSet {
     }
 
     pub(crate) fn open_file(&self, location: &FrameLocation) -> Result<std::fs::File> {
-        let position = location.physical_segment.ok_or(ArchiveError::Invalid(
-            "archive-set frame has no physical segment",
-        ))?;
+        let Some(position) = location.physical_segment else {
+            return self
+                .direct_file
+                .as_ref()
+                .ok_or(ArchiveError::Invalid(
+                    "archive frame has no physical file",
+                ))?
+                .try_clone()
+                .map_err(ArchiveError::Io);
+        };
         self.segments
             .get(position)
             .ok_or(ArchiveError::Invalid(
@@ -5125,6 +5192,53 @@ mod tests {
                 history: None,
             },
         }
+    }
+
+    #[test]
+    fn indexed_archive_set_opens_a_complete_direct_file() {
+        let temporary = tempfile::tempdir().unwrap();
+        let archive = temporary.path().join("wiki.swdump");
+        let titles = temporary.path().join("wiki.swtitle");
+        let mut writer =
+            ArchiveWriter::new(std::fs::File::create(&archive).unwrap(), 1).unwrap();
+        writer
+            .write(&Record::PageState {
+                page_id: 1,
+                timestamp_micros: 20,
+                title: "One".into(),
+                namespace: None,
+                deleted: false,
+            })
+            .unwrap();
+        writer.write(&revision(1, 1, 10, b"text")).unwrap();
+        writer
+            .write(&Record::SiteInfo {
+                timestamp_micros: 30,
+                site_info: SiteInfoRecord {
+                    site_name: "Test".into(),
+                    db_name: "testwiki".into(),
+                    base: String::new(),
+                    generator: String::new(),
+                    case: "first-letter".into(),
+                    language: "en".into(),
+                    rtl: false,
+                    server: String::new(),
+                    script_path: String::new(),
+                    namespaces: Vec::new(),
+                    interwiki: Vec::new(),
+                    magic_words: Vec::new(),
+                },
+            })
+            .unwrap();
+        writer.finish().unwrap();
+        crate::title_index::build(&archive, &titles).unwrap();
+
+        let titles = crate::title_index::TitleIndex::open(&titles).unwrap();
+        assert_eq!(titles.segment_count(), 0);
+        let indexed = IndexedArchiveSet::open(&archive, &titles).unwrap();
+        let location = indexed.location(titles.frame(0).unwrap()).unwrap();
+        assert!(location.physical_segment.is_none());
+        assert!(indexed.open_file(&location).unwrap().metadata().unwrap().len() > 0);
     }
 
     #[test]

@@ -1,4 +1,5 @@
-//! Generated reverse-reference index over the newest revision of every page.
+//! Generated relation indexes. Wikitext references use the newest revision of
+//! every page; user-edit sets inspect contributor metadata from every revision.
 //!
 //! This is deliberately a sidecar, not an archive record: rebuilding it from
 //! the same archive and title index produces identical bytes.  Direct sets are
@@ -20,6 +21,8 @@ use crate::backrefs_parse::{
 
 const MAGIC: [u8; 8] = *b"SWREFOBJ";
 const HEADER_BYTES: usize = 80;
+const CAPABILITY_USER_EDITS: u32 = 1 << 0;
+const REQUIRED_CAPABILITIES: u32 = CAPABILITY_USER_EDITS;
 const DIRECTORY_DESCRIPTOR_BYTES: usize = 40;
 const PRESENCE_WORD_BYTES: usize = 20;
 const MAX_XOR_OFFSET: usize = 160;
@@ -31,6 +34,7 @@ const EDGE_BYTES: usize = 24;
 const EDGE_RUN_RECORDS: usize =
     (48 * 1024 * 1024) / std::mem::size_of::<EdgeRecord>();
 const EDGE_MERGE_FAN_IN: usize = 64;
+const USER_PAGE_RUN_RECORDS: usize = (48 * 1024 * 1024) / 16;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct SourcePage {
@@ -46,6 +50,8 @@ pub struct BuildStats {
     pub unresolved_static_edges: u64,
     pub unresolved_dynamic_targets: u64,
     pub redirect_pages: u64,
+    pub users_with_edits: u64,
+    pub user_page_memberships: u64,
     pub sets: u64,
 }
 
@@ -186,6 +192,12 @@ struct RecentSet {
     bytes: usize,
 }
 
+struct PendingLogicalDirectory {
+    kind: EdgeKind,
+    class: SetClass,
+    entries: Vec<(u64, u32)>,
+}
+
 struct DedupTable {
     hashes: Vec<u64>,
     object_ids: Vec<u32>,
@@ -251,7 +263,7 @@ struct StreamingEncoder {
     payload: std::fs::File,
     payload_len: u64,
     entries: Vec<EncodedMeta>,
-    logical: Vec<Vec<(u64, u32)>>,
+    logical: Vec<PendingLogicalDirectory>,
     logical_count: usize,
     canonical: std::fs::File,
     canonical_len: u64,
@@ -270,7 +282,7 @@ impl StreamingEncoder {
             payload: tempfile::tempfile()?,
             payload_len: 0,
             entries: Vec::new(),
-            logical: (0..16).map(|_| Vec::new()).collect(),
+            logical: Vec::new(),
             logical_count: 0,
             canonical: tempfile::tempfile()?,
             canonical_len: 0,
@@ -313,10 +325,11 @@ impl StreamingEncoder {
         let canonical_offset = self.canonical_len;
         self.canonical.seek(SeekFrom::Start(canonical_offset))?;
         self.canonical.write_all(&raw)?;
-        let direct = matches!(
-            set.key.class,
-            SetClass::DirectUnconditional | SetClass::DirectPossible
-        );
+        let direct = set.key.kind != EdgeKind::UserEdits
+            && matches!(
+                set.key.class,
+                SetClass::DirectUnconditional | SetClass::DirectPossible
+            );
         self.evict_stale_recent();
         let mut best = None::<(&RecentSet, Vec<u8>)>;
         if !direct {
@@ -397,9 +410,36 @@ impl StreamingEncoder {
     }
 
     fn record_logical(&mut self, key: SetKey, object_id: u32) {
-        self.logical[directory_index(key.kind, key.class)]
+        let position = self
+            .logical
+            .iter()
+            .position(|directory| directory.kind == key.kind && directory.class == key.class)
+            .unwrap_or_else(|| {
+                self.logical.push(PendingLogicalDirectory {
+                    kind: key.kind,
+                    class: key.class,
+                    entries: Vec::new(),
+                });
+                self.logical.len() - 1
+            });
+        self.logical[position]
+            .entries
             .push((key.target_page_id, object_id));
         self.logical_count += 1;
+    }
+
+    #[cfg(test)]
+    fn logical_object(&self, key: SetKey) -> Option<u32> {
+        self.logical
+            .iter()
+            .find(|directory| directory.kind == key.kind && directory.class == key.class)
+            .and_then(|directory| {
+                directory
+                    .entries
+                    .iter()
+                    .find(|entry| entry.0 == key.target_page_id)
+                    .map(|entry| entry.1)
+            })
     }
 
     fn record_recent_key(&mut self, key: SetKey, object_id: u32) {
@@ -429,7 +469,11 @@ impl StreamingEncoder {
         }
     }
 
-    fn write(mut self, output: impl AsRef<Path>) -> crate::archive::Result<()> {
+    fn write(
+        mut self,
+        output: impl AsRef<Path>,
+        title_index_fingerprint: u64,
+    ) -> crate::archive::Result<()> {
         if self.logical_count > u32::MAX as usize {
             return Err(ArchiveError::Invalid("too many backref logical sets"));
         }
@@ -457,7 +501,7 @@ impl StreamingEncoder {
         let payload_offset = base_offsets_offset + self.entries.len() as u64;
         temporary.write_all(&MAGIC)?;
         temporary.write_all(&(HEADER_BYTES as u32).to_le_bytes())?;
-        temporary.write_all(&0_u32.to_le_bytes())?;
+        temporary.write_all(&REQUIRED_CAPABILITIES.to_le_bytes())?;
         temporary.write_all(&(self.entries.len() as u64).to_le_bytes())?;
         temporary.write_all(&(self.logical_count as u64).to_le_bytes())?;
         temporary.write_all(&(HEADER_BYTES as u64).to_le_bytes())?;
@@ -465,7 +509,7 @@ impl StreamingEncoder {
         temporary.write_all(&base_offsets_offset.to_le_bytes())?;
         temporary.write_all(&payload_offset.to_le_bytes())?;
         temporary.write_all(&(directories.len() as u64).to_le_bytes())?;
-        temporary.write_all(&0_u64.to_le_bytes())?;
+        temporary.write_all(&title_index_fingerprint.to_le_bytes())?;
         write_logical_directories(temporary.as_file_mut(), &directories)?;
         for entry in &self.entries {
             temporary.write_all(&(payload_offset + entry.payload_offset).to_le_bytes())?;
@@ -509,57 +553,23 @@ struct LogicalDirectory {
     object_ids: Vec<u32>,
 }
 
-fn directory_index(kind: EdgeKind, class: SetClass) -> usize {
-    let kind = match kind {
-        EdgeKind::Template => 0,
-        EdgeKind::Module => 1,
-        EdgeKind::Category => 2,
-        EdgeKind::File => 3,
-    };
-    let class = match class {
-        SetClass::DirectUnconditional => 0,
-        SetClass::DirectPossible => 1,
-        SetClass::TransitiveUnconditional => 2,
-        SetClass::TransitivePossible => 3,
-    };
-    kind * 4 + class
-}
-
-fn directory_identity(index: usize) -> (EdgeKind, SetClass) {
-    let kind = match index / 4 {
-        0 => EdgeKind::Template,
-        1 => EdgeKind::Module,
-        2 => EdgeKind::Category,
-        3 => EdgeKind::File,
-        _ => unreachable!(),
-    };
-    let class = match index % 4 {
-        0 => SetClass::DirectUnconditional,
-        1 => SetClass::DirectPossible,
-        2 => SetClass::TransitiveUnconditional,
-        3 => SetClass::TransitivePossible,
-        _ => unreachable!(),
-    };
-    (kind, class)
-}
-
 fn build_logical_directories(
-    mut logical: Vec<Vec<(u64, u32)>>,
+    mut logical: Vec<PendingLogicalDirectory>,
 ) -> std::io::Result<Vec<LogicalDirectory>> {
+    logical.sort_unstable_by_key(|directory| (directory.kind, directory.class));
     let mut directories = Vec::new();
-    for (index, entries) in logical.iter_mut().enumerate() {
-        if entries.is_empty() {
+    for pending in &mut logical {
+        if pending.entries.is_empty() {
             continue;
         }
-        entries.sort_unstable();
-        let (kind, class) = directory_identity(index);
+        pending.entries.sort_unstable();
         let mut directory = LogicalDirectory {
-            kind: Some(kind),
-            class: Some(class),
+            kind: Some(pending.kind),
+            class: Some(pending.class),
             ..LogicalDirectory::default()
         };
-        for (entry_index, (target_page_id, object_id)) in entries.iter().enumerate() {
-            if entry_index != 0 && entries[entry_index - 1].0 == *target_page_id {
+        for (entry_index, (target_page_id, object_id)) in pending.entries.iter().enumerate() {
+            if entry_index != 0 && pending.entries[entry_index - 1].0 == *target_page_id {
                 return Err(invalid_data("duplicate backref logical key"));
             }
             let word_index = target_page_id / 64;
@@ -813,13 +823,16 @@ impl TargetAccumulator {
 }
 
 /// Build a deterministic sidecar from an archive and its generated title
-/// index.  Only the first (newest) revision record of each page is examined.
+/// index. Wikitext relations inspect only the newest revision of each page;
+/// user-edit membership inspects every revision contributor.
 pub fn build(
     archive: impl AsRef<Path>,
     title_index: impl AsRef<Path>,
     output: impl AsRef<Path>,
 ) -> crate::archive::Result<BuildStats> {
     let archive = archive.as_ref();
+    let title_index = title_index.as_ref();
+    let title_index_fingerprint = file_xxh3_64(title_index)?;
     let titles = crate::title_index::TitleIndex::open(title_index)?;
     let site_info = read_site_info(archive)?;
     let namespaces = namespace_map(&site_info);
@@ -899,14 +912,20 @@ pub fn build(
     edge_spool.sync_all()?;
     edge_spool.seek(SeekFrom::Start(0))?;
     let collected = collect_sorted_edges(edge_spool, &redirects)?;
+    let user_edits = collect_user_edit_pages(archive)?;
     stats.unresolved_static_edges += collected.redirect_misses;
-    stats.sets = write_streaming_sidecar(
+    let (sets, users, memberships) = write_streaming_sidecar(
         output,
         collected.direct,
         collected.topology_seeds,
         collected.graph,
         collected.effects,
+        user_edits,
+        title_index_fingerprint,
     )?;
+    stats.sets = sets;
+    stats.users_with_edits = users;
+    stats.user_page_memberships = memberships;
     Ok(stats)
 }
 
@@ -1248,6 +1267,176 @@ fn merge_edge_runs(inputs: &[std::path::PathBuf], output: &Path) -> std::io::Res
         }
     }
     writer.flush()
+}
+
+fn write_user_page(output: &mut impl Write, user_id: u64, page_id: u64) -> std::io::Result<()> {
+    output.write_all(&user_id.to_le_bytes())?;
+    output.write_all(&page_id.to_le_bytes())
+}
+
+fn read_user_page(input: &mut impl Read) -> std::io::Result<Option<(u64, u64)>> {
+    let mut bytes = [0_u8; 16];
+    let mut read = 0;
+    while read < bytes.len() {
+        let count = input.read(&mut bytes[read..])?;
+        if count == 0 {
+            if read == 0 {
+                return Ok(None);
+            }
+            return Err(invalid_data("truncated user-page pair"));
+        }
+        read += count;
+    }
+    Ok(Some((
+        u64::from_le_bytes(bytes[..8].try_into().unwrap()),
+        u64::from_le_bytes(bytes[8..].try_into().unwrap()),
+    )))
+}
+
+fn merge_user_page_runs(
+    inputs: &[std::path::PathBuf],
+    output: &mut impl Write,
+) -> std::io::Result<()> {
+    let mut readers = inputs
+        .iter()
+        .map(|path| std::fs::File::open(path).map(BufReader::new))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    let mut heap = BinaryHeap::<Reverse<((u64, u64), usize)>>::new();
+    for (run, reader) in readers.iter_mut().enumerate() {
+        if let Some(pair) = read_user_page(reader)? {
+            heap.push(Reverse((pair, run)));
+        }
+    }
+    let mut previous = None;
+    while let Some(Reverse((pair, run))) = heap.pop() {
+        if previous != Some(pair) {
+            write_user_page(output, pair.0, pair.1)?;
+            previous = Some(pair);
+        }
+        if let Some(next) = read_user_page(&mut readers[run])? {
+            heap.push(Reverse((next, run)));
+        }
+    }
+    Ok(())
+}
+
+fn collect_user_edit_pages(archive: &Path) -> crate::archive::Result<std::fs::File> {
+    collect_user_edit_pages_with_limit(archive, USER_PAGE_RUN_RECORDS)
+}
+
+fn collect_user_edit_pages_with_limit(
+    archive: &Path,
+    run_records: usize,
+) -> crate::archive::Result<std::fs::File> {
+    if run_records == 0 {
+        return Err(ArchiveError::Invalid("zero user-page sort run size"));
+    }
+    let temporary = tempfile::tempdir()?;
+    let mut reader = ArchiveRecordReader::open(archive)?;
+    let mut runs = Vec::new();
+    let mut records = Vec::with_capacity(run_records);
+    while let Some(record) = reader.next_record()? {
+        let Record::Revision { page_id, revision } = record else {
+            continue;
+        };
+        let crate::ContributorMeta::Named { user_id, .. } = revision.meta.contributor else {
+            continue;
+        };
+        if user_id == 0 {
+            continue;
+        }
+        records.push((user_id, page_id));
+        if records.len() == run_records {
+            flush_user_page_run(&temporary, &mut runs, &mut records)?;
+        }
+    }
+    flush_user_page_run(&temporary, &mut runs, &mut records)?;
+    let mut stage = 0_usize;
+    while runs.len() > EDGE_MERGE_FAN_IN {
+        let mut next = Vec::new();
+        for (group, inputs) in runs.chunks(EDGE_MERGE_FAN_IN).enumerate() {
+            let path = temporary
+                .path()
+                .join(format!("user-merge-{stage:04}-{group:08}.run"));
+            let mut output = BufWriter::new(std::fs::File::create(&path)?);
+            merge_user_page_runs(inputs, &mut output)?;
+            output.flush()?;
+            next.push(path);
+        }
+        for path in &runs {
+            std::fs::remove_file(path)?;
+        }
+        runs = next;
+        stage += 1;
+    }
+    let mut output = tempfile::tempfile()?;
+    merge_user_page_runs(&runs, &mut output)?;
+    output.seek(SeekFrom::Start(0))?;
+    Ok(output)
+}
+
+fn flush_user_page_run(
+    temporary: &tempfile::TempDir,
+    runs: &mut Vec<std::path::PathBuf>,
+    records: &mut Vec<(u64, u64)>,
+) -> std::io::Result<()> {
+    if records.is_empty() {
+        return Ok(());
+    }
+    records.sort_unstable();
+    records.dedup();
+    let path = temporary.path().join(format!("user-{:08}.run", runs.len()));
+    let mut output = BufWriter::new(std::fs::File::create(&path)?);
+    for (user_id, page_id) in records.drain(..) {
+        write_user_page(&mut output, user_id, page_id)?;
+    }
+    output.flush()?;
+    runs.push(path);
+    Ok(())
+}
+
+fn visit_user_edit_sets(
+    input: &mut std::fs::File,
+    mut visitor: impl FnMut(LogicalSet) -> crate::archive::Result<()>,
+) -> crate::archive::Result<(u64, u64)> {
+    input.seek(SeekFrom::Start(0))?;
+    let mut current_user = None;
+    let mut pages = Bitmap::default();
+    let mut users = 0_u64;
+    let mut memberships = 0_u64;
+    while let Some((user_id, page_id)) = read_user_page(input)? {
+        if current_user != Some(user_id) {
+            if let Some(previous) = current_user {
+                memberships += pages.members().count() as u64;
+                visitor(LogicalSet {
+                    key: SetKey {
+                        target_page_id: previous,
+                        kind: EdgeKind::UserEdits,
+                        class: SetClass::DirectUnconditional,
+                    },
+                    members: std::mem::take(&mut pages),
+                    topology_bases: Vec::new(),
+                })?;
+                users += 1;
+            }
+            current_user = Some(user_id);
+        }
+        pages.insert(page_id);
+    }
+    if let Some(user_id) = current_user {
+        memberships += pages.members().count() as u64;
+        visitor(LogicalSet {
+            key: SetKey {
+                target_page_id: user_id,
+                kind: EdgeKind::UserEdits,
+                class: SetClass::DirectUnconditional,
+            },
+            members: pages,
+            topology_bases: Vec::new(),
+        })?;
+        users += 1;
+    }
+    Ok((users, memberships))
 }
 
 fn write_graph_edge(output: &mut impl Write, edge: GraphEdge) -> std::io::Result<()> {
@@ -1857,6 +2046,7 @@ fn namespace_map(site_info: &crate::archive::SiteInfoRecord) -> NamespaceMap {
                 EdgeKind::Module => "Module",
                 EdgeKind::Category => "Category",
                 EdgeKind::File => "File",
+                EdgeKind::UserEdits => unreachable!("user edits have no MediaWiki namespace"),
             }
         } else {
             &namespace.localized_name
@@ -2166,7 +2356,9 @@ fn write_streaming_sidecar(
     mut topology_seeds: DiskSets,
     graph: DiskGraph,
     effects: DiskGraph,
-) -> crate::archive::Result<u64> {
+    mut user_edits: std::fs::File,
+    title_index_fingerprint: u64,
+) -> crate::archive::Result<(u64, u64, u64)> {
     let mut encoder = StreamingEncoder::new()?;
     visit_logical_sets(
         &mut direct,
@@ -2178,9 +2370,13 @@ fn write_streaming_sidecar(
             Ok(())
         },
     )?;
+    let (users, memberships) = visit_user_edit_sets(&mut user_edits, |set| {
+        encoder.add(set)?;
+        Ok(())
+    })?;
     let count = encoder.logical_count as u64;
-    encoder.write(output)?;
-    Ok(count)
+    encoder.write(output, title_index_fingerprint)?;
+    Ok((count, users, memberships))
 }
 
 fn visit_logical_sets(
@@ -2640,8 +2836,21 @@ fn write_sidecar(
         })?;
     }
     let objects = encoder.entries.len() as u64;
-    encoder.write(output)?;
+    encoder.write(output, 0)?;
     Ok(objects)
+}
+
+fn file_xxh3_64(path: &Path) -> std::io::Result<u64> {
+    let mut input = BufReader::new(std::fs::File::open(path)?);
+    let mut hasher = xxhash_rust::xxh3::Xxh3::new();
+    let mut buffer = [0_u8; 1024 * 1024];
+    loop {
+        let count = input.read(&mut buffer)?;
+        if count == 0 {
+            return Ok(hasher.digest());
+        }
+        hasher.update(&buffer[..count]);
+    }
 }
 
 fn set_readable_permissions(path: &Path) -> std::io::Result<()> {
@@ -2656,6 +2865,8 @@ fn set_readable_permissions(path: &Path) -> std::io::Result<()> {
 #[derive(Debug)]
 pub struct BackrefIndex {
     bytes: memmap2::Mmap,
+    capabilities: u32,
+    title_index_fingerprint: u64,
     object_count: usize,
     directories: Vec<DiskDirectory>,
     object_offsets_offset: usize,
@@ -2687,10 +2898,14 @@ impl BackrefIndex {
         if bytes.len() < HEADER_BYTES || bytes[..8] != MAGIC {
             return Err(ArchiveError::Invalid("bad backref sidecar magic"));
         }
-        if u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize != HEADER_BYTES
-            || u32::from_le_bytes(bytes[12..16].try_into().unwrap()) != 0
-        {
+        if u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize != HEADER_BYTES {
             return Err(ArchiveError::Invalid("unsupported backref sidecar header"));
+        }
+        let capabilities = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
+        if capabilities != REQUIRED_CAPABILITIES {
+            return Err(ArchiveError::Invalid(
+                "backref sidecar lacks required user-edit capability",
+            ));
         }
         let usize_field = |start| {
             usize::try_from(u64::from_le_bytes(
@@ -2705,9 +2920,8 @@ impl BackrefIndex {
         let base_offsets_offset = usize_field(48)?;
         let payload_offset = usize_field(56)?;
         let directory_count = usize_field(64)?;
-        if bytes[72..80] != [0; 8] {
-            return Err(ArchiveError::Invalid("unknown backref sidecar header field"));
-        }
+        let title_index_fingerprint =
+            u64::from_le_bytes(bytes[72..80].try_into().unwrap());
         if object_count > u32::MAX as usize || logical_count > u32::MAX as usize {
             return Err(ArchiveError::Invalid("backref count exceeds u32"));
         }
@@ -2866,12 +3080,27 @@ impl BackrefIndex {
         }
         Ok(Self {
             bytes,
+            capabilities,
+            title_index_fingerprint,
             object_count,
             directories,
             object_offsets_offset,
             base_offsets_offset,
             payload_offset,
         })
+    }
+
+    pub fn open_for_title_index(
+        path: impl AsRef<Path>,
+        title_index: impl AsRef<Path>,
+    ) -> crate::archive::Result<Self> {
+        let index = Self::open(path)?;
+        if index.title_index_fingerprint != file_xxh3_64(title_index.as_ref())? {
+            return Err(ArchiveError::Invalid(
+                "backref sidecar title-index fingerprint mismatch",
+            ));
+        }
+        Ok(index)
     }
 
     pub fn members(&self, key: SetKey) -> crate::archive::Result<Vec<u64>> {
@@ -2881,6 +3110,24 @@ impl BackrefIndex {
         let mut cache = BTreeMap::new();
         let bitmap = self.decode_entry(position, &mut cache)?;
         Ok(bitmap.members().collect())
+    }
+
+    /// Page IDs having at least one revision attributed to this stable local
+    /// user ID. Account-log actions are deliberately not part of this set.
+    pub fn pages_edited_by(&self, local_user_id: u64) -> crate::archive::Result<Vec<u64>> {
+        if self.capabilities & CAPABILITY_USER_EDITS == 0 {
+            return Err(ArchiveError::Invalid(
+                "backref sidecar lacks required user-edit capability",
+            ));
+        }
+        if local_user_id == 0 {
+            return Ok(Vec::new());
+        }
+        self.members(SetKey {
+            target_page_id: local_user_id,
+            kind: EdgeKind::UserEdits,
+            class: SetClass::DirectUnconditional,
+        })
     }
 
     fn decode_entry(
@@ -3001,6 +3248,7 @@ fn kind_byte(kind: EdgeKind) -> u8 {
         EdgeKind::Module => 2,
         EdgeKind::Category => 3,
         EdgeKind::File => 4,
+        EdgeKind::UserEdits => 5,
     }
 }
 
@@ -3017,6 +3265,7 @@ fn parse_kind(value: u8) -> crate::archive::Result<EdgeKind> {
         2 => Ok(EdgeKind::Module),
         3 => Ok(EdgeKind::Category),
         4 => Ok(EdgeKind::File),
+        5 => Ok(EdgeKind::UserEdits),
         _ => Err(ArchiveError::Invalid("unknown backref edge kind")),
     }
 }
@@ -3146,6 +3395,24 @@ mod tests {
                 history: None,
             },
         }
+    }
+
+    fn named_revision(
+        page_id: u64,
+        revision_id: u64,
+        at: i64,
+        text: &str,
+        user_id: u64,
+    ) -> Record {
+        let mut record = revision(page_id, revision_id, at, text);
+        let Record::Revision { revision, .. } = &mut record else {
+            unreachable!()
+        };
+        revision.meta.contributor = crate::ContributorMeta::Named {
+            username: format!("User {user_id}"),
+            user_id,
+        };
+        record
     }
 
     fn resolver(pages: &[SourcePage]) -> impl FnMut(&str) -> Option<u64> + '_ {
@@ -3509,6 +3776,8 @@ mod tests {
             DiskSets::from_memory(topology_seeds).unwrap(),
             graph,
             effects,
+            tempfile::tempfile().unwrap(),
+            0,
         )
         .unwrap();
         let index = BackrefIndex::open(&path).unwrap();
@@ -3670,18 +3939,8 @@ mod tests {
                 topology_bases: vec![base_key],
             })
             .unwrap();
-        let directory =
-            &encoder.logical[directory_index(EdgeKind::Template, SetClass::TransitiveUnconditional)];
-        let target_position = directory
-            .iter()
-            .find(|entry| entry.0 == target_key.target_page_id)
-            .unwrap()
-            .1 as usize;
-        let base_position = directory
-            .iter()
-            .find(|entry| entry.0 == base_key.target_page_id)
-            .unwrap()
-            .1 as usize;
+        let target_position = encoder.logical_object(target_key).unwrap() as usize;
+        let base_position = encoder.logical_object(base_key).unwrap() as usize;
         assert!(encoder.entries[target_position].base_offset > 0);
         assert_eq!(
             target_position - encoder.entries[target_position].base_offset as usize,
@@ -3736,14 +3995,7 @@ mod tests {
                 topology_bases: vec![base_key],
             })
             .unwrap();
-        let target_position = encoder.logical[directory_index(
-            EdgeKind::Template,
-            SetClass::TransitiveUnconditional,
-        )]
-        .iter()
-        .find(|entry| entry.0 == target_key.target_page_id)
-        .unwrap()
-        .1 as usize;
+        let target_position = encoder.logical_object(target_key).unwrap() as usize;
         assert_eq!(encoder.entries[target_position].base_offset, 0);
     }
 
@@ -3889,7 +4141,7 @@ mod tests {
         // deliberately absent.
         assert_eq!(stats.unresolved_static_edges, 2);
         assert!(stats.unresolved_dynamic_targets >= 1);
-        let index = BackrefIndex::open(&sidecar).unwrap();
+        let index = BackrefIndex::open_for_title_index(&sidecar, &titles).unwrap();
         assert_eq!(
             index
                 .members(SetKey {
@@ -3916,6 +4168,122 @@ mod tests {
             std::fs::read(&sidecar).unwrap(),
             std::fs::read(&second).unwrap(),
         );
+    }
+
+    #[test]
+    fn user_edit_sets_index_pages_not_actions_or_repeated_revisions() {
+        let temporary = tempfile::tempdir().unwrap();
+        let archive = temporary.path().join("users.swdump");
+        let titles = temporary.path().join("users.swtitle");
+        let sidecar = temporary.path().join("users.swrefs");
+        let mut writer =
+            crate::archive::ArchiveWriter::new(std::fs::File::create(&archive).unwrap(), 4096)
+                .unwrap();
+        for (page_id, revisions) in [
+            (
+                1,
+                vec![
+                    named_revision(1, 12, 200, "new", 7),
+                    named_revision(1, 11, 100, "old", 7),
+                ],
+            ),
+            (
+                2,
+                vec![
+                    named_revision(2, 22, 200, "new", 7),
+                    named_revision(2, 21, 100, "old", 8),
+                ],
+            ),
+            (3, vec![revision(3, 31, 100, "anonymous")]),
+            (4, vec![named_revision(4, 41, 100, "zero", 0)]),
+        ] {
+            writer
+                .write(&Record::PageState {
+                    page_id,
+                    timestamp_micros: 300_000_000,
+                    title: format!("Page {page_id}"),
+                    namespace: Some(0),
+                    deleted: false,
+                })
+                .unwrap();
+            for revision in revisions {
+                writer.write(&revision).unwrap();
+            }
+        }
+        writer
+            .write(&Record::UserAction {
+                entity: crate::archive::EntityKey {
+                    kind: crate::archive::EntityKind::User,
+                    id: 9,
+                },
+                timestamp_micros: 300,
+                action: crate::archive::UserActionRecord {
+                    log_id: Some(1),
+                    tie_sequence: 1,
+                    kind: crate::archive::UserActionKind::Create,
+                    performer: crate::archive::PerformerRecord {
+                        local_user_id: Some(9),
+                        central_user_id: None,
+                        historical_name: Some("Action only".into()),
+                        account_class: crate::archive::AccountClass::Permanent,
+                    },
+                    comment: String::new(),
+                    historical_name: Some("Action only".into()),
+                    groups: Vec::new(),
+                    blocks: Vec::new(),
+                    bot_by: Vec::new(),
+                    created_by: 0,
+                    registration_timestamp_micros: None,
+                    creation_timestamp_micros: None,
+                    first_edit_timestamp_micros: None,
+                },
+            })
+            .unwrap();
+        writer
+            .write(&Record::SiteInfo {
+                timestamp_micros: 300_000_000,
+                site_info: crate::archive::SiteInfoRecord {
+                    site_name: "Users".into(),
+                    db_name: "userswiki".into(),
+                    base: String::new(),
+                    generator: String::new(),
+                    case: "first-letter".into(),
+                    language: "en".into(),
+                    rtl: false,
+                    server: String::new(),
+                    script_path: String::new(),
+                    namespaces: vec![crate::archive::SiteNamespaceRecord {
+                        id: 0,
+                        case: "first-letter".into(),
+                        localized_name: String::new(),
+                        aliases: Vec::new(),
+                    }],
+                    interwiki: Vec::new(),
+                    magic_words: Vec::new(),
+                },
+            })
+            .unwrap();
+        writer.finish().unwrap();
+        let mut tiny_runs = collect_user_edit_pages_with_limit(&archive, 1).unwrap();
+        let mut tiny_sets = Vec::new();
+        assert_eq!(
+            visit_user_edit_sets(&mut tiny_runs, |set| {
+                tiny_sets.push((set.key.target_page_id, set.members.members().collect::<Vec<_>>()));
+                Ok(())
+            })
+            .unwrap(),
+            (2, 3),
+        );
+        assert_eq!(tiny_sets, vec![(7, vec![1, 2]), (8, vec![2])]);
+        crate::title_index::build(&archive, &titles).unwrap();
+        let stats = build(&archive, &titles, &sidecar).unwrap();
+        assert_eq!(stats.users_with_edits, 2);
+        assert_eq!(stats.user_page_memberships, 3);
+        let index = BackrefIndex::open_for_title_index(&sidecar, &titles).unwrap();
+        assert_eq!(index.pages_edited_by(7).unwrap(), vec![1, 2]);
+        assert_eq!(index.pages_edited_by(8).unwrap(), vec![2]);
+        assert!(index.pages_edited_by(9).unwrap().is_empty());
+        assert!(index.pages_edited_by(0).unwrap().is_empty());
     }
 
     #[test]
@@ -4020,10 +4388,17 @@ mod tests {
         }
         assert_eq!(encoder.entries.len(), 2);
         assert_eq!(encoder.dedup.collisions.len(), 1);
-        let directory = &encoder.logical
-            [directory_index(EdgeKind::File, SetClass::DirectUnconditional)];
-        assert_ne!(directory[0].1, directory[1].1);
-        assert_eq!(directory[1].1, directory[2].1);
+        let ids = [1, 2, 3].map(|target_page_id| {
+            encoder
+                .logical_object(SetKey {
+                    target_page_id,
+                    kind: EdgeKind::File,
+                    class: SetClass::DirectUnconditional,
+                })
+                .unwrap()
+        });
+        assert_ne!(ids[0], ids[1]);
+        assert_eq!(ids[1], ids[2]);
     }
 
     #[test]
@@ -4036,7 +4411,37 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let path = temporary.path().join("empty.swrefs");
         assert_eq!(write_sidecar(&path, &[(key, Vec::new())]).unwrap(), 0);
-        assert!(BackrefIndex::open(&path).unwrap().members(key).unwrap().is_empty());
+        let index = BackrefIndex::open(&path).unwrap();
+        assert!(index.members(key).unwrap().is_empty());
+        assert!(index.pages_edited_by(7).unwrap().is_empty());
+    }
+
+    #[test]
+    fn sidecar_requires_user_edit_capability() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("old.swrefs");
+        write_sidecar(&path, &[]).unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[12..16].copy_from_slice(&0_u32.to_le_bytes());
+        std::fs::write(&path, bytes).unwrap();
+        assert!(BackrefIndex::open(&path).is_err());
+    }
+
+    #[test]
+    fn sidecar_attachment_requires_exact_title_index() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("attached.swrefs");
+        let matching = temporary.path().join("matching.swtitle");
+        let other = temporary.path().join("other.swtitle");
+        std::fs::write(&matching, b"exact title-index bytes").unwrap();
+        std::fs::write(&other, b"different title-index bytes").unwrap();
+        write_sidecar(&path, &[]).unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[72..80]
+            .copy_from_slice(&file_xxh3_64(&matching).unwrap().to_le_bytes());
+        std::fs::write(&path, bytes).unwrap();
+        BackrefIndex::open_for_title_index(&path, &matching).unwrap();
+        assert!(BackrefIndex::open_for_title_index(&path, &other).is_err());
     }
 
     #[test]

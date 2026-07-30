@@ -13,6 +13,7 @@ pub enum EdgeKind {
     Module,
     Category,
     File,
+    UserEdits,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
