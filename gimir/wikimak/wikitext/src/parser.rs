@@ -187,6 +187,13 @@ pub fn to_html(
         }
     }
     open.push('>');
+    let mut body = body;
+    body.push_str(&categories_footer(store, &ctx.categories, opts));
+    if ctx.render_title.ns == NS_CATEGORY {
+        if let Some(members) = store.category_members(&ctx.render_title) {
+            body.push_str(&category_members_footer(store, &members, opts));
+        }
+    }
     let html = format!("{open}{body}</div>");
     aggregate_misses(&mut ctx.misses);
 
@@ -195,6 +202,74 @@ pub fn to_html(
         categories: ctx.categories,
         misses: ctx.misses,
     }
+}
+
+fn categories_footer(
+    store: &dyn PageStore,
+    categories: &[String],
+    opts: &RenderOptions<'_>,
+) -> String {
+    if categories.is_empty() {
+        return String::new();
+    }
+    let site = store.site();
+    let links = categories.iter().map(|category| {
+        let title = Title {
+            ns: NS_CATEGORY,
+            text: category.clone(),
+        };
+        let prefixed = title.prefixed(site);
+        let href = format!(
+            "{}{}{}",
+            opts.link_prefix,
+            html::encode_path(&prefixed),
+            opts.asof_query
+        );
+        format!(
+            r#"<a href="{}" title="{}">{}</a>"#,
+            html::escape(&href),
+            html::escape(&prefixed),
+            html::escape(category),
+        )
+    });
+    format!(
+        r#"<div class="catlinks"><span class="catlabel">Categories:</span> {}</div>"#,
+        links.collect::<Vec<_>>().join(" · ")
+    )
+}
+
+fn category_members_footer(
+    store: &dyn PageStore,
+    members: &[Title],
+    opts: &RenderOptions<'_>,
+) -> String {
+    let site = store.site();
+    let mut out = String::from(r#"<div class="mw-category"><h2>Pages in category</h2>"#);
+    if members.is_empty() {
+        out.push_str(
+            r#"<p class="mw-category-empty">There are no pages in this category.</p>"#,
+        );
+        out.push_str("</div>");
+        return out;
+    }
+    out.push_str("<ul>");
+    for member in members {
+        let prefixed = member.prefixed(site);
+        let href = format!(
+            "{}{}{}",
+            opts.link_prefix,
+            html::encode_path(&prefixed),
+            opts.asof_query
+        );
+        out.push_str(&format!(
+            r#"<li><a href="{}" title="{}">{}</a></li>"#,
+            html::escape(&href),
+            html::escape(&prefixed),
+            html::escape(&prefixed),
+        ));
+    }
+    out.push_str("</ul></div>");
+    out
 }
 
 fn aggregate_misses(misses: &mut RenderMisses) {

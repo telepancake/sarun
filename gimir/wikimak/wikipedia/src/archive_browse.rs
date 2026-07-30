@@ -263,6 +263,69 @@ impl ArchiveBrowseIndex {
         self.titles.lookup(title, timestamp, &self.site_info)
     }
 
+    /// Current members of one category from the generated reverse-reference
+    /// sidecar. `None` means the archive has no sidecar; an empty vector is a
+    /// valid indexed category with no certain members. The sidecar describes
+    /// newest-page state, so callers rendering an historical `as-of` view must
+    /// not present this as historical membership.
+    pub fn category_member_titles(
+        &self,
+        category_page_id: u64,
+    ) -> crate::archive::Result<Option<Vec<String>>> {
+        let Some(backrefs) = self.backrefs.as_ref() else {
+            return Ok(None);
+        };
+        let page_ids = backrefs.members(crate::backrefs::SetKey {
+            target_page_id: category_page_id,
+            kind: crate::backrefs::EdgeKind::Category,
+            class: crate::backrefs::SetClass::TransitiveUnconditional,
+        })?;
+        let mut selected_frames = Vec::<(usize, Vec<u64>)>::new();
+        for page_id in page_ids {
+            let Some(frame_index) = self.page_frame_position(page_id)? else {
+                continue;
+            };
+            match selected_frames.last_mut() {
+                Some((last_frame, pages)) if *last_frame == frame_index => {
+                    pages.push(page_id);
+                }
+                _ => selected_frames.push((frame_index, vec![page_id])),
+            }
+        }
+
+        let mut members = Vec::<(u64, String)>::new();
+        for (frame_index, selected_pages) in selected_frames {
+            let location = self.frame(frame_index)?;
+            self.visit_frame_while(&location, |record| {
+                let Record::PageState {
+                    page_id,
+                    title,
+                    namespace,
+                    deleted,
+                    ..
+                } = record
+                else {
+                    return Ok(true);
+                };
+                if deleted || selected_pages.binary_search(&page_id).is_err() {
+                    return Ok(true);
+                }
+                let title = match namespace {
+                    Some(namespace) => crate::title_index::title_in_namespace(
+                        &title,
+                        namespace,
+                        &self.site_info,
+                    ),
+                    None => title,
+                };
+                members.push((page_id, title));
+                Ok(true)
+            })?;
+        }
+        members.sort_by_key(|(page_id, _)| *page_id);
+        Ok(Some(members.into_iter().map(|(_, title)| title).collect()))
+    }
+
     pub fn pages(&self, filter: Option<&str>, limit: usize) -> Vec<(u64, String)> {
         let filter = filter.map(str::to_lowercase);
         let mut seen = std::collections::HashSet::new();
@@ -1090,6 +1153,34 @@ impl wikimak_wikitext::PageStore for ArchiveAsOfView<'_> {
         None
     }
 
+    fn category_members(
+        &self,
+        category: &wikimak_wikitext::Title,
+    ) -> Option<Vec<wikimak_wikitext::Title>> {
+        if category.ns != wikimak_wikitext::title::NS_CATEGORY
+            || self.timestamp_micros.is_some()
+        {
+            return None;
+        }
+        let category_id = self.archive.page_id_by_title(
+            &category.prefixed(&self.site),
+            i64::MAX,
+        )?;
+        let titles = self
+            .archive
+            .category_member_titles(category_id)
+            .ok()??;
+        let mut members = titles
+            .into_iter()
+            .map(|title| wikimak_wikitext::Title::parse(&title, &self.site))
+            .collect::<Vec<_>>();
+        // The sidecar intentionally stores only page IDs, not MediaWiki's
+        // per-membership sort keys. Alphabetical title order is the useful
+        // deterministic fallback for browsing.
+        members.sort_by_key(|title| title.prefixed(&self.site).to_lowercase());
+        Some(members)
+    }
+
     fn site(&self) -> &wikimak_wikitext::SiteConfig {
         &self.site
     }
@@ -1300,5 +1391,124 @@ mod tests {
             Some(b"hello".to_vec()),
             "an attached reader must keep reading its opened generation"
         );
+    }
+
+    #[test]
+    fn indexed_category_members_are_available_to_the_archive_view() {
+        let temporary = tempfile::tempdir().unwrap();
+        let archive = temporary.path().join("category.swdump");
+        let mut writer = ArchiveWriter::new(
+            std::fs::File::create(&archive).unwrap(),
+            1,
+        )
+        .unwrap();
+        writer
+            .write(&Record::PageState {
+                page_id: 1,
+                timestamp_micros: 2_000_000,
+                title: "Birds".into(),
+                namespace: Some(14),
+                deleted: false,
+            })
+            .unwrap();
+        writer
+            .write(&Record::PageState {
+                page_id: 2,
+                timestamp_micros: 2_000_000,
+                title: "Sparrow".into(),
+                namespace: None,
+                deleted: false,
+            })
+            .unwrap();
+        writer
+            .write(&Record::Revision {
+                page_id: 2,
+                revision: RevisionRecord {
+                    meta: RevisionMeta {
+                        rev_id: 2,
+                        parent_id: 0,
+                        ts: Utc.timestamp_opt(1, 0).unwrap(),
+                        contributor: ContributorMeta::Hidden,
+                        comment: String::new(),
+                        sha1: String::new(),
+                        flags: 0,
+                        text_len: 18,
+                    },
+                    has_text: true,
+                    text: b"[[Category:Birds]]".to_vec(),
+                    visibility: None,
+                    history: None,
+                },
+            })
+            .unwrap();
+        writer
+            .write(&Record::Manifest {
+                timestamp_micros: i64::MAX,
+                manifest: crate::archive::ManifestRecord {
+                    wiki_db: "testwiki".into(),
+                    content_snapshot: "2026-07-29".into(),
+                    metadata_snapshot: "2026-07".into(),
+                    source_files: Vec::new(),
+                },
+            })
+            .unwrap();
+        writer
+            .write(&Record::SiteInfo {
+                timestamp_micros: i64::MAX,
+                site_info: SiteInfoRecord {
+                    site_name: "Test".into(),
+                    db_name: "testwiki".into(),
+                    base: "https://test.invalid/wiki/Main_Page".into(),
+                    generator: "MediaWiki".into(),
+                    case: "first-letter".into(),
+                    language: "en".into(),
+                    rtl: false,
+                    server: "https://test.invalid".into(),
+                    script_path: "/w".into(),
+                    namespaces: vec![
+                        crate::archive::SiteNamespaceRecord {
+                            id: 0,
+                            case: "first-letter".into(),
+                            localized_name: String::new(),
+                            aliases: Vec::new(),
+                        },
+                        crate::archive::SiteNamespaceRecord {
+                            id: 14,
+                            case: "first-letter".into(),
+                            localized_name: "Category".into(),
+                            aliases: Vec::new(),
+                        },
+                    ],
+                    interwiki: Vec::new(),
+                    magic_words: Vec::new(),
+                },
+            })
+            .unwrap();
+        writer.finish().unwrap();
+
+        let title_index = temporary.path().join("category.swtitle");
+        crate::title_index::build(&archive, &title_index).unwrap();
+        let sidecar = temporary.path().join("category.swrefs");
+        crate::backrefs::build(&archive, &title_index, &sidecar).unwrap();
+        let index = ArchiveBrowseIndex::open(&archive, &title_index).unwrap();
+        assert_eq!(
+            index.category_member_titles(1).unwrap(),
+            Some(vec!["Sparrow".to_string()])
+        );
+        let view = index.view(None);
+        let category = wikimak_wikitext::Title::parse(
+            "Category:Birds",
+            wikimak_wikitext::PageStore::site(&view),
+        );
+        let rendered = wikimak_wikitext::render(
+            &view,
+            &category,
+            "description",
+            &wikimak_wikitext::RenderOptions {
+                link_prefix: "/wiki/".into(),
+                ..Default::default()
+            },
+        );
+        assert!(rendered.html.contains("Sparrow"));
     }
 }

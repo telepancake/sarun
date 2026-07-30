@@ -142,6 +142,17 @@ fn list_interrupts_paragraph() {
 }
 
 #[test]
-fn category_only_line_produces_no_paragraph() {
-    assert_eq!(render_inner("[[Category:X]]"), "");
+fn category_only_line_produces_category_footer_without_paragraph() {
+    assert_eq!(
+        render_inner("[[Category:X]]"),
+        "<div class=\"catlinks\"><span class=\"catlabel\">Categories:</span> <a href=\"/wiki/Category:X\" title=\"Category:X\">X</a></div>"
+    );
+}
+
+#[test]
+fn indexed_category_members_are_rendered_after_category_body() {
+    assert_eq!(
+        render_category_inner("intro", "Birds", &["Berlin", "Category:Nesting"]),
+        "<p>intro</p><div class=\"mw-category\"><h2>Pages in category</h2><ul><li><a href=\"/wiki/Berlin\" title=\"Berlin\">Berlin</a></li><li><a href=\"/wiki/Category:Nesting\" title=\"Category:Nesting\">Category:Nesting</a></li></ul></div>"
+    );
 }

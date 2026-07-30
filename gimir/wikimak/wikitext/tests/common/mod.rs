@@ -73,6 +73,8 @@ pub struct Store {
     pub site: SiteConfig,
     /// Prefixed titles that exist (blue links); everything else is red.
     pub existing: Vec<String>,
+    /// Optional current category-member fixture for category-page tests.
+    pub members: Option<Vec<String>>,
 }
 
 impl Store {
@@ -87,12 +89,19 @@ impl Store {
                 "Foo bar".to_string(),
                 "Main Page".to_string(),
             ],
+            members: None,
         }
     }
     pub fn rtl() -> Self {
         let mut s = Self::new();
         s.site.rtl = true;
         s.site.lang = "ar".to_string();
+        s
+    }
+
+    pub fn with_members(members: &[&str]) -> Self {
+        let mut s = Self::new();
+        s.members = Some(members.iter().map(|member| (*member).to_string()).collect());
         s
     }
 }
@@ -103,6 +112,18 @@ impl PageStore for Store {
     }
     fn page_exists(&self, title: &Title) -> bool {
         self.existing.contains(&title.prefixed(&self.site))
+    }
+    fn category_members(&self, category: &Title) -> Option<Vec<Title>> {
+        if category.ns != 14 {
+            return None;
+        }
+        Some(
+            self.members
+                .clone()?
+                .into_iter()
+                .map(|member| Title::parse(&member, &self.site))
+                .collect(),
+        )
     }
     fn site(&self) -> &SiteConfig {
         &self.site
@@ -133,6 +154,20 @@ pub const WRAP_CLOSE: &str = "</div>";
 /// assertions target the body HTML directly.
 pub fn render_inner(input: &str) -> String {
     let full = render_full(input);
+    full.strip_prefix(WRAP_OPEN)
+        .and_then(|s| s.strip_suffix(WRAP_CLOSE))
+        .expect("wrapper present")
+        .to_string()
+}
+
+pub fn render_category_inner(input: &str, category: &str, members: &[&str]) -> String {
+    let store = Store::with_members(members);
+    let opts = RenderOptions {
+        link_prefix: "/wiki/".to_string(),
+        ..Default::default()
+    };
+    let title = Title::parse(&format!("Category:{category}"), &store.site);
+    let full = render(&store, &title, input, &opts).html;
     full.strip_prefix(WRAP_OPEN)
         .and_then(|s| s.strip_suffix(WRAP_CLOSE))
         .expect("wrapper present")

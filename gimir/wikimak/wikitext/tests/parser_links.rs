@@ -89,10 +89,13 @@ fn pipe_trick_strips_after_comma() {
 }
 
 #[test]
-fn category_collected_not_rendered() {
+fn category_collected_and_footer_rendered() {
     let out = render_out("[[Category:Animals]][[Category:Pets|k]] rest");
     assert_eq!(out.categories, vec!["Animals".to_string(), "Pets".to_string()]);
-    assert_eq!(render_inner("[[Category:Animals]]text"), "<p>text</p>");
+    assert_eq!(
+        render_inner("[[Category:Animals]]text"),
+        "<p>text</p><div class=\"catlinks\"><span class=\"catlabel\">Categories:</span> <a href=\"/wiki/Category:Animals\" title=\"Category:Animals\">Animals</a></div>"
+    );
 }
 
 #[test]

@@ -100,6 +100,13 @@ impl PageStore for PageView<'_> {
         }
     }
 
+    fn category_members(&self, category: &Title) -> Option<Vec<Title>> {
+        match self {
+            Self::Depot(view) => view.category_members(category),
+            Self::Archive(view) => view.category_members(category),
+        }
+    }
+
     fn site(&self) -> &wikimak_wikitext::SiteConfig {
         match self {
             Self::Depot(view) => view.site(),
@@ -539,9 +546,6 @@ fn page_response(app: &App, raw_title: &str, query: &HashMap<String, String>) ->
     body.push_str("<div class=\"content\">");
     body.push_str(&content);
     body.push_str("</div>");
-    if let Some(out) = &out {
-        body.push_str(&categories_footer(&out.categories, &asof_query));
-    }
     body.push_str(&instance_footer(site, ts, Some(&display)));
 
     html_resp(200, &shell(site, &escape(&display), &body))
@@ -891,31 +895,6 @@ fn misses_badge(misses: &wikimak_wikitext::RenderMisses) -> String {
         escape(&detail.join(" · ")),
         n,
         if n == 1 { "" } else { "es" },
-    )
-}
-
-fn categories_footer(categories: &[String], asof_query: &str) -> String {
-    if categories.is_empty() {
-        return String::new();
-    }
-    let links: Vec<String> = categories
-        .iter()
-        .map(|c| {
-            format!(
-                r#"<a href="/w/allpages?filter={}{}">{}</a>"#,
-                urlq(c),
-                if asof_query.is_empty() {
-                    String::new()
-                } else {
-                    format!("&asof={}", &asof_query[6..]) // strip leading "?asof="
-                },
-                escape(c),
-            )
-        })
-        .collect();
-    format!(
-        r#"<div class="catlinks"><span class="catlabel">Categories:</span> {}</div>"#,
-        links.join(" · ")
     )
 }
 

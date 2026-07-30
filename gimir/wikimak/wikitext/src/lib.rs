@@ -108,6 +108,15 @@ pub trait PageStore {
         let _ = namespace;
         None
     }
+    /// Current direct members of a category, when the store has a generated
+    /// category-membership index. `None` means that the store cannot provide
+    /// the index; `Some(empty)` is a valid indexed category with no members.
+    /// Historical/as-of stores may deliberately return `None` when their
+    /// membership index only describes the newest archive state.
+    fn category_members(&self, category: &Title) -> Option<Vec<Title>> {
+        let _ = category;
+        None
+    }
     fn site(&self) -> &SiteConfig;
     /// τ in unix micros — drives {{CURRENTYEAR}} etc. (plan §3.2: τ!).
     fn timestamp_micros(&self) -> i64;
