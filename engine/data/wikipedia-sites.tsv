@@ -1,0 +1,367 @@
+# generated 2026-07-30
+# dumps: https://dumps.wikimedia.org/backup-index-bydb.html
+# names: https://meta.wikimedia.org/w/api.php?action=sitematrix&format=json&formatversion=2
+# dbname	language	status
+aawiki	Afar	closed
+abwiki	Abkhazian	open
+acewiki	Acehnese	open
+adywiki	Adyghe	open
+afwiki	Afrikaans	open
+akwiki	Akan	closed
+alswiki	Alemannic	open
+altwiki	Southern Altai	open
+amiwiki	Amis	open
+amwiki	Amharic	open
+angwiki	Old English	open
+annwiki	Obolo	open
+anpwiki	Angika	open
+anwiki	Aragonese	open
+arcwiki	Aramaic	open
+arwiki	Arabic	open
+arywiki	Moroccan Arabic	open
+arzwiki	Egyptian Arabic	open
+astwiki	Asturian	open
+aswiki	Assamese	open
+atjwiki	Atikamekw	open
+avkwiki	Kotava	open
+avwiki	Avaric	open
+awawiki	Awadhi	open
+aywiki	Aymara	open
+azbwiki	South Azerbaijani	open
+azwiki	Azerbaijani	open
+banwiki	Balinese	open
+barwiki	Bavarian	open
+bat_smgwiki	Samogitian	open
+bawiki	Bashkir	open
+bbcwiki	Batak Toba	open
+bclwiki	Central Bikol	open
+bdrwiki	West Coast Bajau	open
+be_x_oldwiki	Belarusian (Taraškievica orthography)	open
+bewiki	Belarusian	open
+bewwiki	Betawi	open
+bgwiki	Bulgarian	open
+bhwiki	Bhojpuri	open
+biwiki	Bislama	open
+bjnwiki	Banjar	open
+blkwiki	Pa'O	open
+bmwiki	Bambara	open
+bnwiki	Bangla	open
+bowiki	Tibetan	open
+bpywiki	Bishnupriya	open
+brwiki	Breton	open
+bswiki	Bosnian	open
+btmwiki	Batak Mandailing	open
+bugwiki	Buginese	open
+bxrwiki	Russia Buriat	open
+cawiki	Catalan	open
+cbk_zamwiki	Chavacano	open
+cdowiki	Mindong	open
+cebwiki	Cebuano	open
+cewiki	Chechen	open
+chowiki	Choctaw	closed
+chrwiki	Cherokee	open
+chwiki	Chamorro	open
+chywiki	Cheyenne	open
+ckbwiki	Central Kurdish	open
+cowiki	Corsican	open
+crhwiki	Crimean Tatar	open
+crwiki	Cree	closed
+csbwiki	Kashubian	open
+cswiki	Czech	open
+cuwiki	Church Slavic	open
+cvwiki	Chuvash	open
+cywiki	Welsh	open
+dagwiki	Dagbani	open
+dawiki	Danish	open
+dewiki	German	open
+dgawiki	Southern Dagaare	open
+dinwiki	Dinka	open
+diqwiki	Dimli	open
+dsbwiki	Lower Sorbian	open
+dtpwiki	Central Dusun	open
+dtywiki	Doteli	open
+dvwiki	Divehi	open
+dzwiki	Dzongkha	open
+eewiki	Ewe	open
+elwiki	Greek	open
+emlwiki	Emiliano-Romagnolo	open
+enwiki	English	open
+eowiki	Esperanto	open
+eswiki	Spanish	open
+etwiki	Estonian	open
+euwiki	Basque	open
+extwiki	Extremaduran	open
+fatwiki	Fanti	open
+fawiki	Persian	open
+ffwiki	Fula	open
+fiu_vrowiki	Võro	open
+fiwiki	Finnish	open
+fjwiki	Fijian	open
+fonwiki	Fon	open
+fowiki	Faroese	open
+frpwiki	Arpitan	open
+frrwiki	Northern Frisian	open
+frwiki	French	open
+furwiki	Friulian	open
+fywiki	Western Frisian	open
+gagwiki	Gagauz	open
+ganwiki	Gan	open
+gawiki	Irish	open
+gcrwiki	Guianan Creole	open
+gdwiki	Scottish Gaelic	open
+glkwiki	Gilaki	open
+glwiki	Galician	open
+gnwiki	Guarani	open
+gomwiki	Goan Konkani	open
+gorwiki	Gorontalo	open
+gotwiki	Gothic	open
+gpewiki	Ghanaian Pidgin	open
+gucwiki	Wayuu	open
+gurwiki	Frafra	open
+guwiki	Gujarati	open
+guwwiki	Gun	open
+gvwiki	Manx	open
+hakwiki	Hakka Chinese	open
+hawiki	Hausa	open
+hawwiki	Hawaiian	open
+hewiki	Hebrew	open
+hifwiki	Fiji Hindi	open
+hiwiki	Hindi	open
+howiki	Hiri Motu	closed
+hrwiki	Croatian	open
+hsbwiki	Upper Sorbian	open
+htwiki	Haitian Creole	open
+huwiki	Hungarian	open
+hywiki	Armenian	open
+hywwiki	Western Armenian	open
+hzwiki	Herero	closed
+iawiki	Interlingua	open
+ibawiki	Iban	open
+idwiki	Indonesian	open
+iewiki	Interlingue	open
+iglwiki	Igala	open
+igwiki	Igbo	open
+iiwiki	Sichuan Yi	closed
+ikwiki	Inupiaq	open
+ilowiki	Iloko	open
+inhwiki	Ingush	open
+iowiki	Ido	open
+isvwiki	Interslavic	open
+iswiki	Icelandic	open
+itwiki	Italian	open
+iuwiki	Inuktitut	open
+jamwiki	Jamaican Creole English	open
+jawiki	Japanese	open
+jbowiki	Lojban	open
+jvwiki	Javanese	open
+kaawiki	Kara-Kalpak	open
+kabwiki	Kabyle	open
+kaiwiki	Karekare	open
+kajwiki	Jju	open
+kawiki	Georgian	open
+kbdwiki	Kabardian	open
+kbpwiki	Kabiye	open
+kcgwiki	Tyap	open
+kgewiki	Komering	open
+kgwiki	Kongo	open
+kiwiki	Kikuyu	open
+kjwiki	Kuanyama	closed
+kkwiki	Kazakh	open
+klwiki	Kalaallisut	closed
+kmwiki	Khmer	open
+kncwiki	Central Kanuri	open
+knwiki	Kannada	open
+koiwiki	Komi-Permyak	open
+kowiki	Korean	open
+krcwiki	Karachay-Balkar	open
+krwiki	Kanuri	closed
+kshwiki	Colognian	open
+kswiki	Kashmiri	open
+kuswiki	Kusaal	open
+kuwiki	Kurdish	open
+kvwiki	Komi	open
+kwwiki	Cornish	open
+kywiki	Kyrgyz	open
+ladwiki	Ladino	open
+lawiki	Latin	open
+lbewiki	Lak	open
+lbwiki	Luxembourgish	open
+lezwiki	Lezghian	open
+lfnwiki	Lingua Franca Nova	open
+lgwiki	Ganda	open
+lijwiki	Ligurian	open
+liwiki	Limburgish	open
+lldwiki	Ladin	open
+lmowiki	Lombard	open
+lnwiki	Lingala	open
+lowiki	Lao	open
+lrcwiki	Northern Luri	closed
+ltgwiki	Latgalian	open
+ltwiki	Lithuanian	open
+lvwiki	Latvian	open
+madwiki	Madurese	open
+magwiki	Magahi	open
+maiwiki	Maithili	open
+map_bmswiki	Banyumasan	open
+mdfwiki	Moksha	open
+mgwiki	Malagasy	open
+mhrwiki	Eastern Mari	open
+mhwiki	Marshallese	closed
+minwiki	Minangkabau	open
+miwiki	Māori	open
+mkwiki	Macedonian	open
+mlwiki	Malayalam	open
+mniwiki	Manipuri	open
+mnwiki	Mongolian	open
+mnwwiki	Mon	open
+moswiki	Mossi	open
+mrjwiki	Western Mari	open
+mrwiki	Marathi	open
+mswiki	Malay	open
+mtwiki	Maltese	open
+muswiki	Muscogee	closed
+mwlwiki	Mirandese	open
+myvwiki	Erzya	open
+mywiki	Burmese	open
+mznwiki	Mazanderani	open
+nahwiki	Nahuatl	open
+napwiki	Neapolitan	open
+nawiki	Nauru	closed
+nds_nlwiki	Low Saxon	open
+ndswiki	Low German	open
+newiki	Nepali	open
+newwiki	Newari	open
+ngwiki	Ndonga	closed
+niawiki	Nias	open
+nlwiki	Dutch	open
+nnwiki	Norwegian Nynorsk	open
+novwiki	Novial	open
+nowiki	Norwegian	open
+nqowiki	N’Ko	open
+nrmwiki	Norman	open
+nrwiki	South Ndebele	open
+nsowiki	Northern Sotho	open
+nupwiki	Nupe	open
+nvwiki	Navajo	open
+nywiki	Nyanja	open
+ocwiki	Occitan	open
+olowiki	Livvi-Karelian	open
+omwiki	Oromo	open
+orwiki	Odia	open
+oswiki	Ossetic	open
+pagwiki	Pangasinan	open
+pamwiki	Pampanga	open
+papwiki	Papiamento	open
+pawiki	Punjabi	open
+pcdwiki	Picard	open
+pcmwiki	Nigerian Pidgin	open
+pdcwiki	Pennsylvania German	open
+pflwiki	Palatine German	open
+pihwiki	Pitcairn-Norfolk	closed
+piwiki	Pali	open
+plwiki	Polish	open
+pmswiki	Piedmontese	open
+pnbwiki	Western Punjabi	open
+pntwiki	Pontic	open
+pplwiki	Nawat	open
+pswiki	Pashto	open
+ptwiki	Portuguese	open
+pwnwiki	Paiwan	open
+quwiki	Quechua	open
+rkiwiki	Arakanese	open
+rmwiki	Romansh	open
+rmywiki	Vlax Romani	open
+rnwiki	Rundi	open
+roa_rupwiki	Aromanian	open
+roa_tarawiki	Tarantino	open
+rowiki	Romanian	open
+rskwiki	Pannonian Rusyn	open
+ruewiki	Rusyn	open
+ruwiki	Russian	open
+rwwiki	Kinyarwanda	open
+sahwiki	Yakut	open
+satwiki	Santali	open
+sawiki	Sanskrit	open
+scnwiki	Sicilian	open
+scowiki	Scots	open
+scwiki	Sardinian	open
+sdwiki	Sindhi	open
+sewiki	Northern Sami	open
+sgwiki	Sango	open
+shiwiki	Tachelhit	open
+shnwiki	Shan	open
+shwiki	Serbo-Croatian	open
+simplewiki	Simple English	open
+siwiki	Sinhala	open
+skrwiki	Saraiki	open
+skwiki	Slovak	open
+slwiki	Slovenian	open
+smnwiki	Inari Sami	open
+smwiki	Samoan	open
+snwiki	Shona	open
+sowiki	Somali	open
+sqwiki	Albanian	open
+srnwiki	Sranan Tongo	open
+srwiki	Serbian	open
+sswiki	Swati	open
+stqwiki	Saterland Frisian	open
+stwiki	Southern Sotho	open
+suwiki	Sundanese	open
+svwiki	Swedish	open
+swwiki	Swahili	open
+sylwiki	Sylheti	open
+szlwiki	Silesian	open
+szywiki	Sakizaya	open
+tawiki	Tamil	open
+taywiki	Atayal	open
+tcywiki	Tulu	open
+tddwiki	Tai Nuea	open
+tetwiki	Tetum	open
+tewiki	Telugu	open
+tgwiki	Tajik	open
+thwiki	Thai	open
+tigwiki	Tigre	open
+tiwiki	Tigrinya	open
+tkwiki	Turkmen	open
+tlwiki	Tagalog	open
+tlywiki	Talysh	open
+tnwiki	Tswana	open
+tokwiki	Toki Pona	open
+towiki	Tongan	open
+tpiwiki	Tok Pisin	open
+trvwiki	Taroko	open
+trwiki	Turkish	open
+tswiki	Tsonga	open
+ttwiki	Tatar	open
+tumwiki	Tumbuka	open
+twwiki	Twi	open
+tyvwiki	Tuvinian	open
+tywiki	Tahitian	open
+udmwiki	Udmurt	open
+ugwiki	Uyghur	open
+ukwiki	Ukrainian	open
+urwiki	Urdu	open
+uzwiki	Uzbek	open
+vecwiki	Venetian	open
+vepwiki	Veps	open
+vewiki	Venda	open
+viwiki	Vietnamese	open
+vlswiki	West Flemish	open
+vowiki	Volapük	open
+warwiki	Waray	open
+wawiki	Walloon	open
+wowiki	Wolof	open
+wuuwiki	Wu	open
+xalwiki	Kalmyk	open
+xhwiki	Xhosa	open
+xmfwiki	Mingrelian	open
+yiwiki	Yiddish	open
+yowiki	Yoruba	open
+zawiki	Zhuang	open
+zeawiki	Zeelandic	open
+zghwiki	Standard Moroccan Tamazight	open
+zh_classicalwiki	Literary Chinese	open
+zh_min_nanwiki	Minnan	open
+zh_yuewiki	Cantonese	open
+zhwiki	Chinese	open
+zuwiki	Zulu	open

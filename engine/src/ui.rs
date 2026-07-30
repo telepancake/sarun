@@ -412,7 +412,7 @@ enum Pane {
     /// summary) read from the box's `sudtrace` sqlar blob and decoded by the
     /// `sudtrace` control verb. Left pane lists events; the right pane shows
     /// the selected event's full fields + text. Only sud boxes populate the
-    /// blob, so the chip is gated on its presence (PaneVis::Data("sudtrace")).
+    /// blob; the empty pane explains that requirement.
     Trace,
     /// Drill-down INTO a flow's TCP stream: left pane = every packet in
     /// that connection (frame · time · src→dst · proto · len · info),
@@ -507,15 +507,15 @@ enum Modal {
     /// Enter opens; Esc cancels.
     EditorOpen { buf: String },
     /// Add one or more Wikipedia mirrors without exposing the generic
-    /// mirror-driver CLI. Preset sites are toggled in the first field;
-    /// `custom` accepts any other Wikimedia database name. `destination`
+    /// mirror-driver CLI. The first field filters the checked-in catalog
+    /// generated from Wikimedia's dump index and SiteMatrix. `destination`
     /// is a user-chosen base directory: every selected database gets one
     /// range-file archive/index pair (for example BASE/enwiki.swdump and
     /// BASE/enwiki.swtitle), so mirrors never collide.
     WikiMirrorSetup {
         selected: std::collections::BTreeSet<String>,
         site_cursor: usize,
-        custom: String,
+        site_filter: String,
         destination: String,
         cadence: usize,
         field: WikiSetupField,
@@ -1518,7 +1518,7 @@ impl App {
             hunk_scroll: 0,
             out_scroll: 0,
             focus: Pane::Sessions,
-            status: "ready · j/k move · b/c/p/o boxes/changes/procs/outputs · e rules · ? help · Enter open · a apply · x discard · K kill · D delete · r rename · / search · q quit".into(),
+            status: "ready".into(),
             renaming: None,
             modal: None,
             f_changes: ViewFilter::default(),
@@ -4111,21 +4111,29 @@ impl App {
     }
 
     fn open_wiki_mirror_setup(&mut self) {
-        let destination = self
+        let nearby = self
             .mirror_jobs
             .get(self.sel_mirror)
             .filter(|job| job.kind == "wiki")
-            .or_else(|| self.mirror_jobs.iter().find(|job| job.kind == "wiki"))
+            .or_else(|| self.mirror_jobs.iter().find(|job| job.kind == "wiki"));
+        let destination = nearby
             .and_then(|job| std::path::Path::new(&job.dest).parent())
             .filter(|path| !path.as_os_str().is_empty())
             .map(|path| path.to_string_lossy().into_owned())
             .unwrap_or_default();
+        let cadence = nearby
+            .and_then(|job| {
+                WIKI_CADENCES
+                    .iter()
+                    .position(|(_, seconds)| *seconds == job.interval_secs)
+            })
+            .unwrap_or(0);
         self.modal = Some(Modal::WikiMirrorSetup {
             selected: std::collections::BTreeSet::new(),
             site_cursor: 0,
-            custom: String::new(),
+            site_filter: String::new(),
             destination,
-            cadence: 0,
+            cadence,
             field: WikiSetupField::Sites,
         });
     }
@@ -4213,15 +4221,11 @@ impl App {
 
     fn commit_wiki_mirror_setup(
         &mut self,
-        mut selected: std::collections::BTreeSet<String>,
-        custom: String,
+        selected: std::collections::BTreeSet<String>,
+        site_filter: String,
         destination: String,
         cadence: usize,
     ) {
-        let custom = custom.trim();
-        if !custom.is_empty() {
-            selected.insert(custom.to_ascii_lowercase());
-        }
         let destination = expand_user_path(destination.trim());
         let error = if selected.is_empty() {
             Some("select at least one Wikipedia site".to_string())
@@ -4241,7 +4245,7 @@ impl App {
             self.modal = Some(Modal::WikiMirrorSetup {
                 selected,
                 site_cursor: 0,
-                custom: custom.to_string(),
+                site_filter,
                 destination: destination.to_string_lossy().into_owned(),
                 cadence,
                 field: WikiSetupField::Sites,
@@ -5882,10 +5886,8 @@ impl App {
         // be close — better than 24×80 forever.
         let (cols, rows) = match crossterm::terminal::size() {
             Ok((c, r)) => {
-                // Body height = rows minus menubar / cmdline / fkeybar
-                // / status = 4. Subtract one more row for the PTY's
-                // title strip.
-                let h = r.saturating_sub(5).max(2);
+                let bar = unified_bar_lines(self, c).len().min(u16::MAX as usize) as u16;
+                let h = r.saturating_sub(bar).saturating_sub(1).max(2);
                 let w = c.max(20);
                 (w, h)
             }
@@ -5908,7 +5910,14 @@ impl App {
 
     fn open_debug_console(&mut self, service: &str, sid: &str) {
         let (cols, rows) = match crossterm::terminal::size() {
-            Ok((columns, rows)) => (columns.max(20), rows.saturating_sub(5).max(2)),
+            Ok((columns, rows)) => {
+                let bar =
+                    unified_bar_lines(self, columns).len().min(u16::MAX as usize) as u16;
+                (
+                    columns.max(20),
+                    rows.saturating_sub(bar).saturating_sub(1).max(2),
+                )
+            }
             Err(_) => (80, 24),
         };
         match PtyPane::open_debug_console(&self.sock, service, rows, cols) {
@@ -5931,8 +5940,7 @@ impl App {
     /// from what the child currently thinks. Called from the main
     /// loop on every iteration AND on Event::Resize. The math
     /// mirrors the draw() layout exactly:
-    ///   root vertical: 1 (menubar) + body + 1 (cmdline) + 1 (fkeybar)
-    ///                   + 1 (status)   → body = rows − 4
+    ///   root vertical: body + the dynamically wrapped unified context bar
     ///   embedded:  right column = round(width * 55 / 100), minus the
     ///              1-row PTY title strip → cols ≈ width*0.55,
     ///              rows = body − 1
@@ -5944,7 +5952,10 @@ impl App {
         if self.ptys.is_empty() {
             return;
         }
-        let body_rows = term_rows.saturating_sub(4).max(2);
+        let bar_rows = unified_bar_lines(self, term_cols)
+            .len()
+            .min(u16::MAX as usize) as u16;
+        let body_rows = term_rows.saturating_sub(bar_rows).max(2);
         let (cols, rows) = if self.focus == Pane::Pty {
             // Full-screen PTY: subtract 1 for the title strip.
             (term_cols.max(20), body_rows.saturating_sub(1).max(2))
@@ -9184,24 +9195,54 @@ fn mirror_state_color(state: &str) -> Color {
     }
 }
 
-/// "in 5m" / "due" for a next_due unix timestamp (already-elapsed shows
-/// as the state column's "pending"; the due cell just says "due").
-const WIKI_SITES: &[(&str, &str)] = &[
-    ("enwiki", "English"),
-    ("lvwiki", "Latvian"),
-    ("dewiki", "German"),
-    ("frwiki", "French"),
-    ("eswiki", "Spanish"),
-    ("plwiki", "Polish"),
-    ("ukwiki", "Ukrainian"),
-    ("ruwiki", "Russian"),
-    ("jawiki", "Japanese"),
-    ("zhwiki", "Chinese"),
-    ("simplewiki", "Simple English"),
-];
+#[derive(Clone, Copy)]
+struct WikiSite {
+    dbname: &'static str,
+    language: &'static str,
+    closed: bool,
+}
+
+fn wiki_sites() -> &'static [WikiSite] {
+    static SITES: std::sync::OnceLock<Vec<WikiSite>> = std::sync::OnceLock::new();
+    SITES.get_or_init(|| {
+        include_str!("../data/wikipedia-sites.tsv")
+            .lines()
+            .filter(|line| !line.starts_with('#') && !line.is_empty())
+            .filter_map(|line| {
+                let mut fields = line.split('\t');
+                Some(WikiSite {
+                    dbname: fields.next()?,
+                    language: fields.next()?,
+                    closed: fields.next()? == "closed",
+                })
+            })
+            .collect()
+    })
+}
+
+fn filtered_wiki_sites(filter: &str) -> Vec<WikiSite> {
+    let needle = filter.trim().to_lowercase();
+    wiki_sites()
+        .iter()
+        .copied()
+        .filter(|site| {
+            needle.is_empty()
+                || site.dbname.contains(&needle)
+                || site.language.to_lowercase().contains(&needle)
+        })
+        .collect()
+}
+
+fn wiki_catalog_date() -> &'static str {
+    include_str!("../data/wikipedia-sites.tsv")
+        .lines()
+        .next()
+        .and_then(|line| line.strip_prefix("# generated "))
+        .unwrap_or("unknown date")
+}
 
 const WIKI_CADENCES: &[(&str, i64)] =
-    &[("daily", 24 * 3600), ("weekly", 7 * 24 * 3600)];
+    &[("every day", 24 * 3600), ("every week", 7 * 24 * 3600)];
 
 fn valid_wiki_dbname(name: &str) -> bool {
     name.ends_with("wiki")
@@ -9736,7 +9777,7 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
         Modal::ModelPicker { models, .. } => (models.len() as u16 + 1).clamp(1, 18) + 7,
         // 3 fields + header + result + help + borders.
         Modal::ApiConfig { .. } => 11,
-        Modal::WikiMirrorSetup { .. } => 24,
+        Modal::WikiMirrorSetup { .. } => 31,
         Modal::WikiMirrorLibrary { .. } => 9,
         Modal::Command {
             buf, completions, ..
@@ -9934,7 +9975,7 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
         Modal::WikiMirrorSetup {
             selected,
             site_cursor,
-            custom,
+            site_filter,
             destination,
             cadence,
             field,
@@ -9944,38 +9985,68 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD);
             let mut body = vec![Line::from(Span::styled(
-                "1  Wikipedia sites",
+                format!("1  Wikipedia sites — {} selected", selected.len()),
                 if *field == WikiSetupField::Sites {
                     label.add_modifier(Modifier::UNDERLINED)
                 } else {
                     label
                 },
             ))];
-            for (row, chunk) in WIKI_SITES.chunks(3).enumerate() {
-                let mut spans = Vec::new();
-                for (column, (dbname, language)) in chunk.iter().enumerate() {
-                    let index = row * 3 + column;
-                    let checked = selected.contains(*dbname);
-                    let text = format!("{} {:<15}", if checked { "●" } else { "○" }, language);
-                    let style = if *field == WikiSetupField::Sites && index == *site_cursor {
-                        active
-                    } else if checked {
-                        Style::default().fg(Color::Yellow)
-                    } else {
-                        Style::default()
-                    };
-                    spans.push(Span::styled(text, style));
-                }
-                body.push(Line::from(spans));
-            }
             body.push(Line::from(format!(
-                "   Other database: {}{}",
-                custom,
+                "   Filter: {}{}",
+                site_filter,
                 if *field == WikiSetupField::Sites {
                     "_"
                 } else {
                     ""
                 }
+            )));
+            let sites = filtered_wiki_sites(site_filter);
+            let cursor = (*site_cursor).min(sites.len().saturating_sub(1));
+            let visible_rows = 9;
+            let first = cursor
+                .saturating_sub(visible_rows / 2)
+                .min(sites.len().saturating_sub(visible_rows));
+            if sites.is_empty() {
+                body.push(Line::from(Span::styled(
+                    "   No matching Wikipedia sites",
+                    Style::default().fg(Color::Yellow),
+                )));
+            } else {
+                for (index, site) in sites
+                    .iter()
+                    .enumerate()
+                    .skip(first)
+                    .take(visible_rows)
+                {
+                    let checked = selected.contains(site.dbname);
+                    let state = if checked { "✓ selected" } else { "○" };
+                    let closed = if site.closed { " · closed" } else { "" };
+                    let text = format!(
+                        "   {state:<10} {:<20} {}{closed}",
+                        site.dbname, site.language
+                    );
+                    let style = if *field == WikiSetupField::Sites && index == cursor {
+                        active
+                    } else if checked {
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD)
+                    } else if site.closed {
+                        Style::default().add_modifier(Modifier::DIM)
+                    } else {
+                        Style::default()
+                    };
+                    body.push(Line::from(Span::styled(text, style)));
+                }
+            }
+            body.push(Line::from(Span::styled(
+                format!(
+                    "   {} available · Wikimedia catalog {}",
+                    wiki_sites().len(),
+                    wiki_catalog_date()
+                ),
+                Style::default().add_modifier(Modifier::DIM),
             )));
             body.push(Line::from(""));
             body.push(Line::from(Span::styled(
@@ -10016,7 +10087,7 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
             )));
             body.push(Line::from(""));
             body.push(Line::from(Span::styled(
-                "3  Check for updates",
+                "3  Automatic incremental updates",
                 if *field == WikiSetupField::Cadence {
                     label.add_modifier(Modifier::UNDERLINED)
                 } else {
@@ -10031,7 +10102,11 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
                         [
                             Span::raw(if index == 0 { "   " } else { "  " }),
                             Span::styled(
-                                format!("[{name}]"),
+                                format!(
+                                    "{} {name}{}",
+                                    if index == *cadence { "●" } else { "○" },
+                                    if index == *cadence { " (selected)" } else { "" }
+                                ),
                                 if index == *cadence {
                                     if *field == WikiSetupField::Cadence {
                                         active
@@ -10046,9 +10121,13 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
                     })
                     .collect::<Vec<_>>(),
             ));
+            body.push(Line::from(Span::styled(
+                "   This controls when sarun checks; every missing daily dump is still ingested.",
+                Style::default().add_modifier(Modifier::DIM),
+            )));
             body.push(Line::from(""));
             body.push(Line::from(
-                "Tab fields · ↑/↓ sites · Space select · type other dbname · ←/→ cadence",
+                "Tab fields · type to filter · ↑/↓ sites · Space select · ←/→ cadence",
             ));
             body.push(Line::from("Enter create and start · Esc cancel"));
             (" add Wikipedia mirrors ", body)
@@ -10697,7 +10776,7 @@ fn view_of_pane(p: Pane) -> Option<(char, &'static str, FilterView)> {
 /// When a pane chip is visible in the menubar.
 enum PaneVis {
     Always,
-    Data(&'static str),
+    Data,
     Pty,
 }
 
@@ -10725,28 +10804,28 @@ const PANE_KEYS: &[(char, Pane, &str, PaneVis, &str)] = &[
         'p',
         Pane::Processes,
         "Procs",
-        PaneVis::Data("processes"),
+        PaneVis::Data,
         "processes — the captured process TREE (exe · argv · env)",
     ),
     (
         'o',
         Pane::Outputs,
         "Outputs",
-        PaneVis::Data("outputs"),
+        PaneVis::Data,
         "outputs — decoded stdout/stderr transcript",
     ),
     (
         'l',
         Pane::Pipelines,
         "Pipes",
-        PaneVis::Data("pipelines"),
+        PaneVis::Data,
         "pipeLines — shell pipelines a -b box ran (parsed structure)",
     ),
     (
         'g',
         Pane::BuildEdges,
         "Build",
-        PaneVis::Data("edges"),
+        PaneVis::Data,
         "build Graph — parsed ninja/make build edges from a -b box",
     ),
     (
@@ -10809,14 +10888,14 @@ const PANE_KEYS: &[(char, Pane, &str, PaneVis, &str)] = &[
         't',
         Pane::Trace,
         "Trace",
-        PaneVis::Data("sudtrace"),
+        PaneVis::Data,
         "sud Trace — a sud box's decoded wire-trace event stream",
     ),
     (
         'v',
         Pane::Vars,
         "Vars",
-        PaneVis::Data("makevar"),
+        PaneVis::Data,
         "variable provenance — make + shell assignments ('/' queries)",
     ),
     (
@@ -11456,222 +11535,263 @@ fn dispatch_pane_key(app: &mut App, code: crossterm::event::KeyCode) -> bool {
     false
 }
 
-/// Top menubar: pane chips with their letter accelerators (derived from
-/// `PANE_KEYS`). The active pane reverses; chips that would lead to an empty
-/// pane for this box are dimmed/hidden by their `PaneVis`. The same list drives
-/// the menubar render, F9 menu-nav dispatch, and the help index — one source of
-/// truth so they can't drift.
-fn menubar_chips(app: &App) -> Vec<(char, &'static str)> {
-    let has = |k: &str| {
-        app.box_summary
-            .get(k)
-            .and_then(Value::as_array)
-            .map(|a| !a.is_empty())
-            .unwrap_or(false)
-    };
-    // `New (N)` is ALWAYS first: it opens the launcher (a shell/container/
-    // browser box, or the host shell). Previously the only menubar route to
-    // the launcher was the `P` chip, which is hidden until a PTY already
-    // exists — a chicken-and-egg where you couldn't discover how to open your
-    // first window. This makes "new window" a visible menu entry, not an F7
-    // treasure hunt.
+/// Pane chips for the unified context bar, derived from `PANE_KEYS`. The same
+/// list drives key dispatch and the help index, so labels cannot drift.
+fn menubar_chips(_app: &App) -> Vec<(char, &'static str)> {
     let mut chips = vec![('N', "New")];
     chips.extend(
         PANE_KEYS
             .iter()
-            .filter(|(_, pane, _, vis, _)| match vis {
-                PaneVis::Always => true,
-                PaneVis::Data(k) => has(k) || app.focus == *pane,
-                PaneVis::Pty => !app.ptys.is_empty(),
-            })
+            .filter(|(_, _, _, vis, _)| matches!(vis, PaneVis::Always))
+            .map(|(key, _, label, _, _)| (*key, *label)),
+    );
+    chips.extend(
+        PANE_KEYS
+            .iter()
+            .filter(|(_, _, _, vis, _)| matches!(vis, PaneVis::Data | PaneVis::Pty))
             .map(|(key, _, label, _, _)| (*key, *label)),
     );
     chips
 }
 
-fn menubar_spans(app: &App) -> Vec<Span<'static>> {
+fn pane_needs_attention(app: &App, key: char) -> bool {
+    match key {
+        'c' => !app.changes.is_empty(),
+        'M' => app
+            .mirror_jobs
+            .iter()
+            .any(|job| matches!(job.state.as_str(), "error" | "stopped" | "pending")),
+        'P' => app.ptys.iter().any(|pty| pty.eof),
+        _ => false,
+    }
+}
+
+fn pane_chip_style(app: &App, key: char) -> Style {
     let active = view_of_pane(app.focus).map(|(k, _, _)| k);
-    let chips = menubar_chips(app);
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    for (i, (key, label)) in chips.iter().enumerate() {
-        let on = active == Some(*key);
-        // Menu-nav mode (F9): the cursor lands on a chip and arrows
-        // move it. Highlight differs from "active view" so the user
-        // can tell "the cursor is HERE waiting for Enter" apart from
-        // "this is the view I'm currently on".
-        let menu_cursor = app.menu_nav && app.menu_sel == i;
-        let style = if menu_cursor {
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Yellow)
-                .add_modifier(Modifier::BOLD)
-        } else if on {
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+    let on = active == Some(key);
+    let menu_cursor = app.menu_nav
+        && menubar_chips(app)
+            .get(app.menu_sel)
+            .is_some_and(|(menu_key, _)| *menu_key == key);
+    if menu_cursor {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    } else if on {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+    } else if pane_needs_attention(app, key) {
+        Style::default()
+            .fg(Color::Red)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().add_modifier(Modifier::DIM)
+    }
+}
+
+/// Readable destination chips, wrapped only between chips. Always-present
+/// application panes precede box-data/PTY panes, so navigation does not jitter
+/// as a box gains data.
+fn unified_pane_lines(app: &App, width: u16) -> Vec<Line<'static>> {
+    let mut ordered = menubar_chips(app);
+    ordered.push(('q', "Quit"));
+
+    let limit = width.max(1) as usize;
+    let mut lines = Vec::new();
+    let mut spans = Vec::new();
+    let mut used = 0usize;
+    for (key, label) in ordered {
+        let text = format!("{key}:{label}");
+        let separator = usize::from(used != 0) * 3;
+        if used != 0 && used + separator + text.chars().count() > limit {
+            lines.push(Line::from(std::mem::take(&mut spans)));
+            used = 0;
+        }
+        if used != 0 {
+            spans.push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
+            used += 3;
+        }
+        let style = if key == 'q' {
+            Style::default().add_modifier(Modifier::DIM)
         } else {
-            Style::default().add_modifier(Modifier::BOLD)
+            pane_chip_style(app, key)
         };
-        spans.push(Span::styled(format!("  {label}"), style));
-        spans.push(Span::styled(
-            format!(" ({key}) "),
-            Style::default().fg(if on || menu_cursor {
-                Color::Yellow
-            } else {
-                Color::DarkGray
-            }),
-        ));
+        used += text.chars().count();
+        spans.push(Span::styled(text, style));
     }
     if app.menu_nav {
-        spans.push(Span::styled(
-            "   ←/→ move · Enter pick · Esc cancel",
+        if !spans.is_empty() {
+            lines.push(Line::from(spans));
+        }
+        lines.push(Line::from(Span::styled(
+            "←/→ choose destination · Enter open · Esc cancel",
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::DIM),
-        ));
+        )));
+    } else if !spans.is_empty() {
+        lines.push(Line::from(spans));
     }
-    spans
+    lines
 }
 
-/// Norton-style cmdline (row above the F-keybar). Shows the active
-/// filter expression when one is set, else a dim "$" placeholder.
-/// Hook point for a future "type a command" input mode — today it's
-/// pure status surface.
-fn cmdline_spans(app: &App) -> Vec<Span<'static>> {
-    let prompt = Span::styled(
-        "$ ",
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    );
-    let active = view_of_pane(app.focus);
-    if let Some((_, _, v)) = active {
-        let f = app.view_filter(v);
-        if f.on && !f.clauses.is_empty() {
-            let expr = clauses_expr(&f.clauses);
-            return vec![
-                prompt,
-                Span::styled(
-                    "filter ",
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(expr, Style::default().fg(Color::Yellow)),
-                Span::styled(
-                    "  ('/' clears)",
-                    Style::default().add_modifier(Modifier::DIM),
-                ),
-            ];
+fn context_key_hints(app: &App) -> String {
+    if app.pending_prompt.is_some() {
+        return "y yes once · n no once · a allow+save · d deny+save".into();
+    }
+    match app.modal.as_ref() {
+        Some(Modal::WikiMirrorSetup { .. }) => {
+            return "↑↓ site · Space select · Tab field · ←→ cadence · Enter create · Esc cancel"
+                .into();
         }
+        Some(Modal::WikiMirrorLibrary { .. }) => {
+            return "type folder · Enter open · Esc cancel".into();
+        }
+        Some(Modal::Confirm { .. }) => return "y confirm · n/Esc cancel".into(),
+        Some(Modal::ActionMenu { .. }) => {
+            return "↑↓ action · Enter run · Esc close".into();
+        }
+        Some(_) => return "Enter accept · Esc cancel".into(),
+        None => {}
     }
-    vec![
-        prompt,
-        Span::styled(
-            "(idle — '/' filter · ':' command · 'm' row actions)",
-            Style::default().add_modifier(Modifier::DIM),
+    match app.focus {
+        Pane::Mirrors => "n add · O library · r run · c stop · R pending · Space pause · b browse · V read · D remove · X delete".into(),
+        Pane::Rules => "n new · d delete · Ctrl-↑/↓ reorder".into(),
+        Pane::Changes | Pane::Hunks => {
+            "a apply · x discard · A/X all · V read · E edit · Space mark".into()
+        }
+        Pane::Pipelines => "t tree/flat · f running only".into(),
+        Pane::Processes | Pane::BuildEdges => "f running only".into(),
+        Pane::Reader => "h history · o open · z zoom · / search · [/] back/forward".into(),
+        Pane::Editor => "Ctrl-S save · Ctrl-O open · Ctrl-E read-only · z zoom".into(),
+        Pane::Pty => format!(
+            "F4/F5 PTY · F6 {} · F7 new · F8 kill · F11 embed · F12 detach",
+            if app.mouse_release { "grab mouse" } else { "select text" }
         ),
-    ]
+        _ => "m actions · / filter · : command".into(),
+    }
 }
 
-/// Norton-Commander-style F-key bar: ten contextual fields, one per
-/// F1..F10, each "<n><LABEL>". Labels change based on the focused
-/// pane so the user always knows what each F-key does HERE. F1/F10
-/// (Help / Quit) stay stable across panes for muscle memory.
-fn fkeybar_spans(app: &App) -> Vec<Span<'static>> {
-    let cells = fkey_labels(app);
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    for (n, label) in cells.iter().enumerate() {
+/// Context-specific actions for the unified bar.
+fn unified_context_spans(app: &App) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    if let Some(prompt) = &app.pending_prompt {
+        let host = prompt.get("host").and_then(Value::as_str).unwrap_or("");
+        let port = prompt.get("port").and_then(Value::as_u64).unwrap_or(0);
+        let scheme = prompt.get("scheme").and_then(Value::as_str).unwrap_or("");
+        let box_name = prompt.get("box").and_then(Value::as_str).unwrap_or("");
         spans.push(Span::styled(
-            format!("{} ", n + 1),
+            format!("[{box_name}] {scheme}://{host}:{port}  "),
             Style::default()
-                .fg(Color::White)
+                .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         ));
-        // dim the label when unused (the label is "·")
-        let lstyle = if *label == "·" {
-            Style::default().add_modifier(Modifier::DIM)
-        } else {
-            Style::default().fg(Color::Black).bg(Color::Cyan)
-        };
-        // F11 (index 10) takes slot 11 — narrower because of the
-        // two-digit prefix, but still readable.
-        let width = if n == 10 { 7 } else { 8 };
-        spans.push(Span::styled(format!("{label:<width$}"), lstyle));
-        spans.push(Span::raw(" "));
+    }
+    spans.push(Span::styled(
+        context_key_hints(app),
+        Style::default().fg(Color::Cyan),
+    ));
+    if app.modal.is_none() && app.pending_prompt.is_none() {
+        spans.push(Span::styled(
+            "  │ F2/3 screen · F4/5 window",
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    let active = view_of_pane(app.focus);
+    if let Some((_, _, view)) = active {
+        let filter = app.view_filter(view);
+        if filter.on && !filter.clauses.is_empty() {
+            spans.push(Span::styled(
+                format!("  │ filter {}", clauses_expr(&filter.clauses)),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
     }
     spans
 }
 
-/// Compute the labels for the F-keybar. We use 11 slots so F11
-/// (split/un-split with the PTY in the right column) can surface
-/// alongside F1..F10. "·" means unbound; rendered dim.
-fn fkey_labels(app: &App) -> [&'static str; 11] {
-    let pty_pane = app.focus == Pane::Pty;
-    let hunks = app.focus == Pane::Hunks;
-    let rules = app.focus == Pane::Rules;
-    let sessions = app.focus == Pane::Sessions;
-    let changes = app.focus == Pane::Changes;
-    let any_pty = !app.ptys.is_empty();
-    [
-        "Help", // F1   — always
-        // F2/F3 cycle SCREENS (main two-pane view / terminal / browser),
-        // F4/F5 cycle the WINDOWS within the current screen: the data
-        // panes on Main, the PTYs of the screen's kind on Terminal /
-        // Browser.
-        "Scrn+",                                   // F2
-        "Scrn-",                                   // F3
-        if pty_pane { "PtyNext" } else { "Win+" }, // F4
-        if pty_pane { "PtyPrev" } else { "Win-" }, // F5
-        // F6: in the PTY pane, toggle the mouse between the app (carbonyl/vim)
-        // and the terminal's native drag-select/copy — label flips with state.
-        if pty_pane {
-            if app.mouse_release { "Grab" } else { "Select" }
-        } else if sessions {
-            "Rename"
-        } else {
-            "·"
-        }, // F6
-        if pty_pane {
-            "PtyNew"
-        } else if sessions {
-            "Image+"
-        } else if rules {
-            "NewRule"
-        } else {
-            "Pty+"
-        }, // F7 — the launcher everywhere else
-        if pty_pane {
-            "PtyKill"
-        } else if hunks || changes {
-            "Discard"
-        } else if rules {
-            "DelRule"
-        } else if sessions {
-            "Delete"
+fn status_style(status: &str) -> Style {
+    let lower = status.to_ascii_lowercase();
+    if ["error", "failed", "killed", "stopped", "unavailable"]
+        .iter()
+        .any(|word| lower.contains(word))
+    {
+        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+    } else if ["running", "searching", "loading", "importing", "downloading"]
+        .iter()
+        .any(|word| lower.contains(word))
+    {
+        Style::default().fg(Color::Green)
+    } else if lower.contains("pending") || lower.contains("paused") {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default().fg(Color::Gray)
+    }
+}
+
+fn wrap_spans(spans: Vec<Span<'static>>, width: u16) -> Vec<Line<'static>> {
+    let limit = width.max(1) as usize;
+    let mut lines = Vec::new();
+    let mut line = Vec::new();
+    let mut used = 0usize;
+    for span in spans {
+        let style = span.style;
+        for token in span.content.split_inclusive(' ') {
+            let mut text = token.to_string();
+            if used == 0 {
+                text = text.trim_start().to_string();
+            }
+            let token_width = text.chars().count();
+            if used != 0 && used + token_width > limit {
+                lines.push(Line::from(std::mem::take(&mut line)));
+                used = 0;
+                text = text.trim_start().to_string();
+            }
+            used += text.chars().count();
+            if !text.is_empty() {
+                line.push(Span::styled(text, style));
+            }
         }
-        // box: dissolve (keep children)
-        else {
-            "·"
-        }, // F8
-        // F9: menubar nav on data panes; the row-actions popup on the
-        // full-screen PTY (where 'm' would go to the shell).
-        if pty_pane { "Actions" } else { "Menu" },
-        "Quit", // F10  — always
-        // F11: split/un-split. The label flips with `pty_in_right`
-        // so the user can read what F11 will DO next. With no PTY there
-        // is nothing to split — dim it (F7 is THE create-a-PTY key;
-        // don't show the same button twice).
-        if pty_pane {
-            "Embed"
-        } else if !any_pty {
-            "·"
-        } else if app.pty_in_right {
-            "Solo"
-        } else {
-            "Split"
-        },
-    ]
+    }
+    if !line.is_empty() {
+        lines.push(Line::from(line));
+    }
+    lines
+}
+
+fn unified_bar_lines(app: &App, width: u16) -> Vec<Line<'static>> {
+    let mut lines = unified_pane_lines(app, width);
+    let (status, style) = if let Some(buf) = &app.renaming {
+        (
+            format!("rename → {buf}_ · Enter commit · Esc cancel"),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        (app.status.clone(), status_style(&app.status))
+    };
+    let status_width = status.chars().count();
+    let status_fits = lines
+        .last()
+        .is_some_and(|line| line.width() + 3 + status_width <= width as usize);
+    if status_fits {
+        let last = lines.last_mut().unwrap();
+        last.spans.push(Span::styled(
+            "  │ ",
+            Style::default().fg(Color::DarkGray),
+        ));
+        last.spans.push(Span::styled(status.clone(), style));
+    }
+    lines.extend(wrap_spans(unified_context_spans(app), width));
+    if !status_fits {
+        lines.extend(wrap_spans(vec![Span::styled(status, style)], width));
+    }
+    lines
 }
 
 /// Render a clause list as a one-line expression (kind:pattern, joined by
@@ -14311,33 +14431,21 @@ fn draw_inspector(f: &mut ratatui::Frame, app: &App, body: ratatui::layout::Rect
 }
 
 fn draw(f: &mut ratatui::Frame, app: &App) {
-    // Norton-Commander-style chrome (top to bottom):
-    //   menubar    : pane names with their letter accelerators (b/c/p/...)
-    //   body       : current 2-pane view, unchanged
-    //   cmdline    : the active filter expression or "$" prompt for input
-    //   fkeybar    : ten F-key fields ("1Help 2Pty+ 3Tab ..."), context-sensitive
-    //   status     : transient status / error line
-    // The two top/bottom strips give the user a stable, ALWAYS-visible
-    // map of what each key does in the current context — no more "open
-    // help to remember which letter switches view".
+    // One context bar replaces the independently maintained menubar, command
+    // strip, F-key strip, and status strip. Its rows are generated
+    // together and ordered by scope: global destinations + state, then the
+    // current context's actions.
+    let context_lines = unified_bar_lines(app, f.area().width);
+    let context_height = context_lines.len().min(u16::MAX as usize) as u16;
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // menubar
-            Constraint::Min(3),    // body
-            Constraint::Length(1), // cmdline
-            Constraint::Length(1), // fkeybar
-            Constraint::Length(1), // status
+            Constraint::Min(3), // body
+            Constraint::Length(context_height), // unified context bar
         ])
         .split(f.area());
-    let menubar_area = root[0];
-    let body = root[1];
-    let cmdline_area = root[2];
-    let fkeybar_area = root[3];
-    let status_area = root[4];
-
-    // Top menubar.
-    f.render_widget(Paragraph::new(Line::from(menubar_spans(app))), menubar_area);
+    let body = root[0];
+    let context_area = root[1];
 
     // The PTY pane takes the whole body. NO border block — the surrounding
     // frame would interfere with the host terminal's native click-drag
@@ -14872,56 +14980,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         }
     }
 
-    // Cmdline (above the F-keybar). Today: the active filter
-    // expression for the focused view, prefixed with a "$" prompt
-    // glyph; if no filter is set, just the dim "$" placeholder. A
-    // future "type a command here" mode will hook into this row.
-    f.render_widget(Paragraph::new(Line::from(cmdline_spans(app))), cmdline_area);
-
-    // F-keybar: ten contextual fields. F1 / F10 are stable across
-    // panes (help / quit); the middle ones change to reflect what
-    // each key does HERE. Look down to know — no help-pane round-trip.
-    f.render_widget(Paragraph::new(Line::from(fkeybar_spans(app))), fkeybar_area);
-
-    // Banner-prompt overrides the regular status bar while a -n box
-    // connection is waiting on a verdict. yellow + bold so it's
-    // unmistakable; format mirrors sakar's prompt text.
-    let status_widget = if let Some(p) = &app.pending_prompt {
-        let host = p.get("host").and_then(Value::as_str).unwrap_or("");
-        let port = p.get("port").and_then(Value::as_u64).unwrap_or(0);
-        let scheme = p.get("scheme").and_then(Value::as_str).unwrap_or("");
-        let box_name = p.get("box").and_then(Value::as_str).unwrap_or("");
-        let body = format!(
-            "[{box_name}] connection: {scheme}://{host}:{port}  \
-             [y]es once  [n]o once  [a]llow+save  [d]eny+save"
-        );
-        Paragraph::new(Line::from(Span::styled(
-            body,
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )))
-    } else {
-        let status_text = if let Some(buf) = &app.renaming {
-            format!("rename -> {buf}_  (Enter to commit, Esc to cancel)")
-        } else {
-            app.status.clone()
-        };
-        Paragraph::new(Line::from(Span::styled(
-            status_text,
-            Style::default().fg(Color::Black).bg(Color::Gray),
-        )))
-    };
-    f.render_widget(
-        status_widget,
-        Rect {
-            x: status_area.x,
-            y: status_area.y,
-            width: status_area.width,
-            height: 1,
-        },
-    );
+    f.render_widget(Paragraph::new(Text::from(context_lines)), context_area);
 
     if let Some(m) = &app.modal {
         draw_modal(f, body, m, app);
@@ -17277,22 +17336,22 @@ fn read_one_line(s: &mut UnixStream) -> Result<String, String> {
 /// Translate a crossterm key event into the bytes a terminal would send to the
 /// child PTY (the input encoding the pane forwards as FRAME_PTY_DATA).
 /// Screen rect of the visible PTY grid. Mirrors draw()'s layout with the
-/// same Layout solves (menubar/cmdline/fkeybar/status strips, the 45/55
-/// horizontal split, the 1-row PTY title strip) — the same contract
+/// same Layout solves (unified context bar, the 45/55 horizontal split,
+/// the 1-row PTY title strip) — the same contract
 /// fit_active_pty() keeps for sizes, extended to origins for mouse
 /// translation. None when no PTY is on screen.
 fn pty_grid_rect(app: &App, term_cols: u16, term_rows: u16) -> Option<Rect> {
     if app.ptys.is_empty() {
         return None;
     }
+    let bar_rows = unified_bar_lines(app, term_cols)
+        .len()
+        .min(u16::MAX as usize) as u16;
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),
             Constraint::Min(3),
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
+            Constraint::Length(bar_rows),
         ])
         .split(Rect {
             x: 0,
@@ -17300,7 +17359,7 @@ fn pty_grid_rect(app: &App, term_cols: u16, term_rows: u16) -> Option<Rect> {
             width: term_cols,
             height: term_rows,
         });
-    let body = root[1];
+    let body = root[0];
     let area = if app.focus == Pane::Pty {
         body
     } else if app.pty_in_right {
@@ -17332,14 +17391,14 @@ fn reader_rects(
     {
         return None;
     }
+    let bar_rows = unified_bar_lines(app, term_cols)
+        .len()
+        .min(u16::MAX as usize) as u16;
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),
             Constraint::Min(3),
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
+            Constraint::Length(bar_rows),
         ])
         .split(Rect {
             x: 0,
@@ -17348,12 +17407,12 @@ fn reader_rects(
             height: term_rows,
         });
     if app.reader_full {
-        Some((None, root[1]))
+        Some((None, root[0]))
     } else {
         let columns = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
-            .split(root[1]);
+            .split(root[0]);
         Some((Some(columns[0]), columns[1]))
     }
 }
@@ -18265,13 +18324,13 @@ fn handle_modal_key(
         Modal::WikiMirrorSetup {
             mut selected,
             mut site_cursor,
-            mut custom,
+            mut site_filter,
             mut destination,
             mut cadence,
             mut field,
         } => {
             if code == KeyCode::Enter {
-                app.commit_wiki_mirror_setup(selected, custom, destination, cadence);
+                app.commit_wiki_mirror_setup(selected, site_filter, destination, cadence);
                 return;
             }
             if code == KeyCode::Esc {
@@ -18297,22 +18356,40 @@ fn handle_modal_key(
                     site_cursor = site_cursor.saturating_sub(1)
                 }
                 KeyCode::Down if field == WikiSetupField::Sites => {
-                    site_cursor = (site_cursor + 1).min(WIKI_SITES.len() - 1)
+                    site_cursor = (site_cursor + 1)
+                        .min(filtered_wiki_sites(&site_filter).len().saturating_sub(1))
+                }
+                KeyCode::PageUp if field == WikiSetupField::Sites => {
+                    site_cursor = site_cursor.saturating_sub(9)
+                }
+                KeyCode::PageDown if field == WikiSetupField::Sites => {
+                    site_cursor = (site_cursor + 9)
+                        .min(filtered_wiki_sites(&site_filter).len().saturating_sub(1))
+                }
+                KeyCode::Home if field == WikiSetupField::Sites => {
+                    site_cursor = 0;
+                }
+                KeyCode::End if field == WikiSetupField::Sites => {
+                    site_cursor = filtered_wiki_sites(&site_filter).len().saturating_sub(1);
                 }
                 KeyCode::Char(' ') if field == WikiSetupField::Sites => {
-                    let dbname = WIKI_SITES[site_cursor].0.to_string();
-                    if !selected.remove(&dbname) {
-                        selected.insert(dbname);
+                    if let Some(site) = filtered_wiki_sites(&site_filter).get(site_cursor) {
+                        let dbname = site.dbname.to_string();
+                        if !selected.remove(&dbname) {
+                            selected.insert(dbname);
+                        }
                     }
                 }
                 KeyCode::Backspace if field == WikiSetupField::Sites => {
-                    custom.pop();
+                    site_filter.pop();
+                    site_cursor = 0;
                 }
                 KeyCode::Char(character)
                     if field == WikiSetupField::Sites
-                        && (character.is_ascii_alphanumeric() || character == '_') =>
+                        && !character.is_control() =>
                 {
-                    custom.push(character.to_ascii_lowercase());
+                    site_filter.push(character.to_ascii_lowercase());
+                    site_cursor = 0;
                 }
                 KeyCode::Backspace if field == WikiSetupField::Destination => {
                     destination.pop();
@@ -18331,7 +18408,7 @@ fn handle_modal_key(
             app.modal = Some(Modal::WikiMirrorSetup {
                 selected,
                 site_cursor,
-                custom,
+                site_filter,
                 destination,
                 cadence,
                 field,
@@ -19341,9 +19418,9 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                 }
                 use crossterm::event::KeyModifiers as KM;
                 let ctrl = k.modifiers.contains(KM::CONTROL);
-                // F-key bar bindings, global outside the PTY pane.
+                // Function-key bindings, global outside the PTY pane.
                 // (PTY pane handles its own F2..F5/F7/F8/F9/F12 before
-                // we get here.) Mapping mirrors fkey_labels() above:
+                // we get here.) Mapping mirrors the unified context bar:
                 //   F1  Help · F2/F3 cycle SCREENS (main two-pane view /
                 //   terminal / browser) · F4/F5 cycle the WINDOWS within
                 //   the current screen (the data panes here on Main)
@@ -22309,26 +22386,93 @@ mod tests {
     }
 
     /// F6 in the PTY pane toggles the mouse between the app and the terminal's
-    /// native selection; its F-keybar label flips with the state so the user
-    /// can read what pressing it will do.
+    /// native selection; the context hint flips with the state.
     #[test]
-    fn f6_mouse_toggle_label_flips() {
+    fn f6_mouse_toggle_hint_flips() {
         let mut app = headless_app();
         app.focus = Pane::Pty;
-        assert_eq!(
-            fkey_labels(&app)[5],
-            "Select",
+        assert!(
+            context_key_hints(&app).contains("F6 select text"),
             "grabbed → F6 offers to release for selection"
         );
         app.mouse_release = true;
-        assert_eq!(
-            fkey_labels(&app)[5],
-            "Grab",
+        assert!(
+            context_key_hints(&app).contains("F6 grab mouse"),
             "released → F6 offers to hand the mouse back to the app"
         );
-        // Outside the PTY pane F6 keeps its list-pane meaning (Rename on Boxes).
+    }
+
+    #[test]
+    fn unified_bar_puts_mirror_context_keys_on_their_own_line() {
+        let mut app = headless_app();
+        app.focus = Pane::Mirrors;
+        let lines = unified_bar_lines(&app, 100);
+        let text = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        for (key, _, label, _, _) in PANE_KEYS {
+            assert!(
+                text.contains(&format!("{key}:{label}")),
+                "readable destination {key}:{label} missing:\n{text}"
+            );
+        }
+        assert!(
+            text.contains("ready"),
+            "current state must remain visible at 100 columns:\n{text}"
+        );
+        assert!(
+            text.contains("n add · O library · r run · c stop"),
+            "the most relevant mirror keys must remain visible at narrow widths:\n{text}"
+        );
+    }
+
+    #[test]
+    fn unified_bar_colors_active_and_attention_panes() {
+        let mut app = headless_app();
         app.focus = Pane::Sessions;
-        assert_eq!(fkey_labels(&app)[5], "Rename");
+        app.mirror_jobs = vec![serde_json::from_value(json!({
+            "id": 1,
+            "kind": "wiki",
+            "src": "lvwiki",
+            "dest": "/tmp/lvwiki.swdump",
+            "interval_secs": 86400,
+            "paused": false,
+            "last_start": null,
+            "last_end": null,
+            "last_exit": null,
+            "last_detail": "",
+            "state": "pending",
+            "next_due": 0
+        }))
+        .unwrap()];
+        let lines = unified_pane_lines(&app, 100);
+        let spans: Vec<_> = lines.iter().flat_map(|line| line.spans.iter()).collect();
+        let boxes = spans
+            .iter()
+            .find(|span| span.content == "b:Boxes")
+            .expect("Boxes chip");
+        let mirrors = spans
+            .iter()
+            .find(|span| span.content == "M:Mirrors")
+            .expect("Mirrors chip");
+        assert_eq!(boxes.style.fg, Some(Color::Yellow));
+        assert!(boxes.style.add_modifier.contains(Modifier::REVERSED));
+        assert_eq!(mirrors.style.fg, Some(Color::Red));
+    }
+
+    #[test]
+    fn unified_bar_colors_current_state_by_severity() {
+        assert_eq!(status_style("ready").fg, Some(Color::Gray));
+        assert_eq!(status_style("importing 3/10").fg, Some(Color::Green));
+        assert_eq!(status_style("mirror update failed").fg, Some(Color::Red));
+        assert_eq!(status_style("update paused").fg, Some(Color::Yellow));
     }
 
     /// The Network/Web pane (DESIGN-web.md W4) renders the box's webcap rows:
@@ -23202,12 +23346,12 @@ mod tests {
         for lab in ["Boxes", "Changes", "Rules", "Help"] {
             assert!(buf.contains(lab), "menubar chip {lab:?} missing:\n{buf}");
         }
-        // chip letters appear inside parentheses, e.g. " (b) ".
+        // Compact accelerator-first chips keep the global row stable.
         for k in ['b', 'c', 'e', '?'] {
-            let lit = format!("({k})");
+            let lit = format!("{k}:");
             assert!(
                 buf.contains(&lit),
-                "menubar accelerator {lit:?} missing:\n{buf}"
+                "context-bar accelerator {lit:?} missing:\n{buf}"
             );
         }
         // Move focus to Procs (forcing it shown since the box has no
@@ -23222,11 +23366,9 @@ mod tests {
         );
     }
 
-    /// Active filter on the focused view surfaces in the COMMAND LINE
-    /// row (above the F-keybar) with the clause expression rendered.
-    /// Renamed from the old "keybar chip" test — same intent, new spot.
+    /// Active filter on the focused view surfaces in the context bar.
     #[test]
-    fn cmdline_shows_active_filter_expression() {
+    fn context_bar_shows_active_filter_expression() {
         let Some(eng) = boot() else {
             eprintln!("SKIP: engine binary missing or FUSE unavailable");
             return;
@@ -23249,11 +23391,11 @@ mod tests {
         let buf = render_to_string(&app, 160, 30).unwrap();
         assert!(
             buf.contains("filter"),
-            "cmdline must surface 'filter' tag when one is active:\n{buf}"
+            "context bar must surface 'filter' tag when one is active:\n{buf}"
         );
         assert!(
             buf.contains("path:**/PUMPKIN*"),
-            "filter expression missing from cmdline:\n{buf}"
+            "filter expression missing from context bar:\n{buf}"
         );
     }
 
@@ -23783,6 +23925,11 @@ mod tests {
         assert!(rendered.contains("add Wikipedia mirrors"), "{rendered}");
         assert!(rendered.contains("Storage folder"), "{rendered}");
         assert!(
+            rendered.contains("available · Wikimedia catalog"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("● every day (selected)"), "{rendered}");
+        assert!(
             !rendered.contains("/Volumes/Elements"),
             "the UI must not contain a machine-specific path:\n{rendered}"
         );
@@ -23792,11 +23939,14 @@ mod tests {
                 .into_iter()
                 .collect(),
             site_cursor: 0,
-            custom: String::new(),
+            site_filter: "lvwiki".into(),
             destination: "/mirror-library".into(),
             cadence: 1,
             field: WikiSetupField::Cadence,
         });
+        let rendered = render_to_string(&app, 120, 34).unwrap();
+        assert!(rendered.contains("✓ selected"), "{rendered}");
+        assert!(rendered.contains("● every week (selected)"), "{rendered}");
         handle_modal_key(&mut app, KeyCode::Enter, KeyModifiers::empty());
         assert!(app.modal.is_none());
         let jobs = crate::mirrors::jobs_list().unwrap();
@@ -23818,6 +23968,7 @@ mod tests {
             app.modal,
             Some(Modal::WikiMirrorSetup {
                 ref destination,
+                cadence: 1,
                 ..
             }) if destination == "/mirror-library"
         ));
@@ -23825,6 +23976,11 @@ mod tests {
 
     #[test]
     fn wikipedia_setup_validates_database_names_and_expands_home() {
+        assert!(wiki_sites().len() >= 300);
+        assert!(wiki_sites().iter().any(|site| site.dbname == "lvwiki"));
+        assert!(wiki_sites().iter().any(|site| site.dbname == "enwiki"));
+        assert!(!wiki_sites().iter().any(|site| site.dbname == "commonswiki"));
+        assert!(!wiki_sites().iter().any(|site| site.dbname == "wikidatawiki"));
         assert!(valid_wiki_dbname("enwiki"));
         assert!(valid_wiki_dbname("simplewiki"));
         assert!(!valid_wiki_dbname("https://en.wikipedia.org"));
