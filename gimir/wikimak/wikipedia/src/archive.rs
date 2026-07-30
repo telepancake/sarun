@@ -3973,7 +3973,7 @@ fn export_page<W: Write>(
         inner: std::sync::Arc::clone(&instance.inner),
         walk: crate::instance::WalkState::new_snapshot(page_id),
     };
-    let mut revisions = PageRevisionSpool::collect(revisions)?.peekable();
+    let mut revisions = PageRevisionSpool::collect_in(revisions, instance.root())?.peekable();
     let mut actions = instance
         .archive_page_actions(page_id)?
         .into_iter()
@@ -4065,8 +4065,9 @@ struct PageRevisionSpool {
 }
 
 impl PageRevisionSpool {
-    fn collect<E>(
+    fn collect_in<E>(
         revisions: impl IntoIterator<Item = std::result::Result<RevisionRecord, E>>,
+        spill_dir: &Path,
     ) -> Result<Self>
     where
         ArchiveError: From<E>,
@@ -4084,7 +4085,15 @@ impl PageRevisionSpool {
                 len: 0,
             });
             if memory_bytes > PAGE_TEXT_MEMORY_LIMIT && file.is_none() {
-                let mut spool = tempfile::tempfile()?;
+                let mut spool = tempfile::tempfile_in(spill_dir).map_err(|error| {
+                    ArchiveError::Io(std::io::Error::new(
+                        error.kind(),
+                        format!(
+                            "cannot create revision-text spill in {}: {error}",
+                            spill_dir.display()
+                        ),
+                    ))
+                })?;
                 spill_texts(&mut spool, &mut entries)?;
                 file = Some(spool);
             } else if let Some(spool) = file.as_mut() {
@@ -4115,6 +4124,7 @@ pub(crate) fn write_content_page<W: Write>(
     observed_at_micros: i64,
     title: String,
     revisions: impl IntoIterator<Item = Result<RevisionRecord>>,
+    spill_dir: &Path,
 ) -> Result<u64> {
     writer.write(&Record::PageState {
         page_id,
@@ -4124,7 +4134,7 @@ pub(crate) fn write_content_page<W: Write>(
         deleted: false,
     })?;
     let mut count = 0_u64;
-    for revision in PageRevisionSpool::collect(revisions)? {
+    for revision in PageRevisionSpool::collect_in(revisions, spill_dir)? {
         writer.write(&Record::Revision {
             page_id,
             revision: revision?,

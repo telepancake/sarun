@@ -363,6 +363,30 @@ impl TitleIndex {
         self.len() as u64
     }
 
+    /// Count the page titles currently owned by a page (the last mapping for
+    /// each encoded title), optionally restricted to one namespace.  This is
+    /// a cheap mmap walk over the sorted title array; it does not decompress
+    /// archive frames and it does not count historical ownership intervals.
+    pub fn current_page_count(&self, namespace: Option<i32>) -> u64 {
+        let mut count = 0_u64;
+        let mut position = 0;
+        while position < self.len() {
+            let key = self.key_time(position).0;
+            let mut end = position + 1;
+            while end < self.len() && self.key_time(end).0 == key {
+                end += 1;
+            }
+            let current_page = self.page_id(end - 1);
+            if current_page != 0
+                && namespace.is_none_or(|wanted| coded_namespace(key) == Some(wanted))
+            {
+                count += 1;
+            }
+            position = end;
+        }
+        count
+    }
+
     pub(crate) fn frame_count(&self) -> usize {
         self.frame_count
     }
@@ -704,6 +728,47 @@ fn put_bits(output: &mut u64, used: &mut usize, value: u64, width: usize) {
     *used += width;
 }
 
+/// Recover the namespace prefix from a short title key.  Long keys are
+/// intentionally hashed (the high bit is set), so their namespace cannot be
+/// recovered and the caller must treat them as an unclassified title.
+fn coded_namespace(key: u64) -> Option<i32> {
+    if key >> 63 != 0 {
+        return None;
+    }
+    let mut used = 0_usize;
+    let mut value = 0_u64;
+    let mut shift = 0_u32;
+    for _ in 0..10 {
+        let first = read_bits(key, &mut used, 1)?;
+        let byte = if first == 0 {
+            u8::try_from(read_bits(key, &mut used, 6)?).ok()?
+        } else {
+            let second = read_bits(key, &mut used, 1)?;
+            if second != 0 {
+                return None;
+            }
+            u8::try_from(read_bits(key, &mut used, 8)?).ok()?
+        };
+        value |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            let signed = (value >> 1) as i64 ^ -((value & 1) as i64);
+            return i32::try_from(signed).ok();
+        }
+        shift += 7;
+    }
+    None
+}
+
+fn read_bits(key: u64, used: &mut usize, width: usize) -> Option<u64> {
+    if width == 0 || *used + width > 63 {
+        return None;
+    }
+    let shift = 63 - *used - width;
+    let mask = if width == 64 { u64::MAX } else { (1_u64 << width) - 1 };
+    *used += width;
+    Some((key >> shift) & mask)
+}
+
 fn common_symbol(byte: u8) -> Option<u8> {
     match byte {
         b' ' => Some(0),
@@ -822,10 +887,19 @@ mod tests {
         let site = site();
         assert_eq!(coded_title("Template:X", &site), coded_title("T:X", &site));
         assert_eq!(coded_title("Test", &site) >> 63, 0);
+        assert_eq!(coded_namespace(coded_title("Test", &site)), Some(0));
+        assert_eq!(coded_namespace(coded_title("Template:X", &site)), Some(10));
         assert_eq!(
             coded_title("This title is deliberately much longer than sixty three coded bits", &site)
                 >> 63,
             1
+        );
+        assert_eq!(
+            coded_namespace(coded_title(
+                "This title is deliberately much longer than sixty three coded bits",
+                &site,
+            )),
+            None
         );
     }
 }

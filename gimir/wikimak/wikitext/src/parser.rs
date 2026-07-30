@@ -450,14 +450,13 @@ impl<'a> Ctx<'a> {
             return next;
         }
 
-        // Render the body through the inline path (escapes any HTML/markup
-        // — this is the XSS boundary) before it becomes note content.
+        // Render the body through the extension-tag and inline paths before
+        // it becomes note content.  A reference may contain another `<ref>`
+        // (for example a citation template that expands one); process that
+        // nested citation exactly as we do at document level, while the
+        // inline renderer remains the XSS boundary for ordinary markup.
         let content = if has_body {
-            // Extension tags can be introduced inside a reference by an
-            // expanded citation template. Run the same shielding pass here
-            // so `<nowiki>[</nowiki>` becomes a literal bracket rather than
-            // visible escaped tag source.
-            let protected = self.strip_nowiki_in_ref(raw);
+            let protected = self.strip_extension_tags(raw);
             Some(self.inline(&protected))
         } else {
             None
@@ -477,29 +476,6 @@ impl<'a> Ctx<'a> {
         }
         out.push_str(&Strip::marker(strip_idx));
         next
-    }
-
-    fn strip_nowiki_in_ref(&mut self, text: &str) -> String {
-        let mut out = String::with_capacity(text.len());
-        let mut i = 0;
-        while i < text.len() {
-            if text.as_bytes()[i] == b'<' {
-                if let Some((_, self_closing, past)) = match_ext_tag(text, i, "nowiki") {
-                    if self_closing {
-                        i = past;
-                    } else {
-                        let (inner, next) = read_to_close(text, past, "nowiki");
-                        out.push_str(&self.strip.stash_inline(html::escape_body(inner)));
-                        i = next;
-                    }
-                    continue;
-                }
-            }
-            let len = html::utf8_len(text.as_bytes()[i]);
-            out.push_str(&text[i..i + len]);
-            i += len;
-        }
-        out
     }
 
     /// Handle one `<references …/>` or `<references …>…</references>`.

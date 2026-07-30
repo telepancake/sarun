@@ -214,13 +214,14 @@ fn malformed_unclosed_ref_does_not_panic() {
 }
 
 #[test]
-fn nested_ref_inside_ref_does_not_recurse_or_panic() {
-    // Inner <ref> is escaped by the sanitizer, never re-parsed as a ref.
+fn nested_ref_inside_ref_is_rendered_and_does_not_recurse_forever() {
     let out = render_inner("Q<ref>outer<ref>inner</ref>tail</ref> rest\n<references/>");
     assert!(
-        out.contains("&lt;ref&gt;inner&lt;/ref&gt;tail"),
-        "complete inner ref preserved in the outer note: {out}"
+        !out.contains("&lt;ref&gt;inner&lt;/ref&gt;"),
+        "nested ref must not be emitted as escaped source: {out}"
     );
+    assert!(out.contains("outer"), "outer note body is present: {out}");
+    assert!(out.contains("inner"), "inner note body is present: {out}");
     assert!(out.contains("<ol class=\"references\">"), "{out}");
     assert!(
         out.contains("</sup> rest</p>"),

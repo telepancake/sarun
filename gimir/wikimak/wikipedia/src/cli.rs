@@ -309,9 +309,15 @@ fn run_build_make(scratch: &Path) -> Result<(), String> {
     let log_directory = std::fs::canonicalize(scratch)
         .map_err(|error| format!("{}: {error}", scratch.display()))?
         .join("target-logs");
+    // The build is deliberately destination-local.  Besides the files we
+    // create explicitly below, make and any recipe subprocesses may use the
+    // platform's default temporary directory.  Point that directory at the
+    // same external scratch tree so a tool added later cannot put an
+    // unbounded intermediate on the system volume.
     let status = std::process::Command::new(make_program()?)
         .current_dir(scratch)
         .env("SARUN_KATI_TARGET_LOG_DIR", log_directory)
+        .env("TMPDIR", scratch)
         .args(["-f", "stage1.mk", "-j3"])
         .status()
         .map_err(|error| format!("cannot start resumable build: {error}"))?;

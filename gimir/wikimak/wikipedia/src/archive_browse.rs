@@ -1007,11 +1007,16 @@ impl ArchiveBrowseIndex {
     }
 
     pub fn view(&self, timestamp_micros: Option<i64>) -> ArchiveAsOfView<'_> {
+        // Older siteinfo captures treated the mere presence of the API's
+        // `rtl` field as true.  Direction is determined from the content
+        // language here as well, so those archives remain readable instead
+        // of laying out Latvian and other LTR wikis backwards.
+        let rtl = crate::asof::RTL_LANGS.contains(&self.site_info.language.as_str());
         let mut site = wikimak_wikitext::SiteConfig {
             site_name: self.site_info.site_name.clone(),
             db_name: self.site_info.db_name.clone(),
             lang: self.site_info.language.clone(),
-            rtl: self.site_info.rtl,
+            rtl,
             server: self.site_info.server.clone(),
             script_path: self.site_info.script_path.clone(),
             ..wikimak_wikitext::SiteConfig::default()
@@ -1044,12 +1049,36 @@ impl ArchiveBrowseIndex {
             );
         }
         for word in &self.site_info.magic_words {
-            for alias in &word.aliases {
+            let canonical = word.canonical_name.trim_start_matches('#').trim_end_matches(':');
+            if !canonical.is_empty() {
                 site.magic_aliases
-                    .insert(alias.clone(), word.canonical_name.clone());
+                    .entry(canonical.to_string())
+                    .or_insert_with(|| canonical.to_string());
                 if !word.case_sensitive {
                     site.magic_aliases
-                        .insert(alias.to_lowercase(), word.canonical_name.clone());
+                        .entry(canonical.to_lowercase())
+                        .or_insert_with(|| canonical.to_string());
+                }
+            }
+            for alias in &word.aliases {
+                let token = alias
+                    .trim_start_matches('#')
+                    .trim_end_matches(':')
+                    .trim();
+                if token.is_empty() || canonical.is_empty() {
+                    continue;
+                }
+                // Several MediaWiki extensions intentionally reuse a short
+                // alias (notably `time`).  Keep the first canonical mapping,
+                // which is the core built-in, rather than letting an
+                // extension's later row silently break `#time`.
+                site.magic_aliases
+                    .entry(token.to_string())
+                    .or_insert_with(|| canonical.to_string());
+                if !word.case_sensitive {
+                    site.magic_aliases
+                        .entry(token.to_lowercase())
+                        .or_insert_with(|| canonical.to_string());
                 }
             }
         }
@@ -1149,8 +1178,7 @@ impl wikimak_wikitext::PageStore for ArchiveAsOfView<'_> {
     }
 
     fn page_count(&self, namespace: Option<i32>) -> Option<u64> {
-        let _ = namespace;
-        None
+        Some(self.archive.titles.current_page_count(namespace))
     }
 
     fn category_members(

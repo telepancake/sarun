@@ -277,14 +277,26 @@ struct StreamingEncoder {
 }
 
 impl StreamingEncoder {
+    #[cfg(test)]
     fn new() -> std::io::Result<Self> {
+        Self::new_with_files(tempfile::tempfile()?, tempfile::tempfile()?)
+    }
+
+    fn new_in(root: &Path) -> std::io::Result<Self> {
+        Self::new_with_files(tempfile::tempfile_in(root)?, tempfile::tempfile_in(root)?)
+    }
+
+    fn new_with_files(
+        payload: std::fs::File,
+        canonical: std::fs::File,
+    ) -> std::io::Result<Self> {
         Ok(Self {
-            payload: tempfile::tempfile()?,
+            payload,
             payload_len: 0,
             entries: Vec::new(),
             logical: Vec::new(),
             logical_count: 0,
-            canonical: tempfile::tempfile()?,
+            canonical,
             canonical_len: 0,
             canonical_offsets: Vec::new(),
             dedup: DedupTable::new(),
@@ -726,9 +738,18 @@ struct DiskSets {
 }
 
 impl DiskSets {
+    #[cfg(test)]
     fn new() -> std::io::Result<Self> {
+        Self::new_with_file(tempfile::tempfile()?)
+    }
+
+    fn new_in(root: &Path) -> std::io::Result<Self> {
+        Self::new_with_file(tempfile::tempfile_in(root)?)
+    }
+
+    fn new_with_file(file: std::fs::File) -> std::io::Result<Self> {
         Ok(Self {
-            file: tempfile::tempfile()?,
+            file,
             positions: Vec::new(),
             len: 0,
         })
@@ -832,6 +853,13 @@ pub fn build(
 ) -> crate::archive::Result<BuildStats> {
     let archive = archive.as_ref();
     let title_index = title_index.as_ref();
+    let output = output.as_ref();
+    let output_parent = output
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let scratch = tempfile::TempDir::new_in(output_parent)?;
+    let scratch = scratch.path();
     let title_index_fingerprint = file_xxh3_64(title_index)?;
     let titles = crate::title_index::TitleIndex::open(title_index)?;
     let site_info = read_site_info(archive)?;
@@ -839,7 +867,7 @@ pub fn build(
     let redirect_words = redirect_words(&site_info);
     let mut redirects = RedirectTable::default();
     let mut stats = BuildStats::default();
-    let mut edge_spool = tempfile::tempfile()?;
+    let mut edge_spool = tempfile::tempfile_in(scratch)?;
 
     // Redirect resolution must be complete before edges are resolved: archive
     // page order does not guarantee that a redirect target was already seen.
@@ -911,10 +939,10 @@ pub fn build(
     })?;
     edge_spool.sync_all()?;
     edge_spool.seek(SeekFrom::Start(0))?;
-    let collected = collect_sorted_edges(edge_spool, &redirects)?;
-    let user_edits = collect_user_edit_pages(archive)?;
+    let collected = collect_sorted_edges_in(edge_spool, &redirects, scratch)?;
+    let user_edits = collect_user_edit_pages_in(archive, scratch)?;
     stats.unresolved_static_edges += collected.redirect_misses;
-    let (sets, users, memberships) = write_streaming_sidecar(
+    let (sets, users, memberships) = write_streaming_sidecar_in(
         output,
         collected.direct,
         collected.topology_seeds,
@@ -922,6 +950,7 @@ pub fn build(
         collected.effects,
         user_edits,
         title_index_fingerprint,
+        scratch,
     )?;
     stats.sets = sets;
     stats.users_with_edits = users;
@@ -981,22 +1010,34 @@ fn read_edge(input: &mut impl Read) -> std::io::Result<Option<EdgeRecord>> {
     }))
 }
 
-fn collect_sorted_edges(
+#[cfg(test)]
+fn collect_sorted_edges_with_limit(
     spool: std::fs::File,
+    run_records: usize,
     redirects: &RedirectTable,
 ) -> crate::archive::Result<CollectedEdges> {
-    collect_sorted_edges_with_limit(spool, EDGE_RUN_RECORDS, redirects)
+    let temporary = tempfile::tempdir()?;
+    collect_sorted_edges_with_limit_in(spool, run_records, redirects, temporary.path())
 }
 
-fn collect_sorted_edges_with_limit(
+fn collect_sorted_edges_in(
+    spool: std::fs::File,
+    redirects: &RedirectTable,
+    scratch: &Path,
+) -> crate::archive::Result<CollectedEdges> {
+    collect_sorted_edges_with_limit_in(spool, EDGE_RUN_RECORDS, redirects, scratch)
+}
+
+fn collect_sorted_edges_with_limit_in(
     mut spool: std::fs::File,
     run_records: usize,
     redirects: &RedirectTable,
+    scratch: &Path,
 ) -> crate::archive::Result<CollectedEdges> {
     if run_records == 0 {
         return Err(ArchiveError::Invalid("zero edge-sort run size"));
     }
-    let temporary = tempfile::tempdir()?;
+    let temporary = tempfile::tempdir_in(scratch)?;
     let mut runs = Vec::new();
     let mut redirect_misses = 0_u64;
     loop {
@@ -1052,10 +1093,10 @@ fn collect_sorted_edges_with_limit(
             heap.push(Reverse((edge, run)));
         }
     }
-    let mut direct = DiskSets::new()?;
-    let mut topology_seeds = DiskSets::new()?;
-    let mut graph_spool = tempfile::tempfile()?;
-    let mut effect_spool = tempfile::tempfile()?;
+    let mut direct = DiskSets::new_in(scratch)?;
+    let mut topology_seeds = DiskSets::new_in(scratch)?;
+    let mut graph_spool = tempfile::tempfile_in(scratch)?;
+    let mut effect_spool = tempfile::tempfile_in(scratch)?;
     let mut accumulator = None::<TargetAccumulator>;
     let mut source_key = None::<(EdgeKind, u64, bool, u64)>;
     let mut source_direct = None::<Certainty>;
@@ -1117,9 +1158,9 @@ fn collect_sorted_edges_with_limit(
         )?;
     }
     graph_spool.seek(SeekFrom::Start(0))?;
-    let graph = build_disk_graph(graph_spool, EDGE_RUN_RECORDS)?;
+    let graph = build_disk_graph_in(graph_spool, EDGE_RUN_RECORDS, scratch)?;
     effect_spool.seek(SeekFrom::Start(0))?;
-    let effects = build_disk_graph(effect_spool, EDGE_RUN_RECORDS)?;
+    let effects = build_disk_graph_in(effect_spool, EDGE_RUN_RECORDS, scratch)?;
     Ok(CollectedEdges {
         direct,
         topology_seeds,
@@ -1320,18 +1361,31 @@ fn merge_user_page_runs(
     Ok(())
 }
 
-fn collect_user_edit_pages(archive: &Path) -> crate::archive::Result<std::fs::File> {
-    collect_user_edit_pages_with_limit(archive, USER_PAGE_RUN_RECORDS)
+fn collect_user_edit_pages_in(
+    archive: &Path,
+    scratch: &Path,
+) -> crate::archive::Result<std::fs::File> {
+    collect_user_edit_pages_with_limit_in(archive, USER_PAGE_RUN_RECORDS, scratch)
 }
 
+#[cfg(test)]
 fn collect_user_edit_pages_with_limit(
     archive: &Path,
     run_records: usize,
 ) -> crate::archive::Result<std::fs::File> {
+    let temporary = tempfile::tempdir()?;
+    collect_user_edit_pages_with_limit_in(archive, run_records, temporary.path())
+}
+
+fn collect_user_edit_pages_with_limit_in(
+    archive: &Path,
+    run_records: usize,
+    scratch: &Path,
+) -> crate::archive::Result<std::fs::File> {
     if run_records == 0 {
         return Err(ArchiveError::Invalid("zero user-page sort run size"));
     }
-    let temporary = tempfile::tempdir()?;
+    let temporary = tempfile::tempdir_in(scratch)?;
     let mut reader = ArchiveRecordReader::open(archive)?;
     let mut runs = Vec::new();
     let mut records = Vec::with_capacity(run_records);
@@ -1369,7 +1423,7 @@ fn collect_user_edit_pages_with_limit(
         runs = next;
         stage += 1;
     }
-    let mut output = tempfile::tempfile()?;
+    let mut output = tempfile::tempfile_in(scratch)?;
     merge_user_page_runs(&runs, &mut output)?;
     output.seek(SeekFrom::Start(0))?;
     Ok(output)
@@ -1534,12 +1588,22 @@ impl DiskGraph {
     }
 }
 
+#[cfg(test)]
 fn build_disk_graph(
     spool: std::fs::File,
     run_records: usize,
 ) -> crate::archive::Result<DiskGraph> {
-    let forward_file = sort_graph_spool(spool, run_records)?;
-    let mut reverse_spool = tempfile::tempfile()?;
+    let temporary = tempfile::tempdir()?;
+    build_disk_graph_in(spool, run_records, temporary.path())
+}
+
+fn build_disk_graph_in(
+    spool: std::fs::File,
+    run_records: usize,
+    scratch: &Path,
+) -> crate::archive::Result<DiskGraph> {
+    let forward_file = sort_graph_spool_in(spool, run_records, scratch)?;
+    let mut reverse_spool = tempfile::tempfile_in(scratch)?;
     if let Some(map) = mmap_file(&forward_file)? {
         for index in 0..map.len() / EDGE_BYTES {
             let start = index * EDGE_BYTES;
@@ -1560,7 +1624,7 @@ fn build_disk_graph(
         }
     }
     reverse_spool.seek(SeekFrom::Start(0))?;
-    let reverse_file = sort_graph_spool(reverse_spool, run_records)?;
+    let reverse_file = sort_graph_spool_in(reverse_spool, run_records, scratch)?;
     Ok(DiskGraph {
         forward: mmap_file(&forward_file)?,
         reverse: mmap_file(&reverse_file)?,
@@ -1576,14 +1640,15 @@ fn mmap_file(file: &std::fs::File) -> std::io::Result<Option<Mmap>> {
     unsafe { memmap2::MmapOptions::new().map(file).map(Some) }
 }
 
-fn sort_graph_spool(
+fn sort_graph_spool_in(
     mut spool: std::fs::File,
     run_records: usize,
+    scratch: &Path,
 ) -> crate::archive::Result<std::fs::File> {
     if run_records == 0 {
         return Err(ArchiveError::Invalid("zero graph-sort run size"));
     }
-    let temporary = tempfile::tempdir()?;
+    let temporary = tempfile::tempdir_in(scratch)?;
     let mut runs = Vec::new();
     loop {
         let mut records = Vec::with_capacity(run_records);
@@ -1622,7 +1687,7 @@ fn sort_graph_spool(
         runs = next;
         stage += 1;
     }
-    let output = tempfile::tempfile()?;
+    let output = tempfile::tempfile_in(scratch)?;
     merge_graph_readers(&runs, &output)?;
     Ok(output)
 }
@@ -1903,12 +1968,14 @@ fn build_logical_sets(
         DiskSets::from_memory(direct).expect("temporary backref sets must be writable");
     let mut topology_seeds = DiskSets::from_memory(topology_seeds)
         .expect("temporary backref sets must be writable");
+    let temporary = tempfile::tempdir().expect("temporary backref scratch must be writable");
     let mut logical = Vec::new();
     visit_logical_sets(
         &mut direct,
         &mut topology_seeds,
         &graph,
         &effects,
+        temporary.path(),
         |set| {
             logical.push(set);
             Ok(())
@@ -2117,9 +2184,18 @@ struct BitmapStore {
 }
 
 impl BitmapStore {
+    #[cfg(test)]
     fn new() -> std::io::Result<Self> {
+        Self::new_with_file(tempfile::tempfile()?)
+    }
+
+    fn new_in(root: &Path) -> std::io::Result<Self> {
+        Self::new_with_file(tempfile::tempfile_in(root)?)
+    }
+
+    fn new_with_file(file: std::fs::File) -> std::io::Result<Self> {
         Ok(Self {
-            file: tempfile::tempfile()?,
+            file,
             positions: Vec::new(),
             len: 0,
         })
@@ -2160,6 +2236,7 @@ fn visit_transitive_sets(
     accepted_kinds: &[EdgeKind],
     direct: &mut DiskSets,
     extra: &mut DiskSets,
+    scratch: &Path,
     mut visitor: impl FnMut(LogicalSet) -> crate::archive::Result<()>,
 ) -> crate::archive::Result<()> {
     let accepted = accepted_kinds.iter().copied().collect::<BTreeSet<_>>();
@@ -2169,7 +2246,7 @@ fn visit_transitive_sets(
     if node_info.len() > u32::MAX as usize {
         return Err(ArchiveError::Invalid("backref graph has more than u32 nodes"));
     }
-    let mut guaranteed = BitmapStore::new()?;
+    let mut guaranteed = BitmapStore::new_in(scratch)?;
 
     for possible in [false, true] {
         let (component_of, component_offsets, component_nodes) = strongly_connected_disk(
@@ -2178,7 +2255,7 @@ fn visit_transitive_sets(
             possible,
             node_info.len(),
         )?;
-        let mut component_spool = tempfile::tempfile()?;
+        let mut component_spool = tempfile::tempfile_in(scratch)?;
         if let Some(map) = &graph.forward {
             for index in 0..map.len() / EDGE_BYTES {
                 let edge = graph.edge_at(false, index);
@@ -2212,8 +2289,8 @@ fn visit_transitive_sets(
             }
         }
         component_spool.seek(SeekFrom::Start(0))?;
-        let component_graph = build_disk_graph(component_spool, EDGE_RUN_RECORDS)?;
-        let mut closures = BitmapStore::new()?;
+        let component_graph = build_disk_graph_in(component_spool, EDGE_RUN_RECORDS, scratch)?;
+        let mut closures = BitmapStore::new_in(scratch)?;
         let component_count = component_offsets.len() - 1;
         let mut remaining = (0..component_count)
             .map(|component| {
@@ -2350,7 +2427,30 @@ fn visit_transitive_sets(
     Ok(())
 }
 
+#[cfg(test)]
 fn write_streaming_sidecar(
+    output: impl AsRef<Path>,
+    direct: DiskSets,
+    topology_seeds: DiskSets,
+    graph: DiskGraph,
+    effects: DiskGraph,
+    user_edits: std::fs::File,
+    title_index_fingerprint: u64,
+) -> crate::archive::Result<(u64, u64, u64)> {
+    let temporary = tempfile::tempdir()?;
+    write_streaming_sidecar_in(
+        output,
+        direct,
+        topology_seeds,
+        graph,
+        effects,
+        user_edits,
+        title_index_fingerprint,
+        temporary.path(),
+    )
+}
+
+fn write_streaming_sidecar_in(
     output: impl AsRef<Path>,
     mut direct: DiskSets,
     mut topology_seeds: DiskSets,
@@ -2358,13 +2458,15 @@ fn write_streaming_sidecar(
     effects: DiskGraph,
     mut user_edits: std::fs::File,
     title_index_fingerprint: u64,
+    scratch: &Path,
 ) -> crate::archive::Result<(u64, u64, u64)> {
-    let mut encoder = StreamingEncoder::new()?;
+    let mut encoder = StreamingEncoder::new_in(scratch)?;
     visit_logical_sets(
         &mut direct,
         &mut topology_seeds,
         &graph,
         &effects,
+        scratch,
         |set| {
             encoder.add(set)?;
             Ok(())
@@ -2384,6 +2486,7 @@ fn visit_logical_sets(
     topology_seeds: &mut DiskSets,
     graph: &DiskGraph,
     effects: &DiskGraph,
+    scratch: &Path,
     mut visitor: impl FnMut(LogicalSet) -> crate::archive::Result<()>,
 ) -> crate::archive::Result<()> {
     let direct_keys = direct
@@ -2409,8 +2512,8 @@ fn visit_logical_sets(
         })?;
     }
 
-    let mut effect_contributions = tempfile::tempfile()?;
-    let mut empty_extra = DiskSets::new()?;
+    let mut effect_contributions = tempfile::tempfile_in(scratch)?;
+    let mut empty_extra = DiskSets::new_in(scratch)?;
     let mut render_nodes = topology_seeds
         .positions
         .iter()
@@ -2420,7 +2523,7 @@ fn visit_logical_sets(
         .collect::<Vec<_>>();
     render_nodes.sort_unstable();
     render_nodes.dedup();
-    let mut typed_spool = tempfile::tempfile()?;
+    let mut typed_spool = tempfile::tempfile_in(scratch)?;
     if let Some(map) = &graph.forward {
         for index in 0..map.len() / EDGE_BYTES {
             let edge = graph.edge_at(false, index);
@@ -2446,13 +2549,14 @@ fn visit_logical_sets(
         }
     }
     typed_spool.seek(SeekFrom::Start(0))?;
-    let render_graph = build_disk_graph(typed_spool, EDGE_RUN_RECORDS)?;
+    let render_graph = build_disk_graph_in(typed_spool, EDGE_RUN_RECORDS, scratch)?;
     visit_transitive_sets(
         &render_nodes,
         &render_graph,
         &[EdgeKind::Template, EdgeKind::Module],
         topology_seeds,
         &mut empty_extra,
+        scratch,
         |set| {
             let (start, count) = effects.range(false, set.key.target_page_id);
             for index in start..start + count {
@@ -2481,10 +2585,11 @@ fn visit_logical_sets(
         },
     )?;
     effect_contributions.seek(SeekFrom::Start(0))?;
-    let mut effect_sets = collect_sorted_edges_with_limit(
+    let mut effect_sets = collect_sorted_edges_with_limit_in(
         effect_contributions,
         EDGE_RUN_RECORDS,
         &RedirectTable::default(),
+        scratch,
     )?
     .direct;
     let effect_keys = effect_sets

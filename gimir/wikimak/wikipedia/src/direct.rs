@@ -1887,6 +1887,9 @@ fn build_content_part(
             observed_at_micros,
             header.title,
             records,
+            path.parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new(".")),
         )
         .map_err(map_archive)?;
         stats.pages += 1;

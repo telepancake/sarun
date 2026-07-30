@@ -639,6 +639,16 @@ fn spawn_run(job: Job, wiki_run: WikiRun) {
         _ => [driver("ietfmak"), vec!["update".into(), job.dest.clone()]].concat(),
     };
     let id = job.id;
+    // Keep both the importer and any helper it launches on the mirror's
+    // destination volume.  The importer already routes its own temporary
+    // files explicitly; TMPDIR covers third-party tools that still consult
+    // the process default.  Do not apply this to other mirror kinds: their
+    // scratch contracts are separate.
+    let wiki_tmp = (job.kind == "wiki").then(|| {
+        let path = wikimak_wikipedia::mirror_scratch_path(std::path::Path::new(&job.dest));
+        let _ = std::fs::create_dir_all(&path);
+        path
+    });
     if !running_map(|m| {
         if m.contains_key(&id) {
             false
@@ -669,6 +679,9 @@ fn spawn_run(job: Job, wiki_run: WikiRun) {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped());
+        if let Some(path) = &wiki_tmp {
+            cmd.env("TMPDIR", path);
+        }
         unsafe {
             use std::os::unix::process::CommandExt;
             cmd.pre_exec(|| {

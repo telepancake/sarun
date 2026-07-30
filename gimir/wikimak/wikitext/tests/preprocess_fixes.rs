@@ -156,6 +156,37 @@ fn localized_variable_and_no_alias_fallback() {
     assert_eq!(xt(&plain, "{{#תנאי:x|yes|no}}").contains("תנאי"), true);
 }
 
+#[test]
+fn core_magic_alias_wins_over_extension_alias_collision() {
+    let mut s = MockStore::new();
+    // Wikimedia exposes both `time` and an extension-specific `timef-time`
+    // row with the short alias `time`.  The core parser function must retain
+    // the first canonical meaning rather than becoming a missing template.
+    s.site.magic_aliases = alias_map(&[
+        ("time", &["time"], false),
+        ("timef-time", &["time"], true),
+    ]);
+    assert_eq!(xt(&s, "{{#time:Y|2005-01-01}}"), "2005");
+}
+
+#[test]
+fn wikibase_property_without_entity_data_is_empty() {
+    let mut s = MockStore::new();
+    s.site.magic_aliases = alias_map(&[("property", &["property"], false)]);
+    assert_eq!(xt(&s, "before{{#property:P625}}after"), "beforeafter");
+}
+
+#[test]
+fn number_of_articles_with_r_format_is_a_magic_variable() {
+    let mut s = MockStore::new();
+    s.site.magic_aliases = alias_map(&[
+        ("plural", &["PLURAL:"], false),
+        ("numberofarticles", &["NUMBEROFARTICLES"], true),
+    ]);
+    assert_eq!(xt(&s, "{{NUMBEROFARTICLES:R}}"), "0");
+    assert_eq!(xt(&s, "{{PLURAL:{{NUMBEROFARTICLES:R}}|article|articles}}"), "articles");
+}
+
 // --- bug 5: inclusion + templatestyles fully consumed ----------------------
 
 /// Convenience for a whole `xt` string helper (mainspace, no invoker).

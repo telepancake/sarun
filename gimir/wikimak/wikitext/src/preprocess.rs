@@ -728,6 +728,11 @@ fn dispatch_colon(
         "#titleparts" => pf_titleparts(ctx, arg0, rest, frame),
         "#tag" => pf_tag(ctx, arg0, rest, frame),
         "#invoke" => pf_invoke(ctx, arg0, rest, frame),
+        // Wikibase properties are not present in a page/revision archive.
+        // MediaWiki returns an empty value when the requested entity/property
+        // has no statement; do the same instead of treating it as a template
+        // title and emitting a misleading red link.
+        "#property" => String::new(),
         // GeoData parser hook: coordinates are already rendered visibly by
         // the calling template; this call only records page metadata.
         "#coordinates" => String::new(),

@@ -113,7 +113,7 @@ pub fn fetch_siteinfo_archive(
                     .filter_map(Value::as_str)
                     .map(str::to_string)
                     .collect(),
-                case_sensitive: word.get("case-sensitive").is_some(),
+                case_sensitive: bool_value(word, "case-sensitive"),
             })
         })
         .collect();
@@ -124,7 +124,7 @@ pub fn fetch_siteinfo_archive(
         generator: string(general, "generator"),
         case: string(general, "case"),
         language: string(general, "lang"),
-        rtl: general.get("rtl").is_some(),
+        rtl: bool_value(general, "rtl"),
         server: string(general, "server"),
         script_path: string(general, "scriptpath"),
         namespaces,
@@ -158,6 +158,21 @@ fn string(value: &Value, key: &str) -> String {
         .to_string()
 }
 
+/// MediaWiki's API has emitted `rtl` both as a JSON boolean and, in older
+/// compatibility responses, as a string.  Presence is not a valid test:
+/// `rtl: false` is still present and must keep LTR wikis LTR.
+fn bool_value(value: &Value, key: &str) -> bool {
+    match value.get(key) {
+        Some(Value::Bool(value)) => *value,
+        Some(Value::String(value)) => matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        Some(Value::Number(value)) => value.as_i64().is_some_and(|value| value != 0),
+        _ => false,
+    }
+}
+
 fn parse_error(message: impl Into<String>) -> Error {
     Error::Mediawiki(wikimak_mediawiki::Error::Parse(message.into()))
 }
@@ -166,5 +181,29 @@ fn map_archive(error: crate::archive::ArchiveError) -> Error {
     match error {
         crate::archive::ArchiveError::Mirror(error) => error,
         other => parse_error(other.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bool_value;
+    use serde_json::json;
+
+    #[test]
+    fn boolean_siteinfo_fields_use_the_value_not_presence() {
+        let value = json!({
+            "false_bool": false,
+            "true_bool": true,
+            "false_string": "false",
+            "true_string": "true",
+            "zero": 0,
+            "one": 1,
+        });
+        assert!(!bool_value(&value, "false_bool"));
+        assert!(bool_value(&value, "true_bool"));
+        assert!(!bool_value(&value, "false_string"));
+        assert!(bool_value(&value, "true_string"));
+        assert!(!bool_value(&value, "zero"));
+        assert!(bool_value(&value, "one"));
     }
 }
