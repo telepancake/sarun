@@ -995,6 +995,104 @@ fn saved_source_stats(
         .unwrap_or_default()
 }
 
+fn grouped_node_receipt(
+    root: &Path,
+    plan: &DirectBuildPlan,
+    group_index: usize,
+) -> Option<(PathBuf, BuildReceipt)> {
+    let node = root
+        .join("nodes")
+        .join(format!("content-{group_index:06}.done"));
+    let data = node.join("data.swdump");
+    let receipt = std::fs::read(node.join("receipt.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<BuildReceipt>(&bytes).ok())?;
+    if receipt.plan_id != plan.plan_id
+        || receipt.kind != "content"
+        || receipt.index != group_index
+        || std::fs::metadata(&data).ok()?.len() != receipt.data_bytes
+        || !archive_file_complete(&data)
+        || (group_index == 0 && !archive_file_complete(&node.join("siteinfo.swdump")))
+    {
+        return None;
+    }
+    Some((node, receipt))
+}
+
+fn write_empty_archive(path: &Path) -> Result<()> {
+    ArchiveWriter::new(std::fs::File::create(path)?, DEFAULT_FRAME_TARGET)
+        .map_err(map_archive)?
+        .finish()
+        .map_err(map_archive)?;
+    Ok(())
+}
+
+fn adopt_grouped_completed_nodes(root: &Path, plan: &DirectBuildPlan) -> Result<()> {
+    let nodes = root.join("nodes");
+    for group_index in 0..plan.content_groups.len() {
+        let group_len = plan.content_groups[group_index].len();
+        if group_len <= 1 {
+            continue;
+        }
+        let Some((old_node, receipt)) = grouped_node_receipt(root, plan, group_index) else {
+            continue;
+        };
+        for source_index in 0..group_len {
+            let index = plan
+                .content_target_index(group_index, source_index)
+                .ok_or(Error::Corrupt("content source is outside build plan"))?;
+            if validate_node(root, plan, "content", index).unwrap_or(false) {
+                continue;
+            }
+            let destination = node_path(root, plan, "content", index);
+            if destination.exists() {
+                if destination.is_dir() {
+                    std::fs::remove_dir_all(&destination)?;
+                } else {
+                    std::fs::remove_file(&destination)?;
+                }
+            }
+            let target = plan
+                .target_name("content", index)
+                .ok_or(Error::Corrupt("content target is outside build plan"))?;
+            let temporary = nodes.join(format!(".{target}.adopting"));
+            if temporary.exists() {
+                std::fs::remove_dir_all(&temporary)?;
+            }
+            std::fs::create_dir(&temporary)?;
+            if source_index == 0 {
+                copy_or_link_file(
+                    &old_node.join("data.swdump"),
+                    &temporary.join("data.swdump"),
+                )?;
+                if group_index == 0 {
+                    copy_or_link_file(
+                        &old_node.join("siteinfo.swdump"),
+                        &temporary.join("siteinfo.swdump"),
+                    )?;
+                }
+            } else {
+                write_empty_archive(&temporary.join("data.swdump"))?;
+            }
+            let stats = if source_index == 0 {
+                receipt.stats.clone()
+            } else {
+                PartialStats::default()
+            };
+            publish_node(root, plan, "content", index, &temporary, &stats)?;
+        }
+        if (0..group_len).all(|source_index| {
+            plan.content_target_index(group_index, source_index)
+                .is_some_and(|index| {
+                    validate_node(root, plan, "content", index).unwrap_or(false)
+                })
+        }) {
+            std::fs::remove_dir_all(old_node)?;
+        }
+    }
+    Ok(())
+}
+
 fn adopt_grouped_partial_sources(root: &Path, plan: &DirectBuildPlan) -> Result<()> {
     let nodes = root.join("nodes");
     let partials = std::fs::read_dir(&nodes)?
@@ -1065,6 +1163,7 @@ fn adopt_grouped_partial_sources(root: &Path, plan: &DirectBuildPlan) -> Result<
 
 pub(crate) fn prune_invalid_build_nodes(root: &Path, plan: &DirectBuildPlan) -> Result<usize> {
     std::fs::create_dir_all(root.join("nodes"))?;
+    adopt_grouped_completed_nodes(root, plan)?;
     adopt_grouped_partial_sources(root, plan)?;
     let mut reusable = 0;
     for (kind, count) in [
@@ -1086,7 +1185,7 @@ pub(crate) fn prune_invalid_build_nodes(root: &Path, plan: &DirectBuildPlan) -> 
         let resumable = name
             .strip_prefix('.')
             .and_then(|name| name.strip_suffix(".partial"))
-            .and_then(|name| name.split('.').next())
+            .filter(|name| !name.contains('.'))
             .is_some_and(|target| plan.target_index(target).is_some());
         if name.starts_with('.') && !resumable {
             let path = entry.path();
@@ -1264,17 +1363,10 @@ pub fn mirror_build_progress(archive: impl AsRef<Path>) -> Option<MirrorBuildPro
         .filter_map(std::result::Result::ok)
         .filter_map(|entry| {
             let name = entry.file_name().to_string_lossy().into_owned();
-            name.starts_with('.')
-                .then(|| {
-                    (
-                        name.trim_start_matches('.')
-                            .split('.')
-                            .next()
-                            .unwrap_or(&name)
-                            .to_owned(),
-                        entry.path(),
-                    )
-                })
+            let attempt = name
+                .strip_prefix('.')?
+                .strip_suffix(".partial")?;
+            (!attempt.contains('.')).then(|| (attempt.to_owned(), entry.path()))
         })
         .collect::<Vec<_>>();
     let mut active = Vec::new();
@@ -3773,6 +3865,86 @@ mod build_graph_tests {
     }
 
     #[test]
+    fn restart_adopts_an_old_completed_group_without_repeating_its_records() {
+        let part = |name: &str| PlannedPart {
+            url: format!("https://example.invalid/{name}"),
+            filename: name.into(),
+            size_bytes: 100,
+            sha256: None,
+            sha1: None,
+            md5: None,
+        };
+        let mut plan = DirectBuildPlan {
+            schema: 1,
+            plan_id: String::new(),
+            wiki_db: "testwiki".into(),
+            content_snapshot: "2024-06-01".into(),
+            metadata_snapshot: "2024-06".into(),
+            observed_at_micros: 0,
+            frame_target: 1,
+            range_target: 1,
+            compression_level: 1,
+            ref_prefix_sample_bytes: 1,
+            ref_prefix_bytes: 1,
+            content_groups: vec![
+                vec![part("first")],
+                vec![part("slice-a"), part("slice-b"), part("slice-c")],
+            ],
+            history_files: Vec::new(),
+        };
+        plan.plan_id = direct_plan_id(&plan).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let old_node = root.path().join("nodes/content-000001.done");
+        std::fs::create_dir_all(&old_node).unwrap();
+        let data = old_node.join("data.swdump");
+        let mut writer =
+            ArchiveWriter::new(std::fs::File::create(&data).unwrap(), 128).unwrap();
+        writer
+            .write(&Record::Manifest {
+                timestamp_micros: 0,
+                manifest: ManifestRecord {
+                    wiki_db: "testwiki".into(),
+                    content_snapshot: "2024-06-01".into(),
+                    metadata_snapshot: "2024-06".into(),
+                    source_files: vec!["old-group".into()],
+                },
+            })
+            .unwrap();
+        writer.finish().unwrap();
+        std::fs::write(
+            old_node.join("receipt.json"),
+            serde_json::to_vec(&BuildReceipt {
+                plan_id: plan.plan_id.clone(),
+                kind: "content".into(),
+                index: 1,
+                data_bytes: std::fs::metadata(&data).unwrap().len(),
+                stats: PartialStats::default(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(prune_invalid_build_nodes(root.path(), &plan).unwrap(), 3);
+        assert!(!old_node.exists());
+        for index in 1..=3 {
+            assert!(validate_node(root.path(), &plan, "content", index).unwrap());
+        }
+        let mut aggregate = ArchiveRecordReader::open(
+            node_path(root.path(), &plan, "content", 1).join("data.swdump"),
+        )
+        .unwrap();
+        assert!(matches!(
+            aggregate.next_record().unwrap(),
+            Some(Record::Manifest { .. })
+        ));
+        let mut empty = ArchiveRecordReader::open(
+            node_path(root.path(), &plan, "content", 2).join("data.swdump"),
+        )
+        .unwrap();
+        assert!(empty.next_record().unwrap().is_none());
+    }
+
+    #[test]
     fn network_progress_survives_partial_target_replacement() {
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir(root.path().join("nodes")).unwrap();
@@ -3874,11 +4046,14 @@ mod build_graph_tests {
             compression_level: 1,
             ref_prefix_sample_bytes: 1,
             ref_prefix_bytes: 1,
-            content_groups: vec![vec![
-                part("source-1.xml.bz2"),
-                part("source-2.xml.bz2"),
-                part("source-3.xml.bz2"),
-            ]],
+            content_groups: vec![
+                vec![
+                    part("source-1.xml.bz2"),
+                    part("source-2.xml.bz2"),
+                    part("source-3.xml.bz2"),
+                ],
+                vec![part("stale.xml.bz2")],
+            ],
             history_files: Vec::new(),
         };
         plan.plan_id = direct_plan_id(&plan).unwrap();
@@ -3921,7 +4096,7 @@ mod build_graph_tests {
         ];
         for (index, value) in values.iter().enumerate() {
             let partial = root.join(format!(
-                "nodes/.content-000000-source-{index:06}.123.partial"
+                "nodes/.content-000000-source-{index:06}.partial"
             ));
             std::fs::create_dir_all(&partial).unwrap();
             std::fs::write(
@@ -3930,6 +4105,22 @@ mod build_graph_tests {
             )
             .unwrap();
         }
+        let stale = root.join("nodes/.content-000001.123.partial");
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::write(
+            stale.join("content-000000.progress.json"),
+            serde_json::to_vec(&LiveTargetProgress {
+                target: "content-000000.swdump".into(),
+                part: "stale.xml.bz2".into(),
+                phase: "downloading".into(),
+                source_bytes_total: 100,
+                started_at_micros: 1,
+                updated_at_micros: 1,
+                ..Default::default()
+            })
+            .unwrap(),
+        )
+        .unwrap();
 
         let progress = mirror_build_progress(&archive).unwrap();
         assert_eq!(progress.source_bytes_completed, 120);
