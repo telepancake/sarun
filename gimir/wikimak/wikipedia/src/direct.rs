@@ -698,6 +698,17 @@ impl DirectBuildPlan {
         None
     }
 
+    fn content_target_index(&self, group_index: usize, source_index: usize) -> Option<usize> {
+        let group = self.content_groups.get(group_index)?;
+        (source_index < group.len()).then(|| {
+            self.content_groups[..group_index]
+                .iter()
+                .map(Vec::len)
+                .sum::<usize>()
+                + source_index
+        })
+    }
+
     pub(crate) fn target_name(&self, kind: &str, index: usize) -> Option<String> {
         match kind {
             "content" => self.content_target(index).map(|(group, source, _)| {
@@ -913,8 +924,148 @@ fn validate_node(
     Ok(true)
 }
 
+fn copy_or_link_file(source: &Path, destination: &Path) -> Result<()> {
+    match std::fs::hard_link(source, destination) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            std::fs::copy(source, destination)?;
+            Ok(())
+        }
+    }
+}
+
+fn grouped_partial_index(name: &str, plan: &DirectBuildPlan) -> Option<usize> {
+    let target = name
+        .strip_prefix('.')?
+        .strip_suffix(".partial")?
+        .split('.')
+        .next()?;
+    let group_index = target.strip_prefix("content-")?.parse::<usize>().ok()?;
+    (plan.content_groups.get(group_index)?.len() > 1).then_some(group_index)
+}
+
+fn grouped_source_index(name: &str) -> Option<usize> {
+    let stem = name.strip_suffix(".swdump")?;
+    stem.rsplit_once("-source-")?.1.parse::<usize>().ok()
+}
+
+fn saved_source_stats(
+    directory: &Path,
+    part: &PlannedPart,
+    archive: &Path,
+    observed_at_micros: i64,
+) -> PartialStats {
+    let key = checkpoint_key(
+        "content-source",
+        observed_at_micros,
+        [part.clone()],
+    )
+    .ok();
+    if let Some(stats) = key
+        .as_deref()
+        .and_then(|key| checkpoint_stats(archive, key))
+    {
+        return stats;
+    }
+    std::fs::read_dir(directory)
+        .ok()
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".progress.json")
+        })
+        .filter_map(|entry| std::fs::read(entry.path()).ok())
+        .filter_map(|bytes| serde_json::from_slice::<LiveTargetProgress>(&bytes).ok())
+        .find(|value| value.part == part.filename && value.phase == "finished")
+        .map(|value| PartialStats {
+            pages: value.pages,
+            revisions: value.revisions,
+            fetch_attempts: value.fetch_attempts,
+            fetch_bytes_received: value.fetch_bytes_received,
+            fetch_rate_limit_responses: value.fetch_rate_limit_responses,
+            fetch_client_error_responses: value.fetch_client_error_responses,
+            fetch_server_error_responses: value.fetch_server_error_responses,
+            fetch_transport_errors: value.fetch_transport_errors,
+            ..Default::default()
+        })
+        .unwrap_or_default()
+}
+
+fn adopt_grouped_partial_sources(root: &Path, plan: &DirectBuildPlan) -> Result<()> {
+    let nodes = root.join("nodes");
+    let partials = std::fs::read_dir(&nodes)?
+        .filter_map(std::result::Result::ok)
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            grouped_partial_index(&name, plan)
+                .map(|group_index| (group_index, entry.path()))
+        })
+        .collect::<Vec<_>>();
+    for (group_index, directory) in partials {
+        let archives = std::fs::read_dir(&directory)?
+            .filter_map(std::result::Result::ok)
+            .filter_map(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                grouped_source_index(&name).map(|source_index| (source_index, entry.path()))
+            })
+            .collect::<Vec<_>>();
+        for (source_index, archive) in archives {
+            let Some(index) = plan.content_target_index(group_index, source_index) else {
+                continue;
+            };
+            if validate_node(root, plan, "content", index).unwrap_or(false)
+                || !archive_file_complete(&archive)
+            {
+                continue;
+            }
+            let destination = node_path(root, plan, "content", index);
+            if destination.exists() {
+                if destination.is_dir() {
+                    std::fs::remove_dir_all(&destination)?;
+                } else {
+                    std::fs::remove_file(&destination)?;
+                }
+            }
+            let siteinfo = site_info_checkpoint_path(&archive);
+            if index == 0 && !archive_file_complete(&siteinfo) {
+                continue;
+            }
+            let target = plan
+                .target_name("content", index)
+                .ok_or(Error::Corrupt("content target is outside build plan"))?;
+            let temporary = nodes.join(format!(".{target}.adopting"));
+            if temporary.exists() {
+                std::fs::remove_dir_all(&temporary)?;
+            }
+            std::fs::create_dir(&temporary)?;
+            copy_or_link_file(&archive, &temporary.join("data.swdump"))?;
+            if index == 0 {
+                copy_or_link_file(&siteinfo, &temporary.join("siteinfo.swdump"))?;
+            }
+            let part = plan
+                .content_groups
+                .get(group_index)
+                .and_then(|group| group.get(source_index))
+                .ok_or(Error::Corrupt("content source is outside build plan"))?;
+            let stats = saved_source_stats(
+                &directory,
+                part,
+                &archive,
+                plan.observed_at_micros,
+            );
+            publish_node(root, plan, "content", index, &temporary, &stats)?;
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn prune_invalid_build_nodes(root: &Path, plan: &DirectBuildPlan) -> Result<usize> {
     std::fs::create_dir_all(root.join("nodes"))?;
+    adopt_grouped_partial_sources(root, plan)?;
     let mut reusable = 0;
     for (kind, count) in [
         ("content", plan.content_target_count()),
@@ -3570,6 +3721,55 @@ mod build_graph_tests {
             Some("content-000001-source-000001")
         );
         assert_eq!(plan.target_name("content", 3).as_deref(), Some("content-000002"));
+    }
+
+    #[test]
+    fn restart_adopts_complete_sources_from_an_old_grouped_partial() {
+        let part = |name: &str| PlannedPart {
+            url: format!("https://example.invalid/{name}"),
+            filename: name.into(),
+            size_bytes: 100,
+            sha256: None,
+            sha1: None,
+            md5: None,
+        };
+        let mut plan = DirectBuildPlan {
+            schema: 1,
+            plan_id: String::new(),
+            wiki_db: "testwiki".into(),
+            content_snapshot: "2024-06-01".into(),
+            metadata_snapshot: "2024-06".into(),
+            observed_at_micros: 0,
+            frame_target: 1,
+            range_target: 1,
+            compression_level: 1,
+            ref_prefix_sample_bytes: 1,
+            ref_prefix_bytes: 1,
+            content_groups: vec![
+                vec![part("first")],
+                vec![part("slice-a"), part("slice-b"), part("slice-c")],
+            ],
+            history_files: Vec::new(),
+        };
+        plan.plan_id = direct_plan_id(&plan).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let partial = root.path().join("nodes/.content-000001.123.partial");
+        std::fs::create_dir_all(&partial).unwrap();
+        for source_index in [0, 2] {
+            let path = partial.join(format!(
+                "content-000000-source-{source_index:06}.swdump"
+            ));
+            ArchiveWriter::new(std::fs::File::create(path).unwrap(), 128)
+                .unwrap()
+                .finish()
+                .unwrap();
+        }
+
+        assert_eq!(prune_invalid_build_nodes(root.path(), &plan).unwrap(), 2);
+        assert!(validate_node(root.path(), &plan, "content", 1).unwrap());
+        assert!(!validate_node(root.path(), &plan, "content", 2).unwrap());
+        assert!(validate_node(root.path(), &plan, "content", 3).unwrap());
+        assert!(!partial.exists());
     }
 
     #[test]
