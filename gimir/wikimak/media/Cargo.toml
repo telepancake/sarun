@@ -15,3 +15,8 @@ wikimak-wikitext = { workspace = true }
 md-5 = { workspace = true }
 thiserror = { workspace = true }
 reqwest = { workspace = true, optional = true }
+zim.workspace = true
+xxhash-rust.workspace = true
+memmap2 = "0.9"
+zstd.workspace = true
+xz2.workspace = true

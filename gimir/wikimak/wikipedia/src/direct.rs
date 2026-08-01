@@ -1,11 +1,11 @@
 //! Direct upstream-dump to portable-archive construction.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
@@ -64,6 +64,56 @@ struct PartialStats {
     page_events: u64,
     user_events: u64,
     global_events: u64,
+    #[serde(default)]
+    fetch_attempts: u64,
+    #[serde(default)]
+    fetch_bytes_received: u64,
+    #[serde(default)]
+    fetch_rate_limit_responses: u64,
+    #[serde(default)]
+    fetch_client_error_responses: u64,
+    #[serde(default)]
+    fetch_server_error_responses: u64,
+    #[serde(default)]
+    fetch_transport_errors: u64,
+}
+
+impl PartialStats {
+    fn merge_from(&mut self, other: &Self) {
+        self.pages = self.pages.saturating_add(other.pages);
+        self.revisions = self.revisions.saturating_add(other.revisions);
+        self.events = self.events.saturating_add(other.events);
+        self.page_events = self.page_events.saturating_add(other.page_events);
+        self.user_events = self.user_events.saturating_add(other.user_events);
+        self.global_events = self.global_events.saturating_add(other.global_events);
+        self.fetch_attempts = self.fetch_attempts.saturating_add(other.fetch_attempts);
+        self.fetch_bytes_received = self
+            .fetch_bytes_received
+            .saturating_add(other.fetch_bytes_received);
+        self.fetch_rate_limit_responses = self
+            .fetch_rate_limit_responses
+            .saturating_add(other.fetch_rate_limit_responses);
+        self.fetch_client_error_responses = self
+            .fetch_client_error_responses
+            .saturating_add(other.fetch_client_error_responses);
+        self.fetch_server_error_responses = self
+            .fetch_server_error_responses
+            .saturating_add(other.fetch_server_error_responses);
+        self.fetch_transport_errors = self
+            .fetch_transport_errors
+            .saturating_add(other.fetch_transport_errors);
+    }
+
+    fn record_fetch(&mut self, handle: &wikimak_mediawiki::FetchStatsHandle) {
+        if let Ok(fetch) = handle.lock() {
+            self.fetch_attempts = fetch.attempts;
+            self.fetch_bytes_received = fetch.bytes_received;
+            self.fetch_rate_limit_responses = fetch.rate_limit_responses;
+            self.fetch_client_error_responses = fetch.client_error_responses;
+            self.fetch_server_error_responses = fetch.server_error_responses;
+            self.fetch_transport_errors = fetch.transport_errors;
+        }
+    }
 }
 
 #[derive(Deserialize, Serialize)]
@@ -143,10 +193,489 @@ pub struct MirrorBuildProgress {
     pub phase: String,
     pub targets_total: u64,
     pub targets_completed: u64,
+    /// Structured rows for the live worker table.  `targets_active` remains
+    /// as a compact compatibility projection for the CLI, but consumers that
+    /// need attribution must use these rows instead of parsing prose.
+    #[serde(default)]
+    pub target_progress: Vec<MirrorTargetProgress>,
     pub targets_active: Vec<String>,
     pub source_bytes_total: u64,
     pub source_bytes_completed: u64,
+    /// Rate for currently active source readers.  This answers whether the
+    /// importer is receiving bytes now, rather than hiding a stalled reader
+    /// behind a whole-job average.
+    pub active_source_bytes_per_second: Option<u64>,
+    /// Age of the quietest active target's last observable update.
+    pub active_quiet_seconds: Option<u64>,
+    /// Network counters reported by the fetcher.  `fetch_bytes_received` is
+    /// wire bytes delivered, so a resumed range may count bytes that were
+    /// already present in the logical source stream.
+    pub fetch_attempts: u64,
+    pub fetch_bytes_received: u64,
+    pub fetch_rate_limit_responses: u64,
+    pub fetch_client_error_responses: u64,
+    pub fetch_server_error_responses: u64,
+    pub fetch_transport_errors: u64,
     pub snapshot: String,
+}
+
+/// One currently materialised source target.  This is deliberately a data
+/// record rather than a preformatted status string: the UI can keep the
+/// worker identity, phase, counters, and long source/title text separate.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct MirrorTargetProgress {
+    pub target: String,
+    pub kind: String,
+    pub phase: String,
+    pub source: String,
+    pub source_bytes_read: u64,
+    pub source_bytes_total: u64,
+    #[serde(default)]
+    pub decoded_bytes: u64,
+    pub bytes_per_second: u64,
+    pub pages: u64,
+    pub records: u64,
+    pub text_bytes: u64,
+    pub current_page: u64,
+    pub current_title: String,
+    pub quiet_seconds: u64,
+    pub heartbeat_seconds: u64,
+    #[serde(default)]
+    pub phase_seconds: u64,
+    #[serde(default)]
+    pub fetch_attempts: u64,
+    #[serde(default)]
+    pub fetch_bytes_received: u64,
+    #[serde(default)]
+    pub fetch_rate_limit_responses: u64,
+    #[serde(default)]
+    pub fetch_client_error_responses: u64,
+    #[serde(default)]
+    pub fetch_server_error_responses: u64,
+    #[serde(default)]
+    pub fetch_transport_errors: u64,
+    #[serde(default)]
+    pub cpu_user_micros: u64,
+    #[serde(default)]
+    pub cpu_system_micros: u64,
+    #[serde(default)]
+    pub peak_rss_bytes: u64,
+}
+
+/// Short-lived progress written by an active source-part worker.  Durable
+/// receipts intentionally remain target-granular, but a split XML target can
+/// spend hours inside one page; this sidecar lets the UI show bytes and
+/// revision progress while that target is still being built.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct LiveTargetProgress {
+    target: String,
+    part: String,
+    phase: String,
+    source_bytes_read: u64,
+    source_bytes_total: u64,
+    #[serde(default)]
+    decoded_bytes: u64,
+    pages: u64,
+    revisions: u64,
+    text_bytes: u64,
+    current_page: u64,
+    current_title: String,
+    started_at_micros: u64,
+    updated_at_micros: u64,
+    /// Last liveness write, kept separate from `updated_at_micros` so a
+    /// blocked parser cannot masquerade as making data progress.
+    #[serde(default)]
+    heartbeat_at_micros: u64,
+    #[serde(default)]
+    phase_started_at_micros: u64,
+    #[serde(default)]
+    fetch_attempts: u64,
+    #[serde(default)]
+    fetch_bytes_received: u64,
+    #[serde(default)]
+    fetch_rate_limit_responses: u64,
+    #[serde(default)]
+    fetch_client_error_responses: u64,
+    #[serde(default)]
+    fetch_server_error_responses: u64,
+    #[serde(default)]
+    fetch_transport_errors: u64,
+    #[serde(default)]
+    cpu_user_micros: u64,
+    #[serde(default)]
+    cpu_system_micros: u64,
+    #[serde(default)]
+    peak_rss_bytes: u64,
+}
+
+struct LiveProgressState {
+    path: PathBuf,
+    value: LiveTargetProgress,
+    last_write: Instant,
+    last_phase: String,
+}
+
+/// Keep a live sidecar fresh while a parser is inside one long blocking read
+/// or decompression call. This is deliberately a liveness signal, not fake
+/// byte/revision progress; the UI can distinguish the two timestamps.
+struct LiveProgressHeartbeat {
+    stop: Arc<AtomicBool>,
+    join: Option<std::thread::JoinHandle<()>>,
+}
+
+/// Any error after a source reader has been created used to leave its last
+/// transient phase behind, making a dead worker look as though it were still
+/// downloading or parsing. Keep the sidecar truthful even when `?` returns
+/// through a deeply nested decoder/parser call.
+struct LiveProgressFailureGuard {
+    state: Arc<Mutex<LiveProgressState>>,
+}
+
+impl Drop for LiveProgressFailureGuard {
+    fn drop(&mut self) {
+        let should_mark = self
+            .state
+            .lock()
+            .map(|state| {
+                state.value.phase != "finished"
+                    && !state.value.phase.to_ascii_lowercase().contains("failed")
+            })
+            .unwrap_or(false);
+        if should_mark {
+            set_live_phase(
+                &self.state,
+                "stopped before completion; inspect attributed target error",
+            );
+        }
+    }
+}
+
+impl LiveProgressHeartbeat {
+    fn start(state: &Arc<Mutex<LiveProgressState>>) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = Arc::clone(&stop);
+        let state_thread = Arc::clone(state);
+        let join = std::thread::spawn(move || {
+            while !stop_thread.load(Ordering::Relaxed) {
+                for _ in 0..20 {
+                    if stop_thread.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                persist_live_heartbeat(&state_thread);
+            }
+        });
+        Self {
+            stop,
+            join: Some(join),
+        }
+    }
+}
+
+impl Drop for LiveProgressHeartbeat {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+fn now_micros() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_micros().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
+}
+
+/// Return the scratch root that owns a live progress sidecar.  Direct build
+/// nodes live below `nodes/.<target>.<pid>.partial`; the older checkpoint
+/// path puts sidecars directly below the scratch directory.  Keeping this
+/// small bit of path knowledge here lets every attempt write an immutable
+/// accounting snapshot without threading the build root through all parser
+/// helpers.
+fn progress_scratch_root(path: &Path) -> PathBuf {
+    let Some(parent) = path.parent() else {
+        return PathBuf::from(".");
+    };
+    let hidden_node = parent
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with('.'));
+    let direct_nodes = parent
+        .parent()
+        .and_then(|nodes| nodes.file_name())
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == "nodes");
+    if hidden_node && direct_nodes {
+        parent
+            .parent()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| parent.to_path_buf())
+    } else {
+        parent.to_path_buf()
+    }
+}
+
+fn progress_history_path(path: &Path, value: &LiveTargetProgress) -> PathBuf {
+    #[derive(Deserialize)]
+    struct PlanMarker {
+        plan_id: String,
+    }
+
+    let root = progress_scratch_root(path);
+    // A new plan gets a new directory.  This is important: scratch is reused
+    // for resumable builds, but counters from an older mirror snapshot must
+    // never leak into the new build's totals.
+    let plan_id = std::fs::read(root.join("plan.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<PlanMarker>(&bytes).ok())
+        .map(|marker| marker.plan_id)
+        .filter(|id| !id.is_empty())
+        .unwrap_or_else(|| "legacy".into());
+    let target = value
+        .target
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' { ch } else { '_' })
+        .collect::<String>();
+    root.join("network-history")
+        .join(plan_id)
+        .join(format!("{target}-{}.json", value.started_at_micros))
+}
+
+#[derive(Default)]
+struct NetworkHistoryTotals {
+    targets: HashSet<String>,
+    fetch_attempts: u64,
+    fetch_bytes_received: u64,
+    fetch_rate_limit_responses: u64,
+    fetch_client_error_responses: u64,
+    fetch_server_error_responses: u64,
+    fetch_transport_errors: u64,
+}
+
+fn progress_record_belongs_to_plan(
+    plan: &DirectBuildPlan,
+    value: &LiveTargetProgress,
+) -> bool {
+    let Some((kind, index)) = value.target.rsplit_once('-').and_then(|(kind, index)| {
+        index.parse::<usize>().ok().map(|index| (kind, index))
+    }) else {
+        return false;
+    };
+    match kind {
+        "content" => plan.content_groups.get(index).is_some_and(|parts| {
+            parts.iter().any(|part| part.filename == value.part)
+        }),
+        "history" => plan
+            .history_files
+            .get(index)
+            .is_some_and(|file| file.part.filename == value.part),
+        _ => false,
+    }
+}
+
+fn read_network_history(root: &Path, plan: &DirectBuildPlan) -> Option<NetworkHistoryTotals> {
+    let directory = root.join("network-history").join(&plan.plan_id);
+    let entries = std::fs::read_dir(directory).ok()?;
+    let mut totals = NetworkHistoryTotals::default();
+    let mut found = false;
+    for entry in entries.flatten() {
+        if entry.path().extension().and_then(|extension| extension.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(entry.path()) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_slice::<LiveTargetProgress>(&bytes) else {
+            continue;
+        };
+        if !progress_record_belongs_to_plan(plan, &value) {
+            continue;
+        }
+        found = true;
+        totals.targets.insert(value.target);
+        totals.fetch_attempts = totals.fetch_attempts.saturating_add(value.fetch_attempts);
+        totals.fetch_bytes_received = totals
+            .fetch_bytes_received
+            .saturating_add(value.fetch_bytes_received);
+        totals.fetch_rate_limit_responses = totals
+            .fetch_rate_limit_responses
+            .saturating_add(value.fetch_rate_limit_responses);
+        totals.fetch_client_error_responses = totals
+            .fetch_client_error_responses
+            .saturating_add(value.fetch_client_error_responses);
+        totals.fetch_server_error_responses = totals
+            .fetch_server_error_responses
+            .saturating_add(value.fetch_server_error_responses);
+        totals.fetch_transport_errors = totals
+            .fetch_transport_errors
+            .saturating_add(value.fetch_transport_errors);
+    }
+    found.then_some(totals)
+}
+
+fn persist_live_progress(state: &Arc<Mutex<LiveProgressState>>, force: bool) {
+    let Ok(mut state) = state.lock() else {
+        return;
+    };
+    if !force && state.last_write.elapsed() < Duration::from_secs(2) {
+        return;
+    }
+    let now = now_micros();
+    if state.last_phase != state.value.phase {
+        state.last_phase = state.value.phase.clone();
+        state.value.phase_started_at_micros = now;
+    } else if state.value.phase_started_at_micros == 0 {
+        state.value.phase_started_at_micros = now;
+    }
+    let (user, system, rss) = process_resource_usage();
+    state.value.cpu_user_micros = user;
+    state.value.cpu_system_micros = system;
+    state.value.peak_rss_bytes = rss;
+    state.value.updated_at_micros = now;
+    write_live_progress_locked(&mut state);
+}
+
+/// Per-target resource counters are sampled in the build-node process itself.
+/// `ru_maxrss` is bytes on macOS and KiB on Linux; keeping the conversion here
+/// makes the sidecar format platform-independent.
+fn process_resource_usage() -> (u64, u64, u64) {
+    #[cfg(unix)]
+    {
+        let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+        if unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } == 0 {
+            let usage = unsafe { usage.assume_init() };
+            let micros = |value: libc::timeval| {
+                let seconds = u64::try_from(value.tv_sec).unwrap_or(0);
+                let micros = u64::try_from(value.tv_usec).unwrap_or(0);
+                seconds.saturating_mul(1_000_000).saturating_add(micros)
+            };
+            let rss = u64::try_from(usage.ru_maxrss).unwrap_or(0);
+            let rss = if cfg!(target_os = "macos") {
+                rss
+            } else {
+                rss.saturating_mul(1024)
+            };
+            return (micros(usage.ru_utime), micros(usage.ru_stime), rss);
+        }
+    }
+    (0, 0, 0)
+}
+
+fn persist_live_heartbeat(state: &Arc<Mutex<LiveProgressState>>) {
+    let Ok(mut state) = state.lock() else {
+        return;
+    };
+    state.value.heartbeat_at_micros = now_micros();
+    write_live_progress_locked(&mut state);
+}
+
+fn set_live_phase(state: &Arc<Mutex<LiveProgressState>>, phase: &str) {
+    let changed = state
+        .lock()
+        .map(|mut state| {
+            if state.value.phase == phase {
+                false
+            } else {
+                state.value.phase = phase.to_owned();
+                true
+            }
+        })
+        .unwrap_or(false);
+    if changed {
+        persist_live_progress(state, true);
+    }
+}
+
+fn write_live_progress_locked(state: &mut LiveProgressState) {
+    let temporary = state.path.with_extension("progress.json.tmp");
+    if let Ok(bytes) = serde_json::to_vec(&state.value) {
+        if std::fs::write(&temporary, &bytes).is_ok() {
+            let _ = std::fs::rename(&temporary, &state.path);
+            // Keep the latest snapshot outside the disposable partial target.
+            // A failed target is deliberately removed before the next retry,
+            // so the sidecar alone cannot provide monotonic build totals.
+            // One file per attempt avoids a contended shared ledger and makes
+            // concurrent workers naturally atomic: each worker only replaces
+            // its own file.
+            let history = progress_history_path(&state.path, &state.value);
+            if let Some(parent) = history.parent() {
+                if std::fs::create_dir_all(parent).is_ok() {
+                    let history_tmp = history.with_extension("json.tmp");
+                    if std::fs::write(&history_tmp, &bytes).is_ok() {
+                        let _ = std::fs::rename(history_tmp, history);
+                    }
+                }
+            }
+            state.last_write = Instant::now();
+        }
+    }
+}
+
+struct CountingReader<R> {
+    inner: R,
+    read_bytes: u64,
+    state: Arc<Mutex<LiveProgressState>>,
+    stats: wikimak_mediawiki::FetchStatsHandle,
+}
+
+struct DecodedCountingReader {
+    inner: Box<dyn Read + Send>,
+    read_bytes: u64,
+    state: Arc<Mutex<LiveProgressState>>,
+}
+
+impl Read for DecodedCountingReader {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        set_live_phase(&self.state, "decompressing");
+        let count = self.inner.read(buffer)?;
+        if count != 0 {
+            self.read_bytes = self.read_bytes.saturating_add(count as u64);
+            if let Ok(mut state) = self.state.lock() {
+                state.value.decoded_bytes = self.read_bytes;
+            }
+            persist_live_progress(&self.state, false);
+        }
+        Ok(count)
+    }
+}
+
+impl<R> CountingReader<R> {
+    fn sync_stats(&self, force: bool) {
+        if let Ok(stats) = self.stats.lock() {
+            if let Ok(mut state) = self.state.lock() {
+                state.value.source_bytes_read = self.read_bytes;
+                state.value.fetch_attempts = stats.attempts;
+                state.value.fetch_bytes_received = stats.bytes_received;
+                state.value.fetch_rate_limit_responses = stats.rate_limit_responses;
+                state.value.fetch_client_error_responses = stats.client_error_responses;
+                state.value.fetch_server_error_responses = stats.server_error_responses;
+                state.value.fetch_transport_errors = stats.transport_errors;
+            }
+        }
+        persist_live_progress(&self.state, force);
+    }
+}
+
+impl<R: Read> Read for CountingReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        set_live_phase(&self.state, "waiting for source bytes");
+        let count = match self.inner.read(buffer) {
+            Ok(count) => count,
+            Err(error) => {
+                self.sync_stats(true);
+                return Err(error);
+            }
+        };
+        if count != 0 {
+            self.read_bytes = self.read_bytes.saturating_add(count as u64);
+        }
+        self.sync_stats(false);
+        Ok(count)
+    }
 }
 
 impl DirectBuildPlan {
@@ -165,6 +694,19 @@ impl DirectBuildPlan {
                     .map(|file| file.part.size_bytes),
             )
             .sum()
+    }
+
+    pub(crate) fn first_source_url(&self) -> Option<&str> {
+        self.content_groups
+            .iter()
+            .flatten()
+            .map(|part| part.url.as_str())
+            .chain(
+                self.history_files
+                    .iter()
+                    .map(|file| file.part.url.as_str()),
+            )
+            .next()
     }
 
     fn target_source_bytes(&self, kind: &str, index: usize) -> u64 {
@@ -200,6 +742,8 @@ struct BuildReceipt {
     kind: String,
     index: usize,
     data_bytes: u64,
+    #[serde(default)]
+    stats: PartialStats,
 }
 
 fn plan_part(part: &PlannedPart) -> wikimak_mediawiki::Part {
@@ -335,7 +879,23 @@ pub(crate) fn prune_invalid_build_nodes(root: &Path, plan: &DirectBuildPlan) -> 
     }
     for entry in std::fs::read_dir(root.join("nodes"))? {
         let entry = entry?;
-        if entry.file_name().to_string_lossy().starts_with('.') {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let resumable = name
+            .strip_prefix('.')
+            .and_then(|name| name.strip_suffix(".partial"))
+            .and_then(|name| name.rsplit_once('-'))
+            .is_some_and(|(kind, index)| {
+                index.parse::<usize>().ok().is_some_and(|index| {
+                    matches!(kind, "content" | "history")
+                        && index
+                            < if kind == "content" {
+                                plan.content_groups.len()
+                            } else {
+                                plan.history_files.len()
+                            }
+                })
+            });
+        if name.starts_with('.') && !resumable {
             let path = entry.path();
             if path.is_dir() {
                 std::fs::remove_dir_all(path)?;
@@ -414,50 +974,437 @@ pub fn mirror_build_progress(archive: impl AsRef<Path>) -> Option<MirrorBuildPro
     let root = crate::cli::mirror_scratch_path(archive.as_ref());
     let plan = read_direct_build_plan(&root.join("plan.json")).ok()?;
     let total = plan.target_count() as u64;
+    let network_history = read_network_history(&root, &plan);
     if root.join("archive.complete").exists() {
         return Some(MirrorBuildProgress {
             phase: "indexing".into(),
             targets_total: total,
             targets_completed: total,
+            target_progress: Vec::new(),
             source_bytes_total: plan.source_bytes(),
             source_bytes_completed: plan.source_bytes(),
+            active_source_bytes_per_second: None,
+            active_quiet_seconds: None,
+            fetch_attempts: network_history
+                .as_ref()
+                .map_or(0, |history| history.fetch_attempts),
+            fetch_bytes_received: network_history
+                .as_ref()
+                .map_or(0, |history| history.fetch_bytes_received),
+            fetch_rate_limit_responses: network_history
+                .as_ref()
+                .map_or(0, |history| history.fetch_rate_limit_responses),
+            fetch_client_error_responses: network_history
+                .as_ref()
+                .map_or(0, |history| history.fetch_client_error_responses),
+            fetch_server_error_responses: network_history
+                .as_ref()
+                .map_or(0, |history| history.fetch_server_error_responses),
+            fetch_transport_errors: network_history
+                .as_ref()
+                .map_or(0, |history| history.fetch_transport_errors),
             snapshot: plan.content_snapshot,
             ..Default::default()
         });
     }
+    let historical_targets = network_history
+        .as_ref()
+        .map(|history| &history.targets);
     let mut completed = 0_u64;
     let mut completed_bytes = 0_u64;
+    let mut fetch_attempts = network_history
+        .as_ref()
+        .map_or(0, |history| history.fetch_attempts);
+    let mut fetch_bytes_received = network_history
+        .as_ref()
+        .map_or(0, |history| history.fetch_bytes_received);
+    let mut fetch_rate_limit_responses = network_history
+        .as_ref()
+        .map_or(0, |history| history.fetch_rate_limit_responses);
+    let mut fetch_client_error_responses = network_history
+        .as_ref()
+        .map_or(0, |history| history.fetch_client_error_responses);
+    let mut fetch_server_error_responses = network_history
+        .as_ref()
+        .map_or(0, |history| history.fetch_server_error_responses);
+    let mut fetch_transport_errors = network_history
+        .as_ref()
+        .map_or(0, |history| history.fetch_transport_errors);
     for (kind, count) in [
         ("content", plan.content_groups.len()),
         ("history", plan.history_files.len()),
     ] {
         for index in 0..count {
-            if node_path(&root, kind, index).join("receipt.json").is_file() {
+            let receipt_path = node_path(&root, kind, index).join("receipt.json");
+            if receipt_path.is_file() {
                 completed += 1;
                 completed_bytes =
                     completed_bytes.saturating_add(plan.target_source_bytes(kind, index));
+                let target_name = format!("{kind}-{index:06}");
+                let receipt_is_historical = historical_targets
+                    .is_some_and(|targets| targets.contains(&target_name));
+                if !receipt_is_historical {
+                    if let Ok(bytes) = std::fs::read(receipt_path) {
+                        if let Ok(receipt) = serde_json::from_slice::<BuildReceipt>(&bytes) {
+                            fetch_attempts = fetch_attempts
+                                .saturating_add(receipt.stats.fetch_attempts);
+                            fetch_bytes_received = fetch_bytes_received
+                                .saturating_add(receipt.stats.fetch_bytes_received);
+                            fetch_rate_limit_responses = fetch_rate_limit_responses
+                                .saturating_add(receipt.stats.fetch_rate_limit_responses);
+                            fetch_client_error_responses = fetch_client_error_responses
+                                .saturating_add(receipt.stats.fetch_client_error_responses);
+                            fetch_server_error_responses = fetch_server_error_responses
+                                .saturating_add(receipt.stats.fetch_server_error_responses);
+                            fetch_transport_errors = fetch_transport_errors
+                                .saturating_add(receipt.stats.fetch_transport_errors);
+                        }
+                    }
+                }
             }
         }
     }
-    let mut active = std::fs::read_dir(root.join("nodes"))
+    let active_dirs = std::fs::read_dir(root.join("nodes"))
         .ok()?
         .filter_map(std::result::Result::ok)
         .filter_map(|entry| {
             let name = entry.file_name().to_string_lossy().into_owned();
             name.starts_with('.')
                 .then(|| {
-                    name.trim_start_matches('.')
-                        .split('.')
-                        .next()
-                        .unwrap_or(&name)
-                        .to_owned()
+                    (
+                        name.trim_start_matches('.')
+                            .split('.')
+                            .next()
+                            .unwrap_or(&name)
+                            .to_owned(),
+                        entry.path(),
+                    )
                 })
         })
         .collect::<Vec<_>>();
+    let mut active = Vec::new();
+    let mut target_progress = Vec::new();
+    let mut active_rate = 0_u64;
+    let mut active_quiet = 0_u64;
+    let mut failed_target = false;
+    let mut live_target = false;
+    for (target, path) in active_dirs {
+        if active.iter().any(|item: &String| item.starts_with(&target)) {
+            continue;
+        }
+        let Some((kind, index)) = target.rsplit_once('-').and_then(|(kind, index)| {
+            index.parse::<usize>().ok().map(|index| (kind, index))
+        }) else {
+            active.push(target);
+            continue;
+        };
+        let mut live = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&path) {
+            for entry in entries.flatten() {
+                let file_name = entry.file_name();
+                if !file_name.to_string_lossy().ends_with(".progress.json") {
+                    continue;
+                }
+                if let Ok(bytes) = std::fs::read(entry.path()) {
+                    if let Ok(value) = serde_json::from_slice::<LiveTargetProgress>(&bytes) {
+                        live.push(value);
+                    }
+                }
+            }
+        }
+        if live.is_empty() {
+            // A dot-prefixed node is not proof that a worker is alive. It
+            // survives a killed worker and is retained for resumability, so
+            // expose it as stale state instead of inventing a dependency on
+            // a coordination service that is not part of the mirror job.
+            failed_target = true;
+            target_progress.push(MirrorTargetProgress {
+                target: target.clone(),
+                kind: kind.to_owned(),
+                phase: "stale build state (no progress record)".into(),
+                source_bytes_total: plan.target_source_bytes(kind, index),
+                ..Default::default()
+            });
+            active.push(format!("{target} · stale build state (no progress record)"));
+            continue;
+        }
+        let downloaded = live
+            .iter()
+            .map(|value| value.source_bytes_read)
+            .sum::<u64>();
+        let total = live
+            .iter()
+            .map(|value| value.source_bytes_total)
+            .sum::<u64>();
+        let revisions = live.iter().map(|value| value.revisions).sum::<u64>();
+        let text_bytes = live.iter().map(|value| value.text_bytes).sum::<u64>();
+        if historical_targets.is_none_or(|targets| !targets.contains(&target)) {
+            fetch_attempts = fetch_attempts.saturating_add(
+                live.iter()
+                    .map(|value| value.fetch_attempts)
+                    .sum::<u64>(),
+            );
+            fetch_bytes_received = fetch_bytes_received.saturating_add(
+                live.iter()
+                    .map(|value| value.fetch_bytes_received)
+                    .sum::<u64>(),
+            );
+            fetch_rate_limit_responses = fetch_rate_limit_responses.saturating_add(
+                live.iter()
+                    .map(|value| value.fetch_rate_limit_responses)
+                    .sum::<u64>(),
+            );
+            fetch_client_error_responses = fetch_client_error_responses.saturating_add(
+                live.iter()
+                    .map(|value| value.fetch_client_error_responses)
+                    .sum::<u64>(),
+            );
+            fetch_server_error_responses = fetch_server_error_responses.saturating_add(
+                live.iter()
+                    .map(|value| value.fetch_server_error_responses)
+                    .sum::<u64>(),
+            );
+            fetch_transport_errors = fetch_transport_errors.saturating_add(
+                live.iter()
+                    .map(|value| value.fetch_transport_errors)
+                    .sum::<u64>(),
+            );
+        }
+        let phase_is_failed = |value: &LiveTargetProgress| {
+            let phase = value.phase.to_ascii_lowercase();
+            phase.contains("failed") || phase.contains("error") || phase.contains("stopped")
+        };
+        // A sibling source can continue briefly after another one fails. Its
+        // newer heartbeat must not hide the failed source that will determine
+        // the target result.
+        let current = live
+            .iter()
+            .filter(|value| phase_is_failed(value))
+            .max_by_key(|value| value.updated_at_micros)
+            .or_else(|| {
+                live.iter()
+                    .filter(|value| value.phase != "finished")
+                    .max_by_key(|value| value.updated_at_micros)
+            })
+            .or_else(|| live.iter().max_by_key(|value| value.updated_at_micros))
+            .expect("live progress is non-empty");
+        let observed_now = now_micros();
+        let source_rate = |value: &LiveTargetProgress| {
+            let elapsed = observed_now.saturating_sub(value.started_at_micros);
+            if elapsed == 0 {
+                0
+            } else {
+                value.source_bytes_read.saturating_mul(1_000_000) / elapsed
+            }
+        };
+        let source_quiet = |value: &LiveTargetProgress| {
+            observed_now.saturating_sub(value.updated_at_micros) / 1_000_000
+        };
+        let rate = live
+            .iter()
+            .filter(|value| value.phase != "finished" && !phase_is_failed(value))
+            .map(source_rate)
+            .sum::<u64>();
+        let quiet_seconds = source_quiet(current);
+        let target_total = plan.target_source_bytes(kind, index);
+        let total = total.max(target_total);
+        let percent = (total > 0)
+            .then(|| downloaded.saturating_mul(100) / total)
+            .unwrap_or(0);
+        let title = if current.current_title.is_empty() {
+            String::new()
+        } else {
+            format!(" · {}", current.current_title.chars().take(80).collect::<String>())
+        };
+        let source_file = if current.part.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " · source {}",
+                current.part.chars().take(96).collect::<String>()
+            )
+        };
+        let all_sources_finished = live.iter().all(|value| value.phase == "finished");
+        let phase = if all_sources_finished {
+            "merging completed source fragments"
+        } else if current.phase.is_empty() {
+            "working"
+        } else {
+            current.phase.as_str()
+        };
+        let is_failed = live.iter().any(phase_is_failed);
+        failed_target |= is_failed;
+        if !is_failed {
+            live_target = true;
+            active_rate = active_rate.saturating_add(rate);
+            let quietest_source = live
+                .iter()
+                .filter(|value| value.phase != "finished")
+                .map(source_quiet)
+                .max()
+                .unwrap_or(quiet_seconds);
+            active_quiet = active_quiet.max(quietest_source);
+        }
+        let record_label = if kind == "history" { "events" } else { "revisions" };
+        let waiting_for_source = current.source_bytes_read == 0
+            && current.revisions == 0
+            && (phase.contains("network") || phase.contains("source bytes"));
+        let heartbeat_seconds = (current.heartbeat_at_micros > 0)
+            .then(|| {
+                now_micros()
+                    .saturating_sub(current.heartbeat_at_micros)
+                    / 1_000_000
+            })
+            .unwrap_or(u64::MAX);
+        let phase_seconds = (current.phase_started_at_micros > 0)
+            .then(|| {
+                now_micros()
+                    .saturating_sub(current.phase_started_at_micros)
+                    / 1_000_000
+            })
+            .unwrap_or(0);
+        let quiet = if quiet_seconds >= 10 {
+            format!(
+                " · no data progress for {quiet_seconds}s ({})",
+                if heartbeat_seconds <= 5 {
+                    format!("worker heartbeat {heartbeat_seconds}s ago")
+                } else if waiting_for_source {
+                    "waiting for source bytes and heartbeat is quiet".into()
+                } else {
+                    "parser/encoder heartbeat quiet".into()
+                }
+            )
+        } else {
+            String::new()
+        };
+        if all_sources_finished {
+            target_progress.push(MirrorTargetProgress {
+                target: target.clone(),
+                kind: kind.to_owned(),
+                phase: phase.to_owned(),
+                source_bytes_read: downloaded,
+                source_bytes_total: total,
+                decoded_bytes: live.iter().map(|value| value.decoded_bytes).sum(),
+                pages: live.iter().map(|value| value.pages).sum(),
+                records: revisions,
+                text_bytes,
+                quiet_seconds,
+                heartbeat_seconds,
+                phase_seconds,
+                cpu_user_micros: current.cpu_user_micros,
+                cpu_system_micros: current.cpu_system_micros,
+                peak_rss_bytes: current.peak_rss_bytes,
+                fetch_attempts: live.iter().map(|value| value.fetch_attempts).sum(),
+                fetch_bytes_received: live
+                    .iter()
+                    .map(|value| value.fetch_bytes_received)
+                    .sum(),
+                fetch_rate_limit_responses: live
+                    .iter()
+                    .map(|value| value.fetch_rate_limit_responses)
+                    .sum(),
+                fetch_client_error_responses: live
+                    .iter()
+                    .map(|value| value.fetch_client_error_responses)
+                    .sum(),
+                fetch_server_error_responses: live
+                    .iter()
+                    .map(|value| value.fetch_server_error_responses)
+                    .sum(),
+                fetch_transport_errors: live
+                    .iter()
+                    .map(|value| value.fetch_transport_errors)
+                    .sum(),
+                ..Default::default()
+            });
+        } else {
+            let mut visible = live
+                .iter()
+                .filter(|value| value.phase != "finished" || phase_is_failed(value))
+                .collect::<Vec<_>>();
+            visible.sort_by_key(|value| {
+                if kind == "content" {
+                    plan.content_groups[index]
+                        .iter()
+                        .position(|part| part.filename == value.part)
+                        .unwrap_or(usize::MAX)
+                } else {
+                    0
+                }
+            });
+            for value in visible {
+                let source_index = if kind == "content" {
+                    plan.content_groups[index]
+                        .iter()
+                        .position(|part| part.filename == value.part)
+                } else {
+                    None
+                };
+                let worker = source_index
+                    .filter(|_| live.len() > 1)
+                    .map_or_else(|| target.clone(), |source| format!("{target}/s{:02}", source + 1));
+                let heartbeat = (value.heartbeat_at_micros > 0)
+                    .then(|| {
+                        observed_now.saturating_sub(value.heartbeat_at_micros) / 1_000_000
+                    })
+                    .unwrap_or(u64::MAX);
+                let phase_age = (value.phase_started_at_micros > 0)
+                    .then(|| {
+                        observed_now.saturating_sub(value.phase_started_at_micros) / 1_000_000
+                    })
+                    .unwrap_or(0);
+                target_progress.push(MirrorTargetProgress {
+                    target: worker,
+                    kind: kind.to_owned(),
+                    phase: if value.phase.is_empty() {
+                        "working".into()
+                    } else {
+                        value.phase.clone()
+                    },
+                    source: value.part.clone(),
+                    source_bytes_read: value.source_bytes_read,
+                    source_bytes_total: value.source_bytes_total,
+                    decoded_bytes: value.decoded_bytes,
+                    bytes_per_second: source_rate(value),
+                    pages: value.pages,
+                    records: value.revisions,
+                    text_bytes: value.text_bytes,
+                    current_page: value.current_page,
+                    current_title: value.current_title.clone(),
+                    quiet_seconds: source_quiet(value),
+                    heartbeat_seconds: heartbeat,
+                    phase_seconds: phase_age,
+                    fetch_attempts: value.fetch_attempts,
+                    fetch_bytes_received: value.fetch_bytes_received,
+                    fetch_rate_limit_responses: value.fetch_rate_limit_responses,
+                    fetch_client_error_responses: value.fetch_client_error_responses,
+                    fetch_server_error_responses: value.fetch_server_error_responses,
+                    fetch_transport_errors: value.fetch_transport_errors,
+                    cpu_user_micros: value.cpu_user_micros,
+                    cpu_system_micros: value.cpu_system_micros,
+                    peak_rss_bytes: value.peak_rss_bytes,
+                });
+            }
+        }
+        active.push(format!(
+            "{target} · {phase} · {percent}% source · {} / {} at {}/s · {} {record_label} · {} text{}{}{}",
+            human_progress_bytes(downloaded),
+            human_progress_bytes(total),
+            human_progress_bytes(rate),
+            revisions,
+            human_progress_bytes(text_bytes),
+            source_file,
+            title,
+            quiet,
+        ));
+        completed_bytes = completed_bytes.saturating_add(downloaded);
+    }
     active.sort();
-    active.dedup();
+    let has_active = live_target;
     Some(MirrorBuildProgress {
-        phase: if !active.is_empty() || completed < total {
+        phase: if failed_target {
+            "failed; inspect target details".into()
+        } else if !active.is_empty() || completed < total {
             "fetching and parsing".into()
         } else if root.join("stage2.mk").exists() {
             "assembling".into()
@@ -466,11 +1413,35 @@ pub fn mirror_build_progress(archive: impl AsRef<Path>) -> Option<MirrorBuildPro
         },
         targets_total: total,
         targets_completed: completed,
+        target_progress,
         targets_active: active,
         source_bytes_total: plan.source_bytes(),
         source_bytes_completed: completed_bytes,
+        active_source_bytes_per_second: has_active.then_some(active_rate),
+        active_quiet_seconds: has_active.then_some(active_quiet),
+        fetch_attempts,
+        fetch_bytes_received,
+        fetch_rate_limit_responses,
+        fetch_client_error_responses,
+        fetch_server_error_responses,
+        fetch_transport_errors,
         snapshot: plan.content_snapshot,
     })
+}
+
+fn human_progress_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{} {}", bytes, UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
 }
 
 fn sync_directory(path: &Path) -> Result<()> {
@@ -485,6 +1456,7 @@ fn publish_node(
     kind: &str,
     index: usize,
     temporary: &Path,
+    stats: &PartialStats,
 ) -> Result<()> {
     let data = temporary.join("data.swdump");
     let data_bytes = std::fs::metadata(&data)?.len();
@@ -497,6 +1469,7 @@ fn publish_node(
         kind: kind.to_owned(),
         index,
         data_bytes,
+        stats: stats.clone(),
     };
     let receipt_path = temporary.join("receipt.json");
     {
@@ -509,6 +1482,20 @@ fn publish_node(
     sync_directory(temporary)?;
     let destination = node_path(root, kind, index);
     std::fs::rename(temporary, &destination)?;
+    // Finished source sidecars remain beside their intermediate archives
+    // until this atomic publish so the target's live byte count cannot move
+    // backwards. The durable receipt supersedes them after publication.
+    for entry in std::fs::read_dir(&destination)? {
+        let entry = entry?;
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".progress.json")
+        {
+            std::fs::remove_file(entry.path())?;
+        }
+    }
+    sync_directory(&destination)?;
     sync_directory(&root.join("nodes"))?;
     Ok(())
 }
@@ -526,15 +1513,47 @@ pub(crate) fn materialize_direct_build_node(
         progress(&format!("reusing {kind} target {}/{}", index + 1, plan.target_count()));
         return Ok(());
     }
-    let temporary = root.join("nodes").join(format!(
-        ".{kind}-{index:06}.{}.partial",
-        std::process::id()
-    ));
-    if temporary.exists() {
-        std::fs::remove_dir_all(&temporary)?;
-    }
-    std::fs::create_dir(&temporary)?;
-    let result = match kind {
+    let temporary = root
+        .join("nodes")
+        .join(format!(".{kind}-{index:06}.partial"));
+    std::fs::create_dir_all(&temporary)?;
+    // A target can spend many minutes inside one blocking read/write call:
+    // durable receipts only appear after the whole target is complete, and
+    // the parent scheduler otherwise sees no stderr at all during that time.
+    // Keep emitting the last known activity so the live mirror job has a
+    // heartbeat even while the parser is blocked on its spool or the output
+    // file is blocked on the destination volume.
+    let activity = Arc::new(Mutex::new(format!(
+        "starting {kind} target {}/{}",
+        index + 1,
+        plan.target_count()
+    )));
+    let heartbeat_stop = Arc::new(AtomicBool::new(false));
+    let heartbeat_activity = Arc::clone(&activity);
+    let heartbeat_stop_thread = Arc::clone(&heartbeat_stop);
+    let heartbeat_name = format!("{kind}-{index:06}");
+    let heartbeat = std::thread::spawn(move || {
+        while !heartbeat_stop_thread.load(Ordering::Relaxed) {
+            for _ in 0..50 {
+                if heartbeat_stop_thread.load(Ordering::Relaxed) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            let message = heartbeat_activity
+                .lock()
+                .map(|message| message.clone())
+                .unwrap_or_else(|_| "activity state unavailable".into());
+            eprintln!("heartbeat {heartbeat_name}: {message}");
+        }
+    });
+    let report = |message: &str| {
+        if let Ok(mut activity) = activity.lock() {
+            *activity = message.to_owned();
+        }
+        progress(message);
+    };
+    let result: Result<PartialStats> = match kind {
         "content" => {
             let parts = plan
                 .content_groups
@@ -546,12 +1565,14 @@ pub(crate) fn materialize_direct_build_node(
             let built = build_content_group(
                 client,
                 &parts,
-                0,
+                index,
                 &temporary,
                 bz2_workers,
                 plan.observed_at_micros,
-                progress,
+                true,
+                &report,
             )?;
+            let built_stats = built.stats.clone();
             std::fs::rename(built.path, temporary.join("data.swdump"))?;
             if index == 0 {
                 let site_info = built
@@ -571,7 +1592,7 @@ pub(crate) fn materialize_direct_build_node(
                     .map_err(map_archive)?;
                 writer.finish().map_err(map_archive)?;
             }
-            Ok(())
+            Ok(built_stats)
         }
         "history" => {
             let file = planned_history(
@@ -580,7 +1601,7 @@ pub(crate) fn materialize_direct_build_node(
                     .ok_or(Error::Corrupt("history target is outside build plan"))?,
             );
             let cancelled = Arc::new(AtomicBool::new(false));
-            let (path, _) = build_history_part(
+            let (path, stats) = build_history_part(
                 client,
                 &plan.wiki_db,
                 &file,
@@ -588,17 +1609,27 @@ pub(crate) fn materialize_direct_build_node(
                 &temporary,
                 bz2_workers,
                 cancelled,
+                &report,
             )?;
             std::fs::rename(path, temporary.join("data.swdump"))?;
-            Ok(())
+            Ok(stats)
         }
         _ => Err(Error::Corrupt("unknown direct build target kind")),
     };
-    if let Err(error) = result {
-        let _ = std::fs::remove_dir_all(&temporary);
-        return Err(error);
-    }
-    publish_node(root, plan, kind, index, &temporary)?;
+    heartbeat_stop.store(true, Ordering::Relaxed);
+    let _ = heartbeat.join();
+    let stats = match result {
+        Ok(stats) => stats,
+        Err(error) => {
+            let message = format!("failed {kind} target {}: {error}", index + 1);
+            eprintln!("{message}");
+            progress(&message);
+            // Keep the failed node and its per-source sidecars for diagnosis.
+            // A resumed build removes this dot-prefixed attempt before retrying.
+            return Err(error);
+        }
+    };
+    publish_node(root, plan, kind, index, &temporary, &stats)?;
     progress(&format!("finished {kind} target {}", index + 1));
     Ok(())
 }
@@ -833,6 +1864,10 @@ pub fn build_direct_archive(
     let started = Instant::now();
     std::fs::create_dir_all(scratch_parent.as_ref())?;
     let scratch = tempfile::TempDir::new_in(scratch_parent)?;
+    std::env::set_var(
+        "SARUN_WIKIMEDIA_ROBOTS_CACHE",
+        scratch.path().join("robots-cache"),
+    );
     let peak = Arc::new(AtomicU64::new(0));
     let stop = Arc::new(AtomicBool::new(false));
     let monitor = {
@@ -883,6 +1918,10 @@ pub fn build_update_archive(
     let frontier = archive_frontier(base_archive.as_ref(), dbname)?;
     std::fs::create_dir_all(scratch_parent.as_ref())?;
     let scratch = scratch_parent.as_ref();
+    std::env::set_var(
+        "SARUN_WIKIMEDIA_ROBOTS_CACHE",
+        scratch.join("robots-cache"),
+    );
     let peak = Arc::new(AtomicU64::new(0));
     let stop = Arc::new(AtomicBool::new(false));
     let monitor = {
@@ -1220,6 +2259,9 @@ fn build_direct_inner(
         return Err(Error::Corrupt("content dump contains no parts"));
     }
     let group_count = groups.len();
+    // Keep a few independent page-range pipelines available for CPU work.
+    // The engine admits one Wikipedia job, while all request workers in that
+    // job share the mediawiki process-wide gate.
     let workers = groups.len().min(cores).min(3).max(1);
     let bz2_workers = (cores / workers).max(1);
     let queue = Arc::new(Mutex::new(VecDeque::from(
@@ -1253,6 +2295,7 @@ fn build_direct_inner(
                     scratch,
                     bz2_workers,
                     observed_at_micros,
+                    false,
                     progress,
                 );
                 if result.is_err() {
@@ -1452,6 +2495,7 @@ fn build_history_parts(
                     scratch,
                     bz2_workers,
                     Arc::clone(&cancelled),
+                    progress,
                 ) {
                     Ok(result) => {
                         if let Err(error) =
@@ -1507,8 +2551,52 @@ fn build_history_part(
     scratch: &Path,
     bz2_workers: usize,
     cancelled: Arc<AtomicBool>,
+    progress: &(impl Fn(&str) + Sync),
 ) -> Result<(PathBuf, PartialStats)> {
-    let source = wikimak_mediawiki::fetch(client, &file.part)?;
+    let live_path = scratch.join(format!("history-{file_index:06}.progress.json"));
+    let live = Arc::new(Mutex::new(LiveProgressState {
+        path: live_path.clone(),
+        value: LiveTargetProgress {
+            target: format!("history-{file_index:06}"),
+            part: file.part.filename.clone(),
+            phase: "starting".into(),
+            source_bytes_total: file.part.size_bytes,
+            started_at_micros: now_micros(),
+            updated_at_micros: now_micros(),
+            ..Default::default()
+        },
+        last_write: Instant::now()
+            .checked_sub(Duration::from_secs(3))
+            .unwrap_or_else(Instant::now),
+        last_phase: "starting".into(),
+    }));
+    persist_live_progress(&live, true);
+    let _heartbeat = LiveProgressHeartbeat::start(&live);
+    let _failure_guard = LiveProgressFailureGuard {
+        state: Arc::clone(&live),
+    };
+    progress(&format!("history download {}", file.part.filename));
+    set_live_phase(&live, "waiting for network slot");
+    let source = match wikimak_mediawiki::fetch(client, &file.part) {
+        Ok(source) => source,
+        Err(error) => {
+            if let Ok(mut state) = live.lock() {
+                state.value.phase = format!("download failed: {error}");
+            }
+            persist_live_progress(&live, true);
+            return Err(Error::Mediawiki(error));
+        }
+    };
+    let fetch_stats = source.stats_handle();
+    let source = CountingReader {
+        inner: source,
+        read_bytes: 0,
+        state: Arc::clone(&live),
+        stats: Arc::clone(&fetch_stats),
+    };
+    source.sync_stats(true);
+    progress(&format!("history decompress/parse {}", file.part.filename));
+    set_live_phase(&live, "streaming source pipeline");
     let decoder = wikimak_mediawiki::new_bz2_reader(
         CancelReader {
             inner: source,
@@ -1518,10 +2606,35 @@ fn build_history_part(
             workers: bz2_workers,
         },
     );
+    let decoder = DecodedCountingReader {
+        inner: Box::new(decoder),
+        read_bytes: 0,
+        state: Arc::clone(&live),
+    };
     let mut sorter = RecordSorter::new_in(scratch).map_err(map_archive)?;
     let mut stats = PartialStats::default();
+    let mut last_activity = Instant::now()
+        .checked_sub(Duration::from_secs(3))
+        .unwrap_or_else(Instant::now);
     for (line_number, line) in std::io::BufReader::new(decoder).lines().enumerate() {
+        set_live_phase(&live, "parsing TSV");
         let line = line?;
+        if let Ok(mut state) = live.lock() {
+            state.value.revisions = line_number.saturating_add(1) as u64;
+            state.value.text_bytes = state
+                .value
+                .text_bytes
+                .saturating_add(line.len() as u64);
+        }
+        persist_live_progress(&live, false);
+        if last_activity.elapsed() >= Duration::from_secs(2) {
+            progress(&format!(
+                "history parse {} line {}",
+                file.part.filename,
+                line_number + 1
+            ));
+            last_activity = Instant::now();
+        }
         let fields: Vec<&str> = line.split('\t').collect();
         let page = match fields.len() {
             78 => 28,
@@ -1552,6 +2665,7 @@ fn build_history_part(
             if fields.len() == 78 { 60 } else { 58 },
             ordinal,
         )? {
+            set_live_phase(&live, "sorting/writing");
             sorter.push(record).map_err(map_archive)?;
         }
         stats.events += 1;
@@ -1569,6 +2683,15 @@ fn build_history_part(
     let (_, _, _) = sorter
         .finish(std::fs::File::create(&path)?, DEFAULT_FRAME_TARGET)
         .map_err(map_archive)?;
+    // Capture the final retry/HTTP counters before the last durable progress
+    // snapshot.  Previously this happened after the sidecar was removed,
+    // leaving the historical accounting one fetch behind.
+    stats.record_fetch(&fetch_stats);
+    if let Ok(mut state) = live.lock() {
+        state.value.phase = "finished".into();
+    }
+    persist_live_progress(&live, true);
+    let _ = std::fs::remove_file(live_path);
     Ok((path, stats))
 }
 
@@ -1652,6 +2775,7 @@ fn build_content_parts(
                     scratch,
                     bz2_workers,
                     observed_at_micros,
+                    false,
                     progress,
                 ) {
                     Ok(result) => {
@@ -1745,16 +2869,75 @@ fn build_content_group(
     scratch: &Path,
     bz2_workers: usize,
     observed_at_micros: i64,
+    retain_live_progress_until_publish: bool,
     progress: &(impl Fn(&str) + Sync),
 ) -> Result<ContentPartResult> {
     let path = scratch.join(format!("content-{index:06}.swdump"));
     if parts.len() > 1 {
         let workers = parts.len().min(bz2_workers).max(1);
         let per_part_workers = (bz2_workers / workers).max(1);
-        let queue = Arc::new(Mutex::new(VecDeque::from(
-            parts.iter().cloned().enumerate().collect::<Vec<_>>(),
-        )));
-        let results = Arc::new(Mutex::new(Vec::new()));
+        let mut pending = Vec::new();
+        let mut reused = Vec::new();
+        for (part_index, part) in parts.iter().cloned().enumerate() {
+            let part_path = scratch.join(format!(
+                "content-{index:06}-source-{part_index:06}.swdump"
+            ));
+            let key = checkpoint_key(
+                "content-source",
+                observed_at_micros,
+                [PlannedPart::from(&part)],
+            )?;
+            let saved = retain_live_progress_until_publish
+                .then(|| {
+                    checkpoint_stats(&part_path, &key).map(|stats| {
+                        read_site_info_checkpoint(&part_path)
+                            .map(|site_info| ContentPartResult {
+                                path: part_path.clone(),
+                                stats,
+                                site_info,
+                            })
+                    })
+                })
+                .flatten()
+                .transpose()?;
+            if let Some(result) = saved {
+                let live_path = part_path.with_extension("progress.json");
+                if !live_path.exists() {
+                    let value = LiveTargetProgress {
+                        target: format!("content-{index:06}"),
+                        part: part.filename.clone(),
+                        phase: "finished".into(),
+                        source_bytes_read: part.size_bytes,
+                        source_bytes_total: part.size_bytes,
+                        pages: result.stats.pages,
+                        revisions: result.stats.revisions,
+                        started_at_micros: now_micros(),
+                        updated_at_micros: now_micros(),
+                        heartbeat_at_micros: now_micros(),
+                        ..Default::default()
+                    };
+                    std::fs::write(&live_path, serde_json::to_vec(&value).map_err(|_| {
+                        Error::Corrupt("cannot restore source progress checkpoint")
+                    })?)?;
+                }
+                progress(&format!("reusing completed source {}", part.filename));
+                reused.push((part_index, result));
+                continue;
+            }
+            for stale in [
+                part_path.clone(),
+                checkpoint_receipt_path(&part_path),
+                site_info_checkpoint_path(&part_path),
+                part_path.with_extension("progress.json"),
+            ] {
+                if stale.exists() {
+                    std::fs::remove_file(stale)?;
+                }
+            }
+            pending.push((part_index, part, key));
+        }
+        let queue = Arc::new(Mutex::new(VecDeque::from(pending)));
+        let results = Arc::new(Mutex::new(reused));
         let failure = Arc::new(Mutex::new(None));
         std::thread::scope(|scope| {
             for _ in 0..workers {
@@ -1765,7 +2948,7 @@ fn build_content_group(
                     if failure.lock().expect("failure mutex").is_some() {
                         return;
                     }
-                    let Some((part_index, part)) =
+                    let Some((part_index, part, key)) =
                         queue.lock().expect("queue mutex").pop_front()
                     else {
                         return;
@@ -1779,12 +2962,32 @@ fn build_content_group(
                         &part_path,
                         per_part_workers,
                         observed_at_micros,
+                        retain_live_progress_until_publish,
                         progress,
                     ) {
-                        Ok(result) => results
-                            .lock()
-                            .expect("results mutex")
-                            .push((part_index, result)),
+                        Ok(result) => {
+                            if retain_live_progress_until_publish {
+                                if let Err(error) = write_site_info_checkpoint(
+                                    &result.path,
+                                    observed_at_micros,
+                                    result.site_info.as_ref(),
+                                )
+                                .and_then(|_| {
+                                    write_checkpoint_receipt(
+                                        &result.path,
+                                        &key,
+                                        &result.stats,
+                                    )
+                                }) {
+                                    *failure.lock().expect("failure mutex") = Some(error);
+                                    return;
+                                }
+                            }
+                            results
+                                .lock()
+                                .expect("results mutex")
+                                .push((part_index, result));
+                        }
                         Err(error) => {
                             *failure.lock().expect("failure mutex") = Some(error);
                             return;
@@ -1805,8 +3008,7 @@ fn build_content_group(
         let mut stats = PartialStats::default();
         let mut site_info = None;
         for (_, result) in &results {
-            stats.pages = stats.pages.saturating_add(result.stats.pages);
-            stats.revisions = stats.revisions.saturating_add(result.stats.revisions);
+            stats.merge_from(&result.stats);
             if site_info.is_none() {
                 site_info = result.site_info.clone();
             }
@@ -1818,7 +3020,15 @@ fn build_content_group(
         )
         .map_err(map_archive)?;
         for input in inputs {
-            std::fs::remove_file(input)?;
+            std::fs::remove_file(&input)?;
+            for checkpoint in [
+                checkpoint_receipt_path(&input),
+                site_info_checkpoint_path(&input),
+            ] {
+                if checkpoint.exists() {
+                    std::fs::remove_file(checkpoint)?;
+                }
+            }
         }
         return Ok(ContentPartResult {
             path,
@@ -1834,6 +3044,7 @@ fn build_content_group(
         &path,
         bz2_workers,
         observed_at_micros,
+        retain_live_progress_until_publish,
         progress,
     )
 }
@@ -1844,14 +3055,72 @@ fn build_content_part(
     path: &Path,
     bz2_workers: usize,
     observed_at_micros: i64,
+    retain_live_progress_until_publish: bool,
     progress: &(impl Fn(&str) + Sync),
 ) -> Result<ContentPartResult> {
-    let mut writer = ArchiveWriter::new(std::fs::File::create(&path)?, DEFAULT_FRAME_TARGET)
-        .map_err(map_archive)?;
+    let live_path = path.with_extension("progress.json");
+    let live = Arc::new(Mutex::new(LiveProgressState {
+        path: live_path.clone(),
+        value: LiveTargetProgress {
+            target: path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("content")
+                .split("-source-")
+                .next()
+                .unwrap_or("content")
+                .to_owned(),
+            part: part.filename.clone(),
+            phase: "starting".into(),
+            source_bytes_total: part.size_bytes,
+            started_at_micros: now_micros(),
+            updated_at_micros: now_micros(),
+            ..Default::default()
+        },
+        last_write: Instant::now()
+            .checked_sub(Duration::from_secs(3))
+            .unwrap_or_else(Instant::now),
+        last_phase: "starting".into(),
+    }));
+    persist_live_progress(&live, true);
+    let _heartbeat = LiveProgressHeartbeat::start(&live);
+    let _failure_guard = LiveProgressFailureGuard {
+        state: Arc::clone(&live),
+    };
+    // Keep the parsed records in memory and let the operating system page cold
+    // text payloads if necessary. The final in-memory sort never compares
+    // wikitext bytes, and the writer then walks each payload once. Explicit
+    // bounded runs remain available for callers that deliberately request them.
+    let mut sorter = RecordSorter::new_in(
+        path.parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new(".")),
+    )
+    .map_err(map_archive)?;
     let mut stats = PartialStats::default();
     let mut site_info = None;
-    progress(&format!("content {}", part.filename));
-    let source = wikimak_mediawiki::fetch(client, part)?;
+    progress(&format!("content download {}", part.filename));
+    set_live_phase(&live, "waiting for network slot");
+    let source = match wikimak_mediawiki::fetch(client, part) {
+        Ok(source) => source,
+        Err(error) => {
+            if let Ok(mut state) = live.lock() {
+                state.value.phase = format!("download failed: {error}");
+            }
+            persist_live_progress(&live, true);
+            return Err(Error::Mediawiki(error));
+        }
+    };
+    let fetch_stats = source.stats_handle();
+    let source = CountingReader {
+        inner: source,
+        read_bytes: 0,
+        state: Arc::clone(&live),
+        stats: Arc::clone(&fetch_stats),
+    };
+    source.sync_stats(true);
+    progress(&format!("content decompress/parse {}", part.filename));
+    set_live_phase(&live, "streaming source pipeline");
     let input: Box<dyn Read + Send> = if part.filename.ends_with(".bz2") {
         Box::new(wikimak_mediawiki::new_bz2_reader(
             source,
@@ -1862,10 +3131,26 @@ fn build_content_part(
     } else {
         Box::new(source)
     };
+    let input = DecodedCountingReader {
+        inner: input,
+        read_bytes: 0,
+        state: Arc::clone(&live),
+    };
     let mut page_stream = wikimak_mediawiki::new_page_stream(input);
     let revisions = page_stream.revisions_mut();
-    while let Some(header) = revisions.next_page() {
+    let mut last_activity = Instant::now()
+        .checked_sub(Duration::from_secs(3))
+        .unwrap_or_else(Instant::now);
+    let mut pages_seen = 0_u64;
+    let mut revisions_seen = 0_u64;
+    let mut text_bytes = 0_u64;
+    loop {
+        set_live_phase(&live, "parsing XML");
+        let Some(header) = revisions.next_page() else {
+            break;
+        };
         let header = header?;
+        pages_seen = pages_seen.saturating_add(1);
         if site_info.is_none() {
             site_info = revisions.site_info().map(convert_site_info);
         }
@@ -1873,29 +3158,104 @@ fn build_content_part(
             .ok()
             .filter(|id| *id > 0)
             .ok_or_else(|| parse_error(format!("invalid page id {}", header.id)))?;
+        if let Ok(mut state) = live.lock() {
+            state.value.phase = "parsing page".into();
+            state.value.pages = pages_seen;
+            state.value.current_page = page_id;
+            state.value.current_title = header.title.clone();
+        }
+        if last_activity.elapsed() >= Duration::from_secs(2) {
+            progress(&format!(
+                "content encode {} page {} #{} ({}); {} revisions, {} text",
+                part.filename,
+                pages_seen,
+                page_id,
+                header.title,
+                revisions_seen,
+                human_progress_bytes(text_bytes),
+            ));
+            persist_live_progress(&live, true);
+            last_activity = Instant::now();
+        }
+        let page_revisions_before = revisions_seen;
         let records = std::iter::from_fn(|| {
+            set_live_phase(&live, "parsing XML");
             revisions.next_revision().map(|result| {
                 result
                     .map_err(Error::Mediawiki)
                     .and_then(convert_revision)
                     .map_err(ArchiveError::Mirror)
+                    .map(|record| {
+                        revisions_seen = revisions_seen.saturating_add(1);
+                        text_bytes = text_bytes.saturating_add(record.text.len() as u64);
+                        if let Ok(mut state) = live.lock() {
+                            state.value.revisions = revisions_seen;
+                            state.value.text_bytes = text_bytes;
+                        }
+                        persist_live_progress(&live, false);
+                        if last_activity.elapsed() >= Duration::from_secs(2) {
+                            progress(&format!(
+                                "content sort {} page #{} ({}); {} revisions, {} text",
+                                part.filename,
+                                page_id,
+                                header.title,
+                                revisions_seen,
+                                human_progress_bytes(text_bytes),
+                            ));
+                            if let Ok(mut state) = live.lock() {
+                                state.value.phase = "sorting and encoding".into();
+                            }
+                            persist_live_progress(&live, true);
+                            last_activity = Instant::now();
+                        }
+                        record
+                    })
             })
         });
-        let count = crate::archive::write_content_page(
-            &mut writer,
-            page_id,
-            observed_at_micros,
-            header.title,
-            records,
-            path.parent()
-                .filter(|parent| !parent.as_os_str().is_empty())
-                .unwrap_or_else(|| Path::new(".")),
-        )
-        .map_err(map_archive)?;
+        set_live_phase(&live, "sorting/writing");
+        sorter
+            .push(Record::PageState {
+                page_id,
+                timestamp_micros: observed_at_micros,
+                title: header.title.clone(),
+                namespace: None,
+                deleted: false,
+            })
+            .map_err(map_archive)?;
+        for revision in records {
+            sorter
+                .push(Record::Revision {
+                    page_id,
+                    revision: revision.map_err(map_archive)?,
+                })
+                .map_err(map_archive)?;
+        }
         stats.pages += 1;
-        stats.revisions += count;
+        stats.revisions += revisions_seen - page_revisions_before;
     }
-    writer.finish().map_err(map_archive)?;
+    if let Ok(mut state) = live.lock() {
+        state.value.phase = "merging sorted runs".into();
+    }
+    persist_live_progress(&live, true);
+    let output = std::fs::File::create(&path)?;
+    let (output, _, _) = sorter
+        .finish(output, DEFAULT_FRAME_TARGET)
+        .map_err(map_archive)?;
+    output.sync_all()?;
+    // The historical snapshot is the build-wide source of network totals
+    // after the live sidecar is removed, so it must include the final fetch
+    // counters.
+    stats.record_fetch(&fetch_stats);
+    if let Ok(mut state) = live.lock() {
+        state.value.phase = "finished".into();
+        state.value.pages = pages_seen;
+        state.value.revisions = revisions_seen;
+        state.value.text_bytes = text_bytes;
+    }
+    persist_live_progress(&live, true);
+    if !retain_live_progress_until_publish {
+        let _ = std::fs::remove_file(live_path);
+    }
     Ok(ContentPartResult {
         path: path.to_path_buf(),
         stats,
@@ -2138,6 +3498,176 @@ mod build_graph_tests {
     use super::*;
 
     #[test]
+    fn network_progress_survives_partial_target_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("nodes")).unwrap();
+        let partial = root.path().join("nodes/.content-000000.123.partial");
+        std::fs::create_dir(&partial).unwrap();
+        std::fs::write(
+            root.path().join("plan.json"),
+            br#"{"plan_id":"plan-test"}"#,
+        )
+        .unwrap();
+        let sidecar = partial.join("content-000000.progress.json");
+        let state = Arc::new(Mutex::new(LiveProgressState {
+            path: sidecar.clone(),
+            value: LiveTargetProgress {
+                target: "content-000000".into(),
+                part: "content.xml.bz2".into(),
+                started_at_micros: 42,
+                fetch_attempts: 3,
+                fetch_rate_limit_responses: 2,
+                fetch_bytes_received: 1234,
+                ..Default::default()
+            },
+            last_write: Instant::now()
+                .checked_sub(Duration::from_secs(3))
+                .unwrap(),
+            last_phase: String::new(),
+        }));
+        persist_live_progress(&state, true);
+        let unrelated = Arc::new(Mutex::new(LiveProgressState {
+            path: partial.join("mislabeled.progress.json"),
+            value: LiveTargetProgress {
+                target: "content-000000".into(),
+                part: "belongs-to-another-target.xml.bz2".into(),
+                started_at_micros: 43,
+                fetch_attempts: 99,
+                fetch_rate_limit_responses: 99,
+                fetch_bytes_received: 99,
+                ..Default::default()
+            },
+            last_write: Instant::now()
+                .checked_sub(Duration::from_secs(3))
+                .unwrap(),
+            last_phase: String::new(),
+        }));
+        persist_live_progress(&unrelated, true);
+        std::fs::remove_dir_all(partial).unwrap();
+
+        let plan = DirectBuildPlan {
+            schema: 1,
+            plan_id: "plan-test".into(),
+            wiki_db: "testwiki".into(),
+            content_snapshot: "2024-06-01".into(),
+            metadata_snapshot: "2024-06".into(),
+            observed_at_micros: 0,
+            frame_target: 1,
+            range_target: 1,
+            compression_level: 1,
+            ref_prefix_sample_bytes: 1,
+            ref_prefix_bytes: 1,
+            content_groups: vec![vec![PlannedPart {
+                url: "https://example.invalid/content.xml.bz2".into(),
+                filename: "content.xml.bz2".into(),
+                size_bytes: 0,
+                sha256: None,
+                sha1: None,
+                md5: None,
+            }]],
+            history_files: Vec::new(),
+        };
+        let totals = read_network_history(root.path(), &plan).unwrap();
+        assert_eq!(totals.targets.len(), 1);
+        assert_eq!(totals.fetch_attempts, 3);
+        assert_eq!(totals.fetch_rate_limit_responses, 2);
+        assert_eq!(totals.fetch_bytes_received, 1234);
+    }
+
+    #[test]
+    fn split_target_progress_is_monotonic_and_source_attributed() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = directory.path().join("testwiki.swdump");
+        let root = crate::cli::mirror_scratch_path(&archive);
+        let partial = root.join("nodes/.content-000000.123.partial");
+        std::fs::create_dir_all(&partial).unwrap();
+        let part = |name: &str| PlannedPart {
+            url: format!("https://example.invalid/{name}"),
+            filename: name.into(),
+            size_bytes: 100,
+            sha256: None,
+            sha1: None,
+            md5: None,
+        };
+        let mut plan = DirectBuildPlan {
+            schema: 1,
+            plan_id: String::new(),
+            wiki_db: "testwiki".into(),
+            content_snapshot: "2024-06-01".into(),
+            metadata_snapshot: "2024-06".into(),
+            observed_at_micros: 0,
+            frame_target: 1,
+            range_target: 1,
+            compression_level: 1,
+            ref_prefix_sample_bytes: 1,
+            ref_prefix_bytes: 1,
+            content_groups: vec![vec![
+                part("source-1.xml.bz2"),
+                part("source-2.xml.bz2"),
+                part("source-3.xml.bz2"),
+            ]],
+            history_files: Vec::new(),
+        };
+        plan.plan_id = direct_plan_id(&plan).unwrap();
+        std::fs::write(
+            root.join("plan.json"),
+            serde_json::to_vec(&plan).unwrap(),
+        )
+        .unwrap();
+        let values = [
+            LiveTargetProgress {
+                target: "content-000000".into(),
+                part: "source-1.xml.bz2".into(),
+                phase: "finished".into(),
+                source_bytes_read: 100,
+                source_bytes_total: 100,
+                started_at_micros: 1,
+                updated_at_micros: now_micros(),
+                ..Default::default()
+            },
+            LiveTargetProgress {
+                target: "content-000000".into(),
+                part: "source-2.xml.bz2".into(),
+                phase: "waiting for source bytes".into(),
+                source_bytes_read: 20,
+                source_bytes_total: 100,
+                started_at_micros: 2,
+                updated_at_micros: now_micros(),
+                ..Default::default()
+            },
+            LiveTargetProgress {
+                target: "content-000000".into(),
+                part: "source-3.xml.bz2".into(),
+                phase: "waiting for network slot".into(),
+                source_bytes_total: 100,
+                started_at_micros: 3,
+                updated_at_micros: now_micros(),
+                ..Default::default()
+            },
+        ];
+        for (index, value) in values.iter().enumerate() {
+            std::fs::write(
+                partial.join(format!("source-{index}.progress.json")),
+                serde_json::to_vec(value).unwrap(),
+            )
+            .unwrap();
+        }
+
+        let progress = mirror_build_progress(&archive).unwrap();
+        assert_eq!(progress.source_bytes_completed, 120);
+        assert_eq!(progress.target_progress.len(), 2);
+        assert_eq!(progress.target_progress[0].target, "content-000000/s02");
+        assert_eq!(progress.target_progress[0].source_bytes_read, 20);
+        assert_eq!(progress.target_progress[1].target, "content-000000/s03");
+        assert_eq!(progress.target_progress[1].fetch_attempts, 0);
+        assert!(
+            progress.targets_active[0].contains("120 B / 300 B"),
+            "target aggregate retains the finished source: {:?}",
+            progress.targets_active,
+        );
+    }
+
+    #[test]
     fn durable_target_is_reused_and_removed_only_after_final_generation() {
         let server = MockServer::start();
         let content = include_bytes!("../tests/data/export_three_pages.xml");
@@ -2258,13 +3788,99 @@ mod build_graph_tests {
                 chrono::NaiveDate::from_ymd_opt(2024, 6, 1).unwrap(),
             )
             .unwrap(),
+            true,
             &|_| {},
         )
         .unwrap();
 
         let (_, _, complete) = crate::archive::index_file(result.path).unwrap();
         assert!(complete);
+        let live = std::fs::read_dir(scratch.path())
+            .unwrap()
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".progress.json")
+            })
+            .filter_map(|entry| std::fs::read(entry.path()).ok())
+            .filter_map(|bytes| serde_json::from_slice::<LiveTargetProgress>(&bytes).ok())
+            .collect::<Vec<_>>();
+        assert_eq!(live.len(), 2, "finished source progress remains target-live");
+        assert!(live.iter().all(|value| value.phase == "finished"));
+        assert_eq!(
+            live.iter().map(|value| value.source_bytes_read).sum::<u64>(),
+            (content.len() * 2) as u64,
+            "finished source bytes remain in the target total until publication",
+        );
         assert_eq!(first.hits(), 1);
         assert_eq!(slice.hits(), 1);
+    }
+
+    #[test]
+    fn split_target_retry_reuses_completed_source_archives() {
+        let server = MockServer::start();
+        let content = include_bytes!("../tests/data/export_three_pages.xml");
+        let first = server.mock(|when, then| {
+            when.method(GET).path("/first.xml");
+            then.status(200).body(content);
+        });
+        let second = server.mock(|when, then| {
+            when.method(GET).path("/second.xml");
+            then.status(200).body(content);
+        });
+        let part = |path: &str, sha1: Option<String>| wikimak_mediawiki::Part {
+            url: server.url(path),
+            filename: path.trim_start_matches('/').into(),
+            size_bytes: content.len() as u64,
+            sha256: None,
+            sha1,
+            md5: None,
+        };
+        let mut parts = [
+            part("/first.xml", None),
+            part("/second.xml", Some("00".repeat(32))),
+        ];
+        let scratch = tempfile::tempdir().unwrap();
+        let observed_at = snapshot_date_micros(
+            chrono::NaiveDate::from_ymd_opt(2024, 6, 1).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            build_content_group(
+                &Client::new(),
+                &parts,
+                0,
+                scratch.path(),
+                2,
+                observed_at,
+                true,
+                &|_| {},
+            )
+            .is_err()
+        );
+        assert_eq!(first.hits(), 1);
+        assert_eq!(second.hits(), 1);
+
+        use sha1::Digest;
+        parts[1].sha1 = Some(hex::encode(sha1::Sha1::digest(content)));
+        build_content_group(
+            &Client::new(),
+            &parts,
+            0,
+            scratch.path(),
+            2,
+            observed_at,
+            true,
+            &|_| {},
+        )
+        .unwrap();
+        assert_eq!(
+            first.hits(),
+            1,
+            "the successfully parsed source must not be fetched again",
+        );
+        assert_eq!(second.hits(), 2);
     }
 }

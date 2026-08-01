@@ -14,6 +14,8 @@ pub mod bz2;
 pub mod discover;
 #[cfg(feature = "fetch")]
 pub mod fetch;
+#[cfg(feature = "fetch")]
+pub(crate) mod politeness;
 pub mod parser;
 pub mod sha1;
 pub mod types;
@@ -22,7 +24,11 @@ pub use bz2::{new_bz2_reader, Bz2Options, Bz2Reader};
 #[cfg(feature = "fetch")]
 pub use discover::{discover, discover_incremental_with, discover_with, Config, DUMPS_BASE_URL};
 #[cfg(feature = "fetch")]
-pub use fetch::{fetch, VerifyingReader};
+pub use fetch::{fetch, FetchStats, FetchStatsHandle, VerifyingReader};
+#[cfg(feature = "fetch")]
+pub fn prepare_robots(client: &reqwest::blocking::Client, url: &str) -> Result<()> {
+    politeness::ensure_robots(client, url)
+}
 pub use parser::{new_page_stream, new_revision_stream, site_info, PageStream, RevisionStream};
 pub use sha1::verify_rev_sha1;
 pub use types::{

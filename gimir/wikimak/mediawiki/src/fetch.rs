@@ -5,16 +5,18 @@
 //! `sha256` takes precedence; if `None`, `sha1` is used.
 
 use std::io::{self, Read};
+use std::sync::{Arc, Mutex};
 #[cfg(target_os = "macos")]
 use std::process::{Child, ChildStdout, Command, Stdio};
 #[cfg(target_os = "macos")]
 use std::time::Duration;
 
-use reqwest::blocking::Client;
+use reqwest::blocking::{Client, Response};
 use md5::Md5;
 use sha1::Sha1;
 use sha2::{Digest as _, Sha256};
 
+use crate::politeness;
 use crate::types::{Error, Part, Result};
 
 /// Which digest the verifier is computing. `None` means no checksum was
@@ -24,6 +26,20 @@ enum Hasher {
     Sha1(Sha1),
     Md5(Md5),
 }
+
+/// Network-level counters for one source part. `bytes_received` counts bytes
+/// delivered by the server, including bytes repeated after a range resume.
+#[derive(Clone, Debug, Default)]
+pub struct FetchStats {
+    pub attempts: u64,
+    pub bytes_received: u64,
+    pub rate_limit_responses: u64,
+    pub client_error_responses: u64,
+    pub server_error_responses: u64,
+    pub transport_errors: u64,
+}
+
+pub type FetchStatsHandle = Arc<Mutex<FetchStats>>;
 
 impl Hasher {
     fn update(&mut self, data: &[u8]) {
@@ -49,6 +65,7 @@ impl Hasher {
 /// Partial reads followed by `into_inner()` or drop skip the check.
 pub struct VerifyingReader<R: Read> {
     pub(crate) inner: R,
+    stats: FetchStatsHandle,
     hasher: Option<Hasher>,
     expected: String,
     filename: String,
@@ -59,6 +76,10 @@ impl<R: Read> VerifyingReader<R> {
     /// Returns the inner reader, skipping the checksum check.
     pub fn into_inner(self) -> R {
         self.inner
+    }
+
+    pub fn stats_handle(&self) -> FetchStatsHandle {
+        Arc::clone(&self.stats)
     }
 }
 
@@ -93,44 +114,112 @@ impl<R: Read> Read for VerifyingReader<R> {
     }
 }
 
+struct ThrottledResponse {
+    response: Response,
+    stats: FetchStatsHandle,
+    permit: Option<politeness::Permit>,
+}
+
+impl ThrottledResponse {
+    fn new(response: Response, permit: politeness::Permit, stats: FetchStatsHandle) -> Self {
+        Self {
+            response,
+            stats,
+            permit: Some(permit),
+        }
+    }
+}
+
+impl Read for ThrottledResponse {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let count = self.response.read(buffer)?;
+        if count != 0 {
+            if let Ok(mut stats) = self.stats.lock() {
+                stats.bytes_received = stats.bytes_received.saturating_add(count as u64);
+            }
+        } else {
+            self.permit.take();
+        }
+        Ok(count)
+    }
+}
+
 /// Fetch a Part: GET the URL, return a streaming reader.
 pub fn fetch(client: &Client, part: &Part) -> Result<VerifyingReader<Box<dyn Read + Send>>> {
+    politeness::ensure_robots(client, &part.url)?;
     #[cfg(target_os = "macos")]
     if part.url.starts_with("https://dumps.wikimedia.org/") {
         return fetch_with_curl(part);
     }
 
+    let stats = Arc::new(Mutex::new(FetchStats {
+        attempts: 1,
+        ..FetchStats::default()
+    }));
     let mut attempt = 0u32;
     let resp = loop {
+        let mut permit = politeness::acquire(&part.url)?;
         match client.get(&part.url).send() {
-            Ok(resp) if resp.status().is_success() => break resp,
-            Ok(resp)
-                if attempt < 3
-                    && (resp.status().as_u16() == 429 || resp.status().is_server_error()) =>
-            {
-                let retry_after = resp
-                    .headers()
-                    .get(reqwest::header::RETRY_AFTER)
-                    .and_then(|value| value.to_str().ok())
-                    .and_then(|value| value.parse::<u64>().ok());
-                let delay = retry_after
-                    .unwrap_or(2u64.saturating_pow(attempt + 1));
-                std::thread::sleep(std::time::Duration::from_secs(delay));
-                attempt += 1;
+            Ok(resp) if resp.status().is_success() => {
+                break ThrottledResponse::new(resp, permit, Arc::clone(&stats));
             }
             Ok(resp) => {
-                return Err(Error::HttpStatus {
-                    status: resp.status().as_u16(),
-                    url: part.url.clone(),
-                });
+                let status = resp.status();
+                let retry_after = politeness::parse_retry_after_header(resp.headers());
+                if let Ok(mut stats) = stats.lock() {
+                    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                        stats.rate_limit_responses = stats.rate_limit_responses.saturating_add(1);
+                    } else if status.is_client_error() {
+                        stats.client_error_responses = stats.client_error_responses.saturating_add(1);
+                    } else if status.is_server_error() {
+                        stats.server_error_responses = stats.server_error_responses.saturating_add(1);
+                    }
+                }
+                if attempt < politeness::MAX_RESPONSE_RETRIES
+                    && politeness::should_retry_response(status, retry_after)
+                {
+                    let delay = permit.retry_delay(Some(status.as_u16()), retry_after);
+                    drop(resp);
+                    drop(permit);
+                    std::thread::sleep(delay);
+                    attempt += 1;
+                    if let Ok(mut stats) = stats.lock() {
+                        stats.attempts = stats.attempts.saturating_add(1);
+                    }
+                } else {
+                    drop(resp);
+                    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                        // Do not retry a refusal without an explicit server
+                        // window, but do publish a conservative shared
+                        // cooldown before waking queued workers.
+                        let _ = permit.retry_delay(Some(status.as_u16()), retry_after);
+                    }
+                    permit.release_now();
+                    return Err(Error::HttpStatus {
+                        status: status.as_u16(),
+                        url: part.url.clone(),
+                    });
+                }
             }
             Err(error) if attempt < 3 && (error.is_connect() || error.is_timeout()) => {
-                std::thread::sleep(std::time::Duration::from_secs(
-                    2u64.saturating_pow(attempt + 1),
+                let delay = permit.transport_delay(std::time::Duration::from_secs(
+                    2u64.saturating_pow(attempt + 1).max(5),
                 ));
+                drop(permit);
+                std::thread::sleep(delay);
                 attempt += 1;
+                if let Ok(mut stats) = stats.lock() {
+                    stats.attempts = stats.attempts.saturating_add(1);
+                    stats.transport_errors = stats.transport_errors.saturating_add(1);
+                }
             }
-            Err(error) => return Err(error.into()),
+            Err(error) => {
+                if let Ok(mut stats) = stats.lock() {
+                    stats.transport_errors = stats.transport_errors.saturating_add(1);
+                }
+                permit.release_now();
+                return Err(error.into());
+            }
         }
     };
     let (hasher, expected) = match (&part.sha256, &part.sha1, &part.md5) {
@@ -141,6 +230,7 @@ pub fn fetch(client: &Client, part: &Part) -> Result<VerifyingReader<Box<dyn Rea
     };
     Ok(VerifyingReader {
         inner: Box::new(resp) as Box<dyn Read + Send>,
+        stats,
         hasher,
         expected,
         filename: part.filename.clone(),
@@ -168,12 +258,25 @@ impl CurlAttempt {
 }
 
 #[cfg(target_os = "macos")]
-const MAX_CURL_RESUMPTIONS: u32 = 16;
+// Keep every failed dump stream to one resumption.  A 429 is retried only when
+// the server supplied a Retry-After interval; otherwise it is surfaced
+// immediately instead of inventing a cadence against a host asking us to stop.
+const MAX_CURL_RESUMPTIONS: u32 = 1;
+
+// A dump response may be very large, but an actually idle TCP connection is
+// not useful.  curl's total timeout is deliberately a day; this independent
+// low-speed timeout prevents a blackholed connection from making an import
+// appear frozen for hours while preserving resumable byte offsets.
+#[cfg(target_os = "macos")]
+const CURL_LOW_SPEED_LIMIT: &str = "1024";
+#[cfg(target_os = "macos")]
+const CURL_LOW_SPEED_TIME: &str = "90";
 
 #[cfg(target_os = "macos")]
 struct CurlReader {
     url: String,
     user_agent: String,
+    permit: Option<politeness::Permit>,
     attempt: Option<CurlAttempt>,
     headers_ready: bool,
     buffered: Vec<u8>,
@@ -181,17 +284,21 @@ struct CurlReader {
     offset: u64,
     retries: u32,
     retry_after: Option<Duration>,
+    last_status: Option<u16>,
     finished: bool,
     last_failure: String,
+    stats: FetchStatsHandle,
 }
 
 #[cfg(target_os = "macos")]
 impl CurlReader {
-    fn new(url: String, user_agent: String) -> io::Result<Self> {
+    fn new(url: String, user_agent: String, stats: FetchStatsHandle) -> io::Result<Self> {
+        let permit = politeness::acquire(&url)?;
         let attempt = Self::spawn(&url, &user_agent, 0)?;
         Ok(Self {
             url,
             user_agent,
+            permit: Some(permit),
             attempt: Some(attempt),
             headers_ready: false,
             buffered: Vec::new(),
@@ -199,8 +306,10 @@ impl CurlReader {
             offset: 0,
             retries: 0,
             retry_after: None,
+            last_status: None,
             finished: false,
             last_failure: "curl ended without a diagnostic".into(),
+            stats,
         })
     }
 
@@ -215,6 +324,10 @@ impl CurlReader {
             "30",
             "--max-time",
             "86400",
+            "--speed-limit",
+            CURL_LOW_SPEED_LIMIT,
+            "--speed-time",
+            CURL_LOW_SPEED_TIME,
             "--user-agent",
             user_agent,
         ]);
@@ -290,13 +403,24 @@ impl CurlReader {
             let (status, reason) = response_status(&header).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidData, "invalid curl HTTP response")
             })?;
+            if let Ok(mut stats) = self.stats.lock() {
+                if status == 429 {
+                    stats.rate_limit_responses = stats.rate_limit_responses.saturating_add(1);
+                } else if (400..500).contains(&status) {
+                    stats.client_error_responses = stats.client_error_responses.saturating_add(1);
+                } else if (500..600).contains(&status) {
+                    stats.server_error_responses = stats.server_error_responses.saturating_add(1);
+                }
+            }
             if status < 200
                 || (300..400).contains(&status)
                 || reason.eq_ignore_ascii_case("connection established")
             {
+                self.last_status = None;
                 continue;
             }
             if self.offset == 0 && (status == 200 || status == 206) {
+                self.last_status = None;
                 self.headers_ready = true;
                 continue;
             }
@@ -306,14 +430,20 @@ impl CurlReader {
                     .and_then(|value| value.split('-').next())
                     .and_then(|value| value.parse::<u64>().ok());
                 if start == Some(self.offset) {
+                    self.last_status = None;
                     self.headers_ready = true;
                     continue;
                 }
             }
+            self.last_status = Some(status);
             self.retry_after = parse_retry_after(header_value(&header, b"retry-after:"));
+            let retry_note = self.retry_after.map_or_else(
+                || "; Retry-After absent".to_owned(),
+                |delay| format!("; Retry-After {}s", delay.as_secs()),
+            );
             return Err(io::Error::other(format!(
-                "curl returned HTTP {status} while fetching {} at byte {}",
-                self.url, self.offset
+                "curl returned HTTP {status} while fetching {} at source offset {}{retry_note}",
+                self.url, self.offset,
             )));
         }
         Ok(())
@@ -339,7 +469,7 @@ impl CurlReader {
 
     fn transfer_error(&self) -> io::Error {
         io::Error::other(format!(
-            "curl transfer failed for {} at byte {} after {} resumptions: {}",
+            "curl transfer failed for {} at source offset {} after {} resumptions: {}",
             self.url, self.offset, self.retries, self.last_failure
         ))
     }
@@ -349,19 +479,47 @@ impl CurlReader {
         if self.retries >= MAX_CURL_RESUMPTIONS {
             return Err(self.transfer_error());
         }
-        let delay = self.retry_after.take().unwrap_or_else(|| {
-            Duration::from_secs(
-                2u64
-                    .saturating_pow(self.retries.saturating_add(1))
-                    .min(30),
-            )
-        });
+        let status = self.last_status;
+        let fallback = Duration::from_secs(
+            2u64
+                .saturating_pow(self.retries.saturating_add(1))
+                .min(30)
+                .max(5),
+        );
+        let delay = if let Some(permit) = self.permit.as_mut() {
+            if status.is_some() {
+                permit.retry_delay(status, self.retry_after.take())
+            } else {
+                permit.transport_delay(fallback)
+            }
+        } else {
+            self.retry_after.take().unwrap_or(fallback)
+        };
+        eprintln!(
+            "wikimak curl retry {}/{} at source offset {} for {} after {}; waiting {}s before resuming",
+            self.retries.saturating_add(1),
+            MAX_CURL_RESUMPTIONS,
+            self.offset,
+            self.url,
+            self.last_failure,
+            delay.as_secs()
+        );
+        if let Some(mut permit) = self.permit.take() {
+            permit.release_now();
+        }
         std::thread::sleep(delay);
         self.retries += 1;
+        if let Ok(mut stats) = self.stats.lock() {
+            stats.attempts = stats.attempts.saturating_add(1);
+        }
+        // A resumption is a new HTTP request. Reacquire the central lease so
+        // its start spacing and active-body limit also cover range retries.
+        self.permit = Some(politeness::acquire(&self.url)?);
         self.attempt = Some(Self::spawn(&self.url, &self.user_agent, self.offset)?);
         self.headers_ready = false;
         self.buffered.clear();
         self.buffered_at = 0;
+        self.last_status = None;
         Ok(())
     }
 }
@@ -385,6 +543,20 @@ impl Read for CurlReader {
         }
         loop {
             if let Err(error) = self.prepare_body() {
+                if self.last_status.is_some_and(|status| status != 429 && !(500..600).contains(&status)) {
+                    return Err(error);
+                }
+                if self.last_status == Some(429) && self.retry_after.is_none() {
+                    if let Some(permit) = self.permit.as_mut() {
+                        let _ = permit.retry_delay(Some(429), None);
+                    }
+                    return Err(error);
+                }
+                if self.last_status.is_none() {
+                    if let Ok(mut stats) = self.stats.lock() {
+                        stats.transport_errors = stats.transport_errors.saturating_add(1);
+                    }
+                }
                 self.last_failure = format!("response/read error: {error}");
                 self.restart()?;
                 continue;
@@ -402,6 +574,9 @@ impl Read for CurlReader {
                     self.buffered.clear();
                     self.buffered_at = 0;
                 }
+                if let Ok(mut stats) = self.stats.lock() {
+                    stats.bytes_received = stats.bytes_received.saturating_add(n as u64);
+                }
                 return Ok(n);
             }
             match self
@@ -413,12 +588,16 @@ impl Read for CurlReader {
             {
                 Ok(n) if n != 0 => {
                     self.offset += n as u64;
+                    if let Ok(mut stats) = self.stats.lock() {
+                        stats.bytes_received = stats.bytes_received.saturating_add(n as u64);
+                    }
                     return Ok(n);
                 }
                 Ok(_) => {
                     let (status, stderr) = self.finish_attempt()?;
                     if status.success() {
                         self.finished = true;
+                        self.permit.take();
                         return Ok(0);
                     }
                     self.last_failure = if stderr.is_empty() {
@@ -426,10 +605,16 @@ impl Read for CurlReader {
                     } else {
                         format!("curl exited with {status}: {stderr}")
                     };
+                    if let Ok(mut stats) = self.stats.lock() {
+                        stats.transport_errors = stats.transport_errors.saturating_add(1);
+                    }
                     self.restart()?;
                 }
                 Err(error) => {
                     self.last_failure = format!("stdout read error: {error}");
+                    if let Ok(mut stats) = self.stats.lock() {
+                        stats.transport_errors = stats.transport_errors.saturating_add(1);
+                    }
                     self.restart()?;
                 }
             }
@@ -485,7 +670,11 @@ fn parse_retry_after(value: Option<&str>) -> Option<Duration> {
 
 #[cfg(target_os = "macos")]
 fn fetch_with_curl(part: &Part) -> Result<VerifyingReader<Box<dyn Read + Send>>> {
-    let reader = CurlReader::new(part.url.clone(), curl_user_agent())?;
+    let stats = Arc::new(Mutex::new(FetchStats {
+        attempts: 1,
+        ..FetchStats::default()
+    }));
+    let reader = CurlReader::new(part.url.clone(), curl_user_agent(), Arc::clone(&stats))?;
     let (hasher, expected) = match (&part.sha256, &part.sha1, &part.md5) {
         (Some(h), _, _) => (Some(Hasher::Sha256(Sha256::new())), h.to_lowercase()),
         (None, Some(h), _) => (Some(Hasher::Sha1(Sha1::new())), h.to_lowercase()),
@@ -494,6 +683,7 @@ fn fetch_with_curl(part: &Part) -> Result<VerifyingReader<Box<dyn Read + Send>>>
     };
     Ok(VerifyingReader {
         inner: Box::new(reader),
+        stats,
         hasher,
         expected,
         filename: part.filename.clone(),
@@ -581,11 +771,22 @@ mod curl_tests {
                 }
             }
         });
-        let mut reader =
-            CurlReader::new(format!("http://{address}/part"), "sarun-test".to_string()).unwrap();
+        let stats = Arc::new(Mutex::new(FetchStats {
+            attempts: 1,
+            ..FetchStats::default()
+        }));
+        let mut reader = CurlReader::new(
+            format!("http://{address}/part"),
+            "sarun-test".to_string(),
+            Arc::clone(&stats),
+        )
+        .unwrap();
         let mut body = Vec::new();
         reader.read_to_end(&mut body).unwrap();
         server.join().unwrap();
         assert_eq!(body, b"abcdefghij");
+        let stats = stats.lock().unwrap().clone();
+        assert_eq!(stats.attempts, 2);
+        assert_eq!(stats.bytes_received, 10);
     }
 }

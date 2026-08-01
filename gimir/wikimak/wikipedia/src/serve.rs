@@ -52,6 +52,13 @@ pub struct ServeConfig {
     /// Blob-cache root for materialized media. Offline serve (no `fetch`
     /// in the media crate) turns every miss into an inline placeholder.
     pub media_cache: PathBuf,
+    /// Optional Kiwix image source selected for this mirror.  The ZIM is
+    /// opened read-only; its directory is indexed at startup and image
+    /// clusters are read on demand.
+    pub kiwix_source: Option<PathBuf>,
+    /// Optional directory containing packed `media-*.data` files and their
+    /// independently mmap-able hash/offset arrays.
+    pub packed_media: Option<PathBuf>,
 }
 
 type Resp = Response<std::io::Cursor<Vec<u8>>>;
@@ -278,7 +285,13 @@ pub fn serve(inst: Instance, cfg: ServeConfig) -> Result<(), String> {
     let server = Arc::new(server);
     // No repos + no `fetch` feature ⇒ every media miss is an offline miss
     // (inline placeholder). A prefetch driver could pass a commons chain.
-    let media = MediaStore::new(cfg.media_cache, Vec::new());
+    let media = match (cfg.packed_media, cfg.kiwix_source) {
+        (Some(path), _) => MediaStore::with_packed(cfg.media_cache, Vec::new(), path)
+            .map_err(|error| error.to_string())?,
+        (None, Some(path)) => MediaStore::with_kiwix(cfg.media_cache, Vec::new(), path)
+            .map_err(|error| error.to_string())?,
+        (None, None) => MediaStore::new(cfg.media_cache, Vec::new()),
+    };
     let app = Arc::new(ServerApp {
         source: ServerSource::Depot(cfg.root),
         media: Arc::new(media),
@@ -291,10 +304,18 @@ pub fn serve_archive(
     archive: Arc<ArchiveBrowseIndex>,
     addr: String,
     media_cache: PathBuf,
+    kiwix_source: Option<PathBuf>,
+    packed_media: Option<PathBuf>,
 ) -> Result<(), String> {
     let server = Server::http(&addr).map_err(|e| format!("bind {addr}: {e}"))?;
     let server = Arc::new(server);
-    let media = MediaStore::new(media_cache, Vec::new());
+    let media = match (packed_media, kiwix_source) {
+        (Some(path), _) => MediaStore::with_packed(media_cache, Vec::new(), path)
+            .map_err(|error| error.to_string())?,
+        (None, Some(path)) => MediaStore::with_kiwix(media_cache, Vec::new(), path)
+            .map_err(|error| error.to_string())?,
+        (None, None) => MediaStore::new(media_cache, Vec::new()),
+    };
     let app = Arc::new(ServerApp {
         source: ServerSource::Archive(archive),
         media: Arc::new(media),
@@ -751,11 +772,15 @@ fn allpages_response(app: &App, query: &HashMap<String, String>) -> Resp {
 fn media_response(app: &App, raw_file: &str, query: &HashMap<String, String>) -> Resp {
     let w = query.get("w").map(String::as_str).unwrap_or("orig");
     let width = if w == "orig" { None } else { w.parse::<u32>().ok() };
-    match app.media.materialize(raw_file, width) {
-        Ok(path) => match std::fs::read(&path) {
-            Ok(bytes) => bytes_resp(200, mime_for(raw_file), bytes),
-            Err(_) => placeholder_svg(raw_file),
-        },
+    match app.media.read_with_type(raw_file, width) {
+        Ok((file_type, bytes)) => bytes_resp(
+            200,
+            file_type
+                .as_deref()
+                .map(mime_for_storage_type)
+                .unwrap_or_else(|| mime_for(raw_file)),
+            bytes,
+        ),
         // Miss / offline / not-found → inline placeholder, HTTP 200 so the
         // embedding page stays clean (plan §4 offline rendering).
         Err(_) => placeholder_svg(raw_file),
@@ -774,6 +799,17 @@ fn mime_for(file: &str) -> &'static str {
         "ogg" | "oga" => "audio/ogg",
         "ogv" => "video/ogg",
         "pdf" => "application/pdf",
+        _ => "application/octet-stream",
+    }
+}
+
+fn mime_for_storage_type(file_type: &str) -> &'static str {
+    match file_type.to_ascii_lowercase().as_str() {
+        "png" => "image/png",
+        "jpeg" | "jpg" => "image/jpeg",
+        "gif" => "image/gif",
+        "svg+xml" => "image/svg+xml",
+        "webp" => "image/webp",
         _ => "application/octet-stream",
     }
 }

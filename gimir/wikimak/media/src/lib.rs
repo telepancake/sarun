@@ -1,5 +1,5 @@
-//! Media pipeline (plan §4): no bulk media dumps exist — media is
-//! lazily materialized into a per-mirror blob store keyed by
+//! Media pipeline (plan §4): media is either lazily materialized into a
+//! per-mirror blob store keyed by
 //! (file, width), served locally forever after. URL scheme (VERIFIED):
 //! `upload.wikimedia.org/<project>/<x>/<xy>/<Filename>` with x/xy from
 //! md5(filename_with_underscores); thumbs at
@@ -20,6 +20,10 @@
 //! substitutes a placeholder.
 
 pub mod bucket;
+pub mod kiwix;
+pub mod packed;
+#[cfg(feature = "fetch")]
+pub mod remote;
 pub mod store;
 pub mod url;
 
@@ -31,6 +35,8 @@ use std::path::PathBuf;
 use wikimak_wikitext::{MediaResolver, Title};
 
 pub use bucket::{snap, Bucket, BUCKETS};
+pub use kiwix::{image_key, KiwixError, KiwixImageSource};
+pub use packed::{media_title_hash, MediaStorage, MediaStorageSpec, MediaStorageWriter, PackedMediaCatalog};
 pub use store::BlobStore;
 
 /// What can go wrong turning a (file, width) into a local path.
@@ -50,6 +56,9 @@ pub enum MediaError {
     /// Blob-store I/O failure.
     #[error("media store io: {0}")]
     Io(#[from] std::io::Error),
+    /// Error reading the configured local Kiwix image source.
+    #[error("kiwix media: {0}")]
+    Kiwix(#[from] KiwixError),
     /// Transport error talking to a repo (feature `fetch`).
     #[error("media fetch failed: {0}")]
     Fetch(String),
@@ -94,6 +103,12 @@ pub struct MediaStore {
     store: BlobStore,
     /// Repos in priority order; the first that has the file wins.
     repos: Vec<Repo>,
+    /// Optional Kiwix image source.  It is consulted before network fetches;
+    /// its ZIM remains packed and image bytes are read on demand.
+    kiwix: Option<KiwixImageSource>,
+    /// Optional packed image catalogue.  Its hash and offset arrays are
+    /// memory-mapped independently; payloads are read only for a hit.
+    packed: Option<PackedMediaCatalog>,
     #[cfg(feature = "fetch")]
     robot: fetch::Robot,
     /// Runtime fetch switch (feature `fetch` only): a prefetch command
@@ -108,11 +123,36 @@ impl MediaStore {
         MediaStore {
             store: BlobStore::new(cache_root),
             repos,
+            kiwix: None,
+            packed: None,
             #[cfg(feature = "fetch")]
             robot: fetch::Robot::new(),
             #[cfg(feature = "fetch")]
             allow_fetch: true,
         }
+    }
+
+    /// Open a mirror media store with a selected local Kiwix image source.
+    /// The source is opened once (directory metadata only); image clusters are
+    /// decompressed only when requested.
+    pub fn with_kiwix(
+        cache_root: impl Into<PathBuf>,
+        repos: Vec<Repo>,
+        kiwix_path: impl Into<PathBuf>,
+    ) -> Result<MediaStore, MediaError> {
+        let mut store = Self::new(cache_root, repos);
+        store.kiwix = Some(KiwixImageSource::open(kiwix_path)?);
+        Ok(store)
+    }
+
+    pub fn with_packed(
+        cache_root: impl Into<PathBuf>,
+        repos: Vec<Repo>,
+        packed_root: impl Into<PathBuf>,
+    ) -> Result<MediaStore, MediaError> {
+        let mut store = Self::new(cache_root, repos);
+        store.packed = Some(PackedMediaCatalog::open_directory(packed_root.into())?);
+        Ok(store)
     }
 
     /// Convenience: a single-repo store pointed at Commons.
@@ -126,6 +166,14 @@ impl MediaStore {
 
     pub fn repos(&self) -> &[Repo] {
         &self.repos
+    }
+
+    pub fn kiwix(&self) -> Option<&KiwixImageSource> {
+        self.kiwix.as_ref()
+    }
+
+    pub fn packed(&self) -> Option<&PackedMediaCatalog> {
+        self.packed.as_ref()
     }
 
     /// Enable/disable network fetch at runtime (feature `fetch`). With it
@@ -150,6 +198,35 @@ impl MediaStore {
             return Err(MediaError::NotFound(file.to_string()));
         }
         self.on_miss(file, bucket)
+    }
+
+    /// Read media bytes without forcing a Kiwix hit into a one-file-per-image
+    /// cache.  Existing blob-cache and network behaviour is preserved.
+    pub fn read(&self, file: &str, width: Option<u32>) -> Result<Vec<u8>, MediaError> {
+        self.read_with_type(file, width).map(|(_, bytes)| bytes)
+    }
+
+    pub fn read_with_type(
+        &self,
+        file: &str,
+        width: Option<u32>,
+    ) -> Result<(Option<String>, Vec<u8>), MediaError> {
+        let bucket = snap(width);
+        if let Some(path) = self.store.get(file, bucket) {
+            return Ok((None, std::fs::read(path)?));
+        }
+        if let Some(packed) = &self.packed {
+            if let Some((file_type, bytes)) = packed.lookup_with_type(file, width)? {
+                return Ok((Some(file_type), bytes));
+            }
+        }
+        if let Some(kiwix) = &self.kiwix {
+            if let Some((file_type, bytes)) = kiwix.get_with_type(file)? {
+                return Ok((Some(file_type), bytes));
+            }
+        }
+        let path = self.materialize(file, width)?;
+        Ok((None, std::fs::read(path)?))
     }
 
     #[cfg(not(feature = "fetch"))]

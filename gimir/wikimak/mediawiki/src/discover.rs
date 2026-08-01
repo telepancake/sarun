@@ -19,15 +19,15 @@
 
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
-#[cfg(target_os = "macos")]
-use std::process::Command;
 
 use chrono::NaiveDate;
 use regex::Regex;
 use reqwest::blocking::{Client, Response};
+use reqwest::header::HeaderMap;
 use reqwest::StatusCode;
 use serde::Deserialize;
 
+use crate::politeness;
 use crate::types::{Error, Part, Result, Run, RunSource};
 
 /// The production base URL. Tests override via `Config`.
@@ -410,25 +410,54 @@ pub fn get_small(client: &Client, url: &str) -> Result<(Vec<u8>, StatusCode)> {
     http_get(client, url)
 }
 
-fn http_get(client: &Client, url: &str) -> Result<(Vec<u8>, StatusCode)> {
-    #[cfg(target_os = "macos")]
-    if url.starts_with("https://dumps.wikimedia.org/") {
-        return curl_get(url);
-    }
+/// Fetch the one-time essential siteinfo bootstrap through the same global
+/// request scheduler, without applying dump-path robots rules.  Siteinfo is
+/// the only deliberately exempt request: without it the archive cannot
+/// interpret pages.
+pub fn get_siteinfo(client: &Client, url: &str) -> Result<(Vec<u8>, StatusCode)> {
+    http_get_inner(client, url, false)
+}
 
-    let mut delay = std::time::Duration::from_secs(1);
+fn http_get(client: &Client, url: &str) -> Result<(Vec<u8>, StatusCode)> {
+    http_get_inner(client, url, true)
+}
+
+fn http_get_inner(client: &Client, url: &str, check_robots: bool) -> Result<(Vec<u8>, StatusCode)> {
+    if check_robots {
+        politeness::ensure_robots(client, url)?;
+    }
     for attempt in 0..4 {
+        let mut permit = politeness::acquire(url)?;
         match client.get(url).send() {
             Ok(resp) => {
                 let status = resp.status();
-                let body = resp.bytes()?;
-                return Ok((body.to_vec(), status));
+                let retry_after = politeness::parse_retry_after_header(resp.headers());
+                let body = resp.bytes()?.to_vec();
+                if attempt < politeness::MAX_RESPONSE_RETRIES
+                    && politeness::should_retry_response(status, retry_after)
+                {
+                    let delay = permit.retry_delay(Some(status.as_u16()), retry_after);
+                    drop(permit);
+                    std::thread::sleep(delay);
+                    continue;
+                }
+                if status == StatusCode::TOO_MANY_REQUESTS {
+                    let _ = permit.retry_delay(Some(status.as_u16()), retry_after);
+                }
+                permit.release_now();
+                return Ok((body, status));
             }
             Err(error) if attempt < 3 && (error.is_connect() || error.is_timeout()) => {
+                let delay = permit.transport_delay(
+                    std::time::Duration::from_secs(2u64.saturating_pow(attempt + 1).max(5)),
+                );
+                drop(permit);
                 std::thread::sleep(delay);
-                delay = delay.saturating_mul(2);
             }
-            Err(error) => return Err(error.into()),
+            Err(error) => {
+                permit.release_now();
+                return Err(error.into());
+            }
         }
     }
     unreachable!("discovery retry loop returns")
@@ -437,8 +466,8 @@ fn http_get(client: &Client, url: &str) -> Result<(Vec<u8>, StatusCode)> {
 /// The `Content-Length` header as a number, if present and parseable.
 /// Read from the raw header — NOT `Response::content_length()`, whose
 /// value can reflect the (absent) HEAD body rather than the entity.
-fn header_content_length(resp: &Response) -> Option<u64> {
-    resp.headers()
+fn header_content_length(headers: &HeaderMap) -> Option<u64> {
+    headers
         .get(reqwest::header::CONTENT_LENGTH)?
         .to_str()
         .ok()?
@@ -449,8 +478,8 @@ fn header_content_length(resp: &Response) -> Option<u64> {
 
 /// The total size from a `Content-Range: bytes X-Y/TOTAL` (or
 /// `bytes */TOTAL`) header.
-fn header_content_range_total(resp: &Response) -> Option<u64> {
-    let v = resp.headers().get(reqwest::header::CONTENT_RANGE)?.to_str().ok()?;
+fn header_content_range_total(headers: &HeaderMap) -> Option<u64> {
+    let v = headers.get(reqwest::header::CONTENT_RANGE)?.to_str().ok()?;
     let total = v.rsplit('/').next()?.trim();
     total.parse().ok()
 }
@@ -464,38 +493,35 @@ fn header_content_range_total(resp: &Response) -> Option<u64> {
 /// ignored-Range 200) are read and whose body never is. No usable
 /// header on any route is a LOUD error, never a silent drain.
 fn http_resolve_size(client: &Client, url: &str) -> Result<u64> {
-    #[cfg(target_os = "macos")]
-    if url.starts_with("https://dumps.wikimedia.org/") {
-        return curl_resolve_size(url);
-    }
+    politeness::ensure_robots(client, url)?;
 
-    if let Ok(resp) = client.head(url).send() {
-        if resp.status().is_success() {
-            if let Some(len) = header_content_length(&resp) {
+    if let Ok(resp) = gated_request(url, || client.head(url).send()) {
+        if resp.status.is_success() {
+            if let Some(len) = header_content_length(&resp.headers) {
                 return Ok(len);
             }
         } else if !matches!(
-            resp.status(),
+            resp.status,
             StatusCode::METHOD_NOT_ALLOWED | StatusCode::NOT_FOUND
         ) {
             return Err(Error::HttpStatus {
-                status: resp.status().as_u16(),
+                status: resp.status.as_u16(),
                 url: url.to_string(),
             });
         }
         // success-without-length, 405, or a GET-only mock route: fall
         // through to the Range probe.
     }
-    let resp: Response = client.get(url).header("Range", "bytes=0-0").send()?;
-    let status = resp.status();
+    let resp = gated_request(url, || client.get(url).header("Range", "bytes=0-0").send())?;
+    let status = resp.status;
     // Response is dropped unread in every arm below — headers only.
     if status == StatusCode::PARTIAL_CONTENT || status == StatusCode::RANGE_NOT_SATISFIABLE {
-        return header_content_range_total(&resp).ok_or_else(|| {
+        return header_content_range_total(&resp.headers).ok_or_else(|| {
             Error::Parse(format!("no total in Content-Range for {url}"))
         });
     }
     if status.is_success() {
-        return header_content_length(&resp)
+        return header_content_length(&resp.headers)
             .ok_or_else(|| Error::Parse(format!("no Content-Length for {url}")));
     }
     Err(Error::HttpStatus {
@@ -504,131 +530,58 @@ fn http_resolve_size(client: &Client, url: &str) -> Result<u64> {
     })
 }
 
-#[cfg(target_os = "macos")]
-const CURL_STATUS_MARKER: &[u8] = b"\nSARUN_HTTP_STATUS:";
+struct MetadataResponse {
+    status: StatusCode,
+    headers: HeaderMap,
+}
 
-#[cfg(target_os = "macos")]
-fn curl_output(args: &[&str], url: &str) -> Result<(Vec<u8>, StatusCode)> {
-    let mut delay = std::time::Duration::from_secs(1);
+fn gated_request<F>(url: &str, request: F) -> Result<MetadataResponse>
+where
+    F: Fn() -> std::result::Result<Response, reqwest::Error>,
+{
     for attempt in 0..4 {
-        let user_agent = curl_user_agent();
-        let output = Command::new("/usr/bin/curl")
-            .args([
-                "--location",
-                "--silent",
-                "--show-error",
-                "--connect-timeout",
-                "30",
-                "--max-time",
-                "300",
-                "--user-agent",
-                &user_agent,
-            ])
-            .args(args)
-            .args(["--write-out", "\nSARUN_HTTP_STATUS:%{http_code}", "--url", url])
-            .output()?;
-        if output.status.success() {
-            return parse_curl_output(&output.stdout, url);
+        let mut permit = politeness::acquire(url)?;
+        match request() {
+            Ok(response) => {
+                let status = response.status();
+                if attempt < politeness::MAX_RESPONSE_RETRIES
+                    && politeness::should_retry_response(
+                        status,
+                        politeness::parse_retry_after_header(response.headers()),
+                    )
+                {
+                    let delay = permit.retry_delay(
+                        Some(status.as_u16()),
+                        politeness::parse_retry_after_header(response.headers()),
+                    );
+                    drop(response);
+                    drop(permit);
+                    std::thread::sleep(delay);
+                    continue;
+                }
+                if status == StatusCode::TOO_MANY_REQUESTS {
+                    let _ = permit.retry_delay(
+                        Some(status.as_u16()),
+                        politeness::parse_retry_after_header(response.headers()),
+                    );
+                }
+                let headers = response.headers().clone();
+                response.bytes()?;
+                permit.release_now();
+                return Ok(MetadataResponse { status, headers });
+            }
+            Err(error) if attempt < 3 && (error.is_connect() || error.is_timeout()) => {
+                let delay = permit.transport_delay(
+                    std::time::Duration::from_secs(2u64.saturating_pow(attempt + 1).max(5)),
+                );
+                drop(permit);
+                std::thread::sleep(delay);
+            }
+            Err(error) => {
+                permit.release_now();
+                return Err(error.into());
+            }
         }
-        if attempt == 3 {
-            return Err(Error::Io(std::io::Error::other(format!(
-                "curl request failed for {url}: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            ))));
-        }
-        std::thread::sleep(delay);
-        delay = delay.saturating_mul(2);
     }
-    unreachable!("curl retry loop returns")
-}
-
-#[cfg(target_os = "macos")]
-fn curl_user_agent() -> String {
-    let operator = std::env::var("SARUN_WIKIMEDIA_CONTACT")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .map(|value| format!("; operator: {value}"))
-        .unwrap_or_default();
-    format!(
-        "sarun-wikimak/{} (+https://github.com/telepancake/sarun{operator})",
-        env!("CARGO_PKG_VERSION")
-    )
-}
-
-#[cfg(target_os = "macos")]
-fn parse_curl_output(stdout: &[u8], url: &str) -> Result<(Vec<u8>, StatusCode)> {
-    let marker = stdout
-        .windows(CURL_STATUS_MARKER.len())
-        .rposition(|window| window == CURL_STATUS_MARKER)
-        .ok_or_else(|| Error::Parse(format!("curl returned no HTTP status for {url}")))?;
-    let code = std::str::from_utf8(&stdout[marker + CURL_STATUS_MARKER.len()..])
-        .ok()
-        .and_then(|value| value.trim().parse::<u16>().ok())
-        .and_then(|value| StatusCode::from_u16(value).ok())
-        .ok_or_else(|| Error::Parse(format!("curl returned invalid HTTP status for {url}")))?;
-    Ok((stdout[..marker].to_vec(), code))
-}
-
-#[cfg(target_os = "macos")]
-fn curl_get(url: &str) -> Result<(Vec<u8>, StatusCode)> {
-    curl_output(&[], url)
-}
-
-#[cfg(target_os = "macos")]
-fn curl_resolve_size(url: &str) -> Result<u64> {
-    let (headers, status) = curl_output(&["--head"], url)?;
-    if !status.is_success() {
-        return Err(Error::HttpStatus {
-            status: status.as_u16(),
-            url: url.to_string(),
-        });
-    }
-    if let Some(size) = header_value(&headers, b"content-length:") {
-        return size
-            .parse()
-            .map_err(|_| Error::Parse(format!("invalid Content-Length for {url}")));
-    }
-
-    let (headers, status) =
-        curl_output(&["--range", "0-0", "--dump-header", "-", "--output", "/dev/null"], url)?;
-    if status == StatusCode::PARTIAL_CONTENT || status == StatusCode::RANGE_NOT_SATISFIABLE {
-        let range = header_value(&headers, b"content-range:")
-            .and_then(|value| value.rsplit('/').next())
-            .and_then(|value| value.trim().parse::<u64>().ok());
-        return range.ok_or_else(|| Error::Parse(format!("no total in Content-Range for {url}")));
-    }
-    Err(Error::Parse(format!("no Content-Length for {url}")))
-}
-
-#[cfg(target_os = "macos")]
-fn header_value<'a>(headers: &'a [u8], name: &[u8]) -> Option<&'a str> {
-    headers
-        .split(|byte| *byte == b'\n')
-        .rev()
-        .find_map(|line| {
-            let line = line.strip_suffix(b"\r").unwrap_or(line);
-            (line.len() >= name.len() && line[..name.len()].eq_ignore_ascii_case(name))
-                .then(|| std::str::from_utf8(line[name.len()..].trim_ascii()).ok())
-                .flatten()
-        })
-}
-
-#[cfg(all(test, target_os = "macos"))]
-mod curl_tests {
-    use super::*;
-
-    #[test]
-    fn curl_output_keeps_body_and_uses_last_status_marker() {
-        let raw = b"body\nSARUN_HTTP_STATUS:not-a-status\nSARUN_HTTP_STATUS:206";
-        let (body, status) = parse_curl_output(raw, "https://example.test").unwrap();
-        assert_eq!(body, b"body\nSARUN_HTTP_STATUS:not-a-status");
-        assert_eq!(status, StatusCode::PARTIAL_CONTENT);
-    }
-
-    #[test]
-    fn curl_headers_are_case_insensitive_and_last_response_wins() {
-        let headers =
-            b"HTTP/1.1 301\r\nContent-Length: 0\r\n\r\nHTTP/2 200\r\ncontent-length: 42\r\n";
-        assert_eq!(header_value(headers, b"content-length:"), Some("42"));
-    }
+    unreachable!("gated request retry loop returns")
 }

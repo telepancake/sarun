@@ -105,6 +105,7 @@ mod wire;
 static TERMINATION_WAKE: AtomicI32 = AtomicI32::new(-1);
 static TERMINATING: AtomicBool = AtomicBool::new(false);
 pub(crate) const UI_ENGINE_PROTOCOL_REVISION: u64 = 1;
+const UI_OWNER_PID_ENV: &str = "SARUN_UI_OWNER_PID";
 
 extern "C" fn on_term(_sig: i32) {
     // Wake the blocking accept loop using only signal-safe operations.  FUSE
@@ -119,6 +120,34 @@ extern "C" fn on_term(_sig: i32) {
             libc::write(wake, byte.as_ptr().cast(), byte.len());
         }
     }
+}
+
+/// An engine auto-started by the UI is owned by that UI invocation.  Keep
+/// the ownership explicit rather than relying on detached-process folklore:
+/// if the terminal UI disappears (including a crash), the engine receives
+/// the same ordinary shutdown path as F10/q and can stop its mirror groups.
+fn start_ui_owner_watchdog() -> Option<std::thread::JoinHandle<()>> {
+    let owner = std::env::var(UI_OWNER_PID_ENV)
+        .ok()?
+        .parse::<libc::pid_t>()
+        .ok()
+        .filter(|pid| *pid > 1)?;
+    Some(std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(Duration::from_millis(500));
+            if TERMINATING.load(Ordering::Acquire) {
+                return;
+            }
+            // The engine is intentionally not a daemon when it was created
+            // for this UI. Reparenting means the owner has gone away.
+            if unsafe { libc::getppid() } != owner {
+                unsafe {
+                    libc::kill(libc::getpid(), libc::SIGTERM);
+                }
+                return;
+            }
+        }
+    }))
 }
 
 fn top_level_help() -> Result<String, String> {
@@ -286,6 +315,7 @@ fn serve() -> i32 {
         libc::signal(libc::SIGTERM, on_term as *const () as libc::sighandler_t);
         libc::signal(libc::SIGINT, on_term as *const () as libc::sighandler_t);
     }
+    let _ui_owner_watchdog = start_ui_owner_watchdog();
     let state: control::State = Default::default();
     state.lock().unwrap().overlay = Some(ov.clone());
     control::install_state_handle(state.clone());
@@ -601,6 +631,7 @@ fn ui_launch(args: &[String]) -> i32 {
         };
         let spawned = std::process::Command::new(&exe)
             .arg("serve")
+            .env(UI_OWNER_PID_ENV, std::process::id().to_string())
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::from(log))
             .stderr(std::process::Stdio::from(log_err))
@@ -639,7 +670,14 @@ fn ui_launch(args: &[String]) -> i32 {
             std::thread::sleep(Duration::from_millis(50));
         }
     }
-    ui::ui_main(args)
+    let status = ui::ui_main(args);
+    if spawn_engine {
+        // The owner watchdog covers crashes and terminal closure.  The
+        // normal return path should still request shutdown immediately so a
+        // clean `q` does not leave a detached engine behind for the next run.
+        ui::shutdown_rpc(sock.to_string_lossy().as_ref());
+    }
+    status
 }
 
 #[cfg(target_os = "macos")]
@@ -763,10 +801,10 @@ fn main() {
         let argv: Vec<String> = std::env::args().skip(1).collect();
         std::process::exit(oaita::cli::main(&argv));
     }
-    // Mirror drivers — same multi-call trick: `gitdepot` / `wikimak` /
-    // `ietfmak` are compiled into this binary (mirrors.rs re-execs it with
-    // the driver name, so the ENGINE process never dials out — fetch runs
-    // in the child). An argv[0] symlink named after a driver works too.
+    // Standalone compatibility entry points. Engine-owned Wikipedia builds
+    // invoke their node operations through the shared brush builtin; this
+    // multi-call path remains for direct `sarun wikimak ...` use and the
+    // other mirror CLIs.
     if let Some(code) = driver_invocation() {
         std::process::exit(code);
     }

@@ -1,13 +1,11 @@
 //! Mirror-update jobs: the engine-side schedule for `gitdepot mirror` /
 //! `wikimak fetch` / `ietfmak update` runs (MIRRORS.md "Update").
 //!
-//! The engine SCHEDULES; the drivers FETCH. The drivers are compiled into
-//! the sarun binary itself (multi-call dispatch in main.rs), so a job run
-//! spawns the engine's OWN binary with the driver name as the subcommand.
-//! The child is a separate host process: the engine-never-dials-out
-//! property is a PROCESS property — the HTTP stack only ever runs in the
-//! spawned child, never in the engine's address space. Moving those
-//! spawns into tap boxes later is mechanical.
+//! The engine owns the schedule and lifecycle. A job gets one supervised
+//! wikimak process for isolation and stderr attribution; its Kati graph calls
+//! the `wikimak` brush builtin for build nodes, so the actual mirror work,
+//! cancellation state, provenance, and Wikimedia gate have one owner rather
+//! than a private dispatcher/service hierarchy.
 //!
 //! Bookkeeping lives in `{state_home}/mirrors.db` (jobs are engine
 //! inventory, not box layer data). Liveness (which jobs are running
@@ -54,11 +52,15 @@ fn db() -> Result<Connection, String> {
             last_start INTEGER,
             last_end INTEGER,
             last_exit INTEGER,
-            last_detail TEXT NOT NULL DEFAULT ''
+            last_detail TEXT NOT NULL DEFAULT '',
+            media_source TEXT
         )",
         [],
     )
     .map_err(|e| e.to_string())?;
+    // Existing installations predate the optional Kiwix source.  This is a
+    // one-column additive migration; old jobs remain unchanged.
+    let _ = conn.execute("ALTER TABLE jobs ADD COLUMN media_source TEXT", []);
     Ok(conn)
 }
 
@@ -66,6 +68,7 @@ fn db() -> Result<Connection, String> {
 struct RunningProcess {
     pid: u32,
     stopping: bool,
+    wiki: bool,
 }
 
 /// Jobs whose driver process is live right now.
@@ -97,6 +100,10 @@ pub struct Job {
     pub last_end: Option<i64>,
     pub last_exit: Option<i64>,
     pub last_detail: String,
+    /// Optional Kiwix source selector.  The UI stores `auto`, meaning the
+    /// latest matching official all-maxi release is fetched in ranges.
+    #[serde(default)]
+    pub media_source: Option<String>,
     /// Derived: running | paused | pending | stopped | error | completed
     /// | scheduled (never-ran pending shows as pending too).
     pub state: String,
@@ -120,10 +127,34 @@ pub struct Job {
     pub targets_completed: Option<u64>,
     #[serde(default)]
     pub targets_active: Vec<String>,
+    /// Structured per-target progress.  The prose `targets_active` field is
+    /// retained for older CLI clients; the UI uses this for attribution.
+    #[serde(default)]
+    pub target_progress: Vec<wikimak_wikipedia::MirrorTargetProgress>,
     #[serde(default)]
     pub source_bytes_total: Option<u64>,
     #[serde(default)]
     pub source_bytes_completed: Option<u64>,
+    #[serde(default)]
+    pub active_source_bytes_per_second: Option<u64>,
+    #[serde(default)]
+    pub active_quiet_seconds: Option<u64>,
+    #[serde(default)]
+    pub fetch_attempts: Option<u64>,
+    #[serde(default)]
+    pub fetch_bytes_received: Option<u64>,
+    #[serde(default)]
+    pub fetch_rate_limit_responses: Option<u64>,
+    #[serde(default)]
+    pub fetch_client_error_responses: Option<u64>,
+    #[serde(default)]
+    pub fetch_server_error_responses: Option<u64>,
+    #[serde(default)]
+    pub fetch_transport_errors: Option<u64>,
+    #[serde(default)]
+    pub process_cpu_percent: Option<f64>,
+    #[serde(default)]
+    pub process_rss_bytes: Option<u64>,
 }
 
 fn derive(mut j: Job) -> Job {
@@ -156,6 +187,12 @@ fn derive(mut j: Job) -> Job {
         due_at.or(Some(now()))
     };
     j.pid = running.map(|process| process.pid).filter(|pid| *pid != 0);
+    if let Some(pid) = j.pid {
+        if let Some((cpu, rss)) = process_tree_metrics(pid) {
+            j.process_cpu_percent = Some(cpu);
+            j.process_rss_bytes = Some(rss);
+        }
+    }
     let destination = std::path::Path::new(&j.dest);
     j.mirror_bytes = cached_path_bytes(destination);
     j.scratch_bytes = (j.kind == "wiki")
@@ -164,16 +201,83 @@ fn derive(mut j: Job) -> Job {
     j.available_bytes = destination.parent().and_then(available_bytes);
     if j.kind == "wiki" {
         if let Some(progress) = wikimak_wikipedia::mirror_build_progress(destination) {
-            j.build_phase = Some(progress.phase);
+            let incomplete = progress.targets_completed < progress.targets_total;
+            j.build_phase = Some(if incomplete
+                && matches!(j.state.as_str(), "stopped" | "error")
+            {
+                format!("job not running; {}", progress.phase)
+            } else {
+                progress.phase
+            });
             j.build_snapshot = Some(progress.snapshot);
             j.targets_total = Some(progress.targets_total);
             j.targets_completed = Some(progress.targets_completed);
+            j.target_progress = progress.target_progress;
             j.targets_active = progress.targets_active;
             j.source_bytes_total = Some(progress.source_bytes_total);
             j.source_bytes_completed = Some(progress.source_bytes_completed);
+            j.active_source_bytes_per_second = progress.active_source_bytes_per_second;
+            j.active_quiet_seconds = progress.active_quiet_seconds;
+            j.fetch_attempts = Some(progress.fetch_attempts);
+            j.fetch_bytes_received = Some(progress.fetch_bytes_received);
+            j.fetch_rate_limit_responses = Some(progress.fetch_rate_limit_responses);
+            j.fetch_client_error_responses = Some(progress.fetch_client_error_responses);
+            j.fetch_server_error_responses = Some(progress.fetch_server_error_responses);
+            j.fetch_transport_errors = Some(progress.fetch_transport_errors);
         }
     }
     j
+}
+
+/// Sum the importer and its descendants. A wiki worker is a small process tree
+/// (driver → Kati/brush build nodes → curl), so reporting only the driver would
+/// make an apparently idle job hide the actual transfer/decompression cost.
+/// `ps` is used here because it is available on macOS and Linux and avoids
+/// making the UI depend on a platform-specific procfs layout.
+fn process_tree_metrics(root: u32) -> Option<(f64, u64)> {
+    let output = std::process::Command::new("/bin/ps")
+        .args(["-axo", "pid=,ppid=,%cpu=,rss="])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let mut rows = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        if fields.len() != 4 {
+            continue;
+        }
+        let (Ok(pid), Ok(ppid), Ok(cpu), Ok(rss_kib)) = (
+            fields[0].parse::<u32>(),
+            fields[1].parse::<u32>(),
+            fields[2].parse::<f64>(),
+            fields[3].parse::<u64>(),
+        ) else {
+            continue;
+        };
+        rows.push((pid, ppid, cpu, rss_kib));
+    }
+    let mut members = vec![root];
+    let mut cursor = 0;
+    while cursor < members.len() {
+        let parent = members[cursor];
+        for (pid, ppid, _, _) in &rows {
+            if *ppid == parent && !members.contains(pid) {
+                members.push(*pid);
+            }
+        }
+        cursor += 1;
+    }
+    let mut cpu = 0.0;
+    let mut rss = 0_u64;
+    for (pid, _, value, rss_kib) in rows {
+        if members.contains(&pid) {
+            cpu += value;
+            rss = rss.saturating_add(rss_kib.saturating_mul(1024));
+        }
+    }
+    Some((cpu, rss))
 }
 
 fn cached_path_bytes(path: &std::path::Path) -> Option<u64> {
@@ -239,7 +343,7 @@ fn available_bytes(path: &std::path::Path) -> Option<u64> {
 pub fn jobs_list() -> Result<Vec<Job>, String> {
     let conn = db()?;
     let mut st = conn
-        .prepare("SELECT id,kind,src,dest,interval_secs,paused,last_start,last_end,last_exit,last_detail FROM jobs ORDER BY id")
+        .prepare("SELECT id,kind,src,dest,interval_secs,paused,last_start,last_end,last_exit,last_detail,media_source FROM jobs ORDER BY id")
         .map_err(|e| e.to_string())?;
     let rows = st
         .query_map([], |r| {
@@ -254,6 +358,7 @@ pub fn jobs_list() -> Result<Vec<Job>, String> {
                 last_end: r.get(7)?,
                 last_exit: r.get(8)?,
                 last_detail: r.get(9)?,
+                media_source: r.get(10)?,
                 state: String::new(),
                 next_due: None,
                 pid: None,
@@ -265,8 +370,19 @@ pub fn jobs_list() -> Result<Vec<Job>, String> {
                 targets_total: None,
                 targets_completed: None,
                 targets_active: Vec::new(),
+                target_progress: Vec::new(),
                 source_bytes_total: None,
                 source_bytes_completed: None,
+                active_source_bytes_per_second: None,
+                active_quiet_seconds: None,
+                fetch_attempts: None,
+                fetch_bytes_received: None,
+                fetch_rate_limit_responses: None,
+                fetch_client_error_responses: None,
+                fetch_server_error_responses: None,
+                fetch_transport_errors: None,
+                process_cpu_percent: None,
+                process_rss_bytes: None,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -317,7 +433,7 @@ pub fn jobs_list_typed() -> Result<Vec<crate::generated_wire::MirrorJob>, String
 }
 
 pub fn job_add(kind: &str, src: &str, dest: &str, interval_secs: i64) -> Result<i64, String> {
-    job_add_with_paused(kind, src, dest, interval_secs, false)
+    job_add_with_media(kind, src, dest, interval_secs, false, None)
 }
 
 /// Register a mirror without starting or scheduling it. Used when an existing
@@ -328,15 +444,16 @@ pub fn job_register_paused(
     dest: &str,
     interval_secs: i64,
 ) -> Result<i64, String> {
-    job_add_with_paused(kind, src, dest, interval_secs, true)
+    job_add_with_media(kind, src, dest, interval_secs, true, None)
 }
 
-fn job_add_with_paused(
+pub fn job_add_with_media(
     kind: &str,
     src: &str,
     dest: &str,
     interval_secs: i64,
     paused: bool,
+    media_source: Option<&str>,
 ) -> Result<i64, String> {
     if !matches!(kind, "git" | "wiki" | "ietf" | "cmd") {
         return Err(format!("unknown mirror kind {kind:?} (git|wiki|ietf|cmd)"));
@@ -355,11 +472,40 @@ fn job_add_with_paused(
         ));
     }
     conn.execute(
-        "INSERT INTO jobs(kind, src, dest, interval_secs, paused) VALUES(?1,?2,?3,?4,?5)",
-        params![kind, src, dest, interval_secs.max(60), paused as i64],
+        "INSERT INTO jobs(kind, src, dest, interval_secs, paused, media_source) VALUES(?1,?2,?3,?4,?5,?6)",
+        params![
+            kind,
+            src,
+            dest,
+            interval_secs.max(60),
+            paused as i64,
+            media_source,
+        ],
     )
     .map_err(|e| e.to_string())?;
     Ok(conn.last_insert_rowid())
+}
+
+/// Enable or disable automatic Kiwix image packing for an existing Wikipedia
+/// mirror.  The child process receives this setting when the next run starts;
+/// changing it never mutates an already-running importer.
+pub fn job_set_media_source(id: i64, source: Option<&str>) -> Result<(), String> {
+    if let Some(source) = source {
+        if source != "auto" {
+            return Err("Wikipedia image source must be auto or disabled".into());
+        }
+    }
+    let conn = db()?;
+    let changed = conn
+        .execute(
+            "UPDATE jobs SET media_source = ?2 WHERE id = ?1 AND kind = 'wiki'",
+            params![id, source],
+        )
+        .map_err(|error| error.to_string())?;
+    if changed == 0 {
+        return Err(format!("Wikipedia mirror job #{id} does not exist"));
+    }
+    Ok(())
 }
 
 /// Remove a job. Returns a human note describing what happened to the
@@ -482,10 +628,9 @@ pub fn job_set_paused(id: i64, paused: bool) -> Result<(), String> {
 pub fn job_run(id: i64) -> Result<(), String> {
     let jobs = jobs_list()?;
     let job = jobs.into_iter().find(|j| j.id == id).ok_or("no such job")?;
-    if running_map(|m| m.contains_key(&id)) {
-        return Err("job is already running".into());
+    if !spawn_run(job, WikiRun::Maintain) {
+        return Err("job is already running, or another Wikipedia mirror job is running".into());
     }
-    spawn_run(job, WikiRun::Maintain);
     Ok(())
 }
 
@@ -557,10 +702,9 @@ pub fn job_run_full(id: i64) -> Result<(), String> {
     if job.kind != "wiki" {
         return Err("full snapshot re-ingest is only available for wiki mirrors".into());
     }
-    if running_map(|m| m.contains_key(&id)) {
-        return Err("job is already running".into());
+    if !spawn_run(job, WikiRun::RefreshContent) {
+        return Err("job is already running, or another Wikipedia mirror job is running".into());
     }
-    spawn_run(job, WikiRun::RefreshContent);
     Ok(())
 }
 
@@ -579,12 +723,13 @@ pub fn run_pending() -> Result<Vec<i64>, String> {
             if j.kind == "wiki" && wiki_running {
                 continue;
             }
-            if j.kind == "wiki" {
-                wiki_running = true;
-            }
             let id = j.id;
-            spawn_run(j, WikiRun::Maintain);
-            started.push(id);
+            if spawn_run(j.clone(), WikiRun::Maintain) {
+                if j.kind == "wiki" {
+                    wiki_running = true;
+                }
+                started.push(id);
+            }
         }
     }
     Ok(started)
@@ -608,7 +753,7 @@ enum WikiRun {
     RefreshContent,
 }
 
-fn spawn_run(job: Job, wiki_run: WikiRun) {
+fn spawn_run(job: Job, wiki_run: WikiRun) -> bool {
     let driver = |name: &str| driver_argv(name, std::env::current_exe().ok());
     let argv: Vec<String> = match job.kind.as_str() {
         "git" => [
@@ -649,8 +794,9 @@ fn spawn_run(job: Job, wiki_run: WikiRun) {
         let _ = std::fs::create_dir_all(&path);
         path
     });
+    let wiki = job.kind == "wiki";
     if !running_map(|m| {
-        if m.contains_key(&id) {
+        if m.contains_key(&id) || (wiki && m.values().any(|process| process.wiki)) {
             false
         } else {
             m.insert(
@@ -658,12 +804,13 @@ fn spawn_run(job: Job, wiki_run: WikiRun) {
                 RunningProcess {
                     pid: 0,
                     stopping: false,
+                    wiki,
                 },
             );
             true
         }
     }) {
-        return;
+        return false;
     }
     if let Ok(conn) = db() {
         let _ = conn.execute(
@@ -679,6 +826,9 @@ fn spawn_run(job: Job, wiki_run: WikiRun) {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped());
+        if let Some(source) = &job.media_source {
+            cmd.env("SARUN_KIWIX_SOURCE", source);
+        }
         if let Some(path) = &wiki_tmp {
             cmd.env("TMPDIR", path);
         }
@@ -707,6 +857,7 @@ fn spawn_run(job: Job, wiki_run: WikiRun) {
                         RunningProcess {
                             pid: c.id(),
                             stopping: false,
+                            wiki,
                         },
                     );
                 });
@@ -756,6 +907,7 @@ fn spawn_run(job: Job, wiki_run: WikiRun) {
             );
         }
     });
+    true
 }
 
 /// Read child stderr line-by-line, updating `last_detail` in the DB every
@@ -903,6 +1055,7 @@ mod tests {
                 RunningProcess {
                     pid: child.id(),
                     stopping: false,
+                    wiki: false,
                 },
             );
         });

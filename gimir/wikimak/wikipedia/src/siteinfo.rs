@@ -16,25 +16,18 @@ pub fn fetch_siteinfo_archive(
     api_url: &str,
     output: impl AsRef<Path>,
 ) -> Result<()> {
-    let response = client
-        .get(api_url)
-        .query(&[
-            ("action", "query"),
-            ("meta", "siteinfo"),
-            (
-                "siprop",
-                "general|namespaces|namespacealiases|interwikimap|magicwords",
-            ),
-            ("format", "json"),
-            ("formatversion", "2"),
-        ])
-        .send()
-        .map_err(wikimak_mediawiki::Error::from)?
-        .error_for_status()
-        .map_err(wikimak_mediawiki::Error::from)?;
-    let bytes = response
-        .bytes()
-        .map_err(wikimak_mediawiki::Error::from)?;
+    let separator = if api_url.contains('?') { '&' } else { '?' };
+    let request_url = format!(
+        "{api_url}{separator}action=query&meta=siteinfo&siprop=general%7Cnamespaces%7Cnamespacealiases%7Cinterwikimap%7Cmagicwords&format=json&formatversion=2"
+    );
+    let (bytes, status) = wikimak_mediawiki::discover::get_siteinfo(client, &request_url)
+        .map_err(Error::Mediawiki)?;
+    if !status.is_success() {
+        return Err(Error::Mediawiki(wikimak_mediawiki::Error::HttpStatus {
+            status: status.as_u16(),
+            url: request_url,
+        }));
+    }
     let root: Value =
         serde_json::from_slice(&bytes).map_err(|error| parse_error(error.to_string()))?;
     let query = root

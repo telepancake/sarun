@@ -7981,7 +7981,7 @@ macro_rules! ui_verbs {
                 Err(error) => json!({"ok": false, "error": error}),
             };
         }
-        // args: [kind, src, dest, interval_secs]
+        // args: [kind, src, dest, interval_secs, optional_kiwix_source]
         "mirror_add" => {
             let (Some(kind), Some(src), Some(dest)) = (
                 args.first().and_then(Value::as_str),
@@ -8006,11 +8006,58 @@ macro_rules! ui_verbs {
                     None => return json!({"ok": false, "error": "invalid mirror interval"}),
                 },
             };
+            if let Some(media_source) = args.get(4).and_then(Value::as_str) {
+                if kind.as_str() != "wiki" {
+                    return json!({"ok": false, "error": "image source is only valid for Wikipedia mirrors"});
+                }
+                if media_source.trim().is_empty() {
+                    return json!({"ok": false, "error": "image source path is empty"});
+                }
+                if crate::wire::BoundedBytes::<{ crate::generated_wire::LIMIT_PATH_BYTES }>::new(
+                    media_source.as_bytes().to_vec(),
+                )
+                .is_err()
+                {
+                    return json!({"ok": false, "error": "image source path exceeds relation bound"});
+                }
+                return match crate::mirrors::job_add_with_media(
+                    kind.as_str(),
+                    src.as_str(),
+                    std::str::from_utf8(dest.as_slice()).unwrap_or_default(),
+                    interval_secs
+                        .unwrap_or(24 * 3600)
+                        .try_into()
+                        .unwrap_or(i64::MAX),
+                    false,
+                    Some(media_source),
+                ) {
+                    Ok(id) => json!({"ok": true, "id": id}),
+                    Err(error) => json!({"ok": false, "error": error}),
+                };
+            }
             return legacy_ui_action_reply(dispatch_action(
                 state, crate::generated_wire::ActionRequest::MirrorAdd {
                     kind, src, dest, interval_secs,
                 },
             ));
+        }
+        // args: [job_id, enabled] — change the automatic Kiwix image source
+        // for an existing Wikipedia mirror.  The setting is consumed by the
+        // next child run; it does not interfere with a currently running job.
+        "mirror_set_media" => {
+            let Some(id) = args.first().and_then(Value::as_i64) else {
+                return json!({"ok": false, "error": "need Wikipedia mirror job id"});
+            };
+            let Some(enabled) = args.get(1).and_then(Value::as_bool) else {
+                return json!({"ok": false, "error": "need image enabled boolean"});
+            };
+            return match crate::mirrors::job_set_media_source(
+                id,
+                enabled.then_some("auto"),
+            ) {
+                Ok(()) => json!({"ok": true}),
+                Err(error) => json!({"ok": false, "error": error}),
+            };
         }
         // args: [kind, src, dest, interval?] — attach an existing portable
         // mirror to this host without starting or scheduling network upkeep.
@@ -11063,6 +11110,45 @@ pub fn cli_mirror(argv: &[String]) -> i32 {
                             _ => String::new(),
                         }
                     );
+                    let live = matches!(g("state").as_str(), Some("running") | Some("stopping"));
+                    if live {
+                        let progress = match (
+                            g("source_bytes_completed").as_u64(),
+                            g("source_bytes_total").as_u64(),
+                        ) {
+                            (Some(done), Some(total)) if total > 0 => format!(
+                                "{}% source",
+                                done.saturating_mul(100) / total
+                            ),
+                            _ => "source size unknown".to_owned(),
+                        };
+                        let targets = match (
+                            g("targets_completed").as_u64(),
+                            g("targets_total").as_u64(),
+                        ) {
+                            (Some(done), Some(total)) => format!("{done}/{total} targets"),
+                            _ => "targets unknown".to_owned(),
+                        };
+                        let rate = g("active_source_bytes_per_second")
+                            .as_u64()
+                            .filter(|rate| *rate > 0)
+                            .map(|rate| format!(" · {rate} B/s compressed"))
+                            .unwrap_or_default();
+                        let quiet = g("active_quiet_seconds")
+                            .as_u64()
+                            .filter(|quiet| *quiet >= 10)
+                            .map(|quiet| format!(" · no activity {quiet}s"))
+                            .unwrap_or_default();
+                        println!(
+                            "     progress: {} · {}{}{}",
+                            progress, targets, rate, quiet
+                        );
+                        if let Some(active) = g("targets_active").as_array() {
+                            for target in active.iter().filter_map(Value::as_str) {
+                                println!("       active: {target}");
+                            }
+                        }
+                    }
                 }
                 0
             }

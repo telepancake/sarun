@@ -41,7 +41,7 @@ pub use error::{Error, Result};
 #[cfg(feature = "fetch")]
 pub use direct::{
     build_direct_archive, build_update_archive, mirror_build_progress, DirectArchiveStats,
-    MirrorBuildProgress, UpdateArchiveStats,
+    MirrorBuildProgress, MirrorTargetProgress, UpdateArchiveStats,
 };
 pub use instance::{
     max_chain_id_for_root, read_config, ContributorMeta, HistoryEntry, HistoryIter, ImportStats,

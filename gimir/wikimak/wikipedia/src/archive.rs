@@ -23,6 +23,10 @@ const DICTIONARY_MAGIC: [u8; 4] = *b"DICT";
 const REF_PREFIX_MAGIC: [u8; 4] = *b"PREF";
 const DONE_MAGIC: [u8; 4] = *b"DONE";
 const FRAME_HEADER_LEN: usize = 64;
+const RAW_STREAM_MAGIC: [u8; 8] = *b"SWRAWREC";
+const RAW_STREAM_VERSION: u32 = 1;
+const RAW_STREAM_HEADER_LEN: usize = 16;
+const RAW_STREAM_DONE: [u8; 8] = *b"\0RAWDONE";
 pub const DEFAULT_FRAME_TARGET: usize = 4 << 20;
 pub const MIRROR_FRAME_TARGET: usize = 128 << 10;
 pub const MIRROR_REF_PREFIX_BYTES: usize = 16 << 20;
@@ -38,7 +42,6 @@ const KIND_USER_ACTION: u8 = 5;
 const KIND_MANIFEST: u8 = 6;
 const KIND_SITE_INFO: u8 = 7;
 const PAGE_TEXT_MEMORY_LIMIT: usize = 16 << 20;
-const HISTORY_SORT_RUN_BYTES: usize = 64 << 20;
 const SORT_MERGE_FAN_IN: usize = 64;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -279,11 +282,14 @@ struct PendingRecord {
     record: Record,
 }
 
-/// Bounded external sorter for typed archive records.
+/// In-memory sorter for typed archive records.
+///
+/// Normal imports retain records until the final sort and let the operating
+/// system page cold payloads. Tests and specialized callers may explicitly
+/// call the private run-flush path when they need an external merge.
 pub(crate) struct RecordSorter {
     temporary: tempfile::TempDir,
     buffered: Vec<PendingRecord>,
-    buffered_bytes: usize,
     runs: Vec<std::path::PathBuf>,
 }
 
@@ -292,21 +298,12 @@ impl RecordSorter {
         Ok(Self {
             temporary: tempfile::TempDir::new_in(root)?,
             buffered: Vec::new(),
-            buffered_bytes: 0,
             runs: Vec::new(),
         })
     }
 
     pub(crate) fn push(&mut self, record: Record) -> Result<()> {
-        let (_, payload) = record_wire_size(&record)?;
-        self.buffered_bytes = self
-            .buffered_bytes
-            .saturating_add(usize::try_from(payload).unwrap_or(usize::MAX))
-            .saturating_add(32);
         self.buffered.push(PendingRecord { record });
-        if self.buffered_bytes >= HISTORY_SORT_RUN_BYTES {
-            self.flush_run()?;
-        }
         Ok(())
     }
 
@@ -327,7 +324,6 @@ impl RecordSorter {
         }
         encoder.finish()?.sync_all()?;
         self.runs.push(path);
-        self.buffered_bytes = 0;
         Ok(())
     }
 
@@ -350,6 +346,39 @@ impl RecordSorter {
         frame_target: usize,
         compression: CompressionSettings,
     ) -> Result<(W, u64, u64, u64)> {
+        if self.runs.is_empty() {
+            self.buffered
+                .sort_by(|left, right| record_order(&left.record, &right.record));
+            let mut writer = ArchiveWriter::with_compression(output, frame_target, compression)?;
+            let mut records = 0_u64;
+            let mut user_actions = 0_u64;
+            let mut current = None;
+            for pending in self.buffered {
+                let record = pending.record;
+                if let Some(previous) = current.take() {
+                    if records_coalesce(&previous, &record) {
+                        current = Some(coalesce_records(previous, record)?);
+                    } else {
+                        user_actions += u64::from(matches!(
+                            &previous,
+                            Record::UserAction { .. }
+                        ));
+                        writer.write(&previous)?;
+                        records += 1;
+                        current = Some(record);
+                    }
+                } else {
+                    current = Some(record);
+                }
+            }
+            if let Some(record) = current {
+                user_actions += u64::from(matches!(&record, Record::UserAction { .. }));
+                writer.write(&record)?;
+                records += 1;
+            }
+            let (output, frames) = writer.finish()?;
+            return Ok((output, frames, records, user_actions));
+        }
         self.flush_run()?;
         self.collapse_runs()?;
         let mut readers = self
@@ -1570,6 +1599,96 @@ pub fn repack<R: Read + Seek, W: Write>(
     compression: CompressionSettings,
 ) -> Result<(W, RepackStats)> {
     repack_inner(input, output, frame_target, compression, None)
+}
+
+/// Write the archive's exact self-delimiting record wire sequence without
+/// compression frames or a compression reference.
+pub fn export_raw_record_stream(
+    input: impl AsRef<Path>,
+    mut output: impl Write,
+) -> Result<u64> {
+    output.write_all(&RAW_STREAM_MAGIC)?;
+    output.write_all(&RAW_STREAM_VERSION.to_le_bytes())?;
+    output.write_all(&0_u32.to_le_bytes())?;
+    let mut reader = ArchiveRecordReader::open(input)?;
+    let mut records = 0_u64;
+    while let Some(record) = reader.next_record()? {
+        output.write_all(&encode_record_wire(&record)?)?;
+        records = records
+            .checked_add(1)
+            .ok_or(ArchiveError::FieldTooLarge)?;
+    }
+    output.write_all(&RAW_STREAM_DONE)?;
+    Ok(records)
+}
+
+/// Read an explicitly selected raw record stream and frame it as a normal
+/// archive. The completion marker makes an exact-record-boundary truncation
+/// distinguishable from a successfully completed stream.
+pub fn import_raw_record_stream<R: Read, W: Write>(
+    mut input: R,
+    output: W,
+    frame_target: usize,
+    compression: CompressionSettings,
+) -> Result<(W, u64, u64)> {
+    let mut header = [0_u8; RAW_STREAM_HEADER_LEN];
+    input.read_exact(&mut header)?;
+    if header[..8] != RAW_STREAM_MAGIC
+        || u32::from_le_bytes(header[8..12].try_into().unwrap()) != RAW_STREAM_VERSION
+        || u32::from_le_bytes(header[12..16].try_into().unwrap()) != 0
+    {
+        return Err(ArchiveError::Invalid("unknown raw record stream format"));
+    }
+    let mut writer = ArchiveWriter::with_compression(output, frame_target, compression)?;
+    let mut records = 0_u64;
+    loop {
+        let mut first = [0_u8; 1];
+        match input.read(&mut first)? {
+            0 => {
+                return Err(ArchiveError::Invalid(
+                    "raw record stream lacks completion marker",
+                ))
+            }
+            1 if first[0] == RAW_STREAM_DONE[0] => {
+                let mut rest = [0_u8; RAW_STREAM_DONE.len() - 1];
+                input.read_exact(&mut rest)?;
+                if rest != RAW_STREAM_DONE[1..] {
+                    return Err(ArchiveError::Invalid(
+                        "malformed raw record stream completion marker",
+                    ));
+                }
+                if input.read(&mut first)? != 0 {
+                    return Err(ArchiveError::Invalid(
+                        "raw record stream has trailing bytes",
+                    ));
+                }
+                let (output, frames) = writer.finish()?;
+                return Ok((output, frames, records));
+            }
+            1 => {}
+            _ => unreachable!("one-byte read returned more than one byte"),
+        }
+        let entity = EntityKey {
+            kind: EntityKind::try_from(first[0])?,
+            id: read_varint(&mut input)?.0,
+        };
+        let timestamp = read_i64(&mut input)?;
+        let kind = read_u8(&mut input)?;
+        let payload_len: usize = read_varint(&mut input)?
+            .0
+            .try_into()
+            .map_err(|_| ArchiveError::FieldTooLarge)?;
+        let mut payload = Vec::new();
+        payload
+            .try_reserve_exact(payload_len)
+            .map_err(|_| ArchiveError::FieldTooLarge)?;
+        payload.resize(payload_len, 0);
+        input.read_exact(&mut payload)?;
+        writer.write(&decode_record(entity, timestamp, kind, payload)?)?;
+        records = records
+            .checked_add(1)
+            .ok_or(ArchiveError::FieldTooLarge)?;
+    }
 }
 
 pub fn repack_with_dictionary<R: Read + Seek, W: Write>(
@@ -3973,7 +4092,9 @@ fn export_page<W: Write>(
         inner: std::sync::Arc::clone(&instance.inner),
         walk: crate::instance::WalkState::new_snapshot(page_id),
     };
-    let mut revisions = PageRevisionSpool::collect_in(revisions, instance.root())?.peekable();
+    let mut no_progress = |_: &'static str, _: u64, _: u64| {};
+    let mut revisions =
+        PageRevisionSpool::collect_in(revisions, instance.root(), &mut no_progress)?.peekable();
     let mut actions = instance
         .archive_page_actions(page_id)?
         .into_iter()
@@ -4068,22 +4189,26 @@ impl PageRevisionSpool {
     fn collect_in<E>(
         revisions: impl IntoIterator<Item = std::result::Result<RevisionRecord, E>>,
         spill_dir: &Path,
+        progress: &mut dyn FnMut(&'static str, u64, u64),
     ) -> Result<Self>
     where
         ArchiveError: From<E>,
     {
         let mut entries = Vec::new();
         let mut memory_bytes = 0_usize;
+        let mut text_bytes = 0_u64;
         let mut file = None;
         for revision in revisions {
             let revision = revision.map_err(ArchiveError::from)?;
             memory_bytes = memory_bytes.saturating_add(revision.text.len());
+            text_bytes = text_bytes.saturating_add(revision.text.len() as u64);
             entries.push(SpooledRevision {
                 meta: revision.meta,
                 text: Some(revision.text),
                 offset: 0,
                 len: 0,
             });
+            progress("spooling revisions", entries.len() as u64, text_bytes);
             if memory_bytes > PAGE_TEXT_MEMORY_LIMIT && file.is_none() {
                 let mut spool = tempfile::tempfile_in(spill_dir).map_err(|error| {
                     ArchiveError::Io(std::io::Error::new(
@@ -4116,32 +4241,6 @@ impl PageRevisionSpool {
             file,
         })
     }
-}
-
-pub(crate) fn write_content_page<W: Write>(
-    writer: &mut ArchiveWriter<W>,
-    page_id: u64,
-    observed_at_micros: i64,
-    title: String,
-    revisions: impl IntoIterator<Item = Result<RevisionRecord>>,
-    spill_dir: &Path,
-) -> Result<u64> {
-    writer.write(&Record::PageState {
-        page_id,
-        timestamp_micros: observed_at_micros,
-        title,
-        namespace: None,
-        deleted: false,
-    })?;
-    let mut count = 0_u64;
-    for revision in PageRevisionSpool::collect_in(revisions, spill_dir)? {
-        writer.write(&Record::Revision {
-            page_id,
-            revision: revision?,
-        })?;
-        count += 1;
-    }
-    Ok(count)
 }
 
 impl Iterator for PageRevisionSpool {
@@ -5249,6 +5348,183 @@ mod tests {
         let location = indexed.location(titles.frame(0).unwrap()).unwrap();
         assert!(location.physical_segment.is_none());
         assert!(indexed.open_file(&location).unwrap().metadata().unwrap().len() > 0);
+    }
+
+    #[test]
+    fn raw_record_stream_round_trips_every_record_kind() {
+        let performer = PerformerRecord {
+            local_user_id: Some(7),
+            central_user_id: None,
+            historical_name: Some("Editor".into()),
+            account_class: AccountClass::Permanent,
+        };
+        let records = vec![
+            Record::PageState {
+                page_id: 1,
+                timestamp_micros: 300,
+                title: "One".into(),
+                namespace: Some(0),
+                deleted: false,
+            },
+            revision(1, 1, 200, b"text"),
+            Record::PageAction {
+                entity: EntityKey {
+                    kind: EntityKind::Page,
+                    id: 1,
+                },
+                timestamp_micros: 100,
+                action: PageActionRecord {
+                    log_id: Some(1),
+                    tie_sequence: 1,
+                    kind: PageActionKind::Move,
+                    performer: performer.clone(),
+                    comment: "move".into(),
+                    title_at_event: "Old".into(),
+                    namespace_at_event: Some(0),
+                    resulting_deleted: Some(false),
+                },
+            },
+            Record::UserState {
+                user_id: 2,
+                timestamp_micros: 300,
+                state: UserStateRecord {
+                    current_name: Some("Editor".into()),
+                    central_user_id: None,
+                    account_class: AccountClass::Permanent,
+                    groups: vec!["user".into()],
+                    blocks: Vec::new(),
+                    bot_by: Vec::new(),
+                },
+            },
+            Record::UserAction {
+                entity: EntityKey {
+                    kind: EntityKind::User,
+                    id: 2,
+                },
+                timestamp_micros: 200,
+                action: UserActionRecord {
+                    log_id: Some(2),
+                    tie_sequence: 2,
+                    kind: UserActionKind::Rename,
+                    performer,
+                    comment: "rename".into(),
+                    historical_name: Some("Old editor".into()),
+                    groups: Vec::new(),
+                    blocks: Vec::new(),
+                    bot_by: Vec::new(),
+                    created_by: 0,
+                    registration_timestamp_micros: None,
+                    creation_timestamp_micros: None,
+                    first_edit_timestamp_micros: None,
+                },
+            },
+            Record::Manifest {
+                timestamp_micros: 300,
+                manifest: ManifestRecord {
+                    wiki_db: "testwiki".into(),
+                    content_snapshot: "2026-07-30".into(),
+                    metadata_snapshot: "2026-07".into(),
+                    source_files: vec!["source".into()],
+                },
+            },
+            Record::SiteInfo {
+                timestamp_micros: 300,
+                site_info: SiteInfoRecord {
+                    site_name: "Test".into(),
+                    db_name: "testwiki".into(),
+                    base: String::new(),
+                    generator: String::new(),
+                    case: "first-letter".into(),
+                    language: "en".into(),
+                    rtl: false,
+                    server: String::new(),
+                    script_path: String::new(),
+                    namespaces: Vec::new(),
+                    interwiki: Vec::new(),
+                    magic_words: Vec::new(),
+                },
+            },
+            Record::Unknown {
+                entity: EntityKey {
+                    kind: EntityKind::Global,
+                    id: 2,
+                },
+                timestamp_micros: 300,
+                kind: 0x80,
+                payload: vec![0, 1, 0xff, 2],
+            },
+        ];
+        let source = tempfile::NamedTempFile::new().unwrap();
+        let mut writer =
+            ArchiveWriter::new(std::fs::File::create(source.path()).unwrap(), 64).unwrap();
+        for record in &records {
+            writer.write(record).unwrap();
+        }
+        writer.finish().unwrap();
+
+        let mut raw = Vec::new();
+        assert_eq!(
+            export_raw_record_stream(source.path(), &mut raw).unwrap(),
+            records.len() as u64,
+        );
+        assert_eq!(&raw[..8], &RAW_STREAM_MAGIC);
+        let (archive, _, count) = import_raw_record_stream(
+            Cursor::new(&raw),
+            Vec::new(),
+            64,
+            CompressionSettings::default(),
+        )
+        .unwrap();
+        assert_eq!(count, records.len() as u64);
+        let mut reader = ArchiveReader::new(Cursor::new(archive)).unwrap();
+        let mut decoded = Vec::new();
+        while let Some(mut frame) = reader.next_frame().unwrap() {
+            while let Some(record) = frame.next_record().unwrap() {
+                decoded.push(record);
+            }
+        }
+        assert!(reader.is_complete());
+        assert_eq!(decoded, records);
+
+        let rebuilt = tempfile::NamedTempFile::new().unwrap();
+        let mut writer =
+            ArchiveWriter::new(std::fs::File::create(rebuilt.path()).unwrap(), 64).unwrap();
+        for record in &decoded {
+            writer.write(record).unwrap();
+        }
+        writer.finish().unwrap();
+        let mut second_raw = Vec::new();
+        export_raw_record_stream(rebuilt.path(), &mut second_raw).unwrap();
+        assert_eq!(second_raw, raw);
+    }
+
+    #[test]
+    fn raw_record_stream_requires_an_exact_completion_marker() {
+        let source = tempfile::NamedTempFile::new().unwrap();
+        let mut writer =
+            ArchiveWriter::new(std::fs::File::create(source.path()).unwrap(), 64).unwrap();
+        writer.write(&revision(1, 1, 10, b"text")).unwrap();
+        writer.finish().unwrap();
+        let mut raw = Vec::new();
+        export_raw_record_stream(source.path(), &mut raw).unwrap();
+
+        let mut truncated = raw.clone();
+        truncated.pop();
+        assert!(import_raw_record_stream(
+            Cursor::new(truncated),
+            Vec::new(),
+            64,
+            CompressionSettings::default(),
+        )
+        .is_err());
+        raw.push(1);
+        assert!(import_raw_record_stream(
+            Cursor::new(raw),
+            Vec::new(),
+            64,
+            CompressionSettings::default(),
+        )
+        .is_err());
     }
 
     #[test]

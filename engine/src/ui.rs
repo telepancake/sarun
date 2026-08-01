@@ -517,6 +517,7 @@ enum Modal {
         site_cursor: usize,
         site_filter: String,
         destination: String,
+        media_enabled: bool,
         cadence: usize,
         field: WikiSetupField,
     },
@@ -636,6 +637,7 @@ enum Modal {
 enum WikiSetupField {
     Sites,
     Destination,
+    MediaSource,
     Cadence,
 }
 
@@ -719,7 +721,7 @@ struct ModelRow {
 #[derive(Clone)]
 struct ActionItem {
     label: String,
-    hint: &'static str,
+    hint: String,
     action: Action,
 }
 
@@ -759,6 +761,7 @@ enum Action {
     MirrorRunPending,
     MirrorFullRefresh,
     MirrorTogglePause,
+    MirrorToggleMedia,
     MirrorRemove,
     MirrorDeleteData,
     MirrorBrowse,
@@ -4128,11 +4131,15 @@ impl App {
                     .position(|(_, seconds)| *seconds == job.interval_secs)
             })
             .unwrap_or(0);
+        let media_enabled = nearby
+            .and_then(|job| job.media_source.as_deref())
+            .is_some_and(|source| source == "auto" || !source.is_empty());
         self.modal = Some(Modal::WikiMirrorSetup {
             selected: std::collections::BTreeSet::new(),
             site_cursor: 0,
             site_filter: String::new(),
             destination,
+            media_enabled,
             cadence,
             field: WikiSetupField::Sites,
         });
@@ -4207,8 +4214,9 @@ impl App {
             format!("Wikipedia library: {}", skipped.join(", "))
         } else if skipped.is_empty() {
             format!(
-                "Wikipedia library: attached {} paused; browse now or press Space to enable updates",
-                attached.join(", ")
+                "Wikipedia library: attached {} paused; {} to enable updates",
+                attached.join(", "),
+                main_action_hint(Pane::Mirrors, PaneAction::MirrorTogglePause)
             )
         } else {
             format!(
@@ -4224,6 +4232,7 @@ impl App {
         selected: std::collections::BTreeSet<String>,
         site_filter: String,
         destination: String,
+        media_enabled: bool,
         cadence: usize,
     ) {
         let destination = expand_user_path(destination.trim());
@@ -4247,6 +4256,7 @@ impl App {
                 site_cursor: 0,
                 site_filter,
                 destination: destination.to_string_lossy().into_owned(),
+                media_enabled,
                 cadence,
                 field: WikiSetupField::Sites,
             });
@@ -4274,7 +4284,12 @@ impl App {
                 .join(format!("{site}.swdump"))
                 .to_string_lossy()
                 .into_owned();
-            match self.mirror_verb("mirror_add", json!(["wiki", site, root, interval])) {
+            let args = if media_enabled {
+                json!(["wiki", site, root, interval, "auto"])
+            } else {
+                json!(["wiki", site, root, interval])
+            };
+            match self.mirror_verb("mirror_add", args) {
                 Ok(value) => {
                     let Some(id) = value.get("id").and_then(Value::as_i64) else {
                         self.status = "Wikipedia mirror: engine returned no job id".into();
@@ -4452,6 +4467,28 @@ impl App {
         self.load_mirrors();
     }
 
+    /// 'i' on Mirrors: toggle automatic Kiwix image packing for the selected
+    /// Wikipedia mirror.  The setting applies when the next child run starts.
+    fn mirror_toggle_media(&mut self) {
+        let Some(job) = self.mirror_jobs.get(self.sel_mirror) else {
+            self.status = "no mirror selected".into();
+            return;
+        };
+        if job.kind != "wiki" {
+            self.status = "Kiwix images are only available for Wikipedia mirrors".into();
+            return;
+        }
+        let (id, enabled) = (job.id, job.media_source.as_deref() != Some("auto"));
+        self.status = match self.mirror_verb("mirror_set_media", json!([id, enabled])) {
+            Ok(_) => format!(
+                "mirror #{id}: Kiwix images {} (takes effect on the next run)",
+                if enabled { "enabled" } else { "disabled" }
+            ),
+            Err(error) => format!("mirror #{id}: {error}"),
+        };
+        self.load_mirrors();
+    }
+
     /// 'D' on Mirrors: y/n-confirmed delete of the selected job.
     #[cfg_attr(test, allow(dead_code))]
     fn confirm_mirror_remove(&mut self) {
@@ -4524,15 +4561,14 @@ impl App {
     /// Mount a freshly opened document in the reader pane and focus it.
     fn reader_mount(&mut self, r: crate::reader::Reader) {
         let label = r.source_label();
+        let hint = reader_context_hint(r.binding_context(), r.has_wiki());
         self.reader.replace(Some(r));
         if self.focus != Pane::Reader {
             self.push_history();
             self.snap_left();
             self.focus = Pane::Reader;
         }
-        self.status = format!(
-            "reading {label} · arrows/click links · j/k scroll · Enter follow · Backspace back"
-        );
+        self.status = format!("reading {label} · {hint}");
     }
 
     /// Enter on the ReaderOpen prompt: open a host path in the reader.
@@ -4739,9 +4775,10 @@ impl App {
             .map(|c| c.dirty)
             .unwrap_or(false)
         {
-            self.status =
-                "editor has UNSAVED changes — Ctrl-S to save them before opening another file"
-                    .into();
+            self.status = format!(
+                "editor has UNSAVED changes · {}",
+                editor_context_hint()
+            );
             return;
         }
         let label = e.target.label();
@@ -4751,8 +4788,7 @@ impl App {
             self.snap_left();
             self.focus = Pane::Editor;
         }
-        self.status =
-            format!("editing {label} · vim keys · Ctrl-S save · Ctrl-E lock · z zoom · Esc back");
+        self.status = format!("editing {label} · {}", editor_context_hint());
     }
 
     /// Enter on the EditorOpen prompt: open a host path in the editor.
@@ -5414,7 +5450,7 @@ impl App {
         self.status = "← back".into();
     }
 
-    /// Switch to a top-level pane (the `PANE_KEYS` accelerators route here via
+    /// Switch to a top-level pane (the pane-switch bindings route here via
     /// `dispatch_menubar_key`). The filterable views (changes/procs/outputs/api)
     /// go through `nav` so cross-pane filters resolve; the rest set focus and
     /// load their data. PTY is handled in the dispatcher (its selection logic).
@@ -5781,15 +5817,16 @@ impl App {
                     self.sel_pty = i;
                     self.focus = Pane::Pty;
                     self.status = format!(
-                        "screen: {} · F4/F5 cycle its windows · F2/F3 screens",
-                        if want { "browser" } else { "terminal" }
+                        "screen: {} · {}",
+                        if want { "browser" } else { "terminal" },
+                        context_key_hints(self)
                     );
                 }
             }
             Screen::Inspect => {
                 self.focus = Pane::Inspect;
                 self.ins_init();
-                self.status = "screen: inspector · Enter drill · Backspace up                                · ':' locator".into();
+                self.status = format!("screen: inspector · {}", context_key_hints(self));
             }
         }
     }
@@ -5806,22 +5843,32 @@ impl App {
                 let chips: Vec<char> = menubar_chips(self)
                     .into_iter()
                     .map(|(c, _)| c)
-                    .filter(|c| *c != 'P')
+                    .filter(|c| {
+                        *c != 'P'
+                            && pane_switch_bindings().any(|binding| {
+                                binding.key.char() == Some(*c)
+                                    && matches!(binding.action, BindingAction::SwitchPane(_))
+                            })
+                    })
                     .collect();
                 let cur = view_of_pane(self.focus).map(|(k, _, _)| k);
                 let i = cur
                     .and_then(|k| chips.iter().position(|c| *c == k))
                     .unwrap_or(0);
                 if let Some(next) = cycle_pick(&chips, i, dir) {
-                    if let Some((_, pane, _, _, _)) = PANE_KEYS.iter().find(|e| e.0 == next) {
-                        self.go_to_pane(*pane);
+                    if let Some(binding) = pane_switch_bindings()
+                        .find(|binding| binding.key.char() == Some(next))
+                    {
+                        if let BindingAction::SwitchPane(pane) = binding.action {
+                            self.go_to_pane(pane);
+                        }
                     }
                 }
             }
             Screen::Terminal => self.pty_cycle_kind(dir, false),
             Screen::Browser => self.pty_cycle_kind(dir, true),
             Screen::Inspect => {
-                self.status = "the inspector is one window — Enter drills,                                Backspace goes up".into();
+                self.status = format!("the inspector is one window · {}", context_key_hints(self));
             }
         }
     }
@@ -5904,9 +5951,10 @@ impl App {
                 self.sel_pty = self.ptys.len() - 1;
                 self.focus = Pane::Pty;
                 self.status = format!(
-                    "PTY {}/{} · F4/F5 cycle · F2/F3 screens · F8 kill · F12 detach",
+                    "PTY {}/{} · {}",
                     self.sel_pty + 1,
-                    self.ptys.len()
+                    self.ptys.len(),
+                    context_key_hints(self)
                 );
             }
             Err(e) => self.status = format!("pty: {e}"),
@@ -5931,9 +5979,10 @@ impl App {
                 self.sel_pty = self.ptys.len() - 1;
                 self.focus = Pane::Pty;
                 self.status = format!(
-                    "debugger for box {sid} · PTY {}/{} · F11 embeds in detail pane",
+                    "debugger for box {sid} · PTY {}/{} · {}",
                     self.sel_pty + 1,
-                    self.ptys.len()
+                    self.ptys.len(),
+                    context_key_hints(self)
                 );
             }
             Err(error) => self.status = format!("debugger for box {sid}: {error}"),
@@ -9370,15 +9419,12 @@ fn mirror_cadence_label(seconds: i64) -> String {
 
 /// MIRRORS pane: one row per mirror-update job.
 fn mirrors_lines(app: &App) -> Vec<Line<'static>> {
-    let mut out = vec![Line::from(Span::styled(
-        "n add Wikipedia · O open library · Enter read · b browse · r update · c stop · space pause",
-        Style::default().add_modifier(Modifier::BOLD),
-    ))];
+    let mut out = Vec::new();
     if app.mirror_jobs.is_empty() {
         out.push(Line::from(""));
         out.push(Line::from("No local mirrors yet."));
         out.push(Line::from(Span::styled(
-            "Press n/Enter to create one, or O to open a mirror library from another drive/system.",
+            "Use the context-sensitive key bar below to add or attach a mirror library.",
             Style::default().fg(Color::Cyan),
         )));
         return out;
@@ -9390,11 +9436,12 @@ fn mirrors_lines(app: &App) -> Vec<Line<'static>> {
             format!("{} · {}", j.kind, j.src)
         };
         let text = format!(
-            " {:<24} {:<10} {:<10} {}",
+            " {:<24} {:<10} {:<10} {}{}",
             name,
             j.state,
             mirror_cadence_label(j.interval_secs),
             mirror_due_label(j.next_due),
+            mirror_row_progress(j),
         );
         let line = if i == app.sel_mirror {
             Line::from(Span::styled(
@@ -9408,6 +9455,259 @@ fn mirrors_lines(app: &App) -> Vec<Line<'static>> {
             ))
         };
         out.push(line);
+    }
+    out
+}
+
+/// Keep the live part of an import visible in the list itself.  The detail
+/// pane can be scrolled, and a user should not have to discover that by trial
+/// and error just to learn whether a large import is still doing work.
+fn mirror_row_progress(j: &crate::mirrors::Job) -> String {
+    if !matches!(j.state.as_str(), "running" | "stopping") {
+        return String::new();
+    }
+    let source = match (j.source_bytes_completed, j.source_bytes_total) {
+        (Some(done), Some(total)) if total > 0 => {
+            format!(" · {}%", done.saturating_mul(100) / total)
+        }
+        _ => String::new(),
+    };
+    let targets = match (j.targets_completed, j.targets_total) {
+        (Some(done), Some(total)) => format!(" · {done}/{total} targets"),
+        _ => String::new(),
+    };
+    let active = if j.targets_active.is_empty() {
+        String::new()
+    } else {
+        format!(" · {} active", j.targets_active.len())
+    };
+    let rate = j
+        .active_source_bytes_per_second
+        .filter(|rate| *rate > 0)
+        .map(|rate| format!(" · {} compressed/s", fmt_bytes(rate.min(i64::MAX as u64) as i64)))
+        .unwrap_or_default();
+    let quiet = j
+        .active_quiet_seconds
+        .filter(|quiet| *quiet >= 10)
+        .map(|quiet| format!(" · idle {quiet}s"))
+        .unwrap_or_default();
+    format!("{source}{targets}{active}{rate}{quiet}")
+}
+
+fn mirror_clip(value: &str, width: usize) -> String {
+    if value.chars().count() > width {
+        format!("{}…", value.chars().take(width.saturating_sub(1)).collect::<String>())
+    } else {
+        value.to_owned()
+    }
+}
+
+fn mirror_target_from_detail(line: &str) -> Option<String> {
+    for kind in ["content", "history"] {
+        let marker = format!("{kind}-");
+        let Some(start) = line.find(&marker) else {
+            continue;
+        };
+        let digits = line[start + marker.len()..]
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect::<String>();
+        if digits.len() == 6 {
+            return Some(format!("{kind}-{digits}"));
+        }
+    }
+    None
+}
+
+/// Scope every historical stderr/event line.  The importer now emits this
+/// prefix itself, while the fallback also understands kati's
+/// `nodes/content-000123.done` spelling and labels old unscoped receipts with
+/// the selected job number rather than leaving the reader to guess.
+fn scoped_mirror_detail(job_id: i64, line: &str) -> String {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if trimmed.starts_with("[content-") || trimmed.starts_with("[history-") {
+        return trimmed.to_owned();
+    }
+    if let Some(target) = mirror_target_from_detail(trimmed) {
+        return format!("[{target}] {trimmed}");
+    }
+    format!("[job #{job_id}] {trimmed}")
+}
+
+fn mirror_worker_table(
+    rows: &[wikimak_wikipedia::MirrorTargetProgress],
+    live: bool,
+) -> Vec<Line<'static>> {
+    const LABEL_WIDTH: usize = 24;
+    const WORKER_WIDTH: usize = 30;
+    const WORKERS_PER_GROUP: usize = 3;
+    let table_row = |label: &str, values: &[String]| {
+        let mut line = format!("{label:<LABEL_WIDTH$}", LABEL_WIDTH = LABEL_WIDTH);
+        for value in values {
+            line.push_str(&format!(
+                "  {:<WORKER_WIDTH$}",
+                mirror_clip(value, WORKER_WIDTH),
+                WORKER_WIDTH = WORKER_WIDTH
+            ));
+        }
+        Line::from(line)
+    };
+    let mut out = Vec::new();
+    out.push(Line::from(Span::styled(
+        if live {
+            "WORKERS  (columns are workers; rows are metrics)"
+        } else {
+            "UNFINISHED TARGETS (last observed)"
+        },
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+    )));
+    for group in rows.chunks(WORKERS_PER_GROUP) {
+        let headers = group
+            .iter()
+            .map(|row| row.target.clone())
+            .collect::<Vec<_>>();
+        out.push(table_row("worker", &headers));
+        out.push(table_row(
+            "state / blocked on",
+            &group.iter().map(|row| row.phase.clone()).collect::<Vec<_>>(),
+        ));
+        out.push(table_row(
+            "source offset / size",
+            &group
+                .iter()
+                .map(|row| {
+                    if row.source_bytes_total == 0 {
+                        format!(
+                            "{} received",
+                            fmt_bytes(row.source_bytes_read.min(i64::MAX as u64) as i64)
+                        )
+                    } else {
+                        format!(
+                            "{} / {}",
+                            fmt_bytes(row.source_bytes_read.min(i64::MAX as u64) as i64),
+                            fmt_bytes(row.source_bytes_total.min(i64::MAX as u64) as i64)
+                        )
+                    }
+                })
+                .collect::<Vec<_>>(),
+        ));
+        out.push(table_row(
+            "wire bytes received",
+            &group
+                .iter()
+                .map(|row| {
+                    fmt_bytes(row.fetch_bytes_received.min(i64::MAX as u64) as i64)
+                })
+                .collect::<Vec<_>>(),
+        ));
+        out.push(table_row(
+            "request attempts",
+            &group
+                .iter()
+                .map(|row| row.fetch_attempts.to_string())
+                .collect::<Vec<_>>(),
+        ));
+        out.push(table_row(
+            "429 / 4xx / 5xx / I/O",
+            &group
+                .iter()
+                .map(|row| {
+                    format!(
+                        "{} / {} / {} / {}",
+                        row.fetch_rate_limit_responses,
+                        row.fetch_client_error_responses,
+                        row.fetch_server_error_responses,
+                        row.fetch_transport_errors,
+                    )
+                })
+                .collect::<Vec<_>>(),
+        ));
+        out.push(table_row(
+            "decompressed bytes",
+            &group
+                .iter()
+                .map(|row| fmt_bytes(row.decoded_bytes.min(i64::MAX as u64) as i64))
+                .collect::<Vec<_>>(),
+        ));
+        out.push(table_row(
+            "pages / revisions",
+            &group
+                .iter()
+                .map(|row| format!("{} / {}", row.pages, row.records))
+                .collect::<Vec<_>>(),
+        ));
+        out.push(table_row(
+            "wikitext bytes",
+            &group
+                .iter()
+                .map(|row| fmt_bytes(row.text_bytes.min(i64::MAX as u64) as i64))
+                .collect::<Vec<_>>(),
+        ));
+        out.push(table_row(
+            "wire rate",
+            &group
+                .iter()
+                .map(|row| {
+                    if row.bytes_per_second == 0 {
+                        "not receiving".to_owned()
+                    } else {
+                        format!(
+                            "{}/s",
+                            fmt_bytes(row.bytes_per_second.min(i64::MAX as u64) as i64)
+                        )
+                    }
+                })
+                .collect::<Vec<_>>(),
+        ));
+        out.push(table_row(
+            "CPU / peak RSS",
+            &group
+                .iter()
+                .map(|row| {
+                    let cpu = (row.cpu_user_micros.saturating_add(row.cpu_system_micros))
+                        as f64
+                        / 1_000_000.0;
+                    let rss = if row.peak_rss_bytes == 0 {
+                        "—".to_owned()
+                    } else {
+                        fmt_bytes(row.peak_rss_bytes.min(i64::MAX as u64) as i64)
+                    };
+                    format!("{cpu:.1}s / {rss}")
+                })
+                .collect::<Vec<_>>(),
+        ));
+        out.push(table_row(
+            "state age / data idle",
+            &group
+                .iter()
+                .map(|row| format!("{}s / {}s", row.phase_seconds, row.quiet_seconds))
+                .collect::<Vec<_>>(),
+        ));
+        out.push(Line::from(""));
+    }
+    out.push(Line::from(Span::styled(
+        "  source/title details:",
+        Style::default().fg(Color::DarkGray),
+    )));
+    for row in rows {
+        if !row.source.is_empty() {
+            out.push(Line::from(format!(
+                "    [{}] source {}",
+                row.target,
+                mirror_clip(&row.source, 140),
+            )));
+        }
+        if !row.current_title.is_empty() {
+            out.push(Line::from(format!(
+                "    [{}] page #{} {}",
+                row.target,
+                row.current_page,
+                mirror_clip(&row.current_title, 120),
+            )));
+        }
     }
     out
 }
@@ -9427,7 +9727,10 @@ fn mirror_detail_lines(app: &App) -> Vec<Line<'static>> {
             Line::from("Choose one or more sites, where they should live,"),
             Line::from("and how often sarun should collect daily adds/changes."),
             Line::from(""),
-            Line::from("Already have a portable library? Press O to attach it paused."),
+            Line::from(format!(
+                "Already have a portable library? {} attaches it paused.",
+                main_action_hint(Pane::Mirrors, PaneAction::WikiMirrorOpenLibrary)
+            )),
             Line::from(""),
             Line::from("Nothing downloads until you confirm the setup."),
         ];
@@ -9456,17 +9759,120 @@ fn mirror_detail_lines(app: &App) -> Vec<Line<'static>> {
         Span::styled(format!("  job #{}", j.id), dim),
     ])];
     if j.kind == "wiki" {
-        out.push(Line::from(Span::styled(
-            "Enter read locally · b browse as a website · r update now",
-            Style::default().fg(Color::Cyan),
-        )));
-        out.push(Line::from(""));
+        // Actions are shown once in the global context-sensitive key bar.
     }
     let field =
         |k: &str, v: String| Line::from(vec![Span::styled(format!("{k:>9} "), cyan), Span::raw(v)]);
+    // Put the actionable part first.  On a narrow terminal the right pane is
+    // often at its top when selected, while the complete receipt/stderr tail
+    // is intentionally kept further down for inspection.
+    let show_live_build = matches!(j.state.as_str(), "running" | "stopping");
+    if show_live_build {
+        out.push(Line::from(Span::styled(
+            if matches!(j.state.as_str(), "running" | "stopping") {
+                "LIVE PROGRESS"
+            } else {
+                "LAST BUILD STATE"
+            },
+            Style::default()
+                .fg(if matches!(j.state.as_str(), "running" | "stopping") {
+                    Color::Green
+                } else {
+                    Color::Yellow
+                })
+                .add_modifier(Modifier::BOLD),
+        )));
+        if let (Some(done), Some(total)) = (j.source_bytes_completed, j.source_bytes_total) {
+            let percent = if total == 0 {
+                0
+            } else {
+                done.saturating_mul(100) / total
+            };
+            out.push(field(
+                "progress",
+                format!(
+                    "{percent}% of source ({} / {})",
+                    fmt_bytes(done.min(i64::MAX as u64) as i64),
+                    fmt_bytes(total.min(i64::MAX as u64) as i64),
+                ),
+            ));
+        }
+        if let (Some(done), Some(total)) = (j.targets_completed, j.targets_total) {
+            let active = j.targets_active.len() as u64;
+            let pending = total.saturating_sub(done.saturating_add(active));
+            out.push(field(
+                "targets",
+                format!("{done}/{total} done · {active} active · {pending} pending"),
+            ));
+        }
+        if !j.target_progress.is_empty() {
+            out.extend(mirror_worker_table(&j.target_progress, true));
+        } else {
+            for target in &j.targets_active {
+                out.push(field("worker", target.clone()));
+            }
+        }
+        if let Some(phase) = &j.build_phase {
+            out.push(field("phase", phase.clone()));
+        }
+        if let Some(rate) = j.active_source_bytes_per_second {
+            out.push(field(
+                "recv rate",
+                format!("{}/s compressed source", fmt_bytes(rate.min(i64::MAX as u64) as i64)),
+            ));
+        }
+        if let Some(quiet) = j.active_quiet_seconds.filter(|quiet| *quiet >= 10) {
+            out.push(field(
+                "activity",
+                format!(
+                    "no observable progress for {quiet}s; {}",
+                    if j
+                        .targets_active
+                        .iter()
+                        .any(|target| target.contains("waiting for source bytes"))
+                    {
+                        "source transfer is quiet"
+                    } else {
+                        "parser/encoder is quiet"
+                    }
+                ),
+            ));
+        }
+        if j.process_cpu_percent.is_some() || j.process_rss_bytes.is_some() {
+            out.push(field(
+                "resources",
+                format!(
+                    "CPU {} · RSS {} (importer and descendants)",
+                    j.process_cpu_percent
+                        .map(|value| format!("{value:.1}%"))
+                        .unwrap_or_else(|| "—".into()),
+                    j.process_rss_bytes
+                        .map(|value| fmt_bytes(value.min(i64::MAX as u64) as i64))
+                        .unwrap_or_else(|| "—".into()),
+                ),
+            ));
+        }
+        if let Some(snapshot) = &j.build_snapshot {
+            out.push(field("snapshot", snapshot.clone()));
+        }
+        if let Some(latest) = j.last_detail.lines().rev().find(|line| !line.trim().is_empty()) {
+            out.push(field("latest", scoped_mirror_detail(j.id, latest)));
+        }
+        out.push(Line::from(""));
+    }
     out.push(field("kind", j.kind.clone()));
     out.push(field("src", j.src.clone()));
     out.push(field("dest", j.dest.clone()));
+    if let Some(source) = &j.media_source {
+        out.push(field(
+            "images",
+            if source == "auto" {
+                "automatic Kiwix all-maxi download".to_owned()
+            } else {
+                format!("local Kiwix source: {source}")
+            },
+        ));
+    }
     out.push(field("interval", mirror_cadence_label(j.interval_secs)));
     out.push(field("paused", j.paused.to_string()));
     if let Some(pid) = j.pid {
@@ -9480,37 +9886,78 @@ fn mirror_detail_lines(app: &App) -> Vec<Line<'static>> {
             .max(0);
         out.push(field("elapsed", format!("{}m {:02}s", elapsed / 60, elapsed % 60)));
     }
-    if let Some(phase) = &j.build_phase {
-        out.push(field("phase", phase.clone()));
+    if !show_live_build && j.last_exit.is_some_and(|exit| exit != 0) {
+        if let Some(detail) = j.last_detail.lines().rev().find(|line| !line.trim().is_empty()) {
+            out.push(field(
+                "failure",
+                format!(
+                    "exit {} · {}",
+                    j.last_exit.unwrap_or(-1),
+                    scoped_mirror_detail(j.id, detail)
+                ),
+            ));
+        }
     }
-    if let Some(snapshot) = &j.build_snapshot {
-        out.push(field("snapshot", snapshot.clone()));
-    }
-    if let (Some(completed), Some(total)) = (j.targets_completed, j.targets_total) {
-        let active = j.targets_active.len() as u64;
-        let pending = total.saturating_sub(completed.saturating_add(active));
-        out.push(field(
-            "targets",
-            format!("{completed}/{total} done · {active} active · {pending} pending"),
-        ));
-    }
-    for target in &j.targets_active {
-        out.push(field("active", target.clone()));
-    }
-    if let (Some(completed), Some(total)) =
-        (j.source_bytes_completed, j.source_bytes_total)
-    {
-        let percent = if total == 0 {
-            String::new()
+    if !show_live_build {
+        if let Some(phase) = &j.build_phase {
+            out.push(field("phase", phase.clone()));
+        }
+        if let Some(snapshot) = &j.build_snapshot {
+            out.push(field("snapshot", snapshot.clone()));
+        }
+        if let (Some(completed), Some(total)) = (j.targets_completed, j.targets_total) {
+            let active = j.targets_active.len() as u64;
+            let pending = total.saturating_sub(completed.saturating_add(active));
+            out.push(field(
+                "targets",
+                format!(
+                    "{completed}/{total} done · {active} unfinished · {pending} pending"
+                ),
+            ));
+        }
+        if !j.target_progress.is_empty() {
+            out.extend(mirror_worker_table(&j.target_progress, false));
         } else {
-            format!(" · {}%", completed.saturating_mul(100) / total)
-        };
+            for target in &j.targets_active {
+                out.push(field("unfinished", target.clone()));
+            }
+        }
+        if let (Some(completed), Some(total)) =
+            (j.source_bytes_completed, j.source_bytes_total)
+        {
+            let percent = if total == 0 {
+                String::new()
+            } else {
+                format!(" · {}%", completed.saturating_mul(100) / total)
+            };
+            out.push(field(
+                "last source",
+                format!(
+                    "{} / {}{percent}",
+                    fmt_bytes(completed.min(i64::MAX as u64) as i64),
+                    fmt_bytes(total.min(i64::MAX as u64) as i64),
+                ),
+            ));
+        }
+    }
+    let attempts = j.fetch_attempts.unwrap_or(0);
+    let received = j.fetch_bytes_received.unwrap_or(0);
+    let rate_limits = j.fetch_rate_limit_responses.unwrap_or(0);
+    let client_errors = j.fetch_client_error_responses.unwrap_or(0);
+    let server_errors = j.fetch_server_error_responses.unwrap_or(0);
+    let transport_errors = j.fetch_transport_errors.unwrap_or(0);
+    if attempts != 0
+        || received != 0
+        || rate_limits != 0
+        || client_errors != 0
+        || server_errors != 0
+        || transport_errors != 0
+    {
         out.push(field(
-            "source",
+            "network",
             format!(
-                "{} / {}{percent}",
-                fmt_bytes(completed.min(i64::MAX as u64) as i64),
-                fmt_bytes(total.min(i64::MAX as u64) as i64),
+                "build total · {attempts} attempts · {} wire received · {rate_limits}×429 · {client_errors} other 4xx · {server_errors}×5xx · {transport_errors} transport errors",
+                fmt_bytes(received.min(i64::MAX as u64) as i64),
             ),
         ));
     }
@@ -9541,20 +9988,23 @@ fn mirror_detail_lines(app: &App) -> Vec<Line<'static>> {
                 .unwrap_or_else(|| "—".into())
         ),
     ));
-    if !j.last_detail.is_empty() {
+    // While a build is live, the structured section above is the single
+    // progress view.  Reprinting the event log here made the same phase,
+    // source and target information appear twice.  Keep the log for a
+    // completed/failed run, where it is the useful historical receipt.
+    if !j.last_detail.is_empty() && !matches!(j.state.as_str(), "running" | "stopping") {
         out.push(Line::from(""));
         out.push(Line::from(Span::styled(
-            if j.state == "running" || j.state == "stopping" {
-                "PROGRESS"
-            } else {
-                "LAST DETAIL"
-            },
+            format!("EVENTS · job #{}", j.id),
             Style::default()
                 .add_modifier(Modifier::BOLD)
                 .fg(Color::Yellow),
         )));
         for l in j.last_detail.lines() {
-            out.push(Line::from(l.to_string()));
+            let line = scoped_mirror_detail(j.id, l);
+            if !line.is_empty() {
+                out.push(Line::from(line));
+            }
         }
     }
     out
@@ -9591,41 +10041,70 @@ fn help_lines() -> Vec<Line<'static>> {
         d("  Box networking is per-box: the default routes through the engine's"),
         d("  in-process proxy (DNS + HTTPS MITM); --net off = closed, -N = host net."),
         t(""),
-        h("Panes (Tab cycles; or jump directly)"),
+        h("Panes (see the generated navigation bindings)"),
     ];
-    // The pane index is GENERATED from PANE_KEYS — the same table that drives
-    // the menubar and the key dispatch. Keys live in one place, never in prose.
-    v.extend(
-        PANE_KEYS
-            .iter()
-            .map(|(k, _, _, _, desc)| t(&format!("  {k}  {desc}"))),
-    );
-    v.push(d(
-        "     in a PTY pane: keys go to the box · Ctrl-] / F12 / Esc-Esc detaches",
-    ));
+    // Pane entries come from the same registry that drives dispatch and the
+    // visible chips.
+    v.extend(pane_switch_bindings().map(|binding| {
+        t(&format!(
+            "  {}  {}",
+            binding_key_label(binding),
+            binding.long_hint
+        ))
+    }));
+    v.push(d("     PTY input is passed to the child; detach is listed in the generated map."));
     v.extend(vec![
         t(""),
         h("Navigation & filters"),
-        t("  j/k or ↓/↑  move       Enter  open the selection in the next pane"),
-        t("  PageUp/PageDown  page   ctrl+↑/↓  reorder a rule (on Rules)"),
+        t("  The generated key map below is the authoritative list for this context."),
     ]);
-    // The action keys are GENERATED from PANE_ACTION_KEYS — the same table
-    // `dispatch_pane_key` runs. Every binding with a help string surfaces
-    // here exactly once; keys can never drift from their documentation. (The
-    // None-help entries — the j/k/Tab/Enter nav block — are described in prose
-    // just above, since they read as a group, not one line each.) Grouped by
-    // gate: global keys work everywhere, pane-gated ones only in their pane.
-    v.push(h("Keys"));
-    v.push(d("  global:"));
-    for (key, gate, _, help) in PANE_ACTION_KEYS {
-        if let (PaneGate::Any, Some(desc)) = (gate, help) {
-            v.push(t(&format!("    {}  {desc}", key.label())));
-        }
-    }
-    v.push(d("  pane-gated:"));
-    for (key, gate, _, help) in PANE_ACTION_KEYS {
-        if let (PaneGate::On(_), Some(desc)) = (gate, help) {
-            v.push(t(&format!("    {}  {desc}", key.label())));
+    v.push(h("Key bindings"));
+    for context in [
+        BindingContext::Main,
+        BindingContext::Reader,
+        BindingContext::Confirm,
+        BindingContext::Global,
+        BindingContext::Prompt,
+        BindingContext::Menu,
+        BindingContext::Rename,
+        BindingContext::Modal,
+        BindingContext::ModalSearch,
+        BindingContext::ModalLauncher,
+        BindingContext::ModalApiConfig,
+        BindingContext::ModalWikiSetup,
+        BindingContext::ModalDismiss,
+        BindingContext::Inspect,
+        BindingContext::Editor,
+        BindingContext::EditorCompletion,
+        BindingContext::Pty,
+    ] {
+        let label = match context {
+            BindingContext::Main => "main panes",
+            BindingContext::Reader => "document reader",
+            BindingContext::Confirm => "confirmation modal",
+            BindingContext::Global => "function keys",
+            BindingContext::Prompt => "permission prompt",
+            BindingContext::Menu => "pane menu",
+            BindingContext::Rename => "rename input",
+            BindingContext::Modal => "dialog navigation and text input",
+            BindingContext::ModalSearch => "filter dialog actions",
+            BindingContext::ModalLauncher => "PTY launcher options",
+            BindingContext::ModalApiConfig => "API configuration actions",
+            BindingContext::ModalWikiSetup => "Wikipedia setup actions",
+            BindingContext::ModalDismiss => "report/image dismissal",
+            BindingContext::Inspect => "object inspector",
+            BindingContext::Editor => "empty editor pane",
+            BindingContext::EditorCompletion => "editor completion list",
+            BindingContext::Pty => "PTY controls",
+            BindingContext::PaneSwitch => unreachable!(),
+        };
+        v.push(d(&format!("  {label}:")));
+        for binding in BINDINGS.iter().filter(|binding| binding.context == context) {
+            v.push(t(&format!(
+                "    {}  {}",
+                binding_key_label(binding),
+                binding.long_hint
+            )));
         }
     }
     v.extend(vec![
@@ -9640,12 +10119,11 @@ fn help_lines() -> Vec<Line<'static>> {
         d("     Rows fold top→bottom by each row's and/or; 'not' negates a row."),
         t("  c/p/o also cross-navigate: pin the destination pane to the rows the"),
         t("       cursor relates to (a change's writers, a process's outputs…)."),
-        d("       Esc drops such a generated filter."),
+        d("       A generated filter can be cleared from the active pane."),
         t(""),
         h("Reviewing changes"),
         t("  In the DIFF pane, a TEXT change is shown as unified-diff hunks:"),
-        t("    ↑/↓  move the hunk cursor (▶)  ·  a  apply this hunk to the host"),
-        t("    x or d  discard this hunk (revert it in the box)"),
+        t("    The generated key map lists movement and apply/discard actions."),
         t("  A BINARY change shows a detail header (path · kind · size · mode,"),
         t("  ⚠ when the host changed since capture) and a STRUCTURAL diff: the"),
         t("  type is sniffed and a differ (readelf/ar/unzip/tar) runs in a"),
@@ -9653,19 +10131,17 @@ fn help_lines() -> Vec<Line<'static>> {
         t(""),
         h("Confirm prompts (y/n)"),
     ]);
-    // The destructive-action prompts (K/D/Z) pop a Confirm modal whose keys are
-    // GENERATED from CONFIRM_KEYS — same single-source-of-truth principle.
+    // Confirmation text is also generated from the registry.
     {
-        let keys = |want: fn(&ConfirmKey) -> bool| {
-            CONFIRM_KEYS
-                .iter()
-                .filter(|(_, a, _)| want(a))
-                .map(|(k, _, _)| k.label())
+        let keys = |want: fn(&BindingAction) -> bool| {
+            confirm_bindings()
+                .filter(|binding| want(&binding.action))
+                .map(binding_key_label)
                 .collect::<Vec<_>>()
                 .join("/")
         };
-        let yes = keys(|a| matches!(a, ConfirmKey::Yes));
-        let no = keys(|a| matches!(a, ConfirmKey::No));
+        let yes = keys(|a| matches!(a, BindingAction::Confirm(ConfirmKey::Yes)));
+        let no = keys(|a| matches!(a, BindingAction::Confirm(ConfirmKey::No)));
         v.push(t(&format!("  {yes}  confirm the action     {no}  cancel")));
     }
     v.extend(vec![
@@ -9677,8 +10153,7 @@ fn help_lines() -> Vec<Line<'static>> {
         d("  Only a TOP-LEVEL box's apply reaches the real host."),
         t(""),
         h("File rules (e)"),
-        t("  n  new rule    Enter  edit selected    d  delete selected"),
-        t("  ctrl+↑ / ctrl+↓  reorder the selected rule (order = priority)"),
+        t("  Rule creation, editing, deletion, and priority movement are listed in the generated key map."),
         t("  Each rule is '<action> <clause>' where action is one of:"),
         d("     apply        keep the matching writes (let them reach the host)"),
         d("     discard      drop the matching writes"),
@@ -9790,7 +10265,7 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
         let block = ratatui::widgets::Block::default()
             .borders(ratatui::widgets::Borders::ALL)
             .title(format!(" image · {title} "))
-            .title_bottom(" Esc/q close ");
+            .title_bottom(modal_dismiss_hint());
         f.render_widget(
             Paragraph::new(Text::from(body))
                 .block(block)
@@ -9816,7 +10291,7 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
         Modal::ModelPicker { models, .. } => (models.len() as u16 + 1).clamp(1, 18) + 7,
         // 3 fields + header + result + help + borders.
         Modal::ApiConfig { .. } => 11,
-        Modal::WikiMirrorSetup { .. } => 31,
+        Modal::WikiMirrorSetup { .. } => 36,
         Modal::WikiMirrorLibrary { .. } => 9,
         Modal::Command {
             buf, completions, ..
@@ -9852,7 +10327,7 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
             vec![
                 Line::from(prompt.clone()),
                 Line::from(""),
-                Line::from("y = yes · n / Esc = cancel"),
+                Line::from(confirm_hint()),
             ],
         ),
         Modal::Search {
@@ -9933,8 +10408,7 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
             }
             body.push(Line::from(""));
             body.push(Line::from(Span::styled(
-                "←/→ field · space toggles on/not (and cycles kind) · type pattern \
-                 · n new row · ^s apply · esc clear",
+                modal_hint_for(BindingContext::ModalSearch, true),
                 Style::default().fg(Color::Gray),
             )));
             (" filter ", body)
@@ -9948,7 +10422,7 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
             vec![
                 Line::from(format!("{buf}_")),
                 Line::from(""),
-                Line::from("e.g.  discard **/*.log   ·   Enter save · Esc cancel"),
+                Line::from(format!("e.g.  discard **/*.log   ·   {}", modal_hint())),
             ],
         ),
         Modal::VarQuery { buf } => (
@@ -9956,9 +10430,10 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
             vec![
                 Line::from(format!("{buf}_")),
                 Line::from(""),
-                Line::from(
-                    "one word matches NAME or VALUE (substring); two words = NAME VALUE; globs ok · Enter · Esc",
-                ),
+                Line::from(format!(
+                    "one word matches NAME or VALUE (substring); two words = NAME VALUE; globs ok · {}",
+                    modal_hint()
+                )),
             ],
         ),
         Modal::PtyCmd { buf } => {
@@ -9970,19 +10445,18 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
             let is_sarun = buf.trim_start().starts_with("sarun ");
             let help = if is_sarun {
                 "this is a `sarun` command — it launches a sandboxed, \
-                 captured box (edit the args or command, then Enter) · \
-                 Esc cancel"
+                 captured box (edit the args or command)"
             } else {
                 "runs on the HOST as typed — no box, no capture (a bare \
                  `bash` is a plain host shell); prefix `sarun run -b -- CMD` \
-                 to run CMD in a fresh captured box · Enter run · Esc cancel"
+                 to run CMD in a fresh captured box"
             };
             (
                 " run on a PTY ",
                 vec![
-                    Line::from(format!("{buf}_")),
-                    Line::from(""),
-                    Line::from(help),
+                Line::from(format!("{buf}_")),
+                Line::from(""),
+                Line::from(format!("{help} · {}", modal_hint())),
                 ],
             )
         }
@@ -9996,7 +10470,7 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
                             persistent BROWSER box — the profile persists and \
                             every page is captured to the box's web archive",
                 ),
-                Line::from("Enter open · Esc cancel"),
+                Line::from(modal_hint()),
             ],
         ),
         Modal::ReaderOpen { buf } => (
@@ -10008,7 +10482,7 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
                     "host path of an .html / .md / text file — rendered \
                             in the document reader (links, headings, search)",
                 ),
-                Line::from("Enter open · Esc cancel"),
+                Line::from(modal_hint()),
             ],
         ),
         Modal::WikiMirrorSetup {
@@ -10016,6 +10490,7 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
             site_cursor,
             site_filter,
             destination,
+            media_enabled,
             cadence,
             field,
         } => {
@@ -10098,13 +10573,8 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
             )));
             body.push(Line::from(Span::styled(
                 format!(
-                    "   {}{}",
-                    destination,
-                    if *field == WikiSetupField::Destination {
-                        "_"
-                    } else {
-                        ""
-                    }
+                    "   {}",
+                    destination
                 ),
                 if *field == WikiSetupField::Destination {
                     active
@@ -10126,7 +10596,39 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
             )));
             body.push(Line::from(""));
             body.push(Line::from(Span::styled(
-                "3  Automatic incremental updates",
+                "3  Kiwix images",
+                if *field == WikiSetupField::MediaSource {
+                    label.add_modifier(Modifier::UNDERLINED)
+                } else {
+                    label
+                },
+            )));
+            body.push(Line::from(Span::styled(
+                format!(
+                    "   {}",
+                    if *media_enabled {
+                        "download latest all-maxi ZIM"
+                    } else {
+                        "disabled"
+                    },
+                ),
+                if *field == WikiSetupField::MediaSource {
+                    active
+                } else {
+                    Style::default()
+                },
+            )));
+            body.push(Line::from(Span::styled(
+                "   Space toggles automatic download from the official Kiwix catalogue.",
+                Style::default().add_modifier(Modifier::DIM),
+            )));
+            body.push(Line::from(Span::styled(
+                "   The ZIM is fetched in ranges and is never saved as a local ZIM file.",
+                Style::default().add_modifier(Modifier::DIM),
+            )));
+            body.push(Line::from(""));
+            body.push(Line::from(Span::styled(
+                "4  Automatic incremental updates",
                 if *field == WikiSetupField::Cadence {
                     label.add_modifier(Modifier::UNDERLINED)
                 } else {
@@ -10165,10 +10667,10 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
                 Style::default().add_modifier(Modifier::DIM),
             )));
             body.push(Line::from(""));
-            body.push(Line::from(
-                "Tab fields · type to filter · ↑/↓ sites · Space select · ←/→ cadence",
-            ));
-            body.push(Line::from("Enter create and start · Esc cancel"));
+            body.push(Line::from(format!(
+                "{} · fields/filter/site selection",
+                modal_hint_with_space()
+            )));
             (" add Wikipedia mirrors ", body)
         }
         Modal::WikiMirrorLibrary { path } => (
@@ -10182,7 +10684,7 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
                     "Discovery is read-only. Mirrors are attached paused: no download or update starts.",
                     Style::default().fg(Color::Yellow),
                 )),
-                Line::from("Enter attach · Esc cancel"),
+                Line::from(modal_hint()),
             ],
         ),
         Modal::EditorOpen { buf } => (
@@ -10194,7 +10696,7 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
                     "host path of a text file — vim-modal editing with \
                             syntax highlighting (rs/py/c/js/sh/json/yaml/md)",
                 ),
-                Line::from("Enter open · Esc cancel"),
+                Line::from(modal_hint()),
             ],
         ),
         Modal::ActionMenu { title, items, sel } => {
@@ -10234,7 +10736,7 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
             }
             body.push(Line::from(""));
             body.push(Line::from(Span::styled(
-                "↑/↓ move · Enter run · Esc cancel",
+                modal_hint_for(BindingContext::ModalLauncher, false),
                 Style::default().fg(Color::Gray),
             )));
             (" actions ", body)
@@ -10262,7 +10764,7 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
             }
             body.push(Line::from(""));
             body.push(Line::from(Span::styled(
-                "↑/↓ move · Enter pick · Esc cancel",
+                modal_hint(),
                 Style::default().fg(Color::Gray),
             )));
             (
@@ -10297,6 +10799,22 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
                 ]
             };
             let mut opts = vec![];
+            let launcher_key = |action: UiAction| {
+                BINDINGS
+                    .iter()
+                    .find(|binding| {
+                        binding.context == BindingContext::ModalLauncher
+                            && match (action, binding.action) {
+                                (UiAction::ModalNetwork, BindingAction::Ui(UiAction::ModalNetwork))
+                                | (UiAction::ModalEnv, BindingAction::Ui(UiAction::ModalEnv)) => true,
+                                _ => false,
+                            }
+                    })
+                    .map(binding_key_label)
+                    .unwrap_or_default()
+            };
+            let network_key = launcher_key(UiAction::ModalNetwork);
+            let env_key = launcher_key(UiAction::ModalEnv);
             let tap_dead = !app.tap_ok && app.launch_net == 0;
             let net_label = if tap_dead {
                 "network: TAP ✗ unavailable here".to_string()
@@ -10305,7 +10823,7 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
             };
             if tap_dead {
                 opts.push(Span::styled(
-                    "[n] ",
+                    format!("[{network_key}] "),
                     Style::default()
                         .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD),
@@ -10316,18 +10834,13 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
                 ));
                 opts.push(Span::raw("   "));
             } else {
-                opts.extend(chip("n", net_label, app.launch_net != 0));
+                opts.extend(chip(&network_key, net_label, app.launch_net != 0));
             }
             opts.extend(chip(
-                "e",
+                &env_key,
                 format!("record env: {}", if app.launch_env { "ON" } else { "off" }),
                 app.launch_env,
             ));
-            let net_hint = if app.tap_ok {
-                "n cycles network (tap → host → off)"
-            } else {
-                "n cycles network (tap ✗ no CLONE_NEWNET here → host → off)"
-            };
             let mut body = vec![
                 Line::from(Span::styled(
                     "New PTY — where should it run?",
@@ -10339,8 +10852,8 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
                 Line::from(opts),
                 Line::from(Span::styled(
                     format!(
-                        "{net_hint} · e toggles env capture — applied \
-                             to box/container launches"
+                        "{} — applied to box/container launches",
+                        modal_hint_for(BindingContext::ModalLauncher, false)
                     ),
                     Style::default().fg(Color::DarkGray),
                 )),
@@ -10369,7 +10882,7 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
             }
             body.push(Line::from(""));
             body.push(Line::from(Span::styled(
-                "↑/↓ move · Enter launch · Esc cancel",
+                modal_hint_for(BindingContext::ModalLauncher, false),
                 Style::default().fg(Color::Gray),
             )));
             (" new PTY ", body)
@@ -10419,7 +10932,7 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
             }
             body.push(Line::from(""));
             body.push(Line::from(Span::styled(
-                "↑/↓ move · Enter pick/descend · Backspace up · Esc cancel",
+                modal_hint(),
                 Style::default().fg(Color::Gray),
             )));
             (" new box from image ", body)
@@ -10429,11 +10942,12 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
             vec![
                 Line::from(format!("{buf}_")),
                 Line::from(""),
-                Line::from(
+                Line::from(format!(
                     "e.g. ubuntu:24.04 · ghcr.io/org/img:tag · \
                             oci-archive:/path.tar — short names resolve via \
-                            /etc/containers · Enter pull · Esc cancel",
-                ),
+                            /etc/containers · {}",
+                    modal_hint()
+                )),
             ],
         ),
         Modal::OaitaTask {
@@ -10456,11 +10970,12 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
                 Line::from(""),
                 Line::from(format!("{buf}_")),
                 Line::from(""),
-                Line::from(
-                    "type the task, e.g. `summarize README.md` — Enter \
+                Line::from(format!(
+                    "type the task, e.g. `summarize README.md` — {} \
                             runs it in a captured box layered on this box \
-                            (net via the Pty+ chip) · Esc cancel",
-                ),
+                            (net via the Pty+ chip)",
+                    modal_hint()
+                )),
             ],
         ),
         Modal::ModelPicker {
@@ -10533,7 +11048,7 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
                 Style::default().fg(Color::DarkGray),
             )));
             body.push(Line::from(Span::styled(
-                "↑/↓ move · Enter download & serve · Esc cancel",
+                modal_hint(),
                 Style::default().fg(Color::Gray),
             )));
             (" local model picker ", body)
@@ -10543,11 +11058,12 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
             vec![
                 Line::from(format!("{buf}_")),
                 Line::from(""),
-                Line::from(
+                Line::from(format!(
                     "paste a GGUF URL (e.g. \
                             https://huggingface.co/…/model-Q4_K_M.gguf) — \
-                            Enter downloads it in a box & serves it · Esc cancel",
-                ),
+                            {} downloads it in a box & serves it",
+                    modal_hint()
+                )),
             ],
         ),
         Modal::ApiConfig {
@@ -10609,7 +11125,7 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
                 Span::styled("  testing connection…", Style::default().fg(Color::Yellow))
             } else if result.is_empty() {
                 Span::styled(
-                    "  (Ctrl-T tests the connection)",
+                    format!("  ({})", modal_hint_with_test()),
                     Style::default().fg(Color::DarkGray),
                 )
             } else if result.starts_with('✓') {
@@ -10619,8 +11135,7 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
             };
             body.push(Line::from(rline));
             body.push(Line::from(Span::styled(
-                "Tab/↑/↓ field · type to edit · Ctrl-T test · Ctrl-S/Enter save \
-                 · Esc cancel",
+                modal_hint_with_test(),
                 Style::default().fg(Color::Gray),
             )));
             (" configure external API ", body)
@@ -10715,7 +11230,7 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
             }
             body.push(Line::from(""));
             body.push(Line::from(Span::styled(
-                "↑↓ scroll · Tab fill+advance · Enter dispatch · Esc cancel",
+                modal_hint(),
                 Style::default().fg(Color::Gray),
             )));
             (" : ", body)
@@ -10790,29 +11305,41 @@ fn wrapped_rows(lines: &[Line], inner_w: u16) -> usize {
 /// menubar + fkeybar both use this so the letters / labels stay
 /// consistent in one place.
 fn view_of_pane(p: Pane) -> Option<(char, &'static str, FilterView)> {
-    match p {
-        Pane::Sessions => Some(('b', "boxes", FilterView::Changes /* unused */)),
-        Pane::Changes | Pane::Hunks => Some(('c', "changes", FilterView::Changes)),
-        Pane::Processes => Some(('p', "procs", FilterView::Procs)),
-        Pane::Outputs => Some(('o', "outputs", FilterView::Outputs)),
-        Pane::Pipelines => Some(('l', "pipes", FilterView::Pipelines)),
-        Pane::BuildEdges => Some(('g', "build", FilterView::BuildEdges)),
-        Pane::Rules => Some(('e', "rules", FilterView::Changes /* unused */)),
-        Pane::Mirrors => Some(('M', "mirrors", FilterView::Changes /* unused */)),
-        Pane::Reader => Some(('u', "reader", FilterView::Changes /* unused */)),
-        Pane::Editor => Some(('W', "editor", FilterView::Changes /* unused */)),
-        Pane::Flows | Pane::Packets => Some(('f', "flows", FilterView::Changes /* unused */)),
-        Pane::Help => Some(('?', "help", FilterView::Changes /* unused */)),
-        Pane::Pty => Some(('P', "PTY", FilterView::Changes /* unused */)),
-        Pane::ApiLogs => Some(('i', "api", FilterView::Changes /* unused */)),
-        Pane::Network => Some(('w', "web", FilterView::Changes /* unused */)),
-        Pane::Trace => Some(('t', "trace", FilterView::Changes /* unused */)),
-        Pane::Vars => Some(('v', "vars", FilterView::Changes /* unused */)),
-        Pane::Inspect => Some(('s', "inspect", FilterView::Changes /* unused */)),
-    }
+    let binding = pane_switch_bindings().find(|binding| {
+        matches!(binding.action, BindingAction::SwitchPane(pane) if pane == p)
+    })?;
+    let key = binding.key.char()?;
+    let label = match p {
+        Pane::Sessions => "boxes",
+        Pane::Changes | Pane::Hunks => "changes",
+        Pane::Processes => "procs",
+        Pane::Outputs => "outputs",
+        Pane::Pipelines => "pipes",
+        Pane::BuildEdges => "build",
+        Pane::Flows | Pane::Packets => "flows",
+        Pane::Rules => "rules",
+        Pane::Mirrors => "mirrors",
+        Pane::Reader => "reader",
+        Pane::Editor => "editor",
+        Pane::Pty => "PTY",
+        Pane::ApiLogs => "api",
+        Pane::Network => "web",
+        Pane::Trace => "trace",
+        Pane::Vars => "vars",
+        Pane::Help => "help",
+        Pane::Inspect => "inspect",
+    };
+    let filter = match p {
+        Pane::Processes => FilterView::Procs,
+        Pane::Pipelines => FilterView::Pipelines,
+        Pane::BuildEdges => FilterView::BuildEdges,
+        _ => FilterView::Changes,
+    };
+    Some((key, label, filter))
 }
 
 /// When a pane chip is visible in the menubar.
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum PaneVis {
     Always,
     Data,
@@ -10824,214 +11351,157 @@ enum PaneVis {
 /// help text. The menubar render, the key dispatch (`dispatch_menubar_key` →
 /// `App::go_to_pane`), and the help index all derive from this — so a key, a
 /// label, and its documentation can never drift apart.
-const PANE_KEYS: &[(char, Pane, &str, PaneVis, &str)] = &[
-    (
-        'b',
-        Pane::Sessions,
-        "Boxes",
-        PaneVis::Always,
-        "boxes/sessions — the box list (path · id · status · cmd)",
-    ),
-    (
-        'c',
-        Pane::Changes,
-        "Changes",
-        PaneVis::Always,
-        "changes — files the box wrote (Enter → its diff)",
-    ),
-    (
-        'p',
-        Pane::Processes,
-        "Procs",
-        PaneVis::Data,
-        "processes — the captured process TREE (exe · argv · env)",
-    ),
-    (
-        'o',
-        Pane::Outputs,
-        "Outputs",
-        PaneVis::Data,
-        "outputs — decoded stdout/stderr transcript",
-    ),
-    (
-        'l',
-        Pane::Pipelines,
-        "Pipes",
-        PaneVis::Data,
-        "pipeLines — shell pipelines a -b box ran (parsed structure)",
-    ),
-    (
-        'g',
-        Pane::BuildEdges,
-        "Build",
-        PaneVis::Data,
-        "build Graph — parsed ninja/make build edges from a -b box",
-    ),
-    (
-        'f',
-        Pane::Flows,
-        "Flows",
-        PaneVis::Always,
-        "network flows — tshark-decoded HTTP/TLS from a -n box's pcap",
-    ),
-    (
-        'e',
-        Pane::Rules,
-        "Rules",
-        PaneVis::Always,
-        "file rules — the ordered apply/discard/passthrough rules",
-    ),
-    (
-        'M',
-        Pane::Mirrors,
-        "Mirrors",
-        PaneVis::Always,
-        "scheduled mirror updates — r run selected, R run pending, V read, space pause/resume, D delete",
-    ),
-    (
-        'u',
-        Pane::Reader,
-        "Read",
-        PaneVis::Always,
-        "docUment reader — html/md/text files + wiki mirror pages; o open, z fullscreen",
-    ),
-    (
-        'W',
-        Pane::Editor,
-        "Edit",
-        PaneVis::Always,
-        "text editor (W = Write) — syntax-highlighted vim-modal editing of host + box files; Ctrl-S save, z fullscreen",
-    ),
-    (
-        'P',
-        Pane::Pty,
-        "PTYs",
-        PaneVis::Pty,
-        "open an engine-held PTY — a live interactive shell pane",
-    ),
-    (
-        'i',
-        Pane::ApiLogs,
-        "Api",
-        PaneVis::Always,
-        "the --api oaita proxy log",
-    ),
-    (
-        'w',
-        Pane::Network,
-        "Web",
-        PaneVis::Always,
-        "web captures — tap MITM HTTP(S) content archive (headers + body)",
-    ),
-    (
-        't',
-        Pane::Trace,
-        "Trace",
-        PaneVis::Data,
-        "sud Trace — a sud box's decoded wire-trace event stream",
-    ),
-    (
-        'v',
-        Pane::Vars,
-        "Vars",
-        PaneVis::Data,
-        "variable provenance — make + shell assignments ('/' queries)",
-    ),
-    (
-        's',
-        Pane::Inspect,
-        "Inspect",
-        PaneVis::Always,
-        "object inspector — drill into every sarun object (':' takes oaita-inspect locators)",
-    ),
-    ('?', Pane::Help, "Help", PaneVis::Always, "this help"),
-];
-
-// ── keybindings as data: the remaining contexts ─────────────────────────────
+// ── the keybinding registry ────────────────────────────────────────────────
 //
-// `PANE_KEYS` above made the top-level pane accelerators a single declarative
-// table (menubar + dispatch + help all derive from it). The rest of the UI's
-// key handling — the Confirm modal and the main loop's per-pane action keys —
-// used to be scattered inline `match KeyCode` arms, so a key, its behavior, and
-// its help text lived in three places and could drift. The model below applies
-// the same pattern to those contexts: a `Key` matcher, per-context tables
-// mapping key -> action, a table-lookup dispatch, and help text GENERATED from
-// the tables (see `help_lines`).
-//
-// The text-entry modals (RuleForm / PtyCmd) and the stateful editors
-// (Search / ActionMenu) are NOT tabled: their "keys" are free-text editing
-// (every Char appends to a buffer) or cursor motion over per-modal state, which
-// a (key -> fixed action) table can't faithfully express. They keep their
-// hand-written handlers; only the genuinely enumerable contexts move to tables.
+// Every fixed UI binding lives in this ordered registry. Dispatchers only
+// select a binding from here; the same records drive pane chips, the context
+// bar, F1 help, and Reader's stateful keymap. Free-form text is represented by
+// the AnyChar binding in the relevant input context, so it does not need a
+// second hint-only keymap.
 
-/// A logical key for table matching — the subset of `crossterm::KeyCode` the
-/// table-driven contexts bind. Char matching is case-sensitive (so 'a' and 'A'
-/// are distinct, as the apply-one vs apply-all split needs).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Key {
     Char(char),
+    AnyChar,
+    CtrlChar(char),
+    CtrlUp,
+    CtrlDown,
     Esc,
     Enter,
+    Backspace,
     Tab,
+    BackTab,
+    Up,
+    Down,
+    Left,
+    Right,
+    PageUp,
+    PageDown,
+    Home,
+    End,
+    F(u8),
 }
 
 impl Key {
-    /// Match against a real crossterm event code. False for codes this matcher
-    /// doesn't model (the caller falls through to non-table handling).
-    fn matches(self, code: crossterm::event::KeyCode) -> bool {
-        use crossterm::event::KeyCode;
+    fn matches(self, code: crossterm::event::KeyCode, mods: crossterm::event::KeyModifiers) -> bool {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let ctrl = mods.contains(KeyModifiers::CONTROL);
+        let alt = mods.contains(KeyModifiers::ALT);
         match self {
-            Key::Char(c) => code == KeyCode::Char(c),
-            Key::Esc => code == KeyCode::Esc,
-            Key::Enter => code == KeyCode::Enter,
-            Key::Tab => code == KeyCode::Tab,
+            Key::Char(c) => !ctrl && !alt && code == KeyCode::Char(c),
+            Key::AnyChar => !ctrl && matches!(code, KeyCode::Char(c) if !c.is_control()),
+            Key::CtrlChar(c) => ctrl && !alt && code == KeyCode::Char(c),
+            Key::CtrlUp => ctrl && !alt && code == KeyCode::Up,
+            Key::CtrlDown => ctrl && !alt && code == KeyCode::Down,
+            Key::Esc => !ctrl && !alt && code == KeyCode::Esc,
+            Key::Enter => !ctrl && !alt && code == KeyCode::Enter,
+            Key::Backspace => !ctrl && !alt && code == KeyCode::Backspace,
+            Key::Tab => !ctrl && !alt && code == KeyCode::Tab,
+            Key::BackTab => !ctrl && !alt && code == KeyCode::BackTab,
+            Key::Up => !ctrl && !alt && code == KeyCode::Up,
+            Key::Down => !ctrl && !alt && code == KeyCode::Down,
+            Key::Left => !ctrl && !alt && code == KeyCode::Left,
+            Key::Right => !ctrl && !alt && code == KeyCode::Right,
+            Key::PageUp => !ctrl && !alt && code == KeyCode::PageUp,
+            Key::PageDown => !ctrl && !alt && code == KeyCode::PageDown,
+            Key::Home => !ctrl && !alt && code == KeyCode::Home,
+            Key::End => !ctrl && !alt && code == KeyCode::End,
+            Key::F(n) => !ctrl && !alt && code == KeyCode::F(n),
         }
     }
-    /// Human label for help/hint rendering (mirrors how `PANE_KEYS` prints its
-    /// accelerator char in the generated help index).
+
     fn label(self) -> String {
         match self {
             Key::Char(c) => c.to_string(),
+            Key::AnyChar => "<text>".into(),
+            Key::CtrlChar(c) => format!("Ctrl-{c}"),
+            Key::CtrlUp => "Ctrl-Up".into(),
+            Key::CtrlDown => "Ctrl-Down".into(),
             Key::Esc => "Esc".into(),
             Key::Enter => "Enter".into(),
+            Key::Backspace => "Backspace".into(),
             Key::Tab => "Tab".into(),
+            Key::BackTab => "Shift-Tab".into(),
+            Key::Up => "Up".into(),
+            Key::Down => "Down".into(),
+            Key::Left => "Left".into(),
+            Key::Right => "Right".into(),
+            Key::PageUp => "PageUp".into(),
+            Key::PageDown => "PageDown".into(),
+            Key::Home => "Home".into(),
+            Key::End => "End".into(),
+            Key::F(n) => format!("F{n}"),
+        }
+    }
+
+    fn char(self) -> Option<char> {
+        match self {
+            Key::Char(c) => Some(c),
+            _ => None,
         }
     }
 }
 
-/// What a Confirm-modal key does. The y/n/Esc contract lived inline in
-/// `handle_modal_key`; now it's the `CONFIRM_KEYS` table.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReaderBindingContext {
+    Document,
+    History,
+    Search,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReaderAction {
+    SearchCancel,
+    SearchAccept,
+    SearchBackspace,
+    SearchText,
+    ScrollDown,
+    ScrollUp,
+    FocusHistory,
+    NextView,
+    RenderedView,
+    RawView,
+    DiffView,
+    SpatialLeft,
+    SpatialRight,
+    SpatialUp,
+    SpatialDown,
+    PageDown,
+    PageUp,
+    Home,
+    End,
+    FocusNextLink,
+    FocusPreviousLink,
+    JumpNext,
+    JumpPrevious,
+    Follow,
+    Back,
+    Forward,
+    DocumentSearch,
+    TitleSearch,
+    FullTextSearch,
+    ToggleFull,
+    Open,
+    Close,
+    HistoryUp,
+    HistoryDown,
+    HistoryPageUp,
+    HistoryPageDown,
+    HistoryHome,
+    HistoryEnd,
+    HistoryOpen,
+    HistoryUser,
+    HistoryEdits,
+    HistoryReturn,
+}
+
 #[derive(Clone, Copy)]
 enum ConfirmKey {
     Yes,
     No,
 }
 
-/// The Confirm modal's keymap: 'y'/'Y' run the pending destructive action,
-/// 'n'/'N'/Esc cancel. Anything else re-arms the modal (the dispatcher's "no
-/// match" path). The modal's help line is generated from this table.
-const CONFIRM_KEYS: &[(Key, ConfirmKey, &str)] = &[
-    (Key::Char('y'), ConfirmKey::Yes, "confirm"),
-    (Key::Char('Y'), ConfirmKey::Yes, "confirm"),
-    (Key::Char('n'), ConfirmKey::No, "cancel"),
-    (Key::Char('N'), ConfirmKey::No, "cancel"),
-    (Key::Esc, ConfirmKey::No, "cancel"),
-];
-
-/// Whether a `PaneAction` is gated on the focused pane. `Any` runs regardless;
-/// `On(pane)` only fires when `app.focus == pane`. The table is consulted in
-/// order, so a guarded entry listed first shadows a bare entry on the same key.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum PaneGate {
-    Any,
-    On(Pane),
-}
-
-/// Actions reachable from the main key loop (outside any modal / PTY / menu-nav
-/// capture). Each variant is one mutation on `App`, so the dispatcher runs it
-/// from a table lookup without holding pane-specific data — the same shape as
-/// `go_to_pane` for the pane accelerators.
-#[derive(Clone, Copy)]
 enum PaneAction {
     Quit,
     Detach,
@@ -11058,6 +11528,7 @@ enum PaneAction {
     MirrorCancel,
     MirrorRunPending,
     MirrorTogglePause,
+    MirrorToggleMedia,
     MirrorBrowse,
     MirrorRead,
     ChangeRead,
@@ -11072,245 +11543,1391 @@ enum PaneAction {
     ToggleMark,
     RangeMark,
     CommandOpen,
+    MoveRuleUp,
+    MoveRuleDown,
+    PageDown,
+    PageUp,
+    Home,
+    End,
+    SessionLeft,
+    SessionRight,
+    ToggleErrors,
+    GoBack,
+    ClosePackets,
+    ClearFilter,
 }
 
-/// The main-loop pane keymap. ORDER MATTERS, and reproduces the original inline
-/// arm precedence exactly: guarded (`On(pane)`) entries that must win over a
-/// bare key are listed BEFORE the bare entry for that key, and the dispatcher
-/// returns on the first gate-satisfied match. So 'a' = apply-hunk on Hunks else
-/// apply-file; 'x' = discard-hunk on Hunks else discard-file; 'd' = discard-hunk
-/// on Hunks, delete-rule on Rules, else detach; 'n' = new-rule on Rules (the
-/// bare 'n' is taken by the banner-prompt steal handled before dispatch).
-///
-/// `help` is the one-line description, or `None` for keys documented as a group
-/// in prose (the j/k move + Tab + Enter navigation block). Keys that need
-/// context a flat table can't carry stay inline and are noted at the call site:
-/// ctrl+arrow rule reorder, PageUp/PageDown, the pane accelerators routed
-/// through `dispatch_menubar_key`, Esc (clear generated filter / close packets),
-/// and the banner-prompt y/n/a/d steal.
-const PANE_ACTION_KEYS: &[(Key, PaneGate, PaneAction, Option<&str>)] = &[
-    (
-        Key::Char('q'),
-        PaneGate::Any,
-        PaneAction::Quit,
-        Some("quit (stops the engine)"),
-    ),
-    (Key::Char('j'), PaneGate::Any, PaneAction::MoveDown, None),
-    (Key::Char('k'), PaneGate::Any, PaneAction::MoveUp, None),
-    (Key::Tab, PaneGate::Any, PaneAction::NextPane, None),
-    (Key::Enter, PaneGate::Any, PaneAction::Open, None),
-    (
-        Key::Char('m'),
-        PaneGate::Any,
-        PaneAction::ActionMenu,
-        Some("actions popup for the selected row"),
-    ),
-    (
-        Key::Char(':'),
-        PaneGate::Any,
-        PaneAction::CommandOpen,
-        Some("command prompt (Tab completes verbs)"),
-    ),
-    (
-        Key::Char('a'),
-        PaneGate::On(Pane::Hunks),
-        PaneAction::ApplyHunk,
-        None,
-    ),
-    (
-        Key::Char('x'),
-        PaneGate::On(Pane::Hunks),
-        PaneAction::DiscardHunk,
-        None,
-    ),
-    (
-        Key::Char('d'),
-        PaneGate::On(Pane::Hunks),
-        PaneAction::DiscardHunk,
-        None,
-    ),
-    (
-        Key::Char(' '),
-        PaneGate::On(Pane::Mirrors),
-        PaneAction::MirrorTogglePause,
-        Some("pause/resume mirror job (on Mirrors)"),
-    ),
-    (
-        Key::Char(' '),
-        PaneGate::Any,
-        PaneAction::ToggleMark,
-        Some("select/unselect row (Boxes/Changes) for batch a/x/D"),
-    ),
-    (
-        Key::Char('['),
-        PaneGate::Any,
-        PaneAction::RangeMark,
-        Some("select range: anchor (Space) → cursor"),
-    ),
-    (Key::Char(']'), PaneGate::Any, PaneAction::RangeMark, None),
-    (
-        Key::Char('a'),
-        PaneGate::Any,
-        PaneAction::ApplyFile,
-        Some("apply selected change / whole box (or all selected)"),
-    ),
-    (
-        Key::Char('x'),
-        PaneGate::Any,
-        PaneAction::DiscardFile,
-        Some("discard selected change / whole box"),
-    ),
-    (
-        Key::Char('A'),
-        PaneGate::Any,
-        PaneAction::ApplyAll,
-        Some("apply ALL the box's changes"),
-    ),
-    (
-        Key::Char('X'),
-        PaneGate::On(Pane::Mirrors),
-        PaneAction::ConfirmMirrorDeleteData,
-        Some("permanently delete selected Wikipedia mirror and its files (on Mirrors, y/n)"),
-    ),
-    (
-        Key::Char('X'),
-        PaneGate::Any,
-        PaneAction::DiscardAll,
-        Some("discard ALL the box's changes"),
-    ),
-    (
-        Key::Char('K'),
-        PaneGate::Any,
-        PaneAction::ConfirmKill,
-        Some("kill box (SIGTERM, y/n)"),
-    ),
-    (
-        Key::Char('D'),
-        PaneGate::On(Pane::Mirrors),
-        PaneAction::ConfirmMirrorRemove,
-        Some("delete mirror job (on Mirrors, y/n)"),
-    ),
-    (
-        Key::Char('D'),
-        PaneGate::Any,
-        PaneAction::ConfirmDissolve,
-        Some("delete box: changes promoted down into children, never to host (y/n)"),
-    ),
-    (
-        Key::Char('t'),
-        PaneGate::On(Pane::Pipelines),
-        PaneAction::ToggleTree,
-        Some("toggle tree / flat chronological (on Pipes)"),
-    ),
-    (
-        Key::Char('f'),
-        PaneGate::On(Pane::Pipelines),
-        PaneAction::ToggleRunningOnly,
-        Some("toggle running-only (on Pipes)"),
-    ),
-    (
-        Key::Char('f'),
-        PaneGate::On(Pane::Processes),
-        PaneAction::ToggleProcRunning,
-        Some("toggle running-only (on Procs)"),
-    ),
-    (
-        Key::Char('f'),
-        PaneGate::On(Pane::BuildEdges),
-        PaneAction::ToggleEdgeRunning,
-        Some("toggle running-only (on Targets)"),
-    ),
-    (
-        Key::Char('r'),
-        PaneGate::On(Pane::Mirrors),
-        PaneAction::MirrorRun,
-        Some("force-run selected mirror job (on Mirrors)"),
-    ),
-    (
-        Key::Char('c'),
-        PaneGate::On(Pane::Mirrors),
-        PaneAction::MirrorCancel,
-        Some("stop selected running mirror job and its children (on Mirrors)"),
-    ),
-    (
-        Key::Char('n'),
-        PaneGate::On(Pane::Mirrors),
-        PaneAction::WikiMirrorAdd,
-        Some("add Wikipedia mirrors (on Mirrors)"),
-    ),
-    (
-        Key::Char('O'),
-        PaneGate::On(Pane::Mirrors),
-        PaneAction::WikiMirrorOpenLibrary,
-        Some("open an existing Wikipedia mirror library (on Mirrors)"),
-    ),
-    (
-        Key::Char('R'),
-        PaneGate::On(Pane::Mirrors),
-        PaneAction::MirrorRunPending,
-        Some("run all pending mirror jobs (on Mirrors)"),
-    ),
-    (
-        Key::Char('b'),
-        PaneGate::On(Pane::Mirrors),
-        PaneAction::MirrorBrowse,
-        Some("browse wiki mirror in the browser (on Mirrors)"),
-    ),
-    (
-        Key::Char('V'),
-        PaneGate::On(Pane::Mirrors),
-        PaneAction::MirrorRead,
-        Some("read the wiki mirror in the document reader (on Mirrors)"),
-    ),
-    (
-        Key::Char('V'),
-        PaneGate::On(Pane::Changes),
-        PaneAction::ChangeRead,
-        Some("open the selected change in the document reader (on Changes)"),
-    ),
-    (
-        Key::Char('E'),
-        PaneGate::On(Pane::Changes),
-        PaneAction::ChangeEdit,
-        Some("edit the selected change in the text editor (on Changes)"),
-    ),
-    (
-        Key::Char('n'),
-        PaneGate::On(Pane::Rules),
-        PaneAction::NewRule,
-        Some("new rule (on Rules)"),
-    ),
-    (
-        Key::Char('d'),
-        PaneGate::On(Pane::Rules),
-        PaneAction::DeleteRule,
-        Some("delete rule (on Rules)"),
-    ),
-    (
-        Key::Char('d'),
-        PaneGate::Any,
-        PaneAction::Detach,
-        Some("detach (leaves the engine running)"),
-    ),
-    (
-        Key::Char('/'),
-        PaneGate::Any,
-        PaneAction::ToggleFilter,
-        Some("filter the active pane"),
-    ),
-    (
-        Key::Char('r'),
-        PaneGate::Any,
-        PaneAction::StartRename,
-        Some("rename box"),
-    ),
-    (
-        Key::Char('R'),
-        PaneGate::Any,
-        PaneAction::Refresh,
-        Some("refresh"),
-    ),
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BindingContext {
+    PaneSwitch,
+    Main,
+    Confirm,
+    Reader,
+    Global,
+    Prompt,
+    Menu,
+    Rename,
+    Modal,
+    ModalSearch,
+    ModalLauncher,
+    ModalApiConfig,
+    ModalWikiSetup,
+    ModalDismiss,
+    Inspect,
+    Editor,
+    EditorCompletion,
+    Pty,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GlobalCondition {
+    Always,
+    Pane(Pane),
+    Pty,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BindingCondition {
+    Always,
+    Pane(Pane),
+    Reader(ReaderBindingContext),
+    ReaderWiki(ReaderBindingContext),
+    Global(GlobalCondition),
+}
+
+#[derive(Clone, Copy)]
+enum GlobalAction {
+    Help,
+    ScreenNext,
+    ScreenPrevious,
+    WindowNext,
+    WindowPrevious,
+    ReaderMouse,
+    Rename,
+    NewRule,
+    NewImageBox,
+    PtyLauncher,
+    DiscardHunk,
+    DiscardFile,
+    DeleteRule,
+    DissolveBox,
+    Menu,
+    Quit,
+    EmbedPty,
+    PtyMouse,
+    PtyActionMenu,
+    PtyKill,
+    PtyDetach,
+}
+
+#[derive(Clone, Copy)]
+enum UiAction {
+    PromptYes,
+    PromptNo,
+    PromptAllow,
+    PromptDeny,
+    MenuCancel,
+    MenuLeft,
+    MenuRight,
+    MenuHome,
+    MenuEnd,
+    MenuOpen,
+    MenuText,
+    RenameCommit,
+    RenameCancel,
+    RenameBackspace,
+    RenameText,
+    ModalCancel,
+    ModalAccept,
+    ModalBackspace,
+    ModalNextField,
+    ModalPreviousField,
+    ModalUp,
+    ModalDown,
+    ModalPageUp,
+    ModalPageDown,
+    ModalHome,
+    ModalEnd,
+    ModalLeft,
+    ModalRight,
+    ModalTest,
+    ModalNewRow,
+    ModalNetwork,
+    ModalEnv,
+    ModalText,
+    InspectUp,
+    InspectDown,
+    InspectPageUp,
+    InspectPageDown,
+    InspectHome,
+    InspectEnd,
+    InspectOpen,
+    InspectLeft,
+    InspectRight,
+    InspectBack,
+    InspectGoto,
+    InspectHotspot(u8),
+    InspectReload,
+    InspectQuit,
+    EditorOpen,
+    EditorClose,
+    EditorSave,
+    EditorReadOnly,
+    EditorToggleFull,
+    EditorCompletionOpen,
+    PtyDetach,
+    CompletionNext,
+    CompletionPrevious,
+    CompletionAccept,
+    CompletionCancel,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EditorAction {
+    Open,
+    Close,
+    Save,
+    ReadOnly,
+    ToggleFull,
+    CompletionOpen,
+}
+
+#[derive(Clone, Copy)]
+enum BindingAction {
+    SwitchPane(Pane),
+    Pane(PaneAction),
+    Confirm(ConfirmKey),
+    Reader(ReaderAction),
+    Global(GlobalAction),
+    Ui(UiAction),
+}
+
+#[derive(Clone, Copy)]
+struct Binding {
+    key: Key,
+    context: BindingContext,
+    condition: BindingCondition,
+    action: BindingAction,
+    pane_label: Option<&'static str>,
+    pane_visibility: Option<PaneVis>,
+    short_hint: &'static str,
+    long_hint: &'static str,
+}
+
+const fn pane_binding(
+    key: char,
+    pane: Pane,
+    label: &'static str,
+    visibility: PaneVis,
+    long_hint: &'static str,
+) -> Binding {
+    Binding {
+        key: Key::Char(key),
+        context: BindingContext::PaneSwitch,
+        condition: BindingCondition::Always,
+        action: BindingAction::SwitchPane(pane),
+        pane_label: Some(label),
+        pane_visibility: Some(visibility),
+        short_hint: label,
+        long_hint,
+    }
+}
+
+const fn menu_binding(
+    key: char,
+    label: &'static str,
+    action: GlobalAction,
+    long_hint: &'static str,
+) -> Binding {
+    Binding {
+        key: Key::Char(key),
+        context: BindingContext::PaneSwitch,
+        condition: BindingCondition::Global(GlobalCondition::Always),
+        action: BindingAction::Global(action),
+        pane_label: Some(label),
+        pane_visibility: Some(PaneVis::Always),
+        short_hint: label,
+        long_hint,
+    }
+}
+
+const fn main_binding(
+    key: Key,
+    condition: BindingCondition,
+    action: PaneAction,
+    short_hint: &'static str,
+    long_hint: &'static str,
+) -> Binding {
+    Binding {
+        key,
+        context: BindingContext::Main,
+        condition,
+        action: BindingAction::Pane(action),
+        pane_label: None,
+        pane_visibility: None,
+        short_hint,
+        long_hint,
+    }
+}
+
+const fn reader_binding(
+    key: Key,
+    condition: BindingCondition,
+    action: ReaderAction,
+    short_hint: &'static str,
+    long_hint: &'static str,
+) -> Binding {
+    Binding {
+        key,
+        context: BindingContext::Reader,
+        condition,
+        action: BindingAction::Reader(action),
+        pane_label: None,
+        pane_visibility: None,
+        short_hint,
+        long_hint,
+    }
+}
+
+const fn global_binding(
+    key: Key,
+    condition: GlobalCondition,
+    action: GlobalAction,
+    short_hint: &'static str,
+    long_hint: &'static str,
+) -> Binding {
+    Binding {
+        key,
+        context: BindingContext::Global,
+        condition: BindingCondition::Global(condition),
+        action: BindingAction::Global(action),
+        pane_label: None,
+        pane_visibility: None,
+        short_hint,
+        long_hint,
+    }
+}
+
+const fn confirm_binding(key: Key, action: ConfirmKey, hint: &'static str) -> Binding {
+    Binding {
+        key,
+        context: BindingContext::Confirm,
+        condition: BindingCondition::Always,
+        action: BindingAction::Confirm(action),
+        pane_label: None,
+        pane_visibility: None,
+        short_hint: hint,
+        long_hint: hint,
+    }
+}
+
+const fn ui_binding(
+    key: Key,
+    context: BindingContext,
+    action: UiAction,
+    short_hint: &'static str,
+    long_hint: &'static str,
+) -> Binding {
+    Binding {
+        key,
+        context,
+        condition: BindingCondition::Always,
+        action: BindingAction::Ui(action),
+        pane_label: None,
+        pane_visibility: None,
+        short_hint,
+        long_hint,
+    }
+}
+
+/// The one ordered list. Specific bindings precede general bindings with the
+/// same key, preserving the old precedence (for example d on Rules beats
+/// detach, and b on Mirrors beats the Boxes pane accelerator).
+const BINDINGS: &[Binding] = &[
+    menu_binding('N', "New", GlobalAction::PtyLauncher,
+        "new launcher — open a shell, browser, or image box"),
+    pane_binding('b', Pane::Sessions, "Boxes", PaneVis::Always,
+        "boxes/sessions — the box list (path · id · status · cmd)"),
+    pane_binding('c', Pane::Changes, "Changes", PaneVis::Always,
+        "changes — files the box wrote (Enter → its diff)"),
+    pane_binding('p', Pane::Processes, "Procs", PaneVis::Data,
+        "processes — the captured process TREE (exe · argv · env)"),
+    pane_binding('o', Pane::Outputs, "Outputs", PaneVis::Data,
+        "outputs — decoded stdout/stderr transcript"),
+    pane_binding('l', Pane::Pipelines, "Pipes", PaneVis::Data,
+        "pipeLines — shell pipelines a -b box ran (parsed structure)"),
+    pane_binding('g', Pane::BuildEdges, "Build", PaneVis::Data,
+        "build Graph — parsed ninja/make build edges from a -b box"),
+    pane_binding('f', Pane::Flows, "Flows", PaneVis::Always,
+        "network flows — tshark-decoded HTTP/TLS from a -n box's pcap"),
+    pane_binding('e', Pane::Rules, "Rules", PaneVis::Always,
+        "file rules — the ordered apply/discard/passthrough rules"),
+    pane_binding('M', Pane::Mirrors, "Mirrors", PaneVis::Always,
+        "scheduled mirror updates — r run selected, R run pending, V read, space pause/resume, D delete"),
+    pane_binding('u', Pane::Reader, "Read", PaneVis::Always,
+        "document reader — html/md/text files + wiki mirror pages"),
+    pane_binding('W', Pane::Editor, "Edit", PaneVis::Always,
+        "text editor — syntax-highlighted vim-modal editing"),
+    pane_binding('P', Pane::Pty, "PTYs", PaneVis::Pty,
+        "open an engine-held PTY — a live interactive shell pane"),
+    pane_binding('i', Pane::ApiLogs, "Api", PaneVis::Always,
+        "the --api oaita proxy log"),
+    pane_binding('w', Pane::Network, "Web", PaneVis::Always,
+        "web captures — tap MITM HTTP(S) content archive"),
+    pane_binding('t', Pane::Trace, "Trace", PaneVis::Data,
+        "sud Trace — a sud box's decoded wire-trace event stream"),
+    pane_binding('v', Pane::Vars, "Vars", PaneVis::Data,
+        "variable provenance — make + shell assignments"),
+    pane_binding('s', Pane::Inspect, "Inspect", PaneVis::Always,
+        "object inspector — drill into every sarun object"),
+    pane_binding('?', Pane::Help, "Help", PaneVis::Always, "this help"),
+
+    global_binding(Key::F(1), GlobalCondition::Always, GlobalAction::Help,
+        "help", "open the help pane"),
+    global_binding(Key::F(1), GlobalCondition::Pty, GlobalAction::Help,
+        "help", "open the help pane"),
+    global_binding(Key::F(2), GlobalCondition::Always, GlobalAction::ScreenNext,
+        "next screen", "cycle to the next screen"),
+    global_binding(Key::F(2), GlobalCondition::Pty, GlobalAction::ScreenNext,
+        "next screen", "cycle to the next screen"),
+    global_binding(Key::F(3), GlobalCondition::Always, GlobalAction::ScreenPrevious,
+        "previous screen", "cycle to the previous screen"),
+    global_binding(Key::F(3), GlobalCondition::Pty, GlobalAction::ScreenPrevious,
+        "previous screen", "cycle to the previous screen"),
+    global_binding(Key::F(4), GlobalCondition::Always, GlobalAction::WindowNext,
+        "next window", "cycle windows on the current screen"),
+    global_binding(Key::F(4), GlobalCondition::Pty, GlobalAction::WindowNext,
+        "next window", "cycle windows on the current screen"),
+    global_binding(Key::F(5), GlobalCondition::Always, GlobalAction::WindowPrevious,
+        "previous window", "cycle windows backwards on the current screen"),
+    global_binding(Key::F(5), GlobalCondition::Pty, GlobalAction::WindowPrevious,
+        "previous window", "cycle windows backwards on the current screen"),
+    global_binding(Key::F(6), GlobalCondition::Pane(Pane::Reader), GlobalAction::ReaderMouse,
+        "mouse select", "toggle Reader mouse capture versus terminal selection"),
+    global_binding(Key::F(6), GlobalCondition::Pane(Pane::Sessions), GlobalAction::Rename,
+        "rename", "start renaming the selected box"),
+    global_binding(Key::F(6), GlobalCondition::Pty, GlobalAction::PtyMouse,
+        "mouse select", "toggle PTY mouse capture versus terminal selection"),
+    global_binding(Key::F(7), GlobalCondition::Pane(Pane::Rules), GlobalAction::NewRule,
+        "new rule", "create a new file rule"),
+    global_binding(Key::F(7), GlobalCondition::Pane(Pane::Sessions), GlobalAction::NewImageBox,
+        "new image box", "create a box from a container image"),
+    global_binding(Key::F(7), GlobalCondition::Pty, GlobalAction::PtyLauncher,
+        "new PTY", "open a new engine-held PTY"),
+    global_binding(Key::F(7), GlobalCondition::Always, GlobalAction::PtyLauncher,
+        "new PTY", "open a new engine-held PTY"),
+    global_binding(Key::F(8), GlobalCondition::Pane(Pane::Hunks), GlobalAction::DiscardHunk,
+        "discard hunk", "discard the selected hunk"),
+    global_binding(Key::F(8), GlobalCondition::Pane(Pane::Changes), GlobalAction::DiscardFile,
+        "discard file", "discard the selected change"),
+    global_binding(Key::F(8), GlobalCondition::Pane(Pane::Rules), GlobalAction::DeleteRule,
+        "delete rule", "delete the selected file rule"),
+    global_binding(Key::F(8), GlobalCondition::Pane(Pane::Sessions), GlobalAction::DissolveBox,
+        "delete box", "delete the selected box; changes go to children (y/n)"),
+    global_binding(Key::F(8), GlobalCondition::Pty, GlobalAction::PtyKill,
+        "kill PTY", "kill the current PTY"),
+    global_binding(Key::F(9), GlobalCondition::Pty, GlobalAction::PtyActionMenu,
+        "PTY actions", "open the PTY actions menu"),
+    global_binding(Key::F(9), GlobalCondition::Always, GlobalAction::Menu,
+        "menu", "enter pane menu navigation"),
+    global_binding(Key::F(10), GlobalCondition::Always, GlobalAction::Quit,
+        "quit", "quit and stop the engine"),
+    global_binding(Key::F(11), GlobalCondition::Pty, GlobalAction::EmbedPty,
+        "embed PTY", "embed the full-screen PTY into the main view"),
+    global_binding(Key::F(11), GlobalCondition::Always, GlobalAction::EmbedPty,
+        "embed PTY", "embed or unembed the active PTY"),
+    global_binding(Key::F(12), GlobalCondition::Pty, GlobalAction::PtyDetach,
+        "detach", "detach from the PTY and leave it running"),
+
+    main_binding(Key::Char('a'), BindingCondition::Pane(Pane::Hunks),
+        PaneAction::ApplyHunk, "apply hunk", "apply this hunk to the host"),
+    main_binding(Key::Char('x'), BindingCondition::Pane(Pane::Hunks),
+        PaneAction::DiscardHunk, "discard hunk", "discard this hunk"),
+    main_binding(Key::Char('d'), BindingCondition::Pane(Pane::Hunks),
+        PaneAction::DiscardHunk, "discard hunk", "discard this hunk"),
+    main_binding(Key::Char(' '), BindingCondition::Pane(Pane::Mirrors),
+        PaneAction::MirrorTogglePause, "pause/resume", "pause or resume the selected mirror job"),
+    main_binding(Key::Char('X'), BindingCondition::Pane(Pane::Mirrors),
+        PaneAction::ConfirmMirrorDeleteData, "delete mirror data", "permanently delete the selected Wikipedia mirror and its files (y/n)"),
+    main_binding(Key::Char('D'), BindingCondition::Pane(Pane::Mirrors),
+        PaneAction::ConfirmMirrorRemove, "delete mirror job", "delete the selected mirror job (y/n)"),
+    main_binding(Key::Char('t'), BindingCondition::Pane(Pane::Pipelines),
+        PaneAction::ToggleTree, "tree/flat", "toggle tree / flat chronological"),
+    main_binding(Key::Char('f'), BindingCondition::Pane(Pane::Pipelines),
+        PaneAction::ToggleRunningOnly, "running only", "show running pipelines only"),
+    main_binding(Key::Char('f'), BindingCondition::Pane(Pane::Processes),
+        PaneAction::ToggleProcRunning, "running only", "show running processes only"),
+    main_binding(Key::Char('f'), BindingCondition::Pane(Pane::BuildEdges),
+        PaneAction::ToggleEdgeRunning, "running only", "show running build edges only"),
+    main_binding(Key::Char('r'), BindingCondition::Pane(Pane::Mirrors),
+        PaneAction::MirrorRun, "run selected", "force-run the selected mirror job"),
+    main_binding(Key::Char('c'), BindingCondition::Pane(Pane::Mirrors),
+        PaneAction::MirrorCancel, "stop selected", "stop the selected running mirror job and its children"),
+    main_binding(Key::Char('n'), BindingCondition::Pane(Pane::Mirrors),
+        PaneAction::WikiMirrorAdd, "add mirror", "add Wikipedia mirrors"),
+    main_binding(Key::Char('O'), BindingCondition::Pane(Pane::Mirrors),
+        PaneAction::WikiMirrorOpenLibrary, "open library", "open an existing Wikipedia mirror library"),
+    main_binding(Key::Char('R'), BindingCondition::Pane(Pane::Mirrors),
+        PaneAction::MirrorRunPending, "run pending", "run all pending mirror jobs"),
+    main_binding(Key::Char('i'), BindingCondition::Pane(Pane::Mirrors),
+        PaneAction::MirrorToggleMedia, "toggle images", "enable or disable automatic Kiwix image packing"),
+    main_binding(Key::Char('b'), BindingCondition::Pane(Pane::Mirrors),
+        PaneAction::MirrorBrowse, "browse", "browse the selected wiki mirror"),
+    main_binding(Key::Char('V'), BindingCondition::Pane(Pane::Mirrors),
+        PaneAction::MirrorRead, "read mirror", "read the selected wiki mirror"),
+    main_binding(Key::Char('V'), BindingCondition::Pane(Pane::Changes),
+        PaneAction::ChangeRead, "read change", "open the selected change in the document reader"),
+    main_binding(Key::Char('E'), BindingCondition::Pane(Pane::Changes),
+        PaneAction::ChangeEdit, "edit change", "edit the selected change in the text editor"),
+    main_binding(Key::Char('n'), BindingCondition::Pane(Pane::Rules),
+        PaneAction::NewRule, "new rule", "create a new file rule"),
+    main_binding(Key::Char('d'), BindingCondition::Pane(Pane::Rules),
+        PaneAction::DeleteRule, "delete rule", "delete the selected file rule"),
+    main_binding(Key::Char('q'), BindingCondition::Always,
+        PaneAction::Quit, "quit", "quit and stop the engine"),
+    main_binding(Key::Char('j'), BindingCondition::Always,
+        PaneAction::MoveDown, "down", "move selection down"),
+    main_binding(Key::Char('k'), BindingCondition::Always,
+        PaneAction::MoveUp, "up", "move selection up"),
+    main_binding(Key::Tab, BindingCondition::Always,
+        PaneAction::NextPane, "next pane", "focus the next pane"),
+    main_binding(Key::Enter, BindingCondition::Always,
+        PaneAction::Open, "open", "open the selected item"),
+    main_binding(Key::Char('m'), BindingCondition::Always,
+        PaneAction::ActionMenu, "actions", "open the actions menu"),
+    main_binding(Key::Char(':'), BindingCondition::Always,
+        PaneAction::CommandOpen, "command", "open the command prompt"),
+    main_binding(Key::Char(' '), BindingCondition::Always,
+        PaneAction::ToggleMark, "mark", "select or unselect the current row"),
+    main_binding(Key::Char('['), BindingCondition::Always,
+        PaneAction::RangeMark, "range anchor", "select a range from the anchor to the cursor"),
+    main_binding(Key::Char(']'), BindingCondition::Always,
+        PaneAction::RangeMark, "range extend", "extend the selected range"),
+    main_binding(Key::Char('a'), BindingCondition::Always,
+        PaneAction::ApplyFile, "apply", "apply the selected change or whole box"),
+    main_binding(Key::Char('x'), BindingCondition::Always,
+        PaneAction::DiscardFile, "discard", "discard the selected change or whole box"),
+    main_binding(Key::Char('A'), BindingCondition::Always,
+        PaneAction::ApplyAll, "apply all", "apply all changes"),
+    main_binding(Key::Char('X'), BindingCondition::Always,
+        PaneAction::DiscardAll, "discard all", "discard all changes"),
+    main_binding(Key::Char('K'), BindingCondition::Always,
+        PaneAction::ConfirmKill, "kill box", "kill the selected box (y/n)"),
+    main_binding(Key::Char('D'), BindingCondition::Always,
+        PaneAction::ConfirmDissolve, "delete box", "delete the selected box; changes go to children (y/n)"),
+    main_binding(Key::Char('d'), BindingCondition::Always,
+        PaneAction::Detach, "detach", "detach and leave the engine running"),
+    main_binding(Key::Char('/'), BindingCondition::Always,
+        PaneAction::ToggleFilter, "filter", "filter the active pane"),
+    main_binding(Key::Char('r'), BindingCondition::Always,
+        PaneAction::StartRename, "rename", "rename the selected box"),
+    main_binding(Key::Char('R'), BindingCondition::Always,
+        PaneAction::Refresh, "refresh", "refresh the current data"),
+    main_binding(Key::CtrlUp, BindingCondition::Pane(Pane::Rules),
+        PaneAction::MoveRuleUp, "rule up", "move the selected rule up"),
+    main_binding(Key::CtrlDown, BindingCondition::Pane(Pane::Rules),
+        PaneAction::MoveRuleDown, "rule down", "move the selected rule down"),
+    main_binding(Key::Up, BindingCondition::Always,
+        PaneAction::MoveUp, "up", "move selection up"),
+    main_binding(Key::Down, BindingCondition::Always,
+        PaneAction::MoveDown, "down", "move selection down"),
+    main_binding(Key::PageUp, BindingCondition::Always,
+        PaneAction::PageUp, "page up", "move one page up"),
+    main_binding(Key::PageDown, BindingCondition::Always,
+        PaneAction::PageDown, "page down", "move one page down"),
+    main_binding(Key::Home, BindingCondition::Always,
+        PaneAction::Home, "top", "move to the first item"),
+    main_binding(Key::End, BindingCondition::Always,
+        PaneAction::End, "bottom", "move to the last item"),
+    main_binding(Key::Left, BindingCondition::Pane(Pane::Sessions),
+        PaneAction::SessionLeft, "left", "select the previous related box"),
+    main_binding(Key::Right, BindingCondition::Pane(Pane::Sessions),
+        PaneAction::SessionRight, "right", "select the next related box"),
+    main_binding(Key::Char('!'), BindingCondition::Always,
+        PaneAction::ToggleErrors, "errors", "toggle the errors-only view"),
+    main_binding(Key::Backspace, BindingCondition::Always,
+        PaneAction::GoBack, "back", "go back from the current detail view"),
+    main_binding(Key::Esc, BindingCondition::Pane(Pane::Packets),
+        PaneAction::ClosePackets, "back", "return from packet details"),
+    main_binding(Key::Esc, BindingCondition::Always,
+        PaneAction::ClearFilter, "clear", "clear the active generated filter"),
+
+    ui_binding(Key::Char('y'), BindingContext::Prompt, UiAction::PromptYes,
+        "yes", "answer yes once"),
+    ui_binding(Key::Char('n'), BindingContext::Prompt, UiAction::PromptNo,
+        "no", "answer no once"),
+    ui_binding(Key::Char('a'), BindingContext::Prompt, UiAction::PromptAllow,
+        "allow", "allow and remember"),
+    ui_binding(Key::Char('d'), BindingContext::Prompt, UiAction::PromptDeny,
+        "deny", "deny and remember"),
+
+    ui_binding(Key::Esc, BindingContext::Menu, UiAction::MenuCancel,
+        "cancel", "leave menu navigation"),
+    ui_binding(Key::Left, BindingContext::Menu, UiAction::MenuLeft,
+        "left", "choose the previous pane"),
+    ui_binding(Key::Right, BindingContext::Menu, UiAction::MenuRight,
+        "right", "choose the next pane"),
+    ui_binding(Key::Home, BindingContext::Menu, UiAction::MenuHome,
+        "first", "choose the first pane"),
+    ui_binding(Key::End, BindingContext::Menu, UiAction::MenuEnd,
+        "last", "choose the last pane"),
+    ui_binding(Key::Enter, BindingContext::Menu, UiAction::MenuOpen,
+        "open", "open the selected pane"),
+    ui_binding(Key::AnyChar, BindingContext::Menu, UiAction::MenuText,
+        "choose", "choose a pane by its accelerator"),
+
+    ui_binding(Key::Enter, BindingContext::Rename, UiAction::RenameCommit,
+        "commit", "commit the new name"),
+    ui_binding(Key::Esc, BindingContext::Rename, UiAction::RenameCancel,
+        "cancel", "cancel renaming"),
+    ui_binding(Key::Backspace, BindingContext::Rename, UiAction::RenameBackspace,
+        "delete", "delete the previous character"),
+    ui_binding(Key::AnyChar, BindingContext::Rename, UiAction::RenameText,
+        "type", "type the new name"),
+
+    ui_binding(Key::Esc, BindingContext::Modal, UiAction::ModalCancel,
+        "cancel", "cancel the current dialog"),
+    ui_binding(Key::Enter, BindingContext::Modal, UiAction::ModalAccept,
+        "accept", "accept the current dialog"),
+    ui_binding(Key::CtrlChar('s'), BindingContext::Modal, UiAction::ModalAccept,
+        "accept", "save or accept the current dialog"),
+    ui_binding(Key::Backspace, BindingContext::Modal, UiAction::ModalBackspace,
+        "delete", "delete the previous character or go back"),
+    ui_binding(Key::Tab, BindingContext::Modal, UiAction::ModalNextField,
+        "next field", "move to the next field"),
+    ui_binding(Key::BackTab, BindingContext::Modal, UiAction::ModalPreviousField,
+        "previous field", "move to the previous field"),
+    ui_binding(Key::Up, BindingContext::Modal, UiAction::ModalUp,
+        "up", "move up"),
+    ui_binding(Key::Down, BindingContext::Modal, UiAction::ModalDown,
+        "down", "move down"),
+    ui_binding(Key::PageUp, BindingContext::Modal, UiAction::ModalPageUp,
+        "page up", "move one page up"),
+    ui_binding(Key::PageDown, BindingContext::Modal, UiAction::ModalPageDown,
+        "page down", "move one page down"),
+    ui_binding(Key::Home, BindingContext::Modal, UiAction::ModalHome,
+        "first", "move to the first item"),
+    ui_binding(Key::End, BindingContext::Modal, UiAction::ModalEnd,
+        "last", "move to the last item"),
+    ui_binding(Key::Left, BindingContext::Modal, UiAction::ModalLeft,
+        "left", "move to the previous field or item"),
+    ui_binding(Key::Right, BindingContext::Modal, UiAction::ModalRight,
+        "right", "move to the next field or item"),
+    ui_binding(Key::Char(' '), BindingContext::Modal, UiAction::ModalText,
+        "toggle/select", "toggle the current option or select an item"),
+    ui_binding(Key::AnyChar, BindingContext::Modal, UiAction::ModalText,
+        "type", "type into the current field"),
+    ui_binding(Key::Char('n'), BindingContext::ModalSearch, UiAction::ModalNewRow,
+        "new row", "add a new filter row"),
+    ui_binding(Key::Char('n'), BindingContext::ModalLauncher, UiAction::ModalNetwork,
+        "network", "cycle the launcher network mode"),
+    ui_binding(Key::Char('N'), BindingContext::ModalLauncher, UiAction::ModalNetwork,
+        "network", "cycle the launcher network mode"),
+    ui_binding(Key::Char('e'), BindingContext::ModalLauncher, UiAction::ModalEnv,
+        "env", "toggle environment capture"),
+    ui_binding(Key::Char('E'), BindingContext::ModalLauncher, UiAction::ModalEnv,
+        "env", "toggle environment capture"),
+    ui_binding(Key::CtrlChar('t'), BindingContext::ModalApiConfig, UiAction::ModalTest,
+        "test", "test the current connection"),
+    ui_binding(Key::Esc, BindingContext::ModalDismiss, UiAction::ModalCancel,
+        "close", "close the report or image view"),
+    ui_binding(Key::Enter, BindingContext::ModalDismiss, UiAction::ModalCancel,
+        "close", "close the report or image view"),
+    ui_binding(Key::Char('q'), BindingContext::ModalDismiss, UiAction::ModalCancel,
+        "close", "close the report or image view"),
+
+    ui_binding(Key::Up, BindingContext::Inspect, UiAction::InspectUp,
+        "up", "move up in the object inspector"),
+    ui_binding(Key::Down, BindingContext::Inspect, UiAction::InspectDown,
+        "down", "move down in the object inspector"),
+    ui_binding(Key::PageUp, BindingContext::Inspect, UiAction::InspectPageUp,
+        "page up", "move one page up in the inspector"),
+    ui_binding(Key::PageDown, BindingContext::Inspect, UiAction::InspectPageDown,
+        "page down", "move one page down in the inspector"),
+    ui_binding(Key::Home, BindingContext::Inspect, UiAction::InspectHome,
+        "first", "move to the first inspector item"),
+    ui_binding(Key::End, BindingContext::Inspect, UiAction::InspectEnd,
+        "last", "move to the last inspector item"),
+    ui_binding(Key::Enter, BindingContext::Inspect, UiAction::InspectOpen,
+        "open", "open the selected inspector item"),
+    ui_binding(Key::Left, BindingContext::Inspect, UiAction::InspectLeft,
+        "left", "select the previous sibling"),
+    ui_binding(Key::Right, BindingContext::Inspect, UiAction::InspectRight,
+        "right", "select the next sibling"),
+    ui_binding(Key::Backspace, BindingContext::Inspect, UiAction::InspectBack,
+        "back", "return to the parent inspector item"),
+    ui_binding(Key::Esc, BindingContext::Inspect, UiAction::InspectBack,
+        "back", "return to the parent inspector item"),
+    ui_binding(Key::Char(':'), BindingContext::Inspect, UiAction::InspectGoto,
+        "goto", "locate an object by path"),
+    ui_binding(Key::Char('1'), BindingContext::Inspect, UiAction::InspectHotspot(0),
+        "hotspot 1", "open inspector hotspot 1"),
+    ui_binding(Key::Char('2'), BindingContext::Inspect, UiAction::InspectHotspot(1),
+        "hotspot 2", "open inspector hotspot 2"),
+    ui_binding(Key::Char('3'), BindingContext::Inspect, UiAction::InspectHotspot(2),
+        "hotspot 3", "open inspector hotspot 3"),
+    ui_binding(Key::Char('4'), BindingContext::Inspect, UiAction::InspectHotspot(3),
+        "hotspot 4", "open inspector hotspot 4"),
+    ui_binding(Key::Char('5'), BindingContext::Inspect, UiAction::InspectHotspot(4),
+        "hotspot 5", "open inspector hotspot 5"),
+    ui_binding(Key::Char('6'), BindingContext::Inspect, UiAction::InspectHotspot(5),
+        "hotspot 6", "open inspector hotspot 6"),
+    ui_binding(Key::Char('7'), BindingContext::Inspect, UiAction::InspectHotspot(6),
+        "hotspot 7", "open inspector hotspot 7"),
+    ui_binding(Key::Char('8'), BindingContext::Inspect, UiAction::InspectHotspot(7),
+        "hotspot 8", "open inspector hotspot 8"),
+    ui_binding(Key::Char('9'), BindingContext::Inspect, UiAction::InspectHotspot(8),
+        "hotspot 9", "open inspector hotspot 9"),
+    ui_binding(Key::Char('R'), BindingContext::Inspect, UiAction::InspectReload,
+        "reload", "reload the inspector"),
+    ui_binding(Key::Char('q'), BindingContext::Inspect, UiAction::InspectQuit,
+        "quit", "quit the UI"),
+
+    ui_binding(Key::Char('o'), BindingContext::Editor, UiAction::EditorOpen,
+        "open", "open an editor file"),
+    ui_binding(Key::CtrlChar('o'), BindingContext::Editor, UiAction::EditorOpen,
+        "open", "open another editor file"),
+    ui_binding(Key::Esc, BindingContext::Editor, UiAction::EditorClose,
+        "close", "close the editor pane"),
+    ui_binding(Key::CtrlChar('s'), BindingContext::Editor, UiAction::EditorSave,
+        "save", "save the editor buffer"),
+    ui_binding(Key::CtrlChar('e'), BindingContext::Editor, UiAction::EditorReadOnly,
+        "lock", "toggle read-only editing"),
+    ui_binding(Key::Char('z'), BindingContext::Editor, UiAction::EditorToggleFull,
+        "fullscreen", "toggle editor fullscreen"),
+    ui_binding(Key::Tab, BindingContext::Editor, UiAction::EditorCompletionOpen,
+        "completions", "open relation completions while inserting"),
+    ui_binding(Key::Tab, BindingContext::EditorCompletion, UiAction::CompletionNext,
+        "next", "select the next completion"),
+    ui_binding(Key::Down, BindingContext::EditorCompletion, UiAction::CompletionNext,
+        "next", "select the next completion"),
+    ui_binding(Key::BackTab, BindingContext::EditorCompletion, UiAction::CompletionPrevious,
+        "previous", "select the previous completion"),
+    ui_binding(Key::Up, BindingContext::EditorCompletion, UiAction::CompletionPrevious,
+        "previous", "select the previous completion"),
+    ui_binding(Key::Enter, BindingContext::EditorCompletion, UiAction::CompletionAccept,
+        "accept", "insert the selected completion"),
+    ui_binding(Key::Esc, BindingContext::EditorCompletion, UiAction::CompletionCancel,
+        "close", "close completion suggestions"),
+    ui_binding(Key::CtrlChar(']'), BindingContext::Pty, UiAction::PtyDetach,
+        "detach", "detach from the PTY and leave it running"),
+
+    confirm_binding(Key::Char('y'), ConfirmKey::Yes, "confirm"),
+    confirm_binding(Key::Char('Y'), ConfirmKey::Yes, "confirm"),
+    confirm_binding(Key::Char('n'), ConfirmKey::No, "cancel"),
+    confirm_binding(Key::Char('N'), ConfirmKey::No, "cancel"),
+    confirm_binding(Key::Esc, ConfirmKey::No, "cancel"),
+
+    reader_binding(Key::Char('j'), BindingCondition::Reader(ReaderBindingContext::Document),
+        ReaderAction::ScrollDown, "scroll down", "scroll down"),
+    reader_binding(Key::Char('k'), BindingCondition::Reader(ReaderBindingContext::Document),
+        ReaderAction::ScrollUp, "scroll up", "scroll up"),
+    reader_binding(Key::Char('h'), BindingCondition::ReaderWiki(ReaderBindingContext::Document),
+        ReaderAction::FocusHistory, "history", "focus page history"),
+    reader_binding(Key::Char('v'), BindingCondition::Reader(ReaderBindingContext::Document),
+        ReaderAction::NextView, "next view", "cycle rendered/raw/diff"),
+    reader_binding(Key::Char('1'), BindingCondition::Reader(ReaderBindingContext::Document),
+        ReaderAction::RenderedView, "rendered", "show rendered wikitext"),
+    reader_binding(Key::Char('2'), BindingCondition::Reader(ReaderBindingContext::Document),
+        ReaderAction::RawView, "raw", "show raw wikitext"),
+    reader_binding(Key::Char('3'), BindingCondition::Reader(ReaderBindingContext::Document),
+        ReaderAction::DiffView, "diff", "show the revision diff"),
+    reader_binding(Key::Left, BindingCondition::Reader(ReaderBindingContext::Document),
+        ReaderAction::SpatialLeft, "← link", "focus the nearest link to the left"),
+    reader_binding(Key::Right, BindingCondition::Reader(ReaderBindingContext::Document),
+        ReaderAction::SpatialRight, "→ link", "focus the nearest link to the right"),
+    reader_binding(Key::Up, BindingCondition::Reader(ReaderBindingContext::Document),
+        ReaderAction::SpatialUp, "↑ link/scroll", "focus the nearest link above"),
+    reader_binding(Key::Down, BindingCondition::Reader(ReaderBindingContext::Document),
+        ReaderAction::SpatialDown, "↓ link/scroll", "focus the nearest link below"),
+    reader_binding(Key::PageDown, BindingCondition::Reader(ReaderBindingContext::Document),
+        ReaderAction::PageDown, "page down", "scroll one page down"),
+    reader_binding(Key::PageUp, BindingCondition::Reader(ReaderBindingContext::Document),
+        ReaderAction::PageUp, "page up", "scroll one page up"),
+    reader_binding(Key::Home, BindingCondition::Reader(ReaderBindingContext::Document),
+        ReaderAction::Home, "top", "go to document top"),
+    reader_binding(Key::Char('g'), BindingCondition::Reader(ReaderBindingContext::Document),
+        ReaderAction::Home, "top", "go to document top"),
+    reader_binding(Key::End, BindingCondition::Reader(ReaderBindingContext::Document),
+        ReaderAction::End, "bottom", "go to document bottom"),
+    reader_binding(Key::Char('G'), BindingCondition::Reader(ReaderBindingContext::Document),
+        ReaderAction::End, "bottom", "go to document bottom"),
+    reader_binding(Key::Tab, BindingCondition::Reader(ReaderBindingContext::Document),
+        ReaderAction::FocusNextLink, "next link", "focus the next link"),
+    reader_binding(Key::BackTab, BindingCondition::Reader(ReaderBindingContext::Document),
+        ReaderAction::FocusPreviousLink, "previous link", "focus the previous link"),
+    reader_binding(Key::Enter, BindingCondition::Reader(ReaderBindingContext::Document),
+        ReaderAction::Follow, "follow", "open the focused link"),
+    reader_binding(Key::Backspace, BindingCondition::Reader(ReaderBindingContext::Document),
+        ReaderAction::Back, "back", "go back"),
+    reader_binding(Key::Char('['), BindingCondition::Reader(ReaderBindingContext::Document),
+        ReaderAction::Back, "back", "go back"),
+    reader_binding(Key::Char(']'), BindingCondition::Reader(ReaderBindingContext::Document),
+        ReaderAction::Forward, "forward", "go forward"),
+    reader_binding(Key::Char('n'), BindingCondition::Reader(ReaderBindingContext::Document),
+        ReaderAction::JumpNext, "next page", "open the next linked page"),
+    reader_binding(Key::Char('p'), BindingCondition::Reader(ReaderBindingContext::Document),
+        ReaderAction::JumpPrevious, "previous page", "open the previous linked page"),
+    reader_binding(Key::Char('/'), BindingCondition::Reader(ReaderBindingContext::Document),
+        ReaderAction::DocumentSearch, "search", "search this document"),
+    reader_binding(Key::Char('T'), BindingCondition::ReaderWiki(ReaderBindingContext::Document),
+        ReaderAction::TitleSearch, "title search", "search page titles by regexp"),
+    reader_binding(Key::Char('F'), BindingCondition::ReaderWiki(ReaderBindingContext::Document),
+        ReaderAction::FullTextSearch, "full-text search", "search revision text by regexp"),
+    reader_binding(Key::Char('z'), BindingCondition::Reader(ReaderBindingContext::Document),
+        ReaderAction::ToggleFull, "fullscreen", "toggle fullscreen"),
+    reader_binding(Key::Char('o'), BindingCondition::Reader(ReaderBindingContext::Document),
+        ReaderAction::Open, "open", "open a file or wiki page"),
+    reader_binding(Key::Esc, BindingCondition::Reader(ReaderBindingContext::Document),
+        ReaderAction::Close, "close", "close search or reader"),
+    reader_binding(Key::Up, BindingCondition::Reader(ReaderBindingContext::History),
+        ReaderAction::HistoryUp, "older", "select the older revision"),
+    reader_binding(Key::Char('k'), BindingCondition::Reader(ReaderBindingContext::History),
+        ReaderAction::HistoryUp, "older", "select the older revision"),
+    reader_binding(Key::Down, BindingCondition::Reader(ReaderBindingContext::History),
+        ReaderAction::HistoryDown, "newer", "select the newer revision"),
+    reader_binding(Key::Char('j'), BindingCondition::Reader(ReaderBindingContext::History),
+        ReaderAction::HistoryDown, "newer", "select the newer revision"),
+    reader_binding(Key::PageUp, BindingCondition::Reader(ReaderBindingContext::History),
+        ReaderAction::HistoryPageUp, "page up", "move one history page up"),
+    reader_binding(Key::PageDown, BindingCondition::Reader(ReaderBindingContext::History),
+        ReaderAction::HistoryPageDown, "page down", "move one history page down"),
+    reader_binding(Key::Home, BindingCondition::Reader(ReaderBindingContext::History),
+        ReaderAction::HistoryHome, "first", "select the oldest revision"),
+    reader_binding(Key::Char('g'), BindingCondition::Reader(ReaderBindingContext::History),
+        ReaderAction::HistoryHome, "first", "select the oldest revision"),
+    reader_binding(Key::End, BindingCondition::Reader(ReaderBindingContext::History),
+        ReaderAction::HistoryEnd, "last", "select the newest revision"),
+    reader_binding(Key::Char('G'), BindingCondition::Reader(ReaderBindingContext::History),
+        ReaderAction::HistoryEnd, "last", "select the newest revision"),
+    reader_binding(Key::Enter, BindingCondition::Reader(ReaderBindingContext::History),
+        ReaderAction::HistoryOpen, "open revision", "open the selected revision"),
+    reader_binding(Key::Char('u'), BindingCondition::Reader(ReaderBindingContext::History),
+        ReaderAction::HistoryUser, "user page", "open the contributor's user page"),
+    reader_binding(Key::Char('e'), BindingCondition::Reader(ReaderBindingContext::History),
+        ReaderAction::HistoryEdits, "user edits", "show edits by the contributor"),
+    reader_binding(Key::Char('v'), BindingCondition::Reader(ReaderBindingContext::History),
+        ReaderAction::NextView, "next view", "cycle rendered/raw/diff"),
+    reader_binding(Key::Char('1'), BindingCondition::Reader(ReaderBindingContext::History),
+        ReaderAction::RenderedView, "rendered", "show rendered wikitext"),
+    reader_binding(Key::Char('2'), BindingCondition::Reader(ReaderBindingContext::History),
+        ReaderAction::RawView, "raw", "show raw wikitext"),
+    reader_binding(Key::Char('3'), BindingCondition::Reader(ReaderBindingContext::History),
+        ReaderAction::DiffView, "diff", "show the revision diff"),
+    reader_binding(Key::Right, BindingCondition::Reader(ReaderBindingContext::History),
+        ReaderAction::HistoryReturn, "document", "return to the document"),
+    reader_binding(Key::Char('l'), BindingCondition::Reader(ReaderBindingContext::History),
+        ReaderAction::HistoryReturn, "document", "return to the document"),
+    reader_binding(Key::Tab, BindingCondition::Reader(ReaderBindingContext::History),
+        ReaderAction::HistoryReturn, "document", "return to the document"),
+    reader_binding(Key::Esc, BindingCondition::Reader(ReaderBindingContext::History),
+        ReaderAction::HistoryReturn, "document", "return to the document"),
+    reader_binding(Key::Char('z'), BindingCondition::Reader(ReaderBindingContext::History),
+        ReaderAction::ToggleFull, "fullscreen", "toggle fullscreen"),
+    reader_binding(Key::Backspace, BindingCondition::Reader(ReaderBindingContext::History),
+        ReaderAction::Back, "back", "go back"),
+    reader_binding(Key::Char('['), BindingCondition::Reader(ReaderBindingContext::History),
+        ReaderAction::Back, "back", "go back"),
+    reader_binding(Key::Char(']'), BindingCondition::Reader(ReaderBindingContext::History),
+        ReaderAction::Forward, "forward", "go forward"),
+
+    reader_binding(Key::Esc, BindingCondition::Reader(ReaderBindingContext::Search),
+        ReaderAction::SearchCancel, "cancel", "cancel search"),
+    reader_binding(Key::Enter, BindingCondition::Reader(ReaderBindingContext::Search),
+        ReaderAction::SearchAccept, "accept", "accept search"),
+    reader_binding(Key::Backspace, BindingCondition::Reader(ReaderBindingContext::Search),
+        ReaderAction::SearchBackspace, "delete", "delete the previous character"),
+    reader_binding(Key::AnyChar, BindingCondition::Reader(ReaderBindingContext::Search),
+        ReaderAction::SearchText, "type", "type the regexp or search text"),
 ];
+
+pub(crate) fn reader_action(
+    context: ReaderBindingContext,
+    _wiki_available: bool,
+    code: crossterm::event::KeyCode,
+    mods: crossterm::event::KeyModifiers,
+) -> Option<ReaderAction> {
+    BINDINGS.iter().find_map(|binding| {
+        let BindingAction::Reader(action) = binding.action else {
+            return None;
+        };
+        let matches_context = binding.context == BindingContext::Reader
+            && match binding.condition {
+                BindingCondition::Reader(c) => c == context,
+                // The binding still owns the key even when the feature is
+                // unavailable: dispatch consumes it and can explain why.
+                // `wiki_available` only controls visibility in hints/help.
+                BindingCondition::ReaderWiki(c) => c == context,
+                _ => false,
+            };
+        (matches_context && binding.key.matches(code, mods)).then_some(action)
+    })
+}
+
+fn ui_action_for(
+    context: BindingContext,
+    code: crossterm::event::KeyCode,
+    mods: crossterm::event::KeyModifiers,
+) -> Option<UiAction> {
+    BINDINGS.iter().find_map(|binding| {
+        let BindingAction::Ui(action) = binding.action else {
+            return None;
+        };
+        (binding.context == context && binding.key.matches(code, mods)).then_some(action)
+    })
+}
+
+fn modal_action_for(
+    context: BindingContext,
+    code: crossterm::event::KeyCode,
+    mods: crossterm::event::KeyModifiers,
+) -> Option<UiAction> {
+    ui_action_for(context, code, mods).or_else(|| ui_action_for(BindingContext::Modal, code, mods))
+}
+
+pub(crate) fn editor_action(
+    code: crossterm::event::KeyCode,
+    mods: crossterm::event::KeyModifiers,
+) -> Option<EditorAction> {
+    match ui_action_for(BindingContext::Editor, code, mods) {
+        Some(UiAction::EditorOpen) => Some(EditorAction::Open),
+        Some(UiAction::EditorClose) => Some(EditorAction::Close),
+        Some(UiAction::EditorSave) => Some(EditorAction::Save),
+        Some(UiAction::EditorReadOnly) => Some(EditorAction::ReadOnly),
+        Some(UiAction::EditorToggleFull) => Some(EditorAction::ToggleFull),
+        Some(UiAction::EditorCompletionOpen) => Some(EditorAction::CompletionOpen),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EditorCompletionAction {
+    Next,
+    Previous,
+    Accept,
+    Cancel,
+}
+
+pub(crate) fn editor_completion_action(
+    code: crossterm::event::KeyCode,
+    mods: crossterm::event::KeyModifiers,
+) -> Option<EditorCompletionAction> {
+    match ui_action_for(BindingContext::EditorCompletion, code, mods) {
+        Some(UiAction::CompletionNext) => Some(EditorCompletionAction::Next),
+        Some(UiAction::CompletionPrevious) => Some(EditorCompletionAction::Previous),
+        Some(UiAction::CompletionAccept) => Some(EditorCompletionAction::Accept),
+        Some(UiAction::CompletionCancel) => Some(EditorCompletionAction::Cancel),
+        _ => None,
+    }
+}
+
+pub(crate) fn editor_completion_hint() -> String {
+    BINDINGS
+        .iter()
+        .filter(|binding| binding.context == BindingContext::EditorCompletion)
+        .map(|binding| format!("{} {}", binding_key_label(binding), binding.short_hint))
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+fn modal_hint_for(context: BindingContext, include_space: bool) -> String {
+    let mut seen = Vec::new();
+    BINDINGS
+        .iter()
+        .filter(|binding| binding.context == BindingContext::Modal || binding.context == context)
+        .filter(|binding| {
+            !matches!(binding.key, Key::AnyChar)
+                && (include_space || !matches!(binding.key, Key::Char(' ')))
+        })
+        .filter_map(|binding| {
+            let label = binding_key_label(binding);
+            if seen.contains(&label) {
+                None
+            } else {
+                seen.push(label.clone());
+                Some(format!("{label} {}", binding.short_hint))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+fn modal_hint() -> String {
+    modal_hint_for(BindingContext::Modal, false)
+}
+
+fn modal_hint_with_space() -> String {
+    modal_hint_for(BindingContext::ModalWikiSetup, true)
+}
+
+fn modal_hint_with_test() -> String {
+    modal_hint_for(BindingContext::ModalApiConfig, false)
+}
+
+fn confirm_hint() -> String {
+    confirm_bindings()
+        .map(|binding| format!("{} {}", binding_key_label(binding), binding.short_hint))
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+fn inspect_hint() -> String {
+    BINDINGS
+        .iter()
+        .filter(|binding| binding.context == BindingContext::Inspect)
+        .map(|binding| format!("{} {}", binding_key_label(binding), binding.short_hint))
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+fn modal_dismiss_hint() -> String {
+    BINDINGS
+        .iter()
+        .filter(|binding| binding.context == BindingContext::ModalDismiss)
+        .map(|binding| format!("{} {}", binding_key_label(binding), binding.short_hint))
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+fn menu_hint() -> String {
+    BINDINGS
+        .iter()
+        .filter(|binding| binding.context == BindingContext::Menu)
+        .filter(|binding| !matches!(binding.action, BindingAction::Ui(UiAction::MenuText)))
+        .map(|binding| format!("{} {}", binding_key_label(binding), binding.short_hint))
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+/// A rendered key-bar item.  The binding itself remains the source of truth
+/// for dispatch, help, and this presentation; only the short wording and
+/// colours are allowed to vary with live application state.
+struct KeyBarItem {
+    binding: &'static Binding,
+    hint: String,
+}
+
+fn binding_hint_for(app: &App, binding: &Binding) -> String {
+    match binding.action {
+        BindingAction::Global(GlobalAction::ReaderMouse | GlobalAction::PtyMouse) => {
+            if app.mouse_release {
+                "grab mouse".into()
+            } else {
+                "select text".into()
+            }
+        }
+        BindingAction::Pane(PaneAction::MirrorTogglePause) => app
+            .mirror_jobs
+            .get(app.sel_mirror)
+            .map(|job| {
+                if job.paused {
+                    "resume".into()
+                } else {
+                    "pause".into()
+                }
+            })
+            .unwrap_or_else(|| binding.short_hint.into()),
+        BindingAction::Pane(PaneAction::MirrorRunPending) => {
+            let pending = app
+                .mirror_jobs
+                .iter()
+                .filter(|job| job.state == "pending")
+                .count();
+            if pending == 0 {
+                binding.short_hint.into()
+            } else {
+                format!("run pending ({pending})")
+            }
+        }
+        _ => binding.short_hint.into(),
+    }
+}
+
+fn add_key_bar_item(
+    app: &App,
+    binding: &'static Binding,
+    include_space: bool,
+    seen: &mut Vec<String>,
+    out: &mut Vec<KeyBarItem>,
+) {
+    if matches!(binding.key, Key::AnyChar)
+        || (!include_space && matches!(binding.key, Key::Char(' ')))
+    {
+        return;
+    }
+    let label = binding_key_label(binding);
+    if seen.contains(&label) {
+        return;
+    }
+    seen.push(label);
+    out.push(KeyBarItem {
+        hint: binding_hint_for(app, binding),
+        binding,
+    });
+}
+
+fn add_global_key_bar_items(
+    app: &App,
+    in_pty: bool,
+    seen: &mut Vec<String>,
+    out: &mut Vec<KeyBarItem>,
+) {
+    for binding in BINDINGS.iter().filter(|binding| {
+        binding.context == BindingContext::Global
+            && match binding.condition {
+                BindingCondition::Global(GlobalCondition::Always) => !in_pty,
+                BindingCondition::Global(GlobalCondition::Pane(pane)) => {
+                    !in_pty && app.focus == pane
+                }
+                BindingCondition::Global(GlobalCondition::Pty) => in_pty,
+                _ => false,
+            }
+    }) {
+        add_key_bar_item(app, binding, false, seen, out);
+    }
+}
+
+fn modal_key_bar_items(
+    app: &App,
+    context: BindingContext,
+    include_space: bool,
+) -> Vec<KeyBarItem> {
+    let mut seen = Vec::new();
+    let mut out = Vec::new();
+    for binding in BINDINGS.iter().filter(|binding| {
+        binding.context == BindingContext::Modal || binding.context == context
+    }) {
+        add_key_bar_item(app, binding, include_space, &mut seen, &mut out);
+    }
+    out
+}
+
+/// The exact active context used by the bottom key bar.  This deliberately
+/// mirrors the dispatch precedence in `context_key_hints`, but carries the
+/// binding through so the key itself can be styled and its wording can react
+/// to progress (for example pause/resume and pending counts).
+fn context_key_items(app: &App) -> Vec<KeyBarItem> {
+    let mut seen = Vec::new();
+    let mut out = Vec::new();
+    if app.pending_prompt.is_some() {
+        for binding in BINDINGS
+            .iter()
+            .filter(|binding| binding.context == BindingContext::Prompt)
+        {
+            add_key_bar_item(app, binding, false, &mut seen, &mut out);
+        }
+        return out;
+    }
+    if app.renaming.is_some() {
+        for binding in BINDINGS
+            .iter()
+            .filter(|binding| binding.context == BindingContext::Rename)
+        {
+            add_key_bar_item(app, binding, false, &mut seen, &mut out);
+        }
+        return out;
+    }
+    if app.menu_nav {
+        for binding in BINDINGS
+            .iter()
+            .filter(|binding| binding.context == BindingContext::Menu)
+        {
+            if !matches!(binding.action, BindingAction::Ui(UiAction::MenuText)) {
+                add_key_bar_item(app, binding, false, &mut seen, &mut out);
+            }
+        }
+        return out;
+    }
+    match app.modal.as_ref() {
+        Some(Modal::ImageView { .. }) | Some(Modal::Report { .. }) => {
+            for binding in BINDINGS
+                .iter()
+                .filter(|binding| binding.context == BindingContext::ModalDismiss)
+            {
+                add_key_bar_item(app, binding, false, &mut seen, &mut out);
+            }
+            return out;
+        }
+        Some(Modal::Confirm { .. }) => {
+            for binding in BINDINGS
+                .iter()
+                .filter(|binding| binding.context == BindingContext::Confirm)
+            {
+                add_key_bar_item(app, binding, false, &mut seen, &mut out);
+            }
+            return out;
+        }
+        Some(Modal::Search { .. }) => return modal_key_bar_items(app, BindingContext::ModalSearch, true),
+        Some(Modal::Launcher { .. }) => {
+            return modal_key_bar_items(app, BindingContext::ModalLauncher, false)
+        }
+        Some(Modal::ApiConfig { .. }) => {
+            return modal_key_bar_items(app, BindingContext::ModalApiConfig, false)
+        }
+        Some(Modal::WikiMirrorSetup { .. }) => {
+            return modal_key_bar_items(app, BindingContext::ModalWikiSetup, true)
+        }
+        Some(_) => return modal_key_bar_items(app, BindingContext::Modal, false),
+        None => {}
+    }
+    if app.focus == Pane::Pty {
+        add_global_key_bar_items(app, true, &mut seen, &mut out);
+        return out;
+    }
+    if app.focus == Pane::Reader {
+        let (context, wiki_available) = app
+            .reader
+            .borrow()
+            .as_ref()
+            .map(|reader| (reader.binding_context(), reader.has_wiki()))
+            .unwrap_or((ReaderBindingContext::Document, false));
+        for binding in reader_bindings_for(context, wiki_available) {
+            add_key_bar_item(app, binding, false, &mut seen, &mut out);
+        }
+        add_global_key_bar_items(app, false, &mut seen, &mut out);
+        return out;
+    }
+    if app.focus == Pane::Editor {
+        for binding in BINDINGS
+            .iter()
+            .filter(|binding| binding.context == BindingContext::Editor)
+        {
+            add_key_bar_item(app, binding, false, &mut seen, &mut out);
+        }
+        add_global_key_bar_items(app, false, &mut seen, &mut out);
+        return out;
+    }
+    if app.focus == Pane::Inspect {
+        for binding in BINDINGS
+            .iter()
+            .filter(|binding| binding.context == BindingContext::Inspect)
+        {
+            add_key_bar_item(app, binding, false, &mut seen, &mut out);
+        }
+        add_global_key_bar_items(app, false, &mut seen, &mut out);
+        return out;
+    }
+    for binding in BINDINGS
+        .iter()
+        .filter(|binding| main_binding_applies(binding, app.focus))
+    {
+        add_key_bar_item(app, binding, false, &mut seen, &mut out);
+    }
+    add_global_key_bar_items(app, false, &mut seen, &mut out);
+    out
+}
+
+fn key_bar_is_mirror_action(binding: &Binding) -> bool {
+    matches!(
+        binding.action,
+        BindingAction::Pane(
+            PaneAction::MirrorRun
+                | PaneAction::MirrorCancel
+                | PaneAction::MirrorRunPending
+                | PaneAction::MirrorTogglePause
+                | PaneAction::MirrorBrowse
+                | PaneAction::MirrorRead
+                | PaneAction::WikiMirrorAdd
+                | PaneAction::WikiMirrorOpenLibrary
+        )
+    )
+}
+
+fn key_bar_key_style(app: &App, binding: &Binding) -> Style {
+    let status = match status_style(&app.status).fg {
+        Some(colour @ (Color::Red | Color::Green | Color::Yellow)) => Some(colour),
+        _ => None,
+    };
+    let mirror_state = if app.focus == Pane::Mirrors && key_bar_is_mirror_action(binding) {
+        if app
+            .mirror_jobs
+            .iter()
+            .any(|job| matches!(job.state.as_str(), "error" | "stopped"))
+        {
+            Some(Color::Red)
+        } else if app.mirror_jobs.iter().any(|job| job.state == "running") {
+            Some(Color::Green)
+        } else if app.mirror_jobs.iter().any(|job| job.state == "pending") {
+            Some(Color::Yellow)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let colour = mirror_state.or(status).unwrap_or(Color::Cyan);
+    Style::default()
+        .fg(Color::Black)
+        .bg(colour)
+        .add_modifier(Modifier::BOLD)
+}
+
+fn key_bar_hint_style(app: &App) -> Style {
+    match status_style(&app.status).fg {
+        Some(Color::Red) => Style::default().fg(Color::LightRed),
+        Some(Color::Green) => Style::default().fg(Color::LightGreen),
+        Some(Color::Yellow) => Style::default().fg(Color::LightYellow),
+        _ => Style::default().fg(Color::Gray),
+    }
+}
+
+fn binding_key_label(binding: &Binding) -> String {
+    binding.key.label()
+}
+
+fn main_binding_applies(binding: &Binding, focus: Pane) -> bool {
+    binding.context == BindingContext::Main
+        && match binding.condition {
+            BindingCondition::Always => true,
+            BindingCondition::Pane(pane) => pane == focus,
+            _ => false,
+        }
+}
+
+fn main_action_hint(pane: Pane, action: PaneAction) -> String {
+    let mut labels = Vec::new();
+    for binding in BINDINGS.iter().filter(|binding| {
+        main_binding_applies(binding, pane)
+            && matches!(binding.action, BindingAction::Pane(candidate) if candidate == action)
+    }) {
+        let label = binding_key_label(binding);
+        if !labels.contains(&label) {
+            labels.push(label);
+        }
+    }
+    labels.join("/")
+}
+
+fn reader_bindings_for(
+    context: ReaderBindingContext,
+    wiki_available: bool,
+) -> impl Iterator<Item = &'static Binding> {
+    BINDINGS.iter().filter(move |binding| {
+        binding.context == BindingContext::Reader
+            && match binding.condition {
+                BindingCondition::Reader(c) => c == context,
+                BindingCondition::ReaderWiki(c) => wiki_available && c == context,
+                _ => false,
+            }
+    })
+}
+
+fn pane_switch_bindings() -> impl Iterator<Item = &'static Binding> {
+    BINDINGS
+        .iter()
+        .filter(|binding| binding.context == BindingContext::PaneSwitch)
+}
+
+fn confirm_bindings() -> impl Iterator<Item = &'static Binding> {
+    BINDINGS
+        .iter()
+        .filter(|binding| binding.context == BindingContext::Confirm)
+}
+
+fn detach_pty(app: &mut App) {
+    app.pty_esc_at = None;
+    if app.focus == Pane::Pty {
+        app.focus = Pane::Sessions;
+    } else {
+        app.right_focused = false;
+    }
+    app.status = format!(
+        "PTY {}/{} detached (still running · Tab/P re-attach)",
+        app.sel_pty + 1,
+        app.ptys.len()
+    );
+}
+
+fn run_global_action(app: &mut App, action: GlobalAction, in_pty: bool) {
+    match action {
+        GlobalAction::Help => {
+            app.snap_left();
+            app.focus = Pane::Help;
+            app.out_scroll = 0;
+        }
+        GlobalAction::ScreenNext => app.cycle_screen(1),
+        GlobalAction::ScreenPrevious => app.cycle_screen(-1),
+        GlobalAction::WindowNext => app.cycle_window(1),
+        GlobalAction::WindowPrevious => app.cycle_window(-1),
+        GlobalAction::ReaderMouse | GlobalAction::PtyMouse => {
+            app.mouse_release = !app.mouse_release;
+            let subject = if matches!(action, GlobalAction::ReaderMouse) {
+                "reader"
+            } else {
+                "PTY"
+            };
+            app.status = if app.mouse_release {
+                format!(
+                    "{subject} mouse released — drag to select/copy · F6 to restore link navigation"
+                )
+            } else {
+                format!(
+                    "{subject} mouse active — click links, wheel scroll · F6 releases selection"
+                )
+            };
+        }
+        GlobalAction::Rename => app.renaming = Some(String::new()),
+        GlobalAction::NewRule => {
+            app.modal = Some(Modal::RuleForm {
+                buf: String::new(),
+                editing: None,
+            });
+        }
+        GlobalAction::NewImageBox => app.open_image_picker(),
+        GlobalAction::PtyLauncher => open_pty_menu(app),
+        GlobalAction::DiscardHunk => app.discard_hunk(),
+        GlobalAction::DiscardFile => app.discard(),
+        GlobalAction::DeleteRule => app.delete_rule(),
+        GlobalAction::DissolveBox => {
+            app.modal = Some(Modal::Confirm {
+                prompt: format!(
+                    "Delete {}? Its changes are promoted down into child boxes (never to the host); children are kept and re-parented.",
+                    app.box_op_scope_label()
+                ),
+                action: ConfirmAction::Dissolve,
+            });
+        }
+        GlobalAction::Menu => {
+            let chips = menubar_chips(app);
+            let active = view_of_pane(app.focus).map(|(k, _, _)| k);
+            app.menu_sel = chips
+                .iter()
+                .position(|(k, _)| Some(*k) == active)
+                .unwrap_or(0);
+            app.menu_nav = true;
+            app.status = format!("menu · {}", menu_hint());
+        }
+        GlobalAction::Quit => {
+            shutdown_rpc(&app.sock);
+            app.should_quit = true;
+        }
+        GlobalAction::EmbedPty => {
+            if in_pty {
+                app.focus = Pane::Sessions;
+                app.pty_in_right = true;
+                app.right_focused = true;
+                app.right_scroll = 0;
+            } else if app.ptys.is_empty() {
+                app.status = "no PTY to split — F7 opens one".into();
+            } else {
+                app.pty_in_right = !app.pty_in_right;
+                app.right_focused = app.pty_in_right;
+                app.right_scroll = 0;
+            }
+        }
+        GlobalAction::PtyActionMenu => {
+            if let Some((title, items)) = pane_action_menu(app) {
+                app.modal = Some(Modal::ActionMenu {
+                    title,
+                    items,
+                    sel: 0,
+                });
+            }
+        }
+        GlobalAction::PtyKill => app.pty_kill(),
+        GlobalAction::PtyDetach => detach_pty(app),
+    }
+}
 
 /// Run a `PaneAction` against the app. Bodies are moved verbatim from the
 /// original inline arms — same semantics, one place now.
@@ -11330,6 +12947,28 @@ fn command_completions(
             Vec::new()
         }
     }
+}
+
+fn global_action_for(
+    app: &App,
+    in_pty: bool,
+    code: crossterm::event::KeyCode,
+    mods: crossterm::event::KeyModifiers,
+) -> Option<GlobalAction> {
+    BINDINGS.iter().find_map(|binding| {
+        let BindingAction::Global(action) = binding.action else {
+            return None;
+        };
+        let BindingCondition::Global(condition) = binding.condition else {
+            return None;
+        };
+        let active = match condition {
+            GlobalCondition::Always => !in_pty,
+            GlobalCondition::Pane(pane) => !in_pty && app.focus == pane,
+            GlobalCondition::Pty => in_pty,
+        };
+        (active && binding.key.matches(code, mods)).then_some(action)
+    })
 }
 
 fn run_pane_action(app: &mut App, action: PaneAction) {
@@ -11410,12 +13049,33 @@ fn run_pane_action(app: &mut App, action: PaneAction) {
         PaneAction::MirrorRun => app.mirror_run_selected(),
         PaneAction::MirrorCancel => app.mirror_cancel_selected(),
         PaneAction::MirrorRunPending => app.mirror_run_pending(),
+        PaneAction::MirrorToggleMedia => app.mirror_toggle_media(),
         PaneAction::MirrorBrowse => app.mirror_browse_selected(),
         PaneAction::MirrorRead => app.mirror_read_selected(),
         PaneAction::ChangeRead => app.change_read_selected(),
         PaneAction::ChangeEdit => app.change_edit_selected(),
         PaneAction::MirrorTogglePause => app.mirror_toggle_pause(),
         PaneAction::StartRename => app.renaming = Some(String::new()),
+        PaneAction::MoveRuleUp => app.move_rule(-1),
+        PaneAction::MoveRuleDown => app.move_rule(1),
+        PaneAction::PageDown => app.page_down(),
+        PaneAction::PageUp => app.page_up(),
+        PaneAction::Home => app.move_home(),
+        PaneAction::End => app.move_end(),
+        PaneAction::SessionLeft => app.sideways(-1),
+        PaneAction::SessionRight => app.sideways(1),
+        PaneAction::ToggleErrors => app.toggle_err_only(),
+        PaneAction::GoBack => app.go_back(),
+        PaneAction::ClosePackets => app.close_packets(),
+        PaneAction::ClearFilter => {
+            if !app.clear_marks() {
+                if let Some(v) = app.focus_filter_view() {
+                    if app.view_filter(v).generated {
+                        app.clear_filter(v);
+                    }
+                }
+            }
+        }
         PaneAction::ToggleFilter => app.toggle_filter(),
         PaneAction::Refresh => {
             app.refresh_sessions();
@@ -11452,15 +13112,20 @@ fn handle_reader_key(
     modifiers: crossterm::event::KeyModifiers,
 ) -> bool {
     use crate::reader::KeyResult;
-    use crossterm::event::KeyCode;
     let res = {
         let mut rd = app.reader.borrow_mut();
         match rd.as_mut() {
             Some(r) => r.handle_key_with_modifiers(code, modifiers),
-            // Empty pane: only the open prompt and leaving make sense.
-            None => match code {
-                KeyCode::Char('o') => KeyResult::OpenPrompt,
-                KeyCode::Esc => KeyResult::Close,
+            // Empty pane: use the same Reader registry; only open/close are
+            // meaningful without a document.
+            None => match reader_action(
+                ReaderBindingContext::Document,
+                false,
+                code,
+                modifiers,
+            ) {
+                Some(ReaderAction::Open) => KeyResult::OpenPrompt,
+                Some(ReaderAction::Close) => KeyResult::Close,
                 _ => KeyResult::NotHandled,
             },
         }
@@ -11512,15 +13177,14 @@ fn handle_editor_key(
     mods: crossterm::event::KeyModifiers,
 ) -> bool {
     use crate::editor::KeyResult;
-    use crossterm::event::KeyCode;
     let res = {
         let mut ed = app.editor.borrow_mut();
         match ed.as_mut() {
             Some(e) => e.handle_key(code, mods),
             // Empty pane: only the open prompt and leaving make sense.
-            None => match code {
-                KeyCode::Char('o') => KeyResult::OpenPrompt,
-                KeyCode::Esc => KeyResult::Close,
+            None => match editor_action(code, mods) {
+                Some(EditorAction::Open) => KeyResult::OpenPrompt,
+                Some(EditorAction::Close) => KeyResult::Close,
                 _ => KeyResult::NotHandled,
             },
         }
@@ -11552,168 +13216,108 @@ fn handle_editor_key(
     }
 }
 
-/// Table-driven dispatch for a main-loop key. Walks `PANE_ACTION_KEYS` in order,
-/// runs the first entry whose key matches AND whose gate is satisfied, returns
-/// true. Returns false when nothing matched (the caller then handles the keys
-/// that need richer context inline). The per-pane-action analogue of
-/// `dispatch_menubar_key`.
-fn dispatch_pane_key(app: &mut App, code: crossterm::event::KeyCode) -> bool {
-    for (key, gate, action, _) in PANE_ACTION_KEYS {
-        if !key.matches(code) {
+/// Table-driven dispatch for a main-loop key. The binding registry is ordered,
+/// so the first condition-satisfied entry wins and preserves specific-pane
+/// precedence over the general action.
+fn dispatch_pane_event(
+    app: &mut App,
+    code: crossterm::event::KeyCode,
+    mods: crossterm::event::KeyModifiers,
+) -> bool {
+    for binding in BINDINGS {
+        if !main_binding_applies(binding, app.focus) || !binding.key.matches(code, mods) {
             continue;
         }
-        let ok = match gate {
-            PaneGate::Any => true,
-            PaneGate::On(p) => app.focus == *p,
-        };
-        if ok {
-            run_pane_action(app, *action);
+        if let BindingAction::Pane(action) = binding.action {
+            run_pane_action(app, action);
             return true;
         }
     }
     false
 }
 
-/// Pane chips for the unified context bar, derived from `PANE_KEYS`. The same
-/// list drives key dispatch and the help index, so labels cannot drift.
+fn dispatch_pane_key(app: &mut App, code: crossterm::event::KeyCode) -> bool {
+    dispatch_pane_event(app, code, crossterm::event::KeyModifiers::empty())
+}
+
+/// Pane-switch entries for menu navigation, derived from the binding registry.
 fn menubar_chips(_app: &App) -> Vec<(char, &'static str)> {
-    let mut chips = vec![('N', "New")];
+    let mut chips = Vec::new();
     chips.extend(
-        PANE_KEYS
-            .iter()
-            .filter(|(_, _, _, vis, _)| matches!(vis, PaneVis::Always))
-            .map(|(key, _, label, _, _)| (*key, *label)),
+        pane_switch_bindings()
+            .filter_map(|binding| {
+                let (Some(key), Some(label), Some(PaneVis::Always)) =
+                    (binding.key.char(), binding.pane_label, binding.pane_visibility)
+                else {
+                    return None;
+                };
+                Some((key, label))
+            }),
     );
     chips.extend(
-        PANE_KEYS
-            .iter()
-            .filter(|(_, _, _, vis, _)| matches!(vis, PaneVis::Data | PaneVis::Pty))
-            .map(|(key, _, label, _, _)| (*key, *label)),
+        pane_switch_bindings()
+            .filter_map(|binding| {
+                let (Some(key), Some(label), Some(visibility)) =
+                    (binding.key.char(), binding.pane_label, binding.pane_visibility)
+                else {
+                    return None;
+                };
+                matches!(visibility, PaneVis::Data | PaneVis::Pty).then_some((key, label))
+            }),
     );
     chips
 }
 
-fn pane_needs_attention(app: &App, key: char) -> bool {
-    match key {
-        'c' => !app.changes.is_empty(),
-        'M' => app
-            .mirror_jobs
-            .iter()
-            .any(|job| matches!(job.state.as_str(), "error" | "stopped" | "pending")),
-        'P' => app.ptys.iter().any(|pty| pty.eof),
-        _ => false,
-    }
+pub(crate) fn reader_context_hint(
+    context: ReaderBindingContext,
+    wiki_available: bool,
+) -> String {
+    reader_bindings_for(context, wiki_available)
+        .filter(|binding| !matches!(binding.key, Key::AnyChar))
+        .map(|binding| format!("{} {}", binding_key_label(binding), binding.short_hint))
+        .collect::<Vec<_>>()
+        .join(" · ")
 }
 
-fn pane_chip_style(app: &App, key: char) -> Style {
-    let active = view_of_pane(app.focus).map(|(k, _, _)| k);
-    let on = active == Some(key);
-    let menu_cursor = app.menu_nav
-        && menubar_chips(app)
-            .get(app.menu_sel)
-            .is_some_and(|(menu_key, _)| *menu_key == key);
-    if menu_cursor {
-        Style::default()
-            .fg(Color::Black)
-            .bg(Color::Yellow)
-            .add_modifier(Modifier::BOLD)
-    } else if on {
-        Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD | Modifier::REVERSED)
-    } else if pane_needs_attention(app, key) {
-        Style::default()
-            .fg(Color::Red)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().add_modifier(Modifier::DIM)
-    }
+pub(crate) fn editor_context_hint() -> String {
+    let mut seen = Vec::new();
+    BINDINGS
+        .iter()
+        .filter(|binding| binding.context == BindingContext::Editor)
+        .filter_map(|binding| {
+            let label = binding_key_label(binding);
+            if seen.contains(&label) {
+                None
+            } else {
+                seen.push(label.clone());
+                Some(format!("{label} {}", binding.short_hint))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" · ")
 }
 
-/// Readable destination chips, wrapped only between chips. Always-present
-/// application panes precede box-data/PTY panes, so navigation does not jitter
-/// as a box gains data.
-fn unified_pane_lines(app: &App, width: u16) -> Vec<Line<'static>> {
-    let mut ordered = menubar_chips(app);
-    ordered.push(('q', "Quit"));
-
-    let limit = width.max(1) as usize;
-    let mut lines = Vec::new();
-    let mut spans = Vec::new();
-    let mut used = 0usize;
-    for (key, label) in ordered {
-        let text = format!("{key}:{label}");
-        let separator = usize::from(used != 0) * 3;
-        if used != 0 && used + separator + text.chars().count() > limit {
-            lines.push(Line::from(std::mem::take(&mut spans)));
-            used = 0;
-        }
-        if used != 0 {
-            spans.push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
-            used += 3;
-        }
-        let style = if key == 'q' {
-            Style::default().add_modifier(Modifier::DIM)
-        } else {
-            pane_chip_style(app, key)
-        };
-        used += text.chars().count();
-        spans.push(Span::styled(text, style));
-    }
-    if app.menu_nav {
-        if !spans.is_empty() {
-            lines.push(Line::from(spans));
-        }
-        lines.push(Line::from(Span::styled(
-            "←/→ choose destination · Enter open · Esc cancel",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::DIM),
-        )));
-    } else if !spans.is_empty() {
-        lines.push(Line::from(spans));
-    }
-    lines
+fn global_context_hint(app: &App, in_pty: bool) -> String {
+    let mut seen = Vec::new();
+    let mut items = Vec::new();
+    add_global_key_bar_items(app, in_pty, &mut seen, &mut items);
+    items
+        .iter()
+        .map(|item| format!("{} {}", binding_key_label(item.binding), item.hint))
+        .collect::<Vec<_>>()
+        .join(" · ")
 }
 
 fn context_key_hints(app: &App) -> String {
-    if app.pending_prompt.is_some() {
-        return "y yes once · n no once · a allow+save · d deny+save".into();
-    }
-    match app.modal.as_ref() {
-        Some(Modal::WikiMirrorSetup { .. }) => {
-            return "↑↓ site · Space select · Tab field · ←→ cadence · Enter create · Esc cancel"
-                .into();
-        }
-        Some(Modal::WikiMirrorLibrary { .. }) => {
-            return "type folder · Enter open · Esc cancel".into();
-        }
-        Some(Modal::Confirm { .. }) => return "y confirm · n/Esc cancel".into(),
-        Some(Modal::ActionMenu { .. }) => {
-            return "↑↓ action · Enter run · Esc close".into();
-        }
-        Some(_) => return "Enter accept · Esc cancel".into(),
-        None => {}
-    }
-    match app.focus {
-        Pane::Mirrors => "n add · O library · r run · c stop · R pending · Space pause · b browse · V read · D remove · X delete".into(),
-        Pane::Rules => "n new · d delete · Ctrl-↑/↓ reorder".into(),
-        Pane::Changes | Pane::Hunks => {
-            "a apply · x discard · A/X all · V read · E edit · Space mark".into()
-        }
-        Pane::Pipelines => "t tree/flat · f running only".into(),
-        Pane::Processes | Pane::BuildEdges => "f running only".into(),
-        Pane::Reader => "h history · o open · z zoom · / search · [/] back/forward".into(),
-        Pane::Editor => "Ctrl-S save · Ctrl-O open · Ctrl-E read-only · z zoom".into(),
-        Pane::Pty => format!(
-            "F4/F5 PTY · F6 {} · F7 new · F8 kill · F11 embed · F12 detach",
-            if app.mouse_release { "grab mouse" } else { "select text" }
-        ),
-        _ => "m actions · / filter · : command".into(),
-    }
+    context_key_items(app)
+        .iter()
+        .map(|item| format!("{} {}", binding_key_label(item.binding), item.hint))
+        .collect::<Vec<_>>()
+        .join(" · ")
 }
 
-/// Context-specific actions for the unified bar.
+/// Context-specific non-key text for the unified bar. Key labels are rendered
+/// separately so their state colour remains legible.
 fn unified_context_spans(app: &App) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
     if let Some(prompt) = &app.pending_prompt {
@@ -11726,16 +13330,6 @@ fn unified_context_spans(app: &App) -> Vec<Span<'static>> {
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
-        ));
-    }
-    spans.push(Span::styled(
-        context_key_hints(app),
-        Style::default().fg(Color::Cyan),
-    ));
-    if app.modal.is_none() && app.pending_prompt.is_none() {
-        spans.push(Span::styled(
-            "  │ F2/3 screen · F4/5 window",
-            Style::default().fg(Color::DarkGray),
         ));
     }
     let active = view_of_pane(app.focus);
@@ -11751,6 +13345,43 @@ fn unified_context_spans(app: &App) -> Vec<Span<'static>> {
         }
     }
     spans
+}
+
+fn key_bar_lines(
+    app: &App,
+    width: u16,
+    status: Option<(&str, Style)>,
+) -> Vec<Line<'static>> {
+    let limit = width.max(1) as usize;
+    let hint_style = key_bar_hint_style(app);
+    let mut lines = Vec::new();
+    let mut line = Vec::new();
+    let mut used = 0usize;
+    if let Some((status, style)) = status.filter(|(status, _)| !status.is_empty()) {
+        line.push(Span::styled(status.to_owned(), style));
+        line.push(Span::styled("  │ ", Style::default().fg(Color::DarkGray)));
+        used = status.chars().count() + 3;
+    }
+    for item in context_key_items(app) {
+        let key = binding_key_label(item.binding);
+        let item_width = key.chars().count() + 1 + item.hint.chars().count();
+        let separator = usize::from(used != 0) * 3;
+        if used != 0 && used + separator + item_width > limit {
+            lines.push(Line::from(std::mem::take(&mut line)));
+            used = 0;
+        }
+        if used != 0 {
+            line.push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
+            used += 3;
+        }
+        line.push(Span::styled(key, key_bar_key_style(app, item.binding)));
+        line.push(Span::styled(format!(" {}", item.hint), hint_style));
+        used += item_width;
+    }
+    if !line.is_empty() {
+        lines.push(Line::from(line));
+    }
+    lines
 }
 
 fn status_style(status: &str) -> Style {
@@ -11779,7 +13410,23 @@ fn wrap_spans(spans: Vec<Span<'static>>, width: u16) -> Vec<Line<'static>> {
     let mut used = 0usize;
     for span in spans {
         let style = span.style;
-        for token in span.content.split_inclusive(' ') {
+        // Context hints use ` · ` as the separator between complete
+        // bindings. Keep each `key short-hint` group together when wrapping;
+        // splitting the key from its explanation makes the bar look like a
+        // second, inconsistent key list.
+        let grouped = span.content.contains(" · ");
+        let tokens: Vec<String> = if grouped {
+            span.content
+                .split_inclusive(" · ")
+                .map(str::to_string)
+                .collect()
+        } else {
+            span.content
+                .split_inclusive(' ')
+                .map(str::to_string)
+                .collect()
+        };
+        for token in tokens {
             let mut text = token.to_string();
             if used == 0 {
                 text = text.trim_start().to_string();
@@ -11803,10 +13450,14 @@ fn wrap_spans(spans: Vec<Span<'static>>, width: u16) -> Vec<Line<'static>> {
 }
 
 fn unified_bar_lines(app: &App, width: u16) -> Vec<Line<'static>> {
-    let mut lines = unified_pane_lines(app, width);
+    // The pane-chip row used to be rendered here. It duplicated (and often
+    // contradicted) the actual context bindings below, so the unified bar is
+    // now just live status/context text followed by the registry-backed key
+    // bar.
+    let mut lines = Vec::new();
     let (status, style) = if let Some(buf) = &app.renaming {
         (
-            format!("rename → {buf}_ · Enter commit · Esc cancel"),
+            format!("rename → {buf}_"),
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
@@ -11814,22 +13465,8 @@ fn unified_bar_lines(app: &App, width: u16) -> Vec<Line<'static>> {
     } else {
         (app.status.clone(), status_style(&app.status))
     };
-    let status_width = status.chars().count();
-    let status_fits = lines
-        .last()
-        .is_some_and(|line| line.width() + 3 + status_width <= width as usize);
-    if status_fits {
-        let last = lines.last_mut().unwrap();
-        last.spans.push(Span::styled(
-            "  │ ",
-            Style::default().fg(Color::DarkGray),
-        ));
-        last.spans.push(Span::styled(status.clone(), style));
-    }
     lines.extend(wrap_spans(unified_context_spans(app), width));
-    if !status_fits {
-        lines.extend(wrap_spans(vec![Span::styled(status, style)], width));
-    }
+    lines.extend(key_bar_lines(app, width, Some((&status, style))));
     lines
 }
 
@@ -12966,7 +14603,7 @@ impl App {
                     lines.push(l.to_string());
                 }
                 if pretty.lines().count() > INS_PAGE {
-                    lines.push("\u{2026} Enter drills into the fields".to_string());
+                    lines.push(format!("\u{2026} {} drills into the fields", inspect_hint()));
                 }
             }
             Some(InsNode::Symbol { path, name, .. }) => {
@@ -12974,7 +14611,7 @@ impl App {
                 lines.push(String::new());
                 lines.push(e.text.clone());
                 lines.push(String::new());
-                lines.push("Enter shows the source.".into());
+                lines.push(format!("{} shows the source.", inspect_hint()));
             }
             Some(_) => {
                 for l in e.text.split('\n') {
@@ -12982,10 +14619,8 @@ impl App {
                 }
                 lines.push(String::new());
                 lines.push(match e.arg {
-                    Some(a) => format!("Enter prompts for the {a}, then drills."),
-                    None => "Enter drills in \u{b7} \u{2190}/\u{2192} walk \
-                             siblings."
-                        .into(),
+                    Some(a) => format!("{} prompts for the {a}, then drills.", inspect_hint()),
+                    None => format!("{} drills in \u{b7} \u{2190}/\u{2192} walk siblings.", inspect_hint()),
                 });
             }
             None => {
@@ -14455,16 +16090,20 @@ fn draw_inspector(f: &mut ratatui::Frame, app: &App, body: ratatui::layout::Rect
         }
     }
     let hint = if app.ins_input.is_some() {
-        "card \u{b7} typing goes to the \u{2315} row above"
-    } else if frame.hotspots.is_empty() {
-        "card \u{b7} Enter drill \u{b7} \u{2190}/\u{2192} siblings \u{b7} \
-         Backspace up \u{b7} ':' locator"
+        "card \u{b7} typing goes to the \u{2315} row above".to_string()
     } else {
-        "card \u{b7} 1-9 follow \u{b7} Enter drill \u{b7} \u{2190}/\u{2192} \
-         siblings \u{b7} Backspace up \u{b7} ':' locator"
+        format!(
+            "card \u{b7} {}{}",
+            inspect_hint(),
+            if frame.hotspots.is_empty() {
+                String::new()
+            } else {
+                " \u{b7} 1-9 follow active hotspots".to_string()
+            }
+        )
     };
     let card = Paragraph::new(Text::from(card_lines))
-        .block(block(title(hint, false), false))
+        .block(block(title(&hint, false), false))
         .wrap(Wrap { trim: false });
     f.render_widget(card, bottom);
 }
@@ -14514,7 +16153,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                 ),
                 Span::raw("   "),
                 Span::styled(
-                    "F4/F5 cycle · F2/F3 screens · F7 new · F8 kill · F12 detach",
+                    global_context_hint(app, true),
                     Style::default().add_modifier(Modifier::DIM),
                 ),
             ]));
@@ -14622,7 +16261,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                     ),
                     Span::raw("   "),
                     Span::styled(
-                        "F11 full-screen · F8 kill · F4/F5 cycle",
+                        global_context_hint(app, false),
                         Style::default().add_modifier(Modifier::DIM),
                     ),
                 ]));
@@ -14848,9 +16487,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                             Line::from(format!("line {}/{}", e.state.cursor.row + 1, rows)),
                             Line::from(""),
                             Line::from("vim-modal editing (edtui)"),
-                            Line::from("Ctrl-S save · Ctrl-O open"),
-                            Line::from("Ctrl-E read-only lock"),
-                            Line::from("z zoom · Esc back"),
+                            Line::from(crate::ui::editor_context_hint()),
                         ];
                         let p = Paragraph::new(Text::from(info))
                             .block(block(title("EDITOR", false), false))
@@ -16396,22 +18033,22 @@ fn open_pty_menu(app: &mut App) {
     let mut items = vec![
         ActionItem {
             label: "Shell in a NEW box (captured; sarun run -b)".into(),
-            hint: "",
+            hint: String::new(),
             action: Action::PtyNewBoxShell,
         },
         ActionItem {
             label: "Container from image… (pick a base image)".into(),
-            hint: "",
+            hint: String::new(),
             action: Action::NewFromImage,
         },
         ActionItem {
             label: "Browser — cellulose (headless Chromium; flows captured)".into(),
-            hint: "",
+            hint: String::new(),
             action: Action::Browser,
         },
         ActionItem {
             label: format!("Host shell — {host_shell} (NOT captured)"),
-            hint: "",
+            hint: String::new(),
             action: Action::PtyNewHostShell,
         },
     ];
@@ -16424,7 +18061,7 @@ fn open_pty_menu(app: &mut App) {
     {
         items.push(ActionItem {
             label: "Container shell on the SELECTED image box".into(),
-            hint: "",
+            hint: String::new(),
             action: Action::RunSelectedImage,
         });
     }
@@ -16435,13 +18072,13 @@ fn open_pty_menu(app: &mut App) {
     {
         items.push(ActionItem {
             label: format!("oaita agent session ON box '{name}'…"),
-            hint: "",
+            hint: String::new(),
             action: Action::OaitaOnSelectedBox,
         });
     }
     items.push(ActionItem {
         label: "Custom command…".into(),
-        hint: "",
+        hint: String::new(),
         action: Action::PtyNewCustom,
     });
     // Don't offer a default that can't work here: when the netns probe says
@@ -17530,8 +19167,7 @@ fn key_to_pty_bytes(
     code: crossterm::event::KeyCode,
     mods: crossterm::event::KeyModifiers,
 ) -> Option<Vec<u8>> {
-    use crossterm::event::KeyCode;
-    use crossterm::event::KeyModifiers;
+    use crossterm::event::{KeyCode, KeyModifiers};
     Some(match code {
         KeyCode::Char(c) => {
             if mods.contains(KeyModifiers::CONTROL) {
@@ -17655,10 +19291,62 @@ fn render_to_string(app: &App, w: u16, h: u16) -> Result<String, String> {
 /// current pane has nothing meaningful you'd do to a row (Help, Pty
 /// — both manage themselves). Caller wraps the returned list in
 /// Modal::ActionMenu and presents it.
+fn registry_action_hint(pane: Pane, action: Action) -> String {
+    let same_action = |binding: &Binding| match (action, binding.action) {
+        (Action::OpenSelection, BindingAction::Pane(PaneAction::Open))
+        | (Action::ApplyFile, BindingAction::Pane(PaneAction::ApplyFile))
+        | (Action::ApplyHunk, BindingAction::Pane(PaneAction::ApplyHunk))
+        | (Action::DiscardFile, BindingAction::Pane(PaneAction::DiscardFile))
+        | (Action::DiscardHunk, BindingAction::Pane(PaneAction::DiscardHunk))
+        | (Action::ApplyBox, BindingAction::Pane(PaneAction::ApplyFile))
+        | (Action::DiscardBox, BindingAction::Pane(PaneAction::DiscardFile))
+        | (Action::DissolveBox, BindingAction::Pane(PaneAction::ConfirmDissolve))
+        | (Action::KillBox, BindingAction::Pane(PaneAction::ConfirmKill))
+        | (Action::StartRename, BindingAction::Pane(PaneAction::StartRename))
+        | (Action::EditRule, BindingAction::Pane(PaneAction::Open))
+        | (Action::NewRule, BindingAction::Pane(PaneAction::NewRule))
+        | (Action::DeleteRule, BindingAction::Pane(PaneAction::DeleteRule))
+        | (Action::MoveRuleUp, BindingAction::Pane(PaneAction::MoveRuleUp))
+        | (Action::MoveRuleDown, BindingAction::Pane(PaneAction::MoveRuleDown))
+        | (Action::WikiMirrorAdd, BindingAction::Pane(PaneAction::WikiMirrorAdd))
+        | (Action::WikiMirrorOpenLibrary, BindingAction::Pane(PaneAction::WikiMirrorOpenLibrary))
+        | (Action::MirrorRun, BindingAction::Pane(PaneAction::MirrorRun))
+        | (Action::MirrorCancel, BindingAction::Pane(PaneAction::MirrorCancel))
+        | (Action::MirrorRunPending, BindingAction::Pane(PaneAction::MirrorRunPending))
+        | (Action::MirrorTogglePause, BindingAction::Pane(PaneAction::MirrorTogglePause))
+        | (Action::MirrorToggleMedia, BindingAction::Pane(PaneAction::MirrorToggleMedia))
+        | (Action::MirrorRemove, BindingAction::Pane(PaneAction::ConfirmMirrorRemove))
+        | (Action::MirrorDeleteData, BindingAction::Pane(PaneAction::ConfirmMirrorDeleteData))
+        | (Action::MirrorBrowse, BindingAction::Pane(PaneAction::MirrorBrowse))
+        | (Action::MirrorRead, BindingAction::Pane(PaneAction::MirrorRead))
+        | (Action::PtyKill, BindingAction::Global(GlobalAction::PtyKill))
+        | (Action::PtyEmbedToggle, BindingAction::Global(GlobalAction::EmbedPty))
+        | (Action::PtyNew, BindingAction::Global(GlobalAction::PtyLauncher))
+        | (Action::NewFromImage, BindingAction::Global(GlobalAction::NewImageBox))
+        | (Action::StartRename, BindingAction::Global(GlobalAction::Rename)) => true,
+        _ => false,
+    };
+    let active = |binding: &Binding| match binding.condition {
+        BindingCondition::Always => true,
+        BindingCondition::Pane(p) => p == pane,
+        BindingCondition::Global(GlobalCondition::Pane(p)) => p == pane,
+        BindingCondition::Global(GlobalCondition::Always) => true,
+        _ => false,
+    };
+    let mut labels = Vec::new();
+    for binding in BINDINGS.iter().filter(|b| same_action(b) && active(b)) {
+        let label = binding_key_label(binding);
+        if !labels.contains(&label) {
+            labels.push(label);
+        }
+    }
+    labels.join("/")
+}
+
 fn pane_action_menu(app: &App) -> Option<(String, Vec<ActionItem>)> {
-    let mk = |label: &str, hint: &'static str, action: Action| ActionItem {
+    let mk = |label: &str, _hint: &'static str, action: Action| ActionItem {
         label: label.into(),
-        hint,
+        hint: registry_action_hint(app.focus, action),
         action,
     };
     let title = |what: &str, target: &str| {
@@ -17791,6 +19479,7 @@ fn pane_action_menu(app: &App) -> Option<(String, Vec<ActionItem>)> {
                         "space",
                         Action::MirrorTogglePause,
                     ),
+                    mk("Toggle Kiwix images", "i", Action::MirrorToggleMedia),
                     mk("Delete this job", "D", Action::MirrorRemove),
                     mk(
                         "Delete this Wikipedia mirror and its files…",
@@ -17899,6 +19588,7 @@ fn run_action(app: &mut App, a: Action) {
         Action::MirrorRunPending => app.mirror_run_pending(),
         Action::MirrorFullRefresh => app.confirm_mirror_full_refresh(),
         Action::MirrorTogglePause => app.mirror_toggle_pause(),
+        Action::MirrorToggleMedia => app.mirror_toggle_media(),
         Action::MirrorRemove => app.confirm_mirror_remove(),
         Action::MirrorDeleteData => app.confirm_mirror_delete_data(),
         Action::MirrorBrowse => app.mirror_browse_selected(),
@@ -17954,22 +19644,22 @@ fn run_action(app: &mut App, a: Action) {
                 items: vec![
                     ActionItem {
                         label: "x86_64".into(),
-                        hint: "",
+                        hint: String::new(),
                         action: Action::DebugSelectedFirmwareX8664,
                     },
                     ActionItem {
                         label: "AArch64".into(),
-                        hint: "",
+                        hint: String::new(),
                         action: Action::DebugSelectedFirmwareAarch64,
                     },
                     ActionItem {
                         label: "ARMv7".into(),
-                        hint: "",
+                        hint: String::new(),
                         action: Action::DebugSelectedFirmwareArm,
                     },
                     ActionItem {
                         label: "MIPS32 little-endian".into(),
-                        hint: "",
+                        hint: String::new(),
                         action: Action::DebugSelectedFirmwareMmips,
                     },
                 ],
@@ -17985,22 +19675,22 @@ fn run_action(app: &mut App, a: Action) {
                 items: vec![
                     ActionItem {
                         label: "x86_64".into(),
-                        hint: "",
+                        hint: String::new(),
                         action: Action::DebugSelectedKernelInitramfsX8664,
                     },
                     ActionItem {
                         label: "AArch64".into(),
-                        hint: "",
+                        hint: String::new(),
                         action: Action::DebugSelectedKernelInitramfsAarch64,
                     },
                     ActionItem {
                         label: "ARMv7".into(),
-                        hint: "",
+                        hint: String::new(),
                         action: Action::DebugSelectedKernelInitramfsArm,
                     },
                     ActionItem {
                         label: "MIPS32 little-endian".into(),
-                        hint: "",
+                        hint: String::new(),
                         action: Action::DebugSelectedKernelInitramfsMmips,
                     },
                 ],
@@ -18068,54 +19758,49 @@ fn run_action(app: &mut App, a: Action) {
 }
 
 fn dispatch_menubar_key(app: &mut App, k: char) {
-    // `New` opens the launcher directly — the one always-available menu entry
-    // for starting a shell / container / browser box, so it's discoverable
-    // without already having a window open.
-    if k == 'N' {
-        open_pty_menu(app);
-        return;
-    }
-    // PTY is special: focus a live PTY if one's open, else prompt for the
-    // login command. Every other accelerator routes through the PANE_KEYS
-    // table to `go_to_pane`, so the binding lives in exactly one place.
-    if k == 'P' {
-        let any_live = app.ptys.iter().any(|p| !p.eof);
-        if any_live {
-            if app.cur_pty().map(|p| p.eof).unwrap_or(true) {
-                if let Some((i, _)) = app.ptys.iter().enumerate().find(|(_, p)| !p.eof) {
-                    app.sel_pty = i;
+    if let Some(binding) = pane_switch_bindings().find(|binding| binding.key.char() == Some(k)) {
+        match binding.action {
+            BindingAction::SwitchPane(Pane::Pty) => {
+                if app.ptys.iter().any(|p| !p.eof) {
+                    if app.cur_pty().map(|p| p.eof).unwrap_or(true) {
+                        if let Some((i, _)) = app.ptys.iter().enumerate().find(|(_, p)| !p.eof) {
+                            app.sel_pty = i;
+                        }
+                    }
+                    app.focus = Pane::Pty;
+                } else {
+                    open_pty_menu(app);
                 }
             }
-            app.focus = Pane::Pty;
-        } else {
-            open_pty_menu(app);
+            BindingAction::SwitchPane(pane) => app.go_to_pane(pane),
+            BindingAction::Global(action) => run_global_action(app, action, false),
+            _ => {}
         }
-        return;
-    }
-    if let Some((_, pane, _, _, _)) = PANE_KEYS.iter().find(|e| e.0 == k) {
-        app.go_to_pane(*pane);
     }
 }
 
 /// Is `c` a global menubar accelerator (a pane-switch chip)? Derived from
-/// `PANE_KEYS` plus `N` (New, the always-first launcher chip), so the set can
+/// the pane-switch bindings, so the set can
 /// never drift from the chips actually rendered. Notably this INCLUDES `t`
 /// (Trace) — previously the hand-maintained match arms omitted it, leaving the
 /// Trace chip keyboard-unreachable (F-keys only).
 fn is_menubar_accel(c: char) -> bool {
-    c == 'N' || PANE_KEYS.iter().any(|(k, ..)| *k == c)
+    pane_switch_bindings().any(|binding| binding.key.char() == Some(c))
 }
 
-/// Does the FOCUSED pane bind `c` as a per-row action (a `PaneGate::On(focus)`
-/// entry in `PANE_ACTION_KEYS`)? Such a binding is the more specific intent
+/// Does the FOCUSED pane bind `c` as a per-row action? Such a binding is the more specific intent
 /// and must beat the global menubar accelerator of the same letter — e.g. `b`
 /// on Mirrors is MirrorBrowse, not "jump to Boxes"; `t` on Pipes toggles the
-/// tree, not "jump to Trace". `PaneGate::Any` rows are NOT counted here: they
+/// tree, not "jump to Trace". Unscoped rows are NOT counted here: they
 /// carry no pane-specific meaning that should override a chip.
 fn pane_row_key_on_focus(app: &App, c: char) -> bool {
-    PANE_ACTION_KEYS.iter().any(|(key, gate, ..)| {
-        key.matches(crossterm::event::KeyCode::Char(c))
-            && matches!(gate, PaneGate::On(p) if *p == app.focus)
+    BINDINGS.iter().any(|binding| {
+        main_binding_applies(binding, app.focus)
+            && matches!(binding.condition, BindingCondition::Pane(_))
+            && binding.key.matches(
+                crossterm::event::KeyCode::Char(c),
+                crossterm::event::KeyModifiers::empty(),
+            )
     })
 }
 
@@ -18123,7 +19808,7 @@ fn pane_row_key_on_focus(app: &App, c: char) -> bool {
 /// per-pane action table and the global menubar accelerators:
 ///   1. a pane-row key bound `On(the focused pane)` wins (the specific intent);
 ///   2. otherwise a global menubar accelerator switches panes;
-///   3. otherwise the flat pane-action table (`PaneGate::Any` keys: q, j/k,
+///   3. otherwise the flat pane-action bindings (q, j/k,
 ///      a/x/d, …) handles it.
 /// This ordering is what makes `b` on Mirrors browse (not jump to Boxes) while
 /// `b` from every other pane still reaches Boxes, and lets `t` reach Trace.
@@ -18144,18 +19829,27 @@ fn handle_modal_key(
     mods: crossterm::event::KeyModifiers,
 ) {
     use crossterm::event::KeyCode;
-    use crossterm::event::KeyModifiers;
     let Some(modal) = app.modal.take() else {
         return;
     };
+    // Modal widgets share these fixed keys; the registry decides their
+    // semantic role while each widget supplies the state transition.
+    let modal_action = ui_action_for(BindingContext::Modal, code, mods);
     match modal {
         Modal::Confirm { prompt, action } => {
-            // y/n/Esc is a fully enumerable keymap → driven from CONFIRM_KEYS
-            // (the same table that generates the modal's help line). On no
-            // match the modal re-arms, exactly as the old `_ =>` arm did.
-            match CONFIRM_KEYS.iter().find(|(k, _, _)| k.matches(code)) {
-                Some((_, ConfirmKey::Yes, _)) => app.run_confirm(action),
-                Some((_, ConfirmKey::No, _)) => app.status = "cancelled".into(),
+            // y/n/Esc comes from the same registry as the modal hint and F1.
+            match confirm_bindings().find(|binding| {
+                binding.key.matches(code, mods)
+            }) {
+                Some(Binding {
+                    action: BindingAction::Confirm(ConfirmKey::Yes),
+                    ..
+                }) => app.run_confirm(action),
+                Some(Binding {
+                    action: BindingAction::Confirm(ConfirmKey::No),
+                    ..
+                }) => app.status = "cancelled".into(),
+                Some(_) => app.modal = Some(Modal::Confirm { prompt, action }),
                 None => app.modal = Some(Modal::Confirm { prompt, action }),
             }
         }
@@ -18166,8 +19860,8 @@ fn handle_modal_key(
             cells,
         } => {
             // Any of Esc / q / Enter dismisses; other keys keep it open.
-            match code {
-                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => {}
+            match ui_action_for(BindingContext::ModalDismiss, code, mods) {
+                Some(UiAction::ModalCancel) => {}
                 _ => {
                     app.modal = Some(Modal::ImageView {
                         title,
@@ -18178,8 +19872,8 @@ fn handle_modal_key(
                 }
             }
         }
-        Modal::Report { title, lines } => match code {
-            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => {}
+        Modal::Report { title, lines } => match ui_action_for(BindingContext::ModalDismiss, code, mods) {
+            Some(UiAction::ModalCancel) => {}
             _ => app.modal = Some(Modal::Report { title, lines }),
         },
         Modal::Search {
@@ -18189,13 +19883,13 @@ fn handle_modal_key(
             mut sel,
             mut field,
         } => {
-            let ctrl = mods.contains(KeyModifiers::CONTROL);
+            let modal_action = modal_action_for(BindingContext::ModalSearch, code, mods);
             // ^s / Enter → commit; Esc → cancel (no change). All else edits rows.
-            if (ctrl && matches!(code, KeyCode::Char('s'))) || code == KeyCode::Enter {
+            if matches!(modal_action, Some(UiAction::ModalAccept)) {
                 app.commit_filter(view, &rows);
                 return;
             }
-            if code == KeyCode::Esc {
+            if matches!(modal_action, Some(UiAction::ModalCancel)) {
                 app.status = "filter unchanged".into();
                 return;
             }
@@ -18208,12 +19902,12 @@ fn handle_modal_key(
                 ClauseField::Pattern,
             ];
             let cur_fi = order.iter().position(|f| *f == field).unwrap_or(4);
-            match code {
-                KeyCode::Left => field = order[cur_fi.saturating_sub(1)],
-                KeyCode::Right => field = order[(cur_fi + 1).min(order.len() - 1)],
-                KeyCode::Up => sel = sel.saturating_sub(1),
-                KeyCode::Down => sel = (sel + 1).min(rows.len().saturating_sub(1)),
-                KeyCode::Char('n') if field != ClauseField::Pattern => {
+            match modal_action {
+                Some(UiAction::ModalLeft) => field = order[cur_fi.saturating_sub(1)],
+                Some(UiAction::ModalRight) => field = order[(cur_fi + 1).min(order.len() - 1)],
+                Some(UiAction::ModalUp) => sel = sel.saturating_sub(1),
+                Some(UiAction::ModalDown) => sel = (sel + 1).min(rows.len().saturating_sub(1)),
+                Some(UiAction::ModalNewRow) if field != ClauseField::Pattern => {
                     rows.push(ClauseRow {
                         enabled: true,
                         join: Join::And,
@@ -18228,7 +19922,7 @@ fn handle_modal_key(
                     if let Some(r) = rows.get_mut(sel) {
                         match field {
                             ClauseField::Pattern => match code {
-                                KeyCode::Backspace => {
+                                _ if matches!(modal_action, Some(UiAction::ModalBackspace)) => {
                                     r.pattern.pop();
                                 }
                                 KeyCode::Char(c) => r.pattern.push(c),
@@ -18273,21 +19967,23 @@ fn handle_modal_key(
                 field,
             });
         }
-        Modal::RuleForm { mut buf, editing } => match code {
-            KeyCode::Enter => app.commit_rule(buf, editing),
-            KeyCode::Esc => app.status = "rule edit cancelled".into(),
-            KeyCode::Backspace => {
+        Modal::RuleForm { mut buf, editing } => match modal_action {
+            Some(UiAction::ModalAccept) => app.commit_rule(buf, editing),
+            Some(UiAction::ModalCancel) => app.status = "rule edit cancelled".into(),
+            Some(UiAction::ModalBackspace) => {
                 buf.pop();
                 app.modal = Some(Modal::RuleForm { buf, editing });
             }
-            KeyCode::Char(c) => {
-                buf.push(c);
+            Some(UiAction::ModalText) => {
+                if let KeyCode::Char(c) = code {
+                    buf.push(c);
+                }
                 app.modal = Some(Modal::RuleForm { buf, editing });
             }
             _ => app.modal = Some(Modal::RuleForm { buf, editing }),
         },
-        Modal::VarQuery { mut buf } => match code {
-            KeyCode::Enter => {
+        Modal::VarQuery { mut buf } => match modal_action {
+            Some(UiAction::ModalAccept) => {
                 // One term searches name OR value (the forgiving default);
                 // two terms are NAME then VALUE, ANDed.
                 let mut it = buf.split_whitespace();
@@ -18297,32 +19993,36 @@ fn handle_modal_key(
                 app.vars_query = if app.vars_any { (a.clone(), a) } else { (a, b) };
                 app.load_vars();
             }
-            KeyCode::Esc => {}
-            KeyCode::Backspace => {
+            Some(UiAction::ModalCancel) => {}
+            Some(UiAction::ModalBackspace) => {
                 buf.pop();
                 app.modal = Some(Modal::VarQuery { buf });
             }
-            KeyCode::Char(c) => {
-                buf.push(c);
+            Some(UiAction::ModalText) => {
+                if let KeyCode::Char(c) = code {
+                    buf.push(c);
+                }
                 app.modal = Some(Modal::VarQuery { buf });
             }
             _ => app.modal = Some(Modal::VarQuery { buf }),
         },
-        Modal::PtyCmd { mut buf } => match code {
-            KeyCode::Enter => app.open_pty(shell_split(&buf)),
-            KeyCode::Esc => app.status = "pty cancelled".into(),
-            KeyCode::Backspace => {
+        Modal::PtyCmd { mut buf } => match modal_action {
+            Some(UiAction::ModalAccept) => app.open_pty(shell_split(&buf)),
+            Some(UiAction::ModalCancel) => app.status = "pty cancelled".into(),
+            Some(UiAction::ModalBackspace) => {
                 buf.pop();
                 app.modal = Some(Modal::PtyCmd { buf });
             }
-            KeyCode::Char(c) => {
-                buf.push(c);
+            Some(UiAction::ModalText) => {
+                if let KeyCode::Char(c) = code {
+                    buf.push(c);
+                }
                 app.modal = Some(Modal::PtyCmd { buf });
             }
             _ => app.modal = Some(Modal::PtyCmd { buf }),
         },
-        Modal::BrowserUrl { mut buf, spki } => match code {
-            KeyCode::Enter => {
+        Modal::BrowserUrl { mut buf, spki } => match modal_action {
+            Some(UiAction::ModalAccept) => {
                 // Assemble the browser launch from the validated URL: the
                 // persistent BROWSER box (profile persists across launches)
                 // with web capture on (browsing archives). One universal
@@ -18344,26 +20044,30 @@ fn handle_modal_key(
                 );
                 app.open_pty(argv);
             }
-            KeyCode::Esc => app.status = "browser cancelled".into(),
-            KeyCode::Backspace => {
+            Some(UiAction::ModalCancel) => app.status = "browser cancelled".into(),
+            Some(UiAction::ModalBackspace) => {
                 buf.pop();
                 app.modal = Some(Modal::BrowserUrl { buf, spki });
             }
-            KeyCode::Char(c) => {
-                buf.push(c);
+            Some(UiAction::ModalText) => {
+                if let KeyCode::Char(c) = code {
+                    buf.push(c);
+                }
                 app.modal = Some(Modal::BrowserUrl { buf, spki });
             }
             _ => app.modal = Some(Modal::BrowserUrl { buf, spki }),
         },
-        Modal::ReaderOpen { mut buf } => match code {
-            KeyCode::Enter => app.reader_open_spec(&buf),
-            KeyCode::Esc => app.status = "reader open cancelled".into(),
-            KeyCode::Backspace => {
+        Modal::ReaderOpen { mut buf } => match modal_action {
+            Some(UiAction::ModalAccept) => app.reader_open_spec(&buf),
+            Some(UiAction::ModalCancel) => app.status = "reader open cancelled".into(),
+            Some(UiAction::ModalBackspace) => {
                 buf.pop();
                 app.modal = Some(Modal::ReaderOpen { buf });
             }
-            KeyCode::Char(c) => {
-                buf.push(c);
+            Some(UiAction::ModalText) => {
+                if let KeyCode::Char(c) = code {
+                    buf.push(c);
+                }
                 app.modal = Some(Modal::ReaderOpen { buf });
             }
             _ => app.modal = Some(Modal::ReaderOpen { buf }),
@@ -18373,53 +20077,65 @@ fn handle_modal_key(
             mut site_cursor,
             mut site_filter,
             mut destination,
+            mut media_enabled,
             mut cadence,
             mut field,
         } => {
-            if code == KeyCode::Enter {
-                app.commit_wiki_mirror_setup(selected, site_filter, destination, cadence);
+            let modal_action = modal_action_for(BindingContext::ModalWikiSetup, code, mods);
+            if matches!(modal_action, Some(UiAction::ModalAccept)) {
+                app.commit_wiki_mirror_setup(
+                    selected,
+                    site_filter,
+                    destination,
+                    media_enabled,
+                    cadence,
+                );
                 return;
             }
-            if code == KeyCode::Esc {
+            if matches!(modal_action, Some(UiAction::ModalCancel)) {
                 app.status = "Wikipedia mirror setup cancelled".into();
                 return;
             }
-            match code {
-                KeyCode::Tab => {
+            match modal_action {
+                Some(UiAction::ModalNextField) => {
                     field = match field {
                         WikiSetupField::Sites => WikiSetupField::Destination,
-                        WikiSetupField::Destination => WikiSetupField::Cadence,
+                        WikiSetupField::Destination => WikiSetupField::MediaSource,
+                        WikiSetupField::MediaSource => WikiSetupField::Cadence,
                         WikiSetupField::Cadence => WikiSetupField::Sites,
                     }
                 }
-                KeyCode::BackTab => {
+                Some(UiAction::ModalPreviousField) => {
                     field = match field {
                         WikiSetupField::Sites => WikiSetupField::Cadence,
                         WikiSetupField::Destination => WikiSetupField::Sites,
-                        WikiSetupField::Cadence => WikiSetupField::Destination,
+                        WikiSetupField::MediaSource => WikiSetupField::Destination,
+                        WikiSetupField::Cadence => WikiSetupField::MediaSource,
                     }
                 }
-                KeyCode::Up if field == WikiSetupField::Sites => {
+                Some(UiAction::ModalUp) if field == WikiSetupField::Sites => {
                     site_cursor = site_cursor.saturating_sub(1)
                 }
-                KeyCode::Down if field == WikiSetupField::Sites => {
+                Some(UiAction::ModalDown) if field == WikiSetupField::Sites => {
                     site_cursor = (site_cursor + 1)
                         .min(filtered_wiki_sites(&site_filter).len().saturating_sub(1))
                 }
-                KeyCode::PageUp if field == WikiSetupField::Sites => {
+                Some(UiAction::ModalPageUp) if field == WikiSetupField::Sites => {
                     site_cursor = site_cursor.saturating_sub(9)
                 }
-                KeyCode::PageDown if field == WikiSetupField::Sites => {
+                Some(UiAction::ModalPageDown) if field == WikiSetupField::Sites => {
                     site_cursor = (site_cursor + 9)
                         .min(filtered_wiki_sites(&site_filter).len().saturating_sub(1))
                 }
-                KeyCode::Home if field == WikiSetupField::Sites => {
+                Some(UiAction::ModalHome) if field == WikiSetupField::Sites => {
                     site_cursor = 0;
                 }
-                KeyCode::End if field == WikiSetupField::Sites => {
+                Some(UiAction::ModalEnd) if field == WikiSetupField::Sites => {
                     site_cursor = filtered_wiki_sites(&site_filter).len().saturating_sub(1);
                 }
-                KeyCode::Char(' ') if field == WikiSetupField::Sites => {
+                Some(UiAction::ModalText)
+                    if code == KeyCode::Char(' ') && field == WikiSetupField::Sites =>
+                {
                     if let Some(site) = filtered_wiki_sites(&site_filter).get(site_cursor) {
                         let dbname = site.dbname.to_string();
                         if !selected.remove(&dbname) {
@@ -18427,27 +20143,39 @@ fn handle_modal_key(
                         }
                     }
                 }
-                KeyCode::Backspace if field == WikiSetupField::Sites => {
+                Some(UiAction::ModalBackspace) if field == WikiSetupField::Sites => {
                     site_filter.pop();
                     site_cursor = 0;
                 }
-                KeyCode::Char(character)
+                Some(UiAction::ModalText)
                     if field == WikiSetupField::Sites
-                        && !character.is_control() =>
+                        && matches!(code, KeyCode::Char(character) if !character.is_control()) =>
                 {
+                    let KeyCode::Char(character) = code else { unreachable!() };
                     site_filter.push(character.to_ascii_lowercase());
                     site_cursor = 0;
                 }
-                KeyCode::Backspace if field == WikiSetupField::Destination => {
+                Some(UiAction::ModalBackspace) if field == WikiSetupField::Destination => {
                     destination.pop();
                 }
-                KeyCode::Char(character) if field == WikiSetupField::Destination => {
+                Some(UiAction::ModalText) if field == WikiSetupField::Destination => {
+                    let KeyCode::Char(character) = code else { unreachable!() };
                     destination.push(character);
                 }
-                KeyCode::Left if field == WikiSetupField::Cadence => {
+                Some(UiAction::ModalText) if field == WikiSetupField::MediaSource
+                    && code == KeyCode::Char(' ') =>
+                {
+                    media_enabled = !media_enabled;
+                }
+                Some(UiAction::ModalLeft) if field == WikiSetupField::Cadence => {
                     cadence = cadence.saturating_sub(1);
                 }
-                KeyCode::Right | KeyCode::Char(' ') if field == WikiSetupField::Cadence => {
+                Some(UiAction::ModalRight)
+                    | Some(UiAction::ModalText)
+                    if (matches!(modal_action, Some(UiAction::ModalRight))
+                        || code == KeyCode::Char(' '))
+                        && field == WikiSetupField::Cadence =>
+                {
                     cadence = (cadence + 1) % WIKI_CADENCES.len();
                 }
                 _ => {}
@@ -18457,32 +20185,37 @@ fn handle_modal_key(
                 site_cursor,
                 site_filter,
                 destination,
+                media_enabled,
                 cadence,
                 field,
             });
         }
-        Modal::WikiMirrorLibrary { mut path } => match code {
-            KeyCode::Enter => app.commit_wiki_mirror_library(path),
-            KeyCode::Esc => app.status = "Wikipedia library attachment cancelled".into(),
-            KeyCode::Backspace => {
+        Modal::WikiMirrorLibrary { mut path } => match modal_action {
+            Some(UiAction::ModalAccept) => app.commit_wiki_mirror_library(path),
+            Some(UiAction::ModalCancel) => app.status = "Wikipedia library attachment cancelled".into(),
+            Some(UiAction::ModalBackspace) => {
                 path.pop();
                 app.modal = Some(Modal::WikiMirrorLibrary { path });
             }
-            KeyCode::Char(character) => {
-                path.push(character);
+            Some(UiAction::ModalText) => {
+                if let KeyCode::Char(character) = code {
+                    path.push(character);
+                }
                 app.modal = Some(Modal::WikiMirrorLibrary { path });
             }
             _ => app.modal = Some(Modal::WikiMirrorLibrary { path }),
         },
-        Modal::EditorOpen { mut buf } => match code {
-            KeyCode::Enter => app.editor_open_spec(&buf),
-            KeyCode::Esc => app.status = "editor open cancelled".into(),
-            KeyCode::Backspace => {
+        Modal::EditorOpen { mut buf } => match modal_action {
+            Some(UiAction::ModalAccept) => app.editor_open_spec(&buf),
+            Some(UiAction::ModalCancel) => app.status = "editor open cancelled".into(),
+            Some(UiAction::ModalBackspace) => {
                 buf.pop();
                 app.modal = Some(Modal::EditorOpen { buf });
             }
-            KeyCode::Char(c) => {
-                buf.push(c);
+            Some(UiAction::ModalText) => {
+                if let KeyCode::Char(c) = code {
+                    buf.push(c);
+                }
                 app.modal = Some(Modal::EditorOpen { buf });
             }
             _ => app.modal = Some(Modal::EditorOpen { buf }),
@@ -18491,28 +20224,28 @@ fn handle_modal_key(
             title,
             items,
             mut sel,
-        } => match code {
-            KeyCode::Esc => app.status = "menu cancelled".into(),
-            KeyCode::Up => {
+        } => match modal_action {
+            Some(UiAction::ModalCancel) => app.status = "menu cancelled".into(),
+            Some(UiAction::ModalUp) => {
                 if sel > 0 {
                     sel -= 1;
                 }
                 app.modal = Some(Modal::ActionMenu { title, items, sel });
             }
-            KeyCode::Down => {
+            Some(UiAction::ModalDown) => {
                 if sel + 1 < items.len() {
                     sel += 1;
                 }
                 app.modal = Some(Modal::ActionMenu { title, items, sel });
             }
-            KeyCode::Home => {
+            Some(UiAction::ModalHome) => {
                 app.modal = Some(Modal::ActionMenu {
                     title,
                     items,
                     sel: 0,
                 })
             }
-            KeyCode::End => {
+            Some(UiAction::ModalEnd) => {
                 let last = items.len().saturating_sub(1);
                 app.modal = Some(Modal::ActionMenu {
                     title,
@@ -18520,7 +20253,7 @@ fn handle_modal_key(
                     sel: last,
                 });
             }
-            KeyCode::Enter => {
+            Some(UiAction::ModalAccept) => {
                 if let Some(it) = items.get(sel) {
                     let act = it.action;
                     run_action(app, act);
@@ -18530,51 +20263,54 @@ fn handle_modal_key(
             }
             _ => app.modal = Some(Modal::ActionMenu { title, items, sel }),
         },
-        Modal::Launcher { items, mut sel } => match code {
-            KeyCode::Esc => app.status = "launcher cancelled".into(),
-            KeyCode::Up => {
+        Modal::Launcher { items, mut sel } => {
+            let modal_action = modal_action_for(BindingContext::ModalLauncher, code, mods);
+            match modal_action {
+            Some(UiAction::ModalCancel) => app.status = "launcher cancelled".into(),
+            Some(UiAction::ModalUp) => {
                 if sel > 0 {
                     sel -= 1;
                 }
                 app.modal = Some(Modal::Launcher { items, sel });
             }
-            KeyCode::Down => {
+            Some(UiAction::ModalDown) => {
                 if sel + 1 < items.len() {
                     sel += 1;
                 }
                 app.modal = Some(Modal::Launcher { items, sel });
             }
-            KeyCode::Home => app.modal = Some(Modal::Launcher { items, sel: 0 }),
-            KeyCode::End => {
+            Some(UiAction::ModalHome) => app.modal = Some(Modal::Launcher { items, sel: 0 }),
+            Some(UiAction::ModalEnd) => {
                 let last = items.len().saturating_sub(1);
                 app.modal = Some(Modal::Launcher { items, sel: last });
             }
             // The visible option chips: cycle in place, stay in the modal —
             // no abort/retype to change a launch flag.
-            KeyCode::Char('n') | KeyCode::Char('N') => {
+            Some(UiAction::ModalNetwork) => {
                 app.launch_net = (app.launch_net + 1) % NET_MODES.len();
                 app.modal = Some(Modal::Launcher { items, sel });
             }
-            KeyCode::Char('e') | KeyCode::Char('E') => {
+            Some(UiAction::ModalEnv) => {
                 app.launch_env = !app.launch_env;
                 app.modal = Some(Modal::Launcher { items, sel });
             }
-            KeyCode::Enter => {
+            Some(UiAction::ModalAccept) => {
                 if let Some(it) = items.get(sel) {
                     let act = it.action;
                     run_action(app, act);
                 }
             }
             _ => app.modal = Some(Modal::Launcher { items, sel }),
+            }
         },
         Modal::FileGroupPick {
             discard,
             sid,
             rows,
             mut sel,
-        } => match code {
-            KeyCode::Esc => app.status = "cancelled".into(),
-            KeyCode::Up => {
+        } => match modal_action {
+            Some(UiAction::ModalCancel) => app.status = "cancelled".into(),
+            Some(UiAction::ModalUp) => {
                 if sel > 0 {
                     sel -= 1;
                 }
@@ -18585,7 +20321,7 @@ fn handle_modal_key(
                     sel,
                 });
             }
-            KeyCode::Down => {
+            Some(UiAction::ModalDown) => {
                 if sel + 1 < rows.len() {
                     sel += 1;
                 }
@@ -18596,7 +20332,7 @@ fn handle_modal_key(
                     sel,
                 });
             }
-            KeyCode::Home => {
+            Some(UiAction::ModalHome) => {
                 app.modal = Some(Modal::FileGroupPick {
                     discard,
                     sid,
@@ -18604,7 +20340,7 @@ fn handle_modal_key(
                     sel: 0,
                 })
             }
-            KeyCode::End => {
+            Some(UiAction::ModalEnd) => {
                 let last = rows.len().saturating_sub(1);
                 app.modal = Some(Modal::FileGroupPick {
                     discard,
@@ -18613,7 +20349,7 @@ fn handle_modal_key(
                     sel: last,
                 });
             }
-            KeyCode::Enter => {
+            Some(UiAction::ModalAccept) => {
                 if let Some((label, paths)) = rows.get(sel) {
                     app.run_file_group(discard, &sid, label, paths.clone());
                 }
@@ -18630,9 +20366,9 @@ fn handle_modal_key(
         Modal::ImagePicker {
             mut crumbs,
             mut stack,
-        } => match code {
-            KeyCode::Esc => app.status = "image picker cancelled".into(),
-            KeyCode::Up => {
+        } => match modal_action {
+            Some(UiAction::ModalCancel) => app.status = "image picker cancelled".into(),
+            Some(UiAction::ModalUp) => {
                 if let Some(l) = stack.last_mut() {
                     if l.sel > 0 {
                         l.sel -= 1;
@@ -18640,7 +20376,7 @@ fn handle_modal_key(
                 }
                 app.modal = Some(Modal::ImagePicker { crumbs, stack });
             }
-            KeyCode::Down => {
+            Some(UiAction::ModalDown) => {
                 if let Some(l) = stack.last_mut() {
                     if l.sel + 1 < l.items.len() {
                         l.sel += 1;
@@ -18648,19 +20384,19 @@ fn handle_modal_key(
                 }
                 app.modal = Some(Modal::ImagePicker { crumbs, stack });
             }
-            KeyCode::Home => {
+            Some(UiAction::ModalHome) => {
                 if let Some(l) = stack.last_mut() {
                     l.sel = 0;
                 }
                 app.modal = Some(Modal::ImagePicker { crumbs, stack });
             }
-            KeyCode::End => {
+            Some(UiAction::ModalEnd) => {
                 if let Some(l) = stack.last_mut() {
                     l.sel = l.items.len().saturating_sub(1);
                 }
                 app.modal = Some(Modal::ImagePicker { crumbs, stack });
             }
-            KeyCode::Backspace | KeyCode::Left => {
+            Some(UiAction::ModalBackspace) | Some(UiAction::ModalLeft) => {
                 // Pop one level; from the top level, close.
                 if stack.len() > 1 {
                     stack.pop();
@@ -18670,7 +20406,7 @@ fn handle_modal_key(
                     app.status = "image picker cancelled".into();
                 }
             }
-            KeyCode::Enter | KeyCode::Right => {
+            Some(UiAction::ModalAccept) | Some(UiAction::ModalRight) => {
                 let cur = stack.last().and_then(|l| l.items.get(l.sel)).cloned();
                 match cur.map(|it| (it.label, it.next)) {
                     Some((label, PickNext::Menu(items))) => {
@@ -18695,8 +20431,8 @@ fn handle_modal_key(
             }
             _ => app.modal = Some(Modal::ImagePicker { crumbs, stack }),
         },
-        Modal::ImageRef { mut buf } => match code {
-            KeyCode::Enter => {
+        Modal::ImageRef { mut buf } => match modal_action {
+            Some(UiAction::ModalAccept) => {
                 let rf = buf.trim().to_string();
                 if rf.is_empty() {
                     app.status = "image reference cancelled".into();
@@ -18704,13 +20440,15 @@ fn handle_modal_key(
                     app.start_image_load(rf);
                 }
             }
-            KeyCode::Esc => app.status = "image reference cancelled".into(),
-            KeyCode::Backspace => {
+            Some(UiAction::ModalCancel) => app.status = "image reference cancelled".into(),
+            Some(UiAction::ModalBackspace) => {
                 buf.pop();
                 app.modal = Some(Modal::ImageRef { buf });
             }
-            KeyCode::Char(c) => {
-                buf.push(c);
+            Some(UiAction::ModalText) => {
+                if let KeyCode::Char(c) = code {
+                    buf.push(c);
+                }
                 app.modal = Some(Modal::ImageRef { buf });
             }
             _ => app.modal = Some(Modal::ImageRef { buf }),
@@ -18719,8 +20457,8 @@ fn handle_modal_key(
             box_name,
             session,
             mut buf,
-        } => match code {
-            KeyCode::Enter => {
+        } => match modal_action {
+            Some(UiAction::ModalAccept) => {
                 let task = buf.trim().to_string();
                 if task.is_empty() {
                     // Don't launch an empty agent session — say what's needed
@@ -18736,8 +20474,8 @@ fn handle_modal_key(
                     app.open_pty(build_launch(&LaunchTarget::Ai { task }, &how));
                 }
             }
-            KeyCode::Esc => app.status = "agent session cancelled".into(),
-            KeyCode::Backspace => {
+            Some(UiAction::ModalCancel) => app.status = "agent session cancelled".into(),
+            Some(UiAction::ModalBackspace) => {
                 buf.pop();
                 app.modal = Some(Modal::OaitaTask {
                     box_name,
@@ -18745,8 +20483,10 @@ fn handle_modal_key(
                     buf,
                 });
             }
-            KeyCode::Char(c) => {
-                buf.push(c);
+            Some(UiAction::ModalText) => {
+                if let KeyCode::Char(c) = code {
+                    buf.push(c);
+                }
                 app.modal = Some(Modal::OaitaTask {
                     box_name,
                     session,
@@ -18769,8 +20509,8 @@ fn handle_modal_key(
         } => {
             // While the catalog is still loading, only Esc does anything.
             if loading {
-                match code {
-                    KeyCode::Esc => app.status = "model picker cancelled".into(),
+                match modal_action {
+                    Some(UiAction::ModalCancel) => app.status = "model picker cancelled".into(),
                     _ => {
                         app.modal = Some(Modal::ModelPicker {
                             models,
@@ -18784,9 +20524,9 @@ fn handle_modal_key(
             }
             // Rows are the models plus one trailing "custom URL…" row.
             let n_rows = models.len() + 1;
-            match code {
-                KeyCode::Esc => app.status = "model picker cancelled".into(),
-                KeyCode::Up => {
+            match modal_action {
+                Some(UiAction::ModalCancel) => app.status = "model picker cancelled".into(),
+                Some(UiAction::ModalUp) => {
                     sel = sel.saturating_sub(1);
                     app.modal = Some(Modal::ModelPicker {
                         models,
@@ -18795,7 +20535,7 @@ fn handle_modal_key(
                         loading,
                     });
                 }
-                KeyCode::Down => {
+                Some(UiAction::ModalDown) => {
                     if sel + 1 < n_rows {
                         sel += 1;
                     }
@@ -18806,7 +20546,7 @@ fn handle_modal_key(
                         loading,
                     });
                 }
-                KeyCode::Home => {
+                Some(UiAction::ModalHome) => {
                     app.modal = Some(Modal::ModelPicker {
                         models,
                         source,
@@ -18814,7 +20554,7 @@ fn handle_modal_key(
                         loading,
                     })
                 }
-                KeyCode::End => {
+                Some(UiAction::ModalEnd) => {
                     let last = n_rows.saturating_sub(1);
                     app.modal = Some(Modal::ModelPicker {
                         models,
@@ -18823,7 +20563,7 @@ fn handle_modal_key(
                         loading,
                     });
                 }
-                KeyCode::Enter => {
+                Some(UiAction::ModalAccept) => {
                     if sel < models.len() {
                         // Boxed download of the chosen model, then serve on
                         // demand — the same flow F4 kicks, with a URL.
@@ -18850,8 +20590,8 @@ fn handle_modal_key(
                 }
             }
         }
-        Modal::ModelUrl { mut buf } => match code {
-            KeyCode::Enter => {
+        Modal::ModelUrl { mut buf } => match modal_action {
+            Some(UiAction::ModalAccept) => {
                 let url = buf.trim().to_string();
                 if url.is_empty() {
                     app.status = "model URL cancelled".into();
@@ -18865,13 +20605,15 @@ fn handle_modal_key(
                     ]);
                 }
             }
-            KeyCode::Esc => app.status = "model URL cancelled".into(),
-            KeyCode::Backspace => {
+            Some(UiAction::ModalCancel) => app.status = "model URL cancelled".into(),
+            Some(UiAction::ModalBackspace) => {
                 buf.pop();
                 app.modal = Some(Modal::ModelUrl { buf });
             }
-            KeyCode::Char(c) => {
-                buf.push(c);
+            Some(UiAction::ModalText) => {
+                if let KeyCode::Char(c) = code {
+                    buf.push(c);
+                }
                 app.modal = Some(Modal::ModelUrl { buf });
             }
             _ => app.modal = Some(Modal::ModelUrl { buf }),
@@ -18884,7 +20626,7 @@ fn handle_modal_key(
             mut result,
             mut testing,
         } => {
-            let ctrl = mods.contains(KeyModifiers::CONTROL);
+            let modal_action = modal_action_for(BindingContext::ModalApiConfig, code, mods);
             // Field order matches the render: 0 model · 1 base_url · 2 api_key.
             let reopen = |app: &mut App, base_url, model, api_key, field, result, testing| {
                 app.modal = Some(Modal::ApiConfig {
@@ -18896,37 +20638,31 @@ fn handle_modal_key(
                     testing,
                 });
             };
-            match code {
-                KeyCode::Esc => app.status = "api config cancelled".into(),
-                KeyCode::Tab | KeyCode::Down => {
+            match modal_action {
+                Some(UiAction::ModalCancel) => app.status = "api config cancelled".into(),
+                Some(UiAction::ModalNextField) | Some(UiAction::ModalDown) => {
                     field = (field + 1) % 3;
                     reopen(app, base_url, model, api_key, field, result, testing);
                 }
-                KeyCode::BackTab | KeyCode::Up => {
+                Some(UiAction::ModalPreviousField) | Some(UiAction::ModalUp) => {
                     field = (field + 2) % 3;
                     reopen(app, base_url, model, api_key, field, result, testing);
                 }
                 // Ctrl-T: fire the connection test with the current values.
-                KeyCode::Char('t') if ctrl => {
+                Some(UiAction::ModalTest) => {
                     testing = true;
                     result = String::new();
                     app.start_api_probe(base_url.clone(), model.clone(), api_key.clone());
                     reopen(app, base_url, model, api_key, field, result, testing);
                 }
                 // Ctrl-S or Enter: persist to oaita.toml.
-                KeyCode::Char('s') if ctrl => {
+                Some(UiAction::ModalAccept) => {
                     app.status = app.save_api_config(&base_url, &model, &api_key);
                     if app.status.starts_with("model is required") {
                         reopen(app, base_url, model, api_key, field, result, testing);
                     }
                 }
-                KeyCode::Enter => {
-                    app.status = app.save_api_config(&base_url, &model, &api_key);
-                    if app.status.starts_with("model is required") {
-                        reopen(app, base_url, model, api_key, field, result, testing);
-                    }
-                }
-                KeyCode::Backspace => {
+                Some(UiAction::ModalBackspace) => {
                     match field {
                         0 => &mut model,
                         1 => &mut base_url,
@@ -18935,7 +20671,11 @@ fn handle_modal_key(
                     .pop();
                     reopen(app, base_url, model, api_key, field, result, testing);
                 }
-                KeyCode::Char(c) => {
+                Some(UiAction::ModalText) => {
+                    let KeyCode::Char(c) = code else {
+                        reopen(app, base_url, model, api_key, field, result, testing);
+                        return;
+                    };
                     match field {
                         0 => &mut model,
                         1 => &mut base_url,
@@ -18951,9 +20691,9 @@ fn handle_modal_key(
             mut buf,
             mut completions,
             mut sel,
-        } => match code {
-            KeyCode::Esc => app.status = "command cancelled".into(),
-            KeyCode::Enter => {
+        } => match modal_action {
+            Some(UiAction::ModalCancel) => app.status = "command cancelled".into(),
+            Some(UiAction::ModalAccept) => {
                 let input = buf.trim().to_string();
                 if input.is_empty() {
                     app.status = "command: empty input".into();
@@ -18961,7 +20701,7 @@ fn handle_modal_key(
                     app.dispatch_command(&input);
                 }
             }
-            KeyCode::Tab => {
+            Some(UiAction::ModalNextField) => {
                 if !completions.is_empty() {
                     buf = crate::parser::apply_completion(&buf, &completions[sel]);
                     completions = command_completions(app, &buf, buf.len());
@@ -18977,7 +20717,7 @@ fn handle_modal_key(
                     });
                 }
             }
-            KeyCode::Down => {
+            Some(UiAction::ModalDown) => {
                 if !completions.is_empty() {
                     sel = (sel + 1) % completions.len();
                     app.modal = Some(Modal::Command {
@@ -18987,7 +20727,7 @@ fn handle_modal_key(
                     });
                 }
             }
-            KeyCode::Up => {
+            Some(UiAction::ModalUp) => {
                 if !completions.is_empty() {
                     sel = if sel == 0 {
                         completions.len() - 1
@@ -19001,7 +20741,7 @@ fn handle_modal_key(
                     });
                 }
             }
-            KeyCode::Backspace => {
+            Some(UiAction::ModalBackspace) => {
                 buf.pop();
                 completions = command_completions(app, &buf, buf.len());
                 sel = 0;
@@ -19011,7 +20751,15 @@ fn handle_modal_key(
                     sel,
                 });
             }
-            KeyCode::Char(c) => {
+            Some(UiAction::ModalText) => {
+                let KeyCode::Char(c) = code else {
+                    app.modal = Some(Modal::Command {
+                        buf,
+                        completions,
+                        sel,
+                    });
+                    return;
+                };
                 buf.push(c);
                 completions = command_completions(app, &buf, buf.len());
                 sel = 0;
@@ -19103,21 +20851,24 @@ fn run_interactive(sock: &str) -> Result<(), String> {
             if app.structd.pending && app.structd.full_lines.is_none() {
                 app.structd.spin = app.structd.spin.wrapping_add(1);
             }
-            // Mirrors is the one pane that polls: a job's state is derived
-            // from wall time (pending flips as intervals elapse) and runs
-            // are started by the engine's scheduler, so there is no push
-            // event to react to. Throttled to ~2s while focused.
-            if app.focus == Pane::Mirrors
+            // Mirror jobs are derived from the engine's live process table and
+            // build receipts, rather than pushed as events.  Refresh while the
+            // pane is visible and while a run is known to be active.  The
+            // latter matters when the user switches to another pane: on
+            // returning, the progress must not be minutes old.
+            let mirror_is_live = app
+                .mirror_jobs
+                .iter()
+                .any(|job| matches!(job.state.as_str(), "running" | "stopping"));
+            if (app.focus == Pane::Mirrors || mirror_is_live)
                 && app
                     .mirrors_loaded_at
                     .is_none_or(|t| t.elapsed() >= Duration::from_secs(2))
             {
                 app.load_mirrors();
             }
-            // No periodic refresh — the engine pushes overlay /
-            // process_added / session_* events on the subscribe stream
-            // (see on_event), so the UI reacts to actual change instead
-            // of polling.
+            // Other panes remain event-driven; mirror progress is the
+            // deliberate exception above because build receipts are polled.
             term.draw(|f| draw(f, &app)).map_err(|e| e.to_string())?;
             // Blit a sixel image over the viewer popover interior (DESIGN-web.md
             // W8). Pixels can't live in ratatui's cell buffer, so we position
@@ -19230,28 +20981,28 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                 // entering nav mode, so this is purely additive.
                 if app.menu_nav {
                     let chips = menubar_chips(&app);
-                    match k.code {
-                        KeyCode::Esc => {
+                    match ui_action_for(BindingContext::Menu, k.code, k.modifiers) {
+                        Some(UiAction::MenuCancel) => {
                             app.menu_nav = false;
                             app.status = "menu cancelled".into();
                         }
-                        KeyCode::Left => {
+                        Some(UiAction::MenuLeft) => {
                             if !chips.is_empty() {
                                 app.menu_sel = (app.menu_sel + chips.len() - 1) % chips.len();
                             }
                         }
-                        KeyCode::Right => {
+                        Some(UiAction::MenuRight) => {
                             if !chips.is_empty() {
                                 app.menu_sel = (app.menu_sel + 1) % chips.len();
                             }
                         }
-                        KeyCode::Home => app.menu_sel = 0,
-                        KeyCode::End => {
+                        Some(UiAction::MenuHome) => app.menu_sel = 0,
+                        Some(UiAction::MenuEnd) => {
                             if !chips.is_empty() {
                                 app.menu_sel = chips.len() - 1;
                             }
                         }
-                        KeyCode::Enter => {
+                        Some(UiAction::MenuOpen) => {
                             // Exit nav, then synthesize the accelerator
                             // letter to dispatch via the existing chip
                             // handler (which already does snap_left and
@@ -19268,7 +21019,8 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                                 let _ = letter_event;
                             }
                         }
-                        KeyCode::Char(c) => {
+                        Some(UiAction::MenuText) => {
+                            let KeyCode::Char(c) = k.code else { continue };
                             // Typing the letter accelerator while in
                             // nav mode also activates (so F9 then 'p'
                             // works the same as just 'p'). Anything
@@ -19288,16 +21040,20 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                 }
                 // rename input mode captures keys
                 if let Some(buf) = app.renaming.as_mut() {
-                    match k.code {
-                        KeyCode::Enter => app.commit_rename(),
-                        KeyCode::Esc => {
+                    match ui_action_for(BindingContext::Rename, k.code, k.modifiers) {
+                        Some(UiAction::RenameCommit) => app.commit_rename(),
+                        Some(UiAction::RenameCancel) => {
                             app.renaming = None;
                             app.status = "rename cancelled".into();
                         }
-                        KeyCode::Backspace => {
+                        Some(UiAction::RenameBackspace) => {
                             buf.pop();
                         }
-                        KeyCode::Char(c) => buf.push(c),
+                        Some(UiAction::RenameText) => {
+                            if let KeyCode::Char(c) = k.code {
+                                buf.push(c)
+                            }
+                        }
                         _ => {}
                     }
                     continue;
@@ -19317,92 +21073,23 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                     || (app.pty_in_right && app.right_focused && !app.ptys.is_empty());
                 if pty_input_active {
                     use crossterm::event::KeyModifiers;
+                    if let Some(action) = global_action_for(&app, true, k.code, k.modifiers) {
+                        run_global_action(&mut app, action, true);
+                        continue;
+                    }
                     // EOF: child is dead. Any key detaches (no point typing
                     // into a corpse — that's how the user got stuck last time).
                     let dead = app.cur_pty().map(|p| p.eof).unwrap_or(true);
-                    // F-key bindings local to the PTY pane (the F-keybar
-                    // shows the same set in its bottom strip — F1 help,
-                    // F2/F3 screen cycle, F4/F5 next/prev PTY of this
-                    // screen's kind, F7 new, F8 kill, F9 actions, F12
-                    // detach. Norton-style: stable mapping, the labels in
-                    // the bar tell you what each does here).
-                    if matches!(k.code, KeyCode::F(2)) {
-                        app.cycle_screen(1);
-                        continue;
-                    }
-                    if matches!(k.code, KeyCode::F(3)) {
-                        app.cycle_screen(-1);
-                        continue;
-                    }
-                    if matches!(k.code, KeyCode::F(4)) {
-                        app.cycle_window(1);
-                        continue;
-                    }
-                    if matches!(k.code, KeyCode::F(5)) {
-                        app.cycle_window(-1);
-                        continue;
-                    }
-                    if matches!(k.code, KeyCode::F(9)) {
-                        // Context-menu popup inside the PTY pane (PTY-
-                        // specific actions: new, kill, embed). Same
-                        // entrypoint as 'm' in any other pane.
-                        if let Some((title, items)) = pane_action_menu(&app) {
-                            app.modal = Some(Modal::ActionMenu {
-                                title,
-                                items,
-                                sel: 0,
-                            });
-                        }
-                        continue;
-                    }
-                    if matches!(k.code, KeyCode::F(7)) {
-                        open_pty_menu(&mut app);
-                        continue;
-                    }
-                    if matches!(k.code, KeyCode::F(8)) {
-                        app.pty_kill();
-                        continue;
-                    }
-                    if matches!(k.code, KeyCode::F(6)) {
-                        // Toggle the mouse between the child (carbonyl/vim get
-                        // clicks + scroll) and the outer terminal (native
-                        // drag-select + copy). The want_mouse block above
-                        // reconciles the actual capture state next iteration.
-                        app.mouse_release = !app.mouse_release;
-                        app.status = if app.mouse_release {
-                            "mouse released to the terminal — drag to select/copy \
-                             · F6 to hand it back to the app"
-                                .into()
-                        } else {
-                            "mouse grabbed by the app — clicks/scroll go to the \
-                             page · F6 to release for selection"
-                                .into()
-                        };
-                        continue;
-                    }
-                    if matches!(k.code, KeyCode::F(11)) {
-                        // F11 from full-screen PTY: shrink the PTY into
-                        // the Sessions view's right column (default
-                        // landing for the embed mode). The user can then
-                        // F11 again to pop back to full-screen.
-                        app.focus = Pane::Sessions;
-                        app.pty_in_right = true;
-                        app.right_focused = true;
-                        app.right_scroll = 0;
-                        continue;
-                    }
-                    if matches!(k.code, KeyCode::F(1)) {
-                        app.snap_left();
-                        app.focus = Pane::Help;
-                        app.out_scroll = 0;
-                        continue;
-                    }
+                    // Function keys are dispatched from the registry above.
                     // Detach via Ctrl-]/F12/Esc-Esc. Crossterm collapses
                     // raw 0x1c..0x1f into Char('4')..Char('7') with
                     // CONTROL set (parse.rs L110); we accept named char,
                     // collapsed digit, and raw GS byte.
-                    let ctrl_bracket = k.modifiers.contains(KeyModifiers::CONTROL)
-                        && matches!(k.code, KeyCode::Char(']') | KeyCode::Char('5'));
+                    let ctrl_bracket = matches!(
+                        ui_action_for(BindingContext::Pty, k.code, k.modifiers),
+                        Some(UiAction::PtyDetach)
+                    ) || (k.modifiers.contains(KeyModifiers::CONTROL)
+                        && matches!(k.code, KeyCode::Char('5')));
                     let raw_gs = matches!(k.code, KeyCode::Char('\u{1d}'));
                     let f12 = matches!(k.code, KeyCode::F(12));
                     let now = std::time::Instant::now();
@@ -19431,18 +21118,7 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                         //     list view they were on, with the PTY still
                         //     running in the right pane (the next Tab
                         //     reattaches it).
-                        app.pty_esc_at = None;
-                        if app.focus == Pane::Pty {
-                            app.focus = Pane::Sessions;
-                        } else {
-                            // Embedded mode: leave focus, just unfocus.
-                            app.right_focused = false;
-                        }
-                        app.status = format!(
-                            "PTY {}/{} detached (still running · Tab/P re-attach)",
-                            app.sel_pty + 1,
-                            app.ptys.len()
-                        );
+                        detach_pty(&mut app);
                     } else if matches!(k.code, KeyCode::Esc) {
                         // Arm the Esc-Esc chord; lone Esc still reaches
                         // the shell via the flush path below.
@@ -19463,126 +21139,11 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                     }
                     continue;
                 }
-                use crossterm::event::KeyModifiers as KM;
-                let ctrl = k.modifiers.contains(KM::CONTROL);
-                // Function-key bindings, global outside the PTY pane.
-                // (PTY pane handles its own F2..F5/F7/F8/F9/F12 before
-                // we get here.) Mapping mirrors the unified context bar:
-                //   F1  Help · F2/F3 cycle SCREENS (main two-pane view /
-                //   terminal / browser) · F4/F5 cycle the WINDOWS within
-                //   the current screen (the data panes here on Main)
-                //   · F6 rename (boxes) · F7 new rule (Rules) / new image
-                //   box (Boxes) / new PTY elsewhere
-                //   · F8 discard (Changes/Hunks) / del rule (Rules)
-                //   · F9 menu-nav               · F10 quit
-                if let KeyCode::F(n) = k.code {
-                    match n {
-                        1 => {
-                            app.snap_left();
-                            app.focus = Pane::Help;
-                            app.out_scroll = 0;
-                        }
-                        2 => {
-                            app.cycle_screen(1);
-                        }
-                        3 => {
-                            app.cycle_screen(-1);
-                        }
-                        11 => {
-                            // Embed the active PTY into the focused view's
-                            // RIGHT column (or un-embed). With no PTY there
-                            // is nothing to split — point at F7 instead of
-                            // duplicating it (the fkeybar dims F11 too).
-                            if app.ptys.is_empty() {
-                                app.status = "no PTY to split — F7 opens one".into();
-                            } else {
-                                app.pty_in_right = !app.pty_in_right;
-                                // Right-focus follows the embedded PTY so
-                                // keystrokes land there immediately.
-                                app.right_focused = app.pty_in_right;
-                                app.right_scroll = 0;
-                            }
-                        }
-                        4 => {
-                            app.cycle_window(1);
-                        }
-                        5 => {
-                            app.cycle_window(-1);
-                        }
-                        6 => {
-                            if app.focus == Pane::Reader {
-                                app.mouse_release = !app.mouse_release;
-                                app.status = if app.mouse_release {
-                                    "reader mouse released — drag to select/copy · F6 to restore link navigation"
-                                        .into()
-                                } else {
-                                    "reader mouse active — click links, wheel scroll · F6 releases selection"
-                                        .into()
-                                };
-                            } else if app.focus == Pane::Sessions {
-                                app.renaming = Some(String::new());
-                            }
-                        }
-                        7 => {
-                            if app.focus == Pane::Rules {
-                                app.modal = Some(Modal::RuleForm {
-                                    buf: String::new(),
-                                    editing: None,
-                                });
-                            } else if app.focus == Pane::Sessions {
-                                // "Image+" — new box from a container image.
-                                app.open_image_picker();
-                            } else {
-                                // Everywhere else: the Pty+ launcher (the
-                                // old F2 binding — F2 now cycles screens).
-                                open_pty_menu(&mut app);
-                            }
-                        }
-                        8 => {
-                            if app.focus == Pane::Hunks {
-                                app.discard_hunk();
-                            } else if app.focus == Pane::Changes {
-                                app.discard();
-                            } else if app.focus == Pane::Rules {
-                                app.delete_rule();
-                            } else if app.focus == Pane::Sessions {
-                                // Box "Delete" = dissolve (changes promoted
-                                // down, keep children); Confirm-guarded.
-                                app.modal = Some(Modal::Confirm {
-                                    prompt: format!(
-                                        "Delete {}? Its changes \
-                                        are promoted down into child boxes \
-                                        (never to the host); children are \
-                                        kept and re-parented.",
-                                        app.box_op_scope_label()
-                                    ),
-                                    action: ConfirmAction::Dissolve,
-                                });
-                            }
-                        }
-                        9 => {
-                            // F9 enters menu-nav mode: highlight a
-                            // menubar chip, ←/→ move, Enter picks,
-                            // Esc cancels. We land on the chip for
-                            // the currently-active view (or the
-                            // first chip if no chip maps).
-                            let chips = menubar_chips(&app);
-                            let active = view_of_pane(app.focus).map(|(k, _, _)| k);
-                            app.menu_sel = chips
-                                .iter()
-                                .position(|(k, _)| Some(*k) == active)
-                                .unwrap_or(0);
-                            app.menu_nav = true;
-                            app.status = "menu — ←/→ move · Enter pick · Esc cancel".into();
-                        }
-                        10 => {
-                            shutdown_rpc(&app.sock);
-                            app.should_quit = true;
-                        }
-                        _ => {}
-                    }
+                if let Some(action) = global_action_for(&app, false, k.code, k.modifiers) {
+                    run_global_action(&mut app, action, false);
                     continue;
                 }
+                // Function keys are dispatched from the registry above.
                 // Inspector screen: its own keymap — list motion, Enter
                 // drill, Backspace/Esc up, ':' locator prompt, 'R' reload.
                 // The F-keys (screens/windows) were handled above; the
@@ -19592,19 +21153,20 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                     // locator) captures typing first — it lives INSIDE the
                     // card, not in a popup.
                     if app.ins_input.is_some() {
-                        match k.code {
-                            KeyCode::Enter => app.ins_input_done(),
-                            KeyCode::Esc => {
+                        match ui_action_for(BindingContext::Modal, k.code, k.modifiers) {
+                            Some(UiAction::ModalAccept) => app.ins_input_done(),
+                            Some(UiAction::ModalCancel) => {
                                 app.ins_input = None;
                                 app.ins_pending = None;
                                 app.status = "inspect: input cancelled".into();
                             }
-                            KeyCode::Backspace => {
+                            Some(UiAction::ModalBackspace) => {
                                 if let Some((_, b)) = app.ins_input.as_mut() {
                                     b.pop();
                                 }
                             }
-                            KeyCode::Char(c) => {
+                            Some(UiAction::ModalText) => {
+                                let KeyCode::Char(c) = k.code else { continue };
                                 if let Some((_, b)) = app.ins_input.as_mut() {
                                     b.push(c);
                                 }
@@ -19613,31 +21175,35 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                         }
                         continue;
                     }
-                    match k.code {
-                        KeyCode::Down | KeyCode::Char('j') => app.ins_move(1),
-                        KeyCode::Up | KeyCode::Char('k') => app.ins_move(-1),
-                        KeyCode::PageDown => app.ins_move(PAGE_SIZE as isize),
-                        KeyCode::PageUp => app.ins_move(-(PAGE_SIZE as isize)),
-                        KeyCode::Home => app.ins_extreme(false),
-                        KeyCode::End => app.ins_extreme(true),
-                        KeyCode::Enter => app.ins_enter(),
-                        KeyCode::Left => app.ins_sibling(-1),
-                        KeyCode::Right => app.ins_sibling(1),
-                        KeyCode::Backspace | KeyCode::Esc => app.ins_pop(),
-                        KeyCode::Char(':') => app.ins_open_goto(),
-                        KeyCode::Char(d @ '1'..='9') => app.ins_hotspot((d as u8 - b'1') as usize),
-                        KeyCode::Char('R') => app.ins_reload(),
-                        KeyCode::Char('q') => {
+                    let inspect_action = ui_action_for(BindingContext::Inspect, k.code, k.modifiers);
+                    match inspect_action {
+                        Some(UiAction::InspectDown) => app.ins_move(1),
+                        Some(UiAction::InspectUp) => app.ins_move(-1),
+                        Some(UiAction::InspectPageDown) => app.ins_move(PAGE_SIZE as isize),
+                        Some(UiAction::InspectPageUp) => app.ins_move(-(PAGE_SIZE as isize)),
+                        Some(UiAction::InspectHome) => app.ins_extreme(false),
+                        Some(UiAction::InspectEnd) => app.ins_extreme(true),
+                        Some(UiAction::InspectOpen) => app.ins_enter(),
+                        Some(UiAction::InspectLeft) => app.ins_sibling(-1),
+                        Some(UiAction::InspectRight) => app.ins_sibling(1),
+                        Some(UiAction::InspectBack) => app.ins_pop(),
+                        Some(UiAction::InspectGoto) => app.ins_open_goto(),
+                        Some(UiAction::InspectHotspot(n)) => app.ins_hotspot(n as usize),
+                        Some(UiAction::InspectReload) => app.ins_reload(),
+                        Some(UiAction::InspectQuit) => {
                             shutdown_rpc(&app.sock);
                             app.should_quit = true;
                         }
                         // Menubar accelerators still switch panes from Inspect
                         // (Inspect has no per-row letter bindings of its own).
-                        // Derived from PANE_KEYS so 't' (Trace) is reachable.
-                        KeyCode::Char(c) if is_menubar_accel(c) => {
-                            dispatch_menubar_key(&mut app, c)
+                        // Derived from the pane-switch bindings so 't' (Trace) is reachable.
+                        _ => {
+                            if let KeyCode::Char(c) = k.code {
+                                if is_menubar_accel(c) {
+                                    dispatch_menubar_key(&mut app, c)
+                                }
+                            }
                         }
-                        _ => {}
                     }
                     continue;
                 }
@@ -19661,95 +21227,35 @@ fn run_interactive(sock: &str) -> Result<(), String> {
                 // rule / 'a' = apply / 'd' = detach). The banner only steals
                 // these four keys; the rest of the UI is fully usable.
                 if app.pending_prompt.is_some() {
-                    match k.code {
-                        KeyCode::Char('y') => {
+                    match ui_action_for(BindingContext::Prompt, k.code, k.modifiers) {
+                        Some(UiAction::PromptYes) => {
                             app.answer_prompt("yes_once");
                             continue;
                         }
-                        KeyCode::Char('n') => {
+                        Some(UiAction::PromptNo) => {
                             app.answer_prompt("no_once");
                             continue;
                         }
-                        KeyCode::Char('a') => {
+                        Some(UiAction::PromptAllow) => {
                             app.answer_prompt("allow_save");
                             continue;
                         }
-                        KeyCode::Char('d') => {
+                        Some(UiAction::PromptDeny) => {
                             app.answer_prompt("deny_save");
                             continue;
                         }
                         _ => {}
                     }
                 }
-                // The per-pane action keys are now a single table
-                // (`PANE_ACTION_KEYS` → `dispatch_pane_key`), the same
-                // keybindings-as-data shape as `PANE_KEYS`. A handful of keys
-                // carry context a flat table can't express and stay inline
-                // BEFORE the table lookup, so their precedence is preserved:
-                //   * ctrl+↑/↓ rule reorder (must beat the plain ↑/↓ move),
-                //   * arrow ↑/↓ and PageUp/PageDown motion (non-Char codes the
-                //     table doesn't model; ↑/↓ mirror k/j),
-                //   * the b/c/p/o/… pane accelerators, routed through
-                //     `dispatch_menubar_key` so they can't diverge from F9 nav,
-                //   * Esc/Backspace popping the packet drill-down, and plain Esc
-                //     clearing a generated (cross-nav) filter.
-                // Everything else (q, a/x/d, A/X, K/D/Z, n, r/R, /, m, Tab,
-                // Enter, j/k) flows through the table.
-                match k.code {
-                    // ctrl+up / ctrl+down reorder the selected file rule (before
-                    // the plain move arm, which also matches Up/Down).
-                    KeyCode::Up if ctrl && app.focus == Pane::Rules => app.move_rule(-1),
-                    KeyCode::Down if ctrl && app.focus == Pane::Rules => app.move_rule(1),
-                    KeyCode::Down => app.move_down(),
-                    KeyCode::Up => app.move_up(),
-                    // DAG sideways (sessions pane): cycle the alternatives
-                    // of the last vertical traversal — all parents (main +
-                    // RO attachments) or all explicit children.
-                    KeyCode::Left if app.focus == Pane::Sessions && !app.right_focused => {
-                        app.sideways(-1)
-                    }
-                    KeyCode::Right if app.focus == Pane::Sessions && !app.right_focused => {
-                        app.sideways(1)
-                    }
-                    KeyCode::PageDown => app.page_down(),
-                    KeyCode::PageUp => app.page_up(),
-                    KeyCode::Home => app.move_home(),
-                    KeyCode::End => app.move_end(),
-                    // '!' — errors-only lens on the focused list view.
-                    KeyCode::Char('!') => app.toggle_err_only(),
-                    // pane switches; c/p/o cross-navigate (install a generated
-                    // ids filter on the destination from the cursor).
-                    // Every letter chip snaps focus back to the LEFT list and
-                    // clears the right-pane scroll — carrying right_focused
-                    // across views would put the cursor in the new view's
-                    // detail body, which has no cursor of its own.
-                    // Character keys: a pane-row binding On(the focused pane)
-                    // wins over the same-letter global accelerator, else the
-                    // menubar chip switches panes, else the flat pane-action
-                    // table handles it (dispatch_char_key). This is what makes
-                    // 'b' on Mirrors browse (not jump to Boxes) and 't' reach
-                    // Trace, without disturbing the accelerators elsewhere.
-                    KeyCode::Char(c) => dispatch_char_key(&mut app, c),
-                    // Esc / Backspace from the packet drill-down pops back
-                    // to the flows list, keeping its cursor + detail state.
-                    KeyCode::Backspace => app.go_back(),
-                    KeyCode::Esc if app.focus == Pane::Packets => app.close_packets(),
-                    KeyCode::Esc => {
-                        // esc first drops an active multi-select; only if there
-                        // was none does it fall through to clearing a generated
-                        // (cross-nav) filter on the focused pane.
-                        if !app.clear_marks() {
-                            if let Some(v) = app.focus_filter_view() {
-                                if app.view_filter(v).generated {
-                                    app.clear_filter(v);
-                                }
-                            }
-                        }
-                    }
-                    // The table handles the rest; unmatched keys are no-ops.
-                    code => {
-                        dispatch_pane_key(&mut app, code);
-                    }
+                // All fixed navigation, selection, filter, and pane actions
+                // are data-driven. Character accelerators still go through
+                // the pane-chip precedence helper after the registry has had
+                // a chance to consume a pane action.
+                if dispatch_pane_event(&mut app, k.code, k.modifiers) {
+                    continue;
+                }
+                if let KeyCode::Char(c) = k.code {
+                    dispatch_char_key(&mut app, c);
                 }
             }
         }
@@ -20041,7 +21547,10 @@ mod tests {
                 .any(|l| l.contains("mirror add") && l.contains("add a scheduled")),
             "no verb line in help"
         );
-        assert!(text.iter().any(|l| l.starts_with("Keys")), "no Keys header");
+        assert!(
+            text.iter().any(|l| l.starts_with("Key bindings")),
+            "no key bindings header"
+        );
         assert!(
             text.iter().any(|l| l.starts_with("Panes")),
             "no Panes header"
@@ -22450,7 +23959,7 @@ mod tests {
     }
 
     #[test]
-    fn unified_bar_puts_mirror_context_keys_on_their_own_line() {
+    fn unified_bar_uses_actual_mirror_bindings_and_highlights_keys() {
         let mut app = headless_app();
         app.focus = Pane::Mirrors;
         let lines = unified_bar_lines(&app, 100);
@@ -22464,26 +23973,29 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        for (key, _, label, _, _) in PANE_KEYS {
-            assert!(
-                text.contains(&format!("{key}:{label}")),
-                "readable destination {key}:{label} missing:\n{text}"
-            );
-        }
+        assert!(text.contains("b browse"), "mirror browse binding missing:\n{text}");
+        assert!(!text.contains("b:Boxes"), "stale pane chip leaked into bar:\n{text}");
         assert!(
             text.contains("ready"),
             "current state must remain visible at 100 columns:\n{text}"
         );
         assert!(
-            text.contains("n add · O library · r run · c stop"),
+            text.contains("n add mirror") && text.contains("O open library"),
             "the most relevant mirror keys must remain visible at narrow widths:\n{text}"
         );
+        let key = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .find(|span| span.content == "b")
+            .expect("highlighted browse key");
+        assert_eq!(key.style.bg, Some(Color::Cyan));
+        assert!(key.style.add_modifier.contains(Modifier::BOLD));
     }
 
     #[test]
-    fn unified_bar_colors_active_and_attention_panes() {
+    fn unified_bar_colors_mirror_attention_keys() {
         let mut app = headless_app();
-        app.focus = Pane::Sessions;
+        app.focus = Pane::Mirrors;
         app.mirror_jobs = vec![serde_json::from_value(json!({
             "id": 1,
             "kind": "wiki",
@@ -22499,19 +24011,13 @@ mod tests {
             "next_due": 0
         }))
         .unwrap()];
-        let lines = unified_pane_lines(&app, 100);
+        let lines = unified_bar_lines(&app, 100);
         let spans: Vec<_> = lines.iter().flat_map(|line| line.spans.iter()).collect();
-        let boxes = spans
+        let run = spans
             .iter()
-            .find(|span| span.content == "b:Boxes")
-            .expect("Boxes chip");
-        let mirrors = spans
-            .iter()
-            .find(|span| span.content == "M:Mirrors")
-            .expect("Mirrors chip");
-        assert_eq!(boxes.style.fg, Some(Color::Yellow));
-        assert!(boxes.style.add_modifier.contains(Modifier::REVERSED));
-        assert_eq!(mirrors.style.fg, Some(Color::Red));
+            .find(|span| span.content == "r")
+            .expect("highlighted run key");
+        assert_eq!(run.style.bg, Some(Color::Yellow));
     }
 
     #[test]
@@ -22587,8 +24093,35 @@ mod tests {
             "targets_total": 432,
             "targets_completed": 120,
             "targets_active": ["content-000120", "history-000003"],
+            "target_progress": [{
+                "target": "content-000120", "kind": "content",
+                "phase": "parsing and sorting", "source": "ruwiki-part.xml.bz2",
+                "source_bytes_read": 1200000000_u64, "source_bytes_total": 3000000000_u64,
+                "bytes_per_second": 1048576_u64, "pages": 1200_u64, "records": 42000_u64,
+                "text_bytes": 710000000_u64, "current_page": 1234_u64,
+                "current_title": "Example", "quiet_seconds": 0_u64,
+                "heartbeat_seconds": 1_u64, "cpu_user_micros": 3000000_u64,
+                "cpu_system_micros": 500000_u64, "peak_rss_bytes": 800000000_u64
+            }, {
+                "target": "history-000003", "kind": "history",
+                "phase": "downloading", "source": "history.tsv.bz2",
+                "source_bytes_read": 0_u64, "source_bytes_total": 500000000_u64,
+                "bytes_per_second": 0_u64, "pages": 0_u64, "records": 0_u64,
+                "text_bytes": 0_u64, "current_page": 0_u64,
+                "current_title": "", "quiet_seconds": 42_u64,
+                "heartbeat_seconds": 42_u64, "cpu_user_micros": 0_u64,
+                "cpu_system_micros": 0_u64, "peak_rss_bytes": 1000000_u64
+            }],
             "source_bytes_total": 256000000000_u64,
-            "source_bytes_completed": 71000000000_u64
+            "source_bytes_completed": 71000000000_u64,
+            "active_source_bytes_per_second": 1048576_u64,
+            "active_quiet_seconds": 42_u64,
+            "fetch_attempts": 9_u64,
+            "fetch_bytes_received": 73000000000_u64,
+            "fetch_rate_limit_responses": 2_u64,
+            "fetch_client_error_responses": 4_u64,
+            "fetch_server_error_responses": 1_u64,
+            "fetch_transport_errors": 3_u64
         }))
         .unwrap()];
 
@@ -22600,8 +24133,59 @@ mod tests {
         assert!(text.contains("fetching and parsing"));
         assert!(text.contains("120/432 done · 2 active · 310 pending"));
         assert!(text.contains("content-000120"));
+        assert!(text.contains("WORKERS") && text.contains("parsing and sorting"));
+        assert!(text.contains("CPU") && text.contains("RSS"));
         assert!(text.contains("history-000003"));
         assert!(text.contains("27%"));
+        assert!(text.contains("recv rate"));
+        assert!(text.contains("no observable progress for 42s"));
+        assert!(
+            text.contains("9 attempts")
+                && text.contains("2×429")
+                && text.contains("4 other 4xx")
+                && text.contains("3 transport errors")
+        );
+    }
+
+    #[test]
+    fn mirror_detail_does_not_call_stale_progress_active() {
+        let mut app = headless_app();
+        app.focus = Pane::Mirrors;
+        app.mirror_jobs = vec![serde_json::from_value(json!({
+            "id": 2,
+            "kind": "wiki",
+            "src": "ruwiki",
+            "dest": "/tmp/ruwiki.swdump",
+            "interval_secs": 86400,
+            "paused": true,
+            "last_start": 1,
+            "last_end": 2,
+            "last_exit": 1,
+            "last_detail": "*** [nodes/content-000098.done] Error 1\nwikimak: mediawiki: xml error: curl returned HTTP 429",
+            "state": "paused",
+            "next_due": null,
+            "build_phase": "fetching and parsing",
+            "targets_total": 402,
+            "targets_completed": 103,
+            "targets_active": ["content-000098 · decompressing and parsing · 0%"],
+            "source_bytes_total": 270517172439_u64,
+            "source_bytes_completed": 86678965181_u64,
+            "fetch_attempts": 5_u64,
+            "fetch_bytes_received": 485095957_u64,
+            "fetch_rate_limit_responses": 4_u64
+        }))
+        .unwrap()];
+
+        let text = mirror_detail_lines(&app)
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(text.contains("failure") && text.contains("exit 1"));
+        assert!(text.contains("unfinished") && !text.contains("active content-000098"));
+        assert!(text.contains("5 attempts") && text.contains("4×429"));
+        assert!(text.contains("EVENTS · job #2"));
+        assert!(text.contains("[content-000098]"));
     }
 
     /// The Network/Web pane (DESIGN-web.md W4) renders the box's webcap rows:
@@ -22838,7 +24422,7 @@ mod tests {
         // real term). The keybindings-as-data sections (pane index + the
         // generated per-pane action + confirm blocks) push the manual past 80
         // rows, so render extra-tall to assert every generated line is present.
-        let buf = render_to_string(&app, 120, 120).unwrap();
+        let buf = render_to_string(&app, 120, 500).unwrap();
         assert!(buf.contains("help"), "help pane title missing:\n{buf}");
         assert!(
             buf.contains("apply") && buf.contains("discard"),
@@ -22862,44 +24446,41 @@ mod tests {
             "manual should document rule actions:\n{buf}"
         );
         assert!(
-            buf.contains("ctrl+"),
+            buf.contains("Ctrl-Up") && buf.contains("Ctrl-Down"),
             "manual should mention rule reorder:\n{buf}"
         );
-        // The pane index must be GENERATED from PANE_KEYS — every accelerator
-        // and its description present, never hardcoded prose that can drift.
-        for (key, _, _, _, desc) in PANE_KEYS {
+        // Every registry entry must surface in generated help.
+        for binding in pane_switch_bindings() {
+            let key = binding_key_label(binding);
+            let desc = binding.long_hint;
             assert!(
                 buf.contains(&format!("{key}  {desc}")),
                 "help pane index missing generated line for {key:?}:\n{buf}"
             );
         }
-        // The remaining contexts' help must ALSO be generated from their tables,
-        // not hardcoded prose. Every PANE_ACTION_KEYS entry with a help string
-        // must surface as a "<key>  <desc>" line — the exact format help_lines
-        // emits. (None-help entries are the nav block documented in prose.)
-        for (key, _, _, help) in PANE_ACTION_KEYS {
-            if let Some(desc) = help {
-                let want = format!("{}  {desc}", key.label());
-                assert!(
-                    buf.contains(&want),
-                    "help missing generated pane-action line {want:?}:\n{buf}"
-                );
-            }
+        for binding in BINDINGS.iter().filter(|binding| {
+            matches!(
+                binding.context,
+                BindingContext::Main
+                    | BindingContext::Reader
+                    | BindingContext::Confirm
+                    | BindingContext::Global
+            )
+        }) {
+            let want = format!("{}  {}", binding_key_label(binding), binding.long_hint);
+            assert!(
+                buf.contains(&want),
+                "help missing generated binding line {want:?}:\n{buf}"
+            );
         }
-        // The Confirm modal's y/n keymap is generated from CONFIRM_KEYS too: the
-        // 'y'/'Y' (confirm) and 'n'/'N'/Esc (cancel) labels must appear joined
-        // exactly as help_lines builds them, so the prompt help can't drift from
-        // the table the modal actually dispatches.
-        let yes = CONFIRM_KEYS
-            .iter()
-            .filter(|(_, a, _)| matches!(a, ConfirmKey::Yes))
-            .map(|(k, _, _)| k.label())
+        let yes = confirm_bindings()
+            .filter(|binding| matches!(binding.action, BindingAction::Confirm(ConfirmKey::Yes)))
+            .map(binding_key_label)
             .collect::<Vec<_>>()
             .join("/");
-        let no = CONFIRM_KEYS
-            .iter()
-            .filter(|(_, a, _)| matches!(a, ConfirmKey::No))
-            .map(|(k, _, _)| k.label())
+        let no = confirm_bindings()
+            .filter(|binding| matches!(binding.action, BindingAction::Confirm(ConfirmKey::No)))
+            .map(binding_key_label)
             .collect::<Vec<_>>()
             .join("/");
         assert!(
@@ -22913,8 +24494,8 @@ mod tests {
     }
 
     /// The keybindings-as-data dispatch is exercised directly (no live engine):
-    /// the Confirm modal's y/n/Esc keymap routes through CONFIRM_KEYS, and the
-    /// per-pane action keys route through PANE_ACTION_KEYS. Both only touch
+    /// the Confirm modal's y/n/Esc keymap and per-pane actions route through
+    /// the single binding registry. Both only touch
     /// engine-free actions here (open/cancel a modal, set detach/rename state),
     /// so this is a pure unit test of the table lookup + precedence.
     #[test]
@@ -22923,7 +24504,7 @@ mod tests {
         use crossterm::event::KeyModifiers;
         let none = KeyModifiers::empty();
 
-        // ── Confirm modal (CONFIRM_KEYS) ──
+        // ── Confirm modal (binding registry) ──
         // a cancel key ('n') clears the modal and notes "cancelled".
         let mut app = headless_app();
         app.modal = Some(Modal::Confirm {
@@ -22951,7 +24532,7 @@ mod tests {
             "an unbound key must leave the Confirm modal up"
         );
 
-        // ── per-pane action keys (PANE_ACTION_KEYS) ──
+        // ── per-pane action keys (binding registry) ──
         // 'K' opens a Kill Confirm; 'D' the box-delete (dissolve) Confirm.
         for (key, want) in [('K', ConfirmAction::Kill), ('D', ConfirmAction::Dissolve)] {
             let mut app = headless_app();
@@ -23941,8 +25522,34 @@ mod tests {
                         let src = args.get(1).and_then(Value::as_str).unwrap_or("");
                         let dest = args.get(2).and_then(Value::as_str).unwrap_or("");
                         let interval = args.get(3).and_then(Value::as_i64).unwrap_or(86400);
-                        match crate::mirrors::job_add(kind, src, dest, interval) {
+                        let result = args
+                            .get(4)
+                            .and_then(Value::as_str)
+                            .map_or_else(
+                                || crate::mirrors::job_add(kind, src, dest, interval),
+                                |media| {
+                                    crate::mirrors::job_add_with_media(
+                                        kind,
+                                        src,
+                                        dest,
+                                        interval,
+                                        false,
+                                        Some(media),
+                                    )
+                                },
+                            );
+                        match result {
                             Ok(id) => json!({"ok": true, "id": id}),
+                            Err(e) => json!({"ok": false, "error": e}),
+                        }
+                    }
+                    "mirror_set_media" => {
+                        let enabled = args.get(1).and_then(Value::as_bool).unwrap_or(false);
+                        match crate::mirrors::job_set_media_source(
+                            id,
+                            enabled.then_some("auto"),
+                        ) {
+                            Ok(()) => json!({"ok": true}),
                             Err(e) => json!({"ok": false, "error": e}),
                         }
                     }
@@ -24070,6 +25677,7 @@ mod tests {
             site_cursor: 0,
             site_filter: "lvwiki".into(),
             destination: "/mirror-library".into(),
+            media_enabled: false,
             cadence: 1,
             field: WikiSetupField::Cadence,
         });
@@ -24091,6 +25699,11 @@ mod tests {
                 .any(|job| job.src == "lvwiki" && job.dest == "/mirror-library/lvwiki.swdump")
         );
         assert!(app.status.contains("started 2 mirrors"), "{}", app.status);
+
+        assert!(dispatch_pane_key(&mut app, KeyCode::Char('i')));
+        let jobs = crate::mirrors::jobs_list().unwrap();
+        assert_eq!(jobs.iter().filter(|job| job.media_source.as_deref() == Some("auto")).count(), 1);
+        assert!(app.status.contains("Kiwix images enabled"), "{}", app.status);
 
         app.open_wiki_mirror_setup();
         assert!(matches!(

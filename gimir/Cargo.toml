@@ -37,6 +37,8 @@ md-5 = "0.10"
 # Localhost serve for `wikimak serve` (browsing plan §5) — small, sync.
 tiny_http = "0.12"
 zstd = "0.13"
+zim = "0.5"
+xz2 = "0.1"
 memchr = "2"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 thiserror = "1"

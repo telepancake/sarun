@@ -18,7 +18,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufRead, Read};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use reqwest::blocking::Client;
 use regex::Regex;
@@ -67,29 +66,20 @@ fn history_listing_size(html: &str, match_end: usize) -> u64 {
 }
 
 fn history_listing(client: &Client, url: &str) -> Result<String> {
-    let mut delay = Duration::from_secs(1);
-    for attempt in 0..4 {
-        let (body, status) = wikimak_mediawiki::discover::get_small(client, url)?;
-        if status.is_success() {
-            return String::from_utf8(body).map_err(|error| {
-                crate::error::Error::Mediawiki(wikimak_mediawiki::Error::Parse(format!(
-                    "history listing is not utf-8: {error}"
-                )))
-            });
-        }
-        if attempt < 3 && (status.as_u16() == 429 || status.is_server_error()) {
-            std::thread::sleep(delay.min(Duration::from_secs(60)));
-            delay = delay.saturating_mul(2);
-            continue;
-        }
-        return Err(crate::error::Error::Mediawiki(
-            wikimak_mediawiki::Error::HttpStatus {
-                status: status.as_u16(),
-                url: url.to_string(),
-            },
-        ));
+    let (body, status) = wikimak_mediawiki::discover::get_small(client, url)?;
+    if status.is_success() {
+        return String::from_utf8(body).map_err(|error| {
+            crate::error::Error::Mediawiki(wikimak_mediawiki::Error::Parse(format!(
+                "history listing is not utf-8: {error}"
+            )))
+        });
     }
-    unreachable!("history listing retry loop returns")
+    Err(crate::error::Error::Mediawiki(
+        wikimak_mediawiki::Error::HttpStatus {
+            status: status.as_u16(),
+            url: url.to_string(),
+        },
+    ))
 }
 
 pub(crate) fn discover_history(
@@ -1579,8 +1569,8 @@ fn import_run(
     let cores = std::thread::available_parallelism()
         .map(usize::from)
         .unwrap_or(1);
-    // Wikimedia may rate-limit a fourth simultaneous large transfer. Three
-    // still overlaps network and decompression without provoking that limit.
+    // The shared transport admits at most three Wikimedia streams across all
+    // helpers, while these pipelines overlap decoding and parsing.
     let outer_workers = groups.len().min(cores).min(3).max(1);
     let bz2_workers = (cores / outer_workers).max(1);
     let queue = Arc::new(Mutex::new(VecDeque::from(groups)));

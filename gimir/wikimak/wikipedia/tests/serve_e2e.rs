@@ -173,6 +173,8 @@ fn serve_renders_and_waybacks_a_synthesized_wiki() {
         root: tmp.path().to_path_buf(),
         addr: addr.clone(),
         media_cache: tmp.path().join("media"),
+        kiwix_source: None,
+        packed_media: None,
     };
     // serve() blocks forever; run it on a detached thread for the test's
     // lifetime.

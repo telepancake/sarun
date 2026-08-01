@@ -43,7 +43,7 @@ tiny_http = { workspace = true, optional = true }
 
 [features]
 default = ["fetch", "serve"]
-fetch = ["dep:reqwest", "wikimak-mediawiki/fetch"]
+fetch = ["dep:reqwest", "wikimak-mediawiki/fetch", "wikimak-media/fetch"]
 serve = ["dep:wikimak-wikitext", "dep:wikimak-scribunto", "dep:wikimak-media", "dep:tiny_http"]
 
 [dev-dependencies]

@@ -865,7 +865,10 @@ impl Reader {
             history_view_h: 1,
             history_origin: None,
             screen_links: Vec::new(),
-            status: "arrows links · h history · v rendered/raw/diff · [/] back/forward · j/k scroll · / page search · T title regexp · F full-text regexp".into(),
+            status: crate::ui::reader_context_hint(
+                crate::ui::ReaderBindingContext::Document,
+                false,
+            ),
             view_h: 20,
         })
     }
@@ -1281,8 +1284,13 @@ impl Reader {
             self.status = "scrolled down".into();
         } else if dx < 0 && self.wiki.as_ref().is_some_and(|wiki| !wiki.revisions.is_empty()) {
             self.focus_history();
-            self.status =
-                "page history · Up/Down select · Enter revision · u user page · e edits".into();
+            self.status = format!(
+                "page history · {}",
+                crate::ui::reader_context_hint(
+                    crate::ui::ReaderBindingContext::History,
+                    self.has_wiki(),
+                )
+            );
         } else {
             self.status = "no link or content in that direction".into();
         }
@@ -1324,9 +1332,13 @@ impl Reader {
                 .saturating_sub(self.history_view_h.max(1));
         }
         self.status = format!(
-            "revision {}/{} · Enter opens · u user page · e edits · Right returns",
+            "revision {}/{} · {}",
             self.history_selected + 1,
-            count
+            count,
+            crate::ui::reader_context_hint(
+                crate::ui::ReaderBindingContext::History,
+                self.has_wiki(),
+            )
         );
         if let Err(error) = self.apply_wiki_view(self.history_selected) {
             self.status = error.to_string();
@@ -1416,10 +1428,14 @@ impl Reader {
         self.screen_links.clear();
         self.history_selected = revision_index;
         self.status = format!(
-            "{} · revision {}/{} · v cycles rendered/raw/diff",
+            "{} · revision {}/{} · {}",
             mode.label(),
             revision_index + 1,
-            self.revision_count()
+            self.revision_count(),
+            crate::ui::reader_context_hint(
+                crate::ui::ReaderBindingContext::History,
+                self.has_wiki(),
+            )
         );
         Ok(())
     }
@@ -1451,8 +1467,12 @@ impl Reader {
         }
         self.finish_history_focus();
         self.status = format!(
-            "revision {} · Left at edge returns to page history",
-            revision_id
+            "revision {} · {}",
+            revision_id,
+            crate::ui::reader_context_hint(
+                crate::ui::ReaderBindingContext::Document,
+                self.has_wiki(),
+            )
         );
     }
 
@@ -1517,7 +1537,13 @@ impl Reader {
                 self.history.push(from);
                 self.future.clear();
                 self.history_focused = false;
-                self.status = format!("user page for {name} · Backspace goes back");
+                self.status = format!(
+                    "user page for {name} · {}",
+                    crate::ui::reader_context_hint(
+                        crate::ui::ReaderBindingContext::Document,
+                        self.has_wiki(),
+                    )
+                );
             }
             Err(error) => self.status = error.to_string(),
         }
@@ -1585,7 +1611,15 @@ impl Reader {
             if let Some(&l) = next {
                 self.scroll = l.saturating_sub(2);
                 let at = self.matches.iter().position(|&m| m == l).unwrap_or(0);
-                self.status = format!("match {}/{} · Esc clears", at + 1, self.matches.len());
+                self.status = format!(
+                    "match {}/{} · {}",
+                    at + 1,
+                    self.matches.len(),
+                    crate::ui::reader_context_hint(
+                        crate::ui::ReaderBindingContext::Search,
+                        self.has_wiki(),
+                    )
+                );
             }
             return;
         }
@@ -1647,7 +1681,13 @@ impl Reader {
 
     fn follow(&mut self) {
         let Some(fi) = self.focus_link else {
-            self.status = "no link focused — Tab cycles links".into();
+            self.status = format!(
+                "no link focused · {}",
+                crate::ui::reader_context_hint(
+                    crate::ui::ReaderBindingContext::Document,
+                    self.has_wiki(),
+                )
+            );
             return;
         };
         let url = self.doc.links[fi].url.clone();
@@ -1727,7 +1767,14 @@ impl Reader {
                 if let Some(f) = frag {
                     self.jump_fragment(&f);
                 }
-                self.status = format!("{} · Backspace goes back", self.display);
+                self.status = format!(
+                    "{} · {}",
+                    self.display,
+                    crate::ui::reader_context_hint(
+                        crate::ui::ReaderBindingContext::Document,
+                        self.has_wiki(),
+                    )
+                );
             }
             Err(e) => self.status = e.to_string(),
         }
@@ -1832,17 +1879,36 @@ impl Reader {
         }
     }
 
+    pub(crate) fn binding_context(&self) -> crate::ui::ReaderBindingContext {
+        if self.searching {
+            crate::ui::ReaderBindingContext::Search
+        } else if self.history_focused {
+            crate::ui::ReaderBindingContext::History
+        } else {
+            crate::ui::ReaderBindingContext::Document
+        }
+    }
+
+    pub(crate) fn has_wiki(&self) -> bool {
+        self.wiki.is_some()
+    }
+
+    /// Handle one key through the shared UI binding registry. The reader still
+    /// owns the state transition bodies, but it no longer owns a second key
+    /// table whose labels can drift from the UI help and context bar.
     pub fn handle_key(&mut self, code: crossterm::event::KeyCode) -> KeyResult {
         use crossterm::event::KeyCode;
-        if self.searching {
-            match code {
-                KeyCode::Esc => {
+
+        let context = self.binding_context();
+        if context == crate::ui::ReaderBindingContext::Search {
+            match crate::ui::reader_action(context, self.has_wiki(), code, crossterm::event::KeyModifiers::empty()) {
+                Some(crate::ui::ReaderAction::SearchCancel) => {
                     self.searching = false;
                     self.search_mode = SearchMode::Document;
                     self.query.clear();
                     self.status.clear();
                 }
-                KeyCode::Enter => {
+                Some(crate::ui::ReaderAction::SearchAccept) => {
                     if self.query.is_empty() {
                         self.searching = false;
                     } else {
@@ -1865,85 +1931,61 @@ impl Reader {
                         }
                     }
                 }
-                KeyCode::Backspace => {
+                Some(crate::ui::ReaderAction::SearchBackspace) => {
                     self.query.pop();
                 }
-                KeyCode::Char(c) => self.query.push(c),
+                Some(crate::ui::ReaderAction::SearchText) => {
+                    if let KeyCode::Char(c) = code {
+                        self.query.push(c);
+                    }
+                }
                 _ => {}
             }
             return KeyResult::Consumed;
         }
-        if self.history_focused {
-            match code {
-                KeyCode::Up | KeyCode::Char('k') => self.move_history(-1),
-                KeyCode::Down | KeyCode::Char('j') => self.move_history(1),
-                KeyCode::PageUp => self.move_history(-(self.history_view_h.max(1) as isize)),
-                KeyCode::PageDown => self.move_history(self.history_view_h.max(1) as isize),
-                KeyCode::Home | KeyCode::Char('g') => {
-                    self.history_selected = 0;
-                    self.history_scroll = 0;
-                    self.move_history(0);
-                }
-                KeyCode::End | KeyCode::Char('G') => {
-                    self.history_selected = self.revision_count().saturating_sub(1);
-                    self.move_history(0);
-                }
-                KeyCode::Enter => self.open_history_revision(),
-                KeyCode::Char('u') => self.open_contributor_page(),
-                KeyCode::Char('e') => {
-                    let Some(contributor) = self.selected_contributor() else {
-                        self.status = "no contributor selected".into();
-                        return KeyResult::Consumed;
-                    };
-                    let Some(label) = Self::contributor_label(&contributor) else {
-                        self.status = "this revision's contributor is hidden".into();
-                        return KeyResult::Consumed;
-                    };
-                    self.finish_history_focus();
-                    return KeyResult::ContributorEdits { contributor, label };
-                }
-                KeyCode::Char('v') => {
-                    let next = self
-                        .wiki
-                        .as_ref()
-                        .map(|wiki| wiki.view_mode.next())
-                        .unwrap_or(WikiViewMode::Rendered);
-                    self.set_wiki_view_mode(next);
-                }
-                KeyCode::Char('1') => self.set_wiki_view_mode(WikiViewMode::Rendered),
-                KeyCode::Char('2') => self.set_wiki_view_mode(WikiViewMode::Raw),
-                KeyCode::Char('3') => self.set_wiki_view_mode(WikiViewMode::Diff),
-                KeyCode::Right | KeyCode::Char('l') | KeyCode::Tab | KeyCode::Esc => {
-                    self.finish_history_focus();
-                    self.status = "document · arrows navigate links".into();
-                }
-                KeyCode::Char('z') => {
-                    self.finish_history_focus();
-                    return KeyResult::ToggleFull;
-                }
-                KeyCode::Backspace | KeyCode::Char('[') => {
-                    self.finish_history_focus();
-                    self.back();
-                }
-                KeyCode::Char(']') => {
-                    self.finish_history_focus();
-                    self.forward();
-                }
-                _ => return KeyResult::NotHandled,
+
+        let Some(action) = crate::ui::reader_action(
+            context,
+            self.has_wiki(),
+            code,
+            crossterm::event::KeyModifiers::empty(),
+        ) else {
+            return KeyResult::NotHandled;
+        };
+
+        match action {
+            crate::ui::ReaderAction::HistoryUp => self.move_history(-1),
+            crate::ui::ReaderAction::HistoryDown => self.move_history(1),
+            crate::ui::ReaderAction::HistoryPageUp => {
+                self.move_history(-(self.history_view_h.max(1) as isize))
             }
-            return KeyResult::Consumed;
-        }
-        match code {
-            KeyCode::Char('j') => self.scroll += 1,
-            KeyCode::Char('k') => self.scroll = self.scroll.saturating_sub(1),
-            KeyCode::Char('h') => {
-                if self.wiki.as_ref().is_some_and(|wiki| !wiki.revisions.is_empty()) {
-                    self.focus_history();
-                    self.status =
-                        "page history · v view · Enter revision · u user page · e edits".into();
-                }
+            crate::ui::ReaderAction::HistoryPageDown => {
+                self.move_history(self.history_view_h.max(1) as isize)
             }
-            KeyCode::Char('v') => {
+            crate::ui::ReaderAction::HistoryHome => {
+                self.history_selected = 0;
+                self.history_scroll = 0;
+                self.move_history(0);
+            }
+            crate::ui::ReaderAction::HistoryEnd => {
+                self.history_selected = self.revision_count().saturating_sub(1);
+                self.move_history(0);
+            }
+            crate::ui::ReaderAction::HistoryOpen => self.open_history_revision(),
+            crate::ui::ReaderAction::HistoryUser => self.open_contributor_page(),
+            crate::ui::ReaderAction::HistoryEdits => {
+                let Some(contributor) = self.selected_contributor() else {
+                    self.status = "no contributor selected".into();
+                    return KeyResult::Consumed;
+                };
+                let Some(label) = Self::contributor_label(&contributor) else {
+                    self.status = "this revision's contributor is hidden".into();
+                    return KeyResult::Consumed;
+                };
+                self.finish_history_focus();
+                return KeyResult::ContributorEdits { contributor, label };
+            }
+            crate::ui::ReaderAction::NextView => {
                 let next = self
                     .wiki
                     .as_ref()
@@ -1951,48 +1993,93 @@ impl Reader {
                     .unwrap_or(WikiViewMode::Rendered);
                 self.set_wiki_view_mode(next);
             }
-            KeyCode::Char('1') => self.set_wiki_view_mode(WikiViewMode::Rendered),
-            KeyCode::Char('2') => self.set_wiki_view_mode(WikiViewMode::Raw),
-            KeyCode::Char('3') => self.set_wiki_view_mode(WikiViewMode::Diff),
-            KeyCode::Left => self.focus_spatial(-1, 0),
-            KeyCode::Right => self.focus_spatial(1, 0),
-            KeyCode::Up => self.focus_spatial(0, -1),
-            KeyCode::Down => self.focus_spatial(0, 1),
-            KeyCode::PageDown => self.scroll += self.view_h.max(1),
-            KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(self.view_h.max(1)),
-            KeyCode::Home | KeyCode::Char('g') => self.scroll = 0,
-            KeyCode::End | KeyCode::Char('G') => {
+            crate::ui::ReaderAction::RenderedView => {
+                self.set_wiki_view_mode(WikiViewMode::Rendered)
+            }
+            crate::ui::ReaderAction::RawView => self.set_wiki_view_mode(WikiViewMode::Raw),
+            crate::ui::ReaderAction::DiffView => self.set_wiki_view_mode(WikiViewMode::Diff),
+            crate::ui::ReaderAction::HistoryReturn => {
+                self.finish_history_focus();
+                self.status = format!(
+                    "document · {}",
+                    crate::ui::reader_context_hint(
+                        crate::ui::ReaderBindingContext::Document,
+                        self.has_wiki(),
+                    )
+                );
+            }
+            crate::ui::ReaderAction::ToggleFull => {
+                if self.history_focused {
+                    self.finish_history_focus();
+                }
+                return KeyResult::ToggleFull;
+            }
+            crate::ui::ReaderAction::Back => {
+                if self.history_focused {
+                    self.finish_history_focus();
+                }
+                self.back();
+            }
+            crate::ui::ReaderAction::Forward => {
+                if self.history_focused {
+                    self.finish_history_focus();
+                }
+                self.forward();
+            }
+            crate::ui::ReaderAction::ScrollDown => self.scroll += 1,
+            crate::ui::ReaderAction::ScrollUp => self.scroll = self.scroll.saturating_sub(1),
+            crate::ui::ReaderAction::FocusHistory => {
+                self.focus_history();
+                self.status = format!(
+                    "page history · {}",
+                    crate::ui::reader_context_hint(
+                        crate::ui::ReaderBindingContext::History,
+                        self.has_wiki(),
+                    )
+                );
+            }
+            crate::ui::ReaderAction::SpatialLeft => self.focus_spatial(-1, 0),
+            crate::ui::ReaderAction::SpatialRight => self.focus_spatial(1, 0),
+            crate::ui::ReaderAction::SpatialUp => self.focus_spatial(0, -1),
+            crate::ui::ReaderAction::SpatialDown => self.focus_spatial(0, 1),
+            crate::ui::ReaderAction::PageDown => self.scroll += self.view_h.max(1),
+            crate::ui::ReaderAction::PageUp => {
+                self.scroll = self.scroll.saturating_sub(self.view_h.max(1))
+            }
+            crate::ui::ReaderAction::Home => self.scroll = 0,
+            crate::ui::ReaderAction::End => {
                 self.scroll = self.doc.lines.len().saturating_sub(self.view_h.max(1))
             }
-            KeyCode::Tab => self.focus_next(1),
-            KeyCode::BackTab => self.focus_next(-1),
-            KeyCode::Enter => self.follow(),
-            KeyCode::Backspace => self.back(),
-            KeyCode::Char('[') => self.back(),
-            KeyCode::Char(']') => self.forward(),
-            KeyCode::Char('n') => self.jump(1),
-            KeyCode::Char('p') => self.jump(-1),
-            KeyCode::Char('/') => {
+            crate::ui::ReaderAction::FocusNextLink => self.focus_next(1),
+            crate::ui::ReaderAction::FocusPreviousLink => self.focus_next(-1),
+            crate::ui::ReaderAction::JumpNext => self.jump(1),
+            crate::ui::ReaderAction::JumpPrevious => self.jump(-1),
+            crate::ui::ReaderAction::Follow => self.follow(),
+            crate::ui::ReaderAction::DocumentSearch => {
                 self.searching = true;
                 self.search_mode = SearchMode::Document;
                 self.query.clear();
             }
-            KeyCode::Char('T') | KeyCode::Char('F') => {
+            crate::ui::ReaderAction::TitleSearch => {
                 if self.wiki.is_none() {
                     self.status = "archive regexp search is only available for wiki mirrors".into();
-                } else {
-                    self.searching = true;
-                    self.search_mode = if code == KeyCode::Char('T') {
-                        SearchMode::ArchiveTitle
-                    } else {
-                        SearchMode::ArchiveFullText
-                    };
-                    self.query.clear();
+                    return KeyResult::Consumed;
                 }
+                self.searching = true;
+                self.search_mode = SearchMode::ArchiveTitle;
+                self.query.clear();
             }
-            KeyCode::Char('z') => return KeyResult::ToggleFull,
-            KeyCode::Char('o') => return KeyResult::OpenPrompt,
-            KeyCode::Esc => {
+            crate::ui::ReaderAction::FullTextSearch => {
+                if self.wiki.is_none() {
+                    self.status = "archive regexp search is only available for wiki mirrors".into();
+                    return KeyResult::Consumed;
+                }
+                self.searching = true;
+                self.search_mode = SearchMode::ArchiveFullText;
+                self.query.clear();
+            }
+            crate::ui::ReaderAction::Open => return KeyResult::OpenPrompt,
+            crate::ui::ReaderAction::Close => {
                 if !self.query.is_empty() || !self.matches.is_empty() {
                     self.query.clear();
                     self.matches.clear();
@@ -2001,7 +2088,10 @@ impl Reader {
                     return KeyResult::Close;
                 }
             }
-            _ => return KeyResult::NotHandled,
+            crate::ui::ReaderAction::SearchCancel
+            | crate::ui::ReaderAction::SearchAccept
+            | crate::ui::ReaderAction::SearchBackspace
+            | crate::ui::ReaderAction::SearchText => {}
         }
         self.clamp_scroll();
         KeyResult::Consumed

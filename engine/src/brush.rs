@@ -1201,6 +1201,44 @@ impl brush_core::builtins::SimpleCommand for EngineSelfCommand {
 /// shadow/`main()` path — both share kati; this is just the in-process door.
 struct MakeBuiltin;
 
+/// Wikipedia mirror operations are an engine-owned brush builtin, not a
+/// second command kingdom hidden behind self-exec recipes.  The generated
+/// Kati graph invokes this name for each build node, so all nodes share the
+/// engine process, its job visibility, cancellation path, and mediawiki gate.
+struct WikimakBuiltin;
+
+impl brush_core::builtins::SimpleCommand for WikimakBuiltin {
+    fn get_content(
+        name: &str,
+        _content_type: brush_core::builtins::ContentType,
+        _options: &brush_core::builtins::ContentOptions,
+    ) -> Result<String, brush_core::error::Error> {
+        Ok(format!("{name}: embedded Wikipedia mirror operation\n"))
+    }
+
+    fn execute<
+        SE: brush_core::extensions::ShellExtensions,
+        I: Iterator<Item = S>,
+        S: AsRef<str>,
+    >(
+        _context: brush_core::commands::ExecutionContext<'_, SE>,
+        args: I,
+    ) -> Result<brush_core::results::ExecutionResult, brush_core::error::Error> {
+        if std::env::var_os("SARUN_MIRROR_DEST").is_none() {
+            eprintln!("wikimak: builtin is only available inside an engine-owned mirror job");
+            return Ok(brush_core::results::ExecutionResult::new(126));
+        }
+        let mut argv = args.map(|arg| arg.as_ref().to_owned()).collect::<Vec<_>>();
+        if !argv.is_empty() {
+            argv.remove(0);
+        }
+        let code = wikimak_wikipedia::cli_main(&argv);
+        Ok(brush_core::results::ExecutionResult::new(
+            (code & 0xff) as u8,
+        ))
+    }
+}
+
 impl brush_core::builtins::SimpleCommand for MakeBuiltin {
     fn get_content(
         name: &str,
@@ -1455,6 +1493,10 @@ fn box_builtins<SE: brush_core::extensions::ShellExtensions>()
     m.insert("make".to_string(), simple_builtin::<MakeBuiltin, SE>());
     m.insert("gmake".to_string(), simple_builtin::<MakeBuiltin, SE>());
     m.insert("ninja".to_string(), simple_builtin::<NinjaBuiltin, SE>());
+    m.insert(
+        "wikimak".to_string(),
+        simple_builtin::<WikimakBuiltin, SE>(),
+    );
     // BashMode shell builtins overwrite any overlapping coreutil names (highest priority).
     m.extend(brush_builtins::default_builtins(
         brush_builtins::BuiltinSet::BashMode,
@@ -3705,6 +3747,12 @@ mod builtin_boundary_tests {
     fn edit_builtin_is_in_the_single_shared_builtin_catalog() {
         let builtins = super::box_builtins::<brush_core::extensions::DefaultShellExtensions>();
         assert!(builtins.contains_key("edit"));
+    }
+
+    #[test]
+    fn wikimak_is_in_the_single_shared_builtin_catalog() {
+        let builtins = super::box_builtins::<brush_core::extensions::DefaultShellExtensions>();
+        assert!(builtins.contains_key("wikimak"));
     }
 
     #[test]

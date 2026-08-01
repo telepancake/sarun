@@ -218,7 +218,11 @@ fn build_tool_command() -> Result<&'static str, String> {
     Ok(if executable_is_standalone_wikimak(&executable) {
         "./wikimak-tool"
     } else {
-        "./wikimak-tool wikimak"
+        // The engine's brush shell exposes wikimak as an in-process builtin.
+        // Keeping build-node/stage assembly in that same process gives Kati,
+        // brush provenance, cancellation, and the Wikimedia gate one owner;
+        // standalone wikimak binaries retain the small helper executable.
+        "wikimak"
     })
 }
 
@@ -317,6 +321,7 @@ fn run_build_make(scratch: &Path) -> Result<(), String> {
     let status = std::process::Command::new(make_program()?)
         .current_dir(scratch)
         .env("SARUN_KATI_TARGET_LOG_DIR", log_directory)
+        .env("SARUN_WIKIMEDIA_ROBOTS_CACHE", scratch.join("robots-cache"))
         .env("TMPDIR", scratch)
         .args(["-f", "stage1.mk", "-j3"])
         .status()
@@ -487,6 +492,63 @@ fn install_built_archive(
     Ok(())
 }
 
+#[cfg(feature = "serve")]
+fn pack_selected_media(
+    client: &reqwest::blocking::Client,
+    dbname: &str,
+    archive: &Path,
+) -> Result<(), String> {
+    let Some(source) = std::env::var_os("SARUN_KIWIX_SOURCE") else {
+        return Ok(());
+    };
+    let output = archive.with_extension("media");
+    if output.exists() {
+        eprintln!(
+            "selected Kiwix media already exists at {}; keeping it",
+            output.display()
+        );
+        return Ok(());
+    }
+    let stats = if source == "auto" {
+        let release = wikimak_media::remote::discover_latest(client, dbname)
+            .map_err(|error| format!("discover Kiwix image source: {error}"))?;
+        eprintln!(
+            "selected Kiwix source: {} (ranged import; no ZIM file is saved)",
+            release.name
+        );
+        let source = wikimak_media::remote::RemoteKiwixImageSource::open(
+            client.clone(),
+            release.url,
+        )
+        .map_err(|error| format!("open remote Kiwix source: {error}"))?;
+        eprintln!(
+            "indexed {} image entries from {} bytes",
+            source.len(),
+            source.file_size()
+        );
+        source
+            .pack(&output)
+            .map_err(|error| format!("pack selected Kiwix media: {error}"))?
+    } else {
+        let source = PathBuf::from(source);
+        eprintln!(
+            "packing selected Kiwix media {} -> {}",
+            source.display(),
+            output.display()
+        );
+        let source = wikimak_media::KiwixImageSource::open(&source)
+            .map_err(|error| format!("open selected Kiwix source: {error}"))?;
+        source
+            .pack(&output)
+            .map_err(|error| format!("pack selected Kiwix media: {error}"))?
+    };
+    eprintln!(
+        "packed {} image entries ({} bytes, {} storages)",
+        stats.entries_written, stats.bytes_written, stats.storages
+    );
+    Ok(())
+}
+
 fn build_full(
     client: &reqwest::blocking::Client,
     dbname: &str,
@@ -494,9 +556,13 @@ fn build_full(
     scratch: &Path,
     replace_plan: bool,
 ) -> Result<(), String> {
+    std::env::set_var("SARUN_MIRROR_DEST", archive);
     recover_interrupted_install(archive)?;
     std::fs::create_dir_all(scratch)
         .map_err(|error| format!("{}: {error}", scratch.display()))?;
+    // Fetch robots.txt once during discovery and leave the result in the
+    // resumable build tree for every stage-one helper to consume.
+    std::env::set_var("SARUN_WIKIMEDIA_ROBOTS_CACHE", scratch.join("robots-cache"));
     let _lock = MirrorBuildLock::acquire(scratch)?;
     if replace_plan {
         clear_mirror_scratch(scratch)?;
@@ -529,6 +595,13 @@ fn build_full(
         persist_json(&plan_path, &plan)?;
         plan
     };
+    if let Some(url) = plan.first_source_url() {
+        // This is deliberately done by the importing process, before any
+        // stage-one helpers start.  A resumed plan therefore cannot race
+        // several workers into independently requesting robots.txt.
+        wikimak_mediawiki::prepare_robots(client, url)
+            .map_err(|error| error.to_string())?;
+    }
     let reusable = crate::direct::prune_invalid_build_nodes(scratch, &plan)
         .map_err(|error| error.to_string())?;
     crate::direct::recover_direct_build_completion(scratch, &plan)
@@ -549,10 +622,13 @@ fn build_full(
         return Err("resumable build stopped without a complete archive".into());
     }
     install_built_archive(built, archive, scratch)?;
+    #[cfg(feature = "serve")]
+    pack_selected_media(client, dbname, archive)?;
     remove_path(scratch).map_err(|error| format!("{}: {error}", scratch.display()))
 }
 
 fn cmd_fetch(dbname: &str, archive: &str) -> Result<(), String> {
+    std::env::set_var("SARUN_MIRROR_DEST", archive);
     let archive = Path::new(archive);
     recover_interrupted_install(archive)?;
     let client = http_client()?;
@@ -567,6 +643,9 @@ fn cmd_fetch(dbname: &str, archive: &str) -> Result<(), String> {
     }
     let scratch = ensure_mirror_scratch(archive)?;
     let _lock = MirrorBuildLock::acquire(&scratch)?;
+    // The update discovery pass owns the one robots.txt fetch for this
+    // resumable import.  Its child workers inherit this artifact path.
+    std::env::set_var("SARUN_WIKIMEDIA_ROBOTS_CACHE", scratch.join("robots-cache"));
     let partial = scratch.join("update.swdump");
     let receipt_path = scratch.join("update.receipt.json");
     let update_marker = install_sidecar(archive, ".updating")?;
@@ -717,6 +796,8 @@ fn cmd_fetch(dbname: &str, archive: &str) -> Result<(), String> {
     std::fs::remove_file(&update_marker)
         .map_err(|error| format!("{}: {error}", update_marker.display()))?;
     sync_parent(archive)?;
+    #[cfg(feature = "serve")]
+    pack_selected_media(&client, dbname, archive)?;
     eprintln!("{records} records, {frames} frames, {title_entries} title intervals");
     remove_path(&scratch).map_err(|error| format!("{}: {error}", scratch.display()))
 }
@@ -743,7 +824,7 @@ fn cmd_discover(dbname: &str) -> Result<(), String> {
 }
 
 #[cfg(feature = "serve")]
-fn cmd_serve(path: &str, addr: &str) -> Result<(), String> {
+fn cmd_serve(path: &str, addr: &str, packed_media: Option<&str>) -> Result<(), String> {
     let started = std::time::Instant::now();
     let path = PathBuf::from(path);
     if install_sidecar(&path, ".installing")?.exists() {
@@ -763,11 +844,50 @@ fn cmd_serve(path: &str, addr: &str) -> Result<(), String> {
         archive.frame_count(),
         started.elapsed().as_secs_f64(),
     );
+    let media_root = path.with_extension("media");
+    let packed_media = packed_media
+        .map(PathBuf::from)
+        .or_else(|| has_packed_media(&media_root).then_some(media_root.clone()));
     crate::serve::serve_archive(
         std::sync::Arc::new(archive),
         addr.to_owned(),
-        path.with_extension("media"),
+        media_root,
+        None,
+        packed_media,
     )
+}
+
+#[cfg(feature = "serve")]
+fn has_packed_media(path: &Path) -> bool {
+    std::fs::read_dir(path).ok().is_some_and(|entries| {
+        entries.flatten().any(|entry| {
+            let path = entry.path();
+            path.extension().and_then(|value| value.to_str()) == Some("data")
+                && path
+                    .file_stem()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|value| value.starts_with("media-"))
+        })
+    })
+}
+
+#[cfg(feature = "serve")]
+fn cmd_kiwix_pack(zim: &str, output: &str) -> Result<(), String> {
+    let source = wikimak_media::KiwixImageSource::open(zim)
+        .map_err(|error| error.to_string())?;
+    eprintln!(
+        "wikimak kiwix-pack: indexed {} image entries from {}",
+        source.len(),
+        zim,
+    );
+    let stats = source
+        .pack(output)
+        .map_err(|error| error.to_string())?;
+    println!(
+        "{} entries written, {} bytes in {} storages",
+        stats.entries_written, stats.bytes_written, stats.storages
+    );
+    Ok(())
 }
 
 fn cmd_siteinfo(api_url: &str, output: &str) -> Result<(), String> {
@@ -848,20 +968,67 @@ impl std::io::Seek for ArchiveInput {
     }
 }
 
+fn cmd_raw_repack(
+    input: &str,
+    output: &str,
+    frame_target: usize,
+    compression: crate::archive::CompressionSettings,
+    raw_input: bool,
+) -> Result<(), String> {
+    let output_path = Path::new(output);
+    let parent = output_path.parent().unwrap_or_else(|| Path::new("."));
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|error| format!("{}: {error}", parent.display()))?;
+    let (records, frames) = if raw_input {
+        let source =
+            std::fs::File::open(input).map_err(|error| format!("{input}: {error}"))?;
+        let (_, frames, records) = crate::archive::import_raw_record_stream(
+            BufReader::new(source),
+            temporary.as_file_mut(),
+            frame_target,
+            compression,
+        )
+        .map_err(|error| error.to_string())?;
+        (records, frames)
+    } else {
+        let records =
+            crate::archive::export_raw_record_stream(input, temporary.as_file_mut())
+                .map_err(|error| error.to_string())?;
+        (records, 0)
+    };
+    temporary
+        .as_file()
+        .sync_all()
+        .map_err(|error| error.to_string())?;
+    temporary
+        .persist(output_path)
+        .map_err(|error| format!("{output}: {}", error.error))?;
+    if raw_input {
+        println!("{records} raw records, {frames} archive frames");
+    } else {
+        println!("{records} raw records");
+    }
+    Ok(())
+}
+
 fn cmd_repack(args: &[&str]) -> Result<(), String> {
     let [input, output, frame_target, level, options @ ..] = args else {
         return Err(
             "repack wants <input> <output> <frame-bytes> <zstd-level> \
-             [--dictionary-bytes N | --ref-prefix-bytes N --sample-bytes N]"
+             [--dictionary-bytes N | --ref-prefix-bytes N --sample-bytes N | \
+              --raw-output | --raw-input]"
                 .into(),
         );
     };
     let frame_target = positive_size(frame_target, "frame bytes")?;
     let compression = compression(level)?;
+    #[derive(Clone, Copy)]
     enum Reference {
         None,
         Dictionary(usize),
         RefPrefix { bytes: usize, sample_bytes: usize },
+        RawOutput,
+        RawInput,
     }
     let reference = match options {
         [] => Reference::None,
@@ -875,8 +1042,19 @@ fn cmd_repack(args: &[&str]) -> Result<(), String> {
                 sample_bytes: positive_size(sample_bytes, "sample bytes")?,
             }
         }
+        ["--raw-output"] => Reference::RawOutput,
+        ["--raw-input"] => Reference::RawInput,
         _ => return Err("unknown repack options".into()),
     };
+    if matches!(reference, Reference::RawOutput | Reference::RawInput) {
+        return cmd_raw_repack(
+            input,
+            output,
+            frame_target,
+            compression,
+            matches!(reference, Reference::RawInput),
+        );
+    }
     let input_path = Path::new(input);
     let input_file = if input_path.is_dir() {
         ArchiveInput::Set(
@@ -917,6 +1095,7 @@ fn cmd_repack(args: &[&str]) -> Result<(), String> {
             frame_target,
             compression,
         ),
+        Reference::RawOutput | Reference::RawInput => unreachable!("returned above"),
     };
     let (_, stats) = result.map_err(|error| error.to_string())?;
     temporary
@@ -1007,9 +1186,9 @@ fn cmd_build_node(args: &[&str]) -> Result<(), String> {
         kind,
         index,
         bz2_workers,
-        &|message| eprintln!("{message}"),
+        &|message| eprintln!("[{kind}-{index:06}] {message}"),
     )
-    .map_err(|error| error.to_string())
+    .map_err(|error| format!("[{kind}-{index:06}] {error}"))
 }
 
 fn cmd_build_stage_two(root: &str, plan: &str) -> Result<(), String> {
@@ -1062,9 +1241,19 @@ pub fn cli_main(args: &[String]) -> i32 {
         ["fetch", dbname, archive] => cmd_fetch(dbname, archive),
         ["refresh-full", dbname, archive] => cmd_refresh_full(dbname, archive),
         #[cfg(feature = "serve")]
-        ["serve", archive] => cmd_serve(archive, "127.0.0.1:8642"),
+        ["serve", archive] => cmd_serve(archive, "127.0.0.1:8642", None),
         #[cfg(feature = "serve")]
-        ["serve", archive, addr] => cmd_serve(archive, addr),
+        ["serve", archive, "--packed-media", packed] => {
+            cmd_serve(archive, "127.0.0.1:8642", Some(packed))
+        }
+        #[cfg(feature = "serve")]
+        ["serve", archive, addr, "--packed-media", packed] => {
+            cmd_serve(archive, addr, Some(packed))
+        }
+        #[cfg(feature = "serve")]
+        ["serve", archive, addr] => cmd_serve(archive, addr, None),
+        #[cfg(feature = "serve")]
+        ["kiwix-pack", zim, output] => cmd_kiwix_pack(zim, output),
         ["siteinfo", api_url, output] => cmd_siteinfo(api_url, output),
         ["title-index", archive, output] => cmd_title_index(archive, output),
         ["backrefs", archive, titles, output] => cmd_backrefs(archive, titles, output),
@@ -1078,11 +1267,12 @@ pub fn cli_main(args: &[String]) -> i32 {
             "usage: wikimak discover <dbname>\n\
              \x20      wikimak fetch <dbname> <archive.swdump>\n\
              \x20      wikimak refresh-full <dbname> <archive.swdump>\n\
-             \x20      wikimak serve <archive.swdump> [addr]\n\
+             \x20      wikimak serve <archive.swdump> [addr] [--packed-media <directory>]\n\
+             \x20      wikimak kiwix-pack <source.zim> <output-directory>\n\
              \x20      wikimak siteinfo <api-url> <output.swdump>\n\
              \x20      wikimak title-index <archive.swdump> <output.swtitle>\n\
              \x20      wikimak backrefs <archive.swdump> <titles.swtitle> <output.swrefs>\n\
-             \x20      wikimak repack <input> <output> <frame-bytes> <zstd-level> [--dictionary-bytes N | --ref-prefix-bytes N --sample-bytes N]\n\
+             \x20      wikimak repack <input> <output> <frame-bytes> <zstd-level> [--dictionary-bytes N | --ref-prefix-bytes N --sample-bytes N | --raw-output | --raw-input]\n\
              \x20      wikimak merge <output> <frame-bytes> <zstd-level> <input>...\n\
              \x20      wikimak inspect <archive.swdump>"
                 .into(),
@@ -1115,6 +1305,19 @@ mod tests {
         let path = tempfile::tempdir_in(parent).unwrap().into_path();
         std::fs::write(path.join("payload"), bytes).unwrap();
         path
+    }
+
+    #[test]
+    fn raw_repack_options_are_explicit_and_exclusive() {
+        for options in [
+            vec!["--raw-input", "--dictionary-bytes", "1024"],
+            vec!["--raw-output", "--ref-prefix-bytes", "1024", "--sample-bytes", "2048"],
+            vec!["--raw-input", "--raw-output"],
+        ] {
+            let mut args = vec!["input", "output", "128", "1"];
+            args.extend(options);
+            assert_eq!(cmd_repack(&args).unwrap_err(), "unknown repack options");
+        }
     }
 
     #[test]

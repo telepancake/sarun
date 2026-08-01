@@ -452,7 +452,7 @@ impl EditorPane {
         let h = hash_of(&text);
         let (analysis_tx, analysis_rx) = mpsc::channel();
         let status = analysis_error.map_or_else(
-            || "vim keys · Ctrl-S save · Ctrl-O open · Ctrl-E lock · z zoom · Esc back".into(),
+            || format!("vim keys · {}", crate::ui::editor_context_hint()),
             |error| format!("brush relation: {error}"),
         );
         Ok(EditorPane {
@@ -687,8 +687,9 @@ impl EditorPane {
 
     fn completion_status(completion: &Completion) -> String {
         format!(
-            "completion: {} · Tab/↓ next · Enter accept · Esc close",
-            completion.display
+            "completion: {} · {}",
+            completion.display,
+            crate::ui::editor_completion_hint()
         )
     }
 
@@ -700,22 +701,22 @@ impl EditorPane {
             self.completions = None;
             return false;
         }
-        match code {
-            KeyCode::Tab | KeyCode::Down => {
+        match crate::ui::editor_completion_action(code, mods) {
+            Some(crate::ui::EditorCompletionAction::Next) => {
                 menu.selected = (menu.selected + 1) % menu.items.len();
                 self.status = Self::completion_status(&menu.items[menu.selected]);
                 true
             }
-            KeyCode::BackTab | KeyCode::Up => {
+            Some(crate::ui::EditorCompletionAction::Previous) => {
                 menu.selected = menu.selected.checked_sub(1).unwrap_or(menu.items.len() - 1);
                 self.status = Self::completion_status(&menu.items[menu.selected]);
                 true
             }
-            KeyCode::Enter => {
+            Some(crate::ui::EditorCompletionAction::Accept) => {
                 self.apply_selected_completion();
                 true
             }
-            KeyCode::Esc => {
+            Some(crate::ui::EditorCompletionAction::Cancel) => {
                 self.completions = None;
                 self.status = "completion closed".into();
                 true
@@ -789,30 +790,40 @@ impl EditorPane {
         if self.handle_completion_key(code, mods) {
             return KeyResult::Consumed;
         }
-        if self.provider == AnalysisProvider::Brush
-            && self.state.mode == EditorMode::Insert
-            && mods.is_empty()
-            && code == KeyCode::Tab
-        {
-            self.open_completions();
-            return KeyResult::Consumed;
+        if matches!(
+            crate::ui::editor_action(code, mods),
+            Some(crate::ui::EditorAction::CompletionOpen)
+        ) {
+            if self.provider == AnalysisProvider::Brush
+                && self.state.mode == EditorMode::Insert
+                && mods.is_empty()
+            {
+                self.open_completions();
+                return KeyResult::Consumed;
+            }
         }
         self.completions = None;
-        // Pane controls first, from any mode: save / open / lock-toggle.
-        if mods.contains(KeyModifiers::CONTROL) {
-            match code {
-                KeyCode::Char('s') => {
+        // Pane controls first, from any mode. Their keys come from the same
+        // registry used by the outer UI/help/context bar; the embedded vim
+        // handler still owns ordinary editing keys.
+        if let Some(action) = crate::ui::editor_action(code, mods) {
+            match action {
+                crate::ui::EditorAction::Save => {
                     if self.read_only {
-                        self.status = "read-only — Ctrl-E unlocks before saving".into();
+                        self.status = format!(
+                            "read-only · {}",
+                            crate::ui::editor_context_hint()
+                        );
                         return KeyResult::Consumed;
                     }
                     return KeyResult::Save;
                 }
-                KeyCode::Char('o') => return KeyResult::OpenPrompt,
-                KeyCode::Char('e') => {
+                crate::ui::EditorAction::Open
+                    if mods.contains(KeyModifiers::CONTROL) => return KeyResult::OpenPrompt,
+                crate::ui::EditorAction::ReadOnly => {
                     self.read_only = !self.read_only;
                     self.status = if self.read_only {
-                        "read-only — navigation only (Ctrl-E unlocks)".into()
+                        format!("read-only — navigation only · {}", crate::ui::editor_context_hint())
                     } else {
                         "editable".into()
                     };
@@ -822,18 +833,21 @@ impl EditorPane {
             }
         }
         if self.state.mode == EditorMode::Normal && mods.is_empty() {
-            match code {
-                KeyCode::Char('z') => return KeyResult::ToggleFull,
+            match crate::ui::editor_action(code, mods) {
+                Some(crate::ui::EditorAction::ToggleFull) => return KeyResult::ToggleFull,
                 // Normal-mode Esc has no edtui meaning — it unwinds the
                 // pane (zoom first, then go_back — decided by the UI).
-                KeyCode::Esc => return KeyResult::Close,
+                Some(crate::ui::EditorAction::Close) => return KeyResult::Close,
                 _ => {}
             }
         }
         // Read-only: the navigation whitelist passes; everything else
         // refuses LOUDLY (status line), never silently mutates.
         if self.read_only && !is_navigation(code, mods, &self.state) {
-            self.status = "read-only — mutation refused (Ctrl-E unlocks)".into();
+            self.status = format!(
+                "read-only · {}",
+                crate::ui::editor_context_hint()
+            );
             return KeyResult::Consumed;
         }
         self.handler
@@ -1052,7 +1066,7 @@ fn save_standalone_host(pane: &mut EditorPane) -> anyhow::Result<()> {
 /// backend is explicitly attached there as well, so shell redirections remain
 /// ordinary command I/O and cannot capture or corrupt the TUI.
 pub fn run_standalone(path: PathBuf, brush_context: BrushSemanticSnapshot) -> anyhow::Result<()> {
-    use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+    use crossterm::event::{self, Event, KeyEventKind};
     use crossterm::{cursor, execute, terminal};
     use ratatui::Terminal;
     use ratatui::backend::CrosstermBackend;
@@ -1113,7 +1127,10 @@ pub fn run_standalone(path: PathBuf, brush_context: BrushSemanticSnapshot) -> an
             continue;
         }
         redraw = true;
-        let closing_key = key.code == KeyCode::Esc;
+        let closing_key = matches!(
+            crate::ui::editor_action(key.code, key.modifiers),
+            Some(crate::ui::EditorAction::Close)
+        );
         match pane.handle_key(key.code, key.modifiers) {
             KeyResult::Save => match save_standalone_host(&mut pane) {
                 Ok(()) => discard_armed = false,
@@ -1121,7 +1138,10 @@ pub fn run_standalone(path: PathBuf, brush_context: BrushSemanticSnapshot) -> an
             },
             KeyResult::Close => {
                 if pane.dirty && !discard_armed {
-                    pane.status = "unsaved changes · Esc again to discard · Ctrl-S saves".into();
+                    pane.status = format!(
+                        "unsaved changes · close again to discard · {}",
+                        crate::ui::editor_context_hint()
+                    );
                     discard_armed = true;
                 } else {
                     break;
