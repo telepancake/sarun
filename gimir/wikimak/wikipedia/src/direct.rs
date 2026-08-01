@@ -262,10 +262,9 @@ pub struct MirrorTargetProgress {
     pub peak_rss_bytes: u64,
 }
 
-/// Short-lived progress written by an active source-part worker.  Durable
-/// receipts intentionally remain target-granular, but a split XML target can
-/// spend hours inside one page; this sidecar lets the UI show bytes and
-/// revision progress while that target is still being built.
+/// Short-lived progress written by an active source-fragment worker. Each
+/// source fragment has its own durable target and retry boundary; this
+/// sidecar exposes byte and revision progress until its receipt is published.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 struct LiveTargetProgress {
     target: String,
@@ -460,15 +459,13 @@ fn progress_record_belongs_to_plan(
     plan: &DirectBuildPlan,
     value: &LiveTargetProgress,
 ) -> bool {
-    let Some((kind, index)) = value.target.rsplit_once('-').and_then(|(kind, index)| {
-        index.parse::<usize>().ok().map(|index| (kind, index))
-    }) else {
+    let Some((kind, index)) = plan.target_index(&value.target) else {
         return false;
     };
     match kind {
-        "content" => plan.content_groups.get(index).is_some_and(|parts| {
-            parts.iter().any(|part| part.filename == value.part)
-        }),
+        "content" => plan
+            .content_target(index)
+            .is_some_and(|(_, _, part)| part.filename == value.part),
         "history" => plan
             .history_files
             .get(index)
@@ -680,7 +677,54 @@ impl<R: Read> Read for CountingReader<R> {
 
 impl DirectBuildPlan {
     pub(crate) fn target_count(&self) -> usize {
-        self.content_groups.len() + self.history_files.len()
+        self.content_target_count() + self.history_files.len()
+    }
+
+    pub(crate) fn content_target_count(&self) -> usize {
+        self.content_groups.iter().map(Vec::len).sum()
+    }
+
+    fn content_target(
+        &self,
+        index: usize,
+    ) -> Option<(usize, usize, &PlannedPart)> {
+        let mut remaining = index;
+        for (group_index, group) in self.content_groups.iter().enumerate() {
+            if remaining < group.len() {
+                return Some((group_index, remaining, &group[remaining]));
+            }
+            remaining -= group.len();
+        }
+        None
+    }
+
+    pub(crate) fn target_name(&self, kind: &str, index: usize) -> Option<String> {
+        match kind {
+            "content" => self.content_target(index).map(|(group, source, _)| {
+                if self.content_groups[group].len() == 1 {
+                    format!("content-{group:06}")
+                } else {
+                    format!("content-{group:06}-source-{source:06}")
+                }
+            }),
+            "history" => self
+                .history_files
+                .get(index)
+                .map(|_| format!("history-{index:06}")),
+            _ => None,
+        }
+    }
+
+    fn target_index(&self, target: &str) -> Option<(&'static str, usize)> {
+        for index in 0..self.content_target_count() {
+            if self.target_name("content", index).as_deref() == Some(target) {
+                return Some(("content", index));
+            }
+        }
+        let index = target.strip_prefix("history-")?.parse::<usize>().ok()?;
+        self.history_files
+            .get(index)
+            .map(|_| ("history", index))
     }
 
     pub(crate) fn source_bytes(&self) -> u64 {
@@ -712,12 +756,8 @@ impl DirectBuildPlan {
     fn target_source_bytes(&self, kind: &str, index: usize) -> u64 {
         match kind {
             "content" => self
-                .content_groups
-                .get(index)
-                .into_iter()
-                .flatten()
-                .map(|part| part.size_bytes)
-                .sum(),
+                .content_target(index)
+                .map_or(0, |(_, _, part)| part.size_bytes),
             "history" => self
                 .history_files
                 .get(index)
@@ -767,9 +807,10 @@ pub(crate) fn discover_direct_build_plan(
     let content_run = wikimak_mediawiki::discover_with(client, config, dbname)?;
     let (metadata_snapshot, history_files) =
         crate::sync::discover_history(client, config, dbname)?;
-    let content_groups = crate::sync::part_groups(content_run.parts.clone())
+    let content_groups = content_run
+        .parts
         .iter()
-        .map(|group| group.iter().map(PlannedPart::from).collect())
+        .map(|part| vec![PlannedPart::from(part)])
         .collect::<Vec<_>>();
     if content_groups.is_empty() {
         return Err(Error::Corrupt("content dump contains no parts"));
@@ -820,9 +861,13 @@ pub(crate) fn read_direct_build_plan(path: &Path) -> Result<DirectBuildPlan> {
     Ok(plan)
 }
 
-fn node_path(root: &Path, kind: &str, index: usize) -> PathBuf {
+fn node_path(root: &Path, plan: &DirectBuildPlan, kind: &str, index: usize) -> PathBuf {
     root.join("nodes")
-        .join(format!("{kind}-{index:06}.done"))
+        .join(format!(
+            "{}.done",
+            plan.target_name(kind, index)
+                .unwrap_or_else(|| format!("{kind}-{index:06}"))
+        ))
 }
 
 fn validate_node(
@@ -831,7 +876,7 @@ fn validate_node(
     kind: &str,
     index: usize,
 ) -> Result<bool> {
-    let node = node_path(root, kind, index);
+    let node = node_path(root, plan, kind, index);
     let data = node.join("data.swdump");
     let receipt: BuildReceipt = match std::fs::read(node.join("receipt.json"))
         .ok()
@@ -840,9 +885,16 @@ fn validate_node(
         Some(receipt) => receipt,
         None => return Ok(false),
     };
+    let receipt_index_matches = match kind {
+        "content" => plan.content_target(index).is_some_and(|(group, _, _)| {
+            receipt.index == index
+                || (plan.content_groups[group].len() == 1 && receipt.index == group)
+        }),
+        _ => receipt.index == index,
+    };
     if receipt.plan_id != plan.plan_id
         || receipt.kind != kind
-        || receipt.index != index
+        || !receipt_index_matches
         || std::fs::metadata(&data)?.len() != receipt.data_bytes
     {
         return Ok(false);
@@ -865,11 +917,11 @@ pub(crate) fn prune_invalid_build_nodes(root: &Path, plan: &DirectBuildPlan) -> 
     std::fs::create_dir_all(root.join("nodes"))?;
     let mut reusable = 0;
     for (kind, count) in [
-        ("content", plan.content_groups.len()),
+        ("content", plan.content_target_count()),
         ("history", plan.history_files.len()),
     ] {
         for index in 0..count {
-            let path = node_path(root, kind, index);
+            let path = node_path(root, plan, kind, index);
             if validate_node(root, plan, kind, index).unwrap_or(false) {
                 reusable += 1;
             } else if path.exists() {
@@ -883,18 +935,8 @@ pub(crate) fn prune_invalid_build_nodes(root: &Path, plan: &DirectBuildPlan) -> 
         let resumable = name
             .strip_prefix('.')
             .and_then(|name| name.strip_suffix(".partial"))
-            .and_then(|name| name.rsplit_once('-'))
-            .is_some_and(|(kind, index)| {
-                index.parse::<usize>().ok().is_some_and(|index| {
-                    matches!(kind, "content" | "history")
-                        && index
-                            < if kind == "content" {
-                                plan.content_groups.len()
-                            } else {
-                                plan.history_files.len()
-                            }
-                })
-            });
+            .and_then(|name| name.split('.').next())
+            .is_some_and(|target| plan.target_index(target).is_some());
         if name.starts_with('.') && !resumable {
             let path = entry.path();
             if path.is_dir() {
@@ -1031,16 +1073,18 @@ pub fn mirror_build_progress(archive: impl AsRef<Path>) -> Option<MirrorBuildPro
         .as_ref()
         .map_or(0, |history| history.fetch_transport_errors);
     for (kind, count) in [
-        ("content", plan.content_groups.len()),
+        ("content", plan.content_target_count()),
         ("history", plan.history_files.len()),
     ] {
         for index in 0..count {
-            let receipt_path = node_path(&root, kind, index).join("receipt.json");
+            let receipt_path = node_path(&root, &plan, kind, index).join("receipt.json");
             if receipt_path.is_file() {
                 completed += 1;
                 completed_bytes =
                     completed_bytes.saturating_add(plan.target_source_bytes(kind, index));
-                let target_name = format!("{kind}-{index:06}");
+                let target_name = plan
+                    .target_name(kind, index)
+                    .unwrap_or_else(|| format!("{kind}-{index:06}"));
                 let receipt_is_historical = historical_targets
                     .is_some_and(|targets| targets.contains(&target_name));
                 if !receipt_is_historical {
@@ -1092,9 +1136,7 @@ pub fn mirror_build_progress(archive: impl AsRef<Path>) -> Option<MirrorBuildPro
         if active.iter().any(|item: &String| item.starts_with(&target)) {
             continue;
         }
-        let Some((kind, index)) = target.rsplit_once('-').and_then(|(kind, index)| {
-            index.parse::<usize>().ok().map(|index| (kind, index))
-        }) else {
+        let Some((kind, index)) = plan.target_index(&target) else {
             active.push(target);
             continue;
         };
@@ -1322,27 +1364,8 @@ pub fn mirror_build_progress(archive: impl AsRef<Path>) -> Option<MirrorBuildPro
                 .iter()
                 .filter(|value| value.phase != "finished" || phase_is_failed(value))
                 .collect::<Vec<_>>();
-            visible.sort_by_key(|value| {
-                if kind == "content" {
-                    plan.content_groups[index]
-                        .iter()
-                        .position(|part| part.filename == value.part)
-                        .unwrap_or(usize::MAX)
-                } else {
-                    0
-                }
-            });
+            visible.sort_by_key(|value| value.part.clone());
             for value in visible {
-                let source_index = if kind == "content" {
-                    plan.content_groups[index]
-                        .iter()
-                        .position(|part| part.filename == value.part)
-                } else {
-                    None
-                };
-                let worker = source_index
-                    .filter(|_| live.len() > 1)
-                    .map_or_else(|| target.clone(), |source| format!("{target}/s{:02}", source + 1));
                 let heartbeat = (value.heartbeat_at_micros > 0)
                     .then(|| {
                         observed_now.saturating_sub(value.heartbeat_at_micros) / 1_000_000
@@ -1354,7 +1377,7 @@ pub fn mirror_build_progress(archive: impl AsRef<Path>) -> Option<MirrorBuildPro
                     })
                     .unwrap_or(0);
                 target_progress.push(MirrorTargetProgress {
-                    target: worker,
+                    target: target.clone(),
                     kind: kind.to_owned(),
                     phase: if value.phase.is_empty() {
                         "working".into()
@@ -1464,10 +1487,22 @@ fn publish_node(
     if temporary.join("siteinfo.swdump").exists() {
         std::fs::File::open(temporary.join("siteinfo.swdump"))?.sync_all()?;
     }
+    let receipt_index = match kind {
+        "content" => plan
+            .content_target(index)
+            .map_or(index, |(group, _, _)| {
+                if plan.content_groups[group].len() == 1 {
+                    group
+                } else {
+                    index
+                }
+            }),
+        _ => index,
+    };
     let receipt = BuildReceipt {
         plan_id: plan.plan_id.clone(),
         kind: kind.to_owned(),
-        index,
+        index: receipt_index,
         data_bytes,
         stats: stats.clone(),
     };
@@ -1480,7 +1515,7 @@ fn publish_node(
         output.sync_all()?;
     }
     sync_directory(temporary)?;
-    let destination = node_path(root, kind, index);
+    let destination = node_path(root, plan, kind, index);
     std::fs::rename(temporary, &destination)?;
     // Finished source sidecars remain beside their intermediate archives
     // until this atomic publish so the target's live byte count cannot move
@@ -1513,9 +1548,12 @@ pub(crate) fn materialize_direct_build_node(
         progress(&format!("reusing {kind} target {}/{}", index + 1, plan.target_count()));
         return Ok(());
     }
+    let target_name = plan
+        .target_name(kind, index)
+        .ok_or(Error::Corrupt("target is outside build plan"))?;
     let temporary = root
         .join("nodes")
-        .join(format!(".{kind}-{index:06}.partial"));
+        .join(format!(".{target_name}.partial"));
     std::fs::create_dir_all(&temporary)?;
     // A target can spend many minutes inside one blocking read/write call:
     // durable receipts only appear after the whole target is complete, and
@@ -1531,7 +1569,7 @@ pub(crate) fn materialize_direct_build_node(
     let heartbeat_stop = Arc::new(AtomicBool::new(false));
     let heartbeat_activity = Arc::clone(&activity);
     let heartbeat_stop_thread = Arc::clone(&heartbeat_stop);
-    let heartbeat_name = format!("{kind}-{index:06}");
+    let heartbeat_name = target_name.clone();
     let heartbeat = std::thread::spawn(move || {
         while !heartbeat_stop_thread.load(Ordering::Relaxed) {
             for _ in 0..50 {
@@ -1555,18 +1593,16 @@ pub(crate) fn materialize_direct_build_node(
     };
     let result: Result<PartialStats> = match kind {
         "content" => {
-            let parts = plan
-                .content_groups
-                .get(index)
-                .ok_or(Error::Corrupt("content target is outside build plan"))?
-                .iter()
-                .map(plan_part)
-                .collect::<Vec<_>>();
-            let built = build_content_group(
+            let part = plan_part(
+                plan.content_target(index)
+                    .ok_or(Error::Corrupt("content target is outside build plan"))?
+                    .2,
+            );
+            let part_path = temporary.join(format!("{target_name}.swdump"));
+            let built = build_content_part(
                 client,
-                &parts,
-                index,
-                &temporary,
+                &part,
+                &part_path,
                 bz2_workers,
                 plan.observed_at_micros,
                 true,
@@ -1644,7 +1680,7 @@ pub(crate) fn assemble_direct_build(
         return Ok(output);
     }
     for (kind, count) in [
-        ("content", plan.content_groups.len()),
+        ("content", plan.content_target_count()),
         ("history", plan.history_files.len()),
     ] {
         for index in 0..count {
@@ -1684,14 +1720,14 @@ pub(crate) fn assemble_direct_build(
         .map_err(map_archive)?;
     manifest_writer.finish().map_err(map_archive)?;
 
-    let mut inputs = (0..plan.content_groups.len())
-        .map(|index| node_path(root, "content", index).join("data.swdump"))
+    let mut inputs = (0..plan.content_target_count())
+        .map(|index| node_path(root, plan, "content", index).join("data.swdump"))
         .chain(
             (0..plan.history_files.len())
-                .map(|index| node_path(root, "history", index).join("data.swdump")),
+                .map(|index| node_path(root, plan, "history", index).join("data.swdump")),
         )
         .collect::<Vec<_>>();
-    inputs.push(node_path(root, "content", 0).join("siteinfo.swdump"));
+    inputs.push(node_path(root, plan, "content", 0).join("siteinfo.swdump"));
     inputs.push(manifest_archive.clone());
     progress("assembling durable page-ID range files");
     let temporary = crate::archive_set::ArchiveSetOutput::new_in(
@@ -1720,12 +1756,12 @@ pub(crate) fn assemble_direct_build(
 
     for kind in ["content", "history"] {
         let count = if kind == "content" {
-            plan.content_groups.len()
+            plan.content_target_count()
         } else {
             plan.history_files.len()
         };
         for index in 0..count {
-            std::fs::remove_dir_all(node_path(root, kind, index))?;
+            std::fs::remove_dir_all(node_path(root, plan, kind, index))?;
         }
     }
     std::fs::remove_file(manifest_archive)?;
@@ -3063,11 +3099,8 @@ fn build_content_part(
         path: live_path.clone(),
         value: LiveTargetProgress {
             target: path
-                .file_name()
+                .file_stem()
                 .and_then(|name| name.to_str())
-                .unwrap_or("content")
-                .split("-source-")
-                .next()
                 .unwrap_or("content")
                 .to_owned(),
             part: part.filename.clone(),
@@ -3498,6 +3531,48 @@ mod build_graph_tests {
     use super::*;
 
     #[test]
+    fn flattened_content_targets_keep_singleton_group_names_stable() {
+        let part = |name: &str| PlannedPart {
+            url: format!("https://example.invalid/{name}"),
+            filename: name.into(),
+            size_bytes: 1,
+            sha256: None,
+            sha1: None,
+            md5: None,
+        };
+        let plan = DirectBuildPlan {
+            schema: 1,
+            plan_id: "test".into(),
+            wiki_db: "testwiki".into(),
+            content_snapshot: "2024-06-01".into(),
+            metadata_snapshot: "2024-06".into(),
+            observed_at_micros: 0,
+            frame_target: 1,
+            range_target: 1,
+            compression_level: 1,
+            ref_prefix_sample_bytes: 1,
+            ref_prefix_bytes: 1,
+            content_groups: vec![
+                vec![part("one")],
+                vec![part("slice-a"), part("slice-b")],
+                vec![part("three")],
+            ],
+            history_files: Vec::new(),
+        };
+        assert_eq!(plan.content_target_count(), 4);
+        assert_eq!(plan.target_name("content", 0).as_deref(), Some("content-000000"));
+        assert_eq!(
+            plan.target_name("content", 1).as_deref(),
+            Some("content-000001-source-000000")
+        );
+        assert_eq!(
+            plan.target_name("content", 2).as_deref(),
+            Some("content-000001-source-000001")
+        );
+        assert_eq!(plan.target_name("content", 3).as_deref(), Some("content-000002"));
+    }
+
+    #[test]
     fn network_progress_survives_partial_target_replacement() {
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir(root.path().join("nodes")).unwrap();
@@ -3579,8 +3654,6 @@ mod build_graph_tests {
         let directory = tempfile::tempdir().unwrap();
         let archive = directory.path().join("testwiki.swdump");
         let root = crate::cli::mirror_scratch_path(&archive);
-        let partial = root.join("nodes/.content-000000.123.partial");
-        std::fs::create_dir_all(&partial).unwrap();
         let part = |name: &str| PlannedPart {
             url: format!("https://example.invalid/{name}"),
             filename: name.into(),
@@ -3609,6 +3682,7 @@ mod build_graph_tests {
             history_files: Vec::new(),
         };
         plan.plan_id = direct_plan_id(&plan).unwrap();
+        std::fs::create_dir_all(root.join("nodes")).unwrap();
         std::fs::write(
             root.join("plan.json"),
             serde_json::to_vec(&plan).unwrap(),
@@ -3616,7 +3690,7 @@ mod build_graph_tests {
         .unwrap();
         let values = [
             LiveTargetProgress {
-                target: "content-000000".into(),
+                target: "content-000000-source-000000".into(),
                 part: "source-1.xml.bz2".into(),
                 phase: "finished".into(),
                 source_bytes_read: 100,
@@ -3626,7 +3700,7 @@ mod build_graph_tests {
                 ..Default::default()
             },
             LiveTargetProgress {
-                target: "content-000000".into(),
+                target: "content-000000-source-000001".into(),
                 part: "source-2.xml.bz2".into(),
                 phase: "waiting for source bytes".into(),
                 source_bytes_read: 20,
@@ -3636,7 +3710,7 @@ mod build_graph_tests {
                 ..Default::default()
             },
             LiveTargetProgress {
-                target: "content-000000".into(),
+                target: "content-000000-source-000002".into(),
                 part: "source-3.xml.bz2".into(),
                 phase: "waiting for network slot".into(),
                 source_bytes_total: 100,
@@ -3646,6 +3720,10 @@ mod build_graph_tests {
             },
         ];
         for (index, value) in values.iter().enumerate() {
+            let partial = root.join(format!(
+                "nodes/.content-000000-source-{index:06}.123.partial"
+            ));
+            std::fs::create_dir_all(&partial).unwrap();
             std::fs::write(
                 partial.join(format!("source-{index}.progress.json")),
                 serde_json::to_vec(value).unwrap(),
@@ -3655,14 +3733,28 @@ mod build_graph_tests {
 
         let progress = mirror_build_progress(&archive).unwrap();
         assert_eq!(progress.source_bytes_completed, 120);
-        assert_eq!(progress.target_progress.len(), 2);
-        assert_eq!(progress.target_progress[0].target, "content-000000/s02");
-        assert_eq!(progress.target_progress[0].source_bytes_read, 20);
-        assert_eq!(progress.target_progress[1].target, "content-000000/s03");
-        assert_eq!(progress.target_progress[1].fetch_attempts, 0);
+        assert_eq!(progress.target_progress.len(), 3);
+        assert_eq!(
+            progress
+                .target_progress
+                .iter()
+                .find(|row| row.target == "content-000000-source-000001")
+                .unwrap()
+                .source_bytes_read,
+            20
+        );
+        assert_eq!(
+            progress
+                .target_progress
+                .iter()
+                .find(|row| row.target == "content-000000-source-000002")
+                .unwrap()
+                .fetch_attempts,
+            0
+        );
         assert!(
-            progress.targets_active[0].contains("120 B / 300 B"),
-            "target aggregate retains the finished source: {:?}",
+            progress.targets_active.iter().any(|row| row.contains("100 B / 100 B")),
+            "finished fragment remains visible until its receipt is published: {:?}",
             progress.targets_active,
         );
     }
@@ -3734,7 +3826,7 @@ mod build_graph_tests {
         crate::archive_set::ArchiveSetReader::open(archive).unwrap();
         assert!(root.path().join("archive.complete").exists());
         assert!(
-            !node_path(root.path(), "content", 0).exists(),
+            !node_path(root.path(), &plan, "content", 0).exists(),
             "consumed target survived its durable replacement"
         );
         std::fs::remove_file(root.path().join("archive.complete")).unwrap();
@@ -3759,8 +3851,23 @@ mod build_graph_tests {
             when.method(GET).path("/slice.xml");
             then.status(200).body(content);
         });
-        let parts = [
-            wikimak_mediawiki::Part {
+        let mut plan = DirectBuildPlan {
+            schema: 1,
+            plan_id: String::new(),
+            wiki_db: "testwiki".into(),
+            content_snapshot: "2024-06-01".into(),
+            metadata_snapshot: "2024-06".into(),
+            observed_at_micros: snapshot_date_micros(
+                chrono::NaiveDate::from_ymd_opt(2024, 6, 1).unwrap(),
+            )
+            .unwrap(),
+            frame_target: MIRROR_FRAME_TARGET,
+            range_target: crate::archive_set::DEFAULT_RANGE_TARGET,
+            compression_level: 9,
+            ref_prefix_sample_bytes: MIRROR_REF_PREFIX_SAMPLE_BYTES,
+            ref_prefix_bytes: MIRROR_REF_PREFIX_BYTES,
+            content_groups: vec![vec![
+                PlannedPart {
                 url: server.url("/range.xml"),
                 filename: "testwiki-p1p3.xml".into(),
                 size_bytes: content.len() as u64,
@@ -3768,7 +3875,7 @@ mod build_graph_tests {
                 sha1: None,
                 md5: None,
             },
-            wikimak_mediawiki::Part {
+                PlannedPart {
                 url: server.url("/slice.xml"),
                 filename: "testwiki-p2r1r999.xml".into(),
                 size_bytes: content.len() as u64,
@@ -3776,44 +3883,45 @@ mod build_graph_tests {
                 sha1: None,
                 md5: None,
             },
-        ];
+            ]],
+            history_files: Vec::new(),
+        };
+        plan.plan_id = direct_plan_id(&plan).unwrap();
         let scratch = tempfile::tempdir().unwrap();
-        let result = build_content_group(
+        std::fs::create_dir(scratch.path().join("nodes")).unwrap();
+        assert_eq!(plan.content_target_count(), 2);
+        assert_eq!(
+            plan.target_name("content", 0).as_deref(),
+            Some("content-000000-source-000000")
+        );
+        assert_eq!(
+            plan.target_name("content", 1).as_deref(),
+            Some("content-000000-source-000001")
+        );
+        materialize_direct_build_node(
             &Client::new(),
-            &parts,
-            0,
             scratch.path(),
+            &plan,
+            "content",
+            0,
             2,
-            snapshot_date_micros(
-                chrono::NaiveDate::from_ymd_opt(2024, 6, 1).unwrap(),
-            )
-            .unwrap(),
-            true,
             &|_| {},
         )
         .unwrap();
-
-        let (_, _, complete) = crate::archive::index_file(result.path).unwrap();
-        assert!(complete);
-        let live = std::fs::read_dir(scratch.path())
-            .unwrap()
-            .flatten()
-            .filter(|entry| {
-                entry
-                    .file_name()
-                    .to_string_lossy()
-                    .ends_with(".progress.json")
-            })
-            .filter_map(|entry| std::fs::read(entry.path()).ok())
-            .filter_map(|bytes| serde_json::from_slice::<LiveTargetProgress>(&bytes).ok())
-            .collect::<Vec<_>>();
-        assert_eq!(live.len(), 2, "finished source progress remains target-live");
-        assert!(live.iter().all(|value| value.phase == "finished"));
-        assert_eq!(
-            live.iter().map(|value| value.source_bytes_read).sum::<u64>(),
-            (content.len() * 2) as u64,
-            "finished source bytes remain in the target total until publication",
-        );
+        materialize_direct_build_node(
+            &Client::new(),
+            scratch.path(),
+            &plan,
+            "content",
+            1,
+            2,
+            &|_| {},
+        )
+        .unwrap();
+        assert!(validate_node(scratch.path(), &plan, "content", 0).unwrap());
+        assert!(validate_node(scratch.path(), &plan, "content", 1).unwrap());
+        let archive = assemble_direct_build(scratch.path(), &plan, &|_| {}).unwrap();
+        crate::archive_set::ArchiveSetReader::open(archive).unwrap();
         assert_eq!(first.hits(), 1);
         assert_eq!(slice.hits(), 1);
     }

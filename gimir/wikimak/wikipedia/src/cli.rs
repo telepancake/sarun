@@ -245,8 +245,14 @@ fn make_program() -> Result<PathBuf, String> {
 }
 
 fn build_node_targets(plan: &crate::direct::DirectBuildPlan) -> Vec<String> {
-    (0..plan.content_groups.len())
-        .map(|index| format!("nodes/content-{index:06}.done"))
+    (0..plan.content_target_count())
+        .map(|index| {
+            format!(
+                "nodes/{}.done",
+                plan.target_name("content", index)
+                    .expect("content target index came from the plan")
+            )
+        })
         .chain(
             (0..plan.history_files.len())
                 .map(|index| format!("nodes/history-{index:06}.done")),
@@ -277,9 +283,12 @@ fn write_stage_one_makefile(
     makefile.push_str(&format!(
         "\n\t@{tool} build-stage2 . plan.json\n\n"
     ));
-    for index in 0..plan.content_groups.len() {
+    for index in 0..plan.content_target_count() {
+        let target = plan
+            .target_name("content", index)
+            .expect("content target index came from the plan");
         makefile.push_str(&format!(
-            "nodes/content-{index:06}.done:\n\
+            "nodes/{target}.done:\n\
              \t@{tool} build-node . plan.json content {index} {bz2_workers}\n\n"
         ));
     }
