@@ -17,6 +17,32 @@ struct UpdateCheckpointReceipt {
     compression_level: i32,
 }
 
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
+struct UpdateRangePlan {
+    schema: u32,
+    checkpoint_key: String,
+    ranges: Vec<UpdateRange>,
+}
+
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
+struct UpdateRange {
+    name: String,
+    kind: u8,
+    first_id: u64,
+    last_id: u64,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct UpdateRangeReceipt {
+    schema: u32,
+    checkpoint_key: String,
+    old_name: String,
+    new_name: String,
+    bytes: u64,
+    frames: u64,
+    records: u64,
+}
+
 impl MirrorBuildLock {
     fn acquire(scratch: &Path) -> Result<Self, String> {
         use std::os::fd::AsRawFd;
@@ -266,7 +292,7 @@ fn write_stage_one_makefile(
 ) -> Result<(), String> {
     let tool = build_tool_command()?;
     let make = recursive_make_command()?;
-    let cores = std::thread::available_parallelism().map_or(1, usize::from);
+    let cores = crate::direct::processing_parallelism();
     let outer_workers = plan.target_count().min(cores).min(3).max(1);
     let bz2_workers = (cores / outer_workers).max(1);
     let targets = build_node_targets(plan);
@@ -318,7 +344,10 @@ fn write_stage_two_makefile(
     persist_text(&scratch.join("stage2.mk"), &makefile)
 }
 
-fn run_build_make(scratch: &Path) -> Result<(), String> {
+fn run_build_make(
+    scratch: &Path,
+    plan: &crate::direct::DirectBuildPlan,
+) -> Result<(), String> {
     let log_directory = std::fs::canonicalize(scratch)
         .map_err(|error| format!("{}: {error}", scratch.display()))?
         .join("target-logs");
@@ -327,12 +356,17 @@ fn run_build_make(scratch: &Path) -> Result<(), String> {
     // platform's default temporary directory.  Point that directory at the
     // same external scratch tree so a tool added later cannot put an
     // unbounded intermediate on the system volume.
+    let jobs = plan
+        .target_count()
+        .min(crate::direct::processing_parallelism())
+        .min(3)
+        .max(1);
     let status = std::process::Command::new(make_program()?)
         .current_dir(scratch)
         .env("SARUN_KATI_TARGET_LOG_DIR", log_directory)
         .env("SARUN_WIKIMEDIA_ROBOTS_CACHE", scratch.join("robots-cache"))
         .env("TMPDIR", scratch)
-        .args(["-f", "stage1.mk", "-j3"])
+        .args(["-f", "stage1.mk", &format!("-j{jobs}")])
         .status()
         .map_err(|error| format!("cannot start resumable build: {error}"))?;
     if status.success() {
@@ -485,11 +519,24 @@ fn install_built_archive(
         .unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(parent).map_err(|error| format!("{}: {error}", parent.display()))?;
 
-    eprintln!("building title history index");
     let mut titles = tempfile::NamedTempFile::new_in(scratch)
         .map_err(|error| format!("{}: {error}", scratch.display()))?;
-    let title_entries = crate::title_index::build(&archive, titles.path())
-        .map_err(|error| error.to_string())?;
+    let projected = archive.with_extension("swtitle");
+    let title_entries = if projected.exists() {
+        eprintln!("using title history index produced during final merge");
+        let index = crate::title_index::TitleIndex::open(&projected)
+            .map_err(|error| error.to_string())?;
+        let entries = index.entry_count() as u64;
+        let mut input = std::fs::File::open(&projected)
+            .map_err(|error| format!("{}: {error}", projected.display()))?;
+        std::io::copy(&mut input, titles.as_file_mut())
+            .map_err(|error| format!("{}: {error}", projected.display()))?;
+        entries
+    } else {
+        eprintln!("building title history index");
+        crate::title_index::build(&archive, titles.path())
+            .map_err(|error| error.to_string())?
+    };
     titles
         .as_file_mut()
         .sync_all()
@@ -499,6 +546,388 @@ fn install_built_archive(
     persist_archive_pair(archive, titles, destination)?;
     eprintln!("{title_entries} title intervals");
     Ok(())
+}
+
+fn load_or_create_update_range_plan(
+    archive: &Path,
+    scratch: &Path,
+    checkpoint_key: &str,
+) -> Result<UpdateRangePlan, String> {
+    let path = scratch.join("update-ranges.json");
+    if path.exists() {
+        let plan: UpdateRangePlan = serde_json::from_slice(
+            &std::fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))?,
+        )
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+        if plan.schema != 1 || plan.checkpoint_key != checkpoint_key || plan.ranges.is_empty() {
+            return Err(format!(
+                "{} does not describe this update generation",
+                path.display()
+            ));
+        }
+        return Ok(plan);
+    }
+    let set = crate::archive_set::ArchiveSetReader::open(archive)
+        .map_err(|error| error.to_string())?;
+    let ranges = set
+        .segments()
+        .iter()
+        .filter_map(|segment| {
+            segment.kind.map(|kind| UpdateRange {
+                name: segment.name.clone(),
+                kind: kind as u8,
+                first_id: segment.first_id,
+                last_id: segment.last_id,
+            })
+        })
+        .collect::<Vec<_>>();
+    if ranges.is_empty() {
+        return Err("Wikipedia archive has no entity range files".into());
+    }
+    let plan = UpdateRangePlan {
+        schema: 1,
+        checkpoint_key: checkpoint_key.to_owned(),
+        ranges,
+    };
+    persist_json(&path, &plan)?;
+    Ok(plan)
+}
+
+fn update_range_receipt_path(scratch: &Path, index: usize) -> PathBuf {
+    scratch
+        .join("updated-ranges")
+        .join(format!("{index:06}.json"))
+}
+
+fn read_update_range_receipt(
+    archive: &Path,
+    scratch: &Path,
+    plan: &UpdateRangePlan,
+    index: usize,
+) -> Result<Option<UpdateRangeReceipt>, String> {
+    let path = update_range_receipt_path(scratch, index);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("{}: {error}", path.display())),
+    };
+    let receipt: UpdateRangeReceipt =
+        serde_json::from_slice(&bytes).map_err(|error| format!("{}: {error}", path.display()))?;
+    let range = &plan.ranges[index];
+    let installed = archive.join(&receipt.new_name);
+    if receipt.schema != 1
+        || receipt.checkpoint_key != plan.checkpoint_key
+        || receipt.old_name != range.name
+        || std::fs::metadata(&installed)
+            .map(|metadata| metadata.len())
+            .ok()
+            != Some(receipt.bytes)
+    {
+        return Err(format!(
+            "{} does not match its installed range file",
+            path.display()
+        ));
+    }
+    Ok(Some(receipt))
+}
+
+fn sync_directory_path(path: &Path) -> Result<(), String> {
+    std::fs::File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| format!("{}: {error}", path.display()))
+}
+
+fn one_range_archive(
+    archive: &Path,
+    range_name: &str,
+    scratch: &Path,
+) -> Result<tempfile::TempDir, String> {
+    let temporary =
+        tempfile::tempdir_in(scratch).map_err(|error| format!("{}: {error}", scratch.display()))?;
+    for name in [
+        "0000-reference.swdump-part",
+        range_name,
+        "9999-complete.swdump-part",
+    ] {
+        std::fs::hard_link(archive.join(name), temporary.path().join(name))
+            .map_err(|error| format!("{}: {error}", archive.join(name).display()))?;
+    }
+    crate::archive_set::ArchiveSetReader::open(temporary.path())
+        .map_err(|error| error.to_string())?;
+    Ok(temporary)
+}
+
+fn update_record_belongs_to_range(
+    record: &crate::archive::Record,
+    kind: crate::archive::EntityKind,
+    upper_id: u64,
+) -> bool {
+    let entity = record.entity();
+    entity.kind == kind && entity.id <= upper_id
+}
+
+struct UpdateRangeSource<'a> {
+    tail: &'a mut crate::archive::ArchiveRecordReader,
+    pending: &'a mut Option<crate::archive::Record>,
+    kind: crate::archive::EntityKind,
+    upper_id: u64,
+    records: &'a mut u64,
+}
+
+impl crate::archive::RecordSource for UpdateRangeSource<'_> {
+    fn next_record(
+        &mut self,
+    ) -> crate::archive::Result<Option<crate::archive::Record>> {
+        let Some(record) = self.pending.take() else {
+            return Ok(None);
+        };
+        if !update_record_belongs_to_range(&record, self.kind, self.upper_id) {
+            *self.pending = Some(record);
+            return Ok(None);
+        }
+        *self.pending = self.tail.next_record()?;
+        *self.records = self
+            .records
+            .checked_add(1)
+            .ok_or(crate::archive::ArchiveError::FieldTooLarge)?;
+        Ok(Some(record))
+    }
+}
+
+fn skip_update_range(
+    tail: &mut crate::archive::ArchiveRecordReader,
+    pending: &mut Option<crate::archive::Record>,
+    kind: crate::archive::EntityKind,
+    upper_id: u64,
+) -> Result<u64, String> {
+    let mut records = 0_u64;
+    while pending
+        .as_ref()
+        .is_some_and(|record| update_record_belongs_to_range(record, kind, upper_id))
+    {
+        *pending = tail.next_record().map_err(|error| error.to_string())?;
+        records = records.saturating_add(1);
+    }
+    Ok(records)
+}
+
+fn replace_archive_ranges(
+    archive: &Path,
+    update: &Path,
+    scratch: &Path,
+    checkpoint_key: &str,
+) -> Result<(u64, u64), String> {
+    let plan = load_or_create_update_range_plan(archive, scratch, checkpoint_key)?;
+    std::fs::create_dir_all(scratch.join("updated-ranges"))
+        .map_err(|error| format!("{}: {error}", scratch.display()))?;
+
+    // Existing readers retain Arc<File> handles for every range. Renaming a
+    // completed replacement therefore switches future generations without
+    // disturbing a reader that was open when the update began.
+    let prefix = crate::archive::archive_ref_prefix(archive)
+        .map_err(|error| error.to_string())?;
+    let mut tail = crate::archive::ArchiveRecordReader::open(update)
+        .map_err(|error| error.to_string())?;
+    let mut pending = tail.next_record().map_err(|error| error.to_string())?;
+    let mut total_frames = 0_u64;
+    let mut total_records = 0_u64;
+
+    for (index, range) in plan.ranges.iter().enumerate() {
+        let kind = crate::archive::EntityKind::try_from(range.kind)
+            .map_err(|error| error.to_string())?;
+        let final_for_kind = plan
+            .ranges
+            .get(index + 1)
+            .is_none_or(|next| next.kind != range.kind);
+        let upper_id = if final_for_kind {
+            u64::MAX
+        } else {
+            range.last_id
+        };
+        if let Some(receipt) =
+            read_update_range_receipt(archive, scratch, &plan, index)?
+        {
+            skip_update_range(&mut tail, &mut pending, kind, upper_id)?;
+            if receipt.old_name != receipt.new_name {
+                match std::fs::remove_file(archive.join(&receipt.old_name)) {
+                    Ok(()) => sync_directory_path(archive)?,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(format!(
+                            "{}: {error}",
+                            archive.join(&receipt.old_name).display()
+                        ))
+                    }
+                }
+            }
+            total_frames = total_frames.saturating_add(receipt.frames);
+            total_records = total_records.saturating_add(receipt.records);
+            eprintln!(
+                "reusing updated range {}/{} {}",
+                index + 1,
+                plan.ranges.len(),
+                receipt.new_name
+            );
+            continue;
+        }
+
+        if pending.as_ref().is_some_and(|record| record.entity().kind < kind) {
+            return Err("sorted update stream contains an entity before its archive range".into());
+        }
+        let touched = pending
+            .as_ref()
+            .is_some_and(|record| update_record_belongs_to_range(record, kind, upper_id));
+        if !touched {
+            let bytes = std::fs::metadata(archive.join(&range.name))
+                .map_err(|error| format!("{}: {error}", archive.join(&range.name).display()))?
+                .len();
+            persist_json(
+                &update_range_receipt_path(scratch, index),
+                &UpdateRangeReceipt {
+                    schema: 1,
+                    checkpoint_key: plan.checkpoint_key.clone(),
+                    old_name: range.name.clone(),
+                    new_name: range.name.clone(),
+                    bytes,
+                    frames: 0,
+                    records: 0,
+                },
+            )?;
+            eprintln!(
+                "keeping unchanged range {}/{} {}",
+                index + 1,
+                plan.ranges.len(),
+                range.name
+            );
+            continue;
+        }
+        eprintln!(
+            "streaming update into range {}/{} {}",
+            index + 1,
+            plan.ranges.len(),
+            range.name
+        );
+        let base = one_range_archive(archive, &range.name, scratch)?;
+        let output = crate::archive_set::ArchiveSetOutput::new_in(scratch, u64::MAX)
+            .map_err(|error| error.to_string())?;
+        let mut additions = 0_u64;
+        let mut last_progress = std::time::Instant::now();
+        let (output, frames, records) =
+            crate::archive::merge_archive_with_sorted_source_and_ref_prefix(
+                &prefix,
+                base.path(),
+                Box::new(UpdateRangeSource {
+                    tail: &mut tail,
+                    pending: &mut pending,
+                    kind,
+                    upper_id,
+                    records: &mut additions,
+                }),
+                output,
+                MIRROR_FRAME_TARGET,
+                mirror_compression(),
+                |records| {
+                    if last_progress.elapsed() >= std::time::Duration::from_secs(2) {
+                        eprintln!(
+                            "range {}/{}: merged {records} records",
+                            index + 1,
+                            plan.ranges.len()
+                        );
+                        last_progress = std::time::Instant::now();
+                    }
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        let completed = output.finish().map_err(|error| error.to_string())?;
+        let replacement = scratch.join(format!(".updated-range-{index:06}"));
+        if replacement.exists() {
+            remove_path(&replacement)
+                .map_err(|error| format!("{}: {error}", replacement.display()))?;
+        }
+        completed
+            .persist(&replacement)
+            .map_err(|error| error.to_string())?;
+        let replacement_set = crate::archive_set::ArchiveSetReader::open(&replacement)
+            .map_err(|error| error.to_string())?;
+        let replacement_range = replacement_set
+            .segments()
+            .iter()
+            .find(|segment| segment.kind == Some(kind))
+            .ok_or_else(|| "range replacement contains no entity data".to_string())?
+            .clone();
+        let new_name = replacement_range.name;
+        let new_bytes = replacement_range.bytes;
+        let installed = archive.join(&new_name);
+        std::fs::rename(replacement.join(&new_name), &installed)
+            .map_err(|error| format!("{}: {error}", installed.display()))?;
+        sync_directory_path(archive)?;
+        let receipt = UpdateRangeReceipt {
+            schema: 1,
+            checkpoint_key: plan.checkpoint_key.clone(),
+            old_name: range.name.clone(),
+            new_name: new_name.clone(),
+            bytes: new_bytes,
+            frames,
+            records,
+        };
+        persist_json(&update_range_receipt_path(scratch, index), &receipt)?;
+        if new_name != range.name {
+            std::fs::remove_file(archive.join(&range.name))
+                .map_err(|error| format!("{}: {error}", archive.join(&range.name).display()))?;
+            sync_directory_path(archive)?;
+        }
+        remove_path(&replacement)
+            .map_err(|error| format!("{}: {error}", replacement.display()))?;
+        total_frames = total_frames.saturating_add(frames);
+        total_records = total_records.saturating_add(records);
+        eprintln!(
+            "installed range {}/{} {} after merging {additions} update records",
+            index + 1,
+            plan.ranges.len(),
+            new_name
+        );
+    }
+    if let Some(record) = pending {
+        return Err(format!(
+            "sorted update record {:?} is outside the archive range plan",
+            record.entity()
+        ));
+    }
+    Ok((total_frames, total_records))
+}
+
+fn ensure_update_serving_snapshot(archive: &Path, scratch: &Path) -> Result<(), String> {
+    let snapshot = scratch.join("serving-generation.swdump");
+    let snapshot_titles = snapshot.with_extension("swtitle");
+    if snapshot.exists() || snapshot_titles.exists() {
+        if !snapshot.exists() || !snapshot_titles.exists() {
+            return Err("update serving snapshot is incomplete".into());
+        }
+        crate::archive_set::ArchiveSetReader::open(&snapshot)
+            .map_err(|error| error.to_string())?;
+        crate::title_index::TitleIndex::open(&snapshot_titles)
+            .map_err(|error| error.to_string())?;
+        return Ok(());
+    }
+    let temporary =
+        tempfile::tempdir_in(scratch).map_err(|error| format!("{}: {error}", scratch.display()))?;
+    for entry in
+        std::fs::read_dir(archive).map_err(|error| format!("{}: {error}", archive.display()))?
+    {
+        let entry = entry.map_err(|error| format!("{}: {error}", archive.display()))?;
+        let name = entry.file_name();
+        std::fs::hard_link(entry.path(), temporary.path().join(name))
+            .map_err(|error| format!("{}: {error}", entry.path().display()))?;
+    }
+    crate::archive_set::ArchiveSetReader::open(temporary.path())
+        .map_err(|error| error.to_string())?;
+    std::fs::hard_link(archive.with_extension("swtitle"), &snapshot_titles)
+        .map_err(|error| format!("{}: {error}", snapshot_titles.display()))?;
+    #[allow(deprecated)]
+    let temporary = temporary.into_path();
+    std::fs::rename(&temporary, &snapshot)
+        .map_err(|error| format!("{}: {error}", snapshot.display()))?;
+    sync_directory_path(scratch)
 }
 
 #[cfg(feature = "serve")]
@@ -623,7 +1052,7 @@ fn build_full(
     }
     prepare_build_tools(scratch)?;
     write_stage_one_makefile(scratch, &plan)?;
-    run_build_make(scratch)?;
+    run_build_make(scratch, &plan)?;
     let built = scratch.join("archive.swdump");
     crate::archive_set::ArchiveSetReader::open(&built)
         .map_err(|error| error.to_string())?;
@@ -737,6 +1166,7 @@ fn cmd_fetch(dbname: &str, archive: &str) -> Result<(), String> {
                 schema: 1,
                 wiki_db: dbname.to_owned(),
                 checkpoint_key: expected_checkpoint_key
+                    .clone()
                     .expect("computed before update mutation"),
                 overlap_days,
                 frame_target: MIRROR_FRAME_TARGET,
@@ -744,7 +1174,21 @@ fn cmd_fetch(dbname: &str, archive: &str) -> Result<(), String> {
             },
         )?;
     }
+    let checkpoint_key = receipt
+        .as_ref()
+        .filter(|_| partial_complete)
+        .map(|receipt| receipt.checkpoint_key.clone())
+        .or(expected_checkpoint_key)
+        .ok_or_else(|| "update checkpoint identity is unavailable".to_string())?;
 
+    if update_marker.exists()
+        && !scratch.join("serving-generation.swdump").exists()
+    {
+        return Err(
+            "range update marker exists without its preserved serving generation".into(),
+        );
+    }
+    ensure_update_serving_snapshot(archive, &scratch)?;
     if !update_marker.exists() {
         std::fs::OpenOptions::new()
             .write(true)
@@ -754,40 +1198,9 @@ fn cmd_fetch(dbname: &str, archive: &str) -> Result<(), String> {
             .map_err(|error| format!("{}: {error}", update_marker.display()))?;
         sync_parent(archive)?;
     }
-    eprintln!("streaming current archive and updates through page-ID range files");
-    let inputs = vec![archive.to_path_buf(), partial];
-    let set = crate::archive_set::ArchiveSetReader::open(archive)
-        .map_err(|error| error.to_string())?;
-    let boundaries = set
-        .segments()
-        .iter()
-        .filter_map(|segment| {
-            segment.kind.map(|kind| crate::archive::EntityKey {
-                kind,
-                id: segment.last_id,
-            })
-        })
-        .collect::<Vec<_>>();
-    let merged = crate::archive_set::ArchiveSetOutput::replacing(
-        archive,
-        crate::archive_set::DEFAULT_RANGE_TARGET,
-        set.segments(),
-    )
-    .map_err(|error| error.to_string())?;
-    let (merged, frames, records) =
-        crate::archive::merge_many_archives_reusing_ref_prefix_at_boundaries(
-        archive,
-        &inputs,
-        merged,
-        MIRROR_FRAME_TARGET,
-        mirror_compression(),
-        boundaries,
-    )
-    .map_err(|error| error.to_string())?;
-    let completed = merged.finish().map_err(|error| error.to_string())?;
-    completed
-        .finish_replacement()
-        .map_err(|error| error.to_string())?;
+    eprintln!("merging the sorted update into one durable page-ID range at a time");
+    let (frames, records) =
+        replace_archive_ranges(archive, &partial, &scratch, &checkpoint_key)?;
 
     eprintln!("rebuilding the single title and virtual-frame index");
     let mut titles = tempfile::NamedTempFile::new_in(&scratch)
@@ -835,13 +1248,20 @@ fn cmd_discover(dbname: &str) -> Result<(), String> {
 #[cfg(feature = "serve")]
 fn cmd_serve(path: &str, addr: &str, packed_media: Option<&str>) -> Result<(), String> {
     let started = std::time::Instant::now();
-    let path = PathBuf::from(path);
-    if install_sidecar(&path, ".installing")?.exists() {
+    let mirror_path = PathBuf::from(path);
+    if install_sidecar(&mirror_path, ".installing")?.exists() {
         return Err("Wikipedia archive generation switch is in progress".into());
     }
-    if install_sidecar(&path, ".updating")?.exists() {
-        return Err("Wikipedia range-file update is in progress".into());
-    }
+    let path = if install_sidecar(&mirror_path, ".updating")?.exists() {
+        let snapshot = mirror_scratch_path(&mirror_path).join("serving-generation.swdump");
+        if !snapshot.exists() || !snapshot.with_extension("swtitle").exists() {
+            return Err("Wikipedia update lacks a readable preserved generation".into());
+        }
+        eprintln!("wikimak serve: update active; opening preserved generation");
+        snapshot
+    } else {
+        mirror_path.clone()
+    };
     let archive = crate::archive_browse::ArchiveBrowseIndex::open(
         &path,
         path.with_extension("swtitle"),
@@ -853,7 +1273,7 @@ fn cmd_serve(path: &str, addr: &str, packed_media: Option<&str>) -> Result<(), S
         archive.frame_count(),
         started.elapsed().as_secs_f64(),
     );
-    let media_root = path.with_extension("media");
+    let media_root = mirror_path.with_extension("media");
     let packed_media = packed_media
         .map(PathBuf::from)
         .or_else(|| has_packed_media(&media_root).then_some(media_root.clone()));
@@ -1314,6 +1734,133 @@ mod tests {
         let path = tempfile::tempdir_in(parent).unwrap().into_path();
         std::fs::write(path.join("payload"), bytes).unwrap();
         path
+    }
+
+    fn page_state(page_id: u64, timestamp_micros: i64) -> crate::archive::Record {
+        crate::archive::Record::PageState {
+            page_id,
+            timestamp_micros,
+            title: format!("Page {page_id}"),
+            namespace: None,
+            deleted: false,
+        }
+    }
+
+    fn manifest(timestamp_micros: i64, snapshot: &str) -> crate::archive::Record {
+        crate::archive::Record::Manifest {
+            timestamp_micros,
+            manifest: crate::archive::ManifestRecord {
+                wiki_db: "testwiki".into(),
+                content_snapshot: snapshot.into(),
+                metadata_snapshot: "2024-06".into(),
+                source_files: Vec::new(),
+            },
+        }
+    }
+
+    fn site_info(timestamp_micros: i64) -> crate::archive::Record {
+        crate::archive::Record::SiteInfo {
+            timestamp_micros,
+            site_info: crate::archive::SiteInfoRecord {
+                site_name: "Test".into(),
+                db_name: "testwiki".into(),
+                base: String::new(),
+                generator: String::new(),
+                case: "first-letter".into(),
+                language: "en".into(),
+                rtl: false,
+                server: String::new(),
+                script_path: String::new(),
+                namespaces: Vec::new(),
+                interwiki: Vec::new(),
+                magic_words: Vec::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn update_ranges_are_individually_durable_and_idempotent() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = directory.path().join("testwiki.swdump");
+        let output =
+            crate::archive_set::ArchiveSetOutput::new_in(directory.path(), 1).unwrap();
+        let prefix = vec![b'x'; 256];
+        let mut writer = crate::archive::ArchiveWriter::with_ref_prefix(
+            output,
+            1,
+            crate::archive::CompressionSettings {
+                level: 1,
+                ..Default::default()
+            },
+            &prefix,
+        )
+        .unwrap();
+        for record in [
+            page_state(1, 100),
+            page_state(2, 100),
+            manifest(100, "2024-06-01"),
+            site_info(100),
+        ] {
+            writer.write(&record).unwrap();
+        }
+        let (output, _) = writer.finish().unwrap();
+        output
+            .finish()
+            .unwrap()
+            .persist(&archive)
+            .unwrap();
+
+        let update = directory.path().join("update.swdump");
+        let mut writer = crate::archive::ArchiveWriter::new(
+            std::fs::File::create(&update).unwrap(),
+            1,
+        )
+        .unwrap();
+        for record in [
+            page_state(2, 200),
+            page_state(3, 200),
+            manifest(200, "2024-06-02"),
+        ] {
+            writer.write(&record).unwrap();
+        }
+        writer.finish().unwrap();
+        let scratch = directory.path().join("scratch");
+        std::fs::create_dir(&scratch).unwrap();
+        crate::title_index::build(&archive, archive.with_extension("swtitle")).unwrap();
+        ensure_update_serving_snapshot(&archive, &scratch).unwrap();
+        let snapshot = scratch.join("serving-generation.swdump");
+
+        let first = replace_archive_ranges(&archive, &update, &scratch, "checkpoint").unwrap();
+        let second = replace_archive_ranges(&archive, &update, &scratch, "checkpoint").unwrap();
+        assert_eq!(first, second);
+        assert_eq!(
+            std::fs::read_dir(scratch.join("updated-ranges"))
+                .unwrap()
+                .count(),
+            4
+        );
+
+        let mut records = crate::archive::ArchiveRecordReader::open(&archive).unwrap();
+        let mut page_three = 0;
+        while let Some(record) = records.next_record().unwrap() {
+            if record.entity()
+                == (crate::archive::EntityKey {
+                    kind: crate::archive::EntityKind::Page,
+                    id: 3,
+                })
+            {
+                page_three += 1;
+            }
+        }
+        assert_eq!(page_three, 1);
+        let mut old_records = crate::archive::ArchiveRecordReader::open(&snapshot).unwrap();
+        while let Some(record) = old_records.next_record().unwrap() {
+            assert_ne!(record.entity().id, 3);
+        }
+        assert!(
+            crate::archive_set::ArchiveSetReader::open(&archive).is_ok(),
+            "range replacement left obsolete or overlapping files"
+        );
     }
 
     #[test]

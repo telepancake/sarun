@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::Path;
 
-use crate::archive::{ArchiveRecordReader, PageActionKind, Record, SiteInfoRecord};
+use crate::archive::{PageActionKind, Record, SiteInfoRecord};
 
 const FILE_MAGIC: [u8; 8] = *b"SWTITLE\0";
 const FILE_VERSION: u32 = 2;
@@ -53,26 +53,30 @@ pub(crate) struct SegmentIndexEntry {
     pub(crate) bytes: u64,
 }
 
-pub fn build(
-    archive: impl AsRef<Path>,
-    output: impl AsRef<Path>,
-) -> crate::archive::Result<u64> {
-    let (_, frames, complete) = crate::archive::index_file(archive.as_ref())?;
-    if !complete {
-        return Err(crate::archive::ArchiveError::Invalid(
-            "archive has no clean completion marker",
-        ));
+type PageTitleInputs = (
+    Vec<(i64, String, Option<i64>, bool)>,
+    Vec<(i64, crate::archive::PageActionRecord)>,
+);
+
+/// Title history accumulated while a sorted archive is being written.
+///
+/// Keeping this projection beside the merge avoids decoding every revision
+/// text a second time merely to recover the comparatively tiny page-state and
+/// page-action subset used by the title index.
+pub(crate) struct TitleIndexBuilder {
+    site_info: Option<(i64, SiteInfoRecord)>,
+    pages: BTreeMap<u64, PageTitleInputs>,
+}
+
+impl TitleIndexBuilder {
+    pub(crate) fn new() -> Self {
+        Self {
+            site_info: None,
+            pages: BTreeMap::new(),
+        }
     }
-    let mut reader = ArchiveRecordReader::open(archive.as_ref())?;
-    let mut site_info = None;
-    let mut pages = BTreeMap::<
-        u64,
-        (
-            Vec<(i64, String, Option<i64>, bool)>,
-            Vec<(i64, crate::archive::PageActionRecord)>,
-        ),
-    >::new();
-    while let Some(record) = reader.next_record()? {
+
+    pub(crate) fn observe(&mut self, record: &Record) {
         match record {
             Record::PageState {
                 page_id,
@@ -80,24 +84,84 @@ pub fn build(
                 title,
                 namespace,
                 deleted,
-            } => pages.entry(page_id).or_default().0.push((
-                timestamp_micros,
-                title,
-                namespace,
-                deleted,
+            } => self.pages.entry(*page_id).or_default().0.push((
+                *timestamp_micros,
+                title.clone(),
+                *namespace,
+                *deleted,
             )),
             Record::PageAction {
                 entity,
                 timestamp_micros,
                 action,
             } if entity.kind == crate::archive::EntityKind::Page => {
-                pages.entry(entity.id).or_default().1.push((timestamp_micros, action));
+                self.pages
+                    .entry(entity.id)
+                    .or_default()
+                    .1
+                    .push((*timestamp_micros, action.clone()));
             }
             Record::SiteInfo {
-                site_info: record, ..
-            } if site_info.is_none() => site_info = Some(record),
+                timestamp_micros,
+                site_info,
+            } if self
+                .site_info
+                .as_ref()
+                .is_none_or(|(current, _)| timestamp_micros > current) =>
+            {
+                self.site_info = Some((*timestamp_micros, site_info.clone()));
+            }
             _ => {}
         }
+    }
+
+    pub(crate) fn finish(
+        self,
+        archive: impl AsRef<Path>,
+        output: impl AsRef<Path>,
+    ) -> crate::archive::Result<u64> {
+        write_index(
+            archive.as_ref(),
+            output.as_ref(),
+            self.site_info.map(|(_, site_info)| site_info),
+            self.pages,
+        )
+    }
+}
+
+pub fn build(
+    archive: impl AsRef<Path>,
+    output: impl AsRef<Path>,
+) -> crate::archive::Result<u64> {
+    let mut builder = TitleIndexBuilder::new();
+    let workers = std::env::var("SARUN_WIKIMAK_CPU_BUDGET")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, usize::from));
+    let mut last_progress = std::time::Instant::now();
+    crate::archive::visit_title_records_parallel(archive.as_ref(), workers, |record| {
+        builder.observe(&record);
+    }, |completed, total| {
+        if completed == total || last_progress.elapsed() >= std::time::Duration::from_secs(2) {
+            eprintln!("title index metadata scan: {completed}/{total} frames");
+            last_progress = std::time::Instant::now();
+        }
+    })?;
+    builder.finish(archive, output)
+}
+
+fn write_index(
+    archive: &Path,
+    output: &Path,
+    site_info: Option<SiteInfoRecord>,
+    pages: BTreeMap<u64, PageTitleInputs>,
+) -> crate::archive::Result<u64> {
+    let (_, frames, complete) = crate::archive::index_file(archive)?;
+    if !complete {
+        return Err(crate::archive::ArchiveError::Invalid(
+            "archive has no clean completion marker",
+        ));
     }
     let site_info = site_info.ok_or(crate::archive::ArchiveError::Invalid(
         "archive has no siteinfo record",
@@ -160,7 +224,6 @@ pub fn build(
         );
     }
 
-    let output = output.as_ref();
     let parent = output
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
@@ -170,8 +233,8 @@ pub fn build(
         u64::try_from(changes.len()).map_err(|_| crate::archive::ArchiveError::FieldTooLarge)?;
     let frame_count =
         u64::try_from(frames.len()).map_err(|_| crate::archive::ArchiveError::FieldTooLarge)?;
-    let segments = if archive.as_ref().is_dir() {
-        crate::archive_set::ArchiveSetReader::open(archive.as_ref())?
+    let segments = if archive.is_dir() {
+        crate::archive_set::ArchiveSetReader::open(archive)?
             .segments()
             .to_vec()
     } else {
@@ -474,6 +537,10 @@ impl TitleIndex {
     }
 
     fn len(&self) -> usize {
+        self.title_count
+    }
+
+    pub(crate) fn entry_count(&self) -> usize {
         self.title_count
     }
 
@@ -879,6 +946,34 @@ mod tests {
             ],
             interwiki: Vec::new(),
             magic_words: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn parallel_projection_keeps_the_newest_siteinfo() {
+        let record = |timestamp_micros, site_name: &str| {
+            let mut site_info = site();
+            site_info.site_name = site_name.into();
+            Record::SiteInfo {
+                timestamp_micros,
+                site_info,
+            }
+        };
+        for records in [
+            [record(20, "new"), record(10, "old")],
+            [record(10, "old"), record(20, "new")],
+        ] {
+            let mut builder = TitleIndexBuilder::new();
+            for record in records {
+                builder.observe(&record);
+            }
+            assert_eq!(
+                builder
+                    .site_info
+                    .as_ref()
+                    .map(|(_, site_info)| site_info.site_name.as_str()),
+                Some("new")
+            );
         }
     }
 

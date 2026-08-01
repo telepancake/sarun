@@ -19,6 +19,16 @@ use crate::archive::{
 use crate::instance::{ContributorMeta, RevisionMeta};
 use crate::{Error, Result};
 
+const HISTORY_SORT_RUN_TARGET: usize = 8 << 30;
+
+pub(crate) fn processing_parallelism() -> usize {
+    std::env::var("SARUN_WIKIMAK_CPU_BUDGET")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, usize::from))
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct DirectArchiveStats {
     pub content_parts: u64,
@@ -345,6 +355,7 @@ impl Drop for LiveProgressFailureGuard {
                 &self.state,
                 "stopped before completion; inspect attributed target error",
             );
+            persist_live_progress(&self.state, true);
         }
     }
 }
@@ -566,24 +577,26 @@ fn persist_live_heartbeat(state: &Arc<Mutex<LiveProgressState>>) {
     let Ok(mut state) = state.lock() else {
         return;
     };
-    state.value.heartbeat_at_micros = now_micros();
+    let now = now_micros();
+    state.value.heartbeat_at_micros = now;
+    if state.last_phase != state.value.phase {
+        state.last_phase = state.value.phase.clone();
+        state.value.phase_started_at_micros = now;
+    } else if state.value.phase_started_at_micros == 0 {
+        state.value.phase_started_at_micros = now;
+    }
+    let (user, system, rss) = process_resource_usage();
+    state.value.cpu_user_micros = user;
+    state.value.cpu_system_micros = system;
+    state.value.peak_rss_bytes = rss;
     write_live_progress_locked(&mut state);
 }
 
 fn set_live_phase(state: &Arc<Mutex<LiveProgressState>>, phase: &str) {
-    let changed = state
-        .lock()
-        .map(|mut state| {
-            if state.value.phase == phase {
-                false
-            } else {
-                state.value.phase = phase.to_owned();
-                true
-            }
-        })
-        .unwrap_or(false);
-    if changed {
-        persist_live_progress(state, true);
+    if let Ok(mut state) = state.lock() {
+        if state.value.phase != phase {
+            state.value.phase = phase.to_owned();
+        }
     }
 }
 
@@ -615,6 +628,7 @@ fn write_live_progress_locked(state: &mut LiveProgressState) {
 struct CountingReader<R> {
     inner: R,
     read_bytes: u64,
+    last_sync: Instant,
     state: Arc<Mutex<LiveProgressState>>,
     stats: wikimak_mediawiki::FetchStatsHandle,
 }
@@ -622,26 +636,31 @@ struct CountingReader<R> {
 struct DecodedCountingReader {
     inner: Box<dyn Read + Send>,
     read_bytes: u64,
+    last_sync: Instant,
     state: Arc<Mutex<LiveProgressState>>,
 }
 
 impl Read for DecodedCountingReader {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-        set_live_phase(&self.state, "decompressing");
         let count = self.inner.read(buffer)?;
         if count != 0 {
             self.read_bytes = self.read_bytes.saturating_add(count as u64);
-            if let Ok(mut state) = self.state.lock() {
-                state.value.decoded_bytes = self.read_bytes;
+            if self.last_sync.elapsed() >= Duration::from_secs(1) {
+                if let Ok(mut state) = self.state.lock() {
+                    state.value.decoded_bytes = self.read_bytes;
+                }
+                self.last_sync = Instant::now();
             }
-            persist_live_progress(&self.state, false);
         }
         Ok(count)
     }
 }
 
 impl<R> CountingReader<R> {
-    fn sync_stats(&self, force: bool) {
+    fn sync_stats(&mut self, force: bool) {
+        if !force && self.last_sync.elapsed() < Duration::from_secs(1) {
+            return;
+        }
         if let Ok(stats) = self.stats.lock() {
             if let Ok(mut state) = self.state.lock() {
                 state.value.source_bytes_read = self.read_bytes;
@@ -653,13 +672,15 @@ impl<R> CountingReader<R> {
                 state.value.fetch_transport_errors = stats.transport_errors;
             }
         }
-        persist_live_progress(&self.state, force);
+        self.last_sync = Instant::now();
+        if force {
+            persist_live_progress(&self.state, true);
+        }
     }
 }
 
 impl<R: Read> Read for CountingReader<R> {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-        set_live_phase(&self.state, "waiting for source bytes");
         let count = match self.inner.read(buffer) {
             Ok(count) => count,
             Err(error) => {
@@ -1238,12 +1259,22 @@ pub(crate) fn recover_direct_build_completion(
 ) -> Result<bool> {
     let marker = root.join("archive.complete");
     let output = root.join("archive.swdump");
+    let titles = output.with_extension("swtitle");
     let marker_matches = std::fs::read_to_string(&marker)
         .is_ok_and(|stored| stored.trim_end() == plan.plan_id);
     if output.exists()
         && archive_file_complete(&output)
         && (marker_matches || archive_records_are_readable(&output))
     {
+        let title_matches = crate::title_index::TitleIndex::open(&titles)
+            .and_then(|index| {
+                crate::archive::IndexedArchiveSet::open(&output, &index)
+                    .map(|_| index)
+            })
+            .is_ok();
+        if !title_matches {
+            crate::title_index::build(&output, &titles).map_err(map_archive)?;
+        }
         if !marker_matches {
             persist_completion_marker(root, plan)?;
         }
@@ -1994,22 +2025,29 @@ pub(crate) fn assemble_direct_build(
     )
     .map_err(map_archive)?;
     let bootstrap = tempfile::tempfile_in(root)?;
-    let (file, _, _, _) = crate::archive::merge_many_archives_bootstrapping_ref_prefix(
-        &inputs,
-        temporary,
-        bootstrap,
-        plan.frame_target,
-        CompressionSettings {
-            level: plan.compression_level,
-            ..CompressionSettings::default()
-        },
-        plan.ref_prefix_sample_bytes,
-        plan.ref_prefix_bytes,
-    )
-    .map_err(map_archive)?;
+    let mut title_index = crate::title_index::TitleIndexBuilder::new();
+    let (file, _, _, _) =
+        crate::archive::merge_many_archives_bootstrapping_ref_prefix_observing(
+            &inputs,
+            temporary,
+            bootstrap,
+            plan.frame_target,
+            CompressionSettings {
+                level: plan.compression_level,
+                ..CompressionSettings::default()
+            },
+            plan.ref_prefix_sample_bytes,
+            plan.ref_prefix_bytes,
+            |record| title_index.observe(record),
+        )
+        .map_err(map_archive)?;
     let completed = file.finish().map_err(map_archive)?;
     completed.persist(&output).map_err(map_archive)?;
     sync_directory(&output)?;
+    progress("writing title and virtual-frame index from the merged record projection");
+    title_index
+        .finish(&output, output.with_extension("swtitle"))
+        .map_err(map_archive)?;
     persist_completion_marker(root, plan)?;
 
     for kind in ["content", "history"] {
@@ -2358,7 +2396,7 @@ fn build_update_inner(
         "{} daily update runs cover through {content_through}",
         runs.len()
     ));
-    let cores = std::thread::available_parallelism().map_or(1, usize::from);
+    let cores = processing_parallelism();
     let mut content_results = Vec::new();
     for run in &runs {
         let run_scratch = scratch.join(format!("incremental-{}", run.date));
@@ -2512,7 +2550,7 @@ fn build_direct_inner(
         history_files.len(),
         byte_size_summary(history_bytes, unknown_history_sizes),
     ));
-    let cores = std::thread::available_parallelism().map_or(1, usize::from);
+    let cores = processing_parallelism();
 
     let history_results =
         build_history_parts(client, dbname, &history_files, scratch, cores, progress)?;
@@ -2882,9 +2920,12 @@ fn build_history_part(
         }
     };
     let fetch_stats = source.stats_handle();
-    let source = CountingReader {
+    let mut source = CountingReader {
         inner: source,
         read_bytes: 0,
+        last_sync: Instant::now()
+            .checked_sub(Duration::from_secs(2))
+            .unwrap_or_else(Instant::now),
         state: Arc::clone(&live),
         stats: Arc::clone(&fetch_stats),
     };
@@ -2903,25 +2944,29 @@ fn build_history_part(
     let decoder = DecodedCountingReader {
         inner: Box::new(decoder),
         read_bytes: 0,
+        last_sync: Instant::now()
+            .checked_sub(Duration::from_secs(2))
+            .unwrap_or_else(Instant::now),
         state: Arc::clone(&live),
     };
-    let mut sorter = RecordSorter::new_in(scratch).map_err(map_archive)?;
+    let mut sorter =
+        RecordSorter::new_with_run_target(scratch, HISTORY_SORT_RUN_TARGET)
+            .map_err(map_archive)?;
     let mut stats = PartialStats::default();
     let mut last_activity = Instant::now()
         .checked_sub(Duration::from_secs(3))
         .unwrap_or_else(Instant::now);
+    let mut history_bytes = 0_u64;
+    set_live_phase(&live, "streaming and parsing TSV");
     for (line_number, line) in std::io::BufReader::new(decoder).lines().enumerate() {
-        set_live_phase(&live, "parsing TSV");
         let line = line?;
-        if let Ok(mut state) = live.lock() {
-            state.value.revisions = line_number.saturating_add(1) as u64;
-            state.value.text_bytes = state
-                .value
-                .text_bytes
-                .saturating_add(line.len() as u64);
-        }
-        persist_live_progress(&live, false);
+        history_bytes = history_bytes.saturating_add(line.len() as u64);
         if last_activity.elapsed() >= Duration::from_secs(2) {
+            if let Ok(mut state) = live.lock() {
+                state.value.revisions = line_number.saturating_add(1) as u64;
+                state.value.text_bytes = history_bytes;
+            }
+            persist_live_progress(&live, true);
             progress(&format!(
                 "history parse {} line {}",
                 file.part.filename,
@@ -2959,7 +3004,6 @@ fn build_history_part(
             if fields.len() == 78 { 60 } else { 58 },
             ordinal,
         )? {
-            set_live_phase(&live, "sorting/writing");
             sorter.push(record).map_err(map_archive)?;
         }
         stats.events += 1;
@@ -2983,6 +3027,8 @@ fn build_history_part(
     stats.record_fetch(&fetch_stats);
     if let Ok(mut state) = live.lock() {
         state.value.phase = "finished".into();
+        state.value.revisions = stats.events;
+        state.value.text_bytes = history_bytes;
     }
     persist_live_progress(&live, true);
     let _ = std::fs::remove_file(live_path);
@@ -3378,16 +3424,13 @@ fn build_content_part(
     let _failure_guard = LiveProgressFailureGuard {
         state: Arc::clone(&live),
     };
-    // Keep the parsed records in memory and let the operating system page cold
-    // text payloads if necessary. The final in-memory sort never compares
-    // wikitext bytes, and the writer then walks each payload once. Explicit
-    // bounded runs remain available for callers that deliberately request them.
-    let mut sorter = RecordSorter::new_in(
-        path.parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new(".")),
-    )
-    .map_err(map_archive)?;
+    // Wikimedia content dumps are ordered by page ID. Buffer only the
+    // revisions of the current page so they can be reversed into the
+    // archive's newest-to-oldest order; retaining and sorting a whole dump
+    // fragment makes memory use proportional to the fragment for no benefit.
+    let output = std::fs::File::create(path)?;
+    let mut writer =
+        ArchiveWriter::new(output, DEFAULT_FRAME_TARGET).map_err(map_archive)?;
     let mut stats = PartialStats::default();
     let mut site_info = None;
     progress(&format!("content download {}", part.filename));
@@ -3403,9 +3446,12 @@ fn build_content_part(
         }
     };
     let fetch_stats = source.stats_handle();
-    let source = CountingReader {
+    let mut source = CountingReader {
         inner: source,
         read_bytes: 0,
+        last_sync: Instant::now()
+            .checked_sub(Duration::from_secs(2))
+            .unwrap_or_else(Instant::now),
         state: Arc::clone(&live),
         stats: Arc::clone(&fetch_stats),
     };
@@ -3425,6 +3471,9 @@ fn build_content_part(
     let input = DecodedCountingReader {
         inner: input,
         read_bytes: 0,
+        last_sync: Instant::now()
+            .checked_sub(Duration::from_secs(2))
+            .unwrap_or_else(Instant::now),
         state: Arc::clone(&live),
     };
     let mut page_stream = wikimak_mediawiki::new_page_stream(input);
@@ -3435,8 +3484,9 @@ fn build_content_part(
     let mut pages_seen = 0_u64;
     let mut revisions_seen = 0_u64;
     let mut text_bytes = 0_u64;
+    let mut last_page_id = None;
+    set_live_phase(&live, "streaming XML to sorted archive");
     loop {
-        set_live_phase(&live, "parsing XML");
         let Some(header) = revisions.next_page() else {
             break;
         };
@@ -3449,8 +3499,15 @@ fn build_content_part(
             .ok()
             .filter(|id| *id > 0)
             .ok_or_else(|| parse_error(format!("invalid page id {}", header.id)))?;
+        if last_page_id.is_some_and(|previous| page_id <= previous) {
+            return Err(parse_error(format!(
+                "{} has page id {page_id} after {}",
+                part.filename,
+                last_page_id.expect("checked above")
+            )));
+        }
+        last_page_id = Some(page_id);
         if let Ok(mut state) = live.lock() {
-            state.value.phase = "parsing page".into();
             state.value.pages = pages_seen;
             state.value.current_page = page_id;
             state.value.current_title = header.title.clone();
@@ -3469,43 +3526,38 @@ fn build_content_part(
             last_activity = Instant::now();
         }
         let page_revisions_before = revisions_seen;
-        let records = std::iter::from_fn(|| {
-            set_live_phase(&live, "parsing XML");
-            revisions.next_revision().map(|result| {
-                result
-                    .map_err(Error::Mediawiki)
-                    .and_then(convert_revision)
-                    .map_err(ArchiveError::Mirror)
-                    .map(|record| {
-                        revisions_seen = revisions_seen.saturating_add(1);
-                        text_bytes = text_bytes.saturating_add(record.text.len() as u64);
-                        if let Ok(mut state) = live.lock() {
-                            state.value.revisions = revisions_seen;
-                            state.value.text_bytes = text_bytes;
-                        }
-                        persist_live_progress(&live, false);
-                        if last_activity.elapsed() >= Duration::from_secs(2) {
-                            progress(&format!(
-                                "content sort {} page #{} ({}); {} revisions, {} text",
-                                part.filename,
-                                page_id,
-                                header.title,
-                                revisions_seen,
-                                human_progress_bytes(text_bytes),
-                            ));
-                            if let Ok(mut state) = live.lock() {
-                                state.value.phase = "sorting and encoding".into();
-                            }
-                            persist_live_progress(&live, true);
-                            last_activity = Instant::now();
-                        }
-                        record
-                    })
-            })
+        let mut page_revisions = Vec::new();
+        while let Some(revision) = revisions.next_revision() {
+            let record = convert_revision(revision.map_err(Error::Mediawiki)?)?;
+            revisions_seen = revisions_seen.saturating_add(1);
+            text_bytes = text_bytes.saturating_add(record.text.len() as u64);
+            page_revisions.push(record);
+            if last_activity.elapsed() >= Duration::from_secs(2) {
+                if let Ok(mut state) = live.lock() {
+                    state.value.revisions = revisions_seen;
+                    state.value.text_bytes = text_bytes;
+                }
+                progress(&format!(
+                    "content stream {} page #{} ({}); {} revisions, {} text",
+                    part.filename,
+                    page_id,
+                    header.title,
+                    revisions_seen,
+                    human_progress_bytes(text_bytes),
+                ));
+                persist_live_progress(&live, true);
+                last_activity = Instant::now();
+            }
+        }
+        page_revisions.sort_by(|left, right| {
+            right
+                .meta
+                .ts
+                .cmp(&left.meta.ts)
+                .then(right.meta.rev_id.cmp(&left.meta.rev_id))
         });
-        set_live_phase(&live, "sorting/writing");
-        sorter
-            .push(Record::PageState {
+        writer
+            .write(&Record::PageState {
                 page_id,
                 timestamp_micros: observed_at_micros,
                 title: header.title.clone(),
@@ -3513,25 +3565,20 @@ fn build_content_part(
                 deleted: false,
             })
             .map_err(map_archive)?;
-        for revision in records {
-            sorter
-                .push(Record::Revision {
+        for revision in page_revisions {
+            writer
+                .write(&Record::Revision {
                     page_id,
-                    revision: revision.map_err(map_archive)?,
+                    revision,
                 })
                 .map_err(map_archive)?;
         }
         stats.pages += 1;
         stats.revisions += revisions_seen - page_revisions_before;
     }
-    if let Ok(mut state) = live.lock() {
-        state.value.phase = "merging sorted runs".into();
-    }
+    set_live_phase(&live, "sealing sorted archive");
     persist_live_progress(&live, true);
-    let output = std::fs::File::create(&path)?;
-    let (output, _, _) = sorter
-        .finish(output, DEFAULT_FRAME_TARGET)
-        .map_err(map_archive)?;
+    let (output, _) = writer.finish().map_err(map_archive)?;
     output.sync_all()?;
     // The historical snapshot is the build-wide source of network totals
     // after the live sidecar is removed, so it must include the final fetch
@@ -3787,6 +3834,35 @@ mod build_graph_tests {
     use httpmock::MockServer;
 
     use super::*;
+
+    #[test]
+    fn phase_changes_are_persisted_only_by_the_periodic_sampler() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("source.progress.json");
+        let state = Arc::new(Mutex::new(LiveProgressState {
+            path: path.clone(),
+            value: LiveTargetProgress {
+                phase: "starting".into(),
+                ..Default::default()
+            },
+            last_write: Instant::now(),
+            last_phase: "starting".into(),
+        }));
+
+        for phase in ["waiting", "decompressing", "parsing", "decompressing"] {
+            set_live_phase(&state, phase);
+        }
+        assert!(
+            !path.exists(),
+            "a hot-path phase transition performed filesystem I/O"
+        );
+
+        persist_live_heartbeat(&state);
+        let persisted: LiveTargetProgress =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(persisted.phase, "decompressing");
+        assert_ne!(persisted.heartbeat_at_micros, 0);
+    }
 
     #[test]
     fn flattened_content_targets_keep_singleton_group_names_stable() {
@@ -4231,13 +4307,22 @@ mod build_graph_tests {
 
         let archive = assemble_direct_build(root.path(), &plan, &|_| {}).unwrap();
         crate::archive_set::ArchiveSetReader::open(archive).unwrap();
+        crate::title_index::TitleIndex::open(
+            root.path().join("archive.swtitle"),
+        )
+        .unwrap();
         assert!(root.path().join("archive.complete").exists());
         assert!(
             !node_path(root.path(), &plan, "content", 0).exists(),
             "consumed target survived its durable replacement"
         );
         std::fs::remove_file(root.path().join("archive.complete")).unwrap();
+        std::fs::remove_file(root.path().join("archive.swtitle")).unwrap();
         assert!(recover_direct_build_completion(root.path(), &plan).unwrap());
+        crate::title_index::TitleIndex::open(
+            root.path().join("archive.swtitle"),
+        )
+        .unwrap();
         assert_eq!(
             std::fs::read_to_string(root.path().join("archive.complete"))
                 .unwrap()

@@ -795,6 +795,13 @@ fn spawn_run(job: Job, wiki_run: WikiRun) -> bool {
         path
     });
     let wiki = job.kind == "wiki";
+    let wiki_background = wiki && std::path::Path::new(&job.dest).exists();
+    let wiki_cpu_budget = wiki_background.then(|| {
+        std::thread::available_parallelism()
+            .map_or(1, usize::from)
+            .saturating_sub(2)
+            .max(1)
+    });
     if !running_map(|m| {
         if m.contains_key(&id) || (wiki && m.values().any(|process| process.wiki)) {
             false
@@ -829,13 +836,19 @@ fn spawn_run(job: Job, wiki_run: WikiRun) -> bool {
         if let Some(source) = &job.media_source {
             cmd.env("SARUN_KIWIX_SOURCE", source);
         }
+        if let Some(cpu_budget) = wiki_cpu_budget {
+            cmd.env("SARUN_WIKIMAK_CPU_BUDGET", cpu_budget.to_string());
+        }
         if let Some(path) = &wiki_tmp {
             cmd.env("TMPDIR", path);
         }
         unsafe {
             use std::os::unix::process::CommandExt;
-            cmd.pre_exec(|| {
+            cmd.pre_exec(move || {
                 if libc::setpgid(0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if wiki_background && libc::setpriority(libc::PRIO_PROCESS, 0, 5) != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
                 #[cfg(target_os = "linux")]
