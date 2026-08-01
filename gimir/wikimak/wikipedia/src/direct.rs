@@ -944,6 +944,25 @@ fn grouped_partial_index(name: &str, plan: &DirectBuildPlan) -> Option<usize> {
     (plan.content_groups.get(group_index)?.len() > 1).then_some(group_index)
 }
 
+fn owned_partial_target(name: &str) -> Option<(&str, u32)> {
+    let attempt = name
+        .strip_prefix('.')?
+        .strip_suffix(".partial")?;
+    let (target, pid) = attempt.rsplit_once('.')?;
+    Some((target, pid.parse::<u32>().ok()?))
+}
+
+fn process_is_alive(pid: u32) -> bool {
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        true
+    } else {
+        std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+}
+
 fn grouped_source_index(name: &str) -> Option<usize> {
     let stem = name.strip_suffix(".swdump")?;
     stem.rsplit_once("-source-")?.1.parse::<usize>().ok()
@@ -1182,12 +1201,7 @@ pub(crate) fn prune_invalid_build_nodes(root: &Path, plan: &DirectBuildPlan) -> 
     for entry in std::fs::read_dir(root.join("nodes"))? {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        let resumable = name
-            .strip_prefix('.')
-            .and_then(|name| name.strip_suffix(".partial"))
-            .filter(|name| !name.contains('.'))
-            .is_some_and(|target| plan.target_index(target).is_some());
-        if name.starts_with('.') && !resumable {
+        if name.starts_with('.') {
             let path = entry.path();
             if path.is_dir() {
                 std::fs::remove_dir_all(path)?;
@@ -1363,10 +1377,8 @@ pub fn mirror_build_progress(archive: impl AsRef<Path>) -> Option<MirrorBuildPro
         .filter_map(std::result::Result::ok)
         .filter_map(|entry| {
             let name = entry.file_name().to_string_lossy().into_owned();
-            let attempt = name
-                .strip_prefix('.')?
-                .strip_suffix(".partial")?;
-            (!attempt.contains('.')).then(|| (attempt.to_owned(), entry.path()))
+            let (target, pid) = owned_partial_target(&name)?;
+            process_is_alive(pid).then(|| (target.to_owned(), entry.path()))
         })
         .collect::<Vec<_>>();
     let mut active = Vec::new();
@@ -1796,7 +1808,10 @@ pub(crate) fn materialize_direct_build_node(
         .ok_or(Error::Corrupt("target is outside build plan"))?;
     let temporary = root
         .join("nodes")
-        .join(format!(".{target_name}.partial"));
+        .join(format!(
+            ".{target_name}.{}.partial",
+            std::process::id()
+        ));
     std::fs::create_dir_all(&temporary)?;
     // A target can spend many minutes inside one blocking read/write call:
     // durable receipts only appear after the whole target is complete, and
@@ -4096,7 +4111,8 @@ mod build_graph_tests {
         ];
         for (index, value) in values.iter().enumerate() {
             let partial = root.join(format!(
-                "nodes/.content-000000-source-{index:06}.partial"
+                "nodes/.content-000000-source-{index:06}.{}.partial",
+                std::process::id()
             ));
             std::fs::create_dir_all(&partial).unwrap();
             std::fs::write(
