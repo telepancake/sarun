@@ -711,12 +711,86 @@ fn skip_update_range(
     Ok(records)
 }
 
+fn replace_single_archive(
+    archive: &Path,
+    update: &Path,
+    scratch: &Path,
+) -> Result<(u64, u64), String> {
+    let serving_snapshot = scratch.join("serving-generation.swdump");
+    if serving_snapshot.exists() {
+        use std::os::unix::fs::MetadataExt;
+        let archive_metadata = std::fs::metadata(archive)
+            .map_err(|error| format!("{}: {error}", archive.display()))?;
+        let snapshot_metadata = std::fs::metadata(&serving_snapshot)
+            .map_err(|error| format!("{}: {error}", serving_snapshot.display()))?;
+        if archive_metadata.dev() != snapshot_metadata.dev()
+            || archive_metadata.ino() != snapshot_metadata.ino()
+        {
+            let (_, frames, complete) =
+                crate::archive::index_file(archive).map_err(|error| error.to_string())?;
+            if !complete {
+                return Err(
+                    "installed single-file update has no completion marker".into(),
+                );
+            }
+            let records = frames.iter().try_fold(0_u64, |total, frame| {
+                total
+                    .checked_add(frame.info.records)
+                    .ok_or_else(|| "updated archive record count overflow".to_string())
+            })?;
+            eprintln!(
+                "reusing the already installed single-file replacement after interruption"
+            );
+            return Ok((frames.len() as u64, records));
+        }
+    }
+    let prefix = crate::archive::archive_ref_prefix(archive)
+        .map_err(|error| error.to_string())?;
+    let tail = crate::archive::ArchiveRecordReader::open(update)
+        .map_err(|error| error.to_string())?;
+    let temporary = tempfile::NamedTempFile::new_in(scratch)
+        .map_err(|error| format!("{}: {error}", scratch.display()))?;
+    let output = temporary
+        .reopen()
+        .map_err(|error| format!("{}: {error}", temporary.path().display()))?;
+    let mut last_progress = std::time::Instant::now();
+    let (output, frames, records) =
+        crate::archive::merge_archive_with_sorted_source_and_ref_prefix(
+            &prefix,
+            archive,
+            Box::new(tail),
+            output,
+            MIRROR_FRAME_TARGET,
+            mirror_compression(),
+            |records| {
+                if last_progress.elapsed() >= std::time::Duration::from_secs(2) {
+                    eprintln!("single-file update: merged {records} records");
+                    last_progress = std::time::Instant::now();
+                }
+            },
+        )
+        .map_err(|error| error.to_string())?;
+    output
+        .sync_all()
+        .map_err(|error| format!("{}: {error}", temporary.path().display()))?;
+    drop(output);
+    temporary
+        .persist(archive)
+        .map_err(|error| format!("{}: {}", archive.display(), error.error))?;
+    sync_parent(archive)?;
+    Ok((frames, records))
+}
+
 fn replace_archive_ranges(
     archive: &Path,
     update: &Path,
     scratch: &Path,
     checkpoint_key: &str,
 ) -> Result<(u64, u64), String> {
+    if !archive.is_dir() {
+        eprintln!("streaming the update through the mirror's single piece file");
+        return replace_single_archive(archive, update, scratch);
+    }
     let plan = load_or_create_update_range_plan(archive, scratch, checkpoint_key)?;
     std::fs::create_dir_all(scratch.join("updated-ranges"))
         .map_err(|error| format!("{}: {error}", scratch.display()))?;
@@ -901,13 +975,37 @@ fn ensure_update_serving_snapshot(archive: &Path, scratch: &Path) -> Result<(), 
     let snapshot_titles = snapshot.with_extension("swtitle");
     if snapshot.exists() || snapshot_titles.exists() {
         if !snapshot.exists() || !snapshot_titles.exists() {
-            return Err("update serving snapshot is incomplete".into());
+            if snapshot.exists() {
+                remove_path(&snapshot)
+                    .map_err(|error| format!("{}: {error}", snapshot.display()))?;
+            }
+            if snapshot_titles.exists() {
+                std::fs::remove_file(&snapshot_titles)
+                    .map_err(|error| format!("{}: {error}", snapshot_titles.display()))?;
+            }
+        } else {
+            let (_, _, complete) =
+                crate::archive::index_file(&snapshot).map_err(|error| error.to_string())?;
+            if !complete {
+                return Err("update serving snapshot is incomplete".into());
+            }
+            let titles = crate::title_index::TitleIndex::open(&snapshot_titles)
+                .map_err(|error| error.to_string())?;
+            crate::archive::IndexedArchiveSet::open(&snapshot, &titles)
+                .map_err(|error| error.to_string())?;
+            return Ok(());
         }
-        crate::archive_set::ArchiveSetReader::open(&snapshot)
-            .map_err(|error| error.to_string())?;
-        crate::title_index::TitleIndex::open(&snapshot_titles)
-            .map_err(|error| error.to_string())?;
-        return Ok(());
+    }
+    if !archive.is_dir() {
+        std::fs::hard_link(archive, &snapshot)
+            .map_err(|error| format!("{}: {error}", snapshot.display()))?;
+        if let Err(error) =
+            std::fs::hard_link(archive.with_extension("swtitle"), &snapshot_titles)
+        {
+            let _ = std::fs::remove_file(&snapshot);
+            return Err(format!("{}: {error}", snapshot_titles.display()));
+        }
+        return sync_directory_path(scratch);
     }
     let temporary =
         tempfile::tempdir_in(scratch).map_err(|error| format!("{}: {error}", scratch.display()))?;
@@ -1181,11 +1279,13 @@ fn cmd_fetch(dbname: &str, archive: &str) -> Result<(), String> {
         .or(expected_checkpoint_key)
         .ok_or_else(|| "update checkpoint identity is unavailable".to_string())?;
 
+    let serving_snapshot = scratch.join("serving-generation.swdump");
     if update_marker.exists()
-        && !scratch.join("serving-generation.swdump").exists()
+        && (!serving_snapshot.exists()
+            || !serving_snapshot.with_extension("swtitle").exists())
     {
         return Err(
-            "range update marker exists without its preserved serving generation".into(),
+            "update marker exists without its preserved serving generation".into(),
         );
     }
     ensure_update_serving_snapshot(archive, &scratch)?;
@@ -1198,7 +1298,11 @@ fn cmd_fetch(dbname: &str, archive: &str) -> Result<(), String> {
             .map_err(|error| format!("{}: {error}", update_marker.display()))?;
         sync_parent(archive)?;
     }
-    eprintln!("merging the sorted update into one durable page-ID range at a time");
+    if archive.is_dir() {
+        eprintln!("merging the sorted update into one durable page-ID range at a time");
+    } else {
+        eprintln!("merging the sorted update into the mirror's one piece file");
+    }
     let (frames, records) =
         replace_archive_ranges(archive, &partial, &scratch, &checkpoint_key)?;
 
@@ -1776,6 +1880,85 @@ mod tests {
                 magic_words: Vec::new(),
             },
         }
+    }
+
+    #[test]
+    fn single_file_mirror_update_reuses_the_same_tail_idempotently() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = directory.path().join("testwiki.swdump");
+        let prefix = vec![b'x'; 256];
+        let mut writer = crate::archive::ArchiveWriter::with_ref_prefix(
+            std::fs::File::create(&archive).unwrap(),
+            1,
+            crate::archive::CompressionSettings {
+                level: 1,
+                ..Default::default()
+            },
+            &prefix,
+        )
+        .unwrap();
+        for record in [
+            page_state(1, 100),
+            page_state(2, 100),
+            manifest(100, "2024-06-01"),
+            site_info(100),
+        ] {
+            writer.write(&record).unwrap();
+        }
+        writer.finish().unwrap().0.sync_all().unwrap();
+        crate::title_index::build(&archive, archive.with_extension("swtitle"))
+            .unwrap();
+
+        let update = directory.path().join("update.swdump");
+        let mut writer = crate::archive::ArchiveWriter::new(
+            std::fs::File::create(&update).unwrap(),
+            1,
+        )
+        .unwrap();
+        for record in [
+            page_state(2, 200),
+            page_state(3, 200),
+            manifest(200, "2024-06-02"),
+        ] {
+            writer.write(&record).unwrap();
+        }
+        writer.finish().unwrap().0.sync_all().unwrap();
+
+        let scratch = directory.path().join("scratch");
+        std::fs::create_dir(&scratch).unwrap();
+        ensure_update_serving_snapshot(&archive, &scratch).unwrap();
+        replace_archive_ranges(&archive, &update, &scratch, "one")
+            .unwrap();
+        use std::os::unix::fs::MetadataExt;
+        let installed_inode = std::fs::metadata(&archive).unwrap().ino();
+        replace_archive_ranges(&archive, &update, &scratch, "one")
+            .unwrap();
+        assert_eq!(
+            std::fs::metadata(&archive).unwrap().ino(),
+            installed_inode,
+            "resume rewrote an already installed single-file generation"
+        );
+
+        let page_threes = |path: &Path| {
+            let mut reader = crate::archive::ArchiveRecordReader::open(path).unwrap();
+            let mut count = 0;
+            while let Some(record) = reader.next_record().unwrap() {
+                if record.entity()
+                    == (crate::archive::EntityKey {
+                        kind: crate::archive::EntityKind::Page,
+                        id: 3,
+                    })
+                {
+                    count += 1;
+                }
+            }
+            count
+        };
+        assert_eq!(page_threes(&archive), 1);
+        assert_eq!(
+            page_threes(&scratch.join("serving-generation.swdump")),
+            0
+        );
     }
 
     #[test]

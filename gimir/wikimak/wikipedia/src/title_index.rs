@@ -686,58 +686,34 @@ fn project_page(
 }
 
 fn assign_current_titles(projections: &[Projection]) -> crate::archive::Result<Vec<Interval>> {
-    let mut assigned = projections
-        .iter()
-        .map(|projection| (!projection.candidates.is_empty()).then_some(0_usize))
-        .collect::<Vec<_>>();
-    loop {
-        let mut owners = BTreeMap::<&str, Vec<usize>>::new();
-        for (index, choice) in assigned.iter().enumerate() {
-            if let Some(choice) = choice {
-                owners
-                    .entry(&projections[index].candidates[*choice].0)
-                    .or_default()
-                    .push(index);
-            }
-        }
-        let conflicts = owners
-            .values()
-            .filter(|owners| owners.len() > 1)
-            .cloned()
-            .collect::<Vec<_>>();
-        if conflicts.is_empty() {
-            break;
-        }
-        let mut changed = false;
-        for conflict in conflicts {
-            for index in conflict {
-                if let Some((choice, _)) = projections[index]
-                    .candidates
-                    .iter()
-                    .enumerate()
-                    .skip(1)
-                    .find(|(_, (title, _))| !owners.contains_key(title.as_str()))
-                {
-                    assigned[index] = Some(choice);
-                    changed = true;
-                    break;
-                }
-            }
-        }
-        if !changed {
-            let conflict = owners
-                .into_iter()
-                .find(|(_, owners)| owners.len() > 1)
-                .expect("conflicts were not empty");
-            return Err(crate::archive::ArchiveError::Conflict(format!(
-                "current title {:?} is claimed by pages {:?}",
-                conflict.0,
-                conflict
-                    .1
-                    .iter()
-                    .map(|index| projections[*index].page_id)
-                    .collect::<Vec<_>>(),
-            )));
+    let mut assigned = vec![None; projections.len()];
+    let mut next_choice = vec![0_usize; projections.len()];
+    let mut owners = BTreeMap::<&str, usize>::new();
+    let mut pending = std::collections::VecDeque::from_iter(0..projections.len());
+    while let Some(index) = pending.pop_front() {
+        let Some((title, start)) =
+            projections[index].candidates.get(next_choice[index])
+        else {
+            continue;
+        };
+        let Some(previous) = owners.get(title.as_str()).copied() else {
+            owners.insert(title, index);
+            assigned[index] = Some(next_choice[index]);
+            continue;
+        };
+        let (_, previous_start) =
+            &projections[previous].candidates[assigned[previous].expect("title owner")];
+        let challenger_wins = (*start, projections[index].page_id)
+            > (*previous_start, projections[previous].page_id);
+        if challenger_wins {
+            assigned[previous] = None;
+            next_choice[previous] += 1;
+            pending.push_back(previous);
+            owners.insert(title, index);
+            assigned[index] = Some(next_choice[index]);
+        } else {
+            next_choice[index] += 1;
+            pending.push_back(index);
         }
     }
     Ok(assigned
@@ -975,6 +951,31 @@ mod tests {
                 Some("new")
             );
         }
+    }
+
+    #[test]
+    fn current_title_handoff_prefers_the_newer_observation() {
+        let projections = [
+            Projection {
+                page_id: 10,
+                closed: Vec::new(),
+                candidates: vec![("Shared".into(), 100), ("Older".into(), 50)],
+            },
+            Projection {
+                page_id: 20,
+                closed: Vec::new(),
+                candidates: vec![("Shared".into(), 200)],
+            },
+        ];
+        let mut intervals = assign_current_titles(&projections).unwrap();
+        intervals.sort_by(|left, right| left.title.cmp(&right.title));
+        assert_eq!(
+            intervals
+                .iter()
+                .map(|interval| (interval.title.as_str(), interval.page_id))
+                .collect::<Vec<_>>(),
+            [("Older", 10), ("Shared", 20)]
+        );
     }
 
     #[test]
