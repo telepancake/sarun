@@ -4384,41 +4384,24 @@ impl App {
         self.load_mirrors();
     }
 
-    /// 'b' on Mirrors: browse the selected WIKI mirror in the in-box
-    /// browser (MIRRORS.md §Serve/browse). Starts a host-side `wikimak
-    /// serve` over the mirror archive (reused if already running) and
-    /// opens the browser at its loopback address with `--net host` so the
-    /// boxed browser can reach the host-side server. Plain HTTP to
-    /// localhost, so no MITM SPKI is needed (unlike the replay path).
+    /// 'b' on Mirrors: open the selected archive through the engine-owned
+    /// library gateway. Selection is only a shortcut for choosing its URL,
+    /// never a prerequisite for making the archive readable.
     fn mirror_browse_selected(&mut self) {
         let Some(job) = self.mirror_jobs.get(self.sel_mirror) else {
             return;
         };
-        if job.kind != "wiki" {
-            self.status = format!(
-                "mirror #{}: browse is for wiki mirrors (this is {})",
-                job.id, job.kind
-            );
-            return;
-        }
-        let (id, root) = (job.id, job.dest.clone());
-        let url = match wiki_serve::ensure(&self_exe(), &root) {
-            Ok(u) => u,
-            Err(e) => {
-                self.status = format!("wiki #{id}: {e}");
-                return;
-            }
+        let id = job.id;
+        let base = crate::archive_gateway::browser_base_url();
+        let url = match job.kind.as_str() {
+            "wiki" => format!("{base}/{}/", job.src),
+            "ietf" => format!("{base}/rfc/"),
+            _ => base,
         };
-        // A Linux guest under QEMU cannot use its own 127.0.0.1 to reach
-        // this macOS process. QEMU user networking exposes the host loopback
-        // as 10.0.2.2; native Linux boxes continue to share the host network
-        // namespace and use the ordinary loopback URL.
-        #[cfg(target_os = "macos")]
-        let url = url.replacen("127.0.0.1", "10.0.2.2", 1);
         let how = How {
             net: "host".into(),
             env: self.launch_env,
-            placement: Placement::Reuse(format!("wiki-{id}")),
+            placement: Placement::Reuse("archive-library".into()),
             webcap: false,
             webfilter: false,
             replay: None,
@@ -4431,7 +4414,7 @@ impl App {
             &how,
         );
         self.open_pty(argv);
-        self.status = format!("wiki #{id}: browsing {url}");
+        self.status = format!("mirror #{id}: browsing {url}");
     }
 
     /// 'R' on Mirrors: start every due, unpaused, not-running job.
@@ -4698,7 +4681,6 @@ impl App {
                         Ok(_) => format!("{name}: ok"),
                         Err(error) => format!("command: {error}"),
                     };
-                    wiki_serve::shutdown_all();
                     self.should_quit = true;
                 } else {
                     match result {
@@ -8648,109 +8630,6 @@ fn open_replay_in_browser(app: &mut App, source_sid: &str, url: &str) {
     app.status = format!("replaying box {source_sid} in carbonyl — {url}");
 }
 
-/// Host-side `wikimak serve` children backing the in-box wiki reader
-/// (MIRRORS.md §Serve/browse). A wiki mirror archive lives on the host
-/// filesystem and the server binds host loopback, so serve runs as a child
-/// of THIS engine (a self-exec of the embedded `wikimak` driver), NOT in a
-/// box — the browser then reaches it with `--net host`. One server per
-/// archive; the port is derived from its path so a re-browse reuses it.
-mod wiki_serve {
-    use std::collections::HashMap;
-    use std::process::Child;
-    use std::sync::{Mutex, OnceLock};
-
-    struct Server {
-        child: Child,
-    }
-
-    static REGISTRY: OnceLock<Mutex<HashMap<String, Server>>> = OnceLock::new();
-
-    fn registry() -> &'static Mutex<HashMap<String, Server>> {
-        REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
-    }
-
-    /// Deterministic loopback port for an archive path (8700..9500),
-    /// so re-browsing the same mirror lands on the same server.
-    fn port_for(root: &str) -> u16 {
-        let mut h: u64 = 0xcbf29ce484222325;
-        for b in root.as_bytes() {
-            h ^= *b as u64;
-            h = h.wrapping_mul(0x100000001b3);
-        }
-        8700 + (h % 800) as u16
-    }
-
-    /// Ensure a server is running for `root`; return its loopback base URL.
-    /// Reuses a live child; otherwise spawns
-    /// `<self_exe> wikimak serve <root> 127.0.0.1:<port>`, waits up to ~2s
-    /// for the port to accept, and registers the child for shutdown.
-    pub fn ensure(self_exe: &str, root: &str) -> Result<String, String> {
-        let port = port_for(root);
-        let addr = format!("127.0.0.1:{port}");
-        let mut reg = registry().lock().expect("wiki_serve registry poisoned");
-        if let Some(s) = reg.get_mut(root) {
-            match s.child.try_wait() {
-                Ok(None) => return Ok(format!("http://{addr}/")), // still live
-                _ => {
-                    reg.remove(root);
-                } // exited; respawn
-            }
-        }
-        let child = std::process::Command::new(self_exe)
-            .args(["wikimak", "serve", root, &addr])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .map_err(|e| format!("spawn wikimak serve: {e}"))?;
-        let mut child = child;
-        let mut bound = false;
-        for _ in 0..40 {
-            if std::net::TcpStream::connect(&addr).is_ok() {
-                bound = true;
-                break;
-            }
-            if let Ok(Some(status)) = child.try_wait() {
-                return Err(format!(
-                    "wikimak serve exited ({status}) before binding {addr}"
-                ));
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-        if !bound {
-            let _ = child.kill();
-            return Err(format!("wikimak serve did not bind {addr} within 2s"));
-        }
-        reg.insert(root.to_string(), Server { child });
-        Ok(format!("http://{addr}/"))
-    }
-
-    /// Kill every serve child (engine quit/detach).
-    pub fn shutdown_all() {
-        if let Some(r) = REGISTRY.get() {
-            let mut reg = r.lock().expect("wiki_serve registry poisoned");
-            for (_, mut s) in reg.drain() {
-                let _ = s.child.kill();
-            }
-        }
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        #[test]
-        fn port_is_deterministic_and_in_range() {
-            let a = port_for("/mirrors/enwiki.swdump");
-            let b = port_for("/mirrors/enwiki.swdump");
-            let c = port_for("/mirrors/dewiki.swdump");
-            assert_eq!(a, b, "same root → same port (re-browse reuse)");
-            assert_ne!(a, c, "different roots → different ports (typically)");
-            assert!((8700..9500).contains(&a) && (8700..9500).contains(&c));
-        }
-    }
-}
-
 fn open_image_view(app: &mut App, source: &str, bytes: &[u8]) {
     let img = match image::load_from_memory(bytes) {
         Ok(i) => i,
@@ -9556,6 +9435,98 @@ fn mirror_worker_table(
         Line::from(line)
     };
     let mut out = Vec::new();
+    if rows.iter().all(|row| row.kind == "assembly") {
+        let assembly_row = |label: &str, values: Vec<String>| {
+            Line::from(format!(
+                "{label:<LABEL_WIDTH$}  {}",
+                values.join("  "),
+                LABEL_WIDTH = LABEL_WIDTH,
+            ))
+        };
+        out.push(Line::from(Span::styled(
+            "ASSEMBLY  (one N-way input stream → one output stream)",
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        )));
+        for group in rows.chunks(WORKERS_PER_GROUP) {
+            out.push(assembly_row(
+                "stream",
+                group.iter().map(|row| row.target.clone()).collect(),
+            ));
+            out.push(assembly_row(
+                "state",
+                group.iter().map(|row| row.phase.clone()).collect(),
+            ));
+            out.push(assembly_row(
+                "input offset / size",
+                group
+                    .iter()
+                    .map(|row| {
+                        format!(
+                            "{} / {}",
+                            fmt_bytes(row.source_bytes_read.min(i64::MAX as u64) as i64),
+                            fmt_bytes(row.source_bytes_total.min(i64::MAX as u64) as i64),
+                        )
+                    })
+                    .collect(),
+            ));
+            out.push(assembly_row(
+                "output written",
+                group
+                    .iter()
+                    .map(|row| fmt_bytes(row.decoded_bytes.min(i64::MAX as u64) as i64))
+                    .collect(),
+            ));
+            out.push(assembly_row(
+                "page ID / records",
+                group
+                    .iter()
+                    .map(|row| format!("{} / {}", row.current_page, row.records))
+                    .collect(),
+            ));
+            out.push(assembly_row(
+                "input rate",
+                group
+                    .iter()
+                    .map(|row| {
+                        if row.bytes_per_second == 0 {
+                            "phase has no input read".to_owned()
+                        } else {
+                            format!(
+                                "{}/s",
+                                fmt_bytes(row.bytes_per_second.min(i64::MAX as u64) as i64),
+                            )
+                        }
+                    })
+                    .collect(),
+            ));
+            out.push(assembly_row(
+                "CPU time / peak RSS",
+                group
+                    .iter()
+                    .map(|row| {
+                        let cpu = (row.cpu_user_micros.saturating_add(row.cpu_system_micros))
+                            as f64
+                            / 1_000_000.0;
+                        let rss = if row.peak_rss_bytes == 0 {
+                            "—".to_owned()
+                        } else {
+                            fmt_bytes(row.peak_rss_bytes.min(i64::MAX as u64) as i64)
+                        };
+                        format!("{cpu:.1}s / {rss}")
+                    })
+                    .collect(),
+            ));
+            out.push(assembly_row(
+                "elapsed / update age",
+                group
+                    .iter()
+                    .map(|row| format!("{}s / {}s", row.phase_seconds, row.quiet_seconds))
+                    .collect(),
+            ));
+            out.push(Line::from(""));
+        }
+        return out;
+    }
     out.push(Line::from(Span::styled(
         if live {
             "WORKERS  (columns are workers; rows are metrics)"
@@ -12974,12 +12945,10 @@ fn global_action_for(
 fn run_pane_action(app: &mut App, action: PaneAction) {
     match action {
         PaneAction::Quit => {
-            wiki_serve::shutdown_all();
             shutdown_rpc(&app.sock);
             app.should_quit = true;
         }
         PaneAction::Detach => {
-            wiki_serve::shutdown_all();
             app.should_quit = true;
         }
         PaneAction::MoveDown => app.move_down(),
@@ -24145,6 +24114,56 @@ mod tests {
                 && text.contains("4 other 4xx")
                 && text.contains("3 transport errors")
         );
+    }
+
+    #[test]
+    fn mirror_detail_shows_streaming_assembly_metrics_without_network_rows() {
+        let mut app = headless_app();
+        app.focus = Pane::Mirrors;
+        app.mirror_jobs = vec![serde_json::from_value(json!({
+            "id": 2,
+            "kind": "wiki",
+            "src": "ruwiki",
+            "dest": "/tmp/ruwiki.swdump",
+            "interval_secs": 86400,
+            "paused": false,
+            "last_start": 1,
+            "last_end": null,
+            "last_exit": null,
+            "last_detail": "",
+            "state": "running",
+            "next_due": null,
+            "build_phase": "assembling · replaying bootstrap 50.0%",
+            "targets_total": 457,
+            "targets_completed": 457,
+            "targets_active": ["assembly"],
+            "target_progress": [{
+                "target": "assembly", "kind": "assembly",
+                "phase": "replaying bootstrap 50/100 records (50.0%) · ETA 2s",
+                "source": "457 typed archives",
+                "source_bytes_read": 300_u64, "source_bytes_total": 1000_u64,
+                "decoded_bytes": 200_u64, "bytes_per_second": 0_u64,
+                "pages": 42_u64, "records": 50_u64, "text_bytes": 0_u64,
+                "current_page": 42_u64, "current_title": "",
+                "quiet_seconds": 1_u64, "heartbeat_seconds": 1_u64,
+                "phase_seconds": 10_u64, "cpu_user_micros": 700000_u64,
+                "cpu_system_micros": 100000_u64, "peak_rss_bytes": 1234_u64
+            }],
+            "source_bytes_total": 1000_u64,
+            "source_bytes_completed": 1000_u64
+        }))
+        .unwrap()];
+
+        let text = mirror_detail_lines(&app)
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(text.contains("ASSEMBLY"));
+        assert!(text.contains("one N-way input stream"));
+        assert!(text.contains("replaying bootstrap 50/100 records"));
+        assert!(text.contains("output written"));
+        assert!(!text.contains("wire bytes received"));
     }
 
     #[test]

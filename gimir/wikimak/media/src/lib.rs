@@ -216,13 +216,17 @@ impl MediaStore {
             return Ok((None, std::fs::read(path)?));
         }
         if let Some(packed) = &self.packed {
-            if let Some((file_type, bytes)) = packed.lookup_with_type(file, width)? {
-                return Ok((Some(file_type), bytes));
+            for candidate in kiwix_image_names(file) {
+                if let Some((file_type, bytes)) = packed.lookup_with_type(&candidate, width)? {
+                    return Ok((Some(file_type), bytes));
+                }
             }
         }
         if let Some(kiwix) = &self.kiwix {
-            if let Some((file_type, bytes)) = kiwix.get_with_type(file)? {
-                return Ok((Some(file_type), bytes));
+            for candidate in kiwix_image_names(file) {
+                if let Some((file_type, bytes)) = kiwix.get_with_type(&candidate)? {
+                    return Ok((Some(file_type), bytes));
+                }
             }
         }
         let path = self.materialize(file, width)?;
@@ -268,6 +272,21 @@ impl MediaStore {
         self.store.put_negative(file, bucket)?;
         Err(MediaError::NotFound(file.to_string()))
     }
+}
+
+/// Kiwix stores thumbnails of browser-incompatible source formats under the
+/// Wikimedia thumbnail filename. An SVG page reference therefore commonly
+/// has a packed WebP payload indexed as `Name.svg.png`. Keep the canonical
+/// source title first, then try only the documented thumbnail suffixes.
+fn kiwix_image_names(file: &str) -> Vec<String> {
+    let mut names = vec![file.to_string()];
+    let lower = file.to_ascii_lowercase();
+    if lower.ends_with(".svg") {
+        names.push(format!("{file}.png"));
+    } else if lower.ends_with(".tif") || lower.ends_with(".tiff") {
+        names.push(format!("{file}.jpg"));
+    }
+    names
 }
 
 /// Render-time [`MediaResolver`] (plan §3 dependency inversion): it does
@@ -335,6 +354,19 @@ fn hex_upper(nibble: u8) -> char {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn kiwix_thumbnail_names_cover_non_browser_source_formats() {
+        assert_eq!(
+            kiwix_image_names("Flag.svg"),
+            vec!["Flag.svg", "Flag.svg.png"]
+        );
+        assert_eq!(
+            kiwix_image_names("Scan.tiff"),
+            vec!["Scan.tiff", "Scan.tiff.jpg"]
+        );
+        assert_eq!(kiwix_image_names("Photo.jpg"), vec!["Photo.jpg"]);
+    }
 
     static SEQ: AtomicU64 = AtomicU64::new(0);
 

@@ -157,6 +157,34 @@ pub struct Job {
     pub process_rss_bytes: Option<u64>,
 }
 
+#[derive(Debug, Clone)]
+pub struct LibraryJob {
+    pub kind: String,
+    pub src: String,
+    pub dest: String,
+}
+
+/// The archive gateway's deliberately small inventory read. Serving a page
+/// must not trigger the UI job projection: that path measures destination and
+/// scratch sizes, reads build progress, and samples process trees.
+pub fn library_jobs() -> Result<Vec<LibraryJob>, String> {
+    let conn = db()?;
+    let mut statement = conn
+        .prepare("SELECT kind,src,dest FROM jobs ORDER BY id")
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(LibraryJob {
+                kind: row.get(0)?,
+                src: row.get(1)?,
+                dest: row.get(2)?,
+            })
+        })
+        .map_err(|error| error.to_string())?;
+    rows.map(|row| row.map_err(|error| error.to_string()))
+        .collect()
+}
+
 fn derive(mut j: Job) -> Job {
     let running = running_map(|m| m.get(&j.id).copied());
     let live = running.is_some();

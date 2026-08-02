@@ -133,6 +133,19 @@ fn require_generated_wire(manifest: &Path) {
 fn main() {
     println!("cargo:rerun-if-env-changed=SARUN_SWIPL_DIR");
     let target = env::var("TARGET").expect("Cargo did not set TARGET");
+    if target.ends_with("-apple-darwin") {
+        cc::Build::new()
+            .cpp(true)
+            .file("src/realplksr_macos.mm")
+            .flag("-fobjc-arc")
+            .flag("-std=c++17")
+            .compile("sarun_realplksr_macos");
+        println!("cargo:rustc-link-lib=framework=Foundation");
+        println!("cargo:rustc-link-lib=framework=Metal");
+        println!("cargo:rustc-link-lib=framework=MetalPerformanceShaders");
+        println!("cargo:rustc-link-lib=framework=MetalPerformanceShadersGraph");
+        println!("cargo:rerun-if-changed=src/realplksr_macos.mm");
+    }
     let swipl_target = match target.as_str() {
         "x86_64-unknown-linux-musl" => "x86_64-linux-musl",
         "aarch64-unknown-linux-musl" => "aarch64-linux-musl",

@@ -165,10 +165,19 @@ impl ArchiveBrowseIndex {
         let titles = crate::title_index::TitleIndex::open(title_index)?;
         let backref_path = path.with_extension("swrefs");
         let backrefs = if backref_path.is_file() {
-            Some(crate::backrefs::BackrefIndex::open_for_title_index(
-                backref_path,
+            match crate::backrefs::BackrefIndex::open_for_title_index(
+                &backref_path,
                 title_index,
-            )?)
+            ) {
+                Ok(index) => Some(index),
+                Err(error) => {
+                    eprintln!(
+                        "wikimak browse: ignoring unusable optional backrefs {}: {error}",
+                        backref_path.display()
+                    );
+                    None
+                }
+            }
         } else {
             None
         };
@@ -1538,5 +1547,14 @@ mod tests {
             },
         );
         assert!(rendered.html.contains("Sparrow"));
+
+        std::fs::write(&sidecar, b"stale optional index").unwrap();
+        let without_stale_backrefs =
+            ArchiveBrowseIndex::open(&archive, &title_index).unwrap();
+        assert_eq!(
+            without_stale_backrefs.page_text_at(2, i64::MAX).unwrap(),
+            Some(b"[[Category:Birds]]".to_vec()),
+            "a stale optional backref sidecar must not make archive content unreadable"
+        );
     }
 }

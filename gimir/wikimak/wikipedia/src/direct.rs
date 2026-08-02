@@ -325,6 +325,41 @@ struct LiveProgressState {
     last_phase: String,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct AssemblyProgressSnapshot {
+    plan_id: String,
+    pid: u32,
+    phase: String,
+    input_bytes: u64,
+    input_bytes_total: u64,
+    output_bytes: u64,
+    records: u64,
+    current_entity_kind: u64,
+    current_entity_id: u64,
+    bytes_per_second: u64,
+    phase_current: u64,
+    phase_total: u64,
+    started_at_micros: u64,
+    updated_at_micros: u64,
+    cpu_user_micros: u64,
+    cpu_system_micros: u64,
+    peak_rss_bytes: u64,
+}
+
+fn assembly_progress_path(root: &Path) -> PathBuf {
+    root.join("assembly.progress.json")
+}
+
+fn write_assembly_progress(root: &Path, value: &AssemblyProgressSnapshot) {
+    let path = assembly_progress_path(root);
+    let temporary = root.join("assembly.progress.json.tmp");
+    if let Ok(bytes) = serde_json::to_vec(value) {
+        if std::fs::write(&temporary, bytes).is_ok() {
+            let _ = std::fs::rename(temporary, path);
+        }
+    }
+}
+
 /// Keep a live sidecar fresh while a parser is inside one long blocking read
 /// or decompression call. This is deliberately a liveness signal, not fake
 /// byte/revision progress; the UI can distinguish the two timestamps.
@@ -1737,10 +1772,55 @@ pub fn mirror_build_progress(archive: impl AsRef<Path>) -> Option<MirrorBuildPro
         ));
         completed_bytes = completed_bytes.saturating_add(downloaded);
     }
+    let assembly = std::fs::read(assembly_progress_path(&root))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<AssemblyProgressSnapshot>(&bytes).ok())
+        .filter(|value| value.plan_id == plan.plan_id && process_is_alive(value.pid));
+    if let Some(value) = &assembly {
+        let quiet_seconds = now_micros()
+            .saturating_sub(value.updated_at_micros)
+            / 1_000_000;
+        target_progress.clear();
+        target_progress.push(MirrorTargetProgress {
+            target: "assembly".into(),
+            kind: "assembly".into(),
+            phase: value.phase.clone(),
+            source_bytes_read: value.input_bytes,
+            source_bytes_total: value.input_bytes_total,
+            decoded_bytes: value.output_bytes,
+            bytes_per_second: value.bytes_per_second,
+            pages: value.current_entity_id,
+            records: value.records,
+            current_page: value.current_entity_id,
+            quiet_seconds,
+            heartbeat_seconds: quiet_seconds,
+            phase_seconds: now_micros()
+                .saturating_sub(value.started_at_micros)
+                / 1_000_000,
+            cpu_user_micros: value.cpu_user_micros,
+            cpu_system_micros: value.cpu_system_micros,
+            peak_rss_bytes: value.peak_rss_bytes,
+            ..Default::default()
+        });
+        active.clear();
+        active.push(format!(
+            "assembly · {} · input {} / {} · output {} · {} records",
+            value.phase,
+            human_progress_bytes(value.input_bytes),
+            human_progress_bytes(value.input_bytes_total),
+            human_progress_bytes(value.output_bytes),
+            value.records,
+        ));
+        active_rate = value.bytes_per_second;
+        active_quiet = quiet_seconds;
+        live_target = true;
+    }
     active.sort();
     let has_active = live_target;
     Some(MirrorBuildProgress {
-        phase: if failed_target {
+        phase: if let Some(value) = &assembly {
+            format!("assembling · {}", value.phase)
+        } else if failed_target {
             "failed; inspect target details".into()
         } else if !active.is_empty() || completed < total {
             "fetching and parsing".into()
@@ -2150,10 +2230,37 @@ pub(crate) fn assemble_direct_build(
         .collect::<Vec<_>>();
     inputs.push(node_path(root, plan, "content", 0).join("siteinfo.swdump"));
     inputs.push(manifest_archive.clone());
+    let assembly_started_micros = now_micros();
+    let inventory_total_bytes = inputs.iter().fold(0_u64, |total, input| {
+        total.saturating_add(std::fs::metadata(input).map_or(0, |metadata| metadata.len()))
+    });
     progress(&format!(
         "inventorying {} durable inputs before assembly",
         inputs.len()
     ));
+    let (cpu_user_micros, cpu_system_micros, peak_rss_bytes) = process_resource_usage();
+    write_assembly_progress(
+        root,
+        &AssemblyProgressSnapshot {
+            plan_id: plan.plan_id.clone(),
+            pid: std::process::id(),
+            phase: format!("inventorying 0/{} inputs", inputs.len()),
+            input_bytes: 0,
+            input_bytes_total: inventory_total_bytes,
+            output_bytes: 0,
+            records: 0,
+            current_entity_kind: 0,
+            current_entity_id: 0,
+            bytes_per_second: 0,
+            phase_current: 0,
+            phase_total: inputs.len() as u64,
+            started_at_micros: assembly_started_micros,
+            updated_at_micros: now_micros(),
+            cpu_user_micros,
+            cpu_system_micros,
+            peak_rss_bytes,
+        },
+    );
     let inventory_started = Instant::now();
     let mut input_checkpoints = Vec::new();
     let mut input_compressed_bytes = 0_u64;
@@ -2167,6 +2274,30 @@ pub(crate) fn assemble_direct_build(
         }
         record_sources.push(Box::new(reader));
         if (position + 1).is_multiple_of(25) || position + 1 == inputs.len() {
+            let (cpu_user_micros, cpu_system_micros, peak_rss_bytes) =
+                process_resource_usage();
+            write_assembly_progress(
+                root,
+                &AssemblyProgressSnapshot {
+                    plan_id: plan.plan_id.clone(),
+                    pid: std::process::id(),
+                    phase: format!("inventorying {}/{} inputs", position + 1, inputs.len()),
+                    input_bytes: input_compressed_bytes,
+                    input_bytes_total: inventory_total_bytes,
+                    output_bytes: 0,
+                    records: 0,
+                    current_entity_kind: 0,
+                    current_entity_id: 0,
+                    bytes_per_second: 0,
+                    phase_current: (position + 1) as u64,
+                    phase_total: inputs.len() as u64,
+                    started_at_micros: assembly_started_micros,
+                    updated_at_micros: now_micros(),
+                    cpu_user_micros,
+                    cpu_system_micros,
+                    peak_rss_bytes,
+                },
+            );
             progress(&format!(
                 "assembly inventory {}/{} inputs · {} compressed · elapsed {}",
                 position + 1,
@@ -2203,6 +2334,8 @@ pub(crate) fn assemble_direct_build(
         let reporter_telemetry = Arc::clone(&telemetry);
         let reporter_stop = Arc::clone(&stop_reporter);
         let reporter = scope.spawn(move || {
+            let mut previous_phase = u64::MAX;
+            let mut phase_started = Instant::now();
             while !reporter_stop.load(Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_secs(2));
                 if reporter_stop.load(Ordering::Relaxed) {
@@ -2213,6 +2346,11 @@ pub(crate) fn assemble_direct_build(
                 let output = reporter_telemetry.output_bytes.load(Ordering::Relaxed);
                 let records = reporter_telemetry.records.load(Ordering::Relaxed);
                 let phase = reporter_telemetry.phase.load(Ordering::Relaxed);
+                if phase != previous_phase {
+                    previous_phase = phase;
+                    phase_started = Instant::now();
+                }
+                let phase_elapsed = phase_started.elapsed().as_secs_f64().max(0.001);
                 let phase_current = reporter_telemetry
                     .phase_current
                     .load(Ordering::Relaxed);
@@ -2258,9 +2396,18 @@ pub(crate) fn assemble_direct_build(
                         } else {
                             phase_current as f64 * 100.0 / phase_total as f64
                         };
+                        let replay_rate = phase_current as f64 / phase_elapsed;
+                        let replay_eta = if phase_current > 0 && phase_current < phase_total {
+                            duration_summary(
+                                ((phase_total - phase_current) as f64
+                                    / replay_rate.max(1.0)) as u64,
+                            )
+                        } else {
+                            "estimating".to_owned()
+                        };
                         format!(
                             "replaying bootstrap {phase_current}/{phase_total} records \
-                             ({replay_percent:.1}%)"
+                            ({replay_percent:.1}%, ETA {replay_eta})"
                         )
                     }
                     _ => format!(
@@ -2273,6 +2420,70 @@ pub(crate) fn assemble_direct_build(
                         human_progress_bytes(rate as u64),
                     ),
                 };
+                let persisted_phase = match phase {
+                    0 => format!(
+                        "sampling newest revisions · page {entity_id} · {percent:.1}% input · \
+                         ETA {eta}"
+                    ),
+                    1 => format!(
+                        "distilling {} refPrefix from {} samples",
+                        human_progress_bytes(phase_total),
+                        human_progress_bytes(phase_current),
+                    ),
+                    2 => {
+                        let replay_percent = if phase_total == 0 {
+                            0.0
+                        } else {
+                            phase_current as f64 * 100.0 / phase_total as f64
+                        };
+                        let replay_rate = phase_current as f64 / phase_elapsed;
+                        let replay_eta = if phase_current > 0 && phase_current < phase_total {
+                            duration_summary(
+                                ((phase_total - phase_current) as f64
+                                    / replay_rate.max(1.0)) as u64,
+                            )
+                        } else {
+                            "estimating".to_owned()
+                        };
+                        format!(
+                            "replaying bootstrap {phase_current}/{phase_total} records \
+                             ({replay_percent:.1}%) · ETA {replay_eta}"
+                        )
+                    }
+                    _ => format!(
+                        "merging · {} {entity_id} · {percent:.1}% input · ETA {eta}",
+                        entity_kind_name(kind),
+                    ),
+                };
+                let persisted_rate = if matches!(phase, 0 | 3) {
+                    rate as u64
+                } else {
+                    0
+                };
+                let (cpu_user_micros, cpu_system_micros, peak_rss_bytes) =
+                    process_resource_usage();
+                write_assembly_progress(
+                    root,
+                    &AssemblyProgressSnapshot {
+                        plan_id: plan.plan_id.clone(),
+                        pid: std::process::id(),
+                        phase: persisted_phase,
+                        input_bytes: input,
+                        input_bytes_total: input_compressed_bytes,
+                        output_bytes: output,
+                        records,
+                        current_entity_kind: kind,
+                        current_entity_id: entity_id,
+                        bytes_per_second: persisted_rate,
+                        phase_current,
+                        phase_total,
+                        started_at_micros: assembly_started_micros,
+                        updated_at_micros: now_micros(),
+                        cpu_user_micros,
+                        cpu_system_micros,
+                        peak_rss_bytes,
+                    },
+                );
                 progress(&format!(
                     "assembly · {status} · output {} (range ~{range}) · {records} records · \
                      CPU {cpu:.1} cores · RSS {memory}",
@@ -4171,6 +4382,71 @@ mod build_graph_tests {
             serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
         assert_eq!(persisted.phase, "decompressing");
         assert_ne!(persisted.heartbeat_at_micros, 0);
+    }
+
+    #[test]
+    fn assembly_snapshot_is_exposed_as_live_structured_progress() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = directory.path().join("testwiki.swdump");
+        let root = crate::cli::mirror_scratch_path(&archive);
+        std::fs::create_dir_all(root.join("nodes")).unwrap();
+        let mut plan = DirectBuildPlan {
+            schema: 1,
+            plan_id: String::new(),
+            wiki_db: "testwiki".into(),
+            content_snapshot: "2024-06-01".into(),
+            metadata_snapshot: "2024-06".into(),
+            observed_at_micros: 0,
+            frame_target: 1,
+            range_target: 1,
+            compression_level: 1,
+            ref_prefix_sample_bytes: 2,
+            ref_prefix_bytes: 1,
+            content_groups: Vec::new(),
+            history_files: Vec::new(),
+        };
+        plan.plan_id = direct_plan_id(&plan).unwrap();
+        std::fs::write(
+            root.join("plan.json"),
+            serde_json::to_vec(&plan).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(root.join("stage2.mk"), b"all:\n").unwrap();
+        write_assembly_progress(
+            &root,
+            &AssemblyProgressSnapshot {
+                plan_id: plan.plan_id.clone(),
+                pid: std::process::id(),
+                phase: "replaying bootstrap 50/100 records (50.0%) · ETA 2s".into(),
+                input_bytes: 300,
+                input_bytes_total: 1000,
+                output_bytes: 200,
+                records: 50,
+                current_entity_kind: EntityKind::Page as u64,
+                current_entity_id: 42,
+                bytes_per_second: 0,
+                phase_current: 50,
+                phase_total: 100,
+                started_at_micros: now_micros().saturating_sub(1_000_000),
+                updated_at_micros: now_micros(),
+                cpu_user_micros: 700_000,
+                cpu_system_micros: 100_000,
+                peak_rss_bytes: 1234,
+            },
+        );
+
+        let progress = mirror_build_progress(&archive).unwrap();
+        assert!(progress.phase.starts_with("assembling · replaying bootstrap"));
+        assert_eq!(progress.target_progress.len(), 1);
+        let assembly = &progress.target_progress[0];
+        assert_eq!(assembly.target, "assembly");
+        assert_eq!(assembly.kind, "assembly");
+        assert_eq!(assembly.source_bytes_read, 300);
+        assert_eq!(assembly.source_bytes_total, 1000);
+        assert_eq!(assembly.decoded_bytes, 200);
+        assert_eq!(assembly.records, 50);
+        assert_eq!(assembly.current_page, 42);
+        assert_eq!(assembly.peak_rss_bytes, 1234);
     }
 
     #[test]

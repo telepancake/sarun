@@ -41,6 +41,7 @@ mod xargs_builtin;
 mod action_bridge;
 mod action_help;
 mod appliance;
+mod archive_gateway;
 mod attach;
 mod browser;
 mod debug_provider_handshake;
@@ -72,6 +73,7 @@ mod paths;
 mod prolog;
 mod pty;
 mod reader;
+mod realplksr;
 mod relation_adapter;
 mod review;
 mod rules;
@@ -462,6 +464,18 @@ fn serve() -> i32 {
             }
         });
     }
+    let library = match archive_gateway::Gateway::start(
+        std::env::current_exe()
+            .unwrap_or_else(|_| PathBuf::from("sarun"))
+            .to_string_lossy()
+            .into_owned(),
+    ) {
+        Ok(library) => library,
+        Err(error) => {
+            eprintln!("sarun-engine: {error}");
+            return 1;
+        }
+    };
     // Mirror-update scheduler: a minute tick starting whatever jobs are
     // due (mirrors.db). No jobs → pure no-op loop.
     mirrors::scheduler_thread();
@@ -479,6 +493,7 @@ fn serve() -> i32 {
         libc::close(termination_pipe[1]);
     }
     mirrors::stop_all();
+    library.shutdown();
     control::terminate_runners(&state);
     #[cfg(target_os = "linux")]
     if let Err(error) = session.unmount() {
@@ -863,6 +878,7 @@ fn main() {
         // engine-native textmode browser (DESIGN-cellulose.md), driving a
         // stock headless Chromium over CDP. Replaces the carbonyl launcher.
         Some("browser") => std::process::exit(browser::launch::browser_cli(&argv[1..])),
+        Some("realplksr") => std::process::exit(realplksr::cli(&argv[1..])),
         // Bare launch / explicit `attach` / `--once` headless render → UI role,
         // auto-spawning the engine when its socket is down.
         None => std::process::exit(ui_launch(&argv)),
