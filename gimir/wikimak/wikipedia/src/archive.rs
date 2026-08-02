@@ -6,7 +6,7 @@
 //! a depot format: it is a compact source for experiments, conversions, and
 //! recovery without depending on the current live storage layout.
 
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BTreeMap, BinaryHeap, HashMap};
 use std::io::{self, BufReader, Cursor, Read, Seek, SeekFrom, Take, Write};
 use std::path::{Path, PathBuf};
 
@@ -42,6 +42,9 @@ const KIND_MANIFEST: u8 = 6;
 const KIND_SITE_INFO: u8 = 7;
 const PAGE_TEXT_MEMORY_LIMIT: usize = 16 << 20;
 const SORT_MERGE_FAN_IN: usize = 64;
+const FRAME_READ_AHEAD: usize = 1 << 20;
+const FRAME_FLUSH_RAW_INTERVAL: usize = 1 << 20;
+const PARALLEL_JOB_RAW_TARGET: usize = 32 << 20;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 #[repr(u8)]
@@ -765,6 +768,9 @@ impl Default for CompressionSettings {
 
 struct FrameBuilder<'a> {
     encoder: zstd::stream::write::Encoder<'a, Vec<u8>>,
+    _prepared_reference: Option<
+        std::sync::Arc<zstd::dict::EncoderDictionary<'static>>,
+    >,
     first_entity: EntityKey,
     last_entity: EntityKey,
     records: u64,
@@ -775,30 +781,20 @@ impl<'a> FrameBuilder<'a> {
     fn new(
         entity: EntityKey,
         settings: CompressionSettings,
-        dictionary: Option<&[u8]>,
-        ref_prefix: Option<&'a [u8]>,
+        prepared_reference: Option<
+            &std::sync::Arc<zstd::dict::EncoderDictionary<'static>>,
+        >,
+        reference_window_log: Option<u32>,
     ) -> Result<Self> {
-        let encoder = match (dictionary, ref_prefix) {
-            (Some(dictionary), None) => {
-                zstd::stream::write::Encoder::with_dictionary(
+        let held_reference = prepared_reference.cloned();
+        let encoder = match held_reference.as_ref() {
+            Some(dictionary) => {
+                zstd::stream::write::Encoder::with_prepared_dictionary(
                     Vec::new(),
-                    settings.level,
                     dictionary,
                 )?
             }
-            (None, Some(prefix)) => {
-                zstd::stream::write::Encoder::with_ref_prefix(
-                    Vec::new(),
-                    settings.level,
-                    prefix,
-                )?
-            }
-            (None, None) => zstd::stream::write::Encoder::new(Vec::new(), settings.level)?,
-            (Some(_), Some(_)) => {
-                return Err(ArchiveError::Invalid(
-                    "cannot use a dictionary and reference prefix together",
-                ))
-            }
+            None => zstd::stream::write::Encoder::new(Vec::new(), settings.level)?,
         };
         let mut encoder = encoder;
         encoder.include_checksum(settings.checksum)?;
@@ -806,15 +802,14 @@ impl<'a> FrameBuilder<'a> {
         if settings.workers != 0 {
             encoder.multithread(settings.workers)?;
         }
-        let window_log = settings
-            .window_log
-            .or_else(|| ref_prefix.map(|prefix| ref_prefix_window_log(prefix.len())));
+        let window_log = settings.window_log.or(reference_window_log);
         if let Some(window_log) = window_log {
             encoder.window_log(window_log)?;
         }
         encoder.set_target_cblock_size(settings.target_block_size)?;
         Ok(Self {
             encoder,
+            _prepared_reference: held_reference,
             first_entity: entity,
             last_entity: entity,
             records: 0,
@@ -827,6 +822,471 @@ impl<'a> FrameBuilder<'a> {
     }
 }
 
+struct PendingParallelFrame {
+    raw: Vec<u8>,
+    entities: Vec<ParallelEntityChunk>,
+}
+
+struct ParallelEntityChunk {
+    entity: EntityKey,
+    end: usize,
+    records: u64,
+}
+
+struct ParallelCompressionJob {
+    sequence: u64,
+    raw: Vec<u8>,
+    entities: Vec<ParallelEntityChunk>,
+    frame_target: usize,
+}
+
+struct ParallelCompressedBatch {
+    sequence: u64,
+    frames: Vec<(FrameInfo, Vec<u8>)>,
+}
+
+struct ParallelArchiveWriter<W: Write> {
+    output: W,
+    frame_target: usize,
+    frame: Option<PendingParallelFrame>,
+    last_entity: Option<EntityKey>,
+    last_timestamp: i64,
+    jobs: Option<std::sync::mpsc::SyncSender<ParallelCompressionJob>>,
+    results: std::sync::mpsc::Receiver<Result<ParallelCompressedBatch>>,
+    workers: Vec<std::thread::JoinHandle<()>>,
+    pending: BTreeMap<u64, ParallelCompressedBatch>,
+    submitted: u64,
+    next_sequence: u64,
+    frames_written: u64,
+    inflight: usize,
+    inflight_limit: usize,
+}
+
+impl<W: Write> ParallelArchiveWriter<W> {
+    fn new(
+        mut output: W,
+        frame_target: usize,
+        mut compression: CompressionSettings,
+        prefix: &[u8],
+        workers: usize,
+    ) -> Result<Self> {
+        if frame_target == 0 || prefix.is_empty() || workers == 0 {
+            return Err(ArchiveError::Invalid(
+                "invalid parallel archive writer configuration",
+            ));
+        }
+        compression.workers = 0;
+        output.write_all(&FILE_MAGIC)?;
+        output.write_all(&FILE_VERSION.to_le_bytes())?;
+        output.write_all(&0_u32.to_le_bytes())?;
+        output.write_all(&(frame_target as u64).to_le_bytes())?;
+        write_ref_prefix_frame(&mut output, prefix, compression)?;
+
+        let capacity = workers.saturating_mul(2).max(2);
+        let (jobs_tx, jobs_rx) =
+            std::sync::mpsc::sync_channel::<ParallelCompressionJob>(capacity);
+        let (results_tx, results_rx) =
+            std::sync::mpsc::sync_channel(capacity);
+        let jobs_rx =
+            std::sync::Arc::new(std::sync::Mutex::new(jobs_rx));
+        let worker_reference = std::sync::Arc::new(
+            zstd::dict::EncoderDictionary::copy(
+                prefix,
+                compression.level,
+            ),
+        );
+        let prefix_bytes = prefix.len();
+        let mut handles = Vec::with_capacity(workers);
+        for _ in 0..workers {
+            let jobs = std::sync::Arc::clone(&jobs_rx);
+            let results = results_tx.clone();
+            let dictionary =
+                std::sync::Arc::clone(&worker_reference);
+            handles.push(std::thread::spawn(move || {
+                let mut context = zstd::zstd_safe::CCtx::create();
+                if let Err(error) =
+                    configure_parallel_context(
+                        &mut context,
+                        compression,
+                        &dictionary,
+                        prefix_bytes,
+                    )
+                {
+                    let _ = results.send(Err(error));
+                    return;
+                }
+                loop {
+                    let job = {
+                        let Ok(receiver) = jobs.lock() else {
+                            return;
+                        };
+                        match receiver.recv() {
+                            Ok(job) => job,
+                            Err(_) => return,
+                        }
+                    };
+                    let result =
+                        compress_parallel_frame(job, &mut context);
+                    if results.send(result).is_err() {
+                        return;
+                    }
+                }
+            }));
+        }
+        drop(results_tx);
+        Ok(Self {
+            output,
+            frame_target,
+            frame: None,
+            last_entity: None,
+            last_timestamp: i64::MAX,
+            jobs: Some(jobs_tx),
+            results: results_rx,
+            workers: handles,
+            pending: BTreeMap::new(),
+            submitted: 0,
+            next_sequence: 0,
+            frames_written: 0,
+            inflight: 0,
+            inflight_limit: capacity,
+        })
+    }
+
+    fn new_frame(entity: EntityKey) -> PendingParallelFrame {
+        PendingParallelFrame {
+            raw: Vec::new(),
+            entities: vec![ParallelEntityChunk {
+                entity,
+                end: 0,
+                records: 0,
+            }],
+        }
+    }
+
+    fn write(&mut self, record: &Record) -> Result<()> {
+        let entity = record.entity();
+        let timestamp = record.timestamp_micros();
+        let new_entity = self.last_entity != Some(entity);
+        if let Some(previous) = self.last_entity {
+            if entity < previous
+                || (!new_entity && timestamp > self.last_timestamp)
+            {
+                return Err(ArchiveError::OutOfOrder {
+                    previous,
+                    previous_timestamp: self.last_timestamp,
+                    current: entity,
+                    current_timestamp: timestamp,
+                });
+            }
+        }
+        if new_entity {
+            let seal = if let Some(frame) = self.frame.as_ref() {
+                frame
+                    .entities
+                    .last()
+                    .is_some_and(|chunk| chunk.entity.kind != entity.kind)
+                    || frame.raw.len() >= PARALLEL_JOB_RAW_TARGET
+            } else {
+                false
+            };
+            if seal {
+                self.submit_frame()?;
+            }
+            if let Some(frame) = self.frame.as_mut() {
+                frame.entities.push(ParallelEntityChunk {
+                    entity,
+                    end: frame.raw.len(),
+                    records: 0,
+                });
+            }
+        }
+        if self.frame.is_none() {
+            self.frame = Some(Self::new_frame(entity));
+        }
+        let frame = self.frame.as_mut().expect("created above");
+        write_record_wire(&mut frame.raw, record)?;
+        let chunk = frame
+            .entities
+            .last_mut()
+            .expect("parallel frame has an entity");
+        chunk.end = frame.raw.len();
+        chunk.records = chunk
+            .records
+            .checked_add(1)
+            .ok_or(ArchiveError::FieldTooLarge)?;
+        self.last_entity = Some(entity);
+        self.last_timestamp = timestamp;
+        Ok(())
+    }
+
+    fn submit_frame(&mut self) -> Result<()> {
+        let Some(frame) = self.frame.take() else {
+            return Ok(());
+        };
+        let job = ParallelCompressionJob {
+            sequence: self.submitted,
+            raw: frame.raw,
+            entities: frame.entities,
+            frame_target: self.frame_target,
+        };
+        self.jobs
+            .as_ref()
+            .ok_or(ArchiveError::Invalid(
+                "parallel compressor is closed",
+            ))?
+            .send(job)
+            .map_err(|_| {
+                ArchiveError::Invalid("parallel compressor stopped")
+            })?;
+        self.submitted = self
+            .submitted
+            .checked_add(1)
+            .ok_or(ArchiveError::FieldTooLarge)?;
+        self.inflight += 1;
+        if self.inflight >= self.inflight_limit {
+            self.receive_one()?;
+        }
+        Ok(())
+    }
+
+    fn receive_one(&mut self) -> Result<()> {
+        let batch = self
+            .results
+            .recv()
+            .map_err(|_| {
+                ArchiveError::Invalid("parallel compressor stopped")
+            })??;
+        self.inflight = self.inflight.saturating_sub(1);
+        self.pending.insert(batch.sequence, batch);
+        while let Some(batch) = self.pending.remove(&self.next_sequence) {
+            for (info, compressed) in batch.frames {
+                write_frame_header(&mut self.output, info)?;
+                self.output.write_all(&compressed)?;
+                self.frames_written = self
+                    .frames_written
+                    .checked_add(1)
+                    .ok_or(ArchiveError::FieldTooLarge)?;
+            }
+            self.next_sequence = self
+                .next_sequence
+                .checked_add(1)
+                .ok_or(ArchiveError::FieldTooLarge)?;
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<(W, u64)> {
+        self.submit_frame()?;
+        self.jobs.take();
+        while self.inflight != 0 {
+            self.receive_one()?;
+        }
+        for worker in self.workers.drain(..) {
+            worker.join().map_err(|_| {
+                ArchiveError::Invalid("parallel compressor panicked")
+            })?;
+        }
+        if self.next_sequence != self.submitted
+            || !self.pending.is_empty()
+        {
+            return Err(ArchiveError::Invalid(
+                "parallel compressor omitted an output frame",
+            ));
+        }
+        self.output.write_all(&DONE_MAGIC)?;
+        self.output.write_all(&[0; FRAME_HEADER_LEN - 4])?;
+        self.output.flush()?;
+        Ok((self.output, self.frames_written))
+    }
+}
+
+fn configure_parallel_context(
+    context: &mut zstd::zstd_safe::CCtx<'static>,
+    settings: CompressionSettings,
+    dictionary: &zstd::dict::EncoderDictionary<'static>,
+    prefix_bytes: usize,
+) -> Result<()> {
+    use zstd::zstd_safe::CParameter;
+    context
+        .set_parameter(CParameter::ChecksumFlag(settings.checksum))
+        .map_err(zstd_error)?;
+    context
+        .set_parameter(CParameter::EnableLongDistanceMatching(
+            settings.long_distance_matching,
+        ))
+        .map_err(zstd_error)?;
+    context
+        .set_parameter(CParameter::WindowLog(
+            settings
+                .window_log
+                .unwrap_or_else(|| ref_prefix_window_log(prefix_bytes)),
+        ))
+        .map_err(zstd_error)?;
+    if let Some(bytes) = settings.target_block_size {
+        context
+            .set_parameter(CParameter::TargetCBlockSize(bytes))
+            .map_err(zstd_error)?;
+    }
+    context
+        .ref_cdict(dictionary.as_cdict())
+        .map_err(zstd_error)?;
+    Ok(())
+}
+
+fn zstd_error(code: usize) -> ArchiveError {
+    ArchiveError::Io(io::Error::other(
+        zstd::zstd_safe::get_error_name(code).to_owned(),
+    ))
+}
+
+fn compress_parallel_frame(
+    job: ParallelCompressionJob,
+    context: &mut zstd::zstd_safe::CCtx<'static>,
+) -> Result<ParallelCompressedBatch> {
+    if job.entities.is_empty() {
+        return Err(ArchiveError::Invalid(
+            "parallel compression job has no entities",
+        ));
+    }
+    let mut frames = Vec::new();
+    let mut compressed = Vec::new();
+    let mut scratch =
+        vec![0_u8; zstd::zstd_safe::CCtx::out_size()];
+    let mut first = 0;
+    let mut raw_start = 0;
+    let mut fed_until = 0;
+    let flush_interval = FRAME_FLUSH_RAW_INTERVAL
+        .min(job.frame_target.saturating_mul(8))
+        .max(1);
+    for end in 1..=job.entities.len() {
+        let raw_end = job.entities[end - 1].end;
+        if raw_end - fed_until < flush_interval {
+            continue;
+        }
+        pump_parallel_context(
+            context,
+            &job.raw[fed_until..raw_end],
+            zstd::zstd_safe::zstd_sys::ZSTD_EndDirective::ZSTD_e_flush,
+            &mut compressed,
+            &mut scratch,
+        )?;
+        fed_until = raw_end;
+        if compressed.len() < job.frame_target {
+            continue;
+        }
+        pump_parallel_context(
+            context,
+            &[],
+            zstd::zstd_safe::zstd_sys::ZSTD_EndDirective::ZSTD_e_end,
+            &mut compressed,
+            &mut scratch,
+        )?;
+        push_parallel_frame(
+            &job.entities,
+            first,
+            end,
+            raw_start,
+            raw_end,
+            std::mem::take(&mut compressed),
+            &mut frames,
+        )?;
+        context
+            .reset(zstd::zstd_safe::ResetDirective::SessionOnly)
+            .map_err(zstd_error)?;
+        first = end;
+        raw_start = raw_end;
+        fed_until = raw_end;
+    }
+    if first < job.entities.len() {
+        pump_parallel_context(
+            context,
+            &job.raw[fed_until..],
+            zstd::zstd_safe::zstd_sys::ZSTD_EndDirective::ZSTD_e_end,
+            &mut compressed,
+            &mut scratch,
+        )?;
+        push_parallel_frame(
+            &job.entities,
+            first,
+            job.entities.len(),
+            raw_start,
+            job.raw.len(),
+            compressed,
+            &mut frames,
+        )?;
+        context
+            .reset(zstd::zstd_safe::ResetDirective::SessionOnly)
+            .map_err(zstd_error)?;
+    }
+    Ok(ParallelCompressedBatch {
+        sequence: job.sequence,
+        frames,
+    })
+}
+
+fn pump_parallel_context(
+    context: &mut zstd::zstd_safe::CCtx<'static>,
+    raw: &[u8],
+    directive: zstd::zstd_safe::zstd_sys::ZSTD_EndDirective,
+    compressed: &mut Vec<u8>,
+    scratch: &mut [u8],
+) -> Result<()> {
+    let mut input = zstd::zstd_safe::InBuffer::around(raw);
+    loop {
+        let (remaining, written) = {
+            let mut output =
+                zstd::zstd_safe::OutBuffer::around(scratch);
+            let remaining = context
+                .compress_stream2(
+                    &mut output,
+                    &mut input,
+                    directive,
+                )
+                .map_err(zstd_error)?;
+            (remaining, output.pos())
+        };
+        compressed.extend_from_slice(&scratch[..written]);
+        if input.pos() == raw.len() && remaining == 0 {
+            return Ok(());
+        }
+    }
+}
+
+fn push_parallel_frame(
+    entities: &[ParallelEntityChunk],
+    first: usize,
+    end: usize,
+    raw_start: usize,
+    raw_end: usize,
+    compressed: Vec<u8>,
+    frames: &mut Vec<(FrameInfo, Vec<u8>)>,
+) -> Result<()> {
+    if zstd::zstd_safe::get_dict_id_from_frame(&compressed).is_some() {
+        return Err(ArchiveError::Invalid(
+            "reference-prefix frame unexpectedly has a dictionary id",
+        ));
+    }
+    let records = entities[first..end]
+        .iter()
+        .try_fold(0_u64, |total, chunk| {
+            total
+                .checked_add(chunk.records)
+                .ok_or(ArchiveError::FieldTooLarge)
+        })?;
+    frames.push((
+        FrameInfo {
+            first_entity: entities[first].entity,
+            last_entity: entities[end - 1].entity,
+            records,
+            raw_bytes: (raw_end - raw_start) as u64,
+            compressed_bytes: compressed.len() as u64,
+            dictionary_id: None,
+        },
+        compressed,
+    ));
+    Ok(())
+}
+
 pub struct ArchiveWriter<'a, W: Write> {
     output: W,
     frame_target: usize,
@@ -835,8 +1295,9 @@ pub struct ArchiveWriter<'a, W: Write> {
     last_entity: Option<EntityKey>,
     last_timestamp: i64,
     frames: u64,
-    dictionary: Option<std::sync::Arc<[u8]>>,
     ref_prefix: Option<&'a [u8]>,
+    prepared_reference:
+        Option<std::sync::Arc<zstd::dict::EncoderDictionary<'static>>>,
     dictionary_id: Option<u32>,
     range_boundaries: std::collections::VecDeque<EntityKey>,
 }
@@ -872,6 +1333,12 @@ impl<W: Write> ArchiveWriter<'static, W> {
             .as_deref()
             .map(dictionary_id)
             .transpose()?;
+        let prepared_reference = dictionary.as_deref().map(|dictionary| {
+            std::sync::Arc::new(zstd::dict::EncoderDictionary::copy(
+                dictionary,
+                compression.level,
+            ))
+        });
         if let (Some(dictionary), Some(dictionary_id)) =
             (dictionary.as_deref(), dictionary_id)
         {
@@ -885,8 +1352,8 @@ impl<W: Write> ArchiveWriter<'static, W> {
             last_entity: None,
             last_timestamp: i64::MAX,
             frames: 0,
-            dictionary,
             ref_prefix: None,
+            prepared_reference,
             dictionary_id,
             range_boundaries: std::collections::VecDeque::new(),
         })
@@ -920,6 +1387,9 @@ impl<'a, W: Write> ArchiveWriter<'a, W> {
         output.write_all(&0_u32.to_le_bytes())?;
         output.write_all(&(frame_target as u64).to_le_bytes())?;
         write_ref_prefix_frame(&mut output, prefix, compression)?;
+        let prepared_reference = Some(std::sync::Arc::new(
+            zstd::dict::EncoderDictionary::copy(prefix, compression.level),
+        ));
         Ok(Self {
             output,
             frame_target,
@@ -928,8 +1398,8 @@ impl<'a, W: Write> ArchiveWriter<'a, W> {
             last_entity: None,
             last_timestamp: i64::MAX,
             frames: 0,
-            dictionary: None,
             ref_prefix: Some(prefix),
+            prepared_reference,
             dictionary_id: None,
             range_boundaries: std::collections::VecDeque::new(),
         })
@@ -977,9 +1447,10 @@ impl<'a, W: Write> ArchiveWriter<'a, W> {
         }
         if new_entity {
             if let Some(frame) = self.frame.as_mut() {
-                frame.encoder.flush()?;
                 if frame.last_entity.kind != entity.kind
                     || frame.compressed_so_far() >= self.frame_target
+                    || frame.raw_bytes
+                        >= self.frame_target.saturating_mul(8) as u64
                 {
                     self.seal_frame()?;
                 }
@@ -989,8 +1460,9 @@ impl<'a, W: Write> ArchiveWriter<'a, W> {
             self.frame = Some(FrameBuilder::new(
                 entity,
                 self.compression,
-                self.dictionary.as_deref(),
-                self.ref_prefix,
+                self.prepared_reference.as_ref(),
+                self.ref_prefix
+                    .map(|prefix| ref_prefix_window_log(prefix.len())),
             )?);
         }
 
@@ -1166,7 +1638,7 @@ impl<R: Read> ArchiveReader<R> {
         let limited = (&mut self.input).take(info.compressed_bytes);
         let compressed = compressed_frame_reader(limited, info)?;
         let decoder = frame_decoder(
-            BufReader::new(compressed),
+            BufReader::with_capacity(FRAME_READ_AHEAD, compressed),
             info,
             self.reference.as_ref(),
         )?;
@@ -1572,7 +2044,7 @@ pub(crate) fn visit_frame_while_file(
         location.info,
     )?;
     let decoder = frame_decoder(
-        BufReader::new(compressed),
+        BufReader::with_capacity(FRAME_READ_AHEAD, compressed),
         location.info,
         location.reference.as_ref(),
     )?;
@@ -1607,6 +2079,55 @@ enum ArchiveRecordSource {
 
 pub(crate) trait RecordSource {
     fn next_record(&mut self) -> Result<Option<Record>>;
+}
+
+pub(crate) struct SequentialRecordGroups<'a> {
+    groups: std::vec::IntoIter<Vec<Box<dyn RecordSource + 'a>>>,
+    current: Option<SortedArchiveMerge<'a>>,
+    last_entity: Option<EntityKey>,
+    at_group_start: bool,
+}
+
+impl<'a> SequentialRecordGroups<'a> {
+    pub(crate) fn new(groups: Vec<Vec<Box<dyn RecordSource + 'a>>>) -> Self {
+        Self {
+            groups: groups.into_iter(),
+            current: None,
+            last_entity: None,
+            at_group_start: false,
+        }
+    }
+}
+
+impl RecordSource for SequentialRecordGroups<'_> {
+    fn next_record(&mut self) -> Result<Option<Record>> {
+        loop {
+            if let Some(current) = self.current.as_mut() {
+                if let Some(record) = current.next_record()? {
+                    let entity = record.entity();
+                    if self.at_group_start
+                        && self.last_entity.is_some_and(|last| entity <= last)
+                    {
+                        return Err(ArchiveError::Invalid(
+                            "sequential archive groups overlap or are out of order",
+                        ));
+                    }
+                    self.at_group_start = false;
+                    self.last_entity = Some(entity);
+                    return Ok(Some(record));
+                }
+                self.current = None;
+            }
+            let Some(group) = self.groups.next() else {
+                return Ok(None);
+            };
+            if group.is_empty() {
+                continue;
+            }
+            self.current = Some(SortedArchiveMerge::new(group)?);
+            self.at_group_start = true;
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1802,11 +2323,13 @@ pub fn repack_with_ref_prefix<R: Read + Seek, W: Write>(
     let prefix = distill_ref_prefix(&samples, prefix_capacity, compression.level)?;
     drop(samples);
     let mut reader = ArchiveReader::new(input)?;
-    let writer = ArchiveWriter::with_compression_and_ref_prefix(
+    let writer = ParallelArchiveWriter::new(
         output,
         frame_target,
         compression,
         &prefix,
+        usize::try_from(streaming_compression_workers())
+            .unwrap_or(usize::MAX),
     )?;
     let mut stats = RepackStats {
         ref_prefix_bytes: prefix.len() as u64,
@@ -1814,7 +2337,8 @@ pub fn repack_with_ref_prefix<R: Read + Seek, W: Write>(
         sample_bytes: sample_bytes as u64,
         ..RepackStats::default()
     };
-    let (output, output_frames) = repack_records(&mut reader, writer, &mut stats)?;
+    let (output, output_frames) =
+        repack_records_parallel(&mut reader, writer, &mut stats)?;
     stats.output_frames = output_frames;
     Ok((output, stats))
 }
@@ -1864,6 +2388,35 @@ fn repack_inner<R: Read + Seek, W: Write>(
 fn repack_records<'a, R: Read, W: Write>(
     reader: &mut ArchiveReader<R>,
     mut writer: ArchiveWriter<'a, W>,
+    stats: &mut RepackStats,
+) -> Result<(W, u64)> {
+    while let Some(mut frame) = reader.next_frame()? {
+        let info = frame.info();
+        stats.input_frames += 1;
+        stats.input_raw_bytes = stats
+            .input_raw_bytes
+            .checked_add(info.raw_bytes)
+            .ok_or(ArchiveError::FieldTooLarge)?;
+        stats.input_compressed_bytes = stats
+            .input_compressed_bytes
+            .checked_add(info.compressed_bytes)
+            .ok_or(ArchiveError::FieldTooLarge)?;
+        while let Some(record) = frame.next_record()? {
+            writer.write(&record)?;
+            stats.records += 1;
+        }
+    }
+    if !reader.is_complete() {
+        return Err(ArchiveError::Invalid(
+            "archive has no clean completion marker",
+        ));
+    }
+    writer.finish()
+}
+
+fn repack_records_parallel<R: Read, W: Write>(
+    reader: &mut ArchiveReader<R>,
+    mut writer: ParallelArchiveWriter<W>,
     stats: &mut RepackStats,
 ) -> Result<(W, u64)> {
     while let Some(mut frame) = reader.next_frame()? {
@@ -2228,7 +2781,7 @@ fn open_owned_frame_input_at(
         location.info,
     )?;
     let decoder = owned_frame_decoder(
-        BufReader::new(compressed),
+        BufReader::with_capacity(FRAME_READ_AHEAD, compressed),
         location.info,
         location.reference.as_ref(),
     )?;
@@ -2530,13 +3083,13 @@ pub(crate) fn merge_record_sources_bootstrapping_ref_prefix_observing<
     };
     drop(samples);
 
-    let mut final_compression = compression;
-    final_compression.workers = streaming_compression_workers();
-    let mut writer = ArchiveWriter::with_compression_and_ref_prefix(
+    let mut writer = ParallelArchiveWriter::new(
         output,
         frame_target,
-        final_compression,
+        compression,
         &prefix,
+        usize::try_from(streaming_compression_workers())
+            .unwrap_or(usize::MAX),
     )?;
     let mut bootstrap_reader = ArchiveReader::new(bootstrap)?;
     let mut replayed = 0_u64;
@@ -2547,7 +3100,7 @@ pub(crate) fn merge_record_sources_bootstrapping_ref_prefix_observing<
             replayed = replayed
                 .checked_add(1)
                 .ok_or(ArchiveError::FieldTooLarge)?;
-            if replayed.is_multiple_of(4096) {
+            if replayed % 4096 == 0 {
                 phase_progress(BootstrapMergePhase::Replaying, replayed, records);
             }
         }
@@ -2683,13 +3236,13 @@ pub(crate) fn merge_archive_with_sorted_source_and_ref_prefix<
     compression: CompressionSettings,
     mut progress: F,
 ) -> Result<(W, u64, u64)> {
-    let mut compression = compression;
-    compression.workers = streaming_compression_workers();
-    let writer = ArchiveWriter::with_compression_and_ref_prefix(
+    let writer = ParallelArchiveWriter::new(
         output,
         frame_target,
         compression,
         prefix,
+        usize::try_from(streaming_compression_workers())
+            .unwrap_or(usize::MAX),
     )?;
     let sources: Vec<Box<dyn RecordSource + 'a>> = vec![
         Box::new(ArchiveRecordReader::open(base_archive)?),
@@ -3753,9 +4306,21 @@ impl<D: Read> ArchiveFrameReader<D> {
                 .try_into()
                 .map_err(|_| ArchiveError::FieldTooLarge)?;
             let record = if include(entity, kind) {
-                let mut payload = vec![0; payload_len];
-                self.decoder.read_exact(&mut payload)?;
-                Some(decode_record(entity, timestamp, kind, payload)?)
+                let mut payload =
+                    (&mut self.decoder).take(payload_len as u64);
+                let record = decode_record_from_reader(
+                    entity,
+                    timestamp,
+                    kind,
+                    &mut payload,
+                )?;
+                if payload.limit() != 0 {
+                    return Err(ArchiveError::Io(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "truncated record payload",
+                    )));
+                }
+                Some(record)
             } else {
                 let copied = io::copy(
                     &mut (&mut self.decoder).take(payload_len as u64),
@@ -4689,8 +5254,7 @@ fn record_wire_size(record: &Record) -> Result<(u8, u64)> {
 
 fn encode_record_wire(record: &Record) -> Result<Vec<u8>> {
     let entity = record.entity();
-    let timestamp = record.timestamp_micros();
-    let (kind, payload_len) = record_wire_size(record)?;
+    let (_, payload_len) = record_wire_size(record)?;
     let capacity = 1_u64
         .checked_add(varint_len(entity.id) as u64)
         .and_then(|size| size.checked_add(8 + 1 + varint_len(payload_len) as u64))
@@ -4699,13 +5263,19 @@ fn encode_record_wire(record: &Record) -> Result<Vec<u8>> {
     let mut bytes = Vec::with_capacity(
         usize::try_from(capacity).map_err(|_| ArchiveError::FieldTooLarge)?,
     );
-    bytes.push(entity.kind as u8);
-    write_varint(&mut bytes, entity.id)?;
-    bytes.extend_from_slice(&timestamp.to_le_bytes());
-    bytes.push(kind);
-    write_varint(&mut bytes, payload_len)?;
-    write_record_payload(&mut bytes, record)?;
+    write_record_wire(&mut bytes, record)?;
     Ok(bytes)
+}
+
+fn write_record_wire(output: &mut impl Write, record: &Record) -> Result<()> {
+    let entity = record.entity();
+    let (kind, payload_len) = record_wire_size(record)?;
+    output.write_all(&[entity.kind as u8])?;
+    write_varint(output, entity.id)?;
+    output.write_all(&record.timestamp_micros().to_le_bytes())?;
+    output.write_all(&[kind])?;
+    write_varint(output, payload_len)?;
+    write_record_payload(output, record)
 }
 
 fn write_record_payload<W: Write>(out: &mut W, record: &Record) -> Result<()> {
@@ -5065,42 +5635,64 @@ fn write_site_info(out: &mut impl Write, site_info: &SiteInfoRecord) -> Result<(
     Ok(())
 }
 
-fn decode_record(entity: EntityKey, timestamp: i64, kind: u8, payload: Vec<u8>) -> Result<Record> {
-    let mut input = payload.as_slice();
+fn decode_record(
+    entity: EntityKey,
+    timestamp: i64,
+    kind: u8,
+    payload: Vec<u8>,
+) -> Result<Record> {
+    let payload_len = payload.len() as u64;
+    let mut input = Cursor::new(payload);
+    let record =
+        decode_record_from_reader(entity, timestamp, kind, &mut input)?;
+    if input.position() != payload_len {
+        return Err(ArchiveError::Invalid(
+            "record payload has trailing bytes",
+        ));
+    }
+    Ok(record)
+}
+
+fn decode_record_from_reader(
+    entity: EntityKey,
+    timestamp: i64,
+    kind: u8,
+    input: &mut impl Read,
+) -> Result<Record> {
     let record = match kind {
         KIND_PAGE_STATE if entity.kind == EntityKind::Page => Record::PageState {
             page_id: entity.id,
             timestamp_micros: timestamp,
-            namespace: read_option_i64(&mut input)?,
-            title: read_string(&mut input)?,
-            deleted: read_bool(&mut input)?,
+            namespace: read_option_i64(&mut *input)?,
+            title: read_string(&mut *input)?,
+            deleted: read_bool(&mut *input)?,
         },
         KIND_REVISION if entity.kind == EntityKind::Page => Record::Revision {
             page_id: entity.id,
-            revision: read_revision(&mut input, timestamp)?,
+            revision: read_revision(&mut *input, timestamp)?,
         },
         KIND_PAGE_ACTION if matches!(entity.kind, EntityKind::Page | EntityKind::Global) => Record::PageAction {
             entity,
             timestamp_micros: timestamp,
-            action: read_action(&mut input)?,
+            action: read_action(&mut *input)?,
         },
         KIND_USER_STATE if entity.kind == EntityKind::User => Record::UserState {
             user_id: entity.id,
             timestamp_micros: timestamp,
-            state: read_user_state(&mut input)?,
+            state: read_user_state(&mut *input)?,
         },
         KIND_USER_ACTION if matches!(entity.kind, EntityKind::User | EntityKind::Global) => Record::UserAction {
             entity,
             timestamp_micros: timestamp,
-            action: read_user_action(&mut input)?,
+            action: read_user_action(&mut *input)?,
         },
         KIND_MANIFEST if entity.kind == EntityKind::Global && entity.id == 0 => Record::Manifest {
             timestamp_micros: timestamp,
-            manifest: read_manifest(&mut input)?,
+            manifest: read_manifest(&mut *input)?,
         },
         KIND_SITE_INFO if entity.kind == EntityKind::Global && entity.id == 1 => Record::SiteInfo {
             timestamp_micros: timestamp,
-            site_info: read_site_info(&mut input)?,
+            site_info: read_site_info(&mut *input)?,
         },
         KIND_PAGE_STATE | KIND_REVISION | KIND_PAGE_ACTION | KIND_USER_STATE
         | KIND_USER_ACTION | KIND_MANIFEST | KIND_SITE_INFO => {
@@ -5109,6 +5701,8 @@ fn decode_record(entity: EntityKey, timestamp: i64, kind: u8, payload: Vec<u8>) 
             ))
         }
         _ => {
+            let mut payload = Vec::new();
+            input.read_to_end(&mut payload)?;
             return Ok(Record::Unknown {
                 entity,
                 timestamp_micros: timestamp,
@@ -5117,13 +5711,13 @@ fn decode_record(entity: EntityKey, timestamp: i64, kind: u8, payload: Vec<u8>) 
             })
         }
     };
-    if !input.is_empty() {
-        return Err(ArchiveError::Invalid("record payload has trailing bytes"));
-    }
     Ok(record)
 }
 
-fn read_revision(input: &mut &[u8], timestamp: i64) -> Result<RevisionRecord> {
+fn read_revision(
+    input: &mut impl Read,
+    timestamp: i64,
+) -> Result<RevisionRecord> {
     let flags = read_u32(input)?;
     let rev_id = read_u64(input)?;
     let parent_id = read_u64(input)?;
@@ -5174,7 +5768,7 @@ fn read_revision(input: &mut &[u8], timestamp: i64) -> Result<RevisionRecord> {
     })
 }
 
-fn read_action(input: &mut &[u8]) -> Result<PageActionRecord> {
+fn read_action(input: &mut impl Read) -> Result<PageActionRecord> {
     Ok(PageActionRecord {
         log_id: read_option_u64(input)?,
         tie_sequence: read_varint(input)?.0,
@@ -5187,7 +5781,9 @@ fn read_action(input: &mut &[u8]) -> Result<PageActionRecord> {
     })
 }
 
-fn read_visibility(input: &mut &[u8]) -> Result<RevisionVisibilityRecord> {
+fn read_visibility(
+    input: &mut impl Read,
+) -> Result<RevisionVisibilityRecord> {
     let deleted_parts = read_u8(input)?;
     let parts_are_suppressed = read_bool(input)?;
     let deleted_by_page_deletion = read_bool(input)?;
@@ -5200,7 +5796,7 @@ fn read_visibility(input: &mut &[u8]) -> Result<RevisionVisibilityRecord> {
     })
 }
 
-fn read_account_class(input: &mut &[u8]) -> Result<AccountClass> {
+fn read_account_class(input: &mut impl Read) -> Result<AccountClass> {
     match read_u8(input)? {
         0 => Ok(AccountClass::Unknown),
         1 => Ok(AccountClass::Anonymous),
@@ -5211,7 +5807,7 @@ fn read_account_class(input: &mut &[u8]) -> Result<AccountClass> {
     }
 }
 
-fn read_performer(input: &mut &[u8]) -> Result<PerformerRecord> {
+fn read_performer(input: &mut impl Read) -> Result<PerformerRecord> {
     Ok(PerformerRecord {
         local_user_id: read_option_u64(input)?,
         central_user_id: read_option_u64(input)?,
@@ -5220,7 +5816,7 @@ fn read_performer(input: &mut &[u8]) -> Result<PerformerRecord> {
     })
 }
 
-fn read_action_kind(input: &mut &[u8]) -> Result<PageActionKind> {
+fn read_action_kind(input: &mut impl Read) -> Result<PageActionKind> {
     match read_u8(input)? {
         0 => Ok(PageActionKind::Create),
         1 => Ok(PageActionKind::LoggedCreate),
@@ -5233,7 +5829,9 @@ fn read_action_kind(input: &mut &[u8]) -> Result<PageActionKind> {
     }
 }
 
-fn read_revision_history(input: &mut &[u8]) -> Result<RevisionHistoryRecord> {
+fn read_revision_history(
+    input: &mut impl Read,
+) -> Result<RevisionHistoryRecord> {
     Ok(RevisionHistoryRecord {
         minor: read_option_bool(input)?,
         content_model: read_option_string(input)?,
@@ -5247,7 +5845,7 @@ fn read_revision_history(input: &mut &[u8]) -> Result<RevisionHistoryRecord> {
     })
 }
 
-fn read_user_state(input: &mut &[u8]) -> Result<UserStateRecord> {
+fn read_user_state(input: &mut impl Read) -> Result<UserStateRecord> {
     Ok(UserStateRecord {
         current_name: read_option_string(input)?,
         central_user_id: read_option_u64(input)?,
@@ -5258,7 +5856,7 @@ fn read_user_state(input: &mut &[u8]) -> Result<UserStateRecord> {
     })
 }
 
-fn read_user_action_kind(input: &mut &[u8]) -> Result<UserActionKind> {
+fn read_user_action_kind(input: &mut impl Read) -> Result<UserActionKind> {
     match read_u8(input)? {
         0 => Ok(UserActionKind::Create),
         1 => Ok(UserActionKind::Rename),
@@ -5269,7 +5867,7 @@ fn read_user_action_kind(input: &mut &[u8]) -> Result<UserActionKind> {
     }
 }
 
-fn read_user_action(input: &mut &[u8]) -> Result<UserActionRecord> {
+fn read_user_action(input: &mut impl Read) -> Result<UserActionRecord> {
     Ok(UserActionRecord {
         log_id: read_option_u64(input)?,
         tie_sequence: read_varint(input)?.0,
@@ -5287,7 +5885,7 @@ fn read_user_action(input: &mut &[u8]) -> Result<UserActionRecord> {
     })
 }
 
-fn read_manifest(input: &mut &[u8]) -> Result<ManifestRecord> {
+fn read_manifest(input: &mut impl Read) -> Result<ManifestRecord> {
     Ok(ManifestRecord {
         wiki_db: read_string(input)?,
         content_snapshot: read_string(input)?,
@@ -5296,7 +5894,7 @@ fn read_manifest(input: &mut &[u8]) -> Result<ManifestRecord> {
     })
 }
 
-fn read_site_info(input: &mut &[u8]) -> Result<SiteInfoRecord> {
+fn read_site_info(input: &mut impl Read) -> Result<SiteInfoRecord> {
     let site_name = read_string(input)?;
     let db_name = read_string(input)?;
     let base = read_string(input)?;
@@ -5530,39 +6128,44 @@ fn read_u64_from(input: &mut impl Read) -> Result<u64> {
     Ok(u64::from_le_bytes(value))
 }
 
-fn read_u32(input: &mut &[u8]) -> Result<u32> {
-    let bytes = take_bytes(input, 4)?;
-    Ok(u32::from_le_bytes(bytes.try_into().unwrap()))
+fn read_u32(input: &mut impl Read) -> Result<u32> {
+    let mut bytes = [0_u8; 4];
+    input.read_exact(&mut bytes)?;
+    Ok(u32::from_le_bytes(bytes))
 }
 
-fn read_u64(input: &mut &[u8]) -> Result<u64> {
-    let bytes = take_bytes(input, 8)?;
-    Ok(u64::from_le_bytes(bytes.try_into().unwrap()))
+fn read_u64(input: &mut impl Read) -> Result<u64> {
+    let mut bytes = [0_u8; 8];
+    input.read_exact(&mut bytes)?;
+    Ok(u64::from_le_bytes(bytes))
 }
 
-fn read_string(input: &mut &[u8]) -> Result<String> {
+fn read_string(input: &mut impl Read) -> Result<String> {
     String::from_utf8(read_bytes(input)?)
         .map_err(|_| ArchiveError::Invalid("archive string is not UTF-8"))
 }
 
-fn read_bytes(input: &mut &[u8]) -> Result<Vec<u8>> {
+fn read_bytes(input: &mut impl Read) -> Result<Vec<u8>> {
     let (len, _) = read_varint(input)?;
     let len = len.try_into().map_err(|_| ArchiveError::FieldTooLarge)?;
-    Ok(take_bytes(input, len)?.to_vec())
+    let mut bytes = vec![0_u8; len];
+    input.read_exact(&mut bytes)?;
+    Ok(bytes)
 }
 
-fn read_option_i64(input: &mut &[u8]) -> Result<Option<i64>> {
+fn read_option_i64(input: &mut impl Read) -> Result<Option<i64>> {
     match read_u8(input)? {
         0 => Ok(None),
         1 => {
-            let bytes = take_bytes(input, 8)?;
-            Ok(Some(i64::from_le_bytes(bytes.try_into().unwrap())))
+            let mut bytes = [0_u8; 8];
+            input.read_exact(&mut bytes)?;
+            Ok(Some(i64::from_le_bytes(bytes)))
         }
         _ => Err(ArchiveError::Invalid("invalid optional integer marker")),
     }
 }
 
-fn read_option_u64(input: &mut &[u8]) -> Result<Option<u64>> {
+fn read_option_u64(input: &mut impl Read) -> Result<Option<u64>> {
     match read_u8(input)? {
         0 => Ok(None),
         1 => Ok(Some(read_varint(input)?.0)),
@@ -5570,7 +6173,7 @@ fn read_option_u64(input: &mut &[u8]) -> Result<Option<u64>> {
     }
 }
 
-fn read_option_bool(input: &mut &[u8]) -> Result<Option<bool>> {
+fn read_option_bool(input: &mut impl Read) -> Result<Option<bool>> {
     match read_u8(input)? {
         0 => Ok(None),
         1 => Ok(Some(false)),
@@ -5579,7 +6182,7 @@ fn read_option_bool(input: &mut &[u8]) -> Result<Option<bool>> {
     }
 }
 
-fn read_option_string(input: &mut &[u8]) -> Result<Option<String>> {
+fn read_option_string(input: &mut impl Read) -> Result<Option<String>> {
     match read_u8(input)? {
         0 => Ok(None),
         1 => Ok(Some(read_string(input)?)),
@@ -5587,7 +6190,7 @@ fn read_option_string(input: &mut &[u8]) -> Result<Option<String>> {
     }
 }
 
-fn read_strings(input: &mut &[u8]) -> Result<Vec<String>> {
+fn read_strings(input: &mut impl Read) -> Result<Vec<String>> {
     let count: usize = read_varint(input)?
         .0
         .try_into()
@@ -5595,21 +6198,12 @@ fn read_strings(input: &mut &[u8]) -> Result<Vec<String>> {
     (0..count).map(|_| read_string(input)).collect()
 }
 
-fn read_bool(input: &mut &[u8]) -> Result<bool> {
+fn read_bool(input: &mut impl Read) -> Result<bool> {
     match read_u8(input)? {
         0 => Ok(false),
         1 => Ok(true),
         _ => Err(ArchiveError::Invalid("invalid boolean")),
     }
-}
-
-fn take_bytes<'a>(input: &mut &'a [u8], len: usize) -> Result<&'a [u8]> {
-    if input.len() < len {
-        return Err(ArchiveError::Invalid("truncated record payload"));
-    }
-    let (value, rest) = input.split_at(len);
-    *input = rest;
-    Ok(value)
 }
 
 #[cfg(test)]

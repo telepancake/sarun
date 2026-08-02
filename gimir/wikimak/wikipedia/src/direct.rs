@@ -1274,7 +1274,7 @@ pub(crate) fn prune_invalid_build_nodes_observing(
                 .map(|metadata| metadata.len())
                 .unwrap_or(0),
             );
-            if checked.is_multiple_of(10) || checked == total {
+            if checked % 10 == 0 || checked == total {
                 progress(&format!(
                     "validated {checked}/{total} source nodes · {reusable} reusable · {} checked · elapsed {}",
                     human_progress_bytes(checked_bytes),
@@ -2264,7 +2264,7 @@ pub(crate) fn assemble_direct_build(
     let inventory_started = Instant::now();
     let mut input_checkpoints = Vec::new();
     let mut input_compressed_bytes = 0_u64;
-    let mut record_sources: Vec<Box<dyn RecordSource>> = Vec::with_capacity(inputs.len());
+    let mut opened_readers = Vec::with_capacity(inputs.len());
     for (position, input) in inputs.iter().enumerate() {
         let reader = ArchiveRecordReader::open(input).map_err(map_archive)?;
         for frame in reader.remaining_frame_locations() {
@@ -2272,8 +2272,8 @@ pub(crate) fn assemble_direct_build(
                 input_compressed_bytes.saturating_add(frame.info.compressed_bytes);
             input_checkpoints.push((frame.info.last_entity, frame.info.compressed_bytes));
         }
-        record_sources.push(Box::new(reader));
-        if (position + 1).is_multiple_of(25) || position + 1 == inputs.len() {
+        opened_readers.push(reader);
+        if (position + 1) % 25 == 0 || position + 1 == inputs.len() {
             let (cpu_user_micros, cpu_system_micros, peak_rss_bytes) =
                 process_resource_usage();
             write_assembly_progress(
@@ -2307,6 +2307,29 @@ pub(crate) fn assemble_direct_build(
             ));
         }
     }
+    let mut opened_readers = opened_readers.into_iter();
+    let content_groups = plan
+        .content_groups
+        .iter()
+        .map(|group| {
+            (0..group.len())
+                .map(|_| {
+                    opened_readers
+                        .next()
+                        .map(|reader| Box::new(reader) as Box<dyn RecordSource>)
+                        .ok_or(Error::Corrupt("content reader inventory is incomplete"))
+                })
+                .collect::<Result<Vec<_>>>()
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut record_sources: Vec<Box<dyn RecordSource>> =
+        Vec::with_capacity(plan.history_files.len() + 3);
+    record_sources.push(Box::new(
+        crate::archive::SequentialRecordGroups::new(content_groups),
+    ));
+    record_sources.extend(
+        opened_readers.map(|reader| Box::new(reader) as Box<dyn RecordSource>),
+    );
     input_checkpoints.sort_unstable_by_key(|(entity, _)| *entity);
     progress(&format!(
         "assembling {} compressed from {} inputs into durable page-ID ranges",
