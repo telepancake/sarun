@@ -1865,8 +1865,8 @@ pub struct ArchiveRecordReader {
 
 #[derive(Clone)]
 enum ArchiveRecordSource {
-    File(PathBuf),
-    Set(Vec<(u64, std::sync::Arc<std::fs::File>)>),
+    Mapped(std::sync::Arc<memmap2::Mmap>),
+    MappedSet(Vec<(u64, std::sync::Arc<memmap2::Mmap>)>),
 }
 
 pub(crate) trait RecordSource {
@@ -1877,6 +1877,44 @@ trait ReadSeek: Read + Seek {}
 impl<T: Read + Seek> ReadSeek for T {}
 
 type OwnedInput = Box<dyn ReadSeek>;
+
+struct MappedInput {
+    bytes: std::sync::Arc<memmap2::Mmap>,
+    position: u64,
+}
+
+impl Read for MappedInput {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        let start = usize::try_from(self.position)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "mapped offset overflow"))?;
+        if start >= self.bytes.len() || output.is_empty() {
+            return Ok(0);
+        }
+        let length = output.len().min(self.bytes.len() - start);
+        output[..length].copy_from_slice(&self.bytes[start..start + length]);
+        self.position += length as u64;
+        Ok(length)
+    }
+}
+
+impl Seek for MappedInput {
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        let position = match position {
+            SeekFrom::Start(position) => i128::from(position),
+            SeekFrom::Current(delta) => i128::from(self.position) + i128::from(delta),
+            SeekFrom::End(delta) => self.bytes.len() as i128 + i128::from(delta),
+        };
+        if position < 0 || position > self.bytes.len() as i128 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "mapped seek is out of bounds",
+            ));
+        }
+        self.position = position as u64;
+        Ok(self.position)
+    }
+}
+
 type OwnedFrameDecoder = zstd::stream::read::Decoder<
     'static,
     BufReader<std::io::Chain<Cursor<Vec<u8>>, Take<OwnedInput>>>,
@@ -2393,21 +2431,29 @@ impl ArchiveRecordReader {
             let set = crate::archive_set::ArchiveSetReader::open(&path)?;
             let segments = set.segments().to_vec();
             let (_, frames, complete) = index_reader(set)?;
-            let files = segments
+            let mappings = segments
                 .iter()
                 .map(|segment| {
-                    Ok((
-                        segment.virtual_start,
-                        std::sync::Arc::new(std::fs::File::open(
-                            path.join(&segment.name),
-                        )?),
-                    ))
+                    let file = std::fs::File::open(path.join(&segment.name))?;
+                    // Completed archive segments are immutable for the lifetime
+                    // of a reader. Mapping them lets a merge retain hundreds of
+                    // independent cursors without retaining hundreds of file
+                    // descriptors.
+                    let bytes = unsafe { memmap2::MmapOptions::new().map(&file)? };
+                    Ok((segment.virtual_start, std::sync::Arc::new(bytes)))
                 })
                 .collect::<Result<Vec<_>>>()?;
-            (frames, complete, ArchiveRecordSource::Set(files))
+            (frames, complete, ArchiveRecordSource::MappedSet(mappings))
         } else {
-            let (_, frames, complete) = index_file(&path)?;
-            (frames, complete, ArchiveRecordSource::File(path))
+            let file = std::fs::File::open(&path)?;
+            let (_, frames, complete) = index_open_file(&file)?;
+            // The source archive is complete and immutable while it is read.
+            let bytes = unsafe { memmap2::MmapOptions::new().map(&file)? };
+            (
+                frames,
+                complete,
+                ArchiveRecordSource::Mapped(std::sync::Arc::new(bytes)),
+            )
         };
         if !complete {
             return Err(ArchiveError::Invalid(
@@ -2448,11 +2494,14 @@ fn open_owned_frame(
     location: &FrameLocation,
 ) -> Result<ArchiveFrameReader<OwnedFrameDecoder>> {
     let (input, offset): (OwnedInput, u64) = match source {
-        ArchiveRecordSource::File(path) => (
-            Box::new(std::fs::File::open(path)?),
+        ArchiveRecordSource::Mapped(bytes) => (
+            Box::new(MappedInput {
+                bytes: std::sync::Arc::clone(bytes),
+                position: 0,
+            }),
             location.compressed_offset,
         ),
-        ArchiveRecordSource::Set(segments) => {
+        ArchiveRecordSource::MappedSet(segments) => {
             let position = segments
                 .partition_point(|(virtual_start, _)| {
                     *virtual_start <= location.compressed_offset
@@ -2462,7 +2511,10 @@ fn open_owned_frame(
                     "frame offset precedes archive-set segments",
                 ))?;
             (
-                Box::new(segments[position].1.try_clone()?),
+                Box::new(MappedInput {
+                    bytes: std::sync::Arc::clone(&segments[position].1),
+                    position: 0,
+                }),
                 location.compressed_offset - segments[position].0,
             )
         }
@@ -6903,6 +6955,46 @@ mod tests {
                 Some(CompressionReference::RefPrefix(stored)) if stored.as_ref() == prefix
             )
         }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn many_archive_merge_survives_low_descriptor_limit() {
+        const CHILD_ROOT: &str = "WIKIMAK_LOW_DESCRIPTOR_MERGE_ROOT";
+        if let Some(root) = std::env::var_os(CHILD_ROOT) {
+            let mut limit = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) }, 0);
+            limit.rlim_cur = 48;
+            assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+
+            let mut inputs = std::fs::read_dir(root)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect::<Vec<_>>();
+            inputs.sort();
+            let (_, frames, records) =
+                merge_many_archives(&inputs, Vec::new(), 1024).unwrap();
+            assert!(frames > 0);
+            assert_eq!(records, 96);
+            return;
+        }
+
+        let temporary = tempfile::tempdir().unwrap();
+        for index in 0..96_u64 {
+            let path = temporary.path().join(format!("{index:03}.swdump"));
+            write_test_archive(&path, &[revision(index + 1, index + 1, 1, b"text")]);
+        }
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("archive::tests::many_archive_merge_survives_low_descriptor_limit")
+            .arg("--nocapture")
+            .env(CHILD_ROOT, temporary.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
     }
 
     fn write_test_archive(path: &Path, records: &[Record]) {
