@@ -6,7 +6,7 @@
 //! a depot format: it is a compact source for experiments, conversions, and
 //! recovery without depending on the current live storage layout.
 
-use std::collections::{BTreeMap, BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap};
 use std::io::{self, BufReader, Cursor, Read, Seek, SeekFrom, Take, Write};
 use std::path::{Path, PathBuf};
 
@@ -747,6 +747,7 @@ pub struct CompressionSettings {
     pub long_distance_matching: bool,
     pub window_log: Option<u32>,
     pub target_block_size: Option<u32>,
+    pub workers: u32,
 }
 
 impl Default for CompressionSettings {
@@ -757,6 +758,7 @@ impl Default for CompressionSettings {
             long_distance_matching: false,
             window_log: None,
             target_block_size: None,
+            workers: 0,
         }
     }
 }
@@ -801,6 +803,9 @@ impl<'a> FrameBuilder<'a> {
         let mut encoder = encoder;
         encoder.include_checksum(settings.checksum)?;
         encoder.long_distance_matching(settings.long_distance_matching)?;
+        if settings.workers != 0 {
+            encoder.multithread(settings.workers)?;
+        }
         let window_log = settings
             .window_log
             .or_else(|| ref_prefix.map(|prefix| ref_prefix_window_log(prefix.len())));
@@ -820,286 +825,6 @@ impl<'a> FrameBuilder<'a> {
     fn compressed_so_far(&self) -> usize {
         self.encoder.get_ref().len()
     }
-}
-
-struct PendingParallelFrame<'a> {
-    probe: zstd::stream::write::Encoder<'a, Vec<u8>>,
-    raw: Vec<u8>,
-    first_entity: EntityKey,
-    last_entity: EntityKey,
-    records: u64,
-}
-
-struct ParallelCompressionJob {
-    sequence: u64,
-    raw: Vec<u8>,
-    first_entity: EntityKey,
-    last_entity: EntityKey,
-    records: u64,
-}
-
-struct ParallelCompressedFrame {
-    sequence: u64,
-    compressed: Vec<u8>,
-    info: FrameInfo,
-}
-
-struct ParallelArchiveWriter<'a, W: Write> {
-    output: W,
-    frame_target: usize,
-    compression: CompressionSettings,
-    prefix: &'a [u8],
-    frame: Option<PendingParallelFrame<'a>>,
-    last_entity: Option<EntityKey>,
-    last_timestamp: i64,
-    jobs: Option<std::sync::mpsc::SyncSender<ParallelCompressionJob>>,
-    results: std::sync::mpsc::Receiver<Result<ParallelCompressedFrame>>,
-    workers: Vec<std::thread::JoinHandle<()>>,
-    pending: BTreeMap<u64, ParallelCompressedFrame>,
-    submitted: u64,
-    written: u64,
-    inflight: usize,
-    inflight_limit: usize,
-}
-
-impl<'a, W: Write> ParallelArchiveWriter<'a, W> {
-    fn new(
-        mut output: W,
-        frame_target: usize,
-        compression: CompressionSettings,
-        prefix: &'a [u8],
-        workers: usize,
-    ) -> Result<Self> {
-        if frame_target == 0 || prefix.is_empty() || workers == 0 {
-            return Err(ArchiveError::Invalid(
-                "invalid parallel archive writer configuration",
-            ));
-        }
-        output.write_all(&FILE_MAGIC)?;
-        output.write_all(&FILE_VERSION.to_le_bytes())?;
-        output.write_all(&0_u32.to_le_bytes())?;
-        output.write_all(&(frame_target as u64).to_le_bytes())?;
-        write_ref_prefix_frame(&mut output, prefix, compression)?;
-
-        let capacity = workers.saturating_mul(2).max(2);
-        let (jobs_tx, jobs_rx) =
-            std::sync::mpsc::sync_channel::<ParallelCompressionJob>(capacity);
-        let (results_tx, results_rx) = std::sync::mpsc::sync_channel(capacity);
-        let jobs_rx = std::sync::Arc::new(std::sync::Mutex::new(jobs_rx));
-        let worker_prefix = std::sync::Arc::<[u8]>::from(prefix);
-        let mut handles = Vec::with_capacity(workers);
-        for _ in 0..workers {
-            let jobs = std::sync::Arc::clone(&jobs_rx);
-            let results = results_tx.clone();
-            let prefix = std::sync::Arc::clone(&worker_prefix);
-            handles.push(std::thread::spawn(move || loop {
-                let job = {
-                    let Ok(receiver) = jobs.lock() else {
-                        return;
-                    };
-                    match receiver.recv() {
-                        Ok(job) => job,
-                        Err(_) => return,
-                    }
-                };
-                let result = compress_parallel_frame(job, compression, &prefix);
-                if results.send(result).is_err() {
-                    return;
-                }
-            }));
-        }
-        drop(results_tx);
-        Ok(Self {
-            output,
-            frame_target,
-            compression,
-            prefix,
-            frame: None,
-            last_entity: None,
-            last_timestamp: i64::MAX,
-            jobs: Some(jobs_tx),
-            results: results_rx,
-            workers: handles,
-            pending: BTreeMap::new(),
-            submitted: 0,
-            written: 0,
-            inflight: 0,
-            inflight_limit: capacity,
-        })
-    }
-
-    fn new_frame(&self, entity: EntityKey) -> Result<PendingParallelFrame<'a>> {
-        let probe_settings = CompressionSettings {
-            level: 1,
-            ..self.compression
-        };
-        let mut probe = zstd::stream::write::Encoder::with_ref_prefix(
-            Vec::new(),
-            probe_settings.level,
-            self.prefix,
-        )?;
-        probe.include_checksum(probe_settings.checksum)?;
-        probe.long_distance_matching(probe_settings.long_distance_matching)?;
-        probe.window_log(
-            probe_settings
-                .window_log
-                .unwrap_or_else(|| ref_prefix_window_log(self.prefix.len())),
-        )?;
-        probe.set_target_cblock_size(probe_settings.target_block_size)?;
-        Ok(PendingParallelFrame {
-            probe,
-            raw: Vec::new(),
-            first_entity: entity,
-            last_entity: entity,
-            records: 0,
-        })
-    }
-
-    fn write(&mut self, record: &Record) -> Result<()> {
-        let entity = record.entity();
-        let timestamp = record.timestamp_micros();
-        let new_entity = self.last_entity != Some(entity);
-        if let Some(previous) = self.last_entity {
-            if entity < previous || (!new_entity && timestamp > self.last_timestamp) {
-                return Err(ArchiveError::OutOfOrder {
-                    previous,
-                    previous_timestamp: self.last_timestamp,
-                    current: entity,
-                    current_timestamp: timestamp,
-                });
-            }
-        }
-        if new_entity {
-            let seal = if let Some(frame) = self.frame.as_mut() {
-                frame.probe.flush()?;
-                frame.last_entity.kind != entity.kind
-                    || frame.probe.get_ref().len() >= self.frame_target
-            } else {
-                false
-            };
-            if seal {
-                self.submit_frame()?;
-            }
-        }
-        if self.frame.is_none() {
-            self.frame = Some(self.new_frame(entity)?);
-        }
-        let encoded = encode_record_wire(record)?;
-        let frame = self.frame.as_mut().expect("created above");
-        frame.probe.write_all(&encoded)?;
-        frame.raw.extend_from_slice(&encoded);
-        frame.last_entity = entity;
-        frame.records = frame
-            .records
-            .checked_add(1)
-            .ok_or(ArchiveError::FieldTooLarge)?;
-        self.last_entity = Some(entity);
-        self.last_timestamp = timestamp;
-        Ok(())
-    }
-
-    fn submit_frame(&mut self) -> Result<()> {
-        let Some(frame) = self.frame.take() else {
-            return Ok(());
-        };
-        let job = ParallelCompressionJob {
-            sequence: self.submitted,
-            raw: frame.raw,
-            first_entity: frame.first_entity,
-            last_entity: frame.last_entity,
-            records: frame.records,
-        };
-        self.jobs
-            .as_ref()
-            .ok_or(ArchiveError::Invalid("parallel compressor is closed"))?
-            .send(job)
-            .map_err(|_| ArchiveError::Invalid("parallel compressor stopped"))?;
-        self.submitted = self
-            .submitted
-            .checked_add(1)
-            .ok_or(ArchiveError::FieldTooLarge)?;
-        self.inflight += 1;
-        if self.inflight >= self.inflight_limit {
-            self.receive_one()?;
-        }
-        Ok(())
-    }
-
-    fn receive_one(&mut self) -> Result<()> {
-        let frame = self
-            .results
-            .recv()
-            .map_err(|_| ArchiveError::Invalid("parallel compressor stopped"))??;
-        self.inflight = self.inflight.saturating_sub(1);
-        self.pending.insert(frame.sequence, frame);
-        while let Some(frame) = self.pending.remove(&self.written) {
-            write_frame_header(&mut self.output, frame.info)?;
-            self.output.write_all(&frame.compressed)?;
-            self.written = self
-                .written
-                .checked_add(1)
-                .ok_or(ArchiveError::FieldTooLarge)?;
-        }
-        Ok(())
-    }
-
-    fn finish(mut self) -> Result<(W, u64)> {
-        self.submit_frame()?;
-        self.jobs.take();
-        while self.inflight != 0 {
-            self.receive_one()?;
-        }
-        for worker in self.workers.drain(..) {
-            worker
-                .join()
-                .map_err(|_| ArchiveError::Invalid("parallel compressor panicked"))?;
-        }
-        if self.written != self.submitted || !self.pending.is_empty() {
-            return Err(ArchiveError::Invalid(
-                "parallel compressor omitted an output frame",
-            ));
-        }
-        self.output.write_all(&DONE_MAGIC)?;
-        self.output.write_all(&[0; FRAME_HEADER_LEN - 4])?;
-        self.output.flush()?;
-        Ok((self.output, self.written))
-    }
-}
-
-fn compress_parallel_frame(
-    job: ParallelCompressionJob,
-    settings: CompressionSettings,
-    prefix: &[u8],
-) -> Result<ParallelCompressedFrame> {
-    let mut encoder =
-        zstd::stream::write::Encoder::with_ref_prefix(Vec::new(), settings.level, prefix)?;
-    encoder.include_checksum(settings.checksum)?;
-    encoder.long_distance_matching(settings.long_distance_matching)?;
-    encoder.window_log(
-        settings
-            .window_log
-            .unwrap_or_else(|| ref_prefix_window_log(prefix.len())),
-    )?;
-    encoder.set_target_cblock_size(settings.target_block_size)?;
-    encoder.write_all(&job.raw)?;
-    let compressed = encoder.finish()?;
-    if zstd::zstd_safe::get_dict_id_from_frame(&compressed).is_some() {
-        return Err(ArchiveError::Invalid(
-            "reference-prefix frame unexpectedly has a dictionary id",
-        ));
-    }
-    Ok(ParallelCompressedFrame {
-        sequence: job.sequence,
-        info: FrameInfo {
-            first_entity: job.first_entity,
-            last_entity: job.last_entity,
-            records: job.records,
-            raw_bytes: job.raw.len() as u64,
-            compressed_bytes: compressed.len() as u64,
-            dictionary_id: None,
-        },
-        compressed,
-    })
 }
 
 pub struct ArchiveWriter<'a, W: Write> {
@@ -1487,6 +1212,17 @@ pub fn index_file(path: impl AsRef<Path>) -> Result<(u64, Vec<FrameLocation>, bo
     }
 }
 
+pub(crate) fn has_clean_completion_marker(path: impl AsRef<Path>) -> Result<bool> {
+    let mut file = std::fs::File::open(path)?;
+    if file.metadata()?.len() < FRAME_HEADER_LEN as u64 {
+        return Ok(false);
+    }
+    file.seek(SeekFrom::End(-(FRAME_HEADER_LEN as i64)))?;
+    let mut marker = [0_u8; FRAME_HEADER_LEN];
+    file.read_exact(&mut marker)?;
+    Ok(marker[..4] == DONE_MAGIC && marker[4..].iter().all(|byte| *byte == 0))
+}
+
 pub(crate) fn index_open_file(
     file: &std::fs::File,
 ) -> Result<(u64, Vec<FrameLocation>, bool)> {
@@ -1865,55 +1601,26 @@ pub struct ArchiveRecordReader {
 
 #[derive(Clone)]
 enum ArchiveRecordSource {
-    Mapped(std::sync::Arc<memmap2::Mmap>),
-    MappedSet(Vec<(u64, std::sync::Arc<memmap2::Mmap>)>),
+    File(PathBuf),
+    Set(Vec<(u64, PathBuf)>),
 }
 
 pub(crate) trait RecordSource {
     fn next_record(&mut self) -> Result<Option<Record>>;
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BootstrapMergePhase {
+    Sampling,
+    Distilling,
+    Replaying,
+    Merging,
+}
+
 trait ReadSeek: Read + Seek {}
 impl<T: Read + Seek> ReadSeek for T {}
 
 type OwnedInput = Box<dyn ReadSeek>;
-
-struct MappedInput {
-    bytes: std::sync::Arc<memmap2::Mmap>,
-    position: u64,
-}
-
-impl Read for MappedInput {
-    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
-        let start = usize::try_from(self.position)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "mapped offset overflow"))?;
-        if start >= self.bytes.len() || output.is_empty() {
-            return Ok(0);
-        }
-        let length = output.len().min(self.bytes.len() - start);
-        output[..length].copy_from_slice(&self.bytes[start..start + length]);
-        self.position += length as u64;
-        Ok(length)
-    }
-}
-
-impl Seek for MappedInput {
-    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
-        let position = match position {
-            SeekFrom::Start(position) => i128::from(position),
-            SeekFrom::Current(delta) => i128::from(self.position) + i128::from(delta),
-            SeekFrom::End(delta) => self.bytes.len() as i128 + i128::from(delta),
-        };
-        if position < 0 || position > self.bytes.len() as i128 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "mapped seek is out of bounds",
-            ));
-        }
-        self.position = position as u64;
-        Ok(self.position)
-    }
-}
 
 type OwnedFrameDecoder = zstd::stream::read::Decoder<
     'static,
@@ -2431,29 +2138,15 @@ impl ArchiveRecordReader {
             let set = crate::archive_set::ArchiveSetReader::open(&path)?;
             let segments = set.segments().to_vec();
             let (_, frames, complete) = index_reader(set)?;
-            let mappings = segments
+            let paths = segments
                 .iter()
-                .map(|segment| {
-                    let file = std::fs::File::open(path.join(&segment.name))?;
-                    // Completed archive segments are immutable for the lifetime
-                    // of a reader. Mapping them lets a merge retain hundreds of
-                    // independent cursors without retaining hundreds of file
-                    // descriptors.
-                    let bytes = unsafe { memmap2::MmapOptions::new().map(&file)? };
-                    Ok((segment.virtual_start, std::sync::Arc::new(bytes)))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            (frames, complete, ArchiveRecordSource::MappedSet(mappings))
+                .map(|segment| (segment.virtual_start, path.join(&segment.name)))
+                .collect();
+            (frames, complete, ArchiveRecordSource::Set(paths))
         } else {
             let file = std::fs::File::open(&path)?;
             let (_, frames, complete) = index_open_file(&file)?;
-            // The source archive is complete and immutable while it is read.
-            let bytes = unsafe { memmap2::MmapOptions::new().map(&file)? };
-            (
-                frames,
-                complete,
-                ArchiveRecordSource::Mapped(std::sync::Arc::new(bytes)),
-            )
+            (frames, complete, ArchiveRecordSource::File(path))
         };
         if !complete {
             return Err(ArchiveError::Invalid(
@@ -2465,6 +2158,10 @@ impl ArchiveRecordReader {
             frames: frames.into_iter(),
             current: None,
         })
+    }
+
+    pub(crate) fn remaining_frame_locations(&self) -> &[FrameLocation] {
+        self.frames.as_slice()
     }
 
     pub fn next_record(&mut self) -> Result<Option<Record>> {
@@ -2493,15 +2190,9 @@ fn open_owned_frame(
     source: &ArchiveRecordSource,
     location: &FrameLocation,
 ) -> Result<ArchiveFrameReader<OwnedFrameDecoder>> {
-    let (input, offset): (OwnedInput, u64) = match source {
-        ArchiveRecordSource::Mapped(bytes) => (
-            Box::new(MappedInput {
-                bytes: std::sync::Arc::clone(bytes),
-                position: 0,
-            }),
-            location.compressed_offset,
-        ),
-        ArchiveRecordSource::MappedSet(segments) => {
+    let (path, offset) = match source {
+        ArchiveRecordSource::File(path) => (path, location.compressed_offset),
+        ArchiveRecordSource::Set(segments) => {
             let position = segments
                 .partition_point(|(virtual_start, _)| {
                     *virtual_start <= location.compressed_offset
@@ -2511,15 +2202,12 @@ fn open_owned_frame(
                     "frame offset precedes archive-set segments",
                 ))?;
             (
-                Box::new(MappedInput {
-                    bytes: std::sync::Arc::clone(&segments[position].1),
-                    position: 0,
-                }),
+                &segments[position].1,
                 location.compressed_offset - segments[position].0,
             )
         }
     };
-    open_owned_frame_input_at(input, location, offset)
+    open_owned_frame_input_at(Box::new(std::fs::File::open(path)?), location, offset)
 }
 
 fn open_owned_frame_file(
@@ -2747,6 +2435,7 @@ pub(crate) fn merge_many_archives_bootstrapping_ref_prefix_observing<
         sample_capacity,
         prefix_capacity,
         observe,
+        |_, _, _| {},
     )
 }
 
@@ -2769,6 +2458,7 @@ pub(crate) fn merge_record_sources_bootstrapping_ref_prefix<'a, W: Write>(
         sample_capacity,
         prefix_capacity,
         |_| {},
+        |_, _, _| {},
     )
 }
 
@@ -2777,6 +2467,7 @@ pub(crate) fn merge_record_sources_bootstrapping_ref_prefix_observing<
     'a,
     W: Write,
     F: FnMut(&Record),
+    P: FnMut(BootstrapMergePhase, u64, u64),
 >(
     inputs: Vec<Box<dyn RecordSource + 'a>>,
     output: W,
@@ -2786,6 +2477,7 @@ pub(crate) fn merge_record_sources_bootstrapping_ref_prefix_observing<
     sample_capacity: usize,
     prefix_capacity: usize,
     mut observe: F,
+    mut phase_progress: P,
 ) -> Result<(W, u64, u64, RepackStats)> {
     if prefix_capacity == 0 || sample_capacity <= prefix_capacity {
         return Err(ArchiveError::Invalid(
@@ -2797,6 +2489,11 @@ pub(crate) fn merge_record_sources_bootstrapping_ref_prefix_observing<
         ArchiveWriter::with_compression(bootstrap, frame_target, compression)?;
     let mut sampler = NewestRevisionSamples::new(sample_capacity)?;
     let mut records = 0_u64;
+    phase_progress(
+        BootstrapMergePhase::Sampling,
+        0,
+        sample_capacity as u64,
+    );
 
     while !sampler.ready() {
         let Some(record) = merge.next_record()? else {
@@ -2817,6 +2514,11 @@ pub(crate) fn merge_record_sources_bootstrapping_ref_prefix_observing<
             "archive has no text-bearing revisions for a reference prefix",
         ));
     }
+    phase_progress(
+        BootstrapMergePhase::Distilling,
+        sample_bytes as u64,
+        prefix_capacity as u64,
+    );
     let prefix = if sample_bytes >= prefix_capacity {
         distill_ref_prefix(&samples, prefix_capacity, compression.level)?
     } else {
@@ -2828,30 +2530,36 @@ pub(crate) fn merge_record_sources_bootstrapping_ref_prefix_observing<
     };
     drop(samples);
 
-    let workers = std::env::var("SARUN_WIKIMAK_CPU_BUDGET")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, usize::from));
-    let mut writer = ParallelArchiveWriter::new(
+    let mut final_compression = compression;
+    final_compression.workers = streaming_compression_workers();
+    let mut writer = ArchiveWriter::with_compression_and_ref_prefix(
         output,
         frame_target,
-        compression,
+        final_compression,
         &prefix,
-        workers,
     )?;
     let mut bootstrap_reader = ArchiveReader::new(bootstrap)?;
+    let mut replayed = 0_u64;
+    phase_progress(BootstrapMergePhase::Replaying, replayed, records);
     while let Some(mut frame) = bootstrap_reader.next_frame()? {
         while let Some(record) = frame.next_record()? {
             writer.write(&record)?;
+            replayed = replayed
+                .checked_add(1)
+                .ok_or(ArchiveError::FieldTooLarge)?;
+            if replayed.is_multiple_of(4096) {
+                phase_progress(BootstrapMergePhase::Replaying, replayed, records);
+            }
         }
     }
+    phase_progress(BootstrapMergePhase::Replaying, replayed, records);
     if !bootstrap_reader.is_complete() {
         return Err(ArchiveError::Invalid(
             "bootstrap archive has no clean completion marker",
         ));
     }
     drop(bootstrap_reader);
+    phase_progress(BootstrapMergePhase::Merging, records, 0);
     while let Some(record) = merge.next_record()? {
         observe(&record);
         writer.write(&record)?;
@@ -2975,17 +2683,13 @@ pub(crate) fn merge_archive_with_sorted_source_and_ref_prefix<
     compression: CompressionSettings,
     mut progress: F,
 ) -> Result<(W, u64, u64)> {
-    let workers = std::env::var("SARUN_WIKIMAK_CPU_BUDGET")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, usize::from));
-    let writer = ParallelArchiveWriter::new(
+    let mut compression = compression;
+    compression.workers = streaming_compression_workers();
+    let writer = ArchiveWriter::with_compression_and_ref_prefix(
         output,
         frame_target,
         compression,
         prefix,
-        workers,
     )?;
     let sources: Vec<Box<dyn RecordSource + 'a>> = vec![
         Box::new(ArchiveRecordReader::open(base_archive)?),
@@ -3003,6 +2707,19 @@ pub(crate) fn merge_archive_with_sorted_source_and_ref_prefix<
     }
     let (output, frames) = writer.finish()?;
     Ok((output, frames, count))
+}
+
+fn streaming_compression_workers() -> u32 {
+    std::env::var("SARUN_WIKIMAK_CPU_BUDGET")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map_or(1, usize::from)
+                .try_into()
+                .unwrap_or(u32::MAX)
+        })
 }
 
 fn merge_sorted_archives<'a, W: Write>(
@@ -3039,6 +2756,7 @@ impl SortedArchiveMerge<'static> {
 
 impl<'a> SortedArchiveMerge<'a> {
     fn new(mut readers: Vec<Box<dyn RecordSource + 'a>>) -> Result<Self> {
+        ensure_stream_descriptor_capacity(readers.len())?;
         let mut heads = BinaryHeap::new();
         for (source, reader) in readers.iter_mut().enumerate() {
             if let Some(record) = reader.next_record()? {
@@ -3078,6 +2796,39 @@ impl<'a> SortedArchiveMerge<'a> {
         }
         Ok(Some(record))
     }
+}
+
+#[cfg(unix)]
+fn ensure_stream_descriptor_capacity(readers: usize) -> Result<()> {
+    let required = readers
+        .checked_add(64)
+        .ok_or(ArchiveError::FieldTooLarge)?;
+    let required = libc::rlim_t::try_from(required).map_err(|_| ArchiveError::FieldTooLarge)?;
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return Err(ArchiveError::Io(io::Error::last_os_error()));
+    }
+    if limit.rlim_cur >= required {
+        return Ok(());
+    }
+    if limit.rlim_max < required {
+        return Err(ArchiveError::Invalid(
+            "not enough file descriptors for streaming archive merge",
+        ));
+    }
+    limit.rlim_cur = required;
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) } != 0 {
+        return Err(ArchiveError::Io(io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_stream_descriptor_capacity(_readers: usize) -> Result<()> {
+    Ok(())
 }
 
 fn records_coalesce(left: &Record, right: &Record) -> bool {

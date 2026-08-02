@@ -1138,8 +1138,12 @@ fn build_full(
         wikimak_mediawiki::prepare_robots(client, url)
             .map_err(|error| error.to_string())?;
     }
-    let reusable = crate::direct::prune_invalid_build_nodes(scratch, &plan)
-        .map_err(|error| error.to_string())?;
+    let reusable = crate::direct::prune_invalid_build_nodes_observing(
+        scratch,
+        &plan,
+        &|message| eprintln!("{message}"),
+    )
+    .map_err(|error| error.to_string())?;
     crate::direct::recover_direct_build_completion(scratch, &plan)
         .map_err(|error| error.to_string())?;
     if reusable != 0 {

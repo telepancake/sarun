@@ -11,10 +11,11 @@ use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 
 use crate::archive::{
-    ArchiveError, ArchiveRecordReader, ArchiveWriter, CompressionSettings, ManifestRecord,
-    Record, RecordSorter, RecordSource, RevisionRecord, SiteInfoRecord, SiteInterwikiRecord,
-    SiteNamespaceRecord, DEFAULT_FRAME_TARGET, MIRROR_FRAME_TARGET,
-    MIRROR_REF_PREFIX_BYTES, MIRROR_REF_PREFIX_SAMPLE_BYTES,
+    ArchiveError, ArchiveRecordReader, ArchiveWriter, BootstrapMergePhase,
+    CompressionSettings, EntityKind, ManifestRecord, Record, RecordSorter, RecordSource,
+    RevisionRecord, SiteInfoRecord, SiteInterwikiRecord, SiteNamespaceRecord,
+    DEFAULT_FRAME_TARGET, MIRROR_FRAME_TARGET, MIRROR_REF_PREFIX_BYTES,
+    MIRROR_REF_PREFIX_SAMPLE_BYTES,
 };
 use crate::instance::{ContributorMeta, RevisionMeta};
 use crate::{Error, Result};
@@ -931,14 +932,13 @@ fn validate_node(
     {
         return Ok(false);
     }
-    let (_, _, complete) = crate::archive::index_file(&data).map_err(map_archive)?;
-    if !complete {
+    if !crate::archive::has_clean_completion_marker(&data).map_err(map_archive)? {
         return Ok(false);
     }
     if kind == "content" && index == 0 {
-        let (_, _, complete) =
-            crate::archive::index_file(node.join("siteinfo.swdump")).map_err(map_archive)?;
-        if !complete {
+        if !crate::archive::has_clean_completion_marker(node.join("siteinfo.swdump"))
+            .map_err(map_archive)?
+        {
             return Ok(false);
         }
     }
@@ -1201,11 +1201,25 @@ fn adopt_grouped_partial_sources(root: &Path, plan: &DirectBuildPlan) -> Result<
     Ok(())
 }
 
-pub(crate) fn prune_invalid_build_nodes(root: &Path, plan: &DirectBuildPlan) -> Result<usize> {
+#[cfg(test)]
+fn prune_invalid_build_nodes(root: &Path, plan: &DirectBuildPlan) -> Result<usize> {
+    prune_invalid_build_nodes_observing(root, plan, &|_| {})
+}
+
+pub(crate) fn prune_invalid_build_nodes_observing(
+    root: &Path,
+    plan: &DirectBuildPlan,
+    progress: &(impl Fn(&str) + Sync),
+) -> Result<usize> {
     std::fs::create_dir_all(root.join("nodes"))?;
+    progress("checking for completed source nodes from earlier runs");
     adopt_grouped_completed_nodes(root, plan)?;
     adopt_grouped_partial_sources(root, plan)?;
     let mut reusable = 0;
+    let total = plan.target_count();
+    let mut checked = 0_usize;
+    let mut checked_bytes = 0_u64;
+    let started = Instant::now();
     for (kind, count) in [
         ("content", plan.content_target_count()),
         ("history", plan.history_files.len()),
@@ -1216,6 +1230,21 @@ pub(crate) fn prune_invalid_build_nodes(root: &Path, plan: &DirectBuildPlan) -> 
                 reusable += 1;
             } else if path.exists() {
                 std::fs::remove_dir_all(path)?;
+            }
+            checked += 1;
+            checked_bytes = checked_bytes.saturating_add(
+                std::fs::metadata(
+                    node_path(root, plan, kind, index).join("data.swdump"),
+                )
+                .map(|metadata| metadata.len())
+                .unwrap_or(0),
+            );
+            if checked.is_multiple_of(10) || checked == total {
+                progress(&format!(
+                    "validated {checked}/{total} source nodes · {reusable} reusable · {} checked · elapsed {}",
+                    human_progress_bytes(checked_bytes),
+                    duration_summary(started.elapsed().as_secs()),
+                ));
             }
         }
     }
@@ -1959,6 +1988,109 @@ pub(crate) fn materialize_direct_build_node(
     Ok(())
 }
 
+struct AssemblyTelemetry {
+    phase: AtomicU64,
+    phase_current: AtomicU64,
+    phase_total: AtomicU64,
+    input_bytes: AtomicU64,
+    output_bytes: AtomicU64,
+    records: AtomicU64,
+    entity_kind: AtomicU64,
+    entity_id: AtomicU64,
+}
+
+impl AssemblyTelemetry {
+    fn new() -> Self {
+        Self {
+            phase: AtomicU64::new(0),
+            phase_current: AtomicU64::new(0),
+            phase_total: AtomicU64::new(0),
+            input_bytes: AtomicU64::new(0),
+            output_bytes: AtomicU64::new(0),
+            records: AtomicU64::new(0),
+            entity_kind: AtomicU64::new(0),
+            entity_id: AtomicU64::new(0),
+        }
+    }
+}
+
+struct AssemblyProgressWriter<W> {
+    inner: W,
+    output_bytes: Arc<AssemblyTelemetry>,
+}
+
+impl<W> AssemblyProgressWriter<W> {
+    fn into_inner(self) -> W {
+        self.inner
+    }
+}
+
+impl<W: Write> Write for AssemblyProgressWriter<W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let written = self.inner.write(bytes)?;
+        self.output_bytes
+            .output_bytes
+            .fetch_add(written as u64, Ordering::Relaxed);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+fn entity_kind_name(kind: u64) -> &'static str {
+    match kind {
+        value if value == EntityKind::Page as u64 => "page",
+        value if value == EntityKind::User as u64 => "user",
+        value if value == EntityKind::Global as u64 => "global",
+        _ => "initializing",
+    }
+}
+
+fn duration_summary(seconds: u64) -> String {
+    if seconds >= 3600 {
+        format!("{}h{:02}m", seconds / 3600, seconds % 3600 / 60)
+    } else if seconds >= 60 {
+        format!("{}m{:02}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+fn process_cpu_seconds() -> f64 {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } != 0 {
+        return 0.0;
+    }
+    let usage = unsafe { usage.assume_init() };
+    let timeval = |value: libc::timeval| {
+        value.tv_sec as f64 + value.tv_usec as f64 / 1_000_000.0
+    };
+    timeval(usage.ru_utime) + timeval(usage.ru_stime)
+}
+
+#[cfg(target_os = "macos")]
+#[allow(deprecated)]
+fn process_resident_bytes() -> Option<u64> {
+    let mut info = std::mem::MaybeUninit::<libc::mach_task_basic_info>::zeroed();
+    let mut count = libc::MACH_TASK_BASIC_INFO_COUNT;
+    let result = unsafe {
+        libc::task_info(
+            libc::mach_task_self(),
+            libc::MACH_TASK_BASIC_INFO,
+            info.as_mut_ptr().cast(),
+            &mut count,
+        )
+    };
+    (result == 0).then(|| unsafe { info.assume_init().resident_size })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn process_resident_bytes() -> Option<u64> {
+    None
+}
+
 pub(crate) fn assemble_direct_build(
     root: &Path,
     plan: &DirectBuildPlan,
@@ -2018,7 +2150,38 @@ pub(crate) fn assemble_direct_build(
         .collect::<Vec<_>>();
     inputs.push(node_path(root, plan, "content", 0).join("siteinfo.swdump"));
     inputs.push(manifest_archive.clone());
-    progress("assembling durable page-ID range files");
+    progress(&format!(
+        "inventorying {} durable inputs before assembly",
+        inputs.len()
+    ));
+    let inventory_started = Instant::now();
+    let mut input_checkpoints = Vec::new();
+    let mut input_compressed_bytes = 0_u64;
+    let mut record_sources: Vec<Box<dyn RecordSource>> = Vec::with_capacity(inputs.len());
+    for (position, input) in inputs.iter().enumerate() {
+        let reader = ArchiveRecordReader::open(input).map_err(map_archive)?;
+        for frame in reader.remaining_frame_locations() {
+            input_compressed_bytes =
+                input_compressed_bytes.saturating_add(frame.info.compressed_bytes);
+            input_checkpoints.push((frame.info.last_entity, frame.info.compressed_bytes));
+        }
+        record_sources.push(Box::new(reader));
+        if (position + 1).is_multiple_of(25) || position + 1 == inputs.len() {
+            progress(&format!(
+                "assembly inventory {}/{} inputs · {} compressed · elapsed {}",
+                position + 1,
+                inputs.len(),
+                human_progress_bytes(input_compressed_bytes),
+                duration_summary(inventory_started.elapsed().as_secs()),
+            ));
+        }
+    }
+    input_checkpoints.sort_unstable_by_key(|(entity, _)| *entity);
+    progress(&format!(
+        "assembling {} compressed from {} inputs into durable page-ID ranges",
+        human_progress_bytes(input_compressed_bytes),
+        inputs.len()
+    ));
     let temporary = crate::archive_set::ArchiveSetOutput::new_in(
         root,
         plan.range_target,
@@ -2026,10 +2189,100 @@ pub(crate) fn assemble_direct_build(
     .map_err(map_archive)?;
     let bootstrap = tempfile::tempfile_in(root)?;
     let mut title_index = crate::title_index::TitleIndexBuilder::new();
-    let (file, _, _, _) =
-        crate::archive::merge_many_archives_bootstrapping_ref_prefix_observing(
-            &inputs,
-            temporary,
+    let telemetry = Arc::new(AssemblyTelemetry::new());
+    let stop_reporter = Arc::new(AtomicBool::new(false));
+    let assembly_started = Instant::now();
+    let cpu_started = process_cpu_seconds();
+    let telemetry_output = AssemblyProgressWriter {
+        inner: temporary,
+        output_bytes: Arc::clone(&telemetry),
+    };
+    let mut checkpoint_position = 0_usize;
+    let mut completed_input_bytes = 0_u64;
+    let (file, _, records, _) = std::thread::scope(|scope| {
+        let reporter_telemetry = Arc::clone(&telemetry);
+        let reporter_stop = Arc::clone(&stop_reporter);
+        let reporter = scope.spawn(move || {
+            while !reporter_stop.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_secs(2));
+                if reporter_stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                let elapsed = assembly_started.elapsed().as_secs_f64().max(0.001);
+                let input = reporter_telemetry.input_bytes.load(Ordering::Relaxed);
+                let output = reporter_telemetry.output_bytes.load(Ordering::Relaxed);
+                let records = reporter_telemetry.records.load(Ordering::Relaxed);
+                let phase = reporter_telemetry.phase.load(Ordering::Relaxed);
+                let phase_current = reporter_telemetry
+                    .phase_current
+                    .load(Ordering::Relaxed);
+                let phase_total = reporter_telemetry.phase_total.load(Ordering::Relaxed);
+                let kind = reporter_telemetry.entity_kind.load(Ordering::Relaxed);
+                let entity_id = reporter_telemetry.entity_id.load(Ordering::Relaxed);
+                let rate = input as f64 / elapsed;
+                let percent = if input_compressed_bytes == 0 {
+                    0.0
+                } else {
+                    input as f64 * 100.0 / input_compressed_bytes as f64
+                };
+                let eta = if input > 0 && input < input_compressed_bytes {
+                    duration_summary(
+                        ((input_compressed_bytes - input) as f64 / rate.max(1.0)) as u64,
+                    )
+                } else {
+                    "estimating".to_owned()
+                };
+                let cpu = (process_cpu_seconds() - cpu_started) / elapsed;
+                let memory = process_resident_bytes()
+                    .map(human_progress_bytes)
+                    .unwrap_or_else(|| "unknown".to_owned());
+                let range = output / plan.range_target + 1;
+                let status = match phase {
+                    0 => format!(
+                        "sampling newest revisions · {} {} · input {}/{} \
+                         ({percent:.1}%, {}/s, ETA {eta})",
+                        entity_kind_name(kind),
+                        entity_id,
+                        human_progress_bytes(input),
+                        human_progress_bytes(input_compressed_bytes),
+                        human_progress_bytes(rate as u64),
+                    ),
+                    1 => format!(
+                        "distilling {} refPrefix from {} samples",
+                        human_progress_bytes(phase_total),
+                        human_progress_bytes(phase_current),
+                    ),
+                    2 => {
+                        let replay_percent = if phase_total == 0 {
+                            0.0
+                        } else {
+                            phase_current as f64 * 100.0 / phase_total as f64
+                        };
+                        format!(
+                            "replaying bootstrap {phase_current}/{phase_total} records \
+                             ({replay_percent:.1}%)"
+                        )
+                    }
+                    _ => format!(
+                        "merging · {} {} · input {}/{} \
+                         ({percent:.1}%, {}/s, ETA {eta})",
+                        entity_kind_name(kind),
+                        entity_id,
+                        human_progress_bytes(input),
+                        human_progress_bytes(input_compressed_bytes),
+                        human_progress_bytes(rate as u64),
+                    ),
+                };
+                progress(&format!(
+                    "assembly · {status} · output {} (range ~{range}) · {records} records · \
+                     CPU {cpu:.1} cores · RSS {memory}",
+                    human_progress_bytes(output),
+                ));
+            }
+        });
+        let result = crate::archive::merge_record_sources_bootstrapping_ref_prefix_observing(
+            record_sources,
+            telemetry_output,
             bootstrap,
             plan.frame_target,
             CompressionSettings {
@@ -2038,10 +2291,56 @@ pub(crate) fn assemble_direct_build(
             },
             plan.ref_prefix_sample_bytes,
             plan.ref_prefix_bytes,
-            |record| title_index.observe(record),
-        )
-        .map_err(map_archive)?;
-    let completed = file.finish().map_err(map_archive)?;
+            |record| {
+                let entity = record.entity();
+                while input_checkpoints
+                    .get(checkpoint_position)
+                    .is_some_and(|(last, _)| *last < entity)
+                {
+                    completed_input_bytes = completed_input_bytes
+                        .saturating_add(input_checkpoints[checkpoint_position].1);
+                    checkpoint_position += 1;
+                }
+                telemetry
+                    .input_bytes
+                    .store(completed_input_bytes, Ordering::Relaxed);
+                telemetry
+                    .records
+                    .fetch_add(1, Ordering::Relaxed);
+                telemetry
+                    .entity_kind
+                    .store(entity.kind as u64, Ordering::Relaxed);
+                telemetry.entity_id.store(entity.id, Ordering::Relaxed);
+                title_index.observe(record);
+            },
+            |phase, current, total| {
+                let phase = match phase {
+                    BootstrapMergePhase::Sampling => 0,
+                    BootstrapMergePhase::Distilling => 1,
+                    BootstrapMergePhase::Replaying => 2,
+                    BootstrapMergePhase::Merging => 3,
+                };
+                telemetry.phase.store(phase, Ordering::Relaxed);
+                telemetry.phase_current.store(current, Ordering::Relaxed);
+                telemetry.phase_total.store(total, Ordering::Relaxed);
+            },
+        );
+        stop_reporter.store(true, Ordering::Relaxed);
+        let _ = reporter.join();
+        result
+    })
+    .map_err(map_archive)?;
+    telemetry
+        .input_bytes
+        .store(input_compressed_bytes, Ordering::Relaxed);
+    let output_bytes = telemetry.output_bytes.load(Ordering::Relaxed);
+    progress(&format!(
+        "assembly merge complete · {records} records · input {} · output {} · elapsed {}",
+        human_progress_bytes(input_compressed_bytes),
+        human_progress_bytes(output_bytes),
+        duration_summary(assembly_started.elapsed().as_secs()),
+    ));
+    let completed = file.into_inner().finish().map_err(map_archive)?;
     completed.persist(&output).map_err(map_archive)?;
     sync_directory(&output)?;
     progress("writing title and virtual-frame index from the merged record projection");
@@ -3708,8 +4007,18 @@ fn directory_bytes(path: &Path) -> std::io::Result<u64> {
 }
 
 fn archive_file_complete(path: &Path) -> bool {
-    crate::archive::index_file(path)
-        .is_ok_and(|(_, _, complete)| complete)
+    if path.is_dir() {
+        let Ok(set) = crate::archive_set::ArchiveSetReader::open(path) else {
+            return false;
+        };
+        let Some(completion) = set.segments().last() else {
+            return false;
+        };
+        crate::archive::has_clean_completion_marker(path.join(&completion.name))
+            .unwrap_or(false)
+    } else {
+        crate::archive::has_clean_completion_marker(path).unwrap_or(false)
+    }
 }
 
 fn checkpoint_receipt_path(path: &Path) -> PathBuf {
