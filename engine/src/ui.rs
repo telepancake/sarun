@@ -9299,8 +9299,26 @@ fn mirror_cadence_label(seconds: i64) -> String {
 /// MIRRORS pane: one row per mirror-update job.
 fn mirrors_lines(app: &App) -> Vec<Line<'static>> {
     let mut out = Vec::new();
+    let host = crate::archive_gateway::host_base_url();
+    let browser = crate::archive_gateway::browser_base_url();
+    out.push(Line::from(vec![
+        Span::styled(
+            "LOCAL ARCHIVE SERVER  RUNNING",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "  engine-owned · local only · starts and stops with sarun",
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]));
+    out.push(Line::from(format!("  host browser   {host}/")));
+    if host != browser {
+        out.push(Line::from(format!("  sarun browser  {browser}/")));
+    }
+    out.push(Line::from(""));
     if app.mirror_jobs.is_empty() {
-        out.push(Line::from(""));
         out.push(Line::from("No local mirrors yet."));
         out.push(Line::from(Span::styled(
             "Use the context-sensitive key bar below to add or attach a mirror library.",
@@ -25652,6 +25670,16 @@ mod tests {
         let buf = render_to_string(&app, 120, 30).unwrap();
         assert!(buf.contains("pending"), "job row not rendered:\n{buf}");
         assert!(buf.contains("/depot/x"), "job row not rendered:\n{buf}");
+        assert!(
+            buf.contains("LOCAL ARCHIVE SERVER")
+                && buf.contains("http://127.0.0.1:8642/"),
+            "archive server state and address are not visible:\n{buf}"
+        );
+        #[cfg(target_os = "macos")]
+        assert!(
+            buf.contains("http://10.0.2.2:8642/"),
+            "QEMU browser address is not visible:\n{buf}"
+        );
 
         run_pane_action(&mut app, PaneAction::MirrorTogglePause);
         let job = app.mirror_jobs.iter().find(|j| j.id == id).unwrap();

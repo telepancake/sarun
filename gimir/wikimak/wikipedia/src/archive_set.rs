@@ -9,7 +9,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::collections::VecDeque;
 
-use crate::archive::{ArchiveError, EntityKind, Result};
+use crate::archive::{ArchiveError, EntityKey, EntityKind, Result};
 
 const FILE_HEADER_BYTES: usize = 24;
 const FRAME_HEADER_BYTES: usize = 64;
@@ -82,7 +82,7 @@ enum WriteState {
 /// frame byte ranges into bounded physical files without changing archive
 /// encoding.
 pub struct ArchiveSetOutput {
-    root: tempfile::TempDir,
+    root: OutputRoot,
     range_target: u64,
     reference: Option<Part>,
     range: Option<Part>,
@@ -95,12 +95,36 @@ pub struct ArchiveSetOutput {
     range_boundaries: VecDeque<(EntityKind, u64, String)>,
 }
 
+enum OutputRoot {
+    Temporary(tempfile::TempDir),
+    Persistent(PathBuf),
+}
+
+impl OutputRoot {
+    fn path(&self) -> &Path {
+        match self {
+            Self::Temporary(root) => root.path(),
+            Self::Persistent(root) => root,
+        }
+    }
+
+    fn into_path(self) -> PathBuf {
+        match self {
+            Self::Temporary(root) => {
+                #[allow(deprecated)]
+                root.into_path()
+            }
+            Self::Persistent(root) => root,
+        }
+    }
+}
+
 impl ArchiveSetOutput {
     pub fn new_in(parent: impl AsRef<Path>, range_target: u64) -> Result<Self> {
         if range_target == 0 {
             return Err(ArchiveError::Invalid("zero archive range target"));
         }
-        let root = tempfile::TempDir::new_in(parent)?;
+        let root = OutputRoot::Temporary(tempfile::TempDir::new_in(parent)?);
         let reference = Some(Self::new_part_at(root.path(), 0)?);
         Ok(Self {
             root,
@@ -115,6 +139,109 @@ impl ArchiveSetOutput {
             replace_root: None,
             range_boundaries: VecDeque::new(),
         })
+    }
+
+    pub fn resumable_in(
+        parent: impl AsRef<Path>,
+        name: impl AsRef<Path>,
+        range_target: u64,
+    ) -> Result<Self> {
+        if range_target == 0 {
+            return Err(ArchiveError::Invalid("zero archive range target"));
+        }
+        let root = parent.as_ref().join(name);
+        std::fs::create_dir_all(&root)?;
+        let mut names = std::fs::read_dir(&root)?
+            .map(|entry| entry.map(|entry| entry.file_name()))
+            .collect::<std::io::Result<Vec<_>>>()?;
+        names.sort();
+        let mut segments = Vec::new();
+        let mut virtual_bytes = 0_u64;
+        for name in names {
+            let name = name
+                .into_string()
+                .map_err(|_| ArchiveError::Invalid("archive-set filename is not UTF-8"))?;
+            let path = root.join(&name);
+            if name.starts_with(".range-") && name.ends_with(".tmp") {
+                std::fs::remove_file(path)?;
+                continue;
+            }
+            if !name.ends_with(PART_SUFFIX) {
+                return Err(ArchiveError::Invalid(
+                    "resumable archive set contains an unknown file",
+                ));
+            }
+            if name == "9999-complete.swdump-part" {
+                return Err(ArchiveError::Invalid(
+                    "resumable archive set is already complete",
+                ));
+            }
+            let bytes = std::fs::metadata(&path)?.len();
+            let (kind, first_id, last_id) = parse_segment_name(&name)?;
+            segments.push(ArchiveSetSegment {
+                name,
+                virtual_start: virtual_bytes,
+                bytes,
+                kind,
+                first_id,
+                last_id,
+            });
+            virtual_bytes = virtual_bytes
+                .checked_add(bytes)
+                .ok_or(ArchiveError::FieldTooLarge)?;
+        }
+        if !segments.is_empty()
+            && !segments
+                .first()
+                .is_some_and(|segment| segment.name == "0000-reference.swdump-part")
+        {
+            return Err(ArchiveError::Invalid(
+                "resumable archive set lacks its reference part",
+            ));
+        }
+        let mut previous = None;
+        for segment in segments.iter().filter(|segment| segment.kind.is_some()) {
+            let first = EntityKey {
+                kind: segment.kind.expect("filtered above"),
+                id: segment.first_id,
+            };
+            if previous.is_some_and(|boundary| first <= boundary) {
+                return Err(ArchiveError::Invalid(
+                    "resumable archive ranges are not strictly ordered",
+                ));
+            }
+            previous = Some(EntityKey {
+                kind: first.kind,
+                id: segment.last_id,
+            });
+        }
+        let reference = Some(Self::new_part_at(&root, 0)?);
+        Ok(Self {
+            root: OutputRoot::Persistent(root),
+            range_target,
+            reference,
+            range: None,
+            segments,
+            virtual_bytes,
+            serial: 1,
+            state: WriteState::FileHeader(Vec::with_capacity(FILE_HEADER_BYTES)),
+            complete: false,
+            replace_root: None,
+            range_boundaries: VecDeque::new(),
+        })
+    }
+
+    pub fn resume_after(&self) -> Option<EntityKey> {
+        self.segments.iter().rev().find_map(|segment| {
+            segment.kind.map(|kind| EntityKey {
+                kind,
+                id: segment.last_id,
+            })
+        })
+    }
+
+    pub fn virtual_bytes(&self) -> u64 {
+        self.virtual_bytes
     }
 
     pub fn replacing(
@@ -189,6 +316,22 @@ impl ArchiveSetOutput {
         let Some(part) = self.reference.take() else {
             return Ok(());
         };
+        if self
+            .segments
+            .first()
+            .is_some_and(|segment| segment.name == "0000-reference.swdump-part")
+        {
+            part.file.sync_all()?;
+            drop(part.file);
+            let existing = self.root.path().join("0000-reference.swdump-part");
+            if !files_equal(&part.temporary, &existing)? {
+                return Err(ArchiveError::Invalid(
+                    "resumed archive changed the reference prefix",
+                ));
+            }
+            std::fs::remove_file(part.temporary)?;
+            return Ok(());
+        }
         self.seal_part(part, "0000-reference.swdump-part".to_owned())
     }
 
@@ -497,7 +640,7 @@ fn files_equal(left: &Path, right: &Path) -> Result<bool> {
 }
 
 pub struct CompletedArchiveSet {
-    root: tempfile::TempDir,
+    root: OutputRoot,
     pub segments: Vec<ArchiveSetSegment>,
     pub virtual_bytes: u64,
     installed: bool,
@@ -517,7 +660,6 @@ impl CompletedArchiveSet {
             ));
         }
         sync_directory(self.root.path())?;
-        #[allow(deprecated)]
         let path = self.root.into_path();
         std::fs::rename(path, destination)?;
         sync_directory(
@@ -794,6 +936,64 @@ mod tests {
         assert!(page_parts > 1);
 
         let mut reader = ArchiveReader::new(set).unwrap();
+        let mut decoded = Vec::new();
+        while let Some(mut frame) = reader.next_frame().unwrap() {
+            while let Some(record) = frame.next_record().unwrap() {
+                decoded.push(record);
+            }
+        }
+        assert!(reader.is_complete());
+        assert_eq!(decoded, records);
+    }
+
+    #[test]
+    fn resumable_output_discards_only_the_open_range() {
+        let records = (1..=64).map(revision).collect::<Vec<_>>();
+        let parent = tempfile::tempdir().unwrap();
+        let name = "assembly-test.partial";
+        {
+            let output = ArchiveSetOutput::resumable_in(parent.path(), name, 1024).unwrap();
+            let mut writer = ArchiveWriter::new(output, 128).unwrap();
+            for record in records.iter().take(40) {
+                writer.write(record).unwrap();
+            }
+        }
+
+        let output = ArchiveSetOutput::resumable_in(parent.path(), name, 1024).unwrap();
+        let boundary = output
+            .resume_after()
+            .expect("at least one range was sealed");
+        assert!(boundary.id < 40);
+        let temporary_parts = parent
+            .path()
+            .join(name)
+            .read_dir()
+            .unwrap()
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".tmp")
+                    .then_some(entry.path())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(temporary_parts.len(), 1);
+        assert_eq!(std::fs::metadata(&temporary_parts[0]).unwrap().len(), 0);
+
+        let mut writer = ArchiveWriter::new(output, 128).unwrap();
+        for record in records
+            .iter()
+            .filter(|record| record.entity() > boundary)
+        {
+            writer.write(record).unwrap();
+        }
+        let (output, _) = writer.finish().unwrap();
+        let completed = output.finish().unwrap();
+        let destination = parent.path().join("testwiki.swdump");
+        completed.persist(&destination).unwrap();
+
+        let mut reader = ArchiveReader::new(ArchiveSetReader::open(destination).unwrap()).unwrap();
         let mut decoded = Vec::new();
         while let Some(mut frame) = reader.next_frame().unwrap() {
             while let Some(record) = frame.next_record().unwrap() {

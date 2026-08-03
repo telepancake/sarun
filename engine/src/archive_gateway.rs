@@ -18,12 +18,12 @@ use tiny_http::{Header, Method, Response, Server};
 
 pub const DEFAULT_ADDR: &str = "127.0.0.1:8642";
 
-pub fn address() -> String {
-    std::env::var("SARUN_LIBRARY_ADDR").unwrap_or_else(|_| DEFAULT_ADDR.into())
+pub fn host_base_url() -> String {
+    format!("http://{DEFAULT_ADDR}")
 }
 
 pub fn browser_base_url() -> String {
-    let addr = address();
+    let addr = DEFAULT_ADDR;
     #[cfg(target_os = "macos")]
     let addr = addr.replacen("127.0.0.1", "10.0.2.2", 1);
     format!("http://{addr}")
@@ -58,7 +58,7 @@ pub struct Gateway {
 
 impl Gateway {
     pub fn start(self_exe: String) -> Result<Self, String> {
-        let addr = address();
+        let addr = DEFAULT_ADDR;
         let server = Arc::new(
             Server::http(&addr)
                 .map_err(|error| format!("archive gateway cannot bind http://{addr}: {error}"))?,
@@ -367,13 +367,7 @@ fn rewrite_wiki_html(dbname: &str, html: &str) -> String {
     url.searchParams.set("sarun_enhanced", "1");
     fetch(url, {cache: "no-store"}).then(response => {
       const state = response.headers.get("X-Sarun-Enhanced");
-      if (state === "ready") return response.blob().then(blob => {
-        const old = img.dataset.sarunBlob;
-        const next = URL.createObjectURL(blob);
-        img.src = next;
-        img.dataset.sarunBlob = next;
-        if (old) URL.revokeObjectURL(old);
-      });
+      if (state === "ready") img.src = url.toString();
       if (state === "processing")
         setTimeout(() => retry(img, attempt + 1), 1500);
     }).catch(() => {});
@@ -677,5 +671,7 @@ mod tests {
         assert!(rewritten.contains(r#"src="/lvwiki/w/media/Riga.jpg?w=250""#));
         assert!(rewritten.contains("sarun_enhanced"));
         assert!(rewritten.contains("cache: \"no-store\""));
+        assert!(!rewritten.contains("createObjectURL"));
+        assert!(rewritten.contains("img.src = url.toString()"));
     }
 }

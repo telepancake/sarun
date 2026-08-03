@@ -2190,6 +2190,19 @@ pub(crate) fn assemble_direct_build(
             }
         }
     }
+    let assembly_name = format!("assembly-{}.partial", plan.plan_id);
+    let assembly_path = root.join(&assembly_name);
+    if assembly_path.is_dir()
+        && crate::archive_set::ArchiveSetReader::open(&assembly_path).is_ok()
+    {
+        progress("installing the already completed assembly checkpoint");
+        std::fs::rename(&assembly_path, &output)?;
+        crate::title_index::build(&output, output.with_extension("swtitle"))
+            .map_err(map_archive)?;
+        persist_completion_marker(root, plan)?;
+        remove_consumed_build_inputs(root, plan)?;
+        return Ok(output);
+    }
     let manifest_archive = root.join("manifest.swdump");
     let mut manifest_writer = ArchiveWriter::new(
         std::fs::File::create(&manifest_archive)?,
@@ -2336,14 +2349,28 @@ pub(crate) fn assemble_direct_build(
         human_progress_bytes(input_compressed_bytes),
         inputs.len()
     ));
-    let temporary = crate::archive_set::ArchiveSetOutput::new_in(
+    let temporary = crate::archive_set::ArchiveSetOutput::resumable_in(
         root,
+        &assembly_name,
         plan.range_target,
     )
     .map_err(map_archive)?;
+    let resume_after = temporary.resume_after();
+    let resumed_output_bytes = temporary.virtual_bytes();
+    if let Some(boundary) = resume_after {
+        progress(&format!(
+            "resuming final assembly after durable {} {} ({} already sealed)",
+            entity_kind_name(boundary.kind as u64),
+            boundary.id,
+            human_progress_bytes(resumed_output_bytes),
+        ));
+    }
     let bootstrap = tempfile::tempfile_in(root)?;
     let mut title_index = crate::title_index::TitleIndexBuilder::new();
     let telemetry = Arc::new(AssemblyTelemetry::new());
+    telemetry
+        .output_bytes
+        .store(resumed_output_bytes, Ordering::Relaxed);
     let stop_reporter = Arc::new(AtomicBool::new(false));
     let assembly_started = Instant::now();
     let cpu_started = process_cpu_seconds();
@@ -2514,7 +2541,7 @@ pub(crate) fn assemble_direct_build(
                 ));
             }
         });
-        let result = crate::archive::merge_record_sources_bootstrapping_ref_prefix_observing(
+        let result = crate::archive::merge_record_sources_bootstrapping_ref_prefix_observing_after(
             record_sources,
             telemetry_output,
             bootstrap,
@@ -2525,6 +2552,7 @@ pub(crate) fn assemble_direct_build(
             },
             plan.ref_prefix_sample_bytes,
             plan.ref_prefix_bytes,
+            resume_after,
             |record| {
                 let entity = record.entity();
                 while input_checkpoints
@@ -2583,6 +2611,12 @@ pub(crate) fn assemble_direct_build(
         .map_err(map_archive)?;
     persist_completion_marker(root, plan)?;
 
+    remove_consumed_build_inputs(root, plan)?;
+    progress("final range files are durable; consumed source targets removed");
+    Ok(output)
+}
+
+fn remove_consumed_build_inputs(root: &Path, plan: &DirectBuildPlan) -> Result<()> {
     for kind in ["content", "history"] {
         let count = if kind == "content" {
             plan.content_target_count()
@@ -2590,13 +2624,17 @@ pub(crate) fn assemble_direct_build(
             plan.history_files.len()
         };
         for index in 0..count {
-            std::fs::remove_dir_all(node_path(root, plan, kind, index))?;
+            let path = node_path(root, plan, kind, index);
+            if path.exists() {
+                std::fs::remove_dir_all(path)?;
+            }
         }
     }
-    std::fs::remove_file(manifest_archive)?;
-    sync_directory(&root.join("nodes"))?;
-    progress("final range files are durable; consumed source targets removed");
-    Ok(output)
+    let manifest = root.join("manifest.swdump");
+    if manifest.exists() {
+        std::fs::remove_file(manifest)?;
+    }
+    sync_directory(&root.join("nodes"))
 }
 
 #[derive(Default)]
