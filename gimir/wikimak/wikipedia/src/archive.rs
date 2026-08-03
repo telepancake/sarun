@@ -860,13 +860,18 @@ fn zstd_error(code: usize) -> ArchiveError {
     ))
 }
 
+struct StreamingPump {
+    written: u64,
+    remaining: u64,
+}
+
 fn pump_streaming_context(
     context: &mut zstd::zstd_safe::CCtx<'static>,
     raw: &[u8],
     directive: zstd::zstd_safe::zstd_sys::ZSTD_EndDirective,
     compressed: &mut impl Write,
     scratch: &mut [u8],
-) -> Result<u64> {
+) -> Result<StreamingPump> {
     let mut input = zstd::zstd_safe::InBuffer::around(raw);
     let mut total = 0_u64;
     loop {
@@ -886,8 +891,19 @@ fn pump_streaming_context(
         total = total
             .checked_add(written as u64)
             .ok_or(ArchiveError::FieldTooLarge)?;
-        if input.pos() == raw.len() && remaining == 0 {
-            return Ok(total);
+        let input_consumed = input.pos() == raw.len();
+        if input_consumed
+            && (matches!(
+                directive,
+                zstd::zstd_safe::zstd_sys::ZSTD_EndDirective::ZSTD_e_continue
+            ) || remaining == 0)
+        {
+            return Ok(StreamingPump {
+                written: total,
+                remaining: remaining
+                    .try_into()
+                    .map_err(|_| ArchiveError::FieldTooLarge)?,
+            });
         }
     }
 }
@@ -899,7 +915,8 @@ struct StreamingArchiveWriter<W: Write> {
     _reference: zstd::dict::EncoderDictionary<'static>,
     compressed: Vec<u8>,
     compressed_bytes: u64,
-    flush_interval: usize,
+    pending_compressed_bytes: u64,
+    feed_interval: usize,
     pending: Vec<u8>,
     scratch: Vec<u8>,
     first_entity: Option<EntityKey>,
@@ -908,6 +925,8 @@ struct StreamingArchiveWriter<W: Write> {
     records: u64,
     raw_bytes: u64,
     frames_written: u64,
+    sealed_raw_bytes: u64,
+    sealed_compressed_bytes: u64,
 }
 
 impl<W: Write> StreamingArchiveWriter<W> {
@@ -944,7 +963,8 @@ impl<W: Write> StreamingArchiveWriter<W> {
             _reference: reference,
             compressed: Vec::new(),
             compressed_bytes: 0,
-            flush_interval: FRAME_FLUSH_RAW_INTERVAL
+            pending_compressed_bytes: 0,
+            feed_interval: FRAME_FLUSH_RAW_INTERVAL
                 .min(frame_target.saturating_mul(8))
                 .max(1),
             pending: Vec::with_capacity(
@@ -959,7 +979,34 @@ impl<W: Write> StreamingArchiveWriter<W> {
             records: 0,
             raw_bytes: 0,
             frames_written: 0,
+            sealed_raw_bytes: 0,
+            sealed_compressed_bytes: 0,
         })
+    }
+
+    fn estimated_compressed_bytes(&self) -> u64 {
+        let progression = self.context.get_frame_progression();
+        let produced = progression
+            .produced
+            .max(
+                self.compressed_bytes
+                    .saturating_add(self.pending_compressed_bytes),
+            );
+        let uncompressed = self.raw_bytes.saturating_sub(progression.consumed);
+        let (ratio_numerator, ratio_denominator) =
+            if progression.consumed >= 64 << 10 && progression.produced != 0 {
+                (progression.produced, progression.consumed)
+            } else if self.sealed_raw_bytes != 0 {
+                (self.sealed_compressed_bytes, self.sealed_raw_bytes)
+            } else {
+                (1, 4)
+            };
+        let estimated_pending = (u128::from(uncompressed)
+            .saturating_mul(u128::from(ratio_numerator))
+            .saturating_add(u128::from(ratio_denominator - 1))
+            / u128::from(ratio_denominator))
+        .min(u128::from(u64::MAX)) as u64;
+        produced.saturating_add(estimated_pending)
     }
 
     fn write(&mut self, record: &Record) -> Result<()> {
@@ -977,7 +1024,7 @@ impl<W: Write> StreamingArchiveWriter<W> {
             }
             if new_entity
                 && (entity.kind != previous.kind
-                    || self.compressed_bytes >= self.frame_target)
+                    || self.estimated_compressed_bytes() >= self.frame_target)
             {
                 self.seal_frame()?;
             }
@@ -998,20 +1045,22 @@ impl<W: Write> StreamingArchiveWriter<W> {
         Ok(())
     }
 
-    fn flush_pending(&mut self) -> Result<()> {
+    fn feed_pending(&mut self) -> Result<()> {
         if self.pending.is_empty() {
             return Ok(());
         }
+        let pumped = pump_streaming_context(
+            &mut self.context,
+            &self.pending,
+            zstd::zstd_safe::zstd_sys::ZSTD_EndDirective::ZSTD_e_continue,
+            &mut self.compressed,
+            &mut self.scratch,
+        )?;
         self.compressed_bytes = self
             .compressed_bytes
-            .checked_add(pump_streaming_context(
-                &mut self.context,
-                &self.pending,
-                zstd::zstd_safe::zstd_sys::ZSTD_EndDirective::ZSTD_e_flush,
-                &mut self.compressed,
-                &mut self.scratch,
-            )?)
+            .checked_add(pumped.written)
             .ok_or(ArchiveError::FieldTooLarge)?;
+        self.pending_compressed_bytes = pumped.remaining;
         self.pending.clear();
         Ok(())
     }
@@ -1023,16 +1072,18 @@ impl<W: Write> StreamingArchiveWriter<W> {
         let last_entity = self
             .last_entity
             .ok_or(ArchiveError::Invalid("streaming frame has no last entity"))?;
+        let pumped = pump_streaming_context(
+            &mut self.context,
+            &self.pending,
+            zstd::zstd_safe::zstd_sys::ZSTD_EndDirective::ZSTD_e_end,
+            &mut self.compressed,
+            &mut self.scratch,
+        )?;
         self.compressed_bytes = self
             .compressed_bytes
-            .checked_add(pump_streaming_context(
-                &mut self.context,
-                &self.pending,
-                zstd::zstd_safe::zstd_sys::ZSTD_EndDirective::ZSTD_e_end,
-                &mut self.compressed,
-                &mut self.scratch,
-            )?)
+            .checked_add(pumped.written)
             .ok_or(ArchiveError::FieldTooLarge)?;
+        self.pending_compressed_bytes = 0;
         self.pending.clear();
         write_frame_header(
             &mut self.output,
@@ -1050,11 +1101,20 @@ impl<W: Write> StreamingArchiveWriter<W> {
             .frames_written
             .checked_add(1)
             .ok_or(ArchiveError::FieldTooLarge)?;
+        self.sealed_raw_bytes = self
+            .sealed_raw_bytes
+            .checked_add(self.raw_bytes)
+            .ok_or(ArchiveError::FieldTooLarge)?;
+        self.sealed_compressed_bytes = self
+            .sealed_compressed_bytes
+            .checked_add(self.compressed_bytes)
+            .ok_or(ArchiveError::FieldTooLarge)?;
         self.compressed.clear();
         self.context
             .reset(zstd::zstd_safe::ResetDirective::SessionOnly)
             .map_err(zstd_error)?;
         self.compressed_bytes = 0;
+        self.pending_compressed_bytes = 0;
         self.first_entity = None;
         self.last_entity = None;
         self.last_timestamp = i64::MAX;
@@ -1080,7 +1140,7 @@ impl<W: Write> Write for StreamingRecordSink<'_, W> {
     fn write(&mut self, mut bytes: &[u8]) -> io::Result<usize> {
         let written = bytes.len();
         while !bytes.is_empty() {
-            let available = self.writer.flush_interval - self.writer.pending.len();
+            let available = self.writer.feed_interval - self.writer.pending.len();
             let take = available.min(bytes.len());
             self.writer.pending.extend_from_slice(&bytes[..take]);
             self.writer.raw_bytes = self
@@ -1089,9 +1149,9 @@ impl<W: Write> Write for StreamingRecordSink<'_, W> {
                 .checked_add(take as u64)
                 .ok_or_else(|| io::Error::other("archive frame is too large"))?;
             bytes = &bytes[take..];
-            if self.writer.pending.len() == self.writer.flush_interval {
+            if self.writer.pending.len() == self.writer.feed_interval {
                 self.writer
-                    .flush_pending()
+                    .feed_pending()
                     .map_err(|error| io::Error::other(error.to_string()))?;
             }
         }
@@ -1100,7 +1160,7 @@ impl<W: Write> Write for StreamingRecordSink<'_, W> {
 
     fn flush(&mut self) -> io::Result<()> {
         self.writer
-            .flush_pending()
+            .feed_pending()
             .map_err(|error| io::Error::other(error.to_string()))
     }
 }
