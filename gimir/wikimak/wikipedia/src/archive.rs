@@ -3137,6 +3137,68 @@ pub(crate) fn archive_ref_prefix(
         ))
 }
 
+pub(crate) fn archive_ref_prefix_part(
+    part: impl AsRef<Path>,
+) -> Result<std::sync::Arc<[u8]>> {
+    let reader = ArchiveReader::new(std::fs::File::open(part)?)?;
+    match reader.reference {
+        Some(CompressionReference::RefPrefix(prefix)) => Ok(prefix),
+        Some(CompressionReference::Dictionary(_)) => Err(ArchiveError::Invalid(
+            "archive reference part contains a dictionary instead of a reference prefix",
+        )),
+        None => Err(ArchiveError::Invalid(
+            "archive reference part has no reference prefix",
+        )),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn merge_record_sources_reusing_ref_prefix_observing_after<
+    'a,
+    W: Write,
+    F: FnMut(&Record),
+>(
+    inputs: Vec<Box<dyn RecordSource + 'a>>,
+    output: W,
+    frame_target: usize,
+    compression: CompressionSettings,
+    prefix: &[u8],
+    resume_after: Option<EntityKey>,
+    mut observe: F,
+) -> Result<(W, u64, u64, RepackStats)> {
+    let mut merge = SortedArchiveMerge::new(inputs)?;
+    let mut writer = StreamingArchiveWriter::new(
+        output,
+        frame_target,
+        compression,
+        prefix,
+        usize::try_from(streaming_compression_workers())
+            .unwrap_or(usize::MAX),
+    )?;
+    let mut records = 0_u64;
+    while let Some(record) = merge.next_record()? {
+        observe(&record);
+        if resume_after.is_none_or(|boundary| record.entity() > boundary) {
+            writer.write(&record)?;
+        }
+        records = records
+            .checked_add(1)
+            .ok_or(ArchiveError::FieldTooLarge)?;
+    }
+    let (output, output_frames) = writer.finish()?;
+    Ok((
+        output,
+        output_frames,
+        records,
+        RepackStats {
+            output_frames,
+            records,
+            ref_prefix_bytes: prefix.len() as u64,
+            ..RepackStats::default()
+        },
+    ))
+}
+
 pub(crate) fn merge_archive_with_sorted_source_and_ref_prefix<
     'a,
     W: Write,
@@ -7262,7 +7324,7 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_merge_resumes_after_the_last_sealed_entity_range() {
+    fn merge_resume_reuses_prefix_after_the_last_sealed_entity_range() {
         let directory = tempfile::tempdir().unwrap();
         let input_path = directory.path().join("input.swdump");
         let records = (1..=128_u64)
@@ -7316,24 +7378,22 @@ mod tests {
         )
         .unwrap();
         let resume_after = output.resume_after().unwrap();
+        let prefix = output.preserved_ref_prefix().unwrap().unwrap();
         let sources: Vec<Box<dyn RecordSource>> = vec![Box::new(
             ArchiveRecordReader::open(&input_path).unwrap(),
         )];
-        let bootstrap = tempfile::tempfile_in(directory.path()).unwrap();
-        let (output, _, _, _) =
-            merge_record_sources_bootstrapping_ref_prefix_observing_after(
-                sources,
-                output,
-                bootstrap,
-                256,
-                CompressionSettings::default(),
-                64 << 10,
-                4 << 10,
-                Some(resume_after),
-                |_| {},
-                |_, _, _| {},
-            )
-            .unwrap();
+        let mut observed = 0_u64;
+        let (output, _, _, _) = merge_record_sources_reusing_ref_prefix_observing_after(
+            sources,
+            output,
+            256,
+            CompressionSettings::default(),
+            &prefix,
+            Some(resume_after),
+            |_| observed += 1,
+        )
+        .unwrap();
+        assert_eq!(observed, records.len() as u64);
         let destination = directory.path().join("complete.swdump");
         output.finish().unwrap().persist(&destination).unwrap();
 

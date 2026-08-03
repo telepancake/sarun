@@ -240,6 +240,20 @@ impl ArchiveSetOutput {
         })
     }
 
+    pub(crate) fn preserved_ref_prefix(&self) -> Result<Option<std::sync::Arc<[u8]>>> {
+        if !self
+            .segments
+            .first()
+            .is_some_and(|segment| segment.name == "0000-reference.swdump-part")
+        {
+            return Ok(None);
+        }
+        crate::archive::archive_ref_prefix_part(
+            self.root.path().join("0000-reference.swdump-part"),
+        )
+        .map(Some)
+    }
+
     pub fn virtual_bytes(&self) -> u64 {
         self.virtual_bytes
     }

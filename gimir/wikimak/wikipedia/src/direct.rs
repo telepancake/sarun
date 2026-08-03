@@ -2356,8 +2356,25 @@ pub(crate) fn assemble_direct_build(
     )
     .map_err(map_archive)?;
     let resume_after = temporary.resume_after();
+    let preserved_ref_prefix = temporary.preserved_ref_prefix().map_err(map_archive)?;
     let resumed_output_bytes = temporary.virtual_bytes();
-    if let Some(boundary) = resume_after {
+    if let Some(prefix) = preserved_ref_prefix.as_ref() {
+        if let Some(boundary) = resume_after {
+            progress(&format!(
+                "resuming final assembly with preserved {} refPrefix after durable {} {} \
+                 ({} already sealed)",
+                human_progress_bytes(prefix.len() as u64),
+                entity_kind_name(boundary.kind as u64),
+                boundary.id,
+                human_progress_bytes(resumed_output_bytes),
+            ));
+        } else {
+            progress(&format!(
+                "resuming final assembly with preserved {} refPrefix",
+                human_progress_bytes(prefix.len() as u64),
+            ));
+        }
+    } else if let Some(boundary) = resume_after {
         progress(&format!(
             "resuming final assembly after durable {} {} ({} already sealed)",
             entity_kind_name(boundary.kind as u64),
@@ -2365,7 +2382,11 @@ pub(crate) fn assemble_direct_build(
             human_progress_bytes(resumed_output_bytes),
         ));
     }
-    let bootstrap = tempfile::tempfile_in(root)?;
+    let bootstrap = if preserved_ref_prefix.is_none() {
+        Some(tempfile::tempfile_in(root)?)
+    } else {
+        None
+    };
     let mut title_index = crate::title_index::TitleIndexBuilder::new();
     let telemetry = Arc::new(AssemblyTelemetry::new());
     telemetry
@@ -2541,52 +2562,66 @@ pub(crate) fn assemble_direct_build(
                 ));
             }
         });
-        let result = crate::archive::merge_record_sources_bootstrapping_ref_prefix_observing_after(
-            record_sources,
-            telemetry_output,
-            bootstrap,
-            plan.frame_target,
-            CompressionSettings {
-                level: plan.compression_level,
-                ..CompressionSettings::default()
-            },
-            plan.ref_prefix_sample_bytes,
-            plan.ref_prefix_bytes,
-            resume_after,
-            |record| {
-                let entity = record.entity();
-                while input_checkpoints
-                    .get(checkpoint_position)
-                    .is_some_and(|(last, _)| *last < entity)
-                {
-                    completed_input_bytes = completed_input_bytes
-                        .saturating_add(input_checkpoints[checkpoint_position].1);
-                    checkpoint_position += 1;
-                }
-                telemetry
-                    .input_bytes
-                    .store(completed_input_bytes, Ordering::Relaxed);
-                telemetry
-                    .records
-                    .fetch_add(1, Ordering::Relaxed);
-                telemetry
-                    .entity_kind
-                    .store(entity.kind as u64, Ordering::Relaxed);
-                telemetry.entity_id.store(entity.id, Ordering::Relaxed);
-                title_index.observe(record);
-            },
-            |phase, current, total| {
-                let phase = match phase {
-                    BootstrapMergePhase::Sampling => 0,
-                    BootstrapMergePhase::Distilling => 1,
-                    BootstrapMergePhase::Replaying => 2,
-                    BootstrapMergePhase::Merging => 3,
-                };
-                telemetry.phase.store(phase, Ordering::Relaxed);
-                telemetry.phase_current.store(current, Ordering::Relaxed);
-                telemetry.phase_total.store(total, Ordering::Relaxed);
-            },
-        );
+        let mut observe = |record: &Record| {
+            let entity = record.entity();
+            while input_checkpoints
+                .get(checkpoint_position)
+                .is_some_and(|(last, _)| *last < entity)
+            {
+                completed_input_bytes = completed_input_bytes
+                    .saturating_add(input_checkpoints[checkpoint_position].1);
+                checkpoint_position += 1;
+            }
+            telemetry
+                .input_bytes
+                .store(completed_input_bytes, Ordering::Relaxed);
+            telemetry.records.fetch_add(1, Ordering::Relaxed);
+            telemetry
+                .entity_kind
+                .store(entity.kind as u64, Ordering::Relaxed);
+            telemetry.entity_id.store(entity.id, Ordering::Relaxed);
+            title_index.observe(record);
+        };
+        let mut report_phase = |phase: BootstrapMergePhase, current, total| {
+            let phase = match phase {
+                BootstrapMergePhase::Sampling => 0,
+                BootstrapMergePhase::Distilling => 1,
+                BootstrapMergePhase::Replaying => 2,
+                BootstrapMergePhase::Merging => 3,
+            };
+            telemetry.phase.store(phase, Ordering::Relaxed);
+            telemetry.phase_current.store(current, Ordering::Relaxed);
+            telemetry.phase_total.store(total, Ordering::Relaxed);
+        };
+        let compression = CompressionSettings {
+            level: plan.compression_level,
+            ..CompressionSettings::default()
+        };
+        let result = if let Some(prefix) = preserved_ref_prefix.as_deref() {
+            report_phase(BootstrapMergePhase::Merging, 0, 0);
+            crate::archive::merge_record_sources_reusing_ref_prefix_observing_after(
+                record_sources,
+                telemetry_output,
+                plan.frame_target,
+                compression,
+                prefix,
+                resume_after,
+                &mut observe,
+            )
+        } else {
+            crate::archive::merge_record_sources_bootstrapping_ref_prefix_observing_after(
+                record_sources,
+                telemetry_output,
+                bootstrap.expect("bootstrap exists without a preserved reference prefix"),
+                plan.frame_target,
+                compression,
+                plan.ref_prefix_sample_bytes,
+                plan.ref_prefix_bytes,
+                resume_after,
+                &mut observe,
+                &mut report_phase,
+            )
+        };
         stop_reporter.store(true, Ordering::Relaxed);
         let _ = reporter.join();
         result
