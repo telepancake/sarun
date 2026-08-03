@@ -43,7 +43,7 @@ const KIND_SITE_INFO: u8 = 7;
 const PAGE_TEXT_MEMORY_LIMIT: usize = 16 << 20;
 const SORT_MERGE_FAN_IN: usize = 64;
 const FRAME_READ_AHEAD: usize = 1 << 20;
-const FRAME_FLUSH_RAW_INTERVAL: usize = 1 << 20;
+const FRAME_FEED_RAW_INTERVAL: usize = 1 << 20;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 #[repr(u8)]
@@ -956,6 +956,11 @@ impl<W: Write> StreamingArchiveWriter<W> {
                 workers.try_into().unwrap_or(u32::MAX),
             ))
             .map_err(zstd_error)?;
+        context
+            .set_parameter(zstd::zstd_safe::CParameter::JobSize(
+                FRAME_FEED_RAW_INTERVAL as u32,
+            ))
+            .map_err(zstd_error)?;
         Ok(Self {
             output,
             frame_target: frame_target as u64,
@@ -964,11 +969,11 @@ impl<W: Write> StreamingArchiveWriter<W> {
             compressed: Vec::new(),
             compressed_bytes: 0,
             pending_compressed_bytes: 0,
-            feed_interval: FRAME_FLUSH_RAW_INTERVAL
+            feed_interval: FRAME_FEED_RAW_INTERVAL
                 .min(frame_target.saturating_mul(8))
                 .max(1),
             pending: Vec::with_capacity(
-                FRAME_FLUSH_RAW_INTERVAL
+                FRAME_FEED_RAW_INTERVAL
                     .min(frame_target.saturating_mul(8))
                     .max(1),
             ),
@@ -7295,6 +7300,10 @@ mod tests {
         .unwrap();
         let large = vec![b'x'; (32 << 20) + 1];
         writer.write(&revision(1, 2, 20, &large)).unwrap();
+        assert!(
+            writer.context.get_frame_progression().currentJobID > 1,
+            "a large streaming frame must be divided among zstd workers"
+        );
         writer.write(&revision(1, 1, 10, b"old")).unwrap();
         let (archive, frames) = writer.finish().unwrap();
         assert_eq!(frames, 1);
