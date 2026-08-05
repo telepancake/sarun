@@ -24,6 +24,10 @@ record why the chosen tradeoff is reasonable.
 
 ## 1. Decide whether the work is exploration or engineering
 
+For repository-wide or cross-process work, start with
+`docs/architecture/SYSTEM_MODEL.md`. It is the reconciled inventory and gap
+register; update it when ownership, artifacts, or transition coverage changes.
+
 Classify the affected subsystem before editing:
 
 - **Experimental:** the question is still “which representation or algorithm

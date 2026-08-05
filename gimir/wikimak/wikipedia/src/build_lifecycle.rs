@@ -422,7 +422,7 @@ fn inspect_title_projection(
     Ok(Some(receipt))
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum InvalidBuildKind {
     Io,
     MalformedReceipt,
@@ -439,6 +439,20 @@ pub(crate) struct InvalidBuildState {
     pub(crate) kind: InvalidBuildKind,
     pub(crate) path: PathBuf,
     pub(crate) diagnostic: String,
+}
+
+/// Explicit recovery requested for a construction tree whose durable
+/// evidence cannot be interpreted.  This is deliberately separate from a
+/// normal resume: deleting a partial build is safe only after the inspector
+/// has classified it, and never mutates an installed generation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InvalidBuildEvent {
+    AbandonInvalidScratch,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InvalidBuildTransition {
+    AbandonScratch,
 }
 
 impl std::fmt::Display for InvalidBuildState {
@@ -459,6 +473,62 @@ fn invalid(
         path: path.into(),
         diagnostic: diagnostic.into(),
     }
+}
+
+/// Decide whether an invalid construction tree may be explicitly abandoned.
+///
+/// I/O failures and contradictory evidence are not recoverable by deletion:
+/// the inspector cannot establish what durable state is present.  A malformed
+/// or foreign temporary receipt, on the other hand, can be discarded when no
+/// complete candidate archive has been committed in the tree.  The caller
+/// still owns the destination-local lock and performs the actual deletion.
+pub(crate) fn transition_invalid_build(
+    root: &Path,
+    state: &InvalidBuildState,
+    event: InvalidBuildEvent,
+) -> Result<InvalidBuildTransition, InvalidBuildState> {
+    if !matches!(event, InvalidBuildEvent::AbandonInvalidScratch) {
+        return Err(invalid(
+            InvalidBuildKind::ContradictoryEvidence,
+            root,
+            "unsupported invalid-build recovery event",
+        ));
+    }
+    if matches!(
+        state.kind,
+        InvalidBuildKind::Io
+            | InvalidBuildKind::MissingArtifact
+            | InvalidBuildKind::CorruptArtifact
+            | InvalidBuildKind::ContradictoryEvidence
+    ) {
+        return Err(invalid(
+            state.kind.clone(),
+            state.path.clone(),
+            format!(
+                "cannot abandon ambiguous build state: {}",
+                state.diagnostic
+            ),
+        ));
+    }
+    // A complete candidate has its own archive/index/receipt evidence.  It is
+    // a recoverable construction result, not disposable scratch.
+    const CANDIDATE_FILES: [&str; 4] = [
+        "archive.swdump",
+        "archive.swtitle",
+        "archive.receipt.json",
+        "archive.generation.json",
+    ];
+    if CANDIDATE_FILES
+        .iter()
+        .any(|name| root.join(name).exists())
+    {
+        return Err(invalid(
+            InvalidBuildKind::ContradictoryEvidence,
+            root,
+            "invalid build state has a candidate archive; preserve it for explicit repair",
+        ));
+    }
+    Ok(InvalidBuildTransition::AbandonScratch)
 }
 
 fn read_optional<T: DeserializeOwned>(
@@ -2010,6 +2080,54 @@ mod tests {
                 .kind,
             InvalidBuildKind::MalformedReceipt
         );
+    }
+
+    #[test]
+    fn malformed_temporary_build_can_be_abandoned() {
+        let root = tempfile::tempdir().unwrap();
+        let state = InvalidBuildState {
+            kind: InvalidBuildKind::MalformedReceipt,
+            path: root.path().join("plan.json"),
+            diagnostic: "unsupported direct build plan".into(),
+        };
+        assert_eq!(
+            transition_invalid_build(
+                root.path(),
+                &state,
+                InvalidBuildEvent::AbandonInvalidScratch,
+            )
+            .unwrap(),
+            InvalidBuildTransition::AbandonScratch
+        );
+    }
+
+    #[test]
+    fn contradictory_or_candidate_build_is_not_auto_abandoned() {
+        let root = tempfile::tempdir().unwrap();
+        let contradictory = InvalidBuildState {
+            kind: InvalidBuildKind::ContradictoryEvidence,
+            path: root.path().join("archive.swdump"),
+            diagnostic: "complete archive and partial assembly coexist".into(),
+        };
+        assert!(transition_invalid_build(
+            root.path(),
+            &contradictory,
+            InvalidBuildEvent::AbandonInvalidScratch,
+        )
+        .is_err());
+
+        std::fs::write(root.path().join("archive.swdump"), b"candidate").unwrap();
+        let foreign = InvalidBuildState {
+            kind: InvalidBuildKind::ForeignIdentity,
+            path: root.path().join("nodes/receipt.json"),
+            diagnostic: "target belongs to another plan".into(),
+        };
+        assert!(transition_invalid_build(
+            root.path(),
+            &foreign,
+            InvalidBuildEvent::AbandonInvalidScratch,
+        )
+        .is_err());
     }
 
     #[test]

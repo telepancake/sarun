@@ -1899,6 +1899,14 @@ fn signal_owned(
         Some(None) => return Ok(()),
         _ => return Err("run no longer owns that process group".into()),
     }
+    signal_process_group(process_group, signal)
+}
+
+/// Signal a group whose ownership was just committed durably by
+/// `record_spawned`.  This path intentionally does not consult RUNNING: a
+/// concurrent shutdown may already have removed the in-memory owner while the
+/// spawn thread is still attaching the newly created group.
+fn signal_process_group(process_group: u32, signal: i32) -> Result<(), String> {
     let group =
         i32::try_from(process_group).map_err(|_| "mirror process group exceeds i32")?;
     if unsafe { libc::kill(-group, signal) } != 0 {
@@ -1930,6 +1938,52 @@ fn durable_stop_reason(run_id: RunId) -> Result<Option<StopReason>, String> {
         ("stopping", Some("shutdown")) => Ok(Some(StopReason::Shutdown)),
         _ => Err("run is no longer spawnable".into()),
     }
+}
+
+/// End a run whose driver has not been spawned when the pre-spawn ownership
+/// check itself fails.  This deliberately uses one conditional UPDATE rather
+/// than first reading the row: the check that failed is the database read, so
+/// another read cannot be a prerequisite for clearing the durable `starting`
+/// state.  A stopping run keeps its requested outcome; an un-stopped run is a
+/// failed attempt with a synthetic non-zero exit code.
+fn finish_pre_spawn_failure(run_id: RunId, detail: &str) -> Result<(), String> {
+    let mut conn = db()?;
+    let transaction = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| error.to_string())?;
+    let changed = transaction
+        .execute(
+            "UPDATE runs SET
+                 state = CASE
+                     WHEN state='stopping' AND stop_reason='user' THEN 'cancelled'
+                     WHEN state='stopping' AND stop_reason='shutdown' THEN 'interrupted'
+                     ELSE 'failed'
+                 END,
+                 ended_at = ?2,
+                 exit_code = CASE
+                     WHEN state='stopping' AND stop_reason IN ('user','shutdown')
+                         THEN NULL
+                     ELSE -1
+                 END,
+                 stop_reason = CASE
+                     WHEN state='stopping' AND stop_reason IN ('user','shutdown')
+                         THEN stop_reason
+                     ELSE NULL
+                 END,
+                 detail = ?3
+             WHERE id=?1
+               AND state IN ('starting','running','stopping')
+               AND NOT EXISTS(
+                   SELECT 1 FROM runs newer
+                   WHERE newer.job_id=runs.job_id AND newer.id>runs.id
+               )",
+            params![run_id.0, now(), detail],
+        )
+        .map_err(|error| error.to_string())?;
+    if changed != 1 {
+        return Err("stale pre-spawn failure lost its run ownership".into());
+    }
+    transaction.commit().map_err(|error| error.to_string())
 }
 
 fn record_spawned(run_id: RunId, process_group: u32) -> Result<Option<StopReason>, String> {
@@ -2198,10 +2252,14 @@ fn spawn_run(job: JobConfig, wiki_run: WikiRun, run_id: RunId) {
             }
             Ok(None) => {}
             Err(error) => {
-                eprintln!(
-                    "mirror job #{id} run #{} pre-spawn ownership check failed: {error}",
-                    run_id.0
-                );
+                let detail = format!("pre-spawn ownership check failed: {error}");
+                if let Err(completion_error) = finish_pre_spawn_failure(run_id, &detail) {
+                    eprintln!(
+                        "mirror job #{id} run #{} pre-spawn ownership check failed: {error}; \
+                         terminalization failed: {completion_error}",
+                        run_id.0
+                    );
+                }
                 remove_owner(id, run_id);
                 return;
             }
@@ -2280,7 +2338,13 @@ fn spawn_run(job: JobConfig, wiki_run: WikiRun, run_id: RunId) {
                     }
                 });
                 if effective_stop.is_some() {
-                    let _ = signal_owned(id, run_id, process_group, libc::SIGTERM);
+                    if let Err(error) = signal_process_group(process_group, libc::SIGTERM) {
+                        eprintln!(
+                            "mirror job #{id} run #{} could not signal the stopping group {}: \
+                             {error}",
+                            run_id.0, process_group
+                        );
+                    }
                 }
                 let stderr = c.stderr.take().expect("piped stderr");
                 let (exit, tail) = stream_stderr(run_id, stderr, &mut c);
@@ -2398,8 +2462,10 @@ pub fn scheduler_thread() {
         return;
     }
     if let Err(error) = recover_unowned_runs() {
-        eprintln!("mirror supervisor recovery stopped scheduling: {error}");
-        return;
+        // Recovery is per-run: diagnostics from one malformed or foreign row
+        // must not prevent scheduling the other jobs after all rows were
+        // terminalized.
+        eprintln!("mirror supervisor recovery completed with diagnostics: {error}");
     }
     std::thread::spawn(|| {
         loop {
@@ -2414,60 +2480,298 @@ pub fn scheduler_thread() {
     });
 }
 
+fn process_group_is_live(process_group: u32) -> bool {
+    if process_group <= 1 {
+        return false;
+    }
+    let Ok(group) = i32::try_from(process_group) else {
+        return false;
+    };
+    (unsafe { libc::kill(-group, 0) == 0 })
+        || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+fn reap_owned_children(process_group: i32) {
+    loop {
+        let mut status = 0;
+        let result = unsafe { libc::waitpid(-process_group, &mut status, libc::WNOHANG) };
+        if result > 0 {
+            continue;
+        }
+        if result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+            continue;
+        }
+        break;
+    }
+}
+
+/// Check that a persisted group still looks like the process group created by
+/// this run before sending a signal after engine restart.  On Linux the
+/// process start time in /proc catches PID/PGID reuse.  Other Unix hosts do
+/// not expose an equivalent portable token, so we require the group leader to
+/// still be its own group and rely on the driver's parent-death watchdog while
+/// the engine is alive; a reused group is rejected when it is obviously
+/// unsafe (PID 1 or the engine's own group).
+fn recorded_group_is_safe(process_group: u32, spawned_at: Option<i64>) -> Result<bool, String> {
+    if process_group <= 1 {
+        return Ok(false);
+    }
+    let group = i32::try_from(process_group)
+        .map_err(|_| format!("process group {process_group} exceeds i32"))?;
+    let own_group = unsafe { libc::getpgrp() };
+    if group == own_group {
+        return Ok(false);
+    }
+    if unsafe { libc::getpgid(group) } != group {
+        return Ok(false);
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let Some(spawned_at) = spawned_at else {
+            return Ok(false);
+        };
+        let stat_path = format!("/proc/{process_group}/stat");
+        let stat = std::fs::read_to_string(&stat_path)
+            .map_err(|error| format!("read {stat_path}: {error}"))?;
+        let fields = stat
+            .rsplit_once(')')
+            .map(|(_, rest)| rest.split_whitespace().collect::<Vec<_>>())
+            .ok_or_else(|| format!("malformed {stat_path}"))?;
+        // After the command name, field 3 is index 0 and field 22
+        // (starttime) is index 19. Field 5 (pgrp) is index 2.
+        let observed_group = fields
+            .get(2)
+            .ok_or_else(|| format!("{stat_path} has no process group"))?
+            .parse::<i32>()
+            .map_err(|_| format!("invalid process group in {stat_path}"))?;
+        if observed_group != group {
+            return Ok(false);
+        }
+        let start_ticks = fields
+            .get(19)
+            .ok_or_else(|| format!("{stat_path} has no start time"))?
+            .parse::<u64>()
+            .map_err(|_| format!("invalid start time in {stat_path}"))?;
+        let boot = std::fs::read_to_string("/proc/stat")
+            .map_err(|error| format!("read /proc/stat: {error}"))?
+            .lines()
+            .find_map(|line| line.strip_prefix("btime "))
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .ok_or_else(|| "Linux /proc/stat has no boot time".to_owned())?;
+        let ticks_per_second = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+        if ticks_per_second <= 0 {
+            return Err("cannot determine Linux clock tick rate".into());
+        }
+        let start_epoch = boot.saturating_add(start_ticks / ticks_per_second as u64);
+        // record_spawned stores seconds after spawn. A group leader can be
+        // observed a few seconds before/after that write under scheduler
+        // pressure, but a PID reused much later must not be signalled.
+        return Ok(start_epoch.saturating_add(5) >= spawned_at as u64
+            && (spawned_at.saturating_add(5) as u64) >= start_epoch);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = spawned_at;
+        Ok(true)
+    }
+}
+
+fn terminate_recorded_group(
+    process_group: u32,
+    spawned_at: Option<i64>,
+) -> Result<(), String> {
+    // A child that already exited is exactly the state we want to recover;
+    // there is no process left to signal or reap.
+    if !process_group_is_live(process_group) {
+        return Ok(());
+    }
+    if !recorded_group_is_safe(process_group, spawned_at)? {
+        return Err(format!(
+            "refusing to signal process group {process_group}: group incarnation is not owned"
+        ));
+    }
+    let group = i32::try_from(process_group)
+        .map_err(|_| format!("process group {process_group} exceeds i32"))?;
+    let mut term_failed = false;
+    if unsafe { libc::kill(-group, libc::SIGTERM) } != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(());
+        }
+        // A group containing only an already-exiting/zombie member can
+        // reject SIGTERM with EPERM even though SIGKILL is still meaningful.
+        // Escalate once before declaring recovery incomplete.
+        term_failed = true;
+    }
+    if !term_failed {
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    // A direct child can remain as a zombie until the supervisor reaps it;
+    // kill(-pgid, 0) reports that group as present and SIGKILL then returns
+    // EPERM. Reap before deciding that escalation is still necessary.
+    reap_owned_children(group);
+    if process_group_is_live(process_group) {
+        if unsafe { libc::kill(-group, libc::SIGKILL) } != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                return Err(format!("kill process group {process_group}: {error}"));
+            }
+        }
+    }
+    // If recovery is running in the original parent (as stop_all can call
+    // this path), reap direct children before checking group disappearance.
+    // After an engine restart waitpid returns ECHILD; the old parent or init
+    // owns those processes and the bounded liveness check below still applies.
+    reap_owned_children(group);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while process_group_is_live(process_group) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        reap_owned_children(group);
+    }
+    if process_group_is_live(process_group) {
+        return Err(format!(
+            "process group {process_group} remains live after SIGKILL"
+        ));
+    }
+    Ok(())
+}
+
 fn recover_unowned_runs() -> Result<(), String> {
-    let mut conn = db()?;
-    let transaction = conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(|error| error.to_string())?;
+    let conn = db()?;
+    let mut diagnostics = Vec::new();
     let mut active = {
-        let mut statement = transaction
+        let mut statement = conn
             .prepare(
-                "SELECT id,state,stop_reason,process_group FROM runs
+                "SELECT id,state,stop_reason,process_group,spawned_at FROM runs
                  WHERE state IN ('starting','running','stopping')",
             )
             .map_err(|error| error.to_string())?;
-        statement
+        let rows = statement
             .query_map([], |row| {
                 Ok((
                     RunId(row.get(0)?),
                     row.get::<_, String>(1)?,
                     row.get::<_, Option<String>>(2)?,
                     row.get::<_, Option<u32>>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
                 ))
             })
-            .map_err(|error| error.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| error.to_string())?
-    };
-    active.sort_by_key(|(run_id, _, _, _)| run_id.0);
-    for (run_id, state, reason, process_group) in active {
-        let current = sql_state_kind(&state, reason.as_deref())
-            .ok_or_else(|| format!("invalid durable mirror run state {state:?}"))?;
-        if current == RunStateKind::Running && process_group.is_none() {
-            return Err("durable running mirror has no process group".into());
-        }
-        let next = transition_run(current, RunEvent::Restart).map_err(str::to_string)?;
-        let state_name = match next {
-            RunStateKind::Cancelled => "cancelled",
-            RunStateKind::Interrupted => "interrupted",
-            _ => return Err("restart left an active run non-terminal".into()),
-        };
-        let changed = transaction
-            .execute(
-                "UPDATE runs SET state=?2,ended_at=?3,exit_code=NULL,
-                                 detail='engine restarted before run completion'
-                 WHERE id=?1 AND state IN ('starting','running','stopping')",
-                params![run_id.0, state_name, now()],
-            )
             .map_err(|error| error.to_string())?;
-        if changed != 1 {
-            return Err(format!(
-                "restart recovery lost ownership of run #{}",
-                run_id.0
+        let mut active = Vec::new();
+        for row in rows {
+            match row {
+                Ok(row) => active.push(row),
+                Err(error) => diagnostics.push(format!(
+                    "cannot decode an active mirror run during restart recovery: {error}"
+                )),
+            }
+        }
+        active
+    };
+    active.sort_by_key(|(run_id, _, _, _, _)| run_id.0);
+
+    // Signal/reap every recorded group before changing any durable run state.
+    // This ordering prevents a restarted engine from publishing an apparently
+    // idle job while its old driver is still mutating the destination.
+    for (run_id, _state, _reason, process_group, spawned_at) in &active {
+        if let Some(process_group) = process_group
+            && let Err(error) = terminate_recorded_group(*process_group, *spawned_at)
+        {
+            diagnostics.push(format!(
+                "run #{} process group {}: {error}",
+                run_id.0, process_group
             ));
         }
     }
-    transaction.commit().map_err(|error| error.to_string())
+    drop(conn);
+
+    // A malformed row must not prevent later rows from being recovered.  The
+    // conditional UPDATE below also handles the narrow case where a valid
+    // state has an invalid stop reason: it records a failed outcome rather
+    // than leaving an active row that the scheduler can never start.
+    for (run_id, state, reason, _process_group, _spawned_at) in active {
+        let (state_name, stop_reason, exit_code) = match (state.as_str(), reason.as_deref()) {
+            ("stopping", Some("user")) => ("cancelled", Some("user"), None),
+            ("stopping", Some("shutdown")) => ("interrupted", Some("shutdown"), None),
+            ("starting" | "running", None) => ("interrupted", None, None),
+            _ => {
+                diagnostics.push(format!(
+                    "run #{} has malformed active state {:?}/{:?}",
+                    run_id.0, state, reason
+                ));
+                ("failed", None, Some(-1_i64))
+            }
+        };
+        let detail = if diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.starts_with(&format!("run #{} process group", run_id.0)))
+        {
+            "engine restarted; process-group cleanup reported an error"
+        } else {
+            "engine restarted before run completion"
+        };
+        let mut conn = match db() {
+            Ok(conn) => conn,
+            Err(error) => {
+                diagnostics.push(format!("run #{} terminalization: {error}", run_id.0));
+                continue;
+            }
+        };
+        let transaction = match conn.transaction_with_behavior(TransactionBehavior::Immediate) {
+            Ok(transaction) => transaction,
+            Err(error) => {
+                diagnostics.push(format!(
+                    "run #{} terminalization transaction: {error}",
+                    run_id.0
+                ));
+                continue;
+            }
+        };
+        let changed = match transaction.execute(
+            "UPDATE runs SET state=?2,ended_at=?3,exit_code=?4,stop_reason=?5,detail=?6
+             WHERE id=?1 AND state=?7
+               AND NOT EXISTS(
+                   SELECT 1 FROM runs newer
+                   WHERE newer.job_id=runs.job_id AND newer.id>runs.id
+               )",
+            params![
+                run_id.0,
+                state_name,
+                now(),
+                exit_code,
+                stop_reason,
+                detail,
+                state,
+            ],
+        ) {
+            Ok(changed) => changed,
+            Err(error) => {
+                diagnostics.push(format!("run #{} terminalization: {error}", run_id.0));
+                continue;
+            }
+        };
+        if changed != 1 {
+            diagnostics.push(format!(
+                "restart recovery lost ownership of run #{}",
+                run_id.0
+            ));
+            continue;
+        }
+        if let Err(error) = transaction.commit() {
+            diagnostics.push(format!("run #{} terminalization commit: {error}", run_id.0));
+        }
+    }
+
+    if diagnostics.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "restart recovery completed with diagnostics: {}",
+            diagnostics.join("; ")
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -3073,7 +3377,7 @@ mod tests {
         }
         std::fs::create_dir_all(crate::paths::state_home()).unwrap();
         use std::os::unix::process::CommandExt;
-        let mut command = std::process::Command::new("/bin/sh");
+        let mut command = std::process::Command::new("/bin/sleep");
         unsafe {
             command.pre_exec(|| {
                 if libc::setpgid(0, 0) == 0 {
@@ -3083,7 +3387,8 @@ mod tests {
                 }
             });
         }
-        let mut child = command.arg("-c").arg("sleep 60").spawn().unwrap();
+        let mut child = command.arg("60").spawn().unwrap();
+        assert!(child.try_wait().unwrap().is_none(), "test child exited before recovery");
         let id = job_add("cmd", "sleep 60", "/tmp/sarun-cancel-test", 3600).unwrap();
         let conn = db().unwrap();
         conn.execute(
@@ -3156,6 +3461,82 @@ mod tests {
         let job = jobs_list().unwrap().remove(0);
         assert_eq!(job.state, "cancelled");
         assert!(!job.automatic_start);
+    }
+
+    #[test]
+    fn pre_spawn_failure_cannot_leave_a_starting_run() {
+        let _guard = crate::depot::TEST_STATE_HOME_LOCK.lock().unwrap();
+        let temporary = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", temporary.path().join("state"));
+        }
+        std::fs::create_dir_all(crate::paths::state_home()).unwrap();
+        let id = job_add(
+            "cmd",
+            "true",
+            temporary.path().join("dest").to_str().unwrap(),
+            3600,
+        )
+        .unwrap();
+        let conn = db().unwrap();
+        conn.execute(
+            "INSERT INTO runs(job_id,request,state,started_at)
+             VALUES(?1,'explicit','starting',?2)",
+            params![id, now()],
+        )
+        .unwrap();
+        let run_id = RunId(conn.last_insert_rowid());
+
+        finish_pre_spawn_failure(run_id, "ownership check failed").unwrap();
+        let state: String = conn
+            .query_row("SELECT state FROM runs WHERE id=?1", [run_id.0], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(state, "failed");
+    }
+
+    #[test]
+    fn restart_recovery_terminates_recorded_process_group_before_publishing_state() {
+        let _guard = crate::depot::TEST_STATE_HOME_LOCK.lock().unwrap();
+        let temporary = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", temporary.path().join("state"));
+        }
+        std::fs::create_dir_all(crate::paths::state_home()).unwrap();
+        use std::os::unix::process::CommandExt;
+        let mut command = std::process::Command::new("/bin/sleep");
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            });
+        }
+        let mut child = command.arg("60").spawn().unwrap();
+        let id = job_add(
+            "cmd",
+            "sleep 60",
+            temporary.path().join("dest").to_str().unwrap(),
+            3600,
+        )
+        .unwrap();
+        let spawned_at = now();
+        let conn = db().unwrap();
+        conn.execute(
+            "INSERT INTO runs(
+                job_id,request,state,started_at,spawned_at,process_group
+             ) VALUES(?1,'explicit','running',?2,?2,?3)",
+            params![id, spawned_at, child.id()],
+        )
+        .unwrap();
+
+        let recovery = recover_unowned_runs();
+        let _ = child.wait();
+        assert!(recovery.is_ok(), "{recovery:?}");
+        assert_eq!(jobs_list().unwrap()[0].state, "interrupted");
     }
 
     #[test]

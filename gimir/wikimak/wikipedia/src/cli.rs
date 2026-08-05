@@ -130,6 +130,48 @@ fn clear_mirror_scratch(scratch: &Path) -> Result<(), String> {
     sync_parent(&scratch.join("build.lock"))
 }
 
+/// Abandon a malformed/foreign construction tree while holding its
+/// destination-local build lock.  The lifecycle inspector decides whether
+/// deletion is safe; this function only removes the private scratch tree and
+/// never touches the selected generation or any candidate publication.
+fn abandon_invalid_build(
+    scratch: &Path,
+    state: &crate::build_lifecycle::InvalidBuildState,
+) -> Result<(), String> {
+    if update_scratch_has_committed_candidate(scratch) {
+        return Err(format!(
+            "invalid temporary build state has a committed update candidate; preserving it: {}",
+            state
+        ));
+    }
+    crate::build_lifecycle::transition_invalid_build(
+        scratch,
+        state,
+        crate::build_lifecycle::InvalidBuildEvent::AbandonInvalidScratch,
+    )
+    .map_err(|error| error.to_string())?;
+    eprintln!(
+        "discarding invalid temporary build state at {}; installed generation preserved",
+        scratch.display()
+    );
+    clear_mirror_scratch(scratch)
+}
+
+fn inspect_build_for_start(
+    scratch: &Path,
+) -> Result<crate::build_lifecycle::BuildState, String> {
+    match crate::build_lifecycle::inspect_build(scratch, None) {
+        Ok(state) => Ok(state),
+        Err(error) => {
+            let original = error.to_string();
+            abandon_invalid_build(scratch, &error)
+                .map_err(|reset_error| format!("{original}; {reset_error}"))?;
+            crate::build_lifecycle::inspect_build(scratch, None)
+                .map_err(|reset_error| reset_error.to_string())
+        }
+    }
+}
+
 fn persist_json(path: &Path, value: &impl serde::Serialize) -> Result<(), String> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let mut temporary = tempfile::NamedTempFile::new_in(parent)
@@ -2079,8 +2121,7 @@ fn build_full(
     if replace_plan {
         clear_mirror_scratch(scratch)?;
     }
-    let inspected = crate::build_lifecycle::inspect_build(scratch, None)
-        .map_err(|error| error.to_string())?;
+    let inspected = inspect_build_for_start(scratch)?;
     let plan = match inspected {
         crate::build_lifecycle::BuildState::Unplanned => {
             let plan = crate::direct::discover_direct_build_plan(
@@ -2225,21 +2266,38 @@ fn cmd_fetch(dbname: &str, archive: &str, run_id: Option<&str>) -> Result<(), St
     let overlap_days = 3;
     let compression = mirror_compression();
 
-    let (_active, paths, source, base, resuming) =
-        if let Some((active, paths)) = load_active_update(&scratch)? {
-            let source = load_update_plan(&active, &paths, dbname)?;
-            let base = if let Some(receipt) = update_lifecycle::read_receipt::<
-                update_lifecycle::PreservedBaseReceipt,
-            >(&paths.base_receipt())
-            .map_err(|error| error.to_string())?
-            {
-                receipt.generation
-            } else {
-                let selected = crate::installation_lifecycle::serving_pair(archive)?
-                    .ok_or_else(|| format!("{} has no installed generation", archive.display()))?;
-                crate::generation::generation_identity(&selected.archive, &selected.title)
-                    .map_err(|error| error.to_string())?
-            };
+    let mut resumed = match load_active_update(&scratch) {
+        Ok(Some((active, paths))) => match load_update_plan(&active, &paths, dbname) {
+            Ok(source) => {
+                let base = if let Some(receipt) = update_lifecycle::read_receipt::<
+                    update_lifecycle::PreservedBaseReceipt,
+                >(&paths.base_receipt())
+                .map_err(|error| error.to_string())?
+                {
+                    receipt.generation
+                } else {
+                    let selected = crate::installation_lifecycle::serving_pair(archive)?
+                        .ok_or_else(|| {
+                            format!("{} has no installed generation", archive.display())
+                        })?;
+                    crate::generation::generation_identity(&selected.archive, &selected.title)
+                        .map_err(|error| error.to_string())?
+                };
+                Some((active, paths, source, base))
+            }
+            Err(error) => {
+                abandon_invalid_update(&scratch, error)?;
+                None
+            }
+        },
+        Ok(None) => None,
+        Err(error) => {
+            abandon_invalid_update(&scratch, error)?;
+            None
+        }
+    };
+    let (_active, mut paths, mut source, mut base, resuming) =
+        if let Some((active, paths, source, base)) = resumed.take() {
             (active, paths, source, base, true)
         } else {
             let (active, paths, source, base) = create_update_plan(
@@ -2255,12 +2313,26 @@ fn cmd_fetch(dbname: &str, archive: &str, run_id: Option<&str>) -> Result<(), St
 
     if resuming {
         let installed_id = installed_generation_id(archive)?;
-        let state = update_lifecycle::inspect_update(&paths, installed_id.as_str())
-            .map_err(|error| error.to_string())?;
-        require_state_preserving_event(
-            state.phase(),
-            update_lifecycle::UpdateEvent::ResumeRequested,
-        )?;
+        match update_lifecycle::inspect_update(&paths, installed_id.as_str()) {
+            Ok(state) => require_state_preserving_event(
+                state.phase(),
+                update_lifecycle::UpdateEvent::ResumeRequested,
+            )?,
+            Err(error) => {
+                abandon_invalid_update(&scratch, error)?;
+                let replacement = create_update_plan(
+                    &client,
+                    dbname,
+                    archive,
+                    &scratch,
+                    overlap_days,
+                    compression,
+                )?;
+                paths = replacement.1;
+                source = replacement.2;
+                base = replacement.3;
+            }
+        }
     }
     loop {
         let installed_id = installed_generation_id(archive)?;
@@ -2404,6 +2476,117 @@ fn cmd_refresh_full(dbname: &str, archive: &str, run_id: Option<&str>) -> Result
         true,
         run_id,
     )
+}
+
+fn update_candidate_is_committed(paths: &update_lifecycle::UpdatePaths) -> bool {
+    [
+        paths.candidate_inventory(),
+        paths.prepared_generation(),
+        paths.commit_receipt(),
+    ]
+    .iter()
+    .any(|path| path.exists())
+}
+
+fn update_scratch_has_committed_candidate(scratch: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(scratch.join("updates")) else {
+        return false;
+    };
+    entries.filter_map(Result::ok).any(|entry| {
+        entry.file_type().is_ok_and(|kind| kind.is_dir())
+            && update_candidate_is_committed(&update_lifecycle::UpdatePaths::new(entry.path()))
+    })
+}
+
+fn abandon_invalid_update(
+    scratch: &Path,
+    detail: impl std::fmt::Display,
+) -> Result<(), String> {
+    if update_scratch_has_committed_candidate(scratch) {
+        return Err(format!(
+            "invalid temporary update state has a committed candidate; preserving it: {detail}"
+        ));
+    }
+    eprintln!(
+        "discarding invalid temporary update state at {}; installed generation preserved ({detail})",
+        scratch.display()
+    );
+    clear_mirror_scratch(scratch)
+}
+
+/// Explicitly abandon an invalid destination-local build/update tree.  This
+/// is intentionally narrower than `refresh-full`: valid resumable work and
+/// any committed candidate are left untouched.
+fn cmd_reset(dbname: &str, archive: &str) -> Result<(), String> {
+    let archive = Path::new(archive);
+    let scratch = ensure_mirror_scratch(archive)?;
+    let _lock = MirrorBuildLock::acquire(&scratch)?;
+    // Validate the publication selector before touching scratch.  A malformed
+    // selector means the installed generation itself needs repair, not a
+    // construction reset.
+    let _ = crate::installation_lifecycle::serving_pair(archive)?;
+
+    match crate::build_lifecycle::inspect_build(&scratch, None) {
+        Ok(crate::build_lifecycle::BuildState::Unplanned) => {}
+        Ok(state) => {
+            return Err(format!(
+                "{} contains valid {} state; use fetch/resume or refresh-full",
+                scratch.display(),
+                state.phase()
+            ));
+        }
+        Err(error) => abandon_invalid_build(&scratch, &error)?,
+    }
+
+    if update_scratch_has_committed_candidate(&scratch) {
+        return Err(format!(
+            "{} contains a committed update candidate; preserving it",
+            scratch.display()
+        ));
+    }
+    match load_active_update(&scratch) {
+        Ok(None) => {}
+        Ok(Some((active, paths))) => {
+            let installed = installed_generation_id(archive)?;
+            match update_lifecycle::inspect_update(&paths, installed.as_str()) {
+                Ok(state) => {
+                    return Err(format!(
+                        "update {} is in valid {:?} state; use fetch/resume",
+                        active.update_id,
+                        state.phase()
+                    ));
+                }
+                Err(error) => {
+                    if update_candidate_is_committed(&paths) {
+                        return Err(format!(
+                            "update {} has a committed candidate; preserving it: {}",
+                            active.update_id, error
+                        ));
+                    }
+                    eprintln!(
+                        "discarding invalid temporary update state at {}; installed generation preserved",
+                        paths.root.display()
+                    );
+                    clear_mirror_scratch(&scratch)?;
+                }
+            }
+        }
+        Err(error) => {
+            if update_scratch_has_committed_candidate(&scratch) {
+                return Err(format!(
+                    "{} has an invalid update selector but also a candidate; preserving it: {}",
+                    scratch.display(), error
+                ));
+            }
+            eprintln!(
+                "discarding invalid temporary update selector at {}; installed generation preserved",
+                update_selector_path(&scratch).display()
+            );
+            clear_mirror_scratch(&scratch)?;
+        }
+    }
+    eprintln!("reset complete for {dbname} at {}", scratch.display());
+    Ok(())
 }
 
 fn cmd_discover(dbname: &str) -> Result<(), String> {
@@ -2838,6 +3021,7 @@ pub fn cli_main(args: &[String]) -> i32 {
         ["discover", dbname] => cmd_discover(dbname),
         ["fetch", dbname, archive] => cmd_fetch(dbname, archive, None),
         ["refresh-full", dbname, archive] => cmd_refresh_full(dbname, archive, None),
+        ["reset", dbname, archive] => cmd_reset(dbname, archive),
         ["fetch", "--run-id", run_id, dbname, archive] => {
             cmd_fetch(dbname, archive, Some(run_id))
         }
@@ -2873,6 +3057,7 @@ pub fn cli_main(args: &[String]) -> i32 {
             "usage: wikimak discover <dbname>\n\
              \x20      wikimak fetch <dbname> <archive.swdump>\n\
              \x20      wikimak refresh-full <dbname> <archive.swdump>\n\
+             \x20      wikimak reset <dbname> <archive.swdump>\n\
              \x20      wikimak serve <archive.swdump> [addr] [--packed-media <directory>]\n\
              \x20      wikimak kiwix-pack <source.zim> <output-directory>\n\
              \x20      wikimak siteinfo <api-url> <output.swdump>\n\
@@ -3066,6 +3251,38 @@ mod tests {
             args.extend(options);
             assert_eq!(cmd_repack(&args).unwrap_err(), "unknown repack options");
         }
+    }
+
+    #[test]
+    fn start_discards_only_malformed_temporary_plan() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("plan.json"), b"old plan").unwrap();
+        assert!(matches!(
+            inspect_build_for_start(root.path()).unwrap(),
+            crate::build_lifecycle::BuildState::Unplanned
+        ));
+        assert!(!root.path().join("plan.json").exists());
+    }
+
+    #[test]
+    fn start_refuses_invalid_tree_with_candidate_archive() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("plan.json"), b"old plan").unwrap();
+        std::fs::write(root.path().join("archive.swdump"), b"candidate").unwrap();
+        let error = inspect_build_for_start(root.path()).unwrap_err();
+        assert!(error.contains("candidate archive"), "{error}");
+        assert!(root.path().join("archive.swdump").exists());
+    }
+
+    #[test]
+    fn invalid_update_reset_preserves_committed_candidate() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = update_lifecycle::UpdatePaths::new(root.path().join("updates/u1"));
+        std::fs::create_dir_all(paths.candidate_inventory().parent().unwrap()).unwrap();
+        std::fs::write(paths.candidate_inventory(), b"candidate").unwrap();
+        let error = abandon_invalid_update(root.path(), "malformed update receipt").unwrap_err();
+        assert!(error.contains("committed candidate"), "{error}");
+        assert!(paths.candidate_inventory().exists());
     }
 
 }
