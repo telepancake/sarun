@@ -6,9 +6,11 @@
 //! a depot format: it is a compact source for experiments, conversions, and
 //! recovery without depending on the current live storage layout.
 
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BTreeMap, BinaryHeap, HashMap, VecDeque};
 use std::io::{self, BufReader, Cursor, Read, Seek, SeekFrom, Take, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::{DateTime, NaiveDateTime, Utc};
 
@@ -908,7 +910,7 @@ fn pump_streaming_context(
     }
 }
 
-struct StreamingArchiveWriter<W: Write> {
+pub(crate) struct StreamingArchiveWriter<W: Write> {
     output: W,
     frame_target: u64,
     context: zstd::zstd_safe::CCtx<'static>,
@@ -921,6 +923,7 @@ struct StreamingArchiveWriter<W: Write> {
     scratch: Vec<u8>,
     first_entity: Option<EntityKey>,
     last_entity: Option<EntityKey>,
+    output_frontier: Option<EntityKey>,
     last_timestamp: i64,
     records: u64,
     raw_bytes: u64,
@@ -930,7 +933,7 @@ struct StreamingArchiveWriter<W: Write> {
 }
 
 impl<W: Write> StreamingArchiveWriter<W> {
-    fn new(
+    pub(crate) fn new(
         mut output: W,
         frame_target: usize,
         mut compression: CompressionSettings,
@@ -980,6 +983,7 @@ impl<W: Write> StreamingArchiveWriter<W> {
             scratch: vec![0_u8; zstd::zstd_safe::CCtx::out_size()],
             first_entity: None,
             last_entity: None,
+            output_frontier: None,
             last_timestamp: i64::MAX,
             records: 0,
             raw_bytes: 0,
@@ -1014,10 +1018,20 @@ impl<W: Write> StreamingArchiveWriter<W> {
         produced.saturating_add(estimated_pending)
     }
 
-    fn write(&mut self, record: &Record) -> Result<()> {
+    pub(crate) fn write(&mut self, record: &Record) -> Result<()> {
         let entity = record.entity();
         let timestamp = record.timestamp_micros();
         let new_entity = self.last_entity != Some(entity);
+        if let Some(previous) = self.output_frontier {
+            if entity <= previous {
+                return Err(ArchiveError::OutOfOrder {
+                    previous,
+                    previous_timestamp: i64::MIN,
+                    current: entity,
+                    current_timestamp: timestamp,
+                });
+            }
+        }
         if let Some(previous) = self.last_entity {
             if entity < previous || (!new_entity && timestamp > self.last_timestamp) {
                 return Err(ArchiveError::OutOfOrder {
@@ -1114,6 +1128,7 @@ impl<W: Write> StreamingArchiveWriter<W> {
             .sealed_compressed_bytes
             .checked_add(self.compressed_bytes)
             .ok_or(ArchiveError::FieldTooLarge)?;
+        self.output_frontier = Some(last_entity);
         self.compressed.clear();
         self.context
             .reset(zstd::zstd_safe::ResetDirective::SessionOnly)
@@ -1128,13 +1143,460 @@ impl<W: Write> StreamingArchiveWriter<W> {
         Ok(())
     }
 
-    fn finish(mut self) -> Result<(W, u64)> {
+    pub(crate) fn finish(mut self) -> Result<(W, u64)> {
         self.seal_frame()?;
         self.output.write_all(&DONE_MAGIC)?;
         self.output.write_all(&[0; FRAME_HEADER_LEN - 4])?;
         self.output.flush()?;
         Ok((self.output, self.frames_written))
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct CopiedFrameStats {
+    pub(crate) frames: u64,
+    pub(crate) records: u64,
+    pub(crate) raw_bytes: u64,
+    pub(crate) compressed_bytes: u64,
+}
+
+struct ParallelFrameJob {
+    sequence: u64,
+    first_entity: EntityKey,
+    last_entity: EntityKey,
+    records: u64,
+    raw: Vec<u8>,
+}
+
+struct ParallelFrameResult {
+    sequence: u64,
+    info: FrameInfo,
+    payload: ParallelFramePayload,
+}
+
+enum ParallelFramePayload {
+    Compressed(Vec<u8>),
+    Copied {
+        source: std::fs::File,
+        payload_offset: u64,
+    },
+}
+
+/// An ordered, bounded pool for independently compressed final frames.
+///
+/// Zstd's internal worker pool cannot usefully parallelize frames whose raw
+/// size is normally below one zstd job. This writer instead assigns complete
+/// frames to independent single-threaded contexts. Only the output thread
+/// writes bytes, in sequence order. At most `workers` submitted raw frames and
+/// one result per worker are retained, plus an indivisible current entity.
+pub(crate) struct ParallelArchiveWriter<W: Write> {
+    output: Option<W>,
+    frame_target: u64,
+    senders: Vec<std::sync::mpsc::SyncSender<Option<ParallelFrameJob>>>,
+    results: std::sync::mpsc::Receiver<Result<ParallelFrameResult>>,
+    threads: Vec<std::thread::JoinHandle<()>>,
+    pending_results: BTreeMap<u64, ParallelFrameResult>,
+    current_raw: Vec<u8>,
+    current_first: Option<EntityKey>,
+    current_last: Option<EntityKey>,
+    submitted_frontier: Option<EntityKey>,
+    current_last_timestamp: i64,
+    current_records: u64,
+    next_submit: u64,
+    next_write: u64,
+    outstanding: usize,
+    next_worker: usize,
+    frames_written: u64,
+    sealed_raw_bytes: u64,
+    sealed_compressed_bytes: u64,
+}
+
+impl<W: Write> ParallelArchiveWriter<W> {
+    pub(crate) fn new(
+        mut output: W,
+        frame_target: usize,
+        mut compression: CompressionSettings,
+        prefix: &[u8],
+        workers: usize,
+    ) -> Result<Self> {
+        if frame_target == 0 || prefix.is_empty() || workers == 0 {
+            return Err(ArchiveError::Invalid(
+                "invalid parallel archive writer configuration",
+            ));
+        }
+        compression.workers = 0;
+        output.write_all(&FILE_MAGIC)?;
+        output.write_all(&FILE_VERSION.to_le_bytes())?;
+        output.write_all(&0_u32.to_le_bytes())?;
+        output.write_all(&(frame_target as u64).to_le_bytes())?;
+        write_ref_prefix_frame(&mut output, prefix, compression)?;
+
+        let prefix: Arc<[u8]> = Arc::from(prefix);
+        let (result_sender, results) = std::sync::mpsc::channel();
+        let mut senders = Vec::with_capacity(workers);
+        let mut threads = Vec::with_capacity(workers);
+        for _ in 0..workers {
+            let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+            let results = result_sender.clone();
+            let prefix = Arc::clone(&prefix);
+            threads.push(std::thread::spawn(move || {
+                parallel_frame_worker(receiver, results, prefix, compression);
+            }));
+            senders.push(sender);
+        }
+        drop(result_sender);
+        Ok(Self {
+            output: Some(output),
+            frame_target: frame_target as u64,
+            senders,
+            results,
+            threads,
+            pending_results: BTreeMap::new(),
+            current_raw: Vec::with_capacity(frame_target.saturating_mul(4)),
+            current_first: None,
+            current_last: None,
+            submitted_frontier: None,
+            current_last_timestamp: i64::MAX,
+            current_records: 0,
+            next_submit: 0,
+            next_write: 0,
+            outstanding: 0,
+            next_worker: 0,
+            frames_written: 0,
+            sealed_raw_bytes: 0,
+            sealed_compressed_bytes: 0,
+        })
+    }
+
+    fn estimated_current_compressed_bytes(&self) -> u64 {
+        if self.sealed_raw_bytes == 0 || self.sealed_compressed_bytes == 0 {
+            return (self.current_raw.len() as u64).div_ceil(4);
+        }
+        (u128::from(self.current_raw.len() as u64)
+            .saturating_mul(u128::from(self.sealed_compressed_bytes))
+            .div_ceil(u128::from(self.sealed_raw_bytes)))
+        .min(u128::from(u64::MAX)) as u64
+    }
+
+    pub(crate) fn write(&mut self, record: &Record) -> Result<()> {
+        let entity = record.entity();
+        let timestamp = record.timestamp_micros();
+        let new_entity = self.current_last != Some(entity);
+        if let Some(previous) = self.submitted_frontier {
+            if entity <= previous {
+                return Err(ArchiveError::OutOfOrder {
+                    previous,
+                    previous_timestamp: i64::MIN,
+                    current: entity,
+                    current_timestamp: timestamp,
+                });
+            }
+        }
+        if let Some(previous) = self.current_last {
+            if entity < previous || (!new_entity && timestamp > self.current_last_timestamp) {
+                return Err(ArchiveError::OutOfOrder {
+                    previous,
+                    previous_timestamp: self.current_last_timestamp,
+                    current: entity,
+                    current_timestamp: timestamp,
+                });
+            }
+            if new_entity
+                && (entity.kind != previous.kind
+                    || self.estimated_current_compressed_bytes() >= self.frame_target)
+            {
+                self.submit_current()?;
+            }
+        }
+        if self.current_first.is_none() {
+            self.current_first = Some(entity);
+        }
+        write_record_wire(&mut self.current_raw, record)?;
+        self.current_records = self
+            .current_records
+            .checked_add(1)
+            .ok_or(ArchiveError::FieldTooLarge)?;
+        self.current_last = Some(entity);
+        self.current_last_timestamp = timestamp;
+        Ok(())
+    }
+
+    fn submit_current(&mut self) -> Result<()> {
+        let Some(first_entity) = self.current_first.take() else {
+            return Ok(());
+        };
+        while self
+            .outstanding
+            .saturating_add(self.pending_results.len())
+            >= self.senders.len()
+        {
+            self.collect_one()?;
+        }
+        let last_entity = self
+            .current_last
+            .take()
+            .ok_or(ArchiveError::Invalid("parallel frame has no last entity"))?;
+        let job = ParallelFrameJob {
+            sequence: self.next_submit,
+            first_entity,
+            last_entity,
+            records: self.current_records,
+            raw: std::mem::replace(
+                &mut self.current_raw,
+                Vec::with_capacity(self.frame_target.saturating_mul(4) as usize),
+            ),
+        };
+        self.submitted_frontier = Some(last_entity);
+        let worker = self.next_worker;
+        self.senders[worker]
+            .send(Some(job))
+            .map_err(|_| ArchiveError::Invalid("parallel compressor stopped"))?;
+        self.next_worker = (worker + 1) % self.senders.len();
+        self.next_submit = self
+            .next_submit
+            .checked_add(1)
+            .ok_or(ArchiveError::FieldTooLarge)?;
+        self.outstanding += 1;
+        self.current_last_timestamp = i64::MAX;
+        self.current_records = 0;
+        Ok(())
+    }
+
+    fn collect_one(&mut self) -> Result<()> {
+        let result = self
+            .results
+            .recv()
+            .map_err(|_| ArchiveError::Invalid("parallel compressor stopped"))??;
+        if self.outstanding == 0 {
+            return Err(ArchiveError::Invalid(
+                "parallel compressor returned an unexpected result",
+            ));
+        }
+        self.outstanding -= 1;
+        self.accept_result(result)
+    }
+
+    fn accept_result(&mut self, result: ParallelFrameResult) -> Result<()> {
+        if result.sequence < self.next_write
+            || result.sequence >= self.next_submit
+            || self.pending_results.insert(result.sequence, result).is_some()
+        {
+            return Err(ArchiveError::Invalid(
+                "parallel compressor returned an invalid sequence",
+            ));
+        }
+        while let Some(result) = self.pending_results.remove(&self.next_write) {
+            let output = self
+                .output
+                .as_mut()
+                .ok_or(ArchiveError::Invalid("parallel archive writer is finished"))?;
+            write_frame_header(output, result.info)?;
+            match result.payload {
+                ParallelFramePayload::Compressed(compressed) => {
+                    output.write_all(&compressed)?;
+                }
+                ParallelFramePayload::Copied {
+                    mut source,
+                    payload_offset,
+                } => {
+                    source.seek(SeekFrom::Start(payload_offset))?;
+                    let copied = io::copy(
+                        &mut source.take(result.info.compressed_bytes),
+                        output,
+                    )?;
+                    if copied != result.info.compressed_bytes {
+                        return Err(ArchiveError::Invalid(
+                            "copied frame payload is truncated",
+                        ));
+                    }
+                }
+            }
+            self.frames_written = self
+                .frames_written
+                .checked_add(1)
+                .ok_or(ArchiveError::FieldTooLarge)?;
+            self.sealed_raw_bytes = self
+                .sealed_raw_bytes
+                .checked_add(result.info.raw_bytes)
+                .ok_or(ArchiveError::FieldTooLarge)?;
+            self.sealed_compressed_bytes = self
+                .sealed_compressed_bytes
+                .checked_add(result.info.compressed_bytes)
+                .ok_or(ArchiveError::FieldTooLarge)?;
+            self.next_write = self
+                .next_write
+                .checked_add(1)
+                .ok_or(ArchiveError::FieldTooLarge)?;
+        }
+        Ok(())
+    }
+
+    /// Seal pending changed records, then enqueue one already-compressed frame
+    /// in the same ordered output sequence.
+    ///
+    /// The source frame must use the same refPrefix as this writer. At most
+    /// `workers` compressed jobs or completed frames are retained; the sole
+    /// output owner drains them in sequence order.
+    pub(crate) fn append_compressed_frame(
+        &mut self,
+        source: &std::fs::File,
+        entry: crate::frame_directory::FrameDirectoryEntry,
+    ) -> Result<CopiedFrameStats> {
+        self.submit_current()?;
+        let info = entry.frame_info();
+        validate_frame_dictionary(info, None)?;
+        if self
+            .submitted_frontier
+            .is_some_and(|previous| previous >= info.first_entity)
+        {
+            return Err(ArchiveError::Invalid(
+                "copied frame is not after the output frontier",
+            ));
+        }
+        while self
+            .outstanding
+            .saturating_add(self.pending_results.len())
+            >= self.senders.len()
+        {
+            self.collect_one()?;
+        }
+        let header_offset = entry
+            .compressed_offset
+            .checked_sub(FRAME_HEADER_LEN as u64)
+            .ok_or(ArchiveError::Invalid(
+                "copied frame payload has no preceding header",
+            ))?;
+        let mut source = source.try_clone()?;
+        source.seek(SeekFrom::Start(header_offset))?;
+        let mut header = [0_u8; FRAME_HEADER_LEN];
+        source.read_exact(&mut header)?;
+        if parse_frame_header(&header)? != Some(info) {
+            return Err(ArchiveError::Invalid(
+                "copied frame header disagrees with its directory",
+            ));
+        }
+        let result = ParallelFrameResult {
+            sequence: self.next_submit,
+            info,
+            payload: ParallelFramePayload::Copied {
+                source,
+                payload_offset: entry.compressed_offset,
+            },
+        };
+        self.next_submit = self
+            .next_submit
+            .checked_add(1)
+            .ok_or(ArchiveError::FieldTooLarge)?;
+        self.submitted_frontier = Some(info.last_entity);
+        self.accept_result(result)?;
+        Ok(CopiedFrameStats {
+            frames: 1,
+            records: info.records,
+            raw_bytes: info.raw_bytes,
+            compressed_bytes: info.compressed_bytes,
+        })
+    }
+
+    #[cfg(test)]
+    fn buffered_frames(&self) -> usize {
+        self.outstanding.saturating_add(self.pending_results.len())
+    }
+
+    #[cfg(test)]
+    fn buffered_frame_limit(&self) -> usize {
+        self.senders.len()
+    }
+
+    fn stop_workers(&mut self) {
+        for sender in &self.senders {
+            let _ = sender.send(None);
+        }
+        self.senders.clear();
+        for thread in self.threads.drain(..) {
+            let _ = thread.join();
+        }
+    }
+
+    pub(crate) fn finish(mut self) -> Result<(W, u64)> {
+        self.submit_current()?;
+        while self.outstanding != 0 {
+            self.collect_one()?;
+        }
+        if self.next_write != self.next_submit || !self.pending_results.is_empty() {
+            return Err(ArchiveError::Invalid(
+                "parallel compressor result sequence is incomplete",
+            ));
+        }
+        self.stop_workers();
+        let mut output = self
+            .output
+            .take()
+            .ok_or(ArchiveError::Invalid("parallel archive writer is finished"))?;
+        output.write_all(&DONE_MAGIC)?;
+        output.write_all(&[0; FRAME_HEADER_LEN - 4])?;
+        output.flush()?;
+        Ok((output, self.frames_written))
+    }
+}
+
+impl<W: Write> Drop for ParallelArchiveWriter<W> {
+    fn drop(&mut self) {
+        self.stop_workers();
+    }
+}
+
+fn parallel_frame_worker(
+    jobs: std::sync::mpsc::Receiver<Option<ParallelFrameJob>>,
+    results: std::sync::mpsc::Sender<Result<ParallelFrameResult>>,
+    prefix: Arc<[u8]>,
+    compression: CompressionSettings,
+) {
+    let reference = zstd::dict::EncoderDictionary::copy(&prefix, compression.level);
+    let mut context = zstd::zstd_safe::CCtx::create();
+    let configured =
+        configure_streaming_context(&mut context, compression, &reference, prefix.len());
+    while let Ok(Some(job)) = jobs.recv() {
+        let result = configured
+            .as_ref()
+            .map_err(|error| ArchiveError::Io(io::Error::other(error.to_string())))
+            .and_then(|_| compress_parallel_frame(&mut context, job));
+        if results.send(result).is_err() {
+            break;
+        }
+    }
+}
+
+fn compress_parallel_frame(
+    context: &mut zstd::zstd_safe::CCtx<'static>,
+    job: ParallelFrameJob,
+) -> Result<ParallelFrameResult> {
+    let raw_bytes =
+        u64::try_from(job.raw.len()).map_err(|_| ArchiveError::FieldTooLarge)?;
+    let mut compressed = Vec::new();
+    let mut scratch = vec![0_u8; zstd::zstd_safe::CCtx::out_size()];
+    pump_streaming_context(
+        context,
+        &job.raw,
+        zstd::zstd_safe::zstd_sys::ZSTD_EndDirective::ZSTD_e_end,
+        &mut compressed,
+        &mut scratch,
+    )?;
+    context
+        .reset(zstd::zstd_safe::ResetDirective::SessionOnly)
+        .map_err(zstd_error)?;
+    Ok(ParallelFrameResult {
+        sequence: job.sequence,
+        info: FrameInfo {
+            first_entity: job.first_entity,
+            last_entity: job.last_entity,
+            records: job.records,
+            raw_bytes,
+            compressed_bytes: u64::try_from(compressed.len())
+                .map_err(|_| ArchiveError::FieldTooLarge)?,
+            dictionary_id: None,
+        },
+        payload: ParallelFramePayload::Compressed(compressed),
+    })
 }
 
 struct StreamingRecordSink<'a, W: Write> {
@@ -1584,6 +2046,116 @@ pub(crate) fn index_open_file(
     index_reader(file.try_clone()?)
 }
 
+/// Visit data-frame headers without retaining their locations or reading
+/// compressed record payloads.
+///
+/// Cost: one file-header read, one 64-byte read per frame/reference, seeks
+/// across compressed payloads, one descriptor, and constant memory.
+pub(crate) fn visit_file_frame_headers(
+    path: impl AsRef<Path>,
+    mut visitor: impl FnMut(FrameInfo, u64) -> Result<()>,
+) -> Result<()> {
+    let mut file = BufReader::new(std::fs::File::open(path)?);
+    let _ = read_file_header(&mut file)?;
+    let mut pending_header = read_frame_header_or_eof(&mut file)?;
+    let mut active_dictionary_id = None;
+    if let Some(header) = pending_header {
+        if let Some(info) = parse_dictionary_header(&header)? {
+            active_dictionary_id = Some(info.id);
+            file.seek(SeekFrom::Current(
+                info.compressed_bytes
+                    .try_into()
+                    .map_err(|_| ArchiveError::FieldTooLarge)?,
+            ))?;
+            pending_header = None;
+        } else if let Some(info) = parse_ref_prefix_header(&header)? {
+            file.seek(SeekFrom::Current(
+                info.compressed_bytes
+                    .try_into()
+                    .map_err(|_| ArchiveError::FieldTooLarge)?,
+            ))?;
+            pending_header = None;
+        }
+    }
+    let mut previous = None;
+    loop {
+        let header = match pending_header.take() {
+            Some(header) => Some(header),
+            None => read_frame_header_or_eof(&mut file)?,
+        };
+        let Some(header) = header else {
+            return Err(ArchiveError::Invalid(
+                "archive has no clean completion marker",
+            ));
+        };
+        let Some(info) = parse_frame_header(&header)? else {
+            return Ok(());
+        };
+        validate_frame_dictionary(info, active_dictionary_id)?;
+        if previous.is_some_and(|entity| entity >= info.first_entity) {
+            return Err(ArchiveError::Invalid(
+                "entity group is split or frames are out of order",
+            ));
+        }
+        previous = Some(info.last_entity);
+        let compressed_offset = file.stream_position()?;
+        visitor(info, compressed_offset)?;
+        file.seek(SeekFrom::Current(
+            info.compressed_bytes
+                .try_into()
+                .map_err(|_| ArchiveError::FieldTooLarge)?,
+        ))?;
+    }
+}
+
+/// Visit a range-set data part containing only FRAME header/payload pairs.
+///
+/// A clean physical EOF is the completion boundary. Offsets passed to the
+/// visitor are local to the part. RefPrefix-compressed range parts carry no
+/// zstd dictionary ID, so any dictionary-bearing frame is rejected.
+pub(crate) fn visit_data_segment_frame_headers(
+    path: impl AsRef<Path>,
+    mut visitor: impl FnMut(FrameInfo, u64) -> Result<()>,
+) -> Result<()> {
+    let file = std::fs::File::open(path)?;
+    let file_bytes = file.metadata()?.len();
+    let mut file = BufReader::new(file);
+    let mut previous = None;
+    let mut frames = 0_u64;
+    loop {
+        let Some(header) = read_frame_header_or_eof(&mut file)? else {
+            if frames == 0 {
+                return Err(ArchiveError::Invalid(
+                    "archive data segment contains no frames",
+                ));
+            }
+            return Ok(());
+        };
+        let info = parse_frame_header(&header)?.ok_or(ArchiveError::Invalid(
+            "archive data segment contains a completion marker",
+        ))?;
+        validate_frame_dictionary(info, None)?;
+        if previous.is_some_and(|entity| entity >= info.first_entity) {
+            return Err(ArchiveError::Invalid(
+                "entity group is split or segment frames are out of order",
+            ));
+        }
+        previous = Some(info.last_entity);
+        let compressed_offset = file.stream_position()?;
+        let end = compressed_offset
+            .checked_add(info.compressed_bytes)
+            .ok_or(ArchiveError::FieldTooLarge)?;
+        if end > file_bytes {
+            return Err(ArchiveError::Invalid(
+                "archive data segment has a truncated frame payload",
+            ));
+        }
+        visitor(info, compressed_offset)?;
+        file.seek(SeekFrom::Start(end))?;
+        frames = frames.checked_add(1).ok_or(ArchiveError::FieldTooLarge)?;
+    }
+}
+
 pub(crate) fn index_reader(
     file: impl Read + Seek,
 ) -> Result<(u64, Vec<FrameLocation>, bool)> {
@@ -1645,13 +2217,24 @@ pub(crate) fn index_reader(
 
 #[derive(Clone, Debug)]
 pub(crate) struct IndexedArchiveSet {
-    segments: Vec<(
-        crate::title_index::SegmentIndexEntry,
-        std::sync::Arc<std::fs::File>,
-    )>,
+    segments: Vec<crate::title_index::SegmentIndexEntry>,
     direct_file: Option<std::sync::Arc<std::fs::File>>,
+    directory: Option<std::sync::Arc<ArchiveDirectoryFiles>>,
     reference: Option<CompressionReference>,
     active_dictionary_id: Option<u32>,
+}
+
+#[derive(Debug)]
+struct ArchiveDirectoryFiles {
+    root: std::fs::File,
+    cache: std::sync::Mutex<VecDeque<(usize, std::sync::Arc<std::fs::File>)>>,
+}
+
+const ARCHIVE_SEGMENT_FILE_CACHE: usize = 8;
+
+#[derive(Debug)]
+pub(crate) struct ArchiveCleanupLease {
+    _file: std::fs::File,
 }
 
 impl IndexedArchiveSet {
@@ -1667,6 +2250,7 @@ impl IndexedArchiveSet {
                 ));
             }
             let file = std::sync::Arc::new(std::fs::File::open(&root)?);
+            lock_archive_shared(&file)?;
             let (_, locations, complete) = index_open_file(&file)?;
             if !complete {
                 return Err(ArchiveError::Invalid(
@@ -1705,6 +2289,7 @@ impl IndexedArchiveSet {
             return Ok(Self {
                 segments: Vec::new(),
                 direct_file: Some(file),
+                directory: None,
                 reference,
                 active_dictionary_id,
             });
@@ -1714,6 +2299,12 @@ impl IndexedArchiveSet {
                 "Wikipedia archive is not a range-file set",
             ));
         }
+        let root_file = std::fs::File::open(&root)?;
+        lock_archive_shared(&root_file)?;
+        let directory = std::sync::Arc::new(ArchiveDirectoryFiles {
+            root: root_file,
+            cache: std::sync::Mutex::new(VecDeque::new()),
+        });
         let mut segments = Vec::with_capacity(titles.segment_count());
         let mut expected_start = 0_u64;
         for position in 0..titles.segment_count() {
@@ -1724,8 +2315,8 @@ impl IndexedArchiveSet {
                 ));
             }
             let name = crate::archive_set::indexed_segment_name(segment)?;
-            let path = root.join(name);
-            if std::fs::metadata(&path)?.len() != segment.bytes {
+            let file = open_archive_child(&directory.root, &name)?;
+            if file.metadata()?.len() != segment.bytes {
                 return Err(ArchiveError::Invalid(
                     "archive-set segment size does not match its index",
                 ));
@@ -1733,18 +2324,17 @@ impl IndexedArchiveSet {
             expected_start = expected_start
                 .checked_add(segment.bytes)
                 .ok_or(ArchiveError::FieldTooLarge)?;
-            let file = std::fs::File::open(&path)?;
-            segments.push((segment, std::sync::Arc::new(file)));
+            segments.push(segment);
         }
-        if segments.first().map(|(segment, _)| segment.role) != Some(0)
-            || segments.last().map(|(segment, _)| segment.role) != Some(4)
+        if segments.first().map(|segment| segment.role) != Some(0)
+            || segments.last().map(|segment| segment.role) != Some(4)
         {
             return Err(ArchiveError::Invalid(
                 "archive-set index lacks reference or completion segment",
             ));
         }
         let mut previous_data = None;
-        for (segment, _) in &segments {
+        for segment in &segments {
             if (1..=3).contains(&segment.role) {
                 if segment.first_id > segment.last_id
                     || previous_data.is_some_and(|(role, last_id)| {
@@ -1764,7 +2354,11 @@ impl IndexedArchiveSet {
             }
         }
 
-        let mut input = BufReader::new(segments[0].1.try_clone()?);
+        let reference_name = crate::archive_set::indexed_segment_name(segments[0])?;
+        let mut input = BufReader::new(open_archive_child(
+            &directory.root,
+            &reference_name,
+        )?);
         let _ = read_file_header(&mut input)?;
         let header = read_frame_header_or_eof(&mut input)?.ok_or(
             ArchiveError::Invalid("archive-set reference segment is empty"),
@@ -1797,7 +2391,10 @@ impl IndexedArchiveSet {
             ));
         }
 
-        let mut completion = segments.last().expect("checked").1.try_clone()?;
+        let completion_name = crate::archive_set::indexed_segment_name(
+            *segments.last().expect("checked"),
+        )?;
+        let mut completion = open_archive_child(&directory.root, &completion_name)?;
         let done = read_frame_header_or_eof(&mut completion)?
             .ok_or(ArchiveError::Invalid("archive-set completion segment is empty"))?;
         if parse_frame_header(&done)?.is_some()
@@ -1810,6 +2407,7 @@ impl IndexedArchiveSet {
         Ok(Self {
             segments,
             direct_file: None,
+            directory: Some(directory),
             reference,
             active_dictionary_id,
         })
@@ -1830,12 +2428,12 @@ impl IndexedArchiveSet {
         }
         let position = self
             .segments
-            .partition_point(|(segment, _)| segment.virtual_start <= entry.compressed_offset)
+            .partition_point(|segment| segment.virtual_start <= entry.compressed_offset)
             .checked_sub(1)
             .ok_or(ArchiveError::Invalid(
                 "frame offset precedes archive-set segments",
             ))?;
-        let (segment, _) = &self.segments[position];
+        let segment = &self.segments[position];
         if !(1..=3).contains(&segment.role) {
             return Err(ArchiveError::Invalid(
                 "frame points into a non-data archive-set segment",
@@ -1885,15 +2483,111 @@ impl IndexedArchiveSet {
                 .try_clone()
                 .map_err(ArchiveError::Io);
         };
-        self.segments
+        let segment = *self
+            .segments
             .get(position)
             .ok_or(ArchiveError::Invalid(
                 "archive-set frame segment is out of bounds",
-            ))?
-            .1
-            .try_clone()
-            .map_err(ArchiveError::Io)
+            ))?;
+        let directory = self
+            .directory
+            .as_ref()
+            .ok_or(ArchiveError::Invalid(
+                "archive-set frame has no directory lease",
+            ))?;
+        let mut cache = directory
+            .cache
+            .lock()
+            .map_err(|_| ArchiveError::Invalid("archive file cache is poisoned"))?;
+        if let Some(found) = cache
+            .iter()
+            .position(|(cached_position, _)| *cached_position == position)
+        {
+            let (_, file) = cache
+                .remove(found)
+                .expect("file cache position was found");
+            let opened = file.try_clone()?;
+            cache.push_back((position, file));
+            return Ok(opened);
+        }
+        let name = crate::archive_set::indexed_segment_name(segment)?;
+        let file = std::sync::Arc::new(open_archive_child(&directory.root, &name)?);
+        let opened = file.try_clone()?;
+        cache.push_back((position, file));
+        while cache.len() > ARCHIVE_SEGMENT_FILE_CACHE {
+            cache.pop_front();
+        }
+        Ok(opened)
     }
+}
+
+#[cfg(unix)]
+fn open_archive_child(root: &std::fs::File, name: &str) -> Result<std::fs::File> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    let name = CString::new(name)
+        .map_err(|_| ArchiveError::Invalid("archive segment name contains NUL"))?;
+    let descriptor = unsafe {
+        libc::openat(
+            root.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC,
+        )
+    };
+    if descriptor < 0 {
+        return Err(ArchiveError::Io(io::Error::last_os_error()));
+    }
+    Ok(unsafe { std::fs::File::from_raw_fd(descriptor) })
+}
+
+#[cfg(not(unix))]
+fn open_archive_child(_root: &std::fs::File, _name: &str) -> Result<std::fs::File> {
+    Err(ArchiveError::Invalid(
+        "archive-set directory leases require openat",
+    ))
+}
+
+#[cfg(unix)]
+fn lock_archive_shared(file: &std::fs::File) -> Result<()> {
+    use std::os::fd::AsRawFd;
+
+    loop {
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH) } == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(ArchiveError::Io(error));
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn lock_archive_shared(_file: &std::fs::File) -> Result<()> {
+    Ok(())
+}
+
+/// Acquire the exclusive lease required before deleting a displaced archive
+/// generation. `None` means an existing reader still owns that generation;
+/// cleanup must be deferred rather than invalidating its lazy segment opens.
+pub(crate) fn try_acquire_archive_cleanup_lease(
+    path: impl AsRef<Path>,
+) -> Result<Option<ArchiveCleanupLease>> {
+    let file = std::fs::File::open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::WouldBlock {
+                return Ok(None);
+            }
+            return Err(ArchiveError::Io(error));
+        }
+    }
+    Ok(Some(ArchiveCleanupLease { _file: file }))
 }
 
 pub fn visit_frame(
@@ -1950,39 +2644,126 @@ pub(crate) fn visit_frame_while_file(
 
 pub struct ArchiveRecordReader {
     source: ArchiveRecordSource,
-    frames: std::vec::IntoIter<FrameLocation>,
+    frames: ArchiveFrameSequence,
     current: Option<ArchiveFrameReader<OwnedFrameDecoder>>,
+    current_frame_offset: Option<u64>,
+    completed_compressed_bytes: Option<Arc<AtomicU64>>,
 }
 
-#[derive(Clone)]
+enum ArchiveFrameSequence {
+    Owned(std::vec::IntoIter<FrameLocation>),
+    Directory {
+        directory: Arc<crate::frame_directory::FrameDirectory>,
+        position: usize,
+        reference: Option<CompressionReference>,
+    },
+}
+
+impl ArchiveFrameSequence {
+    fn next_location(&mut self) -> Result<Option<FrameLocation>> {
+        match self {
+            Self::Owned(frames) => Ok(frames.next()),
+            Self::Directory {
+                directory,
+                position,
+                reference,
+            } => {
+                if *position >= directory.len() {
+                    return Ok(None);
+                }
+                let entry = directory.get(*position)?;
+                *position += 1;
+                Ok(Some(FrameLocation {
+                    info: entry.frame_info(),
+                    compressed_offset: entry.compressed_offset,
+                    reference: reference.clone(),
+                    physical_segment: None,
+                }))
+            }
+        }
+    }
+
+    fn remaining_count(&self) -> usize {
+        match self {
+            Self::Owned(frames) => frames.len(),
+            Self::Directory {
+                directory,
+                position,
+                ..
+            } => directory.len() - *position,
+        }
+    }
+
+}
+
 enum ArchiveRecordSource {
-    File(PathBuf),
-    Set(Vec<(u64, PathBuf)>),
+    File {
+        path: PathBuf,
+        input: Option<OwnedInput>,
+    },
+    Set {
+        segments: Vec<(u64, PathBuf)>,
+        active_segment: Option<usize>,
+        input: Option<OwnedInput>,
+    },
+}
+
+impl ArchiveRecordSource {
+    fn file(path: PathBuf) -> Self {
+        Self::File { path, input: None }
+    }
+
+    fn set(segments: Vec<(u64, PathBuf)>) -> Self {
+        Self::Set {
+            segments,
+            active_segment: None,
+            input: None,
+        }
+    }
+}
+
+impl Clone for ArchiveRecordSource {
+    fn clone(&self) -> Self {
+        match self {
+            Self::File { path, .. } => Self::file(path.clone()),
+            Self::Set { segments, .. } => Self::set(segments.clone()),
+        }
+    }
 }
 
 pub(crate) trait RecordSource {
     fn next_record(&mut self) -> Result<Option<Record>>;
 }
 
-pub(crate) struct SequentialRecordGroups<'a> {
-    groups: std::vec::IntoIter<Vec<Box<dyn RecordSource + 'a>>>,
-    current: Option<SortedArchiveMerge<'a>>,
+pub(crate) struct SequentialRecordGroups {
+    groups: std::vec::IntoIter<Vec<PathBuf>>,
+    current: Option<SortedArchiveMerge<'static>>,
     last_entity: Option<EntityKey>,
     at_group_start: bool,
+    completed_compressed_bytes: Arc<AtomicU64>,
 }
 
-impl<'a> SequentialRecordGroups<'a> {
-    pub(crate) fn new(groups: Vec<Vec<Box<dyn RecordSource + 'a>>>) -> Self {
+impl SequentialRecordGroups {
+    /// Open only the currently consumed page-range group.
+    ///
+    /// Groups must be ordered and non-overlapping. Parts inside one group may
+    /// overlap and are merged with bounded fan-in. Descriptor cost is
+    /// O(parts in the current group), never O(all content targets).
+    pub(crate) fn open_paths(
+        groups: Vec<Vec<PathBuf>>,
+        completed_compressed_bytes: Arc<AtomicU64>,
+    ) -> Self {
         Self {
             groups: groups.into_iter(),
             current: None,
             last_entity: None,
             at_group_start: false,
+            completed_compressed_bytes,
         }
     }
 }
 
-impl RecordSource for SequentialRecordGroups<'_> {
+impl RecordSource for SequentialRecordGroups {
     fn next_record(&mut self) -> Result<Option<Record>> {
         loop {
             if let Some(current) = self.current.as_mut() {
@@ -2007,7 +2788,10 @@ impl RecordSource for SequentialRecordGroups<'_> {
             if group.is_empty() {
                 continue;
             }
-            self.current = Some(SortedArchiveMerge::new(group)?);
+            self.current = Some(SortedArchiveMerge::open_accounted(
+                &group,
+                &self.completed_compressed_bytes,
+            )?);
             self.at_group_start = true;
         }
     }
@@ -2021,8 +2805,8 @@ pub(crate) enum BootstrapMergePhase {
     Merging,
 }
 
-trait ReadSeek: Read + Seek {}
-impl<T: Read + Seek> ReadSeek for T {}
+trait ReadSeek: Read + Seek + Send {}
+impl<T: Read + Seek + Send> ReadSeek for T {}
 
 type OwnedInput = Box<dyn ReadSeek>;
 
@@ -2038,6 +2822,12 @@ pub(crate) struct FrameRecordCursor {
 impl FrameRecordCursor {
     pub(crate) fn next_record(&mut self) -> Result<Option<Record>> {
         self.inner.next_record()
+    }
+}
+
+impl RecordSource for FrameRecordCursor {
+    fn next_record(&mut self) -> Result<Option<Record>> {
+        FrameRecordCursor::next_record(self)
     }
 }
 
@@ -2402,7 +3192,7 @@ fn archive_ref_prefix_samples(
     Ok(selected.into_values().collect())
 }
 
-fn distill_ref_prefix(
+pub(crate) fn distill_ref_prefix(
     samples: &[Vec<u8>],
     capacity: usize,
     compression_level: i32,
@@ -2567,6 +3357,72 @@ impl NewestRevisionSamples {
     }
 }
 
+fn open_receipted_archive_source(
+    path: &Path,
+) -> Result<(
+    ArchiveRecordSource,
+    u64,
+    Option<CompressionReference>,
+    Option<u32>,
+)> {
+    let reference_path = if path.is_dir() {
+        path.join("0000-reference.swdump-part")
+    } else {
+        path.to_path_buf()
+    };
+    let mut input = BufReader::new(std::fs::File::open(&reference_path)?);
+    let _ = read_file_header(&mut input)?;
+    let header = read_frame_header_or_eof(&mut input)?;
+    let (reference, dictionary_id) = match header {
+        Some(header) => {
+            if let Some(info) = parse_dictionary_header(&header)? {
+                (
+                    Some(CompressionReference::Dictionary(
+                        std::sync::Arc::<[u8]>::from(read_dictionary_payload(
+                            &mut input,
+                            info,
+                        )?),
+                    )),
+                    Some(info.id),
+                )
+            } else if let Some(info) = parse_ref_prefix_header(&header)? {
+                (
+                    Some(CompressionReference::RefPrefix(
+                        std::sync::Arc::<[u8]>::from(read_ref_prefix_payload(
+                            &mut input,
+                            info,
+                        )?),
+                    )),
+                    None,
+                )
+            } else {
+                let _ = parse_frame_header(&header)?.ok_or(ArchiveError::Invalid(
+                    "archive begins with an unknown compression-reference header",
+                ))?;
+                (None, None)
+            }
+        }
+        None => (None, None),
+    };
+    let (source, source_bytes) = if path.is_dir() {
+        let set = crate::archive_set::ArchiveSetReader::open(path)?;
+        let source_bytes = set
+            .segments()
+            .last()
+            .map_or(0, |segment| segment.virtual_start.saturating_add(segment.bytes));
+        let segments = set
+            .segments()
+            .iter()
+            .map(|segment| (segment.virtual_start, path.join(&segment.name)))
+            .collect();
+        (ArchiveRecordSource::set(segments), source_bytes)
+    } else {
+        let bytes = std::fs::metadata(path)?.len();
+        (ArchiveRecordSource::file(path.to_path_buf()), bytes)
+    };
+    Ok((source, source_bytes, reference, dictionary_id))
+}
+
 impl ArchiveRecordReader {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
@@ -2578,11 +3434,11 @@ impl ArchiveRecordReader {
                 .iter()
                 .map(|segment| (segment.virtual_start, path.join(&segment.name)))
                 .collect();
-            (frames, complete, ArchiveRecordSource::Set(paths))
+            (frames, complete, ArchiveRecordSource::set(paths))
         } else {
             let file = std::fs::File::open(&path)?;
             let (_, frames, complete) = index_open_file(&file)?;
-            (frames, complete, ArchiveRecordSource::File(path))
+            (frames, complete, ArchiveRecordSource::file(path))
         };
         if !complete {
             return Err(ArchiveError::Invalid(
@@ -2591,27 +3447,107 @@ impl ArchiveRecordReader {
         }
         Ok(Self {
             source,
-            frames: frames.into_iter(),
+            frames: ArchiveFrameSequence::Owned(frames.into_iter()),
             current: None,
+            current_frame_offset: None,
+            completed_compressed_bytes: None,
         })
     }
 
-    pub(crate) fn remaining_frame_locations(&self) -> &[FrameLocation] {
-        self.frames.as_slice()
+    pub(crate) fn open_accounted(
+        path: impl AsRef<Path>,
+        completed_compressed_bytes: Arc<AtomicU64>,
+    ) -> Result<Self> {
+        let mut reader = Self::open(path)?;
+        reader.completed_compressed_bytes = Some(completed_compressed_bytes);
+        Ok(reader)
+    }
+
+    /// Open a mmap-backed, structurally validated frame suffix.
+    ///
+    /// The directory is retained by `Arc`; no frame metadata is copied into a
+    /// `Vec`. Cost is one archive-reference read and one scalar comparison
+    /// against the directory's already validated uniform dictionary ID.
+    pub(crate) fn open_frame_directory(
+        path: impl AsRef<Path>,
+        directory: Arc<crate::frame_directory::FrameDirectory>,
+        start_position: usize,
+    ) -> Result<Self> {
+        if start_position > directory.len() {
+            return Err(ArchiveError::Invalid(
+                "frame directory cursor is out of bounds",
+            ));
+        }
+        let path = path.as_ref().to_path_buf();
+        let (source, source_bytes, reference, dictionary_id) =
+            open_receipted_archive_source(&path)?;
+        directory.require_archive_bounds(source_bytes)?;
+        if directory.summary().dictionary_id != dictionary_id {
+            return Err(ArchiveError::Invalid(
+                "frame directory dictionary ID disagrees with its archive",
+            ));
+        }
+        Ok(Self {
+            source,
+            frames: ArchiveFrameSequence::Directory {
+                directory,
+                position: start_position,
+                reference,
+            },
+            current: None,
+            current_frame_offset: None,
+            completed_compressed_bytes: None,
+        })
+    }
+
+    pub(crate) fn open_frame_directory_accounted(
+        path: impl AsRef<Path>,
+        directory: Arc<crate::frame_directory::FrameDirectory>,
+        start_position: usize,
+        completed_compressed_bytes: Arc<AtomicU64>,
+    ) -> Result<Self> {
+        let mut reader = Self::open_frame_directory(path, directory, start_position)?;
+        reader.completed_compressed_bytes = Some(completed_compressed_bytes);
+        Ok(reader)
+    }
+
+    pub(crate) fn remaining_frame_count(&self) -> usize {
+        self.frames.remaining_count()
+    }
+
+    pub(crate) fn current_frame_offset(&self) -> Option<u64> {
+        self.current_frame_offset
+    }
+
+    pub(crate) fn current_frame_records_read(&self) -> u64 {
+        self.current
+            .as_ref()
+            .map_or(0, |frame| frame.records_read)
     }
 
     pub fn next_record(&mut self) -> Result<Option<Record>> {
         loop {
-            if let Some(frame) = self.current.as_mut() {
-                if let Some(record) = frame.next_record()? {
+            if self.current.is_some() {
+                if let Some(record) = self
+                    .current
+                    .as_mut()
+                    .expect("checked current frame")
+                    .next_record()?
+                {
                     return Ok(Some(record));
                 }
-                self.current = None;
+                let frame = self.current.take().expect("checked current frame");
+                if let Some(completed) = &self.completed_compressed_bytes {
+                    completed.fetch_add(frame.info.compressed_bytes, Ordering::Relaxed);
+                }
+                return_owned_frame_input(&mut self.source, frame);
+                self.current_frame_offset = None;
             }
-            let Some(location) = self.frames.next() else {
+            let Some(location) = self.frames.next_location()? else {
                 return Ok(None);
             };
-            self.current = Some(open_owned_frame(&self.source, &location)?);
+            self.current_frame_offset = Some(location.compressed_offset);
+            self.current = Some(open_owned_frame(&mut self.source, &location)?);
         }
     }
 }
@@ -2623,12 +3559,22 @@ impl RecordSource for ArchiveRecordReader {
 }
 
 fn open_owned_frame(
-    source: &ArchiveRecordSource,
+    source: &mut ArchiveRecordSource,
     location: &FrameLocation,
 ) -> Result<ArchiveFrameReader<OwnedFrameDecoder>> {
-    let (path, offset) = match source {
-        ArchiveRecordSource::File(path) => (path, location.compressed_offset),
-        ArchiveRecordSource::Set(segments) => {
+    let (input, offset) = match source {
+        ArchiveRecordSource::File { path, input } => (
+            input
+                .take()
+                .map(Ok)
+                .unwrap_or_else(|| std::fs::File::open(path).map(|file| Box::new(file) as OwnedInput))?,
+            location.compressed_offset,
+        ),
+        ArchiveRecordSource::Set {
+            segments,
+            active_segment,
+            input,
+        } => {
             let position = segments
                 .partition_point(|(virtual_start, _)| {
                     *virtual_start <= location.compressed_offset
@@ -2637,13 +3583,35 @@ fn open_owned_frame(
                 .ok_or(ArchiveError::Invalid(
                     "frame offset precedes archive-set segments",
                 ))?;
-            (
-                &segments[position].1,
-                location.compressed_offset - segments[position].0,
-            )
+            if *active_segment != Some(position) {
+                *input = None;
+                *active_segment = Some(position);
+            }
+            let input = input
+                .take()
+                .map(Ok)
+                .unwrap_or_else(|| {
+                    std::fs::File::open(&segments[position].1)
+                        .map(|file| Box::new(file) as OwnedInput)
+                })?;
+            (input, location.compressed_offset - segments[position].0)
         }
     };
-    open_owned_frame_input_at(Box::new(std::fs::File::open(path)?), location, offset)
+    open_owned_frame_input_at(input, location, offset)
+}
+
+fn return_owned_frame_input(
+    source: &mut ArchiveRecordSource,
+    frame: ArchiveFrameReader<OwnedFrameDecoder>,
+) {
+    let buffered = frame.decoder.finish();
+    let chain = buffered.into_inner();
+    let (_, compressed) = chain.into_inner();
+    let input = compressed.into_inner();
+    match source {
+        ArchiveRecordSource::File { input: slot, .. }
+        | ArchiveRecordSource::Set { input: slot, .. } => *slot = Some(input),
+    }
 }
 
 fn open_owned_frame_file(
@@ -2804,8 +3772,87 @@ pub fn merge_many_archives_with_compression<W: Write>(
     frame_target: usize,
     compression: CompressionSettings,
 ) -> Result<(W, u64, u64)> {
+    // Keep enough descriptor headroom for the output, executable, telemetry,
+    // and test harness even when the process soft limit is only 48.
+    const PATH_MERGE_FAN_IN: usize = 24;
+    if inputs.len() > PATH_MERGE_FAN_IN {
+        let scratch_parent = inputs
+            .first()
+            .and_then(|path| path.parent())
+            .unwrap_or_else(|| Path::new("."));
+        let scratch = tempfile::tempdir_in(scratch_parent)?;
+        let mut stage_inputs = inputs.to_vec();
+        let mut stage = 0_usize;
+        while stage_inputs.len() > PATH_MERGE_FAN_IN {
+            let mut next = Vec::with_capacity(
+                stage_inputs.len().div_ceil(PATH_MERGE_FAN_IN),
+            );
+            for (group, paths) in stage_inputs
+                .chunks(PATH_MERGE_FAN_IN)
+                .enumerate()
+            {
+                let path = scratch
+                    .path()
+                    .join(format!("merge-{stage:04}-{group:08}.swdump"));
+                let writer = ArchiveWriter::with_compression(
+                    std::fs::File::create(&path)?,
+                    frame_target,
+                    compression,
+                )?;
+                merge_sorted_archives(paths, writer)?;
+                next.push(path);
+            }
+            stage_inputs = next;
+            stage = stage
+                .checked_add(1)
+                .ok_or(ArchiveError::FieldTooLarge)?;
+        }
+        let writer = ArchiveWriter::with_compression(output, frame_target, compression)?;
+        return merge_sorted_archives(&stage_inputs, writer);
+    }
     let writer = ArchiveWriter::with_compression(output, frame_target, compression)?;
     merge_sorted_archives(inputs, writer)
+}
+
+/// Merge already-open sorted sources with ordinary archive compression.
+///
+/// This is the bounded-fan-in counterpart of `merge_many_archives...` for
+/// sources such as `SequentialRecordGroups` that open only their current
+/// nonoverlapping page range. It neither discovers nor records source paths.
+pub(crate) fn merge_record_sources_with_compression<'a, W: Write>(
+    inputs: Vec<Box<dyn RecordSource + 'a>>,
+    output: W,
+    frame_target: usize,
+    compression: CompressionSettings,
+) -> Result<(W, u64, u64)> {
+    let mut merge = SortedArchiveMerge::new(inputs)?;
+    let mut writer = ArchiveWriter::with_compression(output, frame_target, compression)?;
+    let mut records = 0_u64;
+    while let Some(record) = merge.next_record()? {
+        writer.write(&record)?;
+        records = records
+            .checked_add(1)
+            .ok_or(ArchiveError::FieldTooLarge)?;
+    }
+    let (output, frames) = writer.finish()?;
+    Ok((output, frames, records))
+}
+
+/// Visit the deterministic coalesced merge of already-open sorted sources
+/// without materializing another archive.
+pub(crate) fn visit_merged_record_sources<'a, F: FnMut(&Record)>(
+    inputs: Vec<Box<dyn RecordSource + 'a>>,
+    mut visit: F,
+) -> Result<u64> {
+    let mut merge = SortedArchiveMerge::new(inputs)?;
+    let mut records = 0_u64;
+    while let Some(record) = merge.next_record()? {
+        visit(&record);
+        records = records
+            .checked_add(1)
+            .ok_or(ArchiveError::FieldTooLarge)?;
+    }
+    Ok(records)
 }
 
 /// Merge sorted archives while bootstrapping a reference prefix from the
@@ -2998,7 +4045,7 @@ pub(crate) fn merge_record_sources_bootstrapping_ref_prefix_observing_after<
     };
     drop(samples);
 
-    let mut writer = StreamingArchiveWriter::new(
+    let mut writer = ParallelArchiveWriter::new(
         output,
         frame_target,
         compression,
@@ -3121,25 +4168,37 @@ pub fn merge_many_archives_reusing_ref_prefix_at_boundaries<W: Write>(
     merge_sorted_archives(inputs, writer)
 }
 
-pub(crate) fn archive_ref_prefix(
+pub fn archive_compression_reference_identity(
     archive: impl AsRef<Path>,
-) -> Result<std::sync::Arc<[u8]>> {
-    let (_, frames, complete) = index_file(archive)?;
-    if !complete {
-        return Err(ArchiveError::Invalid(
-            "reference archive has no clean completion marker",
-        ));
+) -> Result<crate::generation::CompressionReferenceIdentity> {
+    let archive = archive.as_ref();
+    let path = if archive.is_dir() {
+        archive.join("0000-reference.swdump-part")
+    } else {
+        archive.to_path_buf()
+    };
+    let mut input = BufReader::new(std::fs::File::open(path)?);
+    let _ = read_file_header(&mut input)?;
+    let header = read_frame_header_or_eof(&mut input)?.ok_or(
+        ArchiveError::Invalid("archive has no compression-reference frame"),
+    )?;
+    if let Some(info) = parse_dictionary_header(&header)? {
+        return Ok(crate::generation::CompressionReferenceIdentity::Dictionary {
+            dictionary_id: info.id,
+            raw_bytes: info.raw_bytes,
+            compressed_bytes: info.compressed_bytes,
+        });
     }
-    frames
-        .first()
-        .and_then(|frame| frame.reference.as_ref())
-        .and_then(|reference| match reference {
-            CompressionReference::RefPrefix(prefix) => Some(prefix.clone()),
-            CompressionReference::Dictionary(_) => None,
-        })
-        .ok_or(ArchiveError::Invalid(
-            "reference archive has no reference prefix",
-        ))
+    if let Some(info) = parse_ref_prefix_header(&header)? {
+        return Ok(crate::generation::CompressionReferenceIdentity::RefPrefix {
+            xxh3_64: info.hash,
+            raw_bytes: info.raw_bytes,
+            compressed_bytes: info.compressed_bytes,
+        });
+    }
+    Err(ArchiveError::Invalid(
+        "archive has no compression-reference frame",
+    ))
 }
 
 pub(crate) fn archive_ref_prefix_part(
@@ -3172,7 +4231,7 @@ pub(crate) fn merge_record_sources_reusing_ref_prefix_observing_after<
     mut observe: F,
 ) -> Result<(W, u64, u64, RepackStats)> {
     let mut merge = SortedArchiveMerge::new(inputs)?;
-    let mut writer = StreamingArchiveWriter::new(
+    let mut writer = ParallelArchiveWriter::new(
         output,
         frame_target,
         compression,
@@ -3204,46 +4263,67 @@ pub(crate) fn merge_record_sources_reusing_ref_prefix_observing_after<
     ))
 }
 
-pub(crate) fn merge_archive_with_sorted_source_and_ref_prefix<
-    'a,
-    W: Write,
-    F: FnMut(u64),
->(
-    prefix: &[u8],
-    base_archive: impl AsRef<Path>,
-    records: Box<dyn RecordSource + 'a>,
-    output: W,
-    frame_target: usize,
-    compression: CompressionSettings,
-    mut progress: F,
-) -> Result<(W, u64, u64)> {
-    let writer = StreamingArchiveWriter::new(
-        output,
-        frame_target,
-        compression,
-        prefix,
-        usize::try_from(streaming_compression_workers())
-            .unwrap_or(usize::MAX),
-    )?;
-    let sources: Vec<Box<dyn RecordSource + 'a>> = vec![
-        Box::new(ArchiveRecordReader::open(base_archive)?),
-        records,
-    ];
-    let mut merge = SortedArchiveMerge::new(sources)?;
-    let mut writer = writer;
-    let mut count = 0_u64;
-    while let Some(record) = merge.next_record()? {
-        writer.write(&record)?;
-        count = count
-            .checked_add(1)
-            .ok_or(ArchiveError::FieldTooLarge)?;
-        progress(count);
-    }
-    let (output, frames) = writer.finish()?;
-    Ok((output, frames, count))
+struct BoundedPendingSource<'a> {
+    source: &'a mut dyn RecordSource,
+    pending: &'a mut Option<Record>,
+    last_entity: EntityKey,
 }
 
-fn streaming_compression_workers() -> u32 {
+impl RecordSource for BoundedPendingSource<'_> {
+    fn next_record(&mut self) -> Result<Option<Record>> {
+        let record = match self.pending.take() {
+            Some(record) => record,
+            None => match self.source.next_record()? {
+                Some(record) => record,
+                None => return Ok(None),
+            },
+        };
+        if record.entity() > self.last_entity {
+            *self.pending = Some(record);
+            Ok(None)
+        } else {
+            Ok(Some(record))
+        }
+    }
+}
+
+/// Decode and merge exactly one base frame with sorted update records through
+/// that frame's final entity. Records after the frame remain in `pending`.
+pub(crate) fn merge_frame_with_sorted_source<W: Write>(
+    writer: &mut ParallelArchiveWriter<W>,
+    base: &std::fs::File,
+    entry: crate::frame_directory::FrameDirectoryEntry,
+    prefix: Arc<[u8]>,
+    source: &mut dyn RecordSource,
+    pending: &mut Option<Record>,
+) -> Result<u64> {
+    let location = FrameLocation {
+        info: entry.frame_info(),
+        compressed_offset: entry.compressed_offset,
+        reference: Some(CompressionReference::RefPrefix(prefix)),
+        physical_segment: None,
+    };
+    let frame = open_frame_cursor_file(base, &location)?;
+    let updates = BoundedPendingSource {
+        source,
+        pending,
+        last_entity: entry.last_entity,
+    };
+    let mut merge = SortedArchiveMerge::new(vec![
+        Box::new(frame) as Box<dyn RecordSource>,
+        Box::new(updates) as Box<dyn RecordSource>,
+    ])?;
+    let mut records = 0_u64;
+    while let Some(record) = merge.next_record()? {
+        writer.write(&record)?;
+        records = records
+            .checked_add(1)
+            .ok_or(ArchiveError::FieldTooLarge)?;
+    }
+    Ok(records)
+}
+
+pub(crate) fn streaming_compression_workers() -> u32 {
     std::env::var("SARUN_WIKIMAK_CPU_BUDGET")
         .ok()
         .and_then(|value| value.parse::<u32>().ok())
@@ -3286,11 +4366,32 @@ impl SortedArchiveMerge<'static> {
             .collect::<Result<Vec<_>>>()?;
         Self::new(readers)
     }
+
+    fn open_accounted(
+        inputs: &[PathBuf],
+        completed_compressed_bytes: &Arc<AtomicU64>,
+    ) -> Result<Self> {
+        let readers = inputs
+            .iter()
+            .map(|path| {
+                ArchiveRecordReader::open_accounted(
+                    path,
+                    Arc::clone(completed_compressed_bytes),
+                )
+                .map(|reader| Box::new(reader) as Box<dyn RecordSource>)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Self::new(readers)
+    }
 }
 
 impl<'a> SortedArchiveMerge<'a> {
     fn new(mut readers: Vec<Box<dyn RecordSource + 'a>>) -> Result<Self> {
-        ensure_stream_descriptor_capacity(readers.len())?;
+        if readers.len() > MAX_SORTED_MERGE_FAN_IN {
+            return Err(ArchiveError::Invalid(
+                "sorted archive merge exceeds its fixed input fan-in",
+            ));
+        }
         let mut heads = BinaryHeap::new();
         for (source, reader) in readers.iter_mut().enumerate() {
             if let Some(record) = reader.next_record()? {
@@ -3332,38 +4433,7 @@ impl<'a> SortedArchiveMerge<'a> {
     }
 }
 
-#[cfg(unix)]
-fn ensure_stream_descriptor_capacity(readers: usize) -> Result<()> {
-    let required = readers
-        .checked_add(64)
-        .ok_or(ArchiveError::FieldTooLarge)?;
-    let required = libc::rlim_t::try_from(required).map_err(|_| ArchiveError::FieldTooLarge)?;
-    let mut limit = libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
-    };
-    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
-        return Err(ArchiveError::Io(io::Error::last_os_error()));
-    }
-    if limit.rlim_cur >= required {
-        return Ok(());
-    }
-    if limit.rlim_max < required {
-        return Err(ArchiveError::Invalid(
-            "not enough file descriptors for streaming archive merge",
-        ));
-    }
-    limit.rlim_cur = required;
-    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) } != 0 {
-        return Err(ArchiveError::Io(io::Error::last_os_error()));
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn ensure_stream_descriptor_capacity(_readers: usize) -> Result<()> {
-    Ok(())
-}
+pub(crate) const MAX_SORTED_MERGE_FAN_IN: usize = 64;
 
 fn records_coalesce(left: &Record, right: &Record) -> bool {
     match (left, right) {
@@ -4377,8 +5447,19 @@ pub(crate) fn visit_title_records_parallel(
         source,
         frames,
         current: _,
+        current_frame_offset: _,
+        completed_compressed_bytes: _,
     } = ArchiveRecordReader::open(path)?;
-    let frames = frames.collect::<std::collections::VecDeque<_>>();
+    let frames = match frames {
+        ArchiveFrameSequence::Owned(frames) => {
+            frames.collect::<std::collections::VecDeque<_>>()
+        }
+        ArchiveFrameSequence::Directory { .. } => {
+            return Err(ArchiveError::Invalid(
+                "parallel title scan requires an owned frame inventory",
+            ))
+        }
+    };
     let frame_count = frames.len();
     if frame_count == 0 {
         return Ok(());
@@ -4389,7 +5470,7 @@ pub(crate) fn visit_title_records_parallel(
         std::sync::mpsc::sync_channel::<Result<Vec<Record>>>(workers * 2);
     std::thread::scope(|scope| -> Result<()> {
         for _ in 0..workers {
-            let source = source.clone();
+            let mut source = source.clone();
             let queue = std::sync::Arc::clone(&queue);
             let sender = sender.clone();
             scope.spawn(move || loop {
@@ -4398,11 +5479,12 @@ pub(crate) fn visit_title_records_parallel(
                     return;
                 };
                 let result = (|| {
-                    let mut frame = open_owned_frame(&source, &location)?;
+                    let mut frame = open_owned_frame(&mut source, &location)?;
                     let mut records = Vec::new();
                     while let Some(record) = frame.next_title_record()? {
                         records.push(record);
                     }
+                    return_owned_frame_input(&mut source, frame);
                     Ok(records)
                 })();
                 if sender.send(result).is_err() {
@@ -6257,7 +7339,12 @@ mod tests {
             })
             .unwrap();
         writer.finish().unwrap();
-        crate::title_index::build(&archive, &titles).unwrap();
+        crate::title_index::build(
+            &archive,
+            &titles,
+            &crate::generation::GenerationId::from_plan_bytes(b"archive-indexed-set-test"),
+        )
+        .unwrap();
 
         let titles = crate::title_index::TitleIndex::open(&titles).unwrap();
         assert_eq!(titles.segment_count(), 0);
@@ -6265,6 +7352,85 @@ mod tests {
         let location = indexed.location(titles.frame(0).unwrap()).unwrap();
         assert!(location.physical_segment.is_none());
         assert!(indexed.open_file(&location).unwrap().metadata().unwrap().len() > 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn indexed_range_reader_opens_an_unread_segment_after_publication_rename() {
+        let temporary = tempfile::tempdir().unwrap();
+        let archive = temporary.path().join("wiki.swdump");
+        let displaced = temporary.path().join("wiki.displaced.swdump");
+        let titles_path = temporary.path().join("wiki.swtitle");
+        let output = crate::archive_set::ArchiveSetOutput::new_in(temporary.path(), 256).unwrap();
+        let mut writer = ArchiveWriter::with_ref_prefix(
+            output,
+            1,
+            CompressionSettings::default(),
+            b"indexed range reader reference prefix",
+        )
+        .unwrap();
+        for page_id in 1..=12_u64 {
+            writer
+                .write(&Record::PageState {
+                    page_id,
+                    timestamp_micros: page_id as i64,
+                    title: format!("Page {page_id}"),
+                    namespace: Some(0),
+                    deleted: false,
+                })
+                .unwrap();
+        }
+        writer
+            .write(&Record::SiteInfo {
+                timestamp_micros: 20,
+                site_info: SiteInfoRecord {
+                    site_name: "Test".into(),
+                    db_name: "testwiki".into(),
+                    base: String::new(),
+                    generator: String::new(),
+                    case: "first-letter".into(),
+                    language: "en".into(),
+                    rtl: false,
+                    server: String::new(),
+                    script_path: String::new(),
+                    namespaces: Vec::new(),
+                    interwiki: Vec::new(),
+                    magic_words: Vec::new(),
+                },
+            })
+            .unwrap();
+        let (output, _) = writer.finish().unwrap();
+        output.finish().unwrap().persist(&archive).unwrap();
+        crate::title_index::build(
+            &archive,
+            &titles_path,
+            &crate::generation::GenerationId::from_plan_bytes(b"range-reader-rename"),
+        )
+        .unwrap();
+        let titles = crate::title_index::TitleIndex::open(&titles_path).unwrap();
+        assert!(titles.segment_count() > 3);
+        let indexed = IndexedArchiveSet::open(&archive, &titles).unwrap();
+        let location = indexed
+            .location(titles.frame(titles.frame_count() - 1).unwrap())
+            .unwrap();
+
+        std::fs::rename(&archive, &displaced).unwrap();
+        std::fs::create_dir(&archive).unwrap();
+        assert!(try_acquire_archive_cleanup_lease(&displaced)
+            .unwrap()
+            .is_none());
+        let mut file = indexed.open_file(&location).unwrap();
+        let mut records = 0;
+        visit_frame_while_file(&mut file, &location, |_| {
+            records += 1;
+            Ok(true)
+        })
+        .unwrap();
+        assert!(records > 0);
+        drop(indexed);
+        assert!(try_acquire_archive_cleanup_lease(&displaced)
+            .unwrap()
+            .is_some());
     }
 
     #[test]
@@ -7458,6 +8624,267 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success());
+        assert!(std::fs::read_dir(temporary.path())
+            .unwrap()
+            .all(|entry| entry.unwrap().file_type().unwrap().is_file()));
+    }
+
+    #[test]
+    fn hierarchical_merge_cleans_intermediates_after_error() {
+        let temporary = tempfile::tempdir().unwrap();
+        let mut inputs = Vec::new();
+        for index in 0..25_u64 {
+            let path = temporary.path().join(format!("{index:03}.swdump"));
+            write_test_archive(&path, &[revision(index + 1, index + 1, 1, b"text")]);
+            inputs.push(path);
+        }
+        std::fs::write(&inputs[7], b"not an archive").unwrap();
+        assert!(merge_many_archives(&inputs, Vec::new(), 1024).is_err());
+        assert!(std::fs::read_dir(temporary.path())
+            .unwrap()
+            .all(|entry| entry.unwrap().file_type().unwrap().is_file()));
+    }
+
+    #[test]
+    fn compressed_frame_copy_preserves_bytes_and_output_frontier() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source_path = temporary.path().join("source.swdump");
+        let prefix = b"compressed frame copy reference prefix";
+        let mut source = StreamingArchiveWriter::new(
+            std::fs::File::create(&source_path).unwrap(),
+            1,
+            CompressionSettings::default(),
+            prefix,
+            1,
+        )
+        .unwrap();
+        let page_one = revision(1, 1, 1, b"one");
+        let page_three = revision(3, 3, 3, b"three");
+        source.write(&page_one).unwrap();
+        source.write(&page_three).unwrap();
+        source.finish().unwrap();
+        let (_, locations, complete) = index_file(&source_path).unwrap();
+        assert!(complete);
+        assert_eq!(locations.len(), 2);
+
+        let mut source_file = std::fs::File::open(&source_path).unwrap();
+        let mut target = ParallelArchiveWriter::new(
+            Vec::new(),
+            1,
+            CompressionSettings::default(),
+            prefix,
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            target
+                .append_compressed_frame(
+                    &mut source_file,
+                    crate::frame_directory::FrameDirectoryEntry::from(&locations[0]),
+                )
+                .unwrap()
+                .records,
+            1
+        );
+        let page_two = revision(2, 2, 2, b"two");
+        target.write(&page_two).unwrap();
+        target
+            .append_compressed_frame(
+                &mut source_file,
+                crate::frame_directory::FrameDirectoryEntry::from(&locations[1]),
+            )
+            .unwrap();
+        let (bytes, frames) = target.finish().unwrap();
+        assert_eq!(frames, 3);
+        let mut reader = ArchiveReader::new(Cursor::new(bytes)).unwrap();
+        let mut actual = Vec::new();
+        while let Some(mut frame) = reader.next_frame().unwrap() {
+            while let Some(record) = frame.next_record().unwrap() {
+                actual.push(record);
+            }
+        }
+        assert!(reader.is_complete());
+        assert_eq!(actual, [page_one.clone(), page_two, page_three]);
+
+        let mut bad_target = ParallelArchiveWriter::new(
+            Vec::new(),
+            1,
+            CompressionSettings::default(),
+            prefix,
+            1,
+        )
+        .unwrap();
+        bad_target.write(&page_one).unwrap();
+        bad_target.write(&revision(4, 4, 4, b"four")).unwrap();
+        assert!(matches!(
+            bad_target.append_compressed_frame(
+                &mut source_file,
+                crate::frame_directory::FrameDirectoryEntry::from(&locations[1]),
+            ),
+            Err(ArchiveError::Invalid("copied frame is not after the output frontier"))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_lease_survives_rename_and_defers_cleanup() {
+        let temporary = tempfile::tempdir().unwrap();
+        let installed = temporary.path().join("installed.swdump");
+        let displaced = temporary.path().join("displaced.swdump");
+        std::fs::create_dir(&installed).unwrap();
+        std::fs::write(installed.join("1000-p0000000001-p0000000001.swdump-part"), b"old")
+            .unwrap();
+
+        let root = std::fs::File::open(&installed).unwrap();
+        lock_archive_shared(&root).unwrap();
+        std::fs::rename(&installed, &displaced).unwrap();
+        std::fs::create_dir(&installed).unwrap();
+        std::fs::write(
+            installed.join("1000-p0000000001-p0000000001.swdump-part"),
+            b"new",
+        )
+        .unwrap();
+
+        let mut old_child =
+            open_archive_child(&root, "1000-p0000000001-p0000000001.swdump-part").unwrap();
+        let mut bytes = Vec::new();
+        old_child.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"old");
+        assert!(try_acquire_archive_cleanup_lease(&displaced)
+            .unwrap()
+            .is_none());
+        drop(root);
+        assert!(try_acquire_archive_cleanup_lease(&displaced)
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn parallel_archive_writer_preserves_frame_and_record_order() {
+        let prefix = b"parallel archive reference prefix";
+        let mut writer = ParallelArchiveWriter::new(
+            Vec::new(),
+            1,
+            CompressionSettings {
+                level: 1,
+                ..CompressionSettings::default()
+            },
+            prefix,
+            4,
+        )
+        .unwrap();
+        let mut expected = Vec::new();
+        for page_id in 1..=64_u64 {
+            for revision_id in (1..=3_u64).rev() {
+                let record = revision(
+                    page_id,
+                    page_id * 10 + revision_id,
+                    revision_id as i64,
+                    format!("page {page_id} revision {revision_id}").as_bytes(),
+                );
+                writer.write(&record).unwrap();
+                expected.push(record);
+            }
+        }
+        let (bytes, frames) = writer.finish().unwrap();
+        assert_eq!(frames, 64);
+
+        let mut reader = ArchiveReader::new(Cursor::new(bytes)).unwrap();
+        let mut actual = Vec::new();
+        while let Some(mut frame) = reader.next_frame().unwrap() {
+            while let Some(record) = frame.next_record().unwrap() {
+                actual.push(record);
+            }
+        }
+        assert!(reader.is_complete());
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn parallel_archive_writer_orders_copied_changed_and_copied_frames() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source_path = temporary.path().join("source.swdump");
+        let prefix = b"parallel mixed-frame reference prefix";
+        let page_one = revision(1, 1, 1, b"one");
+        let page_two = revision(2, 2, 2, b"two changed");
+        let page_three = revision(3, 3, 3, b"three");
+        let mut source = StreamingArchiveWriter::new(
+            std::fs::File::create(&source_path).unwrap(),
+            1,
+            CompressionSettings::default(),
+            prefix,
+            1,
+        )
+        .unwrap();
+        source.write(&page_one).unwrap();
+        source.write(&page_three).unwrap();
+        source.finish().unwrap();
+        let (_, source_frames, complete) = index_file(&source_path).unwrap();
+        assert!(complete);
+        assert_eq!(source_frames.len(), 2);
+
+        let mut source_file = std::fs::File::open(&source_path).unwrap();
+        let mut writer = ParallelArchiveWriter::new(
+            Vec::new(),
+            1,
+            CompressionSettings {
+                level: 1,
+                ..CompressionSettings::default()
+            },
+            prefix,
+            2,
+        )
+        .unwrap();
+        let first = writer
+            .append_compressed_frame(
+                &mut source_file,
+                crate::frame_directory::FrameDirectoryEntry::from(&source_frames[0]),
+            )
+            .unwrap();
+        assert_eq!(first.frames, 1);
+        assert_eq!(first.records, 1);
+        assert!(writer.buffered_frames() <= writer.buffered_frame_limit());
+        writer.write(&page_two).unwrap();
+        assert!(writer.buffered_frames() <= writer.buffered_frame_limit());
+        let last = writer
+            .append_compressed_frame(
+                &mut source_file,
+                crate::frame_directory::FrameDirectoryEntry::from(&source_frames[1]),
+            )
+            .unwrap();
+        assert_eq!(last.frames, 1);
+        assert_eq!(last.records, 1);
+        assert!(writer.buffered_frames() <= writer.buffered_frame_limit());
+        let (bytes, frames) = writer.finish().unwrap();
+        assert_eq!(frames, 3);
+
+        let (_, target_frames, complete) = index_reader(Cursor::new(&bytes)).unwrap();
+        assert!(complete);
+        assert_eq!(target_frames.len(), 3);
+        let source_bytes = std::fs::read(&source_path).unwrap();
+        for (source, target) in [
+            (&source_frames[0], &target_frames[0]),
+            (&source_frames[1], &target_frames[2]),
+        ] {
+            let source_start = source.compressed_offset as usize;
+            let source_end = source_start + source.info.compressed_bytes as usize;
+            let target_start = target.compressed_offset as usize;
+            let target_end = target_start + target.info.compressed_bytes as usize;
+            assert_eq!(
+                &source_bytes[source_start..source_end],
+                &bytes[target_start..target_end],
+            );
+        }
+
+        let mut reader = ArchiveReader::new(Cursor::new(bytes)).unwrap();
+        let mut actual = Vec::new();
+        while let Some(mut frame) = reader.next_frame().unwrap() {
+            while let Some(record) = frame.next_record().unwrap() {
+                actual.push(record);
+            }
+        }
+        assert!(reader.is_complete());
+        assert_eq!(actual, [page_one, page_two, page_three]);
     }
 
     fn write_test_archive(path: &Path, records: &[Record]) {

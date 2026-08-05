@@ -10353,10 +10353,7 @@ fn open_wiki_archive(
     path: &str,
 ) -> Result<wikimak_wikipedia::archive_browse::ArchiveBrowseIndex, String> {
     let path = std::path::Path::new(path);
-    wikimak_wikipedia::archive_browse::ArchiveBrowseIndex::open(
-        path,
-        path.with_extension("swtitle"),
-    )
+    wikimak_wikipedia::archive_browse::ArchiveBrowseIndex::open_installed(path)
     .map_err(|error| error.to_string())
 }
 

@@ -36,9 +36,66 @@ mean editing the old range.
 
 The title/frame/segment index is the generation selector. It names the exact
 ordered range inventory that constitutes the generation. Atomically publishing
-the complete new index is the update commit point. Before that commit, new
-readers use the preserved base generation; after it, new readers use the new
-generation. Readers already open may continue using their original generation.
+the complete new index is the reader-visible publication point. Before that
+rename, new readers use the preserved base generation; after it, new readers
+use the new generation. Readers already open may continue using their original
+generation. The lifecycle records `Committed` only after validating that
+published generation and durably writing the update commit receipt.
+
+### 1.1 Performance contract
+
+The state machine also fixes the asymptotic I/O behavior. Correctness recovery
+MUST NOT be implemented by repeatedly rescanning immutable archive data.
+In this section `U_c` and `U_r` are respectively the compressed and raw typed
+sizes of the sorted update tail.
+
+- discovery reads remote metadata only;
+- materializing the sorted tail reads every selected source stream once and
+  writes the authoritative tail once. The normal three-day-overlap update has
+  about seven logical inputs (daily runs, at most two history partitions, and
+  the manifest), so it merges directly. A stale mirror with more than 64
+  logical inputs uses a bounded-fan-in hierarchy: for logical source count
+  `S`, it adds `ceil(log_64(S)) - 1` complete intermediate
+  tail-sized scratch write/read and recompression passes. Thus compressed I/O
+  is `O(U_c * ceil(log_64(S)))` and record CPU is
+  `O(U_r * ceil(log_64(S)))`, never a pass over the base archive. The first
+  intermediate pass appears only once the mirror is roughly 61 daily runs
+  behind; this explicit stale-mirror cost is preferred to retaining one open
+  descriptor or one unbounded decoded frame for every daily run;
+- applying the tail reads each affected base range once and writes its
+  replacement once;
+- an unchanged base range is neither decoded nor rewritten;
+- within a touched range, unchanged base frames are copied as compressed
+  payloads. Changed and newly introduced frames are compressed independently
+  by the configured bounded CPU pool, then one output owner writes copied and
+  recompressed frames in entity order. For raw tail record bytes `U_r` and raw
+  typed bytes `B_H` in intersected base frames, coordinator merge/decode work
+  is `O(U_r + B_H)`; compressed input I/O is the compressed tail plus the
+  intersected frames, not the complete base archive;
+  independent output-frame compression is distributed across the CPU pool.
+  The queue retains at most one submitted/completed frame per worker plus the
+  current indivisible entity. A queued copied frame retains a cloned source
+  descriptor and offset, not a payload-sized memory buffer;
+- the merge keeps a bounded number of source, base-range, candidate, and
+  receipt descriptors open, independent of total source-part and range counts;
+- memory use is bounded independently of wiki size except for the explicitly
+  indivisible current entity, which a correct page-aligned frame cannot split;
+- title projection uses bounded external runs and globally arbitrates current
+  title ownership; page-range-local arbitration is not correct for moves or
+  competing title claims;
+- external-run merge fan-in is bounded, and an interrupted attempt's
+  non-authoritative runs are reclaimed before the next explicit resume;
+- committing reads the prepared index and small receipts/inventories only;
+- restart inspects receipts and bounded structural metadata. It does not scan
+  archive payloads or repeat discovery.
+
+Telemetry for tail and range work MUST expose source bytes read, tail bytes
+read, base-frame payload bytes copied without decoding, base-frame payload
+bytes decoded, candidate bytes written, records, and frames.
+Tests MUST assert the selected I/O envelope with instrumented readers and
+writers: a direct normal-tail merge, the explicit bounded stale-tail
+hierarchy, byte-copying disjoint frames, and decoding only intersected frames.
+Elapsed-time tests are not a substitute for those invariants.
 
 ## 2. Identities
 
@@ -246,6 +303,10 @@ IndexReady {
     candidate_index
 }
 
+Installed {
+    new_generation
+}
+
 Committed {
     old_generation,
     new_generation,
@@ -258,6 +319,23 @@ Committed {
 
 Failure is a run outcome. After failure or interruption, `inspect_update`
 returns the last stable update state.
+
+### 5.1 Closed event alphabet
+
+The implementation defines one closed `UpdateEvent` enum and one pure,
+exhaustive transition function. Its publication events are plan, tail,
+preserved base, range plan, non-final/final range receipt, inventory, index,
+generation installation, commit receipt, and cleanup publication.
+
+Operational events are equally part of the machine: discovery failure,
+source-gap detection, worker failure, cancellation, process crash, explicit
+resume/retry, duplicate/stale/foreign receipts, interrupted installation,
+failed cleanup, an already-open reader observation, and a new reader opening
+either the base or candidate generation. Every phase/event pair is classified
+as advancing, an idempotent no-op, rejected, or impossible. A table test covers
+the complete cross product. Execution uses the same transition decisions for
+resume, worker failure, and serving selection; the table is not a second
+descriptive model.
 
 ## 6. Discovery and tail machine
 
@@ -341,8 +419,10 @@ base index's range slots. The final slot of an entity kind has an open upper
 bound so newly allocated IDs belong to it.
 
 The complete tail is consumed exactly once as an ordered logical stream during
-a run. On resume, already committed range receipts allow the reader to skip
-their recorded tail-key intervals without rebuilding candidates.
+a run. A terminal range receipt records the next tail position as a frame
+offset and record ordinal. Resume seeks to that frame and re-decodes at most
+that one frame; it does not replay completed tail frames or serialize the
+frame remainder into a second archive.
 
 ### 8.2 Per-slot states
 
@@ -376,9 +456,12 @@ openable. It does not install the candidate generation; the old index remains
 the installed selector.
 
 The candidate builder merges one base range and the routed tail interval using
-the archive's immutable compression reference. Record-level merge semantics
-provide idempotence. Recovery MUST nevertheless use receipts rather than
-relying on repeated rewriting as the normal transaction mechanism.
+the archive's immutable compression reference. Because frames are
+entity-aligned, base frames whose entity bounds do not intersect a tail entity
+are copied in compressed form. Only intersecting frames are decoded, merged,
+and recompressed. Record-level merge semantics provide idempotence. Recovery
+MUST nevertheless use receipts rather than relying on repeated rewriting as
+the normal transaction mechanism.
 
 ## 9. Candidate inventory and index
 
@@ -425,18 +508,23 @@ Commit consists of:
 4. atomically publish the new title/frame/segment index at the installed index
    path;
 5. sync its parent directory;
-6. atomically publish/update the installed-generation receipt if it is
-   separate from the index.
+6. atomically publish the commit receipt bound to the observed installed
+   generation.
 
-Step 4 is the generation commit point. Before it, the old index selects the old
-generation. After it, the new index selects the new generation. An update
-marker may aid human diagnostics but cannot redefine this commit point.
+Step 4 is the reader-visible generation switch. Before it, new readers select
+the old generation. After it, new readers select the new generation. Step 6
+records the stable `Committed` lifecycle state. A crash between them is the
+explicit `Installed` state and resumes by publishing only the missing commit
+receipt. An update marker may aid human diagnostics but cannot redefine
+either point.
 
 | Current state | Event | Next state | Rule |
 |---|---|---|---|
 | `IndexReady` | commit begins | unchanged + live activity | base still authoritative |
-| `IndexReady` | index publish succeeds | `Committed` | new generation authoritative |
+| `IndexReady` | index publish succeeds | `Installed` | new generation authoritative |
 | `IndexReady` | crash before index publish | `IndexReady` | resume commit |
+| `Installed` | commit receipt persists | `Committed` | installation transaction durably acknowledged |
+| `Installed` | crash/resume | `Installed` | validate the selected physical generation; do not republish archive or index |
 | `Committed` | crash before marker/remnant cleanup | `Committed` | roll forward; never reapply tail |
 
 The new index MUST NOT become visible before all segment paths it names are
@@ -534,7 +622,7 @@ The shared progress projector combines:
 JobLifecycle
 InstalledGeneration
 UpdateState
-live telemetry for the owned RunId/AttemptId
+live telemetry for the owned `RunId` and update/target identity
 MediaState
 CleanupState
 ```
@@ -760,54 +848,3 @@ The matrix includes empty tails, updates touching one range, all ranges, new
 maximum page/user IDs, title moves, deletions, suppressions represented as
 metadata, history-only updates, content-only updates, and overlapping daily
 runs.
-
-## 18. Current implementation audit
-
-These observations describe code that must converge on the specification. They
-are not compatibility obligations.
-
-1. `update_checkpoint_key` binds wiki name, manifest frontiers, overlap, and
-   compression settings, but not the base generation or archive/index
-   identities (`src/direct.rs:2895-2919`).
-2. Once `.updating` exists, the CLI deliberately does not recompute even that
-   checkpoint key; an old receipt is accepted without comparing it with the
-   current base (`src/cli.rs:1198-1222`).
-3. Update discovery is not persisted as an immutable plan before downloads.
-   The durable `update.receipt.json` is written only after the complete tail is
-   built (`src/cli.rs:1253-1281`).
-4. Generic scratch names are shared by successive updates. A committed update
-   whose media or scratch cleanup fails can leave `update-ranges.json` from the
-   old checkpoint to collide with the next update (`src/cli.rs:551-593`,
-   `1193-1195`, `1333-1336`).
-5. A range receipt validates checkpoint key, old filename, new filename, and
-   installed file length. It does not bind or validate base generation, tail,
-   slot contents, or clean candidate completion (`src/cli.rs:602-631`).
-6. Range candidates are renamed into the live archive directory before their
-   receipts are written; obsolete base names may then be removed before the
-   new index exists (`src/cli.rs:915-954`). Serving safety depends on a
-   separately inferred `.updating` snapshot.
-7. The serving snapshot is validated as an archive/index pair but carries no
-   explicit base-generation receipt (`src/cli.rs:973-1028`).
-8. Serving chooses the snapshot solely because `.updating` exists
-   (`src/cli.rs:1364-1376`), rather than from authoritative generation state.
-9. Single-file recovery treats inode inequality from the snapshot plus any
-   clean archive completion marker as proof the replacement was already
-   installed. It does not bind that archive to the update tail
-   (`src/cli.rs:714-745`).
-10. The old title index remains installed while range files are replaced. The
-    new index is persisted near the end, and `.updating` removal acts as the
-    visibility switch (`src/cli.rs:1317-1332`). The index itself does not yet
-    carry the complete generation transaction identity required here.
-11. If `.updating` exists without both snapshot paths or without the durable
-    tail, restart stops with an error rather than returning a typed recoverable
-    or invalid update state (`src/cli.rs:1230-1251`, `1290-1298`).
-12. Initial content intermediates may be deleted as they are consumed
-    (`src/direct.rs:2765-2775`) before a typed tail receipt exists.
-13. Structured mirror progress is designed around initial-build `plan.json`.
-    An ordinary installed-mirror update has no authoritative structured update
-    projection and relies heavily on stderr details.
-
-The first implementation step is not another recovery condition. It is
-introducing the update identities, inspector, and pure transition model, then
-making discovery, Kati, range materialization, commit, serving, and progress
-consume those shared definitions.

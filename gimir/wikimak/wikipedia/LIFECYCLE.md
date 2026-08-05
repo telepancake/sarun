@@ -8,6 +8,9 @@ The incremental-update lifecycle uses the same job, generation, installation,
 media, and cleanup rules. Its discovery, tail, range-candidate, and generation
 commit machines are specified in
 [UPDATE_LIFECYCLE.md](UPDATE_LIFECYCLE.md).
+Pass counts, memory, scratch-I/O, compression-parallelism, descriptor, and
+reader/publication bounds are normative in
+[PERFORMANCE.md](PERFORMANCE.md).
 
 The key words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are normative.
 
@@ -41,20 +44,23 @@ The key words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are normative.
 - **Run**: one supervised execution of a job. Every run has a fresh `RunId`.
 - **Plan**: the immutable selection of upstream snapshots, source parts, and
   encoding parameters for one full build. Its complete canonical encoding
-  determines `PlanId`.
+  determines its SHA-256 `PlanId`.
 - **Target**: one independently materialized source part named by
   `(PlanId, TargetKind, TargetIndex)`.
 - **Generation**: an archive and its required indexes built from exactly one
   plan. It has a `GenerationId`, which MUST bind the `PlanId`, archive identity,
   and index identity.
-- **Attempt**: one process's work toward a target or assembly checkpoint. It
-  has an `AttemptId`; a PID is telemetry attached to the attempt, not its
-  identity.
-- **Installed generation**: the archive/index pair currently selected for
-  serving.
+- **Installed generation**: the immutable archive directory selected by the
+  stable title/frame index.
 
 Identities MUST be stored inside typed receipts. They MUST NOT be inferred from
 path names. Receipts have a schema version and are written atomically.
+
+`GenerationId` is the deterministic identity assigned by the immutable build
+or update plan; it is not advertised as a payload-content hash. Publication
+still structurally validates that the archive manifest and index both name
+that generation and the same wiki/frontiers. Rehashing all revision payloads
+would add an archive-sized pass without improving the selector state machine.
 
 ## 3. Scope and ownership
 
@@ -63,7 +69,7 @@ path names. Receipts have a schema version and are written atomically.
 | Engine | job record, schedule, `RunId`, child process group, run outcome | build-state interpretation |
 | Build coordinator | destination-local build lock, plan, transition sequencing | schedule policy |
 | Kati | dependency scheduling and bounded parallel execution | durable lifecycle state |
-| Target worker | one target attempt, its checkpoint and telemetry | another target or global completion |
+| Target worker | one target, its checkpoint and telemetry | another target or global completion |
 | Assembler | assembly checkpoint and candidate archive | installed generation |
 | Index builder | candidate generation index | archive identity or installation |
 | Installer | generation switch transaction | archive construction |
@@ -197,9 +203,14 @@ Partial(TargetCheckpoint)
 Ready(TargetReceipt)
 ```
 
-`Working(AttemptId, telemetry)` is a live overlay on `Missing` or `Partial`, not
-a durable fourth state. A failed attempt leaves `Missing` or a valid `Partial`
+`Working(RunId, telemetry)` is a live overlay on `Missing` or `Partial`, not a
+durable fourth state. A failed worker leaves `Missing` or a valid `Partial`
 plus an attributed diagnostic in the run.
+
+There is deliberately no separately persistent target `AttemptId`. The
+destination-local build lock admits one coordinator, and Kati has exactly one
+recipe for each `(PlanId, TargetKind, TargetIndex)`. Those two ownership rules
+exclude concurrent or stale target completion; PID remains telemetry only.
 
 A target receipt MUST bind:
 
@@ -208,6 +219,9 @@ A target receipt MUST bind:
 - source identity from the plan;
 - archive identity and byte size;
 - a clean archive completion marker;
+- a clean metadata-only `title-records.swdump` sidecar;
+- a plan/target-bound `data.swframe` directory whose frame extents fit the
+  target archive;
 - required siteinfo identity for the designated siteinfo target;
 - materialization statistics.
 
@@ -285,53 +299,58 @@ Assembly MUST use a bounded number of open descriptors independent of source
 count. A streaming N-way merge means bounded readers feeding one streaming
 writer; it does not permit retaining every source descriptor for convenience.
 
-If resume rereads records preceding the sealed boundary, progress MUST say so.
-The title projection MUST cover the whole resulting archive, including records
-before the resume boundary.
+Before final merge, all target metadata sidecars are externally merged into a
+durable, content-addressed title projection and an identity-bound receipt.
+Assembly resume opens each target through its `data.swframe` directory at the
+first frame after the last sealed entity. It MUST decode zero sealed-prefix
+frames. The already complete title projection covers both that sealed prefix
+and the resumed suffix.
 
 Source targets and the manifest MUST survive until `ReadyGeneration`. A
 complete archive without an index can be resumed at Projecting without
 redownloading. A complete archive from another plan cannot.
 
-## 9. Installation machine
+## 9. Generation-addressed installation
 
-The installed archive and title/frame index form one logical generation even
-if represented by sibling paths. Serving MUST open only a mutually matching
-pair.
-
-### 9.1 Stable transaction states
+For logical destination `D.swdump`, installation owns:
 
 ```text
-NoInstallTransaction
-Prepared { new_generation, old_generation? }
-OldGenerationPreserved { new_generation, old_generation }
-NewArchivePlaced { new_generation, old_generation? }
-NewPairPlaced { new_generation, old_generation? }
-Committed { new_generation }
+D.swtitle                         stable selector
+D.generations/<GenerationId>/    immutable archive-set directory
+D.install.json                    interrupted-publication/cleanup receipt
 ```
 
-The transaction receipt MUST store old and new `GenerationId`s and its phase.
-Artifact identity, not path presence alone, resolves recovery.
+The title index embeds `GenerationId`; it is the sole reader-visible selector.
+Serving reads that ID and opens exactly the corresponding immutable directory.
+It never scans `D.generations`.
 
-### 9.2 Transitions and recovery
+Publication has one commit point:
 
-| Current state | Event | Next state | Recovery policy |
-|---|---|---|---|
-| `NoInstallTransaction` | install Ready generation | `Prepared` | old generation still served |
-| `Prepared`, replacement | preserve old pair | `OldGenerationPreserved` | rollback to old on interruption |
-| `Prepared`/`OldGenerationPreserved` | place new archive | `NewArchivePlaced` | rollback if matching new index absent |
-| `NewArchivePlaced` | place matching new index | `NewPairPlaced` | roll forward after pair validation |
-| `NewPairPlaced` | persist installed-generation receipt | `Committed` | new pair is authoritative |
-| `Committed` | remove old pair/transaction remnants | `NoInstallTransaction` | cleanup failure is non-fatal |
+1. validate the candidate archive and index as one generation;
+2. hard-link its already durable archive-set segments into a temporary
+   destination-local directory, sync it, and rename it to
+   `D.generations/<GenerationId>`;
+3. stage and sync a destination-local copy/link of the candidate index;
+4. persist a receipt naming the candidate, the previously selected generation,
+   and only the generations explicitly displaced by earlier commits;
+5. atomically rename the staged index over `D.swtitle`, then sync its parent.
 
-For a first install, rollback before `NewPairPlaced` restores the candidate to
-the build tree or leaves no installed generation. For replacement, rollback
-restores the old matching pair. Once the complete matching new pair is durable,
-recovery rolls forward rather than discarding it.
+Step 5 is the complete visibility switch. Before it readers select the old
+generation (or no generation on first install); after it they select the new
+generation. Candidate build artifacts remain intact through this boundary.
+A crash before the receipt leaves only unselected immutable material. A crash
+after the receipt rolls forward only the named candidate. No archive/title
+pair rename and no mixed-pair recovery state exists.
 
-While a transaction is before `Committed`, serving either uses the explicitly
-preserved old generation or refuses if no old generation exists. It MUST NOT
-guess from whichever sibling paths happen to exist.
+Cleanup is independent of publication. It may remove only generation IDs
+explicitly recorded as displaced, and only after obtaining an exclusive
+archive-directory lease. It MUST preserve every other unselected generation:
+one may be an authoritative interrupted build candidate. Cleanup failure keeps
+the receipt and does not change the selected generation.
+
+A reader holds a shared directory lease. If selector replacement races the
+gap between opening an old selector and its generation, the open path rereads
+the selector and retries only when the selected ID changed.
 
 ## 10. Media and cleanup
 
@@ -404,7 +423,7 @@ Required user-visible phases include:
 - optional media work;
 - optional cleanup.
 
-Telemetry MUST be keyed by `RunId`, `AttemptId`, and target/assembly identity.
+Telemetry MUST be keyed by `RunId` and target/assembly identity.
 Stale telemetry may be displayed as historical diagnostics but cannot make a
 state “running.” Free-form stderr is diagnostic text only. Progress code MUST
 NOT parse words such as “failed” or “finished” to determine state.
@@ -425,13 +444,11 @@ not “running,” “fetching,” or “assembling.”
 - a generation receipt without both matching archive and index;
 - archive and index carrying different `GenerationId`s;
 - an assembly checkpoint with reordered, overlapping, or foreign ranges;
-- simultaneous competing candidate generations without an explicit
-  transaction that names both;
-- an install transaction whose observed old/new artifacts match neither its
-  recorded phase nor an adjacent recoverable phase;
-- a final archive without a matching index and no active install transaction;
-- previous-generation backups with no transaction receipt;
-- live telemetry naming a different run or attempt than the engine owns.
+- a publication receipt whose selected generation is neither its recorded
+  predecessor nor its candidate;
+- a stable selector whose generation directory is absent;
+- cleanup of a generation not explicitly recorded as displaced;
+- live telemetry naming a different run than the engine owns.
 
 Invalid-state handling is non-destructive. The program reports exact paths,
 expected identities, and observed identities, then waits for an explicit
@@ -522,6 +539,48 @@ Tests or instrumentation MUST assert:
 - progress continues during long reads, compression, projection, fsync, and
   recovery without inventing a different phase.
 
+### 14.5 Performance contract
+
+Every transition that can touch archive data MUST state its expected cost in
+source bytes read, archive bytes read and written, index bytes read and
+written, open descriptors, retained memory, and network requests. A lifecycle
+change is incomplete until that cost is reviewed at enwiki scale.
+
+The normal full-build path MUST have these properties:
+
+- each selected source stream is downloaded and decompressed once;
+- independently downloadable source parts may run in bounded parallelism;
+- sorted target streams are read once by assembly and the final archive is
+  written once;
+- title and frame projection is observed during assembly, rather than
+  recovering it by decoding all revision text in a second pass;
+- title-history projection uses 64 MiB in-memory runs and merge fan-in 32, so
+  retained memory and descriptors are bounded and the number of merge passes
+  is `ceil(log_32(run_count))`;
+- initial range planning targets roughly 200 GiB of selected source bytes per
+  physical range, clamped to 1 through 128 ranges;
+- generation identity validation reads the index, compression-reference
+  header, receipts, and bounded global metadata, never all revision payloads;
+- installation creates O(`R`) destination-local hard links for the candidate
+  archive-set segments and atomically replaces only the small index selector;
+- the number of open source and archive descriptors is bounded independently
+  of source-part and range count;
+- retained memory is bounded by explicitly named buffers, sort runs, and
+  worker queues rather than total wiki history.
+
+Passive inspection, scheduler ticks, UI refreshes, and engine startup MUST
+read job rows, receipts, indexes, and bounded headers only. They MUST NOT walk
+the entire mirror or scratch directory, hash archive payloads, rebuild indexes,
+or decode revision frames. An explicitly requested recovery transition MAY
+perform an expensive reconstruction only when its state table names that cost,
+the UI reports it, and no cheaper receipt-bound input exists.
+
+Telemetry MUST be maintained at owned write/seal/remove boundaries. It MUST
+NOT estimate ordinary progress by recursively polling large directory trees.
+Tests SHOULD use instrumented readers, writers, and filesystem operations to
+assert byte-pass and descriptor bounds; wall-clock benchmarks validate
+constant factors but do not replace those invariants.
+
 ## 15. Maturity gate
 
 Wikipedia initial import is lifecycle-mature only when:
@@ -531,5 +590,7 @@ Wikipedia initial import is lifecycle-mature only when:
 3. ad-hoc compatibility and fallback paths not justified by a released format
    are removed;
 4. the exhaustive and crash matrices pass;
-5. every remaining deviation from this document is written down as a deliberate
+5. instrumented tests enforce the stated I/O, memory, descriptor, and
+   publication-pass bounds;
+6. every remaining deviation from this document is written down as a deliberate
    specification change, not introduced as a local recovery condition.

@@ -10,15 +10,25 @@ pub mod archive;
 pub mod archive_set;
 pub mod backrefs;
 mod backrefs_parse;
+#[cfg(feature = "fetch")]
+pub(crate) mod build_lifecycle;
+#[cfg(feature = "fetch")]
+pub(crate) mod installation_lifecycle;
 #[cfg(feature = "serve")]
 pub mod archive_browse;
 #[cfg(feature = "fetch")]
 pub mod direct;
 #[cfg(feature = "fetch")]
+mod progress_projection;
+#[cfg(feature = "fetch")]
 mod cli;
 #[cfg(feature = "fetch")]
-pub use cli::{cli_main, mirror_auxiliary_paths, mirror_scratch_path};
+pub use cli::{
+    cli_main, mirror_auxiliary_paths, mirror_has_installed_generation, mirror_scratch_path,
+};
 pub mod error;
+pub(crate) mod frame_directory;
+pub mod generation;
 pub(crate) mod frames;
 pub mod import;
 pub mod instance;
@@ -30,6 +40,7 @@ pub mod serve;
 pub mod schema;
 pub mod title_slots;
 pub mod title_index;
+pub(crate) mod title_projection;
 pub(crate) mod title_history;
 #[cfg(feature = "fetch")]
 pub mod sync;
@@ -40,9 +51,11 @@ pub(crate) mod titles;
 pub use error::{Error, Result};
 #[cfg(feature = "fetch")]
 pub use direct::{
-    build_direct_archive, build_update_archive, mirror_build_progress, DirectArchiveStats,
-    MirrorBuildProgress, MirrorTargetProgress, UpdateArchiveStats,
+    build_direct_archive, build_update_archive, DirectArchiveStats, MirrorBuildProgress,
+    MirrorTargetProgress, UpdateArchiveStats,
 };
+#[cfg(feature = "fetch")]
+pub use progress_projection::{mirror_build_progress, mirror_build_progress_for_run};
 pub use instance::{
     max_chain_id_for_root, read_config, ContributorMeta, HistoryEntry, HistoryIter, ImportStats,
     Instance, InstanceConfig, PackedF0StorageStats, PageAction, RevisionCorrection, RevisionDictionaryStats,

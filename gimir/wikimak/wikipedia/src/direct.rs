@@ -1,7 +1,7 @@
 //! Direct upstream-dump to portable-archive construction.
 
-use std::collections::{BTreeMap, HashSet, VecDeque};
-use std::io::{BufRead, Read, Write};
+use std::collections::{BTreeMap, VecDeque};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -11,8 +11,8 @@ use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 
 use crate::archive::{
-    ArchiveError, ArchiveRecordReader, ArchiveWriter, BootstrapMergePhase,
-    CompressionSettings, EntityKind, ManifestRecord, Record, RecordSorter, RecordSource,
+    ArchiveError, ArchiveRecordReader, ArchiveWriter, CompressionSettings, EntityKey, EntityKind,
+    ManifestRecord, Record, RecordSorter, RecordSource,
     RevisionRecord, SiteInfoRecord, SiteInterwikiRecord, SiteNamespaceRecord,
     DEFAULT_FRAME_TARGET, MIRROR_FRAME_TARGET, MIRROR_REF_PREFIX_BYTES,
     MIRROR_REF_PREFIX_SAMPLE_BYTES,
@@ -21,6 +21,18 @@ use crate::instance::{ContributorMeta, RevisionMeta};
 use crate::{Error, Result};
 
 const HISTORY_SORT_RUN_TARGET: usize = 8 << 30;
+const PLANNED_RANGE_SOURCE_BYTES: u64 = 200 << 30;
+const MAX_PLANNED_RANGES: u64 = 128;
+
+fn planned_range_layout(source_bytes: u64) -> (u64, u64) {
+    let ranges = source_bytes
+        .div_ceil(PLANNED_RANGE_SOURCE_BYTES)
+        .clamp(1, MAX_PLANNED_RANGES);
+    let target = source_bytes
+        .div_ceil(ranges)
+        .max(crate::archive_set::DEFAULT_RANGE_TARGET);
+    (ranges, target)
+}
 
 pub(crate) fn processing_parallelism() -> usize {
     std::env::var("SARUN_WIKIMAK_CPU_BUDGET")
@@ -67,8 +79,8 @@ pub struct UpdateArchiveStats {
     pub elapsed_millis: u64,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-struct PartialStats {
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct PartialStats {
     pages: u64,
     revisions: u64,
     events: u64,
@@ -136,18 +148,83 @@ struct PartCheckpointReceipt {
 
 struct ContentPartResult {
     path: PathBuf,
+    title_path: PathBuf,
     stats: PartialStats,
     site_info: Option<SiteInfoRecord>,
+    samples: Option<PathBuf>,
+}
+
+const SAMPLE_MAGIC: [u8; 8] = *b"SWSAMPLE";
+const SAMPLE_VERSION: u32 = 1;
+
+struct NewestTextSampleWriter {
+    output: BufWriter<std::fs::File>,
+    remaining: usize,
+}
+
+impl NewestTextSampleWriter {
+    fn create(path: &Path, capacity: usize) -> Result<Self> {
+        let mut output = BufWriter::new(std::fs::File::create(path)?);
+        output.write_all(&SAMPLE_MAGIC)?;
+        output.write_all(&SAMPLE_VERSION.to_le_bytes())?;
+        Ok(Self {
+            output,
+            remaining: capacity,
+        })
+    }
+
+    fn push(&mut self, text: &[u8]) -> Result<()> {
+        if text.is_empty() || text.len() > self.remaining || text.len() > u32::MAX as usize {
+            return Ok(());
+        }
+        self.output.write_all(&(text.len() as u32).to_le_bytes())?;
+        self.output.write_all(text)?;
+        self.remaining -= text.len();
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<()> {
+        self.output.write_all(&u32::MAX.to_le_bytes())?;
+        self.output.flush()?;
+        self.output.get_ref().sync_all()?;
+        Ok(())
+    }
+}
+
+fn read_text_samples(path: &Path, mut visit: impl FnMut(&[u8]) -> Result<()>) -> Result<()> {
+    let mut input = BufReader::new(std::fs::File::open(path)?);
+    let mut magic = [0_u8; 8];
+    input.read_exact(&mut magic)?;
+    let mut version = [0_u8; 4];
+    input.read_exact(&mut version)?;
+    if magic != SAMPLE_MAGIC || u32::from_le_bytes(version) != SAMPLE_VERSION {
+        return Err(Error::Corrupt("unknown newest-revision sample format"));
+    }
+    loop {
+        let mut length = [0_u8; 4];
+        input.read_exact(&mut length)?;
+        let length = u32::from_le_bytes(length);
+        if length == u32::MAX {
+            let mut trailing = [0_u8; 1];
+            if input.read(&mut trailing)? != 0 {
+                return Err(Error::Corrupt("newest-revision sample has trailing bytes"));
+            }
+            return Ok(());
+        }
+        let mut sample = vec![0; length as usize];
+        input.read_exact(&mut sample)?;
+        visit(&sample)?;
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct PlannedPart {
-    url: String,
-    filename: String,
-    size_bytes: u64,
-    sha256: Option<String>,
-    sha1: Option<String>,
-    md5: Option<String>,
+    pub(crate) url: String,
+    pub(crate) filename: String,
+    pub(crate) size_bytes: u64,
+    pub(crate) sha256: Option<String>,
+    pub(crate) sha1: Option<String>,
+    pub(crate) md5: Option<String>,
 }
 
 impl From<&wikimak_mediawiki::Part> for PlannedPart {
@@ -178,8 +255,8 @@ impl From<&PlannedPart> for wikimak_mediawiki::Part {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct PlannedHistoryFile {
-    partition: String,
-    part: PlannedPart,
+    pub(crate) partition: String,
+    pub(crate) part: PlannedPart,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -197,6 +274,67 @@ pub(crate) struct DirectBuildPlan {
     pub(crate) ref_prefix_bytes: usize,
     pub(crate) content_groups: Vec<Vec<PlannedPart>>,
     pub(crate) history_files: Vec<PlannedHistoryFile>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct PlannedIncrementalRun {
+    pub(crate) date: String,
+    pub(crate) parts: Vec<PlannedPart>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+pub(crate) struct PlannedCompression {
+    pub(crate) level: i32,
+    pub(crate) checksum: bool,
+    pub(crate) long_distance_matching: bool,
+    pub(crate) window_log: Option<u32>,
+    pub(crate) target_block_size: Option<u32>,
+    pub(crate) workers: u32,
+}
+
+impl From<CompressionSettings> for PlannedCompression {
+    fn from(settings: CompressionSettings) -> Self {
+        Self {
+            level: settings.level,
+            checksum: settings.checksum,
+            long_distance_matching: settings.long_distance_matching,
+            window_log: settings.window_log,
+            target_block_size: settings.target_block_size,
+            workers: settings.workers,
+        }
+    }
+}
+
+impl From<PlannedCompression> for CompressionSettings {
+    fn from(settings: PlannedCompression) -> Self {
+        Self {
+            level: settings.level,
+            checksum: settings.checksum,
+            long_distance_matching: settings.long_distance_matching,
+            window_log: settings.window_log,
+            target_block_size: settings.target_block_size,
+            workers: settings.workers,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct UpdateSourcePlan {
+    pub(crate) schema: u32,
+    pub(crate) source_plan_id: String,
+    pub(crate) generation_id: crate::generation::GenerationId,
+    pub(crate) base_generation_id: crate::generation::GenerationId,
+    pub(crate) wiki_db: String,
+    pub(crate) base_content_frontier: String,
+    pub(crate) base_metadata_frontier: String,
+    pub(crate) overlap_days: u64,
+    pub(crate) frame_target: usize,
+    pub(crate) compression: PlannedCompression,
+    pub(crate) content_runs: Vec<PlannedIncrementalRun>,
+    pub(crate) history_snapshot: String,
+    pub(crate) history_files: Vec<PlannedHistoryFile>,
+    pub(crate) resulting_content_frontier: String,
+    pub(crate) resulting_metadata_frontier: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -277,49 +415,49 @@ pub struct MirrorTargetProgress {
 /// source fragment has its own durable target and retry boundary; this
 /// sidecar exposes byte and revision progress until its receipt is published.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
-struct LiveTargetProgress {
-    target: String,
-    part: String,
-    phase: String,
-    source_bytes_read: u64,
-    source_bytes_total: u64,
+pub(crate) struct LiveTargetProgress {
+    pub(crate) target: String,
+    pub(crate) part: String,
+    pub(crate) phase: String,
+    pub(crate) source_bytes_read: u64,
+    pub(crate) source_bytes_total: u64,
     #[serde(default)]
-    decoded_bytes: u64,
-    pages: u64,
-    revisions: u64,
-    text_bytes: u64,
-    current_page: u64,
-    current_title: String,
-    started_at_micros: u64,
-    updated_at_micros: u64,
+    pub(crate) decoded_bytes: u64,
+    pub(crate) pages: u64,
+    pub(crate) revisions: u64,
+    pub(crate) text_bytes: u64,
+    pub(crate) current_page: u64,
+    pub(crate) current_title: String,
+    pub(crate) started_at_micros: u64,
+    pub(crate) updated_at_micros: u64,
     /// Last liveness write, kept separate from `updated_at_micros` so a
     /// blocked parser cannot masquerade as making data progress.
     #[serde(default)]
-    heartbeat_at_micros: u64,
+    pub(crate) heartbeat_at_micros: u64,
     #[serde(default)]
-    phase_started_at_micros: u64,
+    pub(crate) phase_started_at_micros: u64,
     #[serde(default)]
-    fetch_attempts: u64,
+    pub(crate) fetch_attempts: u64,
     #[serde(default)]
-    fetch_bytes_received: u64,
+    pub(crate) fetch_bytes_received: u64,
     #[serde(default)]
-    fetch_rate_limit_responses: u64,
+    pub(crate) fetch_rate_limit_responses: u64,
     #[serde(default)]
-    fetch_client_error_responses: u64,
+    pub(crate) fetch_client_error_responses: u64,
     #[serde(default)]
-    fetch_server_error_responses: u64,
+    pub(crate) fetch_server_error_responses: u64,
     #[serde(default)]
-    fetch_transport_errors: u64,
+    pub(crate) fetch_transport_errors: u64,
     #[serde(default)]
-    cpu_user_micros: u64,
+    pub(crate) cpu_user_micros: u64,
     #[serde(default)]
-    cpu_system_micros: u64,
+    pub(crate) cpu_system_micros: u64,
     #[serde(default)]
-    peak_rss_bytes: u64,
+    pub(crate) peak_rss_bytes: u64,
 }
 
 struct LiveProgressState {
-    path: PathBuf,
+    projection: Option<crate::progress_projection::SourceWriter>,
     value: LiveTargetProgress,
     last_write: Instant,
     last_phase: String,
@@ -328,6 +466,7 @@ struct LiveProgressState {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct AssemblyProgressSnapshot {
     plan_id: String,
+    run_id: Option<String>,
     pid: u32,
     phase: String,
     input_bytes: u64,
@@ -346,18 +485,26 @@ struct AssemblyProgressSnapshot {
     peak_rss_bytes: u64,
 }
 
-fn assembly_progress_path(root: &Path) -> PathBuf {
-    root.join("assembly.progress.json")
-}
-
 fn write_assembly_progress(root: &Path, value: &AssemblyProgressSnapshot) {
-    let path = assembly_progress_path(root);
-    let temporary = root.join("assembly.progress.json.tmp");
-    if let Ok(bytes) = serde_json::to_vec(value) {
-        if std::fs::write(&temporary, bytes).is_ok() {
-            let _ = std::fs::rename(temporary, path);
-        }
-    }
+    crate::progress_projection::write_assembly(
+        root,
+        crate::progress_projection::AssemblyValue {
+            plan_id: value.plan_id.clone(),
+            run_id: value.run_id.clone(),
+            phase: value.phase.clone(),
+            input_bytes: value.input_bytes,
+            input_bytes_total: value.input_bytes_total,
+            output_bytes: value.output_bytes,
+            records: value.records,
+            current_entity_id: value.current_entity_id,
+            bytes_per_second: value.bytes_per_second,
+            started_at_micros: value.started_at_micros,
+            updated_at_micros: value.updated_at_micros,
+            cpu_user_micros: value.cpu_user_micros,
+            cpu_system_micros: value.cpu_system_micros,
+            peak_rss_bytes: value.peak_rss_bytes,
+        },
+    );
 }
 
 /// Keep a live sidecar fresh while a parser is inside one long blocking read
@@ -435,12 +582,9 @@ fn now_micros() -> u64 {
         .unwrap_or(0)
 }
 
-/// Return the scratch root that owns a live progress sidecar.  Direct build
-/// nodes live below `nodes/.<target>.<pid>.partial`; the older checkpoint
-/// path puts sidecars directly below the scratch directory.  Keeping this
-/// small bit of path knowledge here lets every attempt write an immutable
-/// accounting snapshot without threading the build root through all parser
-/// helpers.
+/// Return the scratch root that owns the shared progress projection. Direct
+/// build nodes live below `nodes/.<target>.<pid>.partial`; the standalone
+/// import path lives directly below its disposable scratch directory.
 fn progress_scratch_root(path: &Path) -> PathBuf {
     let Some(parent) = path.parent() else {
         return PathBuf::from(".");
@@ -463,102 +607,6 @@ fn progress_scratch_root(path: &Path) -> PathBuf {
     } else {
         parent.to_path_buf()
     }
-}
-
-fn progress_history_path(path: &Path, value: &LiveTargetProgress) -> PathBuf {
-    #[derive(Deserialize)]
-    struct PlanMarker {
-        plan_id: String,
-    }
-
-    let root = progress_scratch_root(path);
-    // A new plan gets a new directory.  This is important: scratch is reused
-    // for resumable builds, but counters from an older mirror snapshot must
-    // never leak into the new build's totals.
-    let plan_id = std::fs::read(root.join("plan.json"))
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<PlanMarker>(&bytes).ok())
-        .map(|marker| marker.plan_id)
-        .filter(|id| !id.is_empty())
-        .unwrap_or_else(|| "legacy".into());
-    let target = value
-        .target
-        .chars()
-        .map(|ch| if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' { ch } else { '_' })
-        .collect::<String>();
-    root.join("network-history")
-        .join(plan_id)
-        .join(format!("{target}-{}.json", value.started_at_micros))
-}
-
-#[derive(Default)]
-struct NetworkHistoryTotals {
-    targets: HashSet<String>,
-    fetch_attempts: u64,
-    fetch_bytes_received: u64,
-    fetch_rate_limit_responses: u64,
-    fetch_client_error_responses: u64,
-    fetch_server_error_responses: u64,
-    fetch_transport_errors: u64,
-}
-
-fn progress_record_belongs_to_plan(
-    plan: &DirectBuildPlan,
-    value: &LiveTargetProgress,
-) -> bool {
-    let Some((kind, index)) = plan.target_index(&value.target) else {
-        return false;
-    };
-    match kind {
-        "content" => plan
-            .content_target(index)
-            .is_some_and(|(_, _, part)| part.filename == value.part),
-        "history" => plan
-            .history_files
-            .get(index)
-            .is_some_and(|file| file.part.filename == value.part),
-        _ => false,
-    }
-}
-
-fn read_network_history(root: &Path, plan: &DirectBuildPlan) -> Option<NetworkHistoryTotals> {
-    let directory = root.join("network-history").join(&plan.plan_id);
-    let entries = std::fs::read_dir(directory).ok()?;
-    let mut totals = NetworkHistoryTotals::default();
-    let mut found = false;
-    for entry in entries.flatten() {
-        if entry.path().extension().and_then(|extension| extension.to_str()) != Some("json") {
-            continue;
-        }
-        let Ok(bytes) = std::fs::read(entry.path()) else {
-            continue;
-        };
-        let Ok(value) = serde_json::from_slice::<LiveTargetProgress>(&bytes) else {
-            continue;
-        };
-        if !progress_record_belongs_to_plan(plan, &value) {
-            continue;
-        }
-        found = true;
-        totals.targets.insert(value.target);
-        totals.fetch_attempts = totals.fetch_attempts.saturating_add(value.fetch_attempts);
-        totals.fetch_bytes_received = totals
-            .fetch_bytes_received
-            .saturating_add(value.fetch_bytes_received);
-        totals.fetch_rate_limit_responses = totals
-            .fetch_rate_limit_responses
-            .saturating_add(value.fetch_rate_limit_responses);
-        totals.fetch_client_error_responses = totals
-            .fetch_client_error_responses
-            .saturating_add(value.fetch_client_error_responses);
-        totals.fetch_server_error_responses = totals
-            .fetch_server_error_responses
-            .saturating_add(value.fetch_server_error_responses);
-        totals.fetch_transport_errors = totals
-            .fetch_transport_errors
-            .saturating_add(value.fetch_transport_errors);
-    }
-    found.then_some(totals)
 }
 
 fn persist_live_progress(state: &Arc<Mutex<LiveProgressState>>, force: bool) {
@@ -637,28 +685,10 @@ fn set_live_phase(state: &Arc<Mutex<LiveProgressState>>, phase: &str) {
 }
 
 fn write_live_progress_locked(state: &mut LiveProgressState) {
-    let temporary = state.path.with_extension("progress.json.tmp");
-    if let Ok(bytes) = serde_json::to_vec(&state.value) {
-        if std::fs::write(&temporary, &bytes).is_ok() {
-            let _ = std::fs::rename(&temporary, &state.path);
-            // Keep the latest snapshot outside the disposable partial target.
-            // A failed target is deliberately removed before the next retry,
-            // so the sidecar alone cannot provide monotonic build totals.
-            // One file per attempt avoids a contended shared ledger and makes
-            // concurrent workers naturally atomic: each worker only replaces
-            // its own file.
-            let history = progress_history_path(&state.path, &state.value);
-            if let Some(parent) = history.parent() {
-                if std::fs::create_dir_all(parent).is_ok() {
-                    let history_tmp = history.with_extension("json.tmp");
-                    if std::fs::write(&history_tmp, &bytes).is_ok() {
-                        let _ = std::fs::rename(history_tmp, history);
-                    }
-                }
-            }
-            state.last_write = Instant::now();
-        }
+    if let Some(projection) = &state.projection {
+        projection.write(&state.value);
     }
+    state.last_write = Instant::now();
 }
 
 struct CountingReader<R> {
@@ -738,61 +768,24 @@ impl DirectBuildPlan {
     }
 
     pub(crate) fn content_target_count(&self) -> usize {
-        self.content_groups.iter().map(Vec::len).sum()
+        self.content_groups.len()
     }
 
-    fn content_target(
-        &self,
-        index: usize,
-    ) -> Option<(usize, usize, &PlannedPart)> {
-        let mut remaining = index;
-        for (group_index, group) in self.content_groups.iter().enumerate() {
-            if remaining < group.len() {
-                return Some((group_index, remaining, &group[remaining]));
-            }
-            remaining -= group.len();
-        }
-        None
-    }
-
-    fn content_target_index(&self, group_index: usize, source_index: usize) -> Option<usize> {
-        let group = self.content_groups.get(group_index)?;
-        (source_index < group.len()).then(|| {
-            self.content_groups[..group_index]
-                .iter()
-                .map(Vec::len)
-                .sum::<usize>()
-                + source_index
-        })
+    fn content_target(&self, index: usize) -> Option<&[PlannedPart]> {
+        self.content_groups.get(index).map(Vec::as_slice)
     }
 
     pub(crate) fn target_name(&self, kind: &str, index: usize) -> Option<String> {
         match kind {
-            "content" => self.content_target(index).map(|(group, source, _)| {
-                if self.content_groups[group].len() == 1 {
-                    format!("content-{group:06}")
-                } else {
-                    format!("content-{group:06}-source-{source:06}")
-                }
-            }),
+            "content" => self
+                .content_target(index)
+                .map(|_| format!("content-{index:06}")),
             "history" => self
                 .history_files
                 .get(index)
                 .map(|_| format!("history-{index:06}")),
             _ => None,
         }
-    }
-
-    fn target_index(&self, target: &str) -> Option<(&'static str, usize)> {
-        for index in 0..self.content_target_count() {
-            if self.target_name("content", index).as_deref() == Some(target) {
-                return Some(("content", index));
-            }
-        }
-        let index = target.strip_prefix("history-")?.parse::<usize>().ok()?;
-        self.history_files
-            .get(index)
-            .map(|_| ("history", index))
     }
 
     pub(crate) fn source_bytes(&self) -> u64 {
@@ -821,11 +814,11 @@ impl DirectBuildPlan {
             .next()
     }
 
-    fn target_source_bytes(&self, kind: &str, index: usize) -> u64 {
+    pub(crate) fn target_source_bytes(&self, kind: &str, index: usize) -> u64 {
         match kind {
             "content" => self
                 .content_target(index)
-                .map_or(0, |(_, _, part)| part.size_bytes),
+                .map_or(0, |group| group.iter().map(|part| part.size_bytes).sum()),
             "history" => self
                 .history_files
                 .get(index)
@@ -833,219 +826,79 @@ impl DirectBuildPlan {
             _ => 0,
         }
     }
+
+    pub(crate) fn target_source_identity(&self, kind: &str, index: usize) -> Result<String> {
+        let identity = match kind {
+            "content" => self
+                .content_target(index)
+                .map(|group| serde_json::to_vec(&("content", group)))
+                .transpose()
+                .map_err(|_| Error::Corrupt("cannot encode content target identity"))?,
+            "history" => self
+                .history_files
+                .get(index)
+                .map(|file| serde_json::to_vec(&("history", file)))
+                .transpose()
+                .map_err(|_| Error::Corrupt("cannot encode history target identity"))?,
+            _ => None,
+        }
+        .ok_or(Error::Corrupt("target is outside build plan"))?;
+        use sha2::Digest;
+        Ok(hex::encode(sha2::Sha256::digest(identity)))
+    }
 }
 
-fn direct_plan_id(plan: &DirectBuildPlan) -> Result<String> {
+fn content_sample_quotas(plan: &DirectBuildPlan) -> Vec<usize> {
+    let weights = plan
+        .content_groups
+        .iter()
+        .map(|group| group.iter().map(|part| part.size_bytes).sum::<u64>())
+        .collect::<Vec<_>>();
+    if weights.is_empty() {
+        return Vec::new();
+    }
+    let total_weight = weights.iter().map(|weight| u128::from(*weight)).sum::<u128>();
+    if total_weight == 0 {
+        let mut quotas = vec![plan.ref_prefix_sample_bytes / weights.len(); weights.len()];
+        for quota in quotas
+            .iter_mut()
+            .take(plan.ref_prefix_sample_bytes % weights.len())
+        {
+            *quota += 1;
+        }
+        return quotas;
+    }
+    let capacity = plan.ref_prefix_sample_bytes as u128;
+    let mut quotas = Vec::with_capacity(weights.len());
+    let mut remainders = Vec::with_capacity(weights.len());
+    let mut assigned = 0_usize;
+    for (index, weight) in weights.into_iter().enumerate() {
+        let product = capacity * u128::from(weight);
+        let quota = usize::try_from(product / total_weight)
+            .expect("proportional sample quota does not exceed total capacity");
+        assigned = assigned.saturating_add(quota);
+        quotas.push(quota);
+        remainders.push((product % total_weight, index));
+    }
+    remainders.sort_unstable_by(|left, right| {
+        right.0.cmp(&left.0).then(left.1.cmp(&right.1))
+    });
+    for (_, index) in remainders
+        .into_iter()
+        .take(plan.ref_prefix_sample_bytes.saturating_sub(assigned))
+    {
+        quotas[index] += 1;
+    }
+    quotas
+}
+
+pub(crate) fn canonical_direct_plan_id(plan: &DirectBuildPlan) -> Result<String> {
     let mut identity = plan.clone();
     identity.plan_id.clear();
     let identity = serde_json::to_vec(&identity)
         .map_err(|_| Error::Corrupt("cannot encode direct build plan"))?;
-    use sha1::Digest;
-    Ok(hex::encode(sha1::Sha1::digest(identity)))
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-struct BuildReceipt {
-    plan_id: String,
-    kind: String,
-    index: usize,
-    data_bytes: u64,
-    #[serde(default)]
-    stats: PartialStats,
-}
-
-const STAGED_GENERATION_RECEIPT_SCHEMA: u32 = 1;
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-struct StagedGenerationSegment {
-    name: String,
-    bytes: u64,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-struct StagedGenerationReceipt {
-    schema: u32,
-    plan_id: String,
-    segments: Vec<StagedGenerationSegment>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum DirectBuildLifecycleState {
-    Empty,
-    NeedsIndex,
-    NeedsCompletionMarker,
-    Ready,
-    MetadataWithoutArchive,
-    ArchiveInspectionFailed(String),
-    ReceiptMissing,
-    ReceiptUnreadable(String),
-    ReceiptMalformed(String),
-    ReceiptSchemaUnsupported(u32),
-    ForeignReceipt(String),
-    ReceiptArchiveMismatch,
-}
-
-impl DirectBuildLifecycleState {
-    fn diagnostic(&self) -> Option<String> {
-        match self {
-            Self::Empty | Self::NeedsIndex | Self::NeedsCompletionMarker | Self::Ready => None,
-            Self::MetadataWithoutArchive => {
-                Some("staged generation metadata exists without its archive".into())
-            }
-            Self::ArchiveInspectionFailed(error) => {
-                Some(format!("cannot inspect staged archive generation: {error}"))
-            }
-            Self::ReceiptMissing => {
-                Some("complete staged archive has no generation receipt".into())
-            }
-            Self::ReceiptUnreadable(error) => {
-                Some(format!("cannot read staged generation receipt: {error}"))
-            }
-            Self::ReceiptMalformed(error) => {
-                Some(format!("staged generation receipt is malformed: {error}"))
-            }
-            Self::ReceiptSchemaUnsupported(schema) => Some(format!(
-                "staged generation receipt has unsupported schema {schema}"
-            )),
-            Self::ForeignReceipt(plan_id) => Some(format!(
-                "staged generation belongs to build {plan_id}, not the active build"
-            )),
-            Self::ReceiptArchiveMismatch => Some(
-                "staged generation receipt segment inventory does not match its archive".into(),
-            ),
-        }
-    }
-}
-
-fn staged_generation_receipt_path(root: &Path) -> PathBuf {
-    root.join("archive.generation.json")
-}
-
-fn staged_generation_segments(path: &Path) -> Result<Vec<StagedGenerationSegment>> {
-    let set = crate::archive_set::ArchiveSetReader::open(path).map_err(map_archive)?;
-    let completion = set
-        .segments()
-        .last()
-        .ok_or(Error::Corrupt("staged archive has no completion segment"))?;
-    if !crate::archive::has_clean_completion_marker(path.join(&completion.name))
-        .map_err(map_archive)?
-    {
-        return Err(Error::Corrupt(
-            "staged archive has no clean completion marker",
-        ));
-    }
-    Ok(set
-        .segments()
-        .iter()
-        .map(|segment| StagedGenerationSegment {
-            name: segment.name.clone(),
-            bytes: segment.bytes,
-        })
-        .collect())
-}
-
-fn persist_staged_generation_receipt(
-    root: &Path,
-    plan: &DirectBuildPlan,
-    archive: &Path,
-) -> Result<()> {
-    let receipt = StagedGenerationReceipt {
-        schema: STAGED_GENERATION_RECEIPT_SCHEMA,
-        plan_id: plan.plan_id.clone(),
-        segments: staged_generation_segments(archive)?,
-    };
-    let path = staged_generation_receipt_path(root);
-    let mut temporary = tempfile::NamedTempFile::new_in(root)?;
-    serde_json::to_writer(&mut temporary, &receipt)
-        .map_err(|_| Error::Corrupt("cannot encode staged generation receipt"))?;
-    temporary.write_all(b"\n")?;
-    temporary.as_file().sync_all()?;
-    temporary
-        .persist(path)
-        .map_err(|error| Error::Io(error.error))?;
-    sync_directory(root)
-}
-
-fn read_staged_generation_receipt(
-    root: &Path,
-) -> std::result::Result<
-    Option<StagedGenerationReceipt>,
-    DirectBuildLifecycleState,
-> {
-    let path = staged_generation_receipt_path(root);
-    let bytes = match std::fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(DirectBuildLifecycleState::ReceiptUnreadable(
-            format!("{}: {error}", path.display()),
-        )),
-    };
-    serde_json::from_slice(&bytes).map(Some).map_err(|error| {
-        DirectBuildLifecycleState::ReceiptMalformed(format!(
-            "{}: {error}",
-            path.display()
-        ))
-    })
-}
-
-fn staged_title_index_matches(archive: &Path, titles: &Path) -> bool {
-    crate::title_index::TitleIndex::open(titles)
-        .and_then(|index| {
-            crate::archive::IndexedArchiveSet::open(archive, &index).map(|_| index)
-        })
-        .is_ok()
-}
-
-fn classify_direct_build_lifecycle(
-    root: &Path,
-    plan: &DirectBuildPlan,
-) -> DirectBuildLifecycleState {
-    let marker = root.join("archive.complete");
-    let archive = root.join("archive.swdump");
-    let titles = archive.with_extension("swtitle");
-    let marker_exists = marker.exists();
-    let titles_exist = titles.exists();
-    let receipt = match read_staged_generation_receipt(root) {
-        Ok(receipt) => receipt,
-        Err(state) => return state,
-    };
-    if !archive.exists() {
-        return if marker_exists || titles_exist || receipt.is_some() {
-            DirectBuildLifecycleState::MetadataWithoutArchive
-        } else {
-            DirectBuildLifecycleState::Empty
-        };
-    }
-    let segments = match staged_generation_segments(&archive) {
-        Ok(segments) => segments,
-        Err(error) => {
-            return DirectBuildLifecycleState::ArchiveInspectionFailed(
-                error.to_string(),
-            );
-        }
-    };
-    let Some(receipt) = receipt else {
-        return DirectBuildLifecycleState::ReceiptMissing;
-    };
-    if receipt.schema != STAGED_GENERATION_RECEIPT_SCHEMA {
-        return DirectBuildLifecycleState::ReceiptSchemaUnsupported(receipt.schema);
-    }
-    if receipt.plan_id != plan.plan_id {
-        return DirectBuildLifecycleState::ForeignReceipt(receipt.plan_id);
-    }
-    if receipt.segments != segments {
-        return DirectBuildLifecycleState::ReceiptArchiveMismatch;
-    }
-    if !staged_title_index_matches(&archive, &titles) {
-        return DirectBuildLifecycleState::NeedsIndex;
-    }
-    let marker_matches = std::fs::read_to_string(&marker)
-        .is_ok_and(|stored| stored.trim_end() == plan.plan_id);
-    if marker_matches {
-        DirectBuildLifecycleState::Ready
-    } else {
-        DirectBuildLifecycleState::NeedsCompletionMarker
-    }
+    use sha2::Digest;
+    Ok(hex::encode(sha2::Sha256::digest(identity)))
 }
 
 fn plan_part(part: &PlannedPart) -> wikimak_mediawiki::Part {
@@ -1059,6 +912,15 @@ fn planned_history(file: &PlannedHistoryFile) -> crate::sync::HistoryFile {
     }
 }
 
+fn planned_content_groups(
+    parts: Vec<wikimak_mediawiki::Part>,
+) -> Vec<Vec<PlannedPart>> {
+    crate::sync::part_groups(parts)
+        .into_iter()
+        .map(|group| group.iter().map(PlannedPart::from).collect())
+        .collect()
+}
+
 pub(crate) fn discover_direct_build_plan(
     client: &Client,
     config: &wikimak_mediawiki::Config,
@@ -1069,11 +931,7 @@ pub(crate) fn discover_direct_build_plan(
     let content_run = wikimak_mediawiki::discover_with(client, config, dbname)?;
     let (metadata_snapshot, history_files) =
         crate::sync::discover_history(client, config, dbname)?;
-    let content_groups = content_run
-        .parts
-        .iter()
-        .map(|part| vec![PlannedPart::from(part)])
-        .collect::<Vec<_>>();
+    let content_groups = planned_content_groups(content_run.parts.clone());
     if content_groups.is_empty() {
         return Err(Error::Corrupt("content dump contains no parts"));
     }
@@ -1085,7 +943,15 @@ pub(crate) fn discover_direct_build_plan(
         metadata_snapshot,
         observed_at_micros: snapshot_date_micros(content_run.date)?,
         frame_target: MIRROR_FRAME_TARGET,
-        range_target: crate::archive_set::DEFAULT_RANGE_TARGET,
+        range_target: planned_range_layout(
+            content_run
+                .parts
+                .iter()
+                .map(|part| part.size_bytes)
+                .chain(history_files.iter().map(|file| file.part.size_bytes))
+                .sum(),
+        )
+        .1,
         compression_level: 9,
         ref_prefix_sample_bytes: MIRROR_REF_PREFIX_SAMPLE_BYTES,
         ref_prefix_bytes: MIRROR_REF_PREFIX_BYTES,
@@ -1098,7 +964,7 @@ pub(crate) fn discover_direct_build_plan(
             })
             .collect(),
     };
-    plan.plan_id = direct_plan_id(&plan)?;
+    plan.plan_id = canonical_direct_plan_id(&plan)?;
     progress(&format!(
         "planned {} durable source targets ({} bytes)",
         plan.target_count(),
@@ -1116,7 +982,7 @@ pub(crate) fn read_direct_build_plan(path: &Path) -> Result<DirectBuildPlan> {
         || plan.range_target == 0
         || plan.ref_prefix_sample_bytes == 0
         || plan.ref_prefix_bytes == 0
-        || plan.plan_id != direct_plan_id(&plan)?
+        || plan.plan_id != canonical_direct_plan_id(&plan)?
     {
         return Err(Error::Corrupt("unsupported direct build plan"));
     }
@@ -1124,918 +990,10 @@ pub(crate) fn read_direct_build_plan(path: &Path) -> Result<DirectBuildPlan> {
 }
 
 fn node_path(root: &Path, plan: &DirectBuildPlan, kind: &str, index: usize) -> PathBuf {
-    root.join("nodes")
-        .join(format!(
-            "{}.done",
-            plan.target_name(kind, index)
-                .unwrap_or_else(|| format!("{kind}-{index:06}"))
-        ))
-}
-
-fn validate_node(
-    root: &Path,
-    plan: &DirectBuildPlan,
-    kind: &str,
-    index: usize,
-) -> Result<bool> {
-    let node = node_path(root, plan, kind, index);
-    let data = node.join("data.swdump");
-    let receipt: BuildReceipt = match std::fs::read(node.join("receipt.json"))
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-    {
-        Some(receipt) => receipt,
-        None => return Ok(false),
-    };
-    let receipt_index_matches = match kind {
-        "content" => plan.content_target(index).is_some_and(|(group, _, _)| {
-            receipt.index == index
-                || (plan.content_groups[group].len() == 1 && receipt.index == group)
-        }),
-        _ => receipt.index == index,
-    };
-    if receipt.plan_id != plan.plan_id
-        || receipt.kind != kind
-        || !receipt_index_matches
-        || std::fs::metadata(&data)?.len() != receipt.data_bytes
-    {
-        return Ok(false);
-    }
-    if !crate::archive::has_clean_completion_marker(&data).map_err(map_archive)? {
-        return Ok(false);
-    }
-    if kind == "content" && index == 0 {
-        if !crate::archive::has_clean_completion_marker(node.join("siteinfo.swdump"))
-            .map_err(map_archive)?
-        {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
-fn copy_or_link_file(source: &Path, destination: &Path) -> Result<()> {
-    match std::fs::hard_link(source, destination) {
-        Ok(()) => Ok(()),
-        Err(_) => {
-            std::fs::copy(source, destination)?;
-            Ok(())
-        }
-    }
-}
-
-fn grouped_partial_index(name: &str, plan: &DirectBuildPlan) -> Option<usize> {
-    let target = name
-        .strip_prefix('.')?
-        .strip_suffix(".partial")?
-        .split('.')
-        .next()?;
-    let group_index = target.strip_prefix("content-")?.parse::<usize>().ok()?;
-    (plan.content_groups.get(group_index)?.len() > 1).then_some(group_index)
-}
-
-fn owned_partial_target(name: &str) -> Option<(&str, u32)> {
-    let attempt = name
-        .strip_prefix('.')?
-        .strip_suffix(".partial")?;
-    let (target, pid) = attempt.rsplit_once('.')?;
-    Some((target, pid.parse::<u32>().ok()?))
-}
-
-fn process_is_alive(pid: u32) -> bool {
-    let Ok(pid) = i32::try_from(pid) else {
-        return false;
-    };
-    if unsafe { libc::kill(pid, 0) } == 0 {
-        true
-    } else {
-        std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-    }
-}
-
-fn grouped_source_index(name: &str) -> Option<usize> {
-    let stem = name.strip_suffix(".swdump")?;
-    stem.rsplit_once("-source-")?.1.parse::<usize>().ok()
-}
-
-fn saved_source_stats(
-    directory: &Path,
-    part: &PlannedPart,
-    archive: &Path,
-    observed_at_micros: i64,
-) -> PartialStats {
-    let key = checkpoint_key(
-        "content-source",
-        observed_at_micros,
-        [part.clone()],
-    )
-    .ok();
-    if let Some(stats) = key
-        .as_deref()
-        .and_then(|key| checkpoint_stats(archive, key))
-    {
-        return stats;
-    }
-    std::fs::read_dir(directory)
-        .ok()
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter(|entry| {
-            entry
-                .file_name()
-                .to_string_lossy()
-                .ends_with(".progress.json")
-        })
-        .filter_map(|entry| std::fs::read(entry.path()).ok())
-        .filter_map(|bytes| serde_json::from_slice::<LiveTargetProgress>(&bytes).ok())
-        .find(|value| value.part == part.filename && value.phase == "finished")
-        .map(|value| PartialStats {
-            pages: value.pages,
-            revisions: value.revisions,
-            fetch_attempts: value.fetch_attempts,
-            fetch_bytes_received: value.fetch_bytes_received,
-            fetch_rate_limit_responses: value.fetch_rate_limit_responses,
-            fetch_client_error_responses: value.fetch_client_error_responses,
-            fetch_server_error_responses: value.fetch_server_error_responses,
-            fetch_transport_errors: value.fetch_transport_errors,
-            ..Default::default()
-        })
-        .unwrap_or_default()
-}
-
-fn grouped_node_receipt(
-    root: &Path,
-    plan: &DirectBuildPlan,
-    group_index: usize,
-) -> Option<(PathBuf, BuildReceipt)> {
-    let node = root
-        .join("nodes")
-        .join(format!("content-{group_index:06}.done"));
-    let data = node.join("data.swdump");
-    let receipt = std::fs::read(node.join("receipt.json"))
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<BuildReceipt>(&bytes).ok())?;
-    if receipt.plan_id != plan.plan_id
-        || receipt.kind != "content"
-        || receipt.index != group_index
-        || std::fs::metadata(&data).ok()?.len() != receipt.data_bytes
-        || !archive_file_complete(&data)
-        || (group_index == 0 && !archive_file_complete(&node.join("siteinfo.swdump")))
-    {
-        return None;
-    }
-    Some((node, receipt))
-}
-
-fn write_empty_archive(path: &Path) -> Result<()> {
-    ArchiveWriter::new(std::fs::File::create(path)?, DEFAULT_FRAME_TARGET)
-        .map_err(map_archive)?
-        .finish()
-        .map_err(map_archive)?;
-    Ok(())
-}
-
-fn adopt_grouped_completed_nodes(root: &Path, plan: &DirectBuildPlan) -> Result<()> {
-    let nodes = root.join("nodes");
-    for group_index in 0..plan.content_groups.len() {
-        let group_len = plan.content_groups[group_index].len();
-        if group_len <= 1 {
-            continue;
-        }
-        let Some((old_node, receipt)) = grouped_node_receipt(root, plan, group_index) else {
-            continue;
-        };
-        for source_index in 0..group_len {
-            let index = plan
-                .content_target_index(group_index, source_index)
-                .ok_or(Error::Corrupt("content source is outside build plan"))?;
-            if validate_node(root, plan, "content", index).unwrap_or(false) {
-                continue;
-            }
-            let destination = node_path(root, plan, "content", index);
-            if destination.exists() {
-                if destination.is_dir() {
-                    std::fs::remove_dir_all(&destination)?;
-                } else {
-                    std::fs::remove_file(&destination)?;
-                }
-            }
-            let target = plan
-                .target_name("content", index)
-                .ok_or(Error::Corrupt("content target is outside build plan"))?;
-            let temporary = nodes.join(format!(".{target}.adopting"));
-            if temporary.exists() {
-                std::fs::remove_dir_all(&temporary)?;
-            }
-            std::fs::create_dir(&temporary)?;
-            if source_index == 0 {
-                copy_or_link_file(
-                    &old_node.join("data.swdump"),
-                    &temporary.join("data.swdump"),
-                )?;
-                if group_index == 0 {
-                    copy_or_link_file(
-                        &old_node.join("siteinfo.swdump"),
-                        &temporary.join("siteinfo.swdump"),
-                    )?;
-                }
-            } else {
-                write_empty_archive(&temporary.join("data.swdump"))?;
-            }
-            let stats = if source_index == 0 {
-                receipt.stats.clone()
-            } else {
-                PartialStats::default()
-            };
-            publish_node(root, plan, "content", index, &temporary, &stats)?;
-        }
-        if (0..group_len).all(|source_index| {
-            plan.content_target_index(group_index, source_index)
-                .is_some_and(|index| {
-                    validate_node(root, plan, "content", index).unwrap_or(false)
-                })
-        }) {
-            std::fs::remove_dir_all(old_node)?;
-        }
-    }
-    Ok(())
-}
-
-fn adopt_grouped_partial_sources(root: &Path, plan: &DirectBuildPlan) -> Result<()> {
-    let nodes = root.join("nodes");
-    let partials = std::fs::read_dir(&nodes)?
-        .filter_map(std::result::Result::ok)
-        .filter_map(|entry| {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            grouped_partial_index(&name, plan)
-                .map(|group_index| (group_index, entry.path()))
-        })
-        .collect::<Vec<_>>();
-    for (group_index, directory) in partials {
-        let archives = std::fs::read_dir(&directory)?
-            .filter_map(std::result::Result::ok)
-            .filter_map(|entry| {
-                let name = entry.file_name().to_string_lossy().into_owned();
-                grouped_source_index(&name).map(|source_index| (source_index, entry.path()))
-            })
-            .collect::<Vec<_>>();
-        for (source_index, archive) in archives {
-            let Some(index) = plan.content_target_index(group_index, source_index) else {
-                continue;
-            };
-            if validate_node(root, plan, "content", index).unwrap_or(false)
-                || !archive_file_complete(&archive)
-            {
-                continue;
-            }
-            let destination = node_path(root, plan, "content", index);
-            if destination.exists() {
-                if destination.is_dir() {
-                    std::fs::remove_dir_all(&destination)?;
-                } else {
-                    std::fs::remove_file(&destination)?;
-                }
-            }
-            let siteinfo = site_info_checkpoint_path(&archive);
-            if index == 0 && !archive_file_complete(&siteinfo) {
-                continue;
-            }
-            let target = plan
-                .target_name("content", index)
-                .ok_or(Error::Corrupt("content target is outside build plan"))?;
-            let temporary = nodes.join(format!(".{target}.adopting"));
-            if temporary.exists() {
-                std::fs::remove_dir_all(&temporary)?;
-            }
-            std::fs::create_dir(&temporary)?;
-            copy_or_link_file(&archive, &temporary.join("data.swdump"))?;
-            if index == 0 {
-                copy_or_link_file(&siteinfo, &temporary.join("siteinfo.swdump"))?;
-            }
-            let part = plan
-                .content_groups
-                .get(group_index)
-                .and_then(|group| group.get(source_index))
-                .ok_or(Error::Corrupt("content source is outside build plan"))?;
-            let stats = saved_source_stats(
-                &directory,
-                part,
-                &archive,
-                plan.observed_at_micros,
-            );
-            publish_node(root, plan, "content", index, &temporary, &stats)?;
-        }
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-fn prune_invalid_build_nodes(root: &Path, plan: &DirectBuildPlan) -> Result<usize> {
-    prune_invalid_build_nodes_observing(root, plan, &|_| {})
-}
-
-pub(crate) fn prune_invalid_build_nodes_observing(
-    root: &Path,
-    plan: &DirectBuildPlan,
-    progress: &(impl Fn(&str) + Sync),
-) -> Result<usize> {
-    std::fs::create_dir_all(root.join("nodes"))?;
-    progress("checking for completed source nodes from earlier runs");
-    adopt_grouped_completed_nodes(root, plan)?;
-    adopt_grouped_partial_sources(root, plan)?;
-    let mut reusable = 0;
-    let total = plan.target_count();
-    let mut checked = 0_usize;
-    let mut checked_bytes = 0_u64;
-    let started = Instant::now();
-    for (kind, count) in [
-        ("content", plan.content_target_count()),
-        ("history", plan.history_files.len()),
-    ] {
-        for index in 0..count {
-            let path = node_path(root, plan, kind, index);
-            if validate_node(root, plan, kind, index).unwrap_or(false) {
-                reusable += 1;
-            } else if path.exists() {
-                std::fs::remove_dir_all(path)?;
-            }
-            checked += 1;
-            checked_bytes = checked_bytes.saturating_add(
-                std::fs::metadata(
-                    node_path(root, plan, kind, index).join("data.swdump"),
-                )
-                .map(|metadata| metadata.len())
-                .unwrap_or(0),
-            );
-            if checked % 10 == 0 || checked == total {
-                progress(&format!(
-                    "validated {checked}/{total} source nodes · {reusable} reusable · {} checked · elapsed {}",
-                    human_progress_bytes(checked_bytes),
-                    duration_summary(started.elapsed().as_secs()),
-                ));
-            }
-        }
-    }
-    for entry in std::fs::read_dir(root.join("nodes"))? {
-        let entry = entry?;
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if name.starts_with('.') {
-            let path = entry.path();
-            if path.is_dir() {
-                std::fs::remove_dir_all(path)?;
-            } else {
-                std::fs::remove_file(path)?;
-            }
-        }
-    }
-    for entry in std::fs::read_dir(root)? {
-        let entry = entry?;
-        if entry.file_type()?.is_dir()
-            && entry.file_name().to_string_lossy().starts_with(".tmp")
-        {
-            std::fs::remove_dir_all(entry.path())?;
-        }
-    }
-    Ok(reusable)
-}
-
-fn persist_completion_marker(root: &Path, plan: &DirectBuildPlan) -> Result<()> {
-    let marker = root.join("archive.complete");
-    {
-        let mut file = std::fs::File::create(&marker)?;
-        file.write_all(plan.plan_id.as_bytes())?;
-        file.write_all(b"\n")?;
-        file.sync_all()?;
-    }
-    sync_directory(root)
-}
-
-pub(crate) fn recover_direct_build_completion(
-    root: &Path,
-    plan: &DirectBuildPlan,
-    progress: &(impl Fn(&str) + Sync),
-) -> Result<bool> {
-    let output = root.join("archive.swdump");
-    let titles = output.with_extension("swtitle");
-    match classify_direct_build_lifecycle(root, plan) {
-        DirectBuildLifecycleState::Empty => Ok(false),
-        DirectBuildLifecycleState::NeedsIndex => {
-            progress("completed archive recovered; building title and frame index");
-            crate::title_index::build(&output, &titles).map_err(map_archive)?;
-            progress("title and frame index rebuilt from completed archive");
-            persist_completion_marker(root, plan)?;
-            Ok(true)
-        }
-        DirectBuildLifecycleState::NeedsCompletionMarker => {
-            progress("completed archive and title index recovered; finalizing generation");
-            persist_completion_marker(root, plan)?;
-            Ok(true)
-        }
-        DirectBuildLifecycleState::Ready => {
-            progress("completed archive and title index recovered");
-            Ok(true)
-        }
-        inconsistent => {
-            let reason = inconsistent
-                .diagnostic()
-                .expect("all recoverable lifecycle states matched above");
-            Err(Error::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                reason,
-            )))
-        }
-    }
-}
-
-pub fn mirror_build_progress(archive: impl AsRef<Path>) -> Option<MirrorBuildProgress> {
-    let root = crate::cli::mirror_scratch_path(archive.as_ref());
-    let plan = read_direct_build_plan(&root.join("plan.json")).ok()?;
-    let total = plan.target_count() as u64;
-    let network_history = read_network_history(&root, &plan);
-    let lifecycle = classify_direct_build_lifecycle(&root, &plan);
-    if lifecycle != DirectBuildLifecycleState::Empty {
-        let phase = match lifecycle {
-            DirectBuildLifecycleState::NeedsIndex => "indexing completed archive".into(),
-            DirectBuildLifecycleState::NeedsCompletionMarker => {
-                "finalizing completed archive and index".into()
-            }
-            DirectBuildLifecycleState::Ready => {
-                "completed generation awaiting installation".into()
-            }
-            DirectBuildLifecycleState::Empty => unreachable!("filtered above"),
-            inconsistent => inconsistent
-                .diagnostic()
-                .expect("all consistent lifecycle states matched above"),
-        };
-        return Some(MirrorBuildProgress {
-            phase,
-            targets_total: total,
-            targets_completed: total,
-            target_progress: Vec::new(),
-            source_bytes_total: plan.source_bytes(),
-            source_bytes_completed: plan.source_bytes(),
-            active_source_bytes_per_second: None,
-            active_quiet_seconds: None,
-            fetch_attempts: network_history
-                .as_ref()
-                .map_or(0, |history| history.fetch_attempts),
-            fetch_bytes_received: network_history
-                .as_ref()
-                .map_or(0, |history| history.fetch_bytes_received),
-            fetch_rate_limit_responses: network_history
-                .as_ref()
-                .map_or(0, |history| history.fetch_rate_limit_responses),
-            fetch_client_error_responses: network_history
-                .as_ref()
-                .map_or(0, |history| history.fetch_client_error_responses),
-            fetch_server_error_responses: network_history
-                .as_ref()
-                .map_or(0, |history| history.fetch_server_error_responses),
-            fetch_transport_errors: network_history
-                .as_ref()
-                .map_or(0, |history| history.fetch_transport_errors),
-            snapshot: plan.content_snapshot,
-            ..Default::default()
-        });
-    }
-    let historical_targets = network_history
-        .as_ref()
-        .map(|history| &history.targets);
-    let mut completed = 0_u64;
-    let mut completed_bytes = 0_u64;
-    let mut fetch_attempts = network_history
-        .as_ref()
-        .map_or(0, |history| history.fetch_attempts);
-    let mut fetch_bytes_received = network_history
-        .as_ref()
-        .map_or(0, |history| history.fetch_bytes_received);
-    let mut fetch_rate_limit_responses = network_history
-        .as_ref()
-        .map_or(0, |history| history.fetch_rate_limit_responses);
-    let mut fetch_client_error_responses = network_history
-        .as_ref()
-        .map_or(0, |history| history.fetch_client_error_responses);
-    let mut fetch_server_error_responses = network_history
-        .as_ref()
-        .map_or(0, |history| history.fetch_server_error_responses);
-    let mut fetch_transport_errors = network_history
-        .as_ref()
-        .map_or(0, |history| history.fetch_transport_errors);
-    for (kind, count) in [
-        ("content", plan.content_target_count()),
-        ("history", plan.history_files.len()),
-    ] {
-        for index in 0..count {
-            let receipt_path = node_path(&root, &plan, kind, index).join("receipt.json");
-            if receipt_path.is_file() {
-                completed += 1;
-                completed_bytes =
-                    completed_bytes.saturating_add(plan.target_source_bytes(kind, index));
-                let target_name = plan
-                    .target_name(kind, index)
-                    .unwrap_or_else(|| format!("{kind}-{index:06}"));
-                let receipt_is_historical = historical_targets
-                    .is_some_and(|targets| targets.contains(&target_name));
-                if !receipt_is_historical {
-                    if let Ok(bytes) = std::fs::read(receipt_path) {
-                        if let Ok(receipt) = serde_json::from_slice::<BuildReceipt>(&bytes) {
-                            fetch_attempts = fetch_attempts
-                                .saturating_add(receipt.stats.fetch_attempts);
-                            fetch_bytes_received = fetch_bytes_received
-                                .saturating_add(receipt.stats.fetch_bytes_received);
-                            fetch_rate_limit_responses = fetch_rate_limit_responses
-                                .saturating_add(receipt.stats.fetch_rate_limit_responses);
-                            fetch_client_error_responses = fetch_client_error_responses
-                                .saturating_add(receipt.stats.fetch_client_error_responses);
-                            fetch_server_error_responses = fetch_server_error_responses
-                                .saturating_add(receipt.stats.fetch_server_error_responses);
-                            fetch_transport_errors = fetch_transport_errors
-                                .saturating_add(receipt.stats.fetch_transport_errors);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    let active_dirs = std::fs::read_dir(root.join("nodes"))
-        .ok()?
-        .filter_map(std::result::Result::ok)
-        .filter_map(|entry| {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let (target, pid) = owned_partial_target(&name)?;
-            process_is_alive(pid).then(|| (target.to_owned(), entry.path()))
-        })
-        .collect::<Vec<_>>();
-    let mut active = Vec::new();
-    let mut target_progress = Vec::new();
-    let mut active_rate = 0_u64;
-    let mut active_quiet = 0_u64;
-    let mut failed_target = false;
-    let mut live_target = false;
-    for (target, path) in active_dirs {
-        if active.iter().any(|item: &String| item.starts_with(&target)) {
-            continue;
-        }
-        let Some((kind, index)) = plan.target_index(&target) else {
-            active.push(target);
-            continue;
-        };
-        let mut live = Vec::new();
-        if let Ok(entries) = std::fs::read_dir(&path) {
-            for entry in entries.flatten() {
-                let file_name = entry.file_name();
-                if !file_name.to_string_lossy().ends_with(".progress.json") {
-                    continue;
-                }
-                if let Ok(bytes) = std::fs::read(entry.path()) {
-                    if let Ok(value) = serde_json::from_slice::<LiveTargetProgress>(&bytes) {
-                        live.push(value);
-                    }
-                }
-            }
-        }
-        if live.is_empty() {
-            // A dot-prefixed node is not proof that a worker is alive. It
-            // survives a killed worker and is retained for resumability, so
-            // expose it as stale state instead of inventing a dependency on
-            // a coordination service that is not part of the mirror job.
-            failed_target = true;
-            target_progress.push(MirrorTargetProgress {
-                target: target.clone(),
-                kind: kind.to_owned(),
-                phase: "stale build state (no progress record)".into(),
-                source_bytes_total: plan.target_source_bytes(kind, index),
-                ..Default::default()
-            });
-            active.push(format!("{target} · stale build state (no progress record)"));
-            continue;
-        }
-        let downloaded = live
-            .iter()
-            .map(|value| value.source_bytes_read)
-            .sum::<u64>();
-        let total = live
-            .iter()
-            .map(|value| value.source_bytes_total)
-            .sum::<u64>();
-        let revisions = live.iter().map(|value| value.revisions).sum::<u64>();
-        let text_bytes = live.iter().map(|value| value.text_bytes).sum::<u64>();
-        if historical_targets.is_none_or(|targets| !targets.contains(&target)) {
-            fetch_attempts = fetch_attempts.saturating_add(
-                live.iter()
-                    .map(|value| value.fetch_attempts)
-                    .sum::<u64>(),
-            );
-            fetch_bytes_received = fetch_bytes_received.saturating_add(
-                live.iter()
-                    .map(|value| value.fetch_bytes_received)
-                    .sum::<u64>(),
-            );
-            fetch_rate_limit_responses = fetch_rate_limit_responses.saturating_add(
-                live.iter()
-                    .map(|value| value.fetch_rate_limit_responses)
-                    .sum::<u64>(),
-            );
-            fetch_client_error_responses = fetch_client_error_responses.saturating_add(
-                live.iter()
-                    .map(|value| value.fetch_client_error_responses)
-                    .sum::<u64>(),
-            );
-            fetch_server_error_responses = fetch_server_error_responses.saturating_add(
-                live.iter()
-                    .map(|value| value.fetch_server_error_responses)
-                    .sum::<u64>(),
-            );
-            fetch_transport_errors = fetch_transport_errors.saturating_add(
-                live.iter()
-                    .map(|value| value.fetch_transport_errors)
-                    .sum::<u64>(),
-            );
-        }
-        let phase_is_failed = |value: &LiveTargetProgress| {
-            let phase = value.phase.to_ascii_lowercase();
-            phase.contains("failed") || phase.contains("error") || phase.contains("stopped")
-        };
-        // A sibling source can continue briefly after another one fails. Its
-        // newer heartbeat must not hide the failed source that will determine
-        // the target result.
-        let current = live
-            .iter()
-            .filter(|value| phase_is_failed(value))
-            .max_by_key(|value| value.updated_at_micros)
-            .or_else(|| {
-                live.iter()
-                    .filter(|value| value.phase != "finished")
-                    .max_by_key(|value| value.updated_at_micros)
-            })
-            .or_else(|| live.iter().max_by_key(|value| value.updated_at_micros))
-            .expect("live progress is non-empty");
-        let observed_now = now_micros();
-        let source_rate = |value: &LiveTargetProgress| {
-            let elapsed = observed_now.saturating_sub(value.started_at_micros);
-            if elapsed == 0 {
-                0
-            } else {
-                value.source_bytes_read.saturating_mul(1_000_000) / elapsed
-            }
-        };
-        let source_quiet = |value: &LiveTargetProgress| {
-            observed_now.saturating_sub(value.updated_at_micros) / 1_000_000
-        };
-        let rate = live
-            .iter()
-            .filter(|value| value.phase != "finished" && !phase_is_failed(value))
-            .map(source_rate)
-            .sum::<u64>();
-        let quiet_seconds = source_quiet(current);
-        let target_total = plan.target_source_bytes(kind, index);
-        let total = total.max(target_total);
-        let percent = (total > 0)
-            .then(|| downloaded.saturating_mul(100) / total)
-            .unwrap_or(0);
-        let title = if current.current_title.is_empty() {
-            String::new()
-        } else {
-            format!(" · {}", current.current_title.chars().take(80).collect::<String>())
-        };
-        let source_file = if current.part.is_empty() {
-            String::new()
-        } else {
-            format!(
-                " · source {}",
-                current.part.chars().take(96).collect::<String>()
-            )
-        };
-        let all_sources_finished = live.iter().all(|value| value.phase == "finished");
-        let phase = if all_sources_finished {
-            "merging completed source fragments"
-        } else if current.phase.is_empty() {
-            "working"
-        } else {
-            current.phase.as_str()
-        };
-        let is_failed = live.iter().any(phase_is_failed);
-        failed_target |= is_failed;
-        if !is_failed {
-            live_target = true;
-            active_rate = active_rate.saturating_add(rate);
-            let quietest_source = live
-                .iter()
-                .filter(|value| value.phase != "finished")
-                .map(source_quiet)
-                .max()
-                .unwrap_or(quiet_seconds);
-            active_quiet = active_quiet.max(quietest_source);
-        }
-        let record_label = if kind == "history" { "events" } else { "revisions" };
-        let waiting_for_source = current.source_bytes_read == 0
-            && current.revisions == 0
-            && (phase.contains("network") || phase.contains("source bytes"));
-        let heartbeat_seconds = (current.heartbeat_at_micros > 0)
-            .then(|| {
-                now_micros()
-                    .saturating_sub(current.heartbeat_at_micros)
-                    / 1_000_000
-            })
-            .unwrap_or(u64::MAX);
-        let phase_seconds = (current.phase_started_at_micros > 0)
-            .then(|| {
-                now_micros()
-                    .saturating_sub(current.phase_started_at_micros)
-                    / 1_000_000
-            })
-            .unwrap_or(0);
-        let quiet = if quiet_seconds >= 10 {
-            format!(
-                " · no data progress for {quiet_seconds}s ({})",
-                if heartbeat_seconds <= 5 {
-                    format!("worker heartbeat {heartbeat_seconds}s ago")
-                } else if waiting_for_source {
-                    "waiting for source bytes and heartbeat is quiet".into()
-                } else {
-                    "parser/encoder heartbeat quiet".into()
-                }
-            )
-        } else {
-            String::new()
-        };
-        if all_sources_finished {
-            target_progress.push(MirrorTargetProgress {
-                target: target.clone(),
-                kind: kind.to_owned(),
-                phase: phase.to_owned(),
-                source_bytes_read: downloaded,
-                source_bytes_total: total,
-                decoded_bytes: live.iter().map(|value| value.decoded_bytes).sum(),
-                pages: live.iter().map(|value| value.pages).sum(),
-                records: revisions,
-                text_bytes,
-                quiet_seconds,
-                heartbeat_seconds,
-                phase_seconds,
-                cpu_user_micros: current.cpu_user_micros,
-                cpu_system_micros: current.cpu_system_micros,
-                peak_rss_bytes: current.peak_rss_bytes,
-                fetch_attempts: live.iter().map(|value| value.fetch_attempts).sum(),
-                fetch_bytes_received: live
-                    .iter()
-                    .map(|value| value.fetch_bytes_received)
-                    .sum(),
-                fetch_rate_limit_responses: live
-                    .iter()
-                    .map(|value| value.fetch_rate_limit_responses)
-                    .sum(),
-                fetch_client_error_responses: live
-                    .iter()
-                    .map(|value| value.fetch_client_error_responses)
-                    .sum(),
-                fetch_server_error_responses: live
-                    .iter()
-                    .map(|value| value.fetch_server_error_responses)
-                    .sum(),
-                fetch_transport_errors: live
-                    .iter()
-                    .map(|value| value.fetch_transport_errors)
-                    .sum(),
-                ..Default::default()
-            });
-        } else {
-            let mut visible = live
-                .iter()
-                .filter(|value| value.phase != "finished" || phase_is_failed(value))
-                .collect::<Vec<_>>();
-            visible.sort_by_key(|value| value.part.clone());
-            for value in visible {
-                let heartbeat = (value.heartbeat_at_micros > 0)
-                    .then(|| {
-                        observed_now.saturating_sub(value.heartbeat_at_micros) / 1_000_000
-                    })
-                    .unwrap_or(u64::MAX);
-                let phase_age = (value.phase_started_at_micros > 0)
-                    .then(|| {
-                        observed_now.saturating_sub(value.phase_started_at_micros) / 1_000_000
-                    })
-                    .unwrap_or(0);
-                target_progress.push(MirrorTargetProgress {
-                    target: target.clone(),
-                    kind: kind.to_owned(),
-                    phase: if value.phase.is_empty() {
-                        "working".into()
-                    } else {
-                        value.phase.clone()
-                    },
-                    source: value.part.clone(),
-                    source_bytes_read: value.source_bytes_read,
-                    source_bytes_total: value.source_bytes_total,
-                    decoded_bytes: value.decoded_bytes,
-                    bytes_per_second: source_rate(value),
-                    pages: value.pages,
-                    records: value.revisions,
-                    text_bytes: value.text_bytes,
-                    current_page: value.current_page,
-                    current_title: value.current_title.clone(),
-                    quiet_seconds: source_quiet(value),
-                    heartbeat_seconds: heartbeat,
-                    phase_seconds: phase_age,
-                    fetch_attempts: value.fetch_attempts,
-                    fetch_bytes_received: value.fetch_bytes_received,
-                    fetch_rate_limit_responses: value.fetch_rate_limit_responses,
-                    fetch_client_error_responses: value.fetch_client_error_responses,
-                    fetch_server_error_responses: value.fetch_server_error_responses,
-                    fetch_transport_errors: value.fetch_transport_errors,
-                    cpu_user_micros: value.cpu_user_micros,
-                    cpu_system_micros: value.cpu_system_micros,
-                    peak_rss_bytes: value.peak_rss_bytes,
-                });
-            }
-        }
-        active.push(format!(
-            "{target} · {phase} · {percent}% source · {} / {} at {}/s · {} {record_label} · {} text{}{}{}",
-            human_progress_bytes(downloaded),
-            human_progress_bytes(total),
-            human_progress_bytes(rate),
-            revisions,
-            human_progress_bytes(text_bytes),
-            source_file,
-            title,
-            quiet,
-        ));
-        completed_bytes = completed_bytes.saturating_add(downloaded);
-    }
-    let assembly = std::fs::read(assembly_progress_path(&root))
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<AssemblyProgressSnapshot>(&bytes).ok())
-        .filter(|value| value.plan_id == plan.plan_id && process_is_alive(value.pid));
-    if let Some(value) = &assembly {
-        let quiet_seconds = now_micros()
-            .saturating_sub(value.updated_at_micros)
-            / 1_000_000;
-        target_progress.clear();
-        target_progress.push(MirrorTargetProgress {
-            target: "assembly".into(),
-            kind: "assembly".into(),
-            phase: value.phase.clone(),
-            source_bytes_read: value.input_bytes,
-            source_bytes_total: value.input_bytes_total,
-            decoded_bytes: value.output_bytes,
-            bytes_per_second: value.bytes_per_second,
-            pages: value.current_entity_id,
-            records: value.records,
-            current_page: value.current_entity_id,
-            quiet_seconds,
-            heartbeat_seconds: quiet_seconds,
-            phase_seconds: now_micros()
-                .saturating_sub(value.started_at_micros)
-                / 1_000_000,
-            cpu_user_micros: value.cpu_user_micros,
-            cpu_system_micros: value.cpu_system_micros,
-            peak_rss_bytes: value.peak_rss_bytes,
-            ..Default::default()
-        });
-        active.clear();
-        active.push(format!(
-            "assembly · {} · input {} / {} · output {} · {} records",
-            value.phase,
-            human_progress_bytes(value.input_bytes),
-            human_progress_bytes(value.input_bytes_total),
-            human_progress_bytes(value.output_bytes),
-            value.records,
-        ));
-        active_rate = value.bytes_per_second;
-        active_quiet = quiet_seconds;
-        live_target = true;
-    }
-    active.sort();
-    let has_active = live_target;
-    Some(MirrorBuildProgress {
-        phase: if let Some(value) = &assembly {
-            format!("assembling · {}", value.phase)
-        } else if failed_target {
-            "failed; inspect target details".into()
-        } else if !active.is_empty() || completed < total {
-            "fetching and parsing".into()
-        } else if root.join("stage2.mk").exists() {
-            "assembling".into()
-        } else {
-            "preparing assembly".into()
-        },
-        targets_total: total,
-        targets_completed: completed,
-        target_progress,
-        targets_active: active,
-        source_bytes_total: plan.source_bytes(),
-        source_bytes_completed: completed_bytes,
-        active_source_bytes_per_second: has_active.then_some(active_rate),
-        active_quiet_seconds: has_active.then_some(active_quiet),
-        fetch_attempts,
-        fetch_bytes_received,
-        fetch_rate_limit_responses,
-        fetch_client_error_responses,
-        fetch_server_error_responses,
-        fetch_transport_errors,
-        snapshot: plan.content_snapshot,
-    })
+    let kind = crate::build_lifecycle::TargetKind::parse(kind)
+        .expect("direct build target kind is fixed by the plan");
+    crate::build_lifecycle::target_path(root, plan, kind, index)
+        .expect("direct build target index came from the validated plan")
 }
 
 fn human_progress_bytes(bytes: u64) -> String {
@@ -2073,26 +1031,38 @@ fn publish_node(
     if temporary.join("siteinfo.swdump").exists() {
         std::fs::File::open(temporary.join("siteinfo.swdump"))?.sync_all()?;
     }
-    let receipt_index = match kind {
-        "content" => plan
-            .content_target(index)
-            .map_or(index, |(group, _, _)| {
-                if plan.content_groups[group].len() == 1 {
-                    group
-                } else {
-                    index
-                }
-            }),
-        _ => index,
-    };
-    let receipt = BuildReceipt {
-        plan_id: plan.plan_id.clone(),
-        kind: kind.to_owned(),
-        index: receipt_index,
+    if temporary.join("newest.samples").exists() {
+        std::fs::File::open(temporary.join("newest.samples"))?.sync_all()?;
+    }
+    std::fs::File::open(temporary.join("title-records.swdump"))?.sync_all()?;
+    std::fs::File::open(temporary.join("data.swframe"))?.sync_all()?;
+    let kind = crate::build_lifecycle::TargetKind::parse(kind)
+        .ok_or(Error::Corrupt("unknown direct build target kind"))?;
+    let siteinfo_bytes = temporary
+        .join("siteinfo.swdump")
+        .exists()
+        .then(|| std::fs::metadata(temporary.join("siteinfo.swdump")).map(|value| value.len()))
+        .transpose()?;
+    let sample_bytes = temporary
+        .join("newest.samples")
+        .exists()
+        .then(|| std::fs::metadata(temporary.join("newest.samples")).map(|value| value.len()))
+        .transpose()?;
+    let receipt = crate::build_lifecycle::make_target_receipt(
+        plan,
+        kind,
+        index,
         data_bytes,
-        stats: stats.clone(),
-    };
+        siteinfo_bytes,
+        sample_bytes,
+        stats.clone(),
+    )
+    .map_err(map_invalid_build)?;
     let receipt_path = temporary.join("receipt.json");
+    let checkpoint = temporary.join("checkpoint.json");
+    if checkpoint.exists() {
+        std::fs::remove_file(&checkpoint)?;
+    }
     {
         let mut output = std::fs::File::create(&receipt_path)?;
         serde_json::to_writer(&mut output, &receipt)
@@ -2101,23 +1071,11 @@ fn publish_node(
         output.sync_all()?;
     }
     sync_directory(temporary)?;
-    let destination = node_path(root, plan, kind, index);
+    let destination = node_path(root, plan, kind.as_str(), index);
     std::fs::rename(temporary, &destination)?;
-    // Finished source sidecars remain beside their intermediate archives
-    // until this atomic publish so the target's live byte count cannot move
-    // backwards. The durable receipt supersedes them after publication.
-    for entry in std::fs::read_dir(&destination)? {
-        let entry = entry?;
-        if entry
-            .file_name()
-            .to_string_lossy()
-            .ends_with(".progress.json")
-        {
-            std::fs::remove_file(entry.path())?;
-        }
-    }
     sync_directory(&destination)?;
     sync_directory(&root.join("nodes"))?;
+    crate::progress_projection::mark_target_completed(root, plan, kind.as_str(), index);
     Ok(())
 }
 
@@ -2130,19 +1088,43 @@ pub(crate) fn materialize_direct_build_node(
     bz2_workers: usize,
     progress: &(impl Fn(&str) + Sync),
 ) -> Result<()> {
-    if validate_node(root, plan, kind, index)? {
-        progress(&format!("reusing {kind} target {}/{}", index + 1, plan.target_count()));
-        return Ok(());
+    let target_kind = crate::build_lifecycle::TargetKind::parse(kind)
+        .ok_or(Error::Corrupt("unknown direct build target kind"))?;
+    let target = crate::build_lifecycle::inspect_target_for_materialization(
+        root,
+        plan,
+        target_kind,
+        index,
+    )
+    .map_err(map_invalid_build)?;
+    match crate::build_lifecycle::transition_target(
+        &target.state,
+        crate::build_lifecycle::TargetEvent::Begin,
+    )
+    .map_err(|_| Error::Corrupt("invalid target begin transition"))?
+    {
+        crate::build_lifecycle::TargetTransition::Reuse => {
+            progress(&format!(
+                "reusing {kind} target {}/{}",
+                index + 1,
+                plan.target_count()
+            ));
+            return Ok(());
+        }
+        crate::build_lifecycle::TargetTransition::Start
+        | crate::build_lifecycle::TargetTransition::Resume => {}
+        _ => return Err(Error::Corrupt("target begin produced a non-begin decision")),
     }
     let target_name = plan
         .target_name(kind, index)
         .ok_or(Error::Corrupt("target is outside build plan"))?;
-    let temporary = root
-        .join("nodes")
-        .join(format!(
-            ".{target_name}.{}.partial",
-            std::process::id()
-        ));
+    let temporary = crate::build_lifecycle::target_partial_path(
+        root,
+        plan,
+        target_kind,
+        index,
+    )
+    .map_err(map_invalid_build)?;
     std::fs::create_dir_all(&temporary)?;
     // A target can spend many minutes inside one blocking read/write call:
     // durable receipts only appear after the whole target is complete, and
@@ -2180,25 +1162,35 @@ pub(crate) fn materialize_direct_build_node(
         }
         progress(message);
     };
-    let result: Result<PartialStats> = match kind {
+    let result: Result<PartialStats> = (|| match kind {
         "content" => {
-            let part = plan_part(
-                plan.content_target(index)
-                    .ok_or(Error::Corrupt("content target is outside build plan"))?
-                    .2,
-            );
-            let part_path = temporary.join(format!("{target_name}.swdump"));
-            let built = build_content_part(
+            let parts = plan
+                .content_target(index)
+                .ok_or(Error::Corrupt("content target is outside build plan"))?
+                .iter()
+                .map(plan_part)
+                .collect::<Vec<_>>();
+            let built = build_content_group(
                 client,
-                &part,
-                &part_path,
+                &parts,
+                index,
+                &temporary,
                 bz2_workers,
                 plan.observed_at_micros,
                 true,
+                Some(content_sample_quotas(plan)[index]),
                 &report,
             )?;
             let built_stats = built.stats.clone();
             std::fs::rename(built.path, temporary.join("data.swdump"))?;
+            std::fs::rename(
+                built.title_path,
+                temporary.join("title-records.swdump"),
+            )?;
+            let samples = built
+                .samples
+                .ok_or(Error::Corrupt("content target produced no newest-revision samples"))?;
+            std::fs::rename(samples, temporary.join("newest.samples"))?;
             if index == 0 {
                 let site_info = built
                     .site_info
@@ -2236,11 +1228,13 @@ pub(crate) fn materialize_direct_build_node(
                 cancelled,
                 &report,
             )?;
+            let title_path = path.with_extension("titles.swdump");
             std::fs::rename(path, temporary.join("data.swdump"))?;
+            std::fs::rename(title_path, temporary.join("title-records.swdump"))?;
             Ok(stats)
         }
         _ => Err(Error::Corrupt("unknown direct build target kind")),
-    };
+    })();
     heartbeat_stop.store(true, Ordering::Relaxed);
     let _ = heartbeat.join();
     let stats = match result {
@@ -2249,11 +1243,64 @@ pub(crate) fn materialize_direct_build_node(
             let message = format!("failed {kind} target {}: {error}", index + 1);
             eprintln!("{message}");
             progress(&message);
-            // Keep the failed node and its per-source sidecars for diagnosis.
-            // A resumed build removes this dot-prefixed attempt before retrying.
+            // Keep the failed node for diagnosis. A resumed build removes this
+            // dot-prefixed attempt before retrying; plan-bound telemetry stays
+            // in the shared projection.
             return Err(error);
         }
     };
+    crate::frame_directory::write_from_archive(
+        temporary.join("data.swdump"),
+        temporary.join("data.swframe"),
+        crate::build_lifecycle::target_frame_directory_identity(
+            plan,
+            target_kind,
+            index,
+        )
+        .map_err(map_invalid_build)?,
+    )
+    .map_err(map_archive)?;
+    if crate::build_lifecycle::transition_target(
+        &target.state,
+        crate::build_lifecycle::TargetEvent::Checkpoint,
+    )
+    .map_err(|_| Error::Corrupt("invalid target checkpoint transition"))?
+        != crate::build_lifecycle::TargetTransition::PersistCheckpoint
+    {
+        return Err(Error::Corrupt(
+            "target checkpoint produced a non-checkpoint decision",
+        ));
+    }
+    let checkpoint = crate::build_lifecycle::make_target_checkpoint(
+        root,
+        plan,
+        target_kind,
+        index,
+    )
+    .map_err(map_invalid_build)?;
+    crate::build_lifecycle::persist_receipt(
+        &temporary.join("checkpoint.json"),
+        &checkpoint,
+    )
+    .map_err(map_invalid_build)?;
+    let checkpointed = crate::build_lifecycle::inspect_target_for_materialization(
+        root,
+        plan,
+        target_kind,
+        index,
+    )
+    .map_err(map_invalid_build)?;
+    if crate::build_lifecycle::transition_target(
+        &checkpointed.state,
+        crate::build_lifecycle::TargetEvent::Publish,
+    )
+    .map_err(|_| Error::Corrupt("invalid target publish transition"))?
+        != crate::build_lifecycle::TargetTransition::Publish
+    {
+        return Err(Error::Corrupt(
+            "target publish produced a non-publish decision",
+        ));
+    }
     publish_node(root, plan, kind, index, &temporary, &stats)?;
     progress(&format!("finished {kind} target {}", index + 1));
     Ok(())
@@ -2263,11 +1310,84 @@ struct AssemblyTelemetry {
     phase: AtomicU64,
     phase_current: AtomicU64,
     phase_total: AtomicU64,
-    input_bytes: AtomicU64,
+    input_bytes: Arc<AtomicU64>,
     output_bytes: AtomicU64,
     records: AtomicU64,
     entity_kind: AtomicU64,
     entity_id: AtomicU64,
+}
+
+struct SequentialTargetReaders {
+    targets: std::vec::IntoIter<(PathBuf, PathBuf, [u8; 32])>,
+    current: Option<ArchiveRecordReader>,
+    last_entity: Option<EntityKey>,
+    at_target_start: bool,
+    resume_after: Option<EntityKey>,
+    completed_compressed_bytes: Arc<AtomicU64>,
+}
+
+impl SequentialTargetReaders {
+    fn new(
+        targets: Vec<(PathBuf, PathBuf, [u8; 32])>,
+        resume_after: Option<EntityKey>,
+        completed_compressed_bytes: Arc<AtomicU64>,
+    ) -> Self {
+        Self {
+            targets: targets.into_iter(),
+            current: None,
+            last_entity: None,
+            at_target_start: false,
+            resume_after,
+            completed_compressed_bytes,
+        }
+    }
+}
+
+impl RecordSource for SequentialTargetReaders {
+    fn next_record(&mut self) -> crate::archive::Result<Option<Record>> {
+        loop {
+            if let Some(current) = self.current.as_mut() {
+                if let Some(record) = current.next_record()? {
+                    let entity = record.entity();
+                    if self.at_target_start
+                        && self.last_entity.is_some_and(|last| entity <= last)
+                    {
+                        return Err(ArchiveError::Invalid(
+                            "sequential content targets overlap or are out of order",
+                        ));
+                    }
+                    self.at_target_start = false;
+                    self.last_entity = Some(entity);
+                    return Ok(Some(record));
+                }
+                self.current = None;
+            }
+            let Some((archive, directory_path, identity)) = self.targets.next() else {
+                return Ok(None);
+            };
+            let directory = Arc::new(
+                crate::frame_directory::FrameDirectory::open_bound(
+                    directory_path,
+                    identity,
+                )?,
+            );
+            let position = self
+                .resume_after
+                .map_or(0, |boundary| directory.first_after_entity(boundary));
+            if position == directory.len() {
+                continue;
+            }
+            self.current = Some(
+                ArchiveRecordReader::open_frame_directory_accounted(
+                    archive,
+                    directory,
+                    position,
+                    Arc::clone(&self.completed_compressed_bytes),
+                )?,
+            );
+            self.at_target_start = true;
+        }
+    }
 }
 
 impl AssemblyTelemetry {
@@ -2276,7 +1396,7 @@ impl AssemblyTelemetry {
             phase: AtomicU64::new(0),
             phase_current: AtomicU64::new(0),
             phase_total: AtomicU64::new(0),
-            input_bytes: AtomicU64::new(0),
+            input_bytes: Arc::new(AtomicU64::new(0)),
             output_bytes: AtomicU64::new(0),
             records: AtomicU64::new(0),
             entity_kind: AtomicU64::new(0),
@@ -2285,23 +1405,39 @@ impl AssemblyTelemetry {
     }
 }
 
-struct AssemblyProgressWriter<W> {
-    inner: W,
+struct AssemblyProgressWriter<'a> {
+    inner: crate::archive_set::ArchiveSetOutput,
     output_bytes: Arc<AssemblyTelemetry>,
+    root: &'a Path,
+    plan: &'a DirectBuildPlan,
+    sealed_segments: usize,
+    checkpoint: crate::build_lifecycle::AssemblyCheckpointTracker,
 }
 
-impl<W> AssemblyProgressWriter<W> {
-    fn into_inner(self) -> W {
+impl AssemblyProgressWriter<'_> {
+    fn checkpoint(&mut self) -> std::io::Result<()> {
+        self.checkpoint
+            .checkpoint(self.root, self.plan, self.inner.segments())
+            .map(|_| ())
+            .map_err(std::io::Error::other)
+    }
+
+    fn into_inner(self) -> crate::archive_set::ArchiveSetOutput {
         self.inner
     }
 }
 
-impl<W: Write> Write for AssemblyProgressWriter<W> {
+impl Write for AssemblyProgressWriter<'_> {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         let written = self.inner.write(bytes)?;
         self.output_bytes
             .output_bytes
             .fetch_add(written as u64, Ordering::Relaxed);
+        let sealed = self.inner.segments().len();
+        if sealed != self.sealed_segments {
+            self.checkpoint()?;
+            self.sealed_segments = sealed;
+        }
         Ok(written)
     }
 
@@ -2362,38 +1498,296 @@ fn process_resident_bytes() -> Option<u64> {
     None
 }
 
+fn read_site_info_target(path: &Path) -> Result<crate::archive::SiteInfoRecord> {
+    let mut reader = ArchiveRecordReader::open(path).map_err(map_archive)?;
+    let mut latest = None::<(i64, crate::archive::SiteInfoRecord)>;
+    while let Some(record) = reader.next_record().map_err(map_archive)? {
+        if let Record::SiteInfo {
+            timestamp_micros,
+            site_info,
+        } = record
+        {
+            if latest
+                .as_ref()
+                .is_none_or(|(timestamp, _)| timestamp_micros > *timestamp)
+            {
+                latest = Some((timestamp_micros, site_info));
+            }
+        }
+    }
+    latest
+        .map(|(_, site_info)| site_info)
+        .ok_or(Error::Corrupt("siteinfo target contains no siteinfo record"))
+}
+
+fn write_generation_index_from_projection(
+    archive: &Path,
+    output: &Path,
+    generation_id: &crate::generation::GenerationId,
+    title_entries: &crate::title_projection::ExternalTitleEntries,
+) -> Result<()> {
+    let identity = generation_id.to_bytes().map_err(|_| {
+        Error::Corrupt("generation ID cannot bind the assembly frame directory")
+    })?;
+    let frame_directory_path = archive.with_extension("swframe");
+    if !frame_directory_path.exists() {
+        crate::frame_directory::write_from_archive_set(
+            archive,
+            &frame_directory_path,
+            identity,
+        )
+        .map_err(map_archive)?;
+    }
+    let frames =
+        crate::frame_directory::FrameDirectory::open_bound(&frame_directory_path, identity)
+            .map_err(map_archive)?;
+    let archive_set =
+        crate::archive_set::ArchiveSetReader::open(archive).map_err(map_archive)?;
+    let frame_entries = frames.iter().map(|frame| {
+        frame.map(|frame| crate::title_index::FrameIndexEntry {
+            info: frame.frame_info(),
+            compressed_offset: frame.compressed_offset,
+        })
+    });
+    let segment_entries = archive_set.segments().iter().map(|segment| {
+        let role = match segment.kind {
+            Some(crate::archive::EntityKind::Page) => 1,
+            Some(crate::archive::EntityKind::User) => 2,
+            Some(crate::archive::EntityKind::Global) => 3,
+            None if segment.name.starts_with("0000-") => 0,
+            None if segment.name.starts_with("9999-") => 4,
+            None => u8::MAX,
+        };
+        Ok(crate::title_index::SegmentIndexEntry {
+            role,
+            first_id: segment.first_id,
+            last_id: segment.last_id,
+            virtual_start: segment.virtual_start,
+            bytes: segment.bytes,
+        })
+    });
+    crate::title_index::write_generation_index(
+        output,
+        generation_id,
+        title_entries.iter(),
+        frame_entries,
+        segment_entries,
+    )
+    .map_err(map_archive)
+}
+
+fn distill_plan_ref_prefix(root: &Path, plan: &DirectBuildPlan) -> Result<Vec<u8>> {
+    let mut samples = Vec::new();
+    let mut sample_bytes = 0_usize;
+    for index in 0..plan.content_target_count() {
+        let path = node_path(root, plan, "content", index).join("newest.samples");
+        read_text_samples(&path, |sample| {
+            sample_bytes = sample_bytes
+                .checked_add(sample.len())
+                .ok_or(Error::Corrupt("newest-revision sample volume overflow"))?;
+            if sample_bytes > plan.ref_prefix_sample_bytes {
+                return Err(Error::Corrupt(
+                    "newest-revision samples exceed the plan-wide bound",
+                ));
+            }
+            samples.push(sample.to_vec());
+            Ok(())
+        })?;
+    }
+    if sample_bytes == 0 {
+        return Err(Error::Corrupt(
+            "newest-revision sampling produced no text",
+        ));
+    }
+    if sample_bytes <= plan.ref_prefix_bytes {
+        let mut prefix = Vec::with_capacity(sample_bytes);
+        for sample in samples {
+            prefix.extend_from_slice(&sample);
+        }
+        return Ok(prefix);
+    }
+    crate::archive::distill_ref_prefix(
+        &samples,
+        plan.ref_prefix_bytes,
+        plan.compression_level,
+    )
+    .map_err(map_archive)
+}
+
 pub(crate) fn assemble_direct_build(
     root: &Path,
     plan: &DirectBuildPlan,
     progress: &(impl Fn(&str) + Sync),
 ) -> Result<PathBuf> {
     let output = root.join("archive.swdump");
-    if recover_direct_build_completion(root, plan, progress)? {
-        return Ok(output);
+    let assembly_run_id =
+        crate::progress_projection::current_run_id(root, &plan.plan_id);
+    if crate::build_lifecycle::recover_archive_commit(root, plan)
+        .map_err(map_invalid_build)?
+        .is_some()
+    {
+        progress("recovered the plan-bound complete archive; projecting its index");
     }
-    for (kind, count) in [
-        ("content", plan.content_target_count()),
-        ("history", plan.history_files.len()),
-    ] {
-        for index in 0..count {
-            if !validate_node(root, plan, kind, index)? {
-                return Err(Error::Corrupt("direct build input target is incomplete"));
+    let existing_title_projection =
+        match crate::build_lifecycle::inspect_build(root, Some(&plan.plan_id))
+        .map_err(map_invalid_build)?
+    {
+        crate::build_lifecycle::BuildState::Ready { .. } => {
+            if crate::build_lifecycle::transition_assembly(
+                crate::build_lifecycle::AssemblyState::Ready,
+                crate::build_lifecycle::AssemblyEvent::Begin,
+            )
+            .map_err(|_| Error::Corrupt("invalid ready-generation reuse transition"))?
+                != crate::build_lifecycle::AssemblyTransition::Reuse
+            {
+                return Err(Error::Corrupt("ready generation is not reusable"));
             }
+            return Ok(output);
         }
-    }
-    let assembly_name = format!("assembly-{}.partial", plan.plan_id);
-    let assembly_path = root.join(&assembly_name);
-    if assembly_path.is_dir() && archive_file_complete(&assembly_path) {
-        progress("installing the already completed assembly checkpoint");
-        std::fs::rename(&assembly_path, &output)?;
-        sync_directory(root)?;
-        persist_staged_generation_receipt(root, plan, &output)?;
-        crate::title_index::build(&output, output.with_extension("swtitle"))
+        crate::build_lifecycle::BuildState::Projecting {
+            title_projection,
+            ..
+        } => {
+            if crate::build_lifecycle::transition_assembly(
+                crate::build_lifecycle::AssemblyState::Projecting,
+                crate::build_lifecycle::AssemblyEvent::Begin,
+            )
+            .map_err(|_| Error::Corrupt("invalid title-projection resume transition"))?
+                != crate::build_lifecycle::AssemblyTransition::ResumeProjection
+            {
+                return Err(Error::Corrupt("title projection is not resumable"));
+            }
+            let titles = output.with_extension("swtitle");
+            if !titles.exists() {
+                progress("recovery is finishing the index from its durable title projection");
+                let title_entries = crate::title_projection::ExternalTitleEntries::open_bound(
+                    root.join(&title_projection.file_name),
+                    &title_projection.sha256,
+                    title_projection.entries,
+                )
+                .map_err(map_archive)?;
+                if title_entries.entry_count() != title_projection.entries {
+                    return Err(Error::Corrupt(
+                        "durable title projection disagrees with its receipt",
+                    ));
+                }
+                write_generation_index_from_projection(
+                    &output,
+                    &titles,
+                    &crate::generation::GenerationId::from_plan_id(&plan.plan_id),
+                    &title_entries,
+                )?;
+            }
+            crate::build_lifecycle::commit_generation(root, plan)
+                .map_err(map_invalid_build)?;
+            for path in [
+                root.join(&title_projection.file_name),
+                root.join("title-projection.receipt.json"),
+            ] {
+                std::fs::remove_file(path)?;
+            }
+            sync_directory(root)?;
+            remove_consumed_build_inputs(root, plan)?;
+            return Ok(output);
+        }
+        crate::build_lifecycle::BuildState::ReadyForAssembly { .. } => None,
+        crate::build_lifecycle::BuildState::Assembling {
+            title_projection,
+            ..
+        } => title_projection,
+        crate::build_lifecycle::BuildState::Planned { .. } => {
+            return Err(Error::Corrupt("direct build input target is incomplete"))
+        }
+        crate::build_lifecycle::BuildState::Unplanned => {
+            return Err(Error::Corrupt("direct assembly has no plan"))
+        }
+    };
+    crate::build_lifecycle::prepare_assembly(root, plan).map_err(map_invalid_build)?;
+    let site_info_path = node_path(root, plan, "content", 0).join("siteinfo.swdump");
+    let site_info = read_site_info_target(&site_info_path)?;
+    progress("distilling the refPrefix from bounded content-target samples");
+    let planned_ref_prefix = distill_plan_ref_prefix(root, plan)?;
+    let title_entries = if let Some(receipt) = existing_title_projection {
+        crate::title_projection::ExternalTitleEntries::open_bound(
+            root.join(&receipt.file_name),
+            &receipt.sha256,
+            receipt.entries,
+        )
+        .map_err(map_archive)?
+    } else {
+        let title_projection_work = root.join("title-projection-work");
+        match std::fs::remove_dir_all(&title_projection_work) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(Error::Io(error)),
+        }
+        std::fs::create_dir(&title_projection_work)?;
+        let mut projection =
+            crate::title_projection::ExternalTitleProjectionBuilder::new_in(
+                &title_projection_work,
+                site_info,
+                crate::title_projection::ProjectionLimits::default(),
+            )
             .map_err(map_archive)?;
-        persist_completion_marker(root, plan)?;
-        remove_consumed_build_inputs(root, plan)?;
-        return Ok(output);
-    }
+        let content_title_groups = (0..plan.content_target_count())
+            .map(|index| {
+                vec![node_path(root, plan, "content", index)
+                    .join("title-records.swdump")]
+            })
+            .collect::<Vec<_>>();
+        let title_progress = Arc::new(AtomicU64::new(0));
+        let mut title_sources: Vec<Box<dyn RecordSource>> =
+            Vec::with_capacity(plan.history_files.len() + 1);
+        title_sources.push(Box::new(
+            crate::archive::SequentialRecordGroups::open_paths(
+                content_title_groups,
+                Arc::clone(&title_progress),
+            ),
+        ));
+        for index in 0..plan.history_files.len() {
+            title_sources.push(Box::new(
+                ArchiveRecordReader::open_accounted(
+                    node_path(root, plan, "history", index)
+                        .join("title-records.swdump"),
+                    Arc::clone(&title_progress),
+                )
+                .map_err(map_archive)?,
+            ));
+        }
+        progress("projecting title history from durable metadata-only target sidecars");
+        let mut projection_error = None;
+        crate::archive::visit_merged_record_sources(title_sources, |record| {
+            if projection_error.is_none() {
+                projection_error = projection.observe(record).err();
+            }
+        })
+        .map_err(map_archive)?;
+        if let Some(error) = projection_error {
+            return Err(map_archive(error));
+        }
+        let entries = projection
+            .finish()
+            .map_err(map_archive)?
+            .persist_content_addressed(root)
+            .map_err(map_archive)?;
+        let file_name = entries
+            .file_name()
+            .to_str()
+            .ok_or(Error::Corrupt("title projection filename is not UTF-8"))?
+            .to_owned();
+        let identity = entries.identity_hex();
+        crate::build_lifecycle::commit_title_projection(
+            root,
+            plan,
+            &file_name,
+            entries.entry_count(),
+            &identity,
+        )
+        .map_err(map_invalid_build)?;
+        std::fs::remove_dir(&title_projection_work)?;
+        entries
+    };
+    let assembly_name = "assembly.partial";
     let manifest_archive = root.join("manifest.swdump");
     let mut manifest_writer = ArchiveWriter::new(
         std::fs::File::create(&manifest_archive)?,
@@ -2425,14 +1819,18 @@ pub(crate) fn assemble_direct_build(
         .map_err(map_archive)?;
     manifest_writer.finish().map_err(map_archive)?;
 
-    let mut inputs = (0..plan.content_target_count())
+    let content_inputs = (0..plan.content_target_count())
         .map(|index| node_path(root, plan, "content", index).join("data.swdump"))
-        .chain(
-            (0..plan.history_files.len())
-                .map(|index| node_path(root, plan, "history", index).join("data.swdump")),
-        )
         .collect::<Vec<_>>();
-    inputs.push(node_path(root, plan, "content", 0).join("siteinfo.swdump"));
+    let history_inputs = (0..plan.history_files.len())
+        .map(|index| node_path(root, plan, "history", index).join("data.swdump"))
+        .collect::<Vec<_>>();
+    let mut inputs = content_inputs
+        .iter()
+        .cloned()
+        .chain(history_inputs.iter().cloned())
+        .collect::<Vec<_>>();
+    inputs.push(site_info_path.clone());
     inputs.push(manifest_archive.clone());
     let assembly_started_micros = now_micros();
     let inventory_total_bytes = inputs.iter().fold(0_u64, |total, input| {
@@ -2447,6 +1845,7 @@ pub(crate) fn assemble_direct_build(
         root,
         &AssemblyProgressSnapshot {
             plan_id: plan.plan_id.clone(),
+            run_id: assembly_run_id.clone(),
             pid: std::process::id(),
             phase: format!("inventorying 0/{} inputs", inputs.len()),
             input_bytes: 0,
@@ -2465,76 +1864,8 @@ pub(crate) fn assemble_direct_build(
             peak_rss_bytes,
         },
     );
-    let inventory_started = Instant::now();
-    let mut input_checkpoints = Vec::new();
-    let mut input_compressed_bytes = 0_u64;
-    let mut opened_readers = Vec::with_capacity(inputs.len());
-    for (position, input) in inputs.iter().enumerate() {
-        let reader = ArchiveRecordReader::open(input).map_err(map_archive)?;
-        for frame in reader.remaining_frame_locations() {
-            input_compressed_bytes =
-                input_compressed_bytes.saturating_add(frame.info.compressed_bytes);
-            input_checkpoints.push((frame.info.last_entity, frame.info.compressed_bytes));
-        }
-        opened_readers.push(reader);
-        if (position + 1) % 25 == 0 || position + 1 == inputs.len() {
-            let (cpu_user_micros, cpu_system_micros, peak_rss_bytes) =
-                process_resource_usage();
-            write_assembly_progress(
-                root,
-                &AssemblyProgressSnapshot {
-                    plan_id: plan.plan_id.clone(),
-                    pid: std::process::id(),
-                    phase: format!("inventorying {}/{} inputs", position + 1, inputs.len()),
-                    input_bytes: input_compressed_bytes,
-                    input_bytes_total: inventory_total_bytes,
-                    output_bytes: 0,
-                    records: 0,
-                    current_entity_kind: 0,
-                    current_entity_id: 0,
-                    bytes_per_second: 0,
-                    phase_current: (position + 1) as u64,
-                    phase_total: inputs.len() as u64,
-                    started_at_micros: assembly_started_micros,
-                    updated_at_micros: now_micros(),
-                    cpu_user_micros,
-                    cpu_system_micros,
-                    peak_rss_bytes,
-                },
-            );
-            progress(&format!(
-                "assembly inventory {}/{} inputs · {} compressed · elapsed {}",
-                position + 1,
-                inputs.len(),
-                human_progress_bytes(input_compressed_bytes),
-                duration_summary(inventory_started.elapsed().as_secs()),
-            ));
-        }
-    }
-    let mut opened_readers = opened_readers.into_iter();
-    let content_groups = plan
-        .content_groups
-        .iter()
-        .map(|group| {
-            (0..group.len())
-                .map(|_| {
-                    opened_readers
-                        .next()
-                        .map(|reader| Box::new(reader) as Box<dyn RecordSource>)
-                        .ok_or(Error::Corrupt("content reader inventory is incomplete"))
-                })
-                .collect::<Result<Vec<_>>>()
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let mut record_sources: Vec<Box<dyn RecordSource>> =
-        Vec::with_capacity(plan.history_files.len() + 3);
-    record_sources.push(Box::new(
-        crate::archive::SequentialRecordGroups::new(content_groups),
-    ));
-    record_sources.extend(
-        opened_readers.map(|reader| Box::new(reader) as Box<dyn RecordSource>),
-    );
-    input_checkpoints.sort_unstable_by_key(|(entity, _)| *entity);
+    let input_compressed_bytes = inventory_total_bytes;
+    let telemetry = Arc::new(AssemblyTelemetry::new());
     progress(&format!(
         "assembling {} compressed from {} inputs into durable page-ID ranges",
         human_progress_bytes(input_compressed_bytes),
@@ -2573,13 +1904,76 @@ pub(crate) fn assemble_direct_build(
             human_progress_bytes(resumed_output_bytes),
         ));
     }
-    let bootstrap = if preserved_ref_prefix.is_none() {
-        Some(tempfile::tempfile_in(root)?)
-    } else {
-        None
-    };
-    let mut title_index = crate::title_index::TitleIndexBuilder::new();
-    let telemetry = Arc::new(AssemblyTelemetry::new());
+    if preserved_ref_prefix
+        .as_deref()
+        .is_some_and(|prefix| prefix != planned_ref_prefix.as_slice())
+    {
+        return Err(Error::Corrupt(
+            "resumed assembly refPrefix differs from its plan-bound samples",
+        ));
+    }
+    let ref_prefix = preserved_ref_prefix
+        .as_deref()
+        .unwrap_or(&planned_ref_prefix);
+    let content_targets = (0..plan.content_target_count())
+        .map(|index| {
+            let node = node_path(root, plan, "content", index);
+            Ok((
+                node.join("data.swdump"),
+                node.join("data.swframe"),
+                crate::build_lifecycle::target_frame_directory_identity(
+                    plan,
+                    crate::build_lifecycle::TargetKind::Content,
+                    index,
+                )
+                .map_err(map_invalid_build)?,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut record_sources: Vec<Box<dyn RecordSource>> =
+        Vec::with_capacity(plan.history_files.len() + 3);
+    record_sources.push(Box::new(SequentialTargetReaders::new(
+        content_targets,
+        resume_after,
+        Arc::clone(&telemetry.input_bytes),
+    )));
+    for (index, path) in history_inputs.iter().enumerate() {
+        let node = node_path(root, plan, "history", index);
+        let directory = Arc::new(
+            crate::frame_directory::FrameDirectory::open_bound(
+                node.join("data.swframe"),
+                crate::build_lifecycle::target_frame_directory_identity(
+                    plan,
+                    crate::build_lifecycle::TargetKind::History,
+                    index,
+                )
+                .map_err(map_invalid_build)?,
+            )
+            .map_err(map_archive)?,
+        );
+        let position = resume_after
+            .map_or(0, |boundary| directory.first_after_entity(boundary));
+        if position != directory.len() {
+            record_sources.push(Box::new(
+                ArchiveRecordReader::open_frame_directory_accounted(
+                    path,
+                    directory,
+                    position,
+                    Arc::clone(&telemetry.input_bytes),
+                )
+                .map_err(map_archive)?,
+            ));
+        }
+    }
+    for path in [site_info_path, manifest_archive.clone()] {
+        record_sources.push(Box::new(
+            ArchiveRecordReader::open_accounted(
+                path,
+                Arc::clone(&telemetry.input_bytes),
+            )
+            .map_err(map_archive)?,
+        ));
+    }
     telemetry
         .output_bytes
         .store(resumed_output_bytes, Ordering::Relaxed);
@@ -2587,12 +1981,16 @@ pub(crate) fn assemble_direct_build(
     let assembly_started = Instant::now();
     let cpu_started = process_cpu_seconds();
     let telemetry_output = AssemblyProgressWriter {
+        sealed_segments: temporary.segments().len(),
+        checkpoint: crate::build_lifecycle::AssemblyCheckpointTracker::new(
+            temporary.segments(),
+        ),
         inner: temporary,
         output_bytes: Arc::clone(&telemetry),
+        root,
+        plan,
     };
-    let mut checkpoint_position = 0_usize;
-    let mut completed_input_bytes = 0_u64;
-    let (file, _, records, _) = std::thread::scope(|scope| {
+    let (mut file, _, records, _) = std::thread::scope(|scope| {
         let reporter_telemetry = Arc::clone(&telemetry);
         let reporter_stop = Arc::clone(&stop_reporter);
         let reporter = scope.spawn(move || {
@@ -2728,6 +2126,7 @@ pub(crate) fn assemble_direct_build(
                     root,
                     &AssemblyProgressSnapshot {
                         plan_id: plan.plan_id.clone(),
+                        run_id: assembly_run_id.clone(),
                         pid: std::process::id(),
                         phase: persisted_phase,
                         input_bytes: input,
@@ -2755,64 +2154,26 @@ pub(crate) fn assemble_direct_build(
         });
         let mut observe = |record: &Record| {
             let entity = record.entity();
-            while input_checkpoints
-                .get(checkpoint_position)
-                .is_some_and(|(last, _)| *last < entity)
-            {
-                completed_input_bytes = completed_input_bytes
-                    .saturating_add(input_checkpoints[checkpoint_position].1);
-                checkpoint_position += 1;
-            }
-            telemetry
-                .input_bytes
-                .store(completed_input_bytes, Ordering::Relaxed);
             telemetry.records.fetch_add(1, Ordering::Relaxed);
             telemetry
                 .entity_kind
                 .store(entity.kind as u64, Ordering::Relaxed);
             telemetry.entity_id.store(entity.id, Ordering::Relaxed);
-            title_index.observe(record);
-        };
-        let mut report_phase = |phase: BootstrapMergePhase, current, total| {
-            let phase = match phase {
-                BootstrapMergePhase::Sampling => 0,
-                BootstrapMergePhase::Distilling => 1,
-                BootstrapMergePhase::Replaying => 2,
-                BootstrapMergePhase::Merging => 3,
-            };
-            telemetry.phase.store(phase, Ordering::Relaxed);
-            telemetry.phase_current.store(current, Ordering::Relaxed);
-            telemetry.phase_total.store(total, Ordering::Relaxed);
         };
         let compression = CompressionSettings {
             level: plan.compression_level,
             ..CompressionSettings::default()
         };
-        let result = if let Some(prefix) = preserved_ref_prefix.as_deref() {
-            report_phase(BootstrapMergePhase::Merging, 0, 0);
-            crate::archive::merge_record_sources_reusing_ref_prefix_observing_after(
-                record_sources,
-                telemetry_output,
-                plan.frame_target,
-                compression,
-                prefix,
-                resume_after,
-                &mut observe,
-            )
-        } else {
-            crate::archive::merge_record_sources_bootstrapping_ref_prefix_observing_after(
-                record_sources,
-                telemetry_output,
-                bootstrap.expect("bootstrap exists without a preserved reference prefix"),
-                plan.frame_target,
-                compression,
-                plan.ref_prefix_sample_bytes,
-                plan.ref_prefix_bytes,
-                resume_after,
-                &mut observe,
-                &mut report_phase,
-            )
-        };
+        telemetry.phase.store(3, Ordering::Relaxed);
+        let result = crate::archive::merge_record_sources_reusing_ref_prefix_observing_after(
+            record_sources,
+            telemetry_output,
+            plan.frame_target,
+            compression,
+            ref_prefix,
+            resume_after,
+            &mut observe,
+        );
         stop_reporter.store(true, Ordering::Relaxed);
         let _ = reporter.join();
         result
@@ -2828,22 +2189,70 @@ pub(crate) fn assemble_direct_build(
         human_progress_bytes(output_bytes),
         duration_summary(assembly_started.elapsed().as_secs()),
     ));
+    file.checkpoint()?;
     let completed = file.into_inner().finish().map_err(map_archive)?;
+    if crate::build_lifecycle::transition_assembly(
+        crate::build_lifecycle::AssemblyState::Partial,
+        crate::build_lifecycle::AssemblyEvent::FinishAndRename,
+    )
+    .map_err(|_| Error::Corrupt("invalid assembly finish transition"))?
+        != crate::build_lifecycle::AssemblyTransition::RenameArchive
+    {
+        return Err(Error::Corrupt("assembly is not ready for atomic rename"));
+    }
     completed.persist(&output).map_err(map_archive)?;
-    sync_directory(&output)?;
-    persist_staged_generation_receipt(root, plan, &output)?;
+    crate::build_lifecycle::commit_archive(root, plan).map_err(map_invalid_build)?;
     progress("writing title and virtual-frame index from the merged record projection");
-    title_index
-        .finish(&output, output.with_extension("swtitle"))
-        .map_err(map_archive)?;
-    persist_completion_marker(root, plan)?;
+    write_generation_index_from_projection(
+        &output,
+        &output.with_extension("swtitle"),
+        &crate::generation::GenerationId::from_plan_id(&plan.plan_id),
+        &title_entries,
+    )?;
+    let title_projection_name = title_entries
+        .file_name()
+        .to_str()
+        .ok_or(Error::Corrupt("title projection filename is not UTF-8"))?
+        .to_owned();
+    drop(title_entries);
+    crate::build_lifecycle::commit_generation(root, plan).map_err(map_invalid_build)?;
+    for path in [
+        root.join(title_projection_name),
+        root.join("title-projection.receipt.json"),
+    ] {
+        std::fs::remove_file(path)?;
+    }
+    sync_directory(root)?;
 
-    remove_consumed_build_inputs(root, plan)?;
-    progress("final range files are durable; consumed source targets removed");
+    if let Err(error) = remove_consumed_build_inputs(root, plan) {
+        progress(&format!(
+            "generation is ready; optional source cleanup remains pending: {error}"
+        ));
+    } else {
+        progress("generation is ready; consumed source targets removed");
+    }
     Ok(output)
 }
 
 fn remove_consumed_build_inputs(root: &Path, plan: &DirectBuildPlan) -> Result<()> {
+    if !matches!(
+        crate::build_lifecycle::inspect_build(root, Some(&plan.plan_id))
+            .map_err(map_invalid_build)?,
+        crate::build_lifecycle::BuildState::Ready { .. }
+    ) {
+        return Err(Error::Corrupt(
+            "source cleanup is allowed only after generation commit",
+        ));
+    }
+    if crate::build_lifecycle::transition_assembly(
+        crate::build_lifecycle::AssemblyState::Ready,
+        crate::build_lifecycle::AssemblyEvent::CleanupRequested,
+    )
+    .map_err(|_| Error::Corrupt("invalid committed-source cleanup transition"))?
+        != crate::build_lifecycle::AssemblyTransition::Cleanup
+    {
+        return Err(Error::Corrupt("committed source cleanup is not authorized"));
+    }
     for kind in ["content", "history"] {
         let count = if kind == "content" {
             plan.content_target_count()
@@ -2852,14 +2261,18 @@ fn remove_consumed_build_inputs(root: &Path, plan: &DirectBuildPlan) -> Result<(
         };
         for index in 0..count {
             let path = node_path(root, plan, kind, index);
-            if path.exists() {
-                std::fs::remove_dir_all(path)?;
+            match std::fs::remove_dir_all(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(Error::Io(error)),
             }
         }
     }
     let manifest = root.join("manifest.swdump");
-    if manifest.exists() {
-        std::fs::remove_file(manifest)?;
+    match std::fs::remove_file(&manifest) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(Error::Io(error)),
     }
     sync_directory(&root.join("nodes"))
 }
@@ -2998,24 +2411,6 @@ pub fn build_direct_archive(
         "SARUN_WIKIMEDIA_ROBOTS_CACHE",
         scratch.path().join("robots-cache"),
     );
-    let peak = Arc::new(AtomicU64::new(0));
-    let stop = Arc::new(AtomicBool::new(false));
-    let monitor = {
-        let path = scratch.path().to_path_buf();
-        let peak = Arc::clone(&peak);
-        let stop = Arc::clone(&stop);
-        std::thread::spawn(move || {
-            while !stop.load(Ordering::Relaxed) {
-                if let Ok(bytes) = directory_bytes(&path) {
-                    peak.fetch_max(bytes, Ordering::Relaxed);
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            if let Ok(bytes) = directory_bytes(&path) {
-                peak.fetch_max(bytes, Ordering::Relaxed);
-            }
-        })
-    };
     let result = build_direct_inner(
         client,
         config,
@@ -3024,144 +2419,62 @@ pub fn build_direct_archive(
         scratch.path(),
         &progress,
     );
-    stop.store(true, Ordering::Relaxed);
-    let _ = monitor.join();
     let mut stats = result?;
-    stats.scratch_peak_bytes = peak.load(Ordering::Relaxed);
     stats.elapsed_millis = started.elapsed().as_millis() as u64;
     Ok(stats)
 }
 
-pub fn build_update_archive(
-    client: &Client,
-    config: &wikimak_mediawiki::Config,
-    dbname: &str,
-    base_archive: impl AsRef<Path>,
-    output: impl AsRef<Path>,
-    scratch_parent: impl AsRef<Path>,
-    overlap_days: u64,
-    frame_target: usize,
-    compression: CompressionSettings,
-    progress: impl Fn(&str) + Sync,
-) -> Result<UpdateArchiveStats> {
-    let started = Instant::now();
-    let frontier = archive_frontier(base_archive.as_ref(), dbname)?;
-    std::fs::create_dir_all(scratch_parent.as_ref())?;
-    let scratch = scratch_parent.as_ref();
-    std::env::set_var(
-        "SARUN_WIKIMEDIA_ROBOTS_CACHE",
-        scratch.join("robots-cache"),
-    );
-    let peak = Arc::new(AtomicU64::new(0));
-    let stop = Arc::new(AtomicBool::new(false));
-    let monitor = {
-        let path = scratch.to_path_buf();
-        let peak = Arc::clone(&peak);
-        let stop = Arc::clone(&stop);
-        std::thread::spawn(move || {
-            while !stop.load(Ordering::Relaxed) {
-                if let Ok(bytes) = directory_bytes(&path) {
-                    peak.fetch_max(bytes, Ordering::Relaxed);
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            if let Ok(bytes) = directory_bytes(&path) {
-                peak.fetch_max(bytes, Ordering::Relaxed);
-            }
-        })
-    };
-    let result = build_update_inner(
-        client,
-        config,
-        dbname,
-        frontier,
-        output.as_ref(),
-        scratch,
-        overlap_days,
-        frame_target,
-        compression,
-        &progress,
-    );
-    stop.store(true, Ordering::Relaxed);
-    let _ = monitor.join();
-    let mut stats = result?;
-    stats.scratch_peak_bytes = peak.load(Ordering::Relaxed);
-    stats.elapsed_millis = started.elapsed().as_millis() as u64;
-    Ok(stats)
+fn update_source_plan_id(plan: &UpdateSourcePlan) -> Result<String> {
+    let mut canonical = plan.clone();
+    canonical.source_plan_id.clear();
+    canonical.generation_id = crate::generation::GenerationId::from_plan_bytes(&[]);
+    let bytes = serde_json::to_vec(&canonical)
+        .map_err(|_| Error::Corrupt("cannot encode update source plan"))?;
+    use sha2::Digest;
+    Ok(hex::encode(sha2::Sha256::digest(bytes)))
 }
 
-struct ArchiveFrontier {
-    content: chrono::NaiveDate,
-    metadata: String,
+fn update_generation_id(
+    base_generation_id: &crate::generation::GenerationId,
+    source_plan_id: &str,
+) -> crate::generation::GenerationId {
+    let mut identity = b"wikipedia-update-generation\0".to_vec();
+    identity.extend_from_slice(base_generation_id.as_str().as_bytes());
+    identity.push(0);
+    identity.extend_from_slice(source_plan_id.as_bytes());
+    crate::generation::GenerationId::from_plan_bytes(&identity)
 }
 
-pub(crate) fn update_checkpoint_key(
-    path: &Path,
-    dbname: &str,
-    overlap_days: u64,
-    frame_target: usize,
-    compression: CompressionSettings,
-) -> Result<String> {
-    let frontier = archive_frontier(path, dbname)?;
-    let identity = (
-        dbname,
-        frontier.content.to_string(),
-        frontier.metadata,
-        overlap_days,
-        frame_target,
-        compression.level,
-        compression.checksum,
-        compression.long_distance_matching,
-        compression.window_log,
-        compression.target_block_size,
-    );
-    let bytes = serde_json::to_vec(&identity)
-        .map_err(|_| Error::Corrupt("cannot encode update checkpoint identity"))?;
-    use sha1::Digest;
-    Ok(hex::encode(sha1::Sha1::digest(bytes)))
-}
-
-fn archive_frontier(path: &Path, dbname: &str) -> Result<ArchiveFrontier> {
-    let mut reader = ArchiveRecordReader::open(path).map_err(map_archive)?;
-    let mut content = None;
-    let mut metadata = None;
-    while let Some(record) = reader.next_record().map_err(map_archive)? {
-        if let Record::Manifest { manifest, .. } = record {
-            if manifest.wiki_db != dbname {
-                return Err(Error::Corrupt("base archive belongs to another wiki"));
-            }
-            let parsed = chrono::NaiveDate::parse_from_str(
-                &manifest.content_snapshot,
-                "%Y-%m-%d",
-            )
-            .map_err(|_| Error::Corrupt("invalid archive content snapshot date"))?;
-            content =
-                Some(content.map_or(parsed, |current: chrono::NaiveDate| current.max(parsed)));
-            metadata = Some(metadata.map_or(manifest.metadata_snapshot.clone(), |current: String| {
-                current.max(manifest.metadata_snapshot)
-            }));
-        }
+pub(crate) fn validate_update_source_plan(plan: &UpdateSourcePlan) -> Result<()> {
+    if plan.schema != 1
+        || plan.frame_target == 0
+        || plan.wiki_db.is_empty()
+        || plan.source_plan_id != update_source_plan_id(plan)?
+        || plan.generation_id
+            != update_generation_id(&plan.base_generation_id, &plan.source_plan_id)
+        || chrono::NaiveDate::parse_from_str(&plan.base_content_frontier, "%Y-%m-%d").is_err()
+        || chrono::NaiveDate::parse_from_str(&plan.resulting_content_frontier, "%Y-%m-%d")
+            .is_err()
+    {
+        return Err(Error::Corrupt("invalid update source plan"));
     }
-    Ok(ArchiveFrontier {
-        content: content.ok_or(Error::Corrupt("base archive has no manifest"))?,
-        metadata: metadata.ok_or(Error::Corrupt("base archive has no metadata frontier"))?,
-    })
+    Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn build_update_inner(
+pub(crate) fn discover_update_source_plan(
     client: &Client,
     config: &wikimak_mediawiki::Config,
-    dbname: &str,
-    frontier: ArchiveFrontier,
-    output: &Path,
-    scratch: &Path,
+    base: &crate::generation::GenerationIdentity,
     overlap_days: u64,
     frame_target: usize,
     compression: CompressionSettings,
     progress: &(impl Fn(&str) + Sync),
-) -> Result<UpdateArchiveStats> {
-    let content_from = frontier.content;
+) -> Result<UpdateSourcePlan> {
+    let content_from = chrono::NaiveDate::parse_from_str(
+        &base.content_frontier,
+        "%Y-%m-%d",
+    )
+    .map_err(|_| Error::Corrupt("invalid base generation content frontier"))?;
     progress(&format!(
         "discovering daily updates after {content_from} with {overlap_days} days of overlap"
     ));
@@ -3174,7 +2487,7 @@ fn build_update_inner(
     let runs = wikimak_mediawiki::discover_incremental_with(
         client,
         config,
-        dbname,
+        &base.wiki_db,
         Some(discovery_after),
     )?;
     if let Some(first_after_base) = runs.iter().find(|run| run.date > content_from) {
@@ -3194,33 +2507,19 @@ fn build_update_inner(
         "{} daily update runs cover through {content_through}",
         runs.len()
     ));
-    let cores = processing_parallelism();
-    let mut content_results = Vec::new();
-    for run in &runs {
-        let run_scratch = scratch.join(format!("incremental-{}", run.date));
-        std::fs::create_dir_all(&run_scratch)?;
-        content_results.extend(build_content_parts(
-            client,
-            &run.parts,
-            &run_scratch,
-            cores,
-            snapshot_date_micros(run.date)?,
-            progress,
-        )?);
-    }
 
     progress("discovering MediaWiki History partitions");
     let (metadata_snapshot, mut history_files) =
-        crate::sync::discover_history(client, config, dbname)?;
-    if metadata_snapshot < frontier.metadata {
+        crate::sync::discover_history(client, config, &base.wiki_db)?;
+    if metadata_snapshot < base.metadata_frontier {
         return Err(Error::Mediawiki(wikimak_mediawiki::Error::Parse(
             format!(
                 "MediaWiki History snapshot regressed from {} to {metadata_snapshot}",
-                frontier.metadata
+                base.metadata_frontier
             ),
         )));
     }
-    if metadata_snapshot == frontier.metadata {
+    if metadata_snapshot == base.metadata_frontier {
         history_files.clear();
         progress(&format!(
             "MediaWiki History {metadata_snapshot} is already present"
@@ -3228,6 +2527,163 @@ fn build_update_inner(
     } else if history_files.len() > 2 {
         history_files = history_files.split_off(history_files.len() - 2);
     }
+    let mut plan = UpdateSourcePlan {
+        schema: 1,
+        source_plan_id: String::new(),
+        generation_id: crate::generation::GenerationId::from_plan_bytes(&[]),
+        base_generation_id: base.generation_id.clone(),
+        wiki_db: base.wiki_db.clone(),
+        base_content_frontier: base.content_frontier.clone(),
+        base_metadata_frontier: base.metadata_frontier.clone(),
+        overlap_days,
+        frame_target,
+        compression: compression.into(),
+        content_runs: runs
+            .iter()
+            .map(|run| PlannedIncrementalRun {
+                date: run.date.to_string(),
+                parts: run.parts.iter().map(PlannedPart::from).collect(),
+            })
+            .collect(),
+        history_snapshot: metadata_snapshot.clone(),
+        history_files: history_files
+            .iter()
+            .map(|file| PlannedHistoryFile {
+                partition: file.partition.clone(),
+                part: PlannedPart::from(&file.part),
+            })
+            .collect(),
+        resulting_content_frontier: content_through.to_string(),
+        resulting_metadata_frontier: metadata_snapshot,
+    };
+    plan.source_plan_id = update_source_plan_id(&plan)?;
+    plan.generation_id =
+        update_generation_id(&plan.base_generation_id, &plan.source_plan_id);
+    validate_update_source_plan(&plan)?;
+    Ok(plan)
+}
+
+pub(crate) fn build_update_archive_from_plan(
+    client: &Client,
+    plan: &UpdateSourcePlan,
+    output: impl AsRef<Path>,
+    scratch_parent: impl AsRef<Path>,
+    progress: impl Fn(&str) + Sync,
+) -> Result<UpdateArchiveStats> {
+    validate_update_source_plan(plan)?;
+    let started = Instant::now();
+    std::fs::create_dir_all(scratch_parent.as_ref())?;
+    let scratch = scratch_parent.as_ref();
+    std::env::set_var(
+        "SARUN_WIKIMEDIA_ROBOTS_CACHE",
+        scratch.join("robots-cache"),
+    );
+    let result = build_update_inner(
+        client,
+        plan,
+        output.as_ref(),
+        scratch,
+        &progress,
+    );
+    let mut stats = result?;
+    stats.elapsed_millis = started.elapsed().as_millis() as u64;
+    Ok(stats)
+}
+
+pub fn build_update_archive(
+    client: &Client,
+    config: &wikimak_mediawiki::Config,
+    dbname: &str,
+    base_archive: impl AsRef<Path>,
+    output: impl AsRef<Path>,
+    scratch_parent: impl AsRef<Path>,
+    overlap_days: u64,
+    frame_target: usize,
+    compression: CompressionSettings,
+    progress: impl Fn(&str) + Sync,
+) -> Result<UpdateArchiveStats> {
+    let base_archive = base_archive.as_ref();
+    let base = crate::generation::generation_identity(
+        base_archive,
+        base_archive.with_extension("swtitle"),
+    )
+    .map_err(|error| {
+        Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            error.to_string(),
+        ))
+    })?;
+    if base.wiki_db != dbname {
+        return Err(Error::Corrupt("base archive belongs to another wiki"));
+    }
+    let plan = discover_update_source_plan(
+        client,
+        config,
+        &base,
+        overlap_days,
+        frame_target,
+        compression,
+        &progress,
+    )?;
+    build_update_archive_from_plan(
+        client,
+        &plan,
+        output,
+        scratch_parent,
+        progress,
+    )
+}
+
+fn build_update_inner(
+    client: &Client,
+    plan: &UpdateSourcePlan,
+    output: &Path,
+    scratch: &Path,
+    progress: &(impl Fn(&str) + Sync),
+) -> Result<UpdateArchiveStats> {
+    validate_update_source_plan(plan)?;
+    let content_from = chrono::NaiveDate::parse_from_str(
+        &plan.base_content_frontier,
+        "%Y-%m-%d",
+    )
+    .map_err(|_| Error::Corrupt("invalid update base frontier"))?;
+    let content_through = chrono::NaiveDate::parse_from_str(
+        &plan.resulting_content_frontier,
+        "%Y-%m-%d",
+    )
+    .map_err(|_| Error::Corrupt("invalid update result frontier"))?;
+    let cores = processing_parallelism();
+    let mut content_results = Vec::new();
+    let mut content_input_groups = Vec::new();
+    for run in &plan.content_runs {
+        let date = chrono::NaiveDate::parse_from_str(&run.date, "%Y-%m-%d")
+            .map_err(|_| Error::Corrupt("invalid planned incremental date"))?;
+        let parts = run.parts.iter().map(wikimak_mediawiki::Part::from).collect::<Vec<_>>();
+        let run_scratch = scratch.join(format!("incremental-{date}"));
+        std::fs::create_dir_all(&run_scratch)?;
+        let run_results = build_content_parts(
+            client,
+            &parts,
+            &run_scratch,
+            cores,
+            snapshot_date_micros(date)?,
+            progress,
+        )?;
+        content_input_groups.push(
+            run_results
+                .iter()
+                .map(|result| result.path.clone())
+                .collect::<Vec<_>>(),
+        );
+        content_results.extend(run_results);
+    }
+
+    let metadata_snapshot = plan.resulting_metadata_frontier.clone();
+    let history_files = plan
+        .history_files
+        .iter()
+        .map(planned_history)
+        .collect::<Vec<_>>();
     if !history_files.is_empty() {
         progress(&format!(
             "ingesting {} partitions from MediaWiki History {metadata_snapshot}",
@@ -3235,7 +2691,7 @@ fn build_update_inner(
         ));
     }
     let history_results =
-        build_history_parts(client, dbname, &history_files, scratch, cores, progress)?;
+        build_history_parts(client, &plan.wiki_db, &history_files, scratch, cores, progress)?;
 
     let manifest_archive = scratch.join("update-manifest.swdump");
     let mut manifest_writer =
@@ -3245,7 +2701,7 @@ fn build_update_inner(
         .write(&Record::Manifest {
             timestamp_micros: snapshot_date_micros(content_through)?,
             manifest: ManifestRecord {
-                wiki_db: dbname.to_owned(),
+                wiki_db: plan.wiki_db.clone(),
                 content_snapshot: content_through.to_string(),
                 metadata_snapshot: metadata_snapshot.clone(),
                 source_files: Vec::new(),
@@ -3265,12 +2721,6 @@ fn build_update_inner(
     }
     manifest_writer.finish().map_err(map_archive)?;
 
-    let mut inputs = content_results
-        .iter()
-        .map(|result| result.path.clone())
-        .chain(history_results.iter().map(|(path, _)| path.clone()))
-        .collect::<Vec<_>>();
-    inputs.push(manifest_archive);
     progress("assembling the sorted update record stream");
     let output_parent = output
         .parent()
@@ -3278,14 +2728,41 @@ fn build_update_inner(
         .unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(output_parent)?;
     let mut temporary = tempfile::NamedTempFile::new_in(output_parent)?;
-    let (_, output_frames, output_records) =
-        crate::archive::merge_many_archives_with_compression(
-            &inputs,
-            temporary.as_file_mut(),
-            frame_target,
-            compression,
+    let completed_bytes = Arc::new(AtomicU64::new(0));
+    let mut inputs: Vec<Box<dyn RecordSource>> =
+        Vec::with_capacity(content_input_groups.len() + history_results.len() + 1);
+    for group in content_input_groups {
+        inputs.push(Box::new(
+            crate::archive::SequentialRecordGroups::open_paths(
+                vec![group],
+                Arc::clone(&completed_bytes),
+            ),
+        ));
+    }
+    for (path, _) in &history_results {
+        inputs.push(Box::new(
+            ArchiveRecordReader::open_accounted(
+                path,
+                Arc::clone(&completed_bytes),
+            )
+            .map_err(map_archive)?,
+        ));
+    }
+    inputs.push(Box::new(
+        ArchiveRecordReader::open_accounted(
+            &manifest_archive,
+            Arc::clone(&completed_bytes),
         )
-        .map_err(map_archive)?;
+        .map_err(map_archive)?,
+    ));
+    let merge_work = scratch.join("update-tail-merge-work");
+    let (output_frames, output_records) = merge_record_sources_bounded(
+        inputs,
+        temporary.as_file_mut(),
+        &merge_work,
+        plan.frame_target,
+        plan.compression.into(),
+    )?;
     temporary.as_file().sync_all()?;
     temporary
         .persist(output)
@@ -3301,8 +2778,12 @@ fn build_update_inner(
         content_from: content_from.to_string(),
         content_through: content_through.to_string(),
         metadata_snapshot,
-        incremental_runs: runs.len() as u64,
-        content_parts: runs.iter().map(|run| run.parts.len() as u64).sum(),
+        incremental_runs: plan.content_runs.len() as u64,
+        content_parts: plan
+            .content_runs
+            .iter()
+            .map(|run| run.parts.len() as u64)
+            .sum(),
         history_parts: history_files.len() as u64,
         output_frames,
         output_records,
@@ -3314,6 +2795,64 @@ fn build_update_inner(
         stats.revisions += result.stats.revisions;
     }
     Ok(stats)
+}
+
+fn merge_record_sources_bounded(
+    mut sources: Vec<Box<dyn RecordSource>>,
+    output: &mut std::fs::File,
+    work: &Path,
+    frame_target: usize,
+    compression: CompressionSettings,
+) -> Result<(u64, u64)> {
+    if work.exists() {
+        std::fs::remove_dir_all(work)?;
+    }
+    std::fs::create_dir_all(work)?;
+    let completed_bytes = Arc::new(AtomicU64::new(0));
+    let mut level = 0_usize;
+    while sources.len() > crate::archive::MAX_SORTED_MERGE_FAN_IN {
+        let mut next = Vec::<Box<dyn RecordSource>>::new();
+        let mut input = sources.into_iter();
+        let mut batch = 0_usize;
+        loop {
+            let group = input
+                .by_ref()
+                .take(crate::archive::MAX_SORTED_MERGE_FAN_IN)
+                .collect::<Vec<_>>();
+            if group.is_empty() {
+                break;
+            }
+            let path = work.join(format!("level-{level:03}-{batch:06}.swdump"));
+            let file = std::fs::File::create(&path)?;
+            let (file, _, _) = crate::archive::merge_record_sources_with_compression(
+                group,
+                file,
+                frame_target,
+                compression,
+            )
+            .map_err(map_archive)?;
+            file.sync_all()?;
+            next.push(Box::new(
+                ArchiveRecordReader::open_accounted(
+                    &path,
+                    Arc::clone(&completed_bytes),
+                )
+                .map_err(map_archive)?,
+            ));
+            batch += 1;
+        }
+        sources = next;
+        level += 1;
+    }
+    let (_, frames, records) = crate::archive::merge_record_sources_with_compression(
+        sources,
+        output,
+        frame_target,
+        compression,
+    )
+    .map_err(map_archive)?;
+    std::fs::remove_dir_all(work)?;
+    Ok((frames, records))
 }
 
 fn build_direct_inner(
@@ -3426,6 +2965,7 @@ fn build_direct_inner(
                     bz2_workers,
                     observed_at_micros,
                     false,
+                    None,
                     progress,
                 );
                 if result.is_err() {
@@ -3683,18 +3223,24 @@ fn build_history_part(
     cancelled: Arc<AtomicBool>,
     progress: &(impl Fn(&str) + Sync),
 ) -> Result<(PathBuf, PartialStats)> {
-    let live_path = scratch.join(format!("history-{file_index:06}.progress.json"));
+    let progress_anchor = scratch.join(format!("history-{file_index:06}.progress"));
+    let value = LiveTargetProgress {
+        target: format!("history-{file_index:06}"),
+        part: file.part.filename.clone(),
+        phase: "starting".into(),
+        source_bytes_total: file.part.size_bytes,
+        started_at_micros: now_micros(),
+        updated_at_micros: now_micros(),
+        ..Default::default()
+    };
     let live = Arc::new(Mutex::new(LiveProgressState {
-        path: live_path.clone(),
-        value: LiveTargetProgress {
-            target: format!("history-{file_index:06}"),
-            part: file.part.filename.clone(),
-            phase: "starting".into(),
-            source_bytes_total: file.part.size_bytes,
-            started_at_micros: now_micros(),
-            updated_at_micros: now_micros(),
-            ..Default::default()
-        },
+        projection: crate::progress_projection::source_writer(
+            &progress_scratch_root(&progress_anchor),
+            &value.target,
+            &value.part,
+        )
+        .ok(),
+        value,
         last_write: Instant::now()
             .checked_sub(Duration::from_secs(3))
             .unwrap_or_else(Instant::now),
@@ -3750,6 +3296,9 @@ fn build_history_part(
     let mut sorter =
         RecordSorter::new_with_run_target(scratch, HISTORY_SORT_RUN_TARGET)
             .map_err(map_archive)?;
+    let mut title_sorter =
+        RecordSorter::new_with_run_target(scratch, HISTORY_SORT_RUN_TARGET)
+            .map_err(map_archive)?;
     let mut stats = PartialStats::default();
     let mut last_activity = Instant::now()
         .checked_sub(Duration::from_secs(3))
@@ -3802,6 +3351,9 @@ fn build_history_part(
             if fields.len() == 78 { 60 } else { 58 },
             ordinal,
         )? {
+            if matches!(record, Record::PageState { .. } | Record::PageAction { .. }) {
+                title_sorter.push(record.clone()).map_err(map_archive)?;
+            }
             sorter.push(record).map_err(map_archive)?;
         }
         stats.events += 1;
@@ -3819,6 +3371,13 @@ fn build_history_part(
     let (_, _, _) = sorter
         .finish(std::fs::File::create(&path)?, DEFAULT_FRAME_TARGET)
         .map_err(map_archive)?;
+    let title_path = path.with_extension("titles.swdump");
+    let (_, _, _) = title_sorter
+        .finish(
+            std::fs::File::create(&title_path)?,
+            DEFAULT_FRAME_TARGET,
+        )
+        .map_err(map_archive)?;
     // Capture the final retry/HTTP counters before the last durable progress
     // snapshot.  Previously this happened after the sidecar was removed,
     // leaving the historical accounting one fetch behind.
@@ -3829,7 +3388,6 @@ fn build_history_part(
         state.value.text_bytes = history_bytes;
     }
     persist_live_progress(&live, true);
-    let _ = std::fs::remove_file(live_path);
     Ok((path, stats))
 }
 
@@ -3858,14 +3416,20 @@ fn build_content_parts(
             .map(|stats| read_site_info_checkpoint(&path).map(|site_info| (stats, site_info)))
             .transpose();
         if let Ok(Some((stats, site_info))) = reusable {
+            if !path.with_extension("titles.swdump").is_file() {
+                pending.push((index, group, key));
+                continue;
+            }
             reused_bytes = reused_bytes
                 .saturating_add(group.iter().map(|part| part.size_bytes).sum::<u64>());
             reused.push((
                 index,
                 ContentPartResult {
+                    title_path: path.with_extension("titles.swdump"),
                     path,
                     stats,
                     site_info,
+                    samples: None,
                 },
             ));
         } else {
@@ -3879,6 +3443,10 @@ fn build_content_parts(
             let site_info = site_info_checkpoint_path(&path);
             if site_info.exists() {
                 std::fs::remove_file(site_info)?;
+            }
+            let titles = path.with_extension("titles.swdump");
+            if titles.exists() {
+                std::fs::remove_file(titles)?;
             }
             pending.push((index, group, key));
         }
@@ -3914,6 +3482,7 @@ fn build_content_parts(
                     bz2_workers,
                     observed_at_micros,
                     false,
+                    None,
                     progress,
                 ) {
                     Ok(result) => {
@@ -4008,6 +3577,7 @@ fn build_content_group(
     bz2_workers: usize,
     observed_at_micros: i64,
     retain_live_progress_until_publish: bool,
+    sample_capacity: Option<usize>,
     progress: &(impl Fn(&str) + Sync),
 ) -> Result<ContentPartResult> {
     let path = scratch.join(format!("content-{index:06}.swdump"));
@@ -4030,34 +3600,23 @@ fn build_content_group(
                     checkpoint_stats(&part_path, &key).map(|stats| {
                         read_site_info_checkpoint(&part_path)
                             .map(|site_info| ContentPartResult {
+                                title_path: part_path.with_extension("titles.swdump"),
                                 path: part_path.clone(),
                                 stats,
                                 site_info,
+                                samples: part_path
+                                    .with_extension("samples")
+                                    .exists()
+                                    .then(|| part_path.with_extension("samples")),
                             })
                     })
                 })
                 .flatten()
                 .transpose()?;
-            if let Some(result) = saved {
-                let live_path = part_path.with_extension("progress.json");
-                if !live_path.exists() {
-                    let value = LiveTargetProgress {
-                        target: format!("content-{index:06}"),
-                        part: part.filename.clone(),
-                        phase: "finished".into(),
-                        source_bytes_read: part.size_bytes,
-                        source_bytes_total: part.size_bytes,
-                        pages: result.stats.pages,
-                        revisions: result.stats.revisions,
-                        started_at_micros: now_micros(),
-                        updated_at_micros: now_micros(),
-                        heartbeat_at_micros: now_micros(),
-                        ..Default::default()
-                    };
-                    std::fs::write(&live_path, serde_json::to_vec(&value).map_err(|_| {
-                        Error::Corrupt("cannot restore source progress checkpoint")
-                    })?)?;
-                }
+            if let Some(result) = saved.filter(|result| {
+                result.title_path.is_file()
+                    && (sample_capacity.is_none() || result.samples.is_some())
+            }) {
                 progress(&format!("reusing completed source {}", part.filename));
                 reused.push((part_index, result));
                 continue;
@@ -4066,7 +3625,7 @@ fn build_content_group(
                 part_path.clone(),
                 checkpoint_receipt_path(&part_path),
                 site_info_checkpoint_path(&part_path),
-                part_path.with_extension("progress.json"),
+                part_path.with_extension("titles.swdump"),
             ] {
                 if stale.exists() {
                     std::fs::remove_file(stale)?;
@@ -4101,6 +3660,8 @@ fn build_content_group(
                         per_part_workers,
                         observed_at_micros,
                         retain_live_progress_until_publish,
+                        sample_capacity
+                            .map(|capacity| capacity.div_ceil(parts.len().max(1))),
                         progress,
                     ) {
                         Ok(result) => {
@@ -4143,6 +3704,10 @@ fn build_content_group(
             .iter()
             .map(|(_, result)| result.path.clone())
             .collect::<Vec<_>>();
+        let title_inputs = results
+            .iter()
+            .map(|(_, result)| result.title_path.clone())
+            .collect::<Vec<_>>();
         let mut stats = PartialStats::default();
         let mut site_info = None;
         for (_, result) in &results {
@@ -4157,11 +3722,38 @@ fn build_content_group(
             DEFAULT_FRAME_TARGET,
         )
         .map_err(map_archive)?;
+        let title_path = path.with_extension("titles.swdump");
+        crate::archive::merge_many_archives(
+            &title_inputs,
+            std::fs::File::create(&title_path)?,
+            DEFAULT_FRAME_TARGET,
+        )
+        .map_err(map_archive)?;
+        let samples = if let Some(capacity) = sample_capacity {
+            let samples = path.with_extension("samples");
+            let mut writer = NewestTextSampleWriter::create(&samples, capacity)?;
+            for (_, result) in &results {
+                let source = result
+                    .samples
+                    .as_ref()
+                    .ok_or(Error::Corrupt("content source has no sample sidecar"))?;
+                read_text_samples(source, |sample| writer.push(sample))?;
+            }
+            writer.finish()?;
+            Some(samples)
+        } else {
+            None
+        };
         for input in inputs {
             std::fs::remove_file(&input)?;
+            let title_input = input.with_extension("titles.swdump");
+            if title_input.exists() {
+                std::fs::remove_file(title_input)?;
+            }
             for checkpoint in [
                 checkpoint_receipt_path(&input),
                 site_info_checkpoint_path(&input),
+                input.with_extension("samples"),
             ] {
                 if checkpoint.exists() {
                     std::fs::remove_file(checkpoint)?;
@@ -4169,9 +3761,11 @@ fn build_content_group(
             }
         }
         return Ok(ContentPartResult {
+            title_path,
             path,
             stats,
             site_info,
+            samples,
         });
     }
     build_content_part(
@@ -4183,6 +3777,7 @@ fn build_content_group(
         bz2_workers,
         observed_at_micros,
         retain_live_progress_until_publish,
+        sample_capacity,
         progress,
     )
 }
@@ -4194,24 +3789,31 @@ fn build_content_part(
     bz2_workers: usize,
     observed_at_micros: i64,
     retain_live_progress_until_publish: bool,
+    sample_capacity: Option<usize>,
     progress: &(impl Fn(&str) + Sync),
 ) -> Result<ContentPartResult> {
-    let live_path = path.with_extension("progress.json");
+    let progress_anchor = path.with_extension("progress");
+    let value = LiveTargetProgress {
+        target: path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .unwrap_or("content")
+            .to_owned(),
+        part: part.filename.clone(),
+        phase: "starting".into(),
+        source_bytes_total: part.size_bytes,
+        started_at_micros: now_micros(),
+        updated_at_micros: now_micros(),
+        ..Default::default()
+    };
     let live = Arc::new(Mutex::new(LiveProgressState {
-        path: live_path.clone(),
-        value: LiveTargetProgress {
-            target: path
-                .file_stem()
-                .and_then(|name| name.to_str())
-                .unwrap_or("content")
-                .to_owned(),
-            part: part.filename.clone(),
-            phase: "starting".into(),
-            source_bytes_total: part.size_bytes,
-            started_at_micros: now_micros(),
-            updated_at_micros: now_micros(),
-            ..Default::default()
-        },
+        projection: crate::progress_projection::source_writer(
+            &progress_scratch_root(&progress_anchor),
+            &value.target,
+            &value.part,
+        )
+        .ok(),
+        value,
         last_write: Instant::now()
             .checked_sub(Duration::from_secs(3))
             .unwrap_or_else(Instant::now),
@@ -4229,6 +3831,17 @@ fn build_content_part(
     let output = std::fs::File::create(path)?;
     let mut writer =
         ArchiveWriter::new(output, DEFAULT_FRAME_TARGET).map_err(map_archive)?;
+    let title_path = path.with_extension("titles.swdump");
+    let mut title_writer = ArchiveWriter::new(
+        std::fs::File::create(&title_path)?,
+        DEFAULT_FRAME_TARGET,
+    )
+    .map_err(map_archive)?;
+    let samples = sample_capacity.map(|capacity| (path.with_extension("samples"), capacity));
+    let mut sample_writer = samples
+        .as_ref()
+        .map(|(path, capacity)| NewestTextSampleWriter::create(path, *capacity))
+        .transpose()?;
     let mut stats = PartialStats::default();
     let mut site_info = None;
     progress(&format!("content download {}", part.filename));
@@ -4354,15 +3967,20 @@ fn build_content_part(
                 .cmp(&left.meta.ts)
                 .then(right.meta.rev_id.cmp(&left.meta.rev_id))
         });
-        writer
-            .write(&Record::PageState {
-                page_id,
-                timestamp_micros: observed_at_micros,
-                title: header.title.clone(),
-                namespace: None,
-                deleted: false,
-            })
-            .map_err(map_archive)?;
+        if let (Some(samples), Some(newest)) = (sample_writer.as_mut(), page_revisions.first()) {
+            if newest.has_text {
+                samples.push(&newest.text)?;
+            }
+        }
+        let page_state = Record::PageState {
+            page_id,
+            timestamp_micros: observed_at_micros,
+            title: header.title.clone(),
+            namespace: None,
+            deleted: false,
+        };
+        writer.write(&page_state).map_err(map_archive)?;
+        title_writer.write(&page_state).map_err(map_archive)?;
         for revision in page_revisions {
             writer
                 .write(&Record::Revision {
@@ -4378,6 +3996,11 @@ fn build_content_part(
     persist_live_progress(&live, true);
     let (output, _) = writer.finish().map_err(map_archive)?;
     output.sync_all()?;
+    let (title_output, _) = title_writer.finish().map_err(map_archive)?;
+    title_output.sync_all()?;
+    if let Some(samples) = sample_writer {
+        samples.finish()?;
+    }
     // The historical snapshot is the build-wide source of network totals
     // after the live sidecar is removed, so it must include the final fetch
     // counters.
@@ -4390,12 +4013,13 @@ fn build_content_part(
     }
     persist_live_progress(&live, true);
     if !retain_live_progress_until_publish {
-        let _ = std::fs::remove_file(live_path);
     }
     Ok(ContentPartResult {
         path: path.to_path_buf(),
+        title_path,
         stats,
         site_info,
+        samples: samples.map(|(path, _)| path),
     })
 }
 
@@ -4489,20 +4113,6 @@ fn convert_revision(revision: wikimak_mediawiki::Revision) -> Result<RevisionRec
         visibility: None,
         history: None,
     })
-}
-
-fn directory_bytes(path: &Path) -> std::io::Result<u64> {
-    let mut bytes = 0_u64;
-    for entry in std::fs::read_dir(path)? {
-        let entry = entry?;
-        let metadata = entry.metadata()?;
-        if metadata.is_dir() {
-            bytes = bytes.saturating_add(directory_bytes(&entry.path())?);
-        } else {
-            bytes = bytes.saturating_add(metadata.len());
-        }
-    }
-    Ok(bytes)
 }
 
 fn archive_file_complete(path: &Path) -> bool {
@@ -4632,6 +4242,10 @@ fn map_archive(error: ArchiveError) -> Error {
     }
 }
 
+fn map_invalid_build(error: crate::build_lifecycle::InvalidBuildState) -> Error {
+    Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+}
+
 fn parse_error(message: String) -> Error {
     Error::Mediawiki(wikimak_mediawiki::Error::Parse(message))
 }
@@ -4642,6 +4256,108 @@ mod build_graph_tests {
     use httpmock::MockServer;
 
     use super::*;
+
+    struct CountedRecord {
+        record: Option<Record>,
+        calls: Arc<AtomicU64>,
+    }
+
+    impl RecordSource for CountedRecord {
+        fn next_record(&mut self) -> crate::archive::Result<Option<Record>> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Ok(self.record.take())
+        }
+    }
+
+    #[test]
+    fn update_tail_merge_is_direct_below_the_fan_in_bound() {
+        let root = tempfile::tempdir().unwrap();
+        let output_path = root.path().join("tail.swdump");
+        let mut output = std::fs::File::create(&output_path).unwrap();
+        let calls = (0..7)
+            .map(|_| Arc::new(AtomicU64::new(0)))
+            .collect::<Vec<_>>();
+        let sources = (1..=7_u64)
+            .rev()
+            .zip(calls.iter())
+            .map(|(page_id, calls)| {
+                Box::new(CountedRecord {
+                    record: Some(Record::PageState {
+                        page_id,
+                        timestamp_micros: 1,
+                        title: format!("Page {page_id}"),
+                        namespace: None,
+                        deleted: false,
+                    }),
+                    calls: Arc::clone(calls),
+                }) as Box<dyn RecordSource>
+            })
+            .collect();
+        let (frames, records) = merge_record_sources_bounded(
+            sources,
+            &mut output,
+            &root.path().join("merge-work"),
+            1024,
+            CompressionSettings::default(),
+        )
+        .unwrap();
+        assert_ne!(frames, 0);
+        assert_eq!(records, 7);
+        assert!(calls
+            .iter()
+            .all(|calls| calls.load(Ordering::Relaxed) == 2));
+        assert!(!root.path().join("merge-work").exists());
+    }
+
+    #[test]
+    fn update_tail_merge_bounds_fan_in_above_sixty_four_sources() {
+        let root = tempfile::tempdir().unwrap();
+        let output_path = root.path().join("tail.swdump");
+        let mut output = std::fs::File::create(&output_path).unwrap();
+        let calls = (0..130)
+            .map(|_| Arc::new(AtomicU64::new(0)))
+            .collect::<Vec<_>>();
+        let sources = (1..=130_u64)
+            .rev()
+            .zip(calls.iter())
+            .map(|(page_id, calls)| {
+                Box::new(CountedRecord {
+                    record: Some(Record::PageState {
+                        page_id,
+                        timestamp_micros: 1,
+                        title: format!("Page {page_id}"),
+                        namespace: None,
+                        deleted: false,
+                    }),
+                    calls: Arc::clone(calls),
+                }) as Box<dyn RecordSource>
+            })
+            .collect();
+        let (frames, records) = merge_record_sources_bounded(
+            sources,
+            &mut output,
+            &root.path().join("merge-work"),
+            1024,
+            CompressionSettings::default(),
+        )
+        .unwrap();
+        drop(output);
+        assert!(frames != 0);
+        assert_eq!(records, 130);
+        assert!(!root.path().join("merge-work").exists());
+        assert!(calls
+            .iter()
+            .all(|calls| calls.load(Ordering::Relaxed) == 2));
+        assert_eq!(crate::archive::MAX_SORTED_MERGE_FAN_IN, 64);
+        let mut reader = ArchiveRecordReader::open(&output_path).unwrap();
+        for expected in 1..=130_u64 {
+            assert_eq!(
+                reader.next_record().unwrap().unwrap().entity().id,
+                expected
+            );
+        }
+        assert!(reader.next_record().unwrap().is_none());
+    }
 
     fn lifecycle_test_plan() -> DirectBuildPlan {
         let mut plan = DirectBuildPlan {
@@ -4659,384 +4375,11 @@ mod build_graph_tests {
             content_groups: Vec::new(),
             history_files: Vec::new(),
         };
-        plan.plan_id = direct_plan_id(&plan).unwrap();
+        plan.plan_id = canonical_direct_plan_id(&plan).unwrap();
         plan
     }
 
-    fn write_lifecycle_test_archive(root: &Path) {
-        let output =
-            crate::archive_set::ArchiveSetOutput::new_in(root, 1024).unwrap();
-        let mut writer = ArchiveWriter::with_ref_prefix(
-            output,
-            128,
-            CompressionSettings {
-                level: 1,
-                ..CompressionSettings::default()
-            },
-            b"test reference prefix",
-        )
-        .unwrap();
-        writer
-            .write(&Record::SiteInfo {
-                timestamp_micros: 1,
-                site_info: SiteInfoRecord {
-                    site_name: "Test".into(),
-                    db_name: "testwiki".into(),
-                    base: "https://example.invalid/wiki/Main_Page".into(),
-                    generator: "MediaWiki".into(),
-                    case: "first-letter".into(),
-                    language: "en".into(),
-                    rtl: false,
-                    server: "https://example.invalid".into(),
-                    script_path: "/w".into(),
-                    namespaces: Vec::new(),
-                    interwiki: Vec::new(),
-                    magic_words: Vec::new(),
-                },
-            })
-            .unwrap();
-        let (output, _) = writer.finish().unwrap();
-        output
-            .finish()
-            .unwrap()
-            .persist(root.join("archive.swdump"))
-            .unwrap();
-    }
 
-    #[test]
-    fn direct_build_lifecycle_classification_and_recovery_are_exhaustive() {
-        #[derive(Clone, Copy)]
-        enum ArchiveFixture {
-            Absent,
-            Incomplete,
-            Complete,
-        }
-        #[derive(Clone, Copy)]
-        enum ReceiptFixture {
-            Absent,
-            Matching,
-            Foreign,
-            Malformed,
-            Unreadable,
-            WrongSchema,
-            WrongInventory,
-        }
-        #[derive(Clone, Copy)]
-        enum IndexFixture {
-            Absent,
-            Matching,
-        }
-        #[derive(Clone, Copy)]
-        enum MarkerFixture {
-            Absent,
-            Matching,
-            Wrong,
-        }
-        struct Case {
-            name: &'static str,
-            archive: ArchiveFixture,
-            receipt: ReceiptFixture,
-            index: IndexFixture,
-            marker: MarkerFixture,
-            expected: &'static str,
-            diagnostic: Option<&'static str>,
-            recovery: std::result::Result<bool, ()>,
-        }
-
-        let state_name = |state: &DirectBuildLifecycleState| match state {
-            DirectBuildLifecycleState::Empty => "empty",
-            DirectBuildLifecycleState::NeedsIndex => "needs-index",
-            DirectBuildLifecycleState::NeedsCompletionMarker => "needs-marker",
-            DirectBuildLifecycleState::Ready => "ready",
-            DirectBuildLifecycleState::MetadataWithoutArchive => "metadata-without-archive",
-            DirectBuildLifecycleState::ArchiveInspectionFailed(_) => "archive-inspection-failed",
-            DirectBuildLifecycleState::ReceiptMissing => "receipt-missing",
-            DirectBuildLifecycleState::ReceiptUnreadable(_) => "receipt-unreadable",
-            DirectBuildLifecycleState::ReceiptMalformed(_) => "receipt-malformed",
-            DirectBuildLifecycleState::ReceiptSchemaUnsupported(_) => "receipt-schema",
-            DirectBuildLifecycleState::ForeignReceipt(_) => "receipt-foreign",
-            DirectBuildLifecycleState::ReceiptArchiveMismatch => "receipt-archive-mismatch",
-        };
-
-        let cases = [
-            Case {
-                name: "empty",
-                archive: ArchiveFixture::Absent,
-                receipt: ReceiptFixture::Absent,
-                index: IndexFixture::Absent,
-                marker: MarkerFixture::Absent,
-                expected: "empty",
-                diagnostic: None,
-                recovery: Ok(false),
-            },
-            Case {
-                name: "metadata without archive",
-                archive: ArchiveFixture::Absent,
-                receipt: ReceiptFixture::Foreign,
-                index: IndexFixture::Absent,
-                marker: MarkerFixture::Absent,
-                expected: "metadata-without-archive",
-                diagnostic: Some("metadata exists without its archive"),
-                recovery: Err(()),
-            },
-            Case {
-                name: "incomplete archive",
-                archive: ArchiveFixture::Incomplete,
-                receipt: ReceiptFixture::Absent,
-                index: IndexFixture::Absent,
-                marker: MarkerFixture::Absent,
-                expected: "archive-inspection-failed",
-                diagnostic: Some("cannot inspect staged archive generation"),
-                recovery: Err(()),
-            },
-            Case {
-                name: "complete archive without receipt",
-                archive: ArchiveFixture::Complete,
-                receipt: ReceiptFixture::Absent,
-                index: IndexFixture::Absent,
-                marker: MarkerFixture::Absent,
-                expected: "receipt-missing",
-                diagnostic: Some("has no generation receipt"),
-                recovery: Err(()),
-            },
-            Case {
-                name: "complete archive with foreign receipt",
-                archive: ArchiveFixture::Complete,
-                receipt: ReceiptFixture::Foreign,
-                index: IndexFixture::Absent,
-                marker: MarkerFixture::Absent,
-                expected: "receipt-foreign",
-                diagnostic: Some("belongs to build wrong"),
-                recovery: Err(()),
-            },
-            Case {
-                name: "complete archive with malformed receipt",
-                archive: ArchiveFixture::Complete,
-                receipt: ReceiptFixture::Malformed,
-                index: IndexFixture::Absent,
-                marker: MarkerFixture::Absent,
-                expected: "receipt-malformed",
-                diagnostic: Some("receipt is malformed"),
-                recovery: Err(()),
-            },
-            Case {
-                name: "complete archive with unreadable receipt",
-                archive: ArchiveFixture::Complete,
-                receipt: ReceiptFixture::Unreadable,
-                index: IndexFixture::Absent,
-                marker: MarkerFixture::Absent,
-                expected: "receipt-unreadable",
-                diagnostic: Some("cannot read staged generation receipt"),
-                recovery: Err(()),
-            },
-            Case {
-                name: "complete archive with unsupported receipt schema",
-                archive: ArchiveFixture::Complete,
-                receipt: ReceiptFixture::WrongSchema,
-                index: IndexFixture::Absent,
-                marker: MarkerFixture::Absent,
-                expected: "receipt-schema",
-                diagnostic: Some("unsupported schema"),
-                recovery: Err(()),
-            },
-            Case {
-                name: "complete archive with wrong receipt inventory",
-                archive: ArchiveFixture::Complete,
-                receipt: ReceiptFixture::WrongInventory,
-                index: IndexFixture::Absent,
-                marker: MarkerFixture::Absent,
-                expected: "receipt-archive-mismatch",
-                diagnostic: Some("inventory does not match"),
-                recovery: Err(()),
-            },
-            Case {
-                name: "bound archive needs index",
-                archive: ArchiveFixture::Complete,
-                receipt: ReceiptFixture::Matching,
-                index: IndexFixture::Absent,
-                marker: MarkerFixture::Absent,
-                expected: "needs-index",
-                diagnostic: None,
-                recovery: Ok(true),
-            },
-            Case {
-                name: "completion marker cannot substitute for index",
-                archive: ArchiveFixture::Complete,
-                receipt: ReceiptFixture::Matching,
-                index: IndexFixture::Absent,
-                marker: MarkerFixture::Matching,
-                expected: "needs-index",
-                diagnostic: None,
-                recovery: Ok(true),
-            },
-            Case {
-                name: "bound archive and index need final marker",
-                archive: ArchiveFixture::Complete,
-                receipt: ReceiptFixture::Matching,
-                index: IndexFixture::Matching,
-                marker: MarkerFixture::Absent,
-                expected: "needs-marker",
-                diagnostic: None,
-                recovery: Ok(true),
-            },
-            Case {
-                name: "wrong final marker is replaced only after binding and index",
-                archive: ArchiveFixture::Complete,
-                receipt: ReceiptFixture::Matching,
-                index: IndexFixture::Matching,
-                marker: MarkerFixture::Wrong,
-                expected: "needs-marker",
-                diagnostic: None,
-                recovery: Ok(true),
-            },
-            Case {
-                name: "ready",
-                archive: ArchiveFixture::Complete,
-                receipt: ReceiptFixture::Matching,
-                index: IndexFixture::Matching,
-                marker: MarkerFixture::Matching,
-                expected: "ready",
-                diagnostic: None,
-                recovery: Ok(true),
-            },
-        ];
-
-        for case in cases {
-            let directory = tempfile::tempdir().unwrap();
-            let root = directory.path();
-            let plan = lifecycle_test_plan();
-            match case.archive {
-                ArchiveFixture::Absent => {}
-                ArchiveFixture::Incomplete => {
-                    std::fs::create_dir(root.join("archive.swdump")).unwrap();
-                    std::fs::write(
-                        root.join("archive.swdump/0000-reference.swdump-part"),
-                        b"incomplete",
-                    )
-                    .unwrap();
-                }
-                ArchiveFixture::Complete => write_lifecycle_test_archive(root),
-            }
-            match case.receipt {
-                ReceiptFixture::Absent => {}
-                ReceiptFixture::Matching => {
-                    persist_staged_generation_receipt(
-                        root,
-                        &plan,
-                        &root.join("archive.swdump"),
-                    )
-                    .unwrap();
-                }
-                ReceiptFixture::Foreign => {
-                    std::fs::write(
-                        staged_generation_receipt_path(root),
-                        br#"{"schema":1,"plan_id":"wrong","segments":[]}"#,
-                    )
-                    .unwrap();
-                }
-                ReceiptFixture::Malformed => {
-                    std::fs::write(staged_generation_receipt_path(root), b"{").unwrap();
-                }
-                ReceiptFixture::Unreadable => {
-                    std::fs::create_dir(staged_generation_receipt_path(root)).unwrap();
-                }
-                ReceiptFixture::WrongSchema | ReceiptFixture::WrongInventory => {
-                    let receipt = StagedGenerationReceipt {
-                        schema: if matches!(case.receipt, ReceiptFixture::WrongSchema) {
-                            2
-                        } else {
-                            STAGED_GENERATION_RECEIPT_SCHEMA
-                        },
-                        plan_id: plan.plan_id.clone(),
-                        segments: Vec::new(),
-                    };
-                    std::fs::write(
-                        staged_generation_receipt_path(root),
-                        serde_json::to_vec(&receipt).unwrap(),
-                    )
-                    .unwrap();
-                }
-            }
-            if matches!(case.index, IndexFixture::Matching) {
-                crate::title_index::build(
-                    root.join("archive.swdump"),
-                    root.join("archive.swtitle"),
-                )
-                .unwrap();
-            }
-            match case.marker {
-                MarkerFixture::Absent => {}
-                MarkerFixture::Matching => {
-                    persist_completion_marker(root, &plan).unwrap();
-                }
-                MarkerFixture::Wrong => {
-                    std::fs::write(root.join("archive.complete"), b"wrong\n").unwrap();
-                }
-            }
-
-            let classified = classify_direct_build_lifecycle(root, &plan);
-            assert_eq!(state_name(&classified), case.expected, "{}", case.name);
-            if let Some(expected) = case.diagnostic {
-                assert!(
-                    classified
-                        .diagnostic()
-                        .is_some_and(|diagnostic| diagnostic.contains(expected)),
-                    "{}: {:?}",
-                    case.name,
-                    classified,
-                );
-            }
-            let recovered = recover_direct_build_completion(root, &plan, &|_| {});
-            match case.recovery {
-                Ok(expected) => {
-                    assert_eq!(recovered.unwrap(), expected, "{}", case.name);
-                    if expected {
-                        assert_eq!(
-                            classify_direct_build_lifecycle(root, &plan),
-                            DirectBuildLifecycleState::Ready,
-                            "{}",
-                            case.name,
-                        );
-                    }
-                }
-                Err(()) => {
-                    assert!(recovered.is_err(), "{}", case.name);
-                    let after = classify_direct_build_lifecycle(root, &plan);
-                    assert_eq!(
-                        state_name(&after),
-                        case.expected,
-                        "{} changed after rejected recovery: {:?}",
-                        case.name,
-                        after,
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn structured_progress_reports_indexing_from_staged_generation_state() {
-        let directory = tempfile::tempdir().unwrap();
-        let archive = directory.path().join("testwiki.swdump");
-        let root = crate::cli::mirror_scratch_path(&archive);
-        std::fs::create_dir_all(&root).unwrap();
-        let plan = lifecycle_test_plan();
-        std::fs::write(
-            root.join("plan.json"),
-            serde_json::to_vec(&plan).unwrap(),
-        )
-        .unwrap();
-        write_lifecycle_test_archive(&root);
-        persist_staged_generation_receipt(
-            &root,
-            &plan,
-            &root.join("archive.swdump"),
-        )
-        .unwrap();
-
-        let progress = mirror_build_progress(&archive).unwrap();
-        assert_eq!(progress.phase, "indexing completed archive");
-    }
 
     #[test]
     fn name_complete_assembly_without_clean_done_is_not_installed() {
@@ -5052,16 +4395,33 @@ mod build_graph_tests {
             sha1: None,
             md5: None,
         }]];
-        plan.plan_id = direct_plan_id(&plan).unwrap();
+        plan.plan_id = canonical_direct_plan_id(&plan).unwrap();
 
         let node = root.join("nodes/.candidate");
         std::fs::create_dir(&node).unwrap();
+        let data = node.join("data.swdump");
+        ArchiveWriter::new(std::fs::File::create(&data).unwrap(), 128)
+            .unwrap()
+            .finish()
+            .unwrap();
         ArchiveWriter::new(
-            std::fs::File::create(node.join("data.swdump")).unwrap(),
+            std::fs::File::create(node.join("title-records.swdump")).unwrap(),
             128,
         )
         .unwrap()
         .finish()
+        .unwrap();
+        std::fs::write(node.join("newest.samples"), b"").unwrap();
+        crate::frame_directory::write_from_archive(
+            &data,
+            node.join("data.swframe"),
+            crate::build_lifecycle::target_frame_directory_identity(
+                &plan,
+                crate::build_lifecycle::TargetKind::Content,
+                0,
+            )
+            .unwrap(),
+        )
         .unwrap();
         let mut siteinfo = ArchiveWriter::new(
             std::fs::File::create(node.join("siteinfo.swdump")).unwrap(),
@@ -5122,102 +4482,9 @@ mod build_graph_tests {
         assert!(node_path(root, &plan, "content", 0).exists());
     }
 
-    #[test]
-    fn phase_changes_are_persisted_only_by_the_periodic_sampler() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("source.progress.json");
-        let state = Arc::new(Mutex::new(LiveProgressState {
-            path: path.clone(),
-            value: LiveTargetProgress {
-                phase: "starting".into(),
-                ..Default::default()
-            },
-            last_write: Instant::now(),
-            last_phase: "starting".into(),
-        }));
-
-        for phase in ["waiting", "decompressing", "parsing", "decompressing"] {
-            set_live_phase(&state, phase);
-        }
-        assert!(
-            !path.exists(),
-            "a hot-path phase transition performed filesystem I/O"
-        );
-
-        persist_live_heartbeat(&state);
-        let persisted: LiveTargetProgress =
-            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
-        assert_eq!(persisted.phase, "decompressing");
-        assert_ne!(persisted.heartbeat_at_micros, 0);
-    }
 
     #[test]
-    fn assembly_snapshot_is_exposed_as_live_structured_progress() {
-        let directory = tempfile::tempdir().unwrap();
-        let archive = directory.path().join("testwiki.swdump");
-        let root = crate::cli::mirror_scratch_path(&archive);
-        std::fs::create_dir_all(root.join("nodes")).unwrap();
-        let mut plan = DirectBuildPlan {
-            schema: 1,
-            plan_id: String::new(),
-            wiki_db: "testwiki".into(),
-            content_snapshot: "2024-06-01".into(),
-            metadata_snapshot: "2024-06".into(),
-            observed_at_micros: 0,
-            frame_target: 1,
-            range_target: 1,
-            compression_level: 1,
-            ref_prefix_sample_bytes: 2,
-            ref_prefix_bytes: 1,
-            content_groups: Vec::new(),
-            history_files: Vec::new(),
-        };
-        plan.plan_id = direct_plan_id(&plan).unwrap();
-        std::fs::write(
-            root.join("plan.json"),
-            serde_json::to_vec(&plan).unwrap(),
-        )
-        .unwrap();
-        std::fs::write(root.join("stage2.mk"), b"all:\n").unwrap();
-        write_assembly_progress(
-            &root,
-            &AssemblyProgressSnapshot {
-                plan_id: plan.plan_id.clone(),
-                pid: std::process::id(),
-                phase: "replaying bootstrap 50/100 records (50.0%) · ETA 2s".into(),
-                input_bytes: 300,
-                input_bytes_total: 1000,
-                output_bytes: 200,
-                records: 50,
-                current_entity_kind: EntityKind::Page as u64,
-                current_entity_id: 42,
-                bytes_per_second: 0,
-                phase_current: 50,
-                phase_total: 100,
-                started_at_micros: now_micros().saturating_sub(1_000_000),
-                updated_at_micros: now_micros(),
-                cpu_user_micros: 700_000,
-                cpu_system_micros: 100_000,
-                peak_rss_bytes: 1234,
-            },
-        );
-
-        let progress = mirror_build_progress(&archive).unwrap();
-        assert!(progress.phase.starts_with("assembling · replaying bootstrap"));
-        assert_eq!(progress.target_progress.len(), 1);
-        let assembly = &progress.target_progress[0];
-        assert_eq!(assembly.target, "assembly");
-        assert_eq!(assembly.kind, "assembly");
-        assert_eq!(assembly.source_bytes_read, 300);
-        assert_eq!(assembly.source_bytes_total, 1000);
-        assert_eq!(assembly.decoded_bytes, 200);
-        assert_eq!(assembly.records, 50);
-        assert_eq!(assembly.current_page, 42);
-        assert_eq!(assembly.peak_rss_bytes, 1234);
-    }
-
-    #[test]
-    fn flattened_content_targets_keep_singleton_group_names_stable() {
+    fn content_overlap_groups_are_single_logical_targets() {
         let part = |name: &str| PlannedPart {
             url: format!("https://example.invalid/{name}"),
             filename: name.into(),
@@ -5245,445 +4512,150 @@ mod build_graph_tests {
             ],
             history_files: Vec::new(),
         };
-        assert_eq!(plan.content_target_count(), 4);
+        assert_eq!(plan.content_target_count(), 3);
         assert_eq!(plan.target_name("content", 0).as_deref(), Some("content-000000"));
         assert_eq!(
             plan.target_name("content", 1).as_deref(),
-            Some("content-000001-source-000000")
+            Some("content-000001")
         );
-        assert_eq!(
-            plan.target_name("content", 2).as_deref(),
-            Some("content-000001-source-000001")
-        );
-        assert_eq!(plan.target_name("content", 3).as_deref(), Some("content-000002"));
+        assert_eq!(plan.target_name("content", 2).as_deref(), Some("content-000002"));
     }
 
     #[test]
-    fn restart_adopts_complete_sources_from_an_old_grouped_partial() {
-        let part = |name: &str| PlannedPart {
+    fn newest_revision_sample_budget_is_exact_and_source_proportional() {
+        let part = |name: &str, size_bytes| PlannedPart {
             url: format!("https://example.invalid/{name}"),
             filename: name.into(),
-            size_bytes: 100,
+            size_bytes,
             sha256: None,
             sha1: None,
             md5: None,
         };
-        let mut plan = DirectBuildPlan {
-            schema: 1,
-            plan_id: String::new(),
-            wiki_db: "testwiki".into(),
-            content_snapshot: "2024-06-01".into(),
-            metadata_snapshot: "2024-06".into(),
-            observed_at_micros: 0,
-            frame_target: 1,
-            range_target: 1,
-            compression_level: 1,
-            ref_prefix_sample_bytes: 1,
-            ref_prefix_bytes: 1,
-            content_groups: vec![
-                vec![part("first")],
-                vec![part("slice-a"), part("slice-b"), part("slice-c")],
-            ],
-            history_files: Vec::new(),
-        };
-        plan.plan_id = direct_plan_id(&plan).unwrap();
+        let mut plan = lifecycle_test_plan();
+        plan.ref_prefix_sample_bytes = 5;
+        plan.content_groups = vec![
+            vec![part("small", 1)],
+            vec![part("large", 3)],
+        ];
+        assert_eq!(content_sample_quotas(&plan), vec![1, 4]);
+
+        plan.content_groups = vec![
+            vec![part("first", 0)],
+            vec![part("second", 0)],
+        ];
+        assert_eq!(content_sample_quotas(&plan), vec![3, 2]);
+        assert_eq!(content_sample_quotas(&plan).into_iter().sum::<usize>(), 5);
+    }
+
+    #[test]
+    fn small_wiki_uses_all_samples_without_invoking_dictionary_training() {
         let root = tempfile::tempdir().unwrap();
-        let partial = root.path().join("nodes/.content-000001.123.partial");
-        std::fs::create_dir_all(&partial).unwrap();
-        for source_index in [0, 2] {
-            let path = partial.join(format!(
-                "content-000000-source-{source_index:06}.swdump"
-            ));
-            ArchiveWriter::new(std::fs::File::create(path).unwrap(), 128)
-                .unwrap()
-                .finish()
+        let mut plan = lifecycle_test_plan();
+        plan.ref_prefix_sample_bytes = 1024;
+        plan.ref_prefix_bytes = 512;
+        plan.content_groups = vec![vec![PlannedPart {
+            url: "https://example.invalid/tiny.xml".into(),
+            filename: "tiny.xml".into(),
+            size_bytes: 7,
+            sha256: None,
+            sha1: None,
+            md5: None,
+        }]];
+        plan.plan_id = canonical_direct_plan_id(&plan).unwrap();
+        let node = node_path(root.path(), &plan, "content", 0);
+        std::fs::create_dir_all(&node).unwrap();
+        let mut samples = NewestTextSampleWriter::create(&node.join("newest.samples"), 1024)
+            .unwrap();
+        samples.push(b"abc").unwrap();
+        samples.push(b"defg").unwrap();
+        samples.finish().unwrap();
+
+        assert_eq!(distill_plan_ref_prefix(root.path(), &plan).unwrap(), b"abcdefg");
+    }
+
+    #[test]
+    fn assembly_resume_does_not_decode_the_sealed_target_prefix() {
+        use std::io::{Seek, SeekFrom};
+
+        let root = tempfile::tempdir().unwrap();
+        let archive = root.path().join("target.swdump");
+        let mut writer =
+            ArchiveWriter::new(std::fs::File::create(&archive).unwrap(), 1).unwrap();
+        for page_id in 1..=3 {
+            writer
+                .write(&Record::PageState {
+                    page_id,
+                    timestamp_micros: 1,
+                    title: format!("Page {page_id}"),
+                    namespace: Some(0),
+                    deleted: false,
+                })
                 .unwrap();
         }
-
-        assert_eq!(prune_invalid_build_nodes(root.path(), &plan).unwrap(), 2);
-        assert!(validate_node(root.path(), &plan, "content", 1).unwrap());
-        assert!(!validate_node(root.path(), &plan, "content", 2).unwrap());
-        assert!(validate_node(root.path(), &plan, "content", 3).unwrap());
-        assert!(!partial.exists());
-    }
-
-    #[test]
-    fn restart_adopts_an_old_completed_group_without_repeating_its_records() {
-        let part = |name: &str| PlannedPart {
-            url: format!("https://example.invalid/{name}"),
-            filename: name.into(),
-            size_bytes: 100,
-            sha256: None,
-            sha1: None,
-            md5: None,
-        };
-        let mut plan = DirectBuildPlan {
-            schema: 1,
-            plan_id: String::new(),
-            wiki_db: "testwiki".into(),
-            content_snapshot: "2024-06-01".into(),
-            metadata_snapshot: "2024-06".into(),
-            observed_at_micros: 0,
-            frame_target: 1,
-            range_target: 1,
-            compression_level: 1,
-            ref_prefix_sample_bytes: 1,
-            ref_prefix_bytes: 1,
-            content_groups: vec![
-                vec![part("first")],
-                vec![part("slice-a"), part("slice-b"), part("slice-c")],
-            ],
-            history_files: Vec::new(),
-        };
-        plan.plan_id = direct_plan_id(&plan).unwrap();
-        let root = tempfile::tempdir().unwrap();
-        let old_node = root.path().join("nodes/content-000001.done");
-        std::fs::create_dir_all(&old_node).unwrap();
-        let data = old_node.join("data.swdump");
-        let mut writer =
-            ArchiveWriter::new(std::fs::File::create(&data).unwrap(), 128).unwrap();
-        writer
-            .write(&Record::Manifest {
-                timestamp_micros: 0,
-                manifest: ManifestRecord {
-                    wiki_db: "testwiki".into(),
-                    content_snapshot: "2024-06-01".into(),
-                    metadata_snapshot: "2024-06".into(),
-                    source_files: vec!["old-group".into()],
-                },
-            })
-            .unwrap();
         writer.finish().unwrap();
-        std::fs::write(
-            old_node.join("receipt.json"),
-            serde_json::to_vec(&BuildReceipt {
-                plan_id: plan.plan_id.clone(),
-                kind: "content".into(),
-                index: 1,
-                data_bytes: std::fs::metadata(&data).unwrap().len(),
-                stats: PartialStats::default(),
-            })
-            .unwrap(),
+        let frame_directory = root.path().join("target.swframe");
+        let identity = [19_u8; 32];
+        crate::frame_directory::write_from_archive(
+            &archive,
+            &frame_directory,
+            identity,
         )
         .unwrap();
+        let directory =
+            crate::frame_directory::FrameDirectory::open_bound(&frame_directory, identity)
+                .unwrap();
+        assert_eq!(directory.len(), 3);
+        let suffix_compressed_bytes = (1..directory.len())
+            .map(|index| directory.get(index).unwrap().compressed_bytes)
+            .sum::<u64>();
 
-        assert_eq!(prune_invalid_build_nodes(root.path(), &plan).unwrap(), 3);
-        assert!(!old_node.exists());
-        for index in 1..=3 {
-            assert!(validate_node(root.path(), &plan, "content", index).unwrap());
-        }
-        let mut aggregate = ArchiveRecordReader::open(
-            node_path(root.path(), &plan, "content", 1).join("data.swdump"),
-        )
-        .unwrap();
-        assert!(matches!(
-            aggregate.next_record().unwrap(),
-            Some(Record::Manifest { .. })
-        ));
-        let mut empty = ArchiveRecordReader::open(
-            node_path(root.path(), &plan, "content", 2).join("data.swdump"),
-        )
-        .unwrap();
-        assert!(empty.next_record().unwrap().is_none());
-    }
-
-    #[test]
-    fn network_progress_survives_partial_target_replacement() {
-        let root = tempfile::tempdir().unwrap();
-        std::fs::create_dir(root.path().join("nodes")).unwrap();
-        let partial = root.path().join("nodes/.content-000000.123.partial");
-        std::fs::create_dir(&partial).unwrap();
-        std::fs::write(
-            root.path().join("plan.json"),
-            br#"{"plan_id":"plan-test"}"#,
-        )
-        .unwrap();
-        let sidecar = partial.join("content-000000.progress.json");
-        let state = Arc::new(Mutex::new(LiveProgressState {
-            path: sidecar.clone(),
-            value: LiveTargetProgress {
-                target: "content-000000".into(),
-                part: "content.xml.bz2".into(),
-                started_at_micros: 42,
-                fetch_attempts: 3,
-                fetch_rate_limit_responses: 2,
-                fetch_bytes_received: 1234,
-                ..Default::default()
-            },
-            last_write: Instant::now()
-                .checked_sub(Duration::from_secs(3))
-                .unwrap(),
-            last_phase: String::new(),
-        }));
-        persist_live_progress(&state, true);
-        let unrelated = Arc::new(Mutex::new(LiveProgressState {
-            path: partial.join("mislabeled.progress.json"),
-            value: LiveTargetProgress {
-                target: "content-000000".into(),
-                part: "belongs-to-another-target.xml.bz2".into(),
-                started_at_micros: 43,
-                fetch_attempts: 99,
-                fetch_rate_limit_responses: 99,
-                fetch_bytes_received: 99,
-                ..Default::default()
-            },
-            last_write: Instant::now()
-                .checked_sub(Duration::from_secs(3))
-                .unwrap(),
-            last_phase: String::new(),
-        }));
-        persist_live_progress(&unrelated, true);
-        std::fs::remove_dir_all(partial).unwrap();
-
-        let plan = DirectBuildPlan {
-            schema: 1,
-            plan_id: "plan-test".into(),
-            wiki_db: "testwiki".into(),
-            content_snapshot: "2024-06-01".into(),
-            metadata_snapshot: "2024-06".into(),
-            observed_at_micros: 0,
-            frame_target: 1,
-            range_target: 1,
-            compression_level: 1,
-            ref_prefix_sample_bytes: 1,
-            ref_prefix_bytes: 1,
-            content_groups: vec![vec![PlannedPart {
-                url: "https://example.invalid/content.xml.bz2".into(),
-                filename: "content.xml.bz2".into(),
-                size_bytes: 0,
-                sha256: None,
-                sha1: None,
-                md5: None,
-            }]],
-            history_files: Vec::new(),
-        };
-        let totals = read_network_history(root.path(), &plan).unwrap();
-        assert_eq!(totals.targets.len(), 1);
-        assert_eq!(totals.fetch_attempts, 3);
-        assert_eq!(totals.fetch_rate_limit_responses, 2);
-        assert_eq!(totals.fetch_bytes_received, 1234);
-    }
-
-    #[test]
-    fn split_target_progress_is_monotonic_and_source_attributed() {
-        let directory = tempfile::tempdir().unwrap();
-        let archive = directory.path().join("testwiki.swdump");
-        let root = crate::cli::mirror_scratch_path(&archive);
-        let part = |name: &str| PlannedPart {
-            url: format!("https://example.invalid/{name}"),
-            filename: name.into(),
-            size_bytes: 100,
-            sha256: None,
-            sha1: None,
-            md5: None,
-        };
-        let mut plan = DirectBuildPlan {
-            schema: 1,
-            plan_id: String::new(),
-            wiki_db: "testwiki".into(),
-            content_snapshot: "2024-06-01".into(),
-            metadata_snapshot: "2024-06".into(),
-            observed_at_micros: 0,
-            frame_target: 1,
-            range_target: 1,
-            compression_level: 1,
-            ref_prefix_sample_bytes: 1,
-            ref_prefix_bytes: 1,
-            content_groups: vec![
-                vec![
-                    part("source-1.xml.bz2"),
-                    part("source-2.xml.bz2"),
-                    part("source-3.xml.bz2"),
-                ],
-                vec![part("stale.xml.bz2")],
-            ],
-            history_files: Vec::new(),
-        };
-        plan.plan_id = direct_plan_id(&plan).unwrap();
-        std::fs::create_dir_all(root.join("nodes")).unwrap();
-        std::fs::write(
-            root.join("plan.json"),
-            serde_json::to_vec(&plan).unwrap(),
-        )
-        .unwrap();
-        let values = [
-            LiveTargetProgress {
-                target: "content-000000-source-000000".into(),
-                part: "source-1.xml.bz2".into(),
-                phase: "finished".into(),
-                source_bytes_read: 100,
-                source_bytes_total: 100,
-                started_at_micros: 1,
-                updated_at_micros: now_micros(),
-                ..Default::default()
-            },
-            LiveTargetProgress {
-                target: "content-000000-source-000001".into(),
-                part: "source-2.xml.bz2".into(),
-                phase: "waiting for source bytes".into(),
-                source_bytes_read: 20,
-                source_bytes_total: 100,
-                started_at_micros: 2,
-                updated_at_micros: now_micros(),
-                ..Default::default()
-            },
-            LiveTargetProgress {
-                target: "content-000000-source-000002".into(),
-                part: "source-3.xml.bz2".into(),
-                phase: "waiting for network slot".into(),
-                source_bytes_total: 100,
-                started_at_micros: 3,
-                updated_at_micros: now_micros(),
-                ..Default::default()
-            },
-        ];
-        for (index, value) in values.iter().enumerate() {
-            let partial = root.join(format!(
-                "nodes/.content-000000-source-{index:06}.{}.partial",
-                std::process::id()
-            ));
-            std::fs::create_dir_all(&partial).unwrap();
-            std::fs::write(
-                partial.join(format!("source-{index}.progress.json")),
-                serde_json::to_vec(value).unwrap(),
-            )
+        // Make decoding the sealed prefix fail decisively. A correctly
+        // positioned resume never touches these bytes.
+        let first = directory.get(0).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&archive)
             .unwrap();
-        }
-        let stale = root.join("nodes/.content-000001.123.partial");
-        std::fs::create_dir_all(&stale).unwrap();
-        std::fs::write(
-            stale.join("content-000000.progress.json"),
-            serde_json::to_vec(&LiveTargetProgress {
-                target: "content-000000.swdump".into(),
-                part: "stale.xml.bz2".into(),
-                phase: "downloading".into(),
-                source_bytes_total: 100,
-                started_at_micros: 1,
-                updated_at_micros: 1,
-                ..Default::default()
-            })
-            .unwrap(),
-        )
-        .unwrap();
+        file.seek(SeekFrom::Start(first.compressed_offset)).unwrap();
+        file.write_all(&vec![0; first.compressed_bytes as usize])
+            .unwrap();
+        file.sync_all().unwrap();
+        drop(file);
 
-        let progress = mirror_build_progress(&archive).unwrap();
-        assert_eq!(progress.source_bytes_completed, 120);
-        assert_eq!(progress.target_progress.len(), 3);
-        assert_eq!(
-            progress
-                .target_progress
-                .iter()
-                .find(|row| row.target == "content-000000-source-000001")
-                .unwrap()
-                .source_bytes_read,
-            20
+        let accounted = Arc::new(AtomicU64::new(0));
+        let mut source = SequentialTargetReaders::new(
+            vec![(archive, frame_directory, identity)],
+            Some(EntityKey {
+                kind: EntityKind::Page,
+                id: 1,
+            }),
+            Arc::clone(&accounted),
         );
+        assert_eq!(source.next_record().unwrap().unwrap().entity().id, 2);
+        assert_eq!(source.next_record().unwrap().unwrap().entity().id, 3);
+        assert!(source.next_record().unwrap().is_none());
         assert_eq!(
-            progress
-                .target_progress
-                .iter()
-                .find(|row| row.target == "content-000000-source-000002")
-                .unwrap()
-                .fetch_attempts,
-            0
-        );
-        assert!(
-            progress.targets_active.iter().any(|row| row.contains("100 B / 100 B")),
-            "finished fragment remains visible until its receipt is published: {:?}",
-            progress.targets_active,
+            accounted.load(Ordering::Relaxed),
+            suffix_compressed_bytes,
+            "resume accounting includes only frames after the sealed entity"
         );
     }
 
     #[test]
-    fn durable_target_is_reused_and_removed_only_after_final_generation() {
-        let server = MockServer::start();
-        let content = include_bytes!("../tests/data/export_three_pages.xml");
-        let source = server.mock(|when, then| {
-            when.method(GET).path("/content.xml");
-            then.status(200).body(content);
-        });
-        let root = tempfile::tempdir().unwrap();
-        std::fs::create_dir(root.path().join("nodes")).unwrap();
-        let mut plan = DirectBuildPlan {
-            schema: 1,
-            plan_id: String::new(),
-            wiki_db: "testwiki".into(),
-            content_snapshot: "2024-06-01".into(),
-            metadata_snapshot: "2024-06".into(),
-            observed_at_micros: snapshot_date_micros(
-                chrono::NaiveDate::from_ymd_opt(2024, 6, 1).unwrap(),
-            )
-            .unwrap(),
-            frame_target: MIRROR_FRAME_TARGET,
-            range_target: crate::archive_set::DEFAULT_RANGE_TARGET,
-            compression_level: 9,
-            ref_prefix_sample_bytes: MIRROR_REF_PREFIX_SAMPLE_BYTES,
-            ref_prefix_bytes: MIRROR_REF_PREFIX_BYTES,
-            content_groups: vec![vec![PlannedPart {
-                url: server.url("/content.xml"),
-                filename: "content.xml".into(),
-                size_bytes: content.len() as u64,
-                sha256: None,
-                sha1: None,
-                md5: None,
-            }]],
-            history_files: vec![],
-        };
-        plan.plan_id = direct_plan_id(&plan).unwrap();
-        let client = Client::new();
-
-        materialize_direct_build_node(
-            &client,
-            root.path(),
-            &plan,
-            "content",
-            0,
-            1,
-            &|_| {},
-        )
-        .unwrap();
-        assert_eq!(source.hits(), 1);
-        assert!(validate_node(root.path(), &plan, "content", 0).unwrap());
-
-        materialize_direct_build_node(
-            &client,
-            root.path(),
-            &plan,
-            "content",
-            0,
-            1,
-            &|_| {},
-        )
-        .unwrap();
-        assert_eq!(source.hits(), 1, "durable target was fetched again");
-
-        let archive = assemble_direct_build(root.path(), &plan, &|_| {}).unwrap();
-        crate::archive_set::ArchiveSetReader::open(archive).unwrap();
-        crate::title_index::TitleIndex::open(
-            root.path().join("archive.swtitle"),
-        )
-        .unwrap();
-        assert!(root.path().join("archive.complete").exists());
+    fn planned_range_count_stays_bounded_at_wikipedia_scale() {
+        assert_eq!(planned_range_layout(600 << 20).0, 1);
+        assert_eq!(planned_range_layout(2 << 40).0, 11);
+        assert_eq!(planned_range_layout(20 << 40).0, 103);
+        assert_eq!(planned_range_layout(u64::MAX).0, MAX_PLANNED_RANGES);
         assert!(
-            !node_path(root.path(), &plan, "content", 0).exists(),
-            "consumed target survived its durable replacement"
-        );
-        std::fs::remove_file(root.path().join("archive.complete")).unwrap();
-        std::fs::remove_file(root.path().join("archive.swtitle")).unwrap();
-        assert!(
-            recover_direct_build_completion(root.path(), &plan, &|_| {}).unwrap()
-        );
-        crate::title_index::TitleIndex::open(
-            root.path().join("archive.swtitle"),
-        )
-        .unwrap();
-        assert_eq!(
-            std::fs::read_to_string(root.path().join("archive.complete"))
-                .unwrap()
-                .trim_end(),
-            plan.plan_id
+            planned_range_layout(20 << 40).1
+                >= crate::archive_set::DEFAULT_RANGE_TARGET
         );
     }
+
+
+
+
 
     #[test]
     fn overlapping_content_parts_are_merged_instead_of_concatenated() {
@@ -5732,17 +4704,14 @@ mod build_graph_tests {
             ]],
             history_files: Vec::new(),
         };
-        plan.plan_id = direct_plan_id(&plan).unwrap();
+        plan.plan_id = canonical_direct_plan_id(&plan).unwrap();
         let scratch = tempfile::tempdir().unwrap();
         std::fs::create_dir(scratch.path().join("nodes")).unwrap();
-        assert_eq!(plan.content_target_count(), 2);
+        crate::build_lifecycle::commit_plan(scratch.path(), &plan).unwrap();
+        assert_eq!(plan.content_target_count(), 1);
         assert_eq!(
             plan.target_name("content", 0).as_deref(),
-            Some("content-000000-source-000000")
-        );
-        assert_eq!(
-            plan.target_name("content", 1).as_deref(),
-            Some("content-000000-source-000001")
+            Some("content-000000")
         );
         materialize_direct_build_node(
             &Client::new(),
@@ -5754,18 +4723,12 @@ mod build_graph_tests {
             &|_| {},
         )
         .unwrap();
-        materialize_direct_build_node(
-            &Client::new(),
-            scratch.path(),
-            &plan,
-            "content",
-            1,
-            2,
-            &|_| {},
-        )
-        .unwrap();
-        assert!(validate_node(scratch.path(), &plan, "content", 0).unwrap());
-        assert!(validate_node(scratch.path(), &plan, "content", 1).unwrap());
+        let inspected =
+            crate::build_lifecycle::inspect_build(scratch.path(), Some(&plan.plan_id)).unwrap();
+        assert!(inspected.targets().iter().all(|target| matches!(
+            target.state,
+            crate::build_lifecycle::TargetState::Ready(_)
+        )));
         let archive = assemble_direct_build(scratch.path(), &plan, &|_| {}).unwrap();
         crate::archive_set::ArchiveSetReader::open(archive).unwrap();
         assert_eq!(first.hits(), 1);
@@ -5810,6 +4773,7 @@ mod build_graph_tests {
                 2,
                 observed_at,
                 true,
+                None,
                 &|_| {},
             )
             .is_err()
@@ -5827,6 +4791,7 @@ mod build_graph_tests {
             2,
             observed_at,
             true,
+            None,
             &|_| {},
         )
         .unwrap();

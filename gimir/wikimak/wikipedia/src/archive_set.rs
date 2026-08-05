@@ -54,6 +54,100 @@ pub struct ArchiveSetSegment {
     pub last_id: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PartialArchiveSetIdentity {
+    pub(crate) segments: Vec<ArchiveSetSegment>,
+    pub(crate) attempt_tails: Vec<String>,
+    pub(crate) unowned_entries: Vec<String>,
+}
+
+/// Inspect a resumable archive set without changing it.
+///
+/// Sealed segments are authoritative only when a build receipt names this
+/// exact inventory. Open `.range-*.tmp` files and unrelated entries are
+/// reported separately so the caller can decide an explicit resume/abandon
+/// transition; this function never deletes or adopts either class.
+pub(crate) fn inspect_partial_archive_set(
+    root: impl AsRef<Path>,
+) -> Result<PartialArchiveSetIdentity> {
+    let root = root.as_ref();
+    let mut names = std::fs::read_dir(root)?
+        .map(|entry| entry.map(|entry| entry.file_name()))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    names.sort();
+    let mut segments = Vec::new();
+    let mut attempt_tails = Vec::new();
+    let mut unowned_entries = Vec::new();
+    let mut virtual_start = 0_u64;
+    for name in names {
+        let name = name
+            .into_string()
+            .map_err(|_| ArchiveError::Invalid("archive-set filename is not UTF-8"))?;
+        if name.starts_with(".range-") && name.ends_with(".tmp") {
+            attempt_tails.push(name);
+            continue;
+        }
+        if !name.ends_with(PART_SUFFIX) {
+            unowned_entries.push(name);
+            continue;
+        }
+        if name == "9999-complete.swdump-part" {
+            return Err(ArchiveError::Invalid(
+                "partial archive-set inspection found a completion segment",
+            ));
+        }
+        let path = root.join(&name);
+        if !path.is_file() {
+            return Err(ArchiveError::Invalid(
+                "archive-set segment is not a regular file",
+            ));
+        }
+        let bytes = std::fs::metadata(&path)?.len();
+        let (kind, first_id, last_id) = parse_segment_name(&name)?;
+        segments.push(ArchiveSetSegment {
+            name,
+            virtual_start,
+            bytes,
+            kind,
+            first_id,
+            last_id,
+        });
+        virtual_start = virtual_start
+            .checked_add(bytes)
+            .ok_or(ArchiveError::FieldTooLarge)?;
+    }
+    if !segments.is_empty()
+        && !segments
+            .first()
+            .is_some_and(|segment| segment.name == "0000-reference.swdump-part")
+    {
+        return Err(ArchiveError::Invalid(
+            "partial archive set lacks its reference segment",
+        ));
+    }
+    let mut previous = None;
+    for segment in segments.iter().filter(|segment| segment.kind.is_some()) {
+        let first = EntityKey {
+            kind: segment.kind.expect("filtered above"),
+            id: segment.first_id,
+        };
+        if previous.is_some_and(|boundary| first <= boundary) {
+            return Err(ArchiveError::Invalid(
+                "partial archive ranges are not strictly ordered",
+            ));
+        }
+        previous = Some(EntityKey {
+            kind: first.kind,
+            id: segment.last_id,
+        });
+    }
+    Ok(PartialArchiveSetIdentity {
+        segments,
+        attempt_tails,
+        unowned_entries,
+    })
+}
+
 struct Part {
     temporary: PathBuf,
     file: std::fs::File,

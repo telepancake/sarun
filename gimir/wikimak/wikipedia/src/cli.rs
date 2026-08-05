@@ -5,43 +5,10 @@ use std::path::{Path, PathBuf};
 
 use crate::archive::MIRROR_FRAME_TARGET;
 
+#[path = "update_lifecycle.rs"]
+mod update_lifecycle;
+
 struct MirrorBuildLock(std::fs::File);
-
-#[derive(serde::Deserialize, serde::Serialize)]
-struct UpdateCheckpointReceipt {
-    schema: u32,
-    wiki_db: String,
-    checkpoint_key: String,
-    overlap_days: u64,
-    frame_target: usize,
-    compression_level: i32,
-}
-
-#[derive(Clone, serde::Deserialize, serde::Serialize)]
-struct UpdateRangePlan {
-    schema: u32,
-    checkpoint_key: String,
-    ranges: Vec<UpdateRange>,
-}
-
-#[derive(Clone, serde::Deserialize, serde::Serialize)]
-struct UpdateRange {
-    name: String,
-    kind: u8,
-    first_id: u64,
-    last_id: u64,
-}
-
-#[derive(serde::Deserialize, serde::Serialize)]
-struct UpdateRangeReceipt {
-    schema: u32,
-    checkpoint_key: String,
-    old_name: String,
-    new_name: String,
-    bytes: u64,
-    frames: u64,
-    records: u64,
-}
 
 impl MirrorBuildLock {
     fn acquire(scratch: &Path) -> Result<Self, String> {
@@ -110,19 +77,6 @@ pub fn mirror_scratch_path(archive: &Path) -> PathBuf {
     parent.join(".wikimak-scratch").join(name)
 }
 
-fn install_sidecar(destination: &Path, suffix: &str) -> Result<PathBuf, String> {
-    let parent = destination
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let mut name = destination
-        .file_name()
-        .ok_or_else(|| format!("{} has no file name", destination.display()))?
-        .to_os_string();
-    name.push(suffix);
-    Ok(parent.join(name))
-}
-
 fn sync_parent(destination: &Path) -> Result<(), String> {
     #[cfg(unix)]
     {
@@ -146,14 +100,13 @@ fn remove_path(path: &Path) -> std::io::Result<()> {
 }
 
 pub fn mirror_auxiliary_paths(archive: &Path) -> Result<Vec<PathBuf>, String> {
-    let title = archive.with_extension("swtitle");
-    Ok(vec![
-        mirror_scratch_path(archive),
-        install_sidecar(archive, ".installing")?,
-        install_sidecar(archive, ".previous")?,
-        install_sidecar(archive, ".updating")?,
-        install_sidecar(&title, ".previous")?,
-    ])
+    let mut paths = vec![mirror_scratch_path(archive)];
+    paths.extend(crate::installation_lifecycle::auxiliary_paths(archive)?);
+    Ok(paths)
+}
+
+pub fn mirror_has_installed_generation(archive: &Path) -> Result<bool, String> {
+    crate::installation_lifecycle::serving_pair(archive).map(|pair| pair.is_some())
 }
 
 fn ensure_mirror_scratch(archive: &Path) -> Result<PathBuf, String> {
@@ -274,14 +227,14 @@ fn build_node_targets(plan: &crate::direct::DirectBuildPlan) -> Vec<String> {
     (0..plan.content_target_count())
         .map(|index| {
             format!(
-                "nodes/{}.done",
+                "nodes/{}.done/receipt.json",
                 plan.target_name("content", index)
                     .expect("content target index came from the plan")
             )
         })
         .chain(
             (0..plan.history_files.len())
-                .map(|index| format!("nodes/history-{index:06}.done")),
+                .map(|index| format!("nodes/history-{index:06}.done/receipt.json")),
         )
         .collect()
 }
@@ -297,10 +250,7 @@ fn write_stage_one_makefile(
     let bz2_workers = (cores / outer_workers).max(1);
     let targets = build_node_targets(plan);
     let mut makefile = String::from(".PHONY: all\n");
-    makefile.push_str("ifneq ($(wildcard archive.complete),)\nall:\n");
-    makefile.push_str(&format!(
-        "else\nall: stage2.mk\n\t@{make} -f stage2.mk -j1\n\n"
-    ));
+    makefile.push_str(&format!("all: stage2.mk\n\t@{make} -f stage2.mk -j1\n\n"));
     makefile.push_str("stage2.mk:");
     for target in &targets {
         makefile.push(' ');
@@ -314,17 +264,16 @@ fn write_stage_one_makefile(
             .target_name("content", index)
             .expect("content target index came from the plan");
         makefile.push_str(&format!(
-            "nodes/{target}.done:\n\
+            "nodes/{target}.done/receipt.json:\n\
              \t@{tool} build-node . plan.json content {index} {bz2_workers}\n\n"
         ));
     }
     for index in 0..plan.history_files.len() {
         makefile.push_str(&format!(
-            "nodes/history-{index:06}.done:\n\
+            "nodes/history-{index:06}.done/receipt.json:\n\
              \t@{tool} build-node . plan.json history {index} {bz2_workers}\n\n"
         ));
     }
-    makefile.push_str("endif\n");
     persist_text(&scratch.join("stage1.mk"), &makefile)
 }
 
@@ -333,7 +282,8 @@ fn write_stage_two_makefile(
     plan: &crate::direct::DirectBuildPlan,
 ) -> Result<(), String> {
     let tool = build_tool_command()?;
-    let mut makefile = String::from(".PHONY: all\nall: archive.complete\n\narchive.complete:");
+    let mut makefile =
+        String::from(".PHONY: all\nall: archive.generation.json\n\narchive.generation.json:");
     for target in build_node_targets(plan) {
         makefile.push(' ');
         makefile.push_str(&target);
@@ -381,137 +331,9 @@ fn run_build_make(
     }
 }
 
-fn recover_interrupted_install(destination: &Path) -> Result<(), String> {
-    let marker = install_sidecar(destination, ".installing")?;
-    if !marker.exists() {
-        return Ok(());
-    }
-    let title = destination.with_extension("swtitle");
-    let old_archive = install_sidecar(destination, ".previous")?;
-    let old_title = install_sidecar(&title, ".previous")?;
-    match (old_archive.exists(), old_title.exists()) {
-        (true, true) => {
-            if destination.exists() {
-                remove_path(destination)
-                    .map_err(|error| format!("{}: {error}", destination.display()))?;
-            }
-            if title.exists() {
-                std::fs::remove_file(&title)
-                    .map_err(|error| format!("{}: {error}", title.display()))?;
-            }
-            std::fs::rename(&old_archive, destination)
-                .map_err(|error| format!("{}: {error}", destination.display()))?;
-            std::fs::rename(&old_title, &title)
-                .map_err(|error| format!("{}: {error}", title.display()))?;
-        }
-        (false, false) => match (destination.exists(), title.exists()) {
-            (true, false) => remove_path(destination)
-                .map_err(|error| format!("{}: {error}", destination.display()))?,
-            (false, true) => std::fs::remove_file(&title)
-                .map_err(|error| format!("{}: {error}", title.display()))?,
-            _ => {}
-        },
-        (true, false) => {
-            if destination.exists() {
-                remove_path(destination)
-                    .map_err(|error| format!("{}: {error}", destination.display()))?;
-            }
-            std::fs::rename(&old_archive, destination)
-                .map_err(|error| format!("{}: {error}", destination.display()))?;
-        }
-        (false, true) => {
-            std::fs::remove_file(&old_title)
-                .map_err(|error| format!("{}: {error}", old_title.display()))?;
-        }
-    }
-    std::fs::remove_file(&marker)
-        .map_err(|error| format!("{}: {error}", marker.display()))?;
-    sync_parent(destination)
-}
-
-fn persist_archive_pair(
-    archive: PathBuf,
-    titles: tempfile::NamedTempFile,
-    destination: &Path,
-) -> Result<(), String> {
-    let title = destination.with_extension("swtitle");
-    if !destination.exists() && !title.exists() {
-        let marker = install_sidecar(destination, ".installing")?;
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&marker)
-            .and_then(|file| file.sync_all())
-            .map_err(|error| format!("{}: {error}", marker.display()))?;
-        sync_parent(destination)?;
-        let install = std::fs::rename(&archive, destination)
-            .map_err(|error| format!("{}: {error}", destination.display()))
-            .and_then(|_| {
-                titles
-                    .persist(&title)
-                    .map_err(|error| format!("{}: {}", title.display(), error.error))
-            })
-            .and_then(|_| sync_parent(destination));
-        if let Err(error) = install {
-            recover_interrupted_install(destination)?;
-            return Err(error);
-        }
-        std::fs::remove_file(&marker)
-            .map_err(|error| format!("{}: {error}", marker.display()))?;
-        return sync_parent(destination);
-    }
-    if !destination.exists() || !title.exists() {
-        return Err(format!(
-            "{} and {} must either both exist or both be absent",
-            destination.display(),
-            title.display()
-        ));
-    }
-
-    let marker = install_sidecar(destination, ".installing")?;
-    let old_archive = install_sidecar(destination, ".previous")?;
-    let old_title = install_sidecar(&title, ".previous")?;
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&marker)
-        .and_then(|file| file.sync_all())
-        .map_err(|error| format!("{}: {error}", marker.display()))?;
-    std::fs::rename(destination, &old_archive)
-        .map_err(|error| format!("{}: {error}", old_archive.display()))?;
-    if let Err(error) = std::fs::hard_link(&title, &old_title) {
-        let _ = std::fs::rename(&old_archive, destination);
-        let _ = std::fs::remove_file(&marker);
-        return Err(format!("{}: {error}", old_title.display()));
-    }
-    sync_parent(destination)?;
-
-    let install = std::fs::rename(&archive, destination)
-        .map_err(|error| format!("{}: {error}", destination.display()))
-        .and_then(|_| {
-            titles
-                .persist(&title)
-                .map_err(|error| format!("{}: {}", title.display(), error.error))
-        })
-        .and_then(|_| sync_parent(destination));
-    if let Err(error) = install {
-        recover_interrupted_install(destination)?;
-        return Err(error);
-    }
-
-    remove_path(&old_archive)
-        .map_err(|error| format!("{}: {error}", old_archive.display()))?;
-    std::fs::remove_file(&old_title)
-        .map_err(|error| format!("{}: {error}", old_title.display()))?;
-    std::fs::remove_file(&marker)
-        .map_err(|error| format!("{}: {error}", marker.display()))?;
-    sync_parent(destination)
-}
-
 fn install_built_archive(
     archive: PathBuf,
     destination: &Path,
-    scratch: &Path,
 ) -> Result<(), String> {
     let parent = destination
         .parent()
@@ -519,142 +341,31 @@ fn install_built_archive(
         .unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(parent).map_err(|error| format!("{}: {error}", parent.display()))?;
 
-    let mut titles = tempfile::NamedTempFile::new_in(scratch)
-        .map_err(|error| format!("{}: {error}", scratch.display()))?;
     let projected = archive.with_extension("swtitle");
-    let title_entries = if projected.exists() {
-        eprintln!("using title history index produced during final merge");
-        let index = crate::title_index::TitleIndex::open(&projected)
-            .map_err(|error| error.to_string())?;
-        let entries = index.entry_count() as u64;
-        let mut input = std::fs::File::open(&projected)
-            .map_err(|error| format!("{}: {error}", projected.display()))?;
-        std::io::copy(&mut input, titles.as_file_mut())
-            .map_err(|error| format!("{}: {error}", projected.display()))?;
-        entries
-    } else {
-        eprintln!("building title history index");
-        crate::title_index::build(&archive, titles.path())
-            .map_err(|error| error.to_string())?
-    };
-    titles
-        .as_file_mut()
-        .sync_all()
-        .map_err(|error| format!("{}: {error}", titles.path().display()))?;
+    if !projected.exists() {
+        return Err("ready build generation has no projected title index".into());
+    }
+    eprintln!("using title history index produced during final merge");
+    let index =
+        crate::title_index::TitleIndex::open(&projected).map_err(|error| error.to_string())?;
+    let title_entries = index.entry_count() as u64;
 
     eprintln!("installing completed archive and title index");
-    persist_archive_pair(archive, titles, destination)?;
+    let outcome =
+        crate::installation_lifecycle::install(archive, projected, destination)?;
+    if outcome.cleanup_pending {
+        eprintln!(
+            "installed generation is live; previous generation cleanup waits for active readers"
+        );
+    }
     eprintln!("{title_entries} title intervals");
     Ok(())
-}
-
-fn load_or_create_update_range_plan(
-    archive: &Path,
-    scratch: &Path,
-    checkpoint_key: &str,
-) -> Result<UpdateRangePlan, String> {
-    let path = scratch.join("update-ranges.json");
-    if path.exists() {
-        let plan: UpdateRangePlan = serde_json::from_slice(
-            &std::fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))?,
-        )
-        .map_err(|error| format!("{}: {error}", path.display()))?;
-        if plan.schema != 1 || plan.checkpoint_key != checkpoint_key || plan.ranges.is_empty() {
-            return Err(format!(
-                "{} does not describe this update generation",
-                path.display()
-            ));
-        }
-        return Ok(plan);
-    }
-    let set = crate::archive_set::ArchiveSetReader::open(archive)
-        .map_err(|error| error.to_string())?;
-    let ranges = set
-        .segments()
-        .iter()
-        .filter_map(|segment| {
-            segment.kind.map(|kind| UpdateRange {
-                name: segment.name.clone(),
-                kind: kind as u8,
-                first_id: segment.first_id,
-                last_id: segment.last_id,
-            })
-        })
-        .collect::<Vec<_>>();
-    if ranges.is_empty() {
-        return Err("Wikipedia archive has no entity range files".into());
-    }
-    let plan = UpdateRangePlan {
-        schema: 1,
-        checkpoint_key: checkpoint_key.to_owned(),
-        ranges,
-    };
-    persist_json(&path, &plan)?;
-    Ok(plan)
-}
-
-fn update_range_receipt_path(scratch: &Path, index: usize) -> PathBuf {
-    scratch
-        .join("updated-ranges")
-        .join(format!("{index:06}.json"))
-}
-
-fn read_update_range_receipt(
-    archive: &Path,
-    scratch: &Path,
-    plan: &UpdateRangePlan,
-    index: usize,
-) -> Result<Option<UpdateRangeReceipt>, String> {
-    let path = update_range_receipt_path(scratch, index);
-    let bytes = match std::fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(format!("{}: {error}", path.display())),
-    };
-    let receipt: UpdateRangeReceipt =
-        serde_json::from_slice(&bytes).map_err(|error| format!("{}: {error}", path.display()))?;
-    let range = &plan.ranges[index];
-    let installed = archive.join(&receipt.new_name);
-    if receipt.schema != 1
-        || receipt.checkpoint_key != plan.checkpoint_key
-        || receipt.old_name != range.name
-        || std::fs::metadata(&installed)
-            .map(|metadata| metadata.len())
-            .ok()
-            != Some(receipt.bytes)
-    {
-        return Err(format!(
-            "{} does not match its installed range file",
-            path.display()
-        ));
-    }
-    Ok(Some(receipt))
 }
 
 fn sync_directory_path(path: &Path) -> Result<(), String> {
     std::fs::File::open(path)
         .and_then(|directory| directory.sync_all())
         .map_err(|error| format!("{}: {error}", path.display()))
-}
-
-fn one_range_archive(
-    archive: &Path,
-    range_name: &str,
-    scratch: &Path,
-) -> Result<tempfile::TempDir, String> {
-    let temporary =
-        tempfile::tempdir_in(scratch).map_err(|error| format!("{}: {error}", scratch.display()))?;
-    for name in [
-        "0000-reference.swdump-part",
-        range_name,
-        "9999-complete.swdump-part",
-    ] {
-        std::fs::hard_link(archive.join(name), temporary.path().join(name))
-            .map_err(|error| format!("{}: {error}", archive.join(name).display()))?;
-    }
-    crate::archive_set::ArchiveSetReader::open(temporary.path())
-        .map_err(|error| error.to_string())?;
-    Ok(temporary)
 }
 
 fn update_record_belongs_to_range(
@@ -666,366 +377,1626 @@ fn update_record_belongs_to_range(
     entity.kind == kind && entity.id <= upper_id
 }
 
-struct UpdateRangeSource<'a> {
+fn read_required_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, String> {
+    serde_json::from_slice(
+        &std::fs::read(path).map_err(|error| format!("{}: {error}", path.display()))?,
+    )
+    .map_err(|error| format!("{}: {error}", path.display()))
+}
+
+fn update_selector_path(scratch: &Path) -> PathBuf {
+    scratch.join("updates").join("active.json")
+}
+
+fn update_root(scratch: &Path, update_id: &str) -> PathBuf {
+    scratch.join("updates").join(update_id)
+}
+
+fn lifecycle_plan(source: &crate::direct::UpdateSourcePlan) -> update_lifecycle::UpdatePlanReceipt {
+    let compression: crate::archive::CompressionSettings = source.compression.into();
+    update_lifecycle::UpdatePlanReceipt {
+        schema: update_lifecycle::UPDATE_SCHEMA,
+        update_id: source.source_plan_id.clone(),
+        base_generation_id: source.base_generation_id.as_str().to_owned(),
+        new_generation_id: source.generation_id.as_str().to_owned(),
+        source_plan_id: source.source_plan_id.clone(),
+        wiki_db: source.wiki_db.clone(),
+        base_content_frontier: source.base_content_frontier.clone(),
+        base_metadata_frontier: source.base_metadata_frontier.clone(),
+        result_content_frontier: source.resulting_content_frontier.clone(),
+        result_metadata_frontier: source.resulting_metadata_frontier.clone(),
+        overlap_days: source.overlap_days,
+        frame_target: source.frame_target,
+        compression: update_lifecycle::CompressionReceipt::from(compression),
+    }
+}
+
+fn load_active_update(
+    scratch: &Path,
+) -> Result<Option<(update_lifecycle::ActiveUpdate, update_lifecycle::UpdatePaths)>, String> {
+    let selector = update_selector_path(scratch);
+    let active = match std::fs::read(&selector) {
+        Ok(bytes) => serde_json::from_slice::<update_lifecycle::ActiveUpdate>(&bytes)
+            .map_err(|error| format!("{}: {error}", selector.display()))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("{}: {error}", selector.display())),
+    };
+    if active.schema != update_lifecycle::UPDATE_SCHEMA
+        || active.update_id.is_empty()
+        || active.base_generation_id.is_empty()
+    {
+        return Err(format!("{} is not a valid update selector", selector.display()));
+    }
+    Ok(Some((
+        active.clone(),
+        update_lifecycle::UpdatePaths::new(update_root(scratch, &active.update_id)),
+    )))
+}
+
+fn installed_generation_id(archive: &Path) -> Result<crate::generation::GenerationId, String> {
+    let selected = crate::installation_lifecycle::serving_pair(archive)?
+        .ok_or_else(|| format!("{} has no installed generation", archive.display()))?;
+    crate::title_index::TitleIndex::open(selected.title)
+        .map(|titles| titles.generation_id().clone())
+        .map_err(|error| error.to_string())
+}
+
+fn create_update_plan(
+    client: &reqwest::blocking::Client,
+    dbname: &str,
+    archive: &Path,
+    scratch: &Path,
+    overlap_days: u64,
+    compression: crate::archive::CompressionSettings,
+) -> Result<
+    (
+        update_lifecycle::ActiveUpdate,
+        update_lifecycle::UpdatePaths,
+        crate::direct::UpdateSourcePlan,
+        crate::generation::GenerationIdentity,
+    ),
+    String,
+> {
+    let selected = crate::installation_lifecycle::serving_pair(archive)?
+        .ok_or_else(|| format!("{} has no installed generation", archive.display()))?;
+    let base = crate::generation::generation_identity(&selected.archive, &selected.title)
+        .map_err(|error| error.to_string())?;
+    if base.wiki_db != dbname {
+        return Err(format!(
+            "installed generation belongs to {}, not {dbname}",
+            base.wiki_db
+        ));
+    }
+    let source = crate::direct::discover_update_source_plan(
+        client,
+        &wikimak_mediawiki::Config::default(),
+        &base,
+        overlap_days,
+        MIRROR_FRAME_TARGET,
+        compression,
+        &|message| eprintln!("{message}"),
+    )
+    .map_err(|error| error.to_string())?;
+    let active = update_lifecycle::ActiveUpdate {
+        schema: update_lifecycle::UPDATE_SCHEMA,
+        update_id: source.source_plan_id.clone(),
+        base_generation_id: base.generation_id.as_str().to_owned(),
+    };
+    let paths =
+        update_lifecycle::UpdatePaths::new(update_root(scratch, &active.update_id));
+    std::fs::create_dir_all(&paths.root)
+        .map_err(|error| format!("{}: {error}", paths.root.display()))?;
+    // Exact remote discovery is durable before the selector makes this plan
+    // resumable.  Materialization never rediscovers.
+    persist_json(&paths.source_plan(), &source)?;
+    persist_json(&paths.plan(), &lifecycle_plan(&source))?;
+    std::fs::create_dir_all(update_selector_path(scratch).parent().unwrap())
+        .map_err(|error| format!("{}: {error}", scratch.display()))?;
+    persist_json(&update_selector_path(scratch), &active)?;
+    Ok((active, paths, source, base))
+}
+
+fn load_update_plan(
+    active: &update_lifecycle::ActiveUpdate,
+    paths: &update_lifecycle::UpdatePaths,
+    dbname: &str,
+) -> Result<crate::direct::UpdateSourcePlan, String> {
+    let source: crate::direct::UpdateSourcePlan = read_required_json(&paths.source_plan())?;
+    crate::direct::validate_update_source_plan(&source)
+        .map_err(|error| error.to_string())?;
+    let plan: update_lifecycle::UpdatePlanReceipt = read_required_json(&paths.plan())?;
+    if source.source_plan_id != active.update_id
+        || source.base_generation_id.as_str() != active.base_generation_id
+        || source.wiki_db != dbname
+        || plan != lifecycle_plan(&source)
+    {
+        return Err(format!(
+            "{} does not match the active update selector",
+            paths.plan().display()
+        ));
+    }
+    Ok(source)
+}
+
+fn tail_id(
+    source: &crate::direct::UpdateSourcePlan,
+    stats: &crate::direct::UpdateArchiveStats,
+) -> String {
+    let mut identity = b"wikipedia-update-tail\0".to_vec();
+    identity.extend_from_slice(source.source_plan_id.as_bytes());
+    identity.extend_from_slice(&stats.output_bytes.to_le_bytes());
+    identity.extend_from_slice(&stats.output_frames.to_le_bytes());
+    identity.extend_from_slice(&stats.output_records.to_le_bytes());
+    crate::generation::GenerationId::from_plan_bytes(&identity)
+        .as_str()
+        .to_owned()
+}
+
+fn ensure_update_tail(
+    client: &reqwest::blocking::Client,
+    source: &crate::direct::UpdateSourcePlan,
+    paths: &update_lifecycle::UpdatePaths,
+) -> Result<update_lifecycle::TailReceipt, String> {
+    if let Some(receipt) =
+        update_lifecycle::read_receipt::<update_lifecycle::TailReceipt>(
+            &paths.tail_receipt(),
+        )
+        .map_err(|error| error.to_string())?
+    {
+        return Ok(receipt);
+    }
+    std::fs::create_dir_all(paths.tail_archive().parent().unwrap())
+        .map_err(|error| format!("{}: {error}", paths.root.display()))?;
+    if paths.tail_archive().exists() {
+        std::fs::remove_file(paths.tail_archive())
+            .map_err(|error| format!("{}: {error}", paths.tail_archive().display()))?;
+    }
+    let work = paths.root.join("tail").join("work");
+    std::fs::create_dir_all(&work)
+        .map_err(|error| format!("{}: {error}", work.display()))?;
+    let stats = crate::direct::build_update_archive_from_plan(
+        client,
+        source,
+        paths.tail_archive(),
+        &work,
+        |message| eprintln!("{message}"),
+    )
+    .map_err(|error| error.to_string())?;
+    let tail_id = tail_id(source, &stats);
+    let identity = crate::generation::GenerationId::parse(&tail_id)
+        .and_then(|identity| identity.to_bytes())
+        .map_err(|error| error.to_string())?;
+    let frame_directory = crate::frame_directory::write_from_archive(
+        paths.tail_archive(),
+        paths.tail_frame_directory(),
+        identity,
+    )
+    .map_err(|error| error.to_string())?;
+    if frame_directory.frames != stats.output_frames
+        || frame_directory.records != stats.output_records
+    {
+        return Err("materialized update tail statistics disagree with its frame directory".into());
+    }
+    let receipt = update_lifecycle::TailReceipt {
+        schema: update_lifecycle::UPDATE_SCHEMA,
+        update_id: source.source_plan_id.clone(),
+        base_generation_id: source.base_generation_id.as_str().to_owned(),
+        source_plan_id: source.source_plan_id.clone(),
+        tail_id,
+        file_name: "records.swdump".into(),
+        bytes: stats.output_bytes,
+        frame_directory_name: "frames.swframe".into(),
+        frame_directory_format: crate::frame_directory::FORMAT_VERSION,
+        frame_directory_bytes: frame_directory.bytes,
+        frames: frame_directory.frames,
+        records: frame_directory.records,
+        first_entity: frame_directory.first_entity.map(Into::into),
+        last_entity: frame_directory.last_entity.map(Into::into),
+        complete: true,
+    };
+    persist_json(&paths.tail_receipt(), &receipt)?;
+    Ok(receipt)
+}
+
+fn hard_link_file(source: &Path, destination: &Path) -> Result<(), String> {
+    std::fs::hard_link(source, destination).map_err(|error| {
+        format!(
+            "cannot create destination-local immutable range link {} -> {}: {error}",
+            destination.display(),
+            source.display()
+        )
+    })
+}
+
+fn hard_link_archive(source: &Path, destination: &Path) -> Result<(), String> {
+    if source.is_dir() {
+        std::fs::create_dir(destination)
+            .map_err(|error| format!("{}: {error}", destination.display()))?;
+        for entry in
+            std::fs::read_dir(source).map_err(|error| format!("{}: {error}", source.display()))?
+        {
+            let entry = entry.map_err(|error| format!("{}: {error}", source.display()))?;
+            hard_link_file(&entry.path(), &destination.join(entry.file_name()))?;
+        }
+        sync_directory_path(destination)
+    } else {
+        hard_link_file(source, destination)?;
+        sync_parent(destination)
+    }
+}
+
+fn ensure_preserved_base(
+    archive: &Path,
+    source: &crate::direct::UpdateSourcePlan,
+    base: &crate::generation::GenerationIdentity,
+    paths: &update_lifecycle::UpdatePaths,
+) -> Result<update_lifecycle::PreservedBaseReceipt, String> {
+    if let Some(receipt) =
+        update_lifecycle::read_receipt::<update_lifecycle::PreservedBaseReceipt>(
+            &paths.base_receipt(),
+        )
+        .map_err(|error| error.to_string())?
+    {
+        crate::generation::validate_generation(
+            paths.base_archive(),
+            paths.base_index(),
+            &receipt.generation,
+        )
+        .map_err(|error| error.to_string())?;
+        return Ok(receipt);
+    }
+    let base_archive = paths.base_archive();
+    let base_root = base_archive.parent().unwrap();
+    std::fs::create_dir_all(base_root)
+        .map_err(|error| format!("{}: {error}", base_root.display()))?;
+    for path in [paths.base_archive(), paths.base_index()] {
+        if path.exists() {
+            remove_path(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+        }
+    }
+    let selected = crate::installation_lifecycle::serving_pair(archive)?
+        .ok_or_else(|| format!("{} has no installed generation", archive.display()))?;
+    hard_link_archive(&selected.archive, &paths.base_archive())?;
+    if let Err(error) = hard_link_file(&selected.title, &paths.base_index()) {
+        let _ = remove_path(&paths.base_archive());
+        return Err(error);
+    }
+    sync_directory_path(base_root)?;
+    crate::generation::validate_generation(
+        paths.base_archive(),
+        paths.base_index(),
+        base,
+    )
+    .map_err(|error| error.to_string())?;
+    let receipt = update_lifecycle::PreservedBaseReceipt {
+        schema: update_lifecycle::UPDATE_SCHEMA,
+        update_id: source.source_plan_id.clone(),
+        generation: base.clone(),
+        archive_name: "archive.swdump".into(),
+        index_name: "archive.swtitle".into(),
+    };
+    persist_json(&paths.base_receipt(), &receipt)?;
+    Ok(receipt)
+}
+
+fn stable_update_object_id(domain: &[u8], fields: &impl serde::Serialize) -> Result<String, String> {
+    let mut bytes = domain.to_vec();
+    bytes.extend_from_slice(
+        &serde_json::to_vec(fields).map_err(|error| format!("encode update identity: {error}"))?,
+    );
+    Ok(crate::generation::GenerationId::from_plan_bytes(&bytes)
+        .as_str()
+        .to_owned())
+}
+
+fn ensure_range_plan(
+    source: &crate::direct::UpdateSourcePlan,
+    tail: &update_lifecycle::TailReceipt,
+    base: &crate::generation::GenerationIdentity,
+    paths: &update_lifecycle::UpdatePaths,
+) -> Result<update_lifecycle::RangePlanReceipt, String> {
+    if let Some(plan) =
+        update_lifecycle::read_receipt::<update_lifecycle::RangePlanReceipt>(
+            &paths.range_plan(),
+        )
+        .map_err(|error| error.to_string())?
+    {
+        return Ok(plan);
+    }
+    if !paths.base_archive().is_dir() {
+        return Err(
+            "incremental update requires the installed Wikipedia archive-set layout".into(),
+        );
+    }
+    let archive = crate::archive_set::ArchiveSetReader::open(paths.base_archive())
+        .map_err(|error| error.to_string())?;
+    if archive.segments().len() != base.segments.len() {
+        return Err("base generation segment inventory changed after preservation".into());
+    }
+    let mut slots = Vec::new();
+    for (segment, identity) in archive.segments().iter().zip(&base.segments) {
+        let Some(kind) = segment.kind else {
+            continue;
+        };
+        let expected_role = match kind {
+            crate::archive::EntityKind::Page => 1,
+            crate::archive::EntityKind::User => 2,
+            crate::archive::EntityKind::Global => 3,
+        };
+        if identity.role != expected_role
+            || identity.first_id != segment.first_id
+            || identity.last_id != segment.last_id
+            || identity.virtual_start != segment.virtual_start
+            || identity.bytes != segment.bytes
+        {
+            return Err("base archive paths do not match the preserved generation index".into());
+        }
+        let index = slots.len();
+        let base_segment_id = stable_update_object_id(
+            b"wikipedia-base-range\0",
+            &(
+                source.base_generation_id.as_str(),
+                identity.role,
+                identity.first_id,
+                identity.last_id,
+                identity.virtual_start,
+                identity.bytes,
+            ),
+        )?;
+        let candidate_id = stable_update_object_id(
+            b"wikipedia-update-range\0",
+            &(
+                &source.source_plan_id,
+                &tail.tail_id,
+                index,
+                &base_segment_id,
+            ),
+        )?;
+        slots.push(update_lifecycle::RangeSlot {
+            index,
+            kind: kind as u8,
+            first_id: segment.first_id,
+            last_id: segment.last_id,
+            base_segment_id,
+            base_name: segment.name.clone(),
+            base_bytes: segment.bytes,
+            candidate_id,
+        });
+    }
+    if slots.is_empty() {
+        return Err("base archive has no entity range slots".into());
+    }
+    let plan = update_lifecycle::RangePlanReceipt {
+        schema: update_lifecycle::UPDATE_SCHEMA,
+        update_id: source.source_plan_id.clone(),
+        base_generation_id: source.base_generation_id.as_str().to_owned(),
+        tail_id: tail.tail_id.clone(),
+        slots,
+    };
+    std::fs::create_dir_all(paths.range_plan().parent().unwrap())
+        .map_err(|error| format!("{}: {error}", paths.range_plan().display()))?;
+    persist_json(&paths.range_plan(), &plan)?;
+    Ok(plan)
+}
+
+fn is_title_projection_record(record: &crate::archive::Record) -> bool {
+    match record {
+        crate::archive::Record::PageState { .. }
+        | crate::archive::Record::SiteInfo { .. } => true,
+        crate::archive::Record::PageAction { entity, .. } => {
+            entity.kind == crate::archive::EntityKind::Page
+        }
+        _ => false,
+    }
+}
+
+struct LifecycleRangeSource<'a> {
     tail: &'a mut crate::archive::ArchiveRecordReader,
     pending: &'a mut Option<crate::archive::Record>,
     kind: crate::archive::EntityKind,
     upper_id: u64,
-    records: &'a mut u64,
+    additions: &'a mut u64,
+    first_addition: &'a mut Option<crate::archive::EntityKey>,
+    last_addition: &'a mut Option<crate::archive::EntityKey>,
+    title_writer: &'a mut crate::archive::ArchiveWriter<'static, std::fs::File>,
+    title_records: &'a mut u64,
 }
 
-impl crate::archive::RecordSource for UpdateRangeSource<'_> {
-    fn next_record(
+impl LifecycleRangeSource<'_> {
+    fn peek_entity(
         &mut self,
-    ) -> crate::archive::Result<Option<crate::archive::Record>> {
-        let Some(record) = self.pending.take() else {
-            return Ok(None);
+    ) -> crate::archive::Result<Option<crate::archive::EntityKey>> {
+        if self.pending.is_none() {
+            *self.pending = self.tail.next_record()?;
+        }
+        Ok(self.pending.as_ref().map(crate::archive::Record::entity))
+    }
+
+    fn restore(&mut self, record: crate::archive::Record) -> crate::archive::Result<()> {
+        if self.pending.replace(record).is_some() {
+            return Err(crate::archive::ArchiveError::Invalid(
+                "range source already has a pending record",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl crate::archive::RecordSource for LifecycleRangeSource<'_> {
+    fn next_record(&mut self) -> crate::archive::Result<Option<crate::archive::Record>> {
+        let record = match self.pending.take() {
+            Some(record) => record,
+            None => match self.tail.next_record()? {
+                Some(record) => record,
+                None => return Ok(None),
+            },
         };
         if !update_record_belongs_to_range(&record, self.kind, self.upper_id) {
             *self.pending = Some(record);
             return Ok(None);
         }
-        *self.pending = self.tail.next_record()?;
-        *self.records = self
-            .records
+        if is_title_projection_record(&record) {
+            self.title_writer.write(&record)?;
+            *self.title_records = self
+                .title_records
+                .checked_add(1)
+                .ok_or(crate::archive::ArchiveError::FieldTooLarge)?;
+        }
+        let entity = record.entity();
+        self.first_addition.get_or_insert(entity);
+        *self.last_addition = Some(entity);
+        *self.additions = self
+            .additions
             .checked_add(1)
             .ok_or(crate::archive::ArchiveError::FieldTooLarge)?;
         Ok(Some(record))
     }
 }
 
-fn skip_update_range(
-    tail: &mut crate::archive::ArchiveRecordReader,
-    pending: &mut Option<crate::archive::Record>,
-    kind: crate::archive::EntityKind,
-    upper_id: u64,
-) -> Result<u64, String> {
-    let mut records = 0_u64;
-    while pending
-        .as_ref()
-        .is_some_and(|record| update_record_belongs_to_range(record, kind, upper_id))
-    {
-        *pending = tail.next_record().map_err(|error| error.to_string())?;
-        records = records.saturating_add(1);
-    }
-    Ok(records)
-}
-
-fn replace_single_archive(
-    archive: &Path,
-    update: &Path,
-    scratch: &Path,
-) -> Result<(u64, u64), String> {
-    let serving_snapshot = scratch.join("serving-generation.swdump");
-    if serving_snapshot.exists() {
-        use std::os::unix::fs::MetadataExt;
-        let archive_metadata = std::fs::metadata(archive)
-            .map_err(|error| format!("{}: {error}", archive.display()))?;
-        let snapshot_metadata = std::fs::metadata(&serving_snapshot)
-            .map_err(|error| format!("{}: {error}", serving_snapshot.display()))?;
-        if archive_metadata.dev() != snapshot_metadata.dev()
-            || archive_metadata.ino() != snapshot_metadata.ino()
-        {
-            let (_, frames, complete) =
-                crate::archive::index_file(archive).map_err(|error| error.to_string())?;
-            if !complete {
-                return Err(
-                    "installed single-file update has no completion marker".into(),
-                );
-            }
-            let records = frames.iter().try_fold(0_u64, |total, frame| {
-                total
-                    .checked_add(frame.info.records)
-                    .ok_or_else(|| "updated archive record count overflow".to_string())
-            })?;
-            eprintln!(
-                "reusing the already installed single-file replacement after interruption"
-            );
-            return Ok((frames.len() as u64, records));
+fn begin_title_projection(
+    paths: &update_lifecycle::UpdatePaths,
+    slot: &update_lifecycle::RangeSlot,
+) -> Result<
+    (
+        PathBuf,
+        crate::archive::ArchiveWriter<'static, std::fs::File>,
+    ),
+    String,
+> {
+    let final_path = paths.range_projection(&slot.candidate_id);
+    std::fs::create_dir_all(final_path.parent().unwrap())
+        .map_err(|error| format!("{}: {error}", final_path.display()))?;
+    let building = final_path.with_extension("swdump-building");
+    for path in [&building, &final_path] {
+        if path.exists() {
+            std::fs::remove_file(path)
+                .map_err(|error| format!("{}: {error}", path.display()))?;
         }
     }
-    let prefix = crate::archive::archive_ref_prefix(archive)
+    let file = std::fs::File::create(&building)
+        .map_err(|error| format!("{}: {error}", building.display()))?;
+    let writer = crate::archive::ArchiveWriter::new(file, 1 << 20)
         .map_err(|error| error.to_string())?;
-    let tail = crate::archive::ArchiveRecordReader::open(update)
-        .map_err(|error| error.to_string())?;
-    let temporary = tempfile::NamedTempFile::new_in(scratch)
-        .map_err(|error| format!("{}: {error}", scratch.display()))?;
-    let output = temporary
-        .reopen()
-        .map_err(|error| format!("{}: {error}", temporary.path().display()))?;
-    let mut last_progress = std::time::Instant::now();
-    let (output, frames, records) =
-        crate::archive::merge_archive_with_sorted_source_and_ref_prefix(
-            &prefix,
-            archive,
-            Box::new(tail),
-            output,
-            MIRROR_FRAME_TARGET,
-            mirror_compression(),
-            |records| {
-                if last_progress.elapsed() >= std::time::Duration::from_secs(2) {
-                    eprintln!("single-file update: merged {records} records");
-                    last_progress = std::time::Instant::now();
-                }
-            },
-        )
-        .map_err(|error| error.to_string())?;
-    output
-        .sync_all()
-        .map_err(|error| format!("{}: {error}", temporary.path().display()))?;
-    drop(output);
-    temporary
-        .persist(archive)
-        .map_err(|error| format!("{}: {}", archive.display(), error.error))?;
-    sync_parent(archive)?;
-    Ok((frames, records))
+    Ok((building, writer))
 }
 
-fn replace_archive_ranges(
-    archive: &Path,
-    update: &Path,
-    scratch: &Path,
-    checkpoint_key: &str,
-) -> Result<(u64, u64), String> {
-    if !archive.is_dir() {
-        eprintln!("streaming the update through the mirror's single piece file");
-        return replace_single_archive(archive, update, scratch);
+fn finish_title_projection(
+    paths: &update_lifecycle::UpdatePaths,
+    slot: &update_lifecycle::RangeSlot,
+    building: &Path,
+    writer: crate::archive::ArchiveWriter<'static, std::fs::File>,
+    records: u64,
+) -> Result<(Option<String>, u64, u64), String> {
+    let (file, _) = writer.finish().map_err(|error| error.to_string())?;
+    file.sync_all()
+        .map_err(|error| format!("{}: {error}", building.display()))?;
+    drop(file);
+    if records == 0 {
+        std::fs::remove_file(building)
+            .map_err(|error| format!("{}: {error}", building.display()))?;
+        return Ok((None, 0, 0));
     }
-    let plan = load_or_create_update_range_plan(archive, scratch, checkpoint_key)?;
-    std::fs::create_dir_all(scratch.join("updated-ranges"))
-        .map_err(|error| format!("{}: {error}", scratch.display()))?;
+    let final_path = paths.range_projection(&slot.candidate_id);
+    std::fs::rename(building, &final_path)
+        .map_err(|error| format!("{}: {error}", final_path.display()))?;
+    sync_parent(&final_path)?;
+    let bytes = std::fs::metadata(&final_path)
+        .map_err(|error| format!("{}: {error}", final_path.display()))?
+        .len();
+    Ok((
+        Some(format!("{}.swdump", slot.candidate_id)),
+        bytes,
+        records,
+    ))
+}
 
-    // Existing readers retain Arc<File> handles for every range. Renaming a
-    // completed replacement therefore switches future generations without
-    // disturbing a reader that was open when the update began.
-    let prefix = crate::archive::archive_ref_prefix(archive)
+#[derive(Default)]
+struct SparseRangeMergeStats {
+    output_frames: u64,
+    output_records: u64,
+    copied_frames: u64,
+    copied_compressed_bytes: u64,
+    decoded_frames: u64,
+    decoded_compressed_bytes: u64,
+}
+
+fn base_range_frame_directory(
+    paths: &update_lifecycle::UpdatePaths,
+    slot: &update_lifecycle::RangeSlot,
+) -> Result<std::sync::Arc<crate::frame_directory::FrameDirectory>, String> {
+    let path = paths.base_range_frame_directory(&slot.base_segment_id);
+    let identity = crate::generation::GenerationId::parse(&slot.base_segment_id)
+        .and_then(|identity| identity.to_bytes())
         .map_err(|error| error.to_string())?;
-    let mut tail = crate::archive::ArchiveRecordReader::open(update)
+    if !path.exists() {
+        std::fs::create_dir_all(path.parent().unwrap())
+            .map_err(|error| format!("{}: {error}", path.display()))?;
+        crate::frame_directory::write_from_archive_segment(
+            paths.base_archive().join(&slot.base_name),
+            &path,
+            identity,
+        )
         .map_err(|error| error.to_string())?;
-    let mut pending = tail.next_record().map_err(|error| error.to_string())?;
+    }
+    let directory = crate::frame_directory::FrameDirectory::open_bound(
+        &path,
+        identity,
+    )
+    .map_err(|error| error.to_string())?;
+    directory
+        .require_archive_bounds(slot.base_bytes)
+        .map_err(|error| error.to_string())?;
+    Ok(std::sync::Arc::new(directory))
+}
+
+fn merge_sparse_update_range(
+    paths: &update_lifecycle::UpdatePaths,
+    slot: &update_lifecycle::RangeSlot,
+    prefix: &[u8],
+    updates: &mut LifecycleRangeSource<'_>,
+    output: crate::archive_set::ArchiveSetOutput,
+    progress: &mut impl FnMut(u64),
+) -> Result<
+    (
+        crate::archive_set::ArchiveSetOutput,
+        SparseRangeMergeStats,
+    ),
+    String,
+> {
+    let directory = base_range_frame_directory(paths, slot)?;
+    let mut base = std::fs::File::open(
+        paths.base_archive().join(&slot.base_name),
+    )
+    .map_err(|error| error.to_string())?;
+    let workers = usize::try_from(crate::archive::streaming_compression_workers())
+        .unwrap_or(usize::MAX);
+    let mut writer = crate::archive::ParallelArchiveWriter::new(
+        output,
+        MIRROR_FRAME_TARGET,
+        mirror_compression(),
+        prefix,
+        workers,
+    )
+    .map_err(|error| error.to_string())?;
+    let prefix: std::sync::Arc<[u8]> = std::sync::Arc::from(prefix);
+    let mut stats = SparseRangeMergeStats::default();
+
+    for position in 0..directory.len() {
+        let entry = directory
+            .get(position)
+            .map_err(|error| error.to_string())?;
+        while updates
+            .peek_entity()
+            .map_err(|error| error.to_string())?
+            .is_some_and(|entity| entity < entry.first_entity)
+        {
+            let record = crate::archive::RecordSource::next_record(updates)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| {
+                    "range source ended before its peeked record".to_string()
+                })?;
+            writer.write(&record).map_err(|error| error.to_string())?;
+            stats.output_records = stats.output_records.saturating_add(1);
+            progress(stats.output_records);
+        }
+        let intersects = updates
+            .peek_entity()
+            .map_err(|error| error.to_string())?
+            .is_some_and(|entity| entity <= entry.last_entity);
+        if intersects {
+            let mut pending = None;
+            let records = crate::archive::merge_frame_with_sorted_source(
+                &mut writer,
+                &base,
+                entry,
+                std::sync::Arc::clone(&prefix),
+                updates,
+                &mut pending,
+            )
+            .map_err(|error| error.to_string())?;
+            if let Some(record) = pending {
+                updates.restore(record).map_err(|error| error.to_string())?;
+            }
+            stats.decoded_frames = stats.decoded_frames.saturating_add(1);
+            stats.decoded_compressed_bytes = stats
+                .decoded_compressed_bytes
+                .saturating_add(entry.compressed_bytes);
+            stats.output_records = stats.output_records.saturating_add(records);
+            progress(stats.output_records);
+        } else {
+            let copied = writer
+                .append_compressed_frame(&mut base, entry)
+                .map_err(|error| error.to_string())?;
+            stats.copied_frames = stats.copied_frames.saturating_add(copied.frames);
+            stats.copied_compressed_bytes = stats
+                .copied_compressed_bytes
+                .saturating_add(copied.compressed_bytes);
+            stats.output_records = stats.output_records.saturating_add(copied.records);
+            progress(stats.output_records);
+        }
+    }
+    while let Some(record) = crate::archive::RecordSource::next_record(updates)
+        .map_err(|error| error.to_string())?
+    {
+        writer.write(&record).map_err(|error| error.to_string())?;
+        stats.output_records = stats.output_records.saturating_add(1);
+        progress(stats.output_records);
+    }
+    let (output, frames) = writer.finish().map_err(|error| error.to_string())?;
+    stats.output_frames = frames;
+    Ok((output, stats))
+}
+
+fn apply_update_ranges(
+    source: &crate::direct::UpdateSourcePlan,
+    tail_receipt: &update_lifecycle::TailReceipt,
+    range_plan: &update_lifecycle::RangePlanReceipt,
+    paths: &update_lifecycle::UpdatePaths,
+) -> Result<(u64, u64), String> {
+    let identity = crate::generation::GenerationId::parse(&tail_receipt.tail_id)
+        .and_then(|identity| identity.to_bytes())
+        .map_err(|error| error.to_string())?;
+    let all_frames = std::sync::Arc::new(
+        crate::frame_directory::FrameDirectory::open_bound(
+            paths.tail_frame_directory(),
+            identity,
+        )
+        .map_err(|error| error.to_string())?,
+    );
+    let mut completed = 0;
+    let mut previous_receipt = None;
+    for slot in &range_plan.slots {
+        let receipt =
+            update_lifecycle::read_receipt::<update_lifecycle::RangeCandidateReceipt>(
+                &paths.range_receipt(slot.index),
+            )
+            .map_err(|error| error.to_string())?;
+        let Some(receipt) = receipt else {
+            break;
+        };
+        previous_receipt = Some(receipt);
+        completed += 1;
+    }
+    if range_plan.slots[completed..].iter().any(|slot| {
+        paths.range_receipt(slot.index).exists()
+    }) {
+        return Err("range receipts contain a gap".into());
+    }
+
+    let cursor = previous_receipt
+        .as_ref()
+        .map(|receipt| receipt.tail_cursor.clone())
+        .unwrap_or(update_lifecycle::TailCursorReceipt {
+            frame_offset: all_frames.get(0).ok().map(|frame| frame.compressed_offset),
+            record_ordinal: 0,
+        });
+    let remaining_start = match cursor.frame_offset {
+        Some(offset) => all_frames.lower_bound_offset(offset),
+        None if completed == 0 => 0,
+        None => all_frames.len(),
+    };
+    if cursor
+        .frame_offset
+        .is_some_and(|offset| all_frames.index_of_offset(offset).is_none())
+    {
+        return Err("range receipt points between update-tail frames".into());
+    }
+    let mut tail = crate::archive::ArchiveRecordReader::open_frame_directory(
+        paths.tail_archive(),
+        std::sync::Arc::clone(&all_frames),
+        remaining_start,
+    )
+    .map_err(|error| error.to_string())?;
+    for _ in 0..cursor.record_ordinal {
+        if tail
+            .next_record()
+            .map_err(|error| error.to_string())?
+            .is_none()
+        {
+            return Err("tail cursor record ordinal lies beyond end of frame".into());
+        }
+    }
+    let mut pending = None;
+    let prefix = crate::archive::archive_ref_prefix_part(
+        paths
+            .base_archive()
+            .join("0000-reference.swdump-part"),
+    )
+    .map_err(|error| error.to_string())?;
     let mut total_frames = 0_u64;
     let mut total_records = 0_u64;
+    let mut frame_start = remaining_start;
 
-    for (index, range) in plan.ranges.iter().enumerate() {
-        let kind = crate::archive::EntityKind::try_from(range.kind)
-            .map_err(|error| error.to_string())?;
-        let final_for_kind = plan
-            .ranges
+    for (index, slot) in range_plan.slots.iter().enumerate().skip(completed) {
+        let kind =
+            crate::archive::EntityKind::try_from(slot.kind).map_err(|error| error.to_string())?;
+        let final_for_kind = range_plan
+            .slots
             .get(index + 1)
-            .is_none_or(|next| next.kind != range.kind);
+            .is_none_or(|next| next.kind != slot.kind);
         let upper_id = if final_for_kind {
             u64::MAX
         } else {
-            range.last_id
+            slot.last_id
         };
-        if let Some(receipt) =
-            read_update_range_receipt(archive, scratch, &plan, index)?
-        {
-            skip_update_range(&mut tail, &mut pending, kind, upper_id)?;
-            if receipt.old_name != receipt.new_name {
-                match std::fs::remove_file(archive.join(&receipt.old_name)) {
-                    Ok(()) => sync_directory_path(archive)?,
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => {
-                        return Err(format!(
-                            "{}: {error}",
-                            archive.join(&receipt.old_name).display()
-                        ))
-                    }
-                }
-            }
-            total_frames = total_frames.saturating_add(receipt.frames);
-            total_records = total_records.saturating_add(receipt.records);
-            eprintln!(
-                "reusing updated range {}/{} {}",
-                index + 1,
-                plan.ranges.len(),
-                receipt.new_name
-            );
-            continue;
-        }
-
-        if pending.as_ref().is_some_and(|record| record.entity().kind < kind) {
-            return Err("sorted update stream contains an entity before its archive range".into());
+        if pending.is_none() {
+            pending = tail.next_record().map_err(|error| error.to_string())?;
         }
         let touched = pending
             .as_ref()
             .is_some_and(|record| update_record_belongs_to_range(record, kind, upper_id));
-        if !touched {
-            let bytes = std::fs::metadata(archive.join(&range.name))
-                .map_err(|error| format!("{}: {error}", archive.join(&range.name).display()))?
-                .len();
-            persist_json(
-                &update_range_receipt_path(scratch, index),
-                &UpdateRangeReceipt {
-                    schema: 1,
-                    checkpoint_key: plan.checkpoint_key.clone(),
-                    old_name: range.name.clone(),
-                    new_name: range.name.clone(),
-                    bytes,
-                    frames: 0,
-                    records: 0,
-                },
-            )?;
-            eprintln!(
-                "keeping unchanged range {}/{} {}",
-                index + 1,
-                plan.ranges.len(),
-                range.name
-            );
-            continue;
-        }
-        eprintln!(
-            "streaming update into range {}/{} {}",
-            index + 1,
-            plan.ranges.len(),
-            range.name
-        );
-        let base = one_range_archive(archive, &range.name, scratch)?;
-        let output = crate::archive_set::ArchiveSetOutput::new_in(scratch, u64::MAX)
-            .map_err(|error| error.to_string())?;
         let mut additions = 0_u64;
-        let mut last_progress = std::time::Instant::now();
-        let (output, frames, records) =
-            crate::archive::merge_archive_with_sorted_source_and_ref_prefix(
+        let mut first_addition = None;
+        let mut last_addition = None;
+        let mut title_projection_name = None;
+        let mut title_projection_bytes = 0;
+        let mut title_projection_records = 0;
+        let mut base_frame_bytes_copied = 0_u64;
+        let mut base_frame_bytes_decoded = 0_u64;
+        let selection = if !touched {
+            update_lifecycle::RangeSelection::Unchanged {
+                segment_id: slot.base_segment_id.clone(),
+                name: slot.base_name.clone(),
+                bytes: slot.base_bytes,
+            }
+        } else {
+            eprintln!(
+                "update range {}/{}: streaming {}",
+                index + 1,
+                range_plan.slots.len(),
+                slot.base_name
+            );
+            let (title_building, mut title_writer) =
+                begin_title_projection(paths, slot)?;
+            let output = crate::archive_set::ArchiveSetOutput::new_in(&paths.root, u64::MAX)
+                .map_err(|error| error.to_string())?;
+            let mut last_progress = std::time::Instant::now();
+            let mut range_source = LifecycleRangeSource {
+                tail: &mut tail,
+                pending: &mut pending,
+                kind,
+                upper_id,
+                additions: &mut additions,
+                first_addition: &mut first_addition,
+                last_addition: &mut last_addition,
+                title_writer: &mut title_writer,
+                title_records: &mut title_projection_records,
+            };
+            let (output, merge_stats) = merge_sparse_update_range(
+                paths,
+                slot,
                 &prefix,
-                base.path(),
-                Box::new(UpdateRangeSource {
-                    tail: &mut tail,
-                    pending: &mut pending,
-                    kind,
-                    upper_id,
-                    records: &mut additions,
-                }),
+                &mut range_source,
                 output,
-                MIRROR_FRAME_TARGET,
-                mirror_compression(),
-                |records| {
+                &mut |records| {
                     if last_progress.elapsed() >= std::time::Duration::from_secs(2) {
                         eprintln!(
-                            "range {}/{}: merged {records} records",
+                            "update range {}/{}: {records} merged records",
                             index + 1,
-                            plan.ranges.len()
+                            range_plan.slots.len()
                         );
                         last_progress = std::time::Instant::now();
                     }
                 },
+            )?;
+            let records = merge_stats.output_records;
+            base_frame_bytes_copied = merge_stats.copied_compressed_bytes;
+            base_frame_bytes_decoded = merge_stats.decoded_compressed_bytes;
+            eprintln!(
+                "update range {}/{}: {} base frames copied ({} bytes), {} decoded ({} bytes)",
+                index + 1,
+                range_plan.slots.len(),
+                merge_stats.copied_frames,
+                merge_stats.copied_compressed_bytes,
+                merge_stats.decoded_frames,
+                merge_stats.decoded_compressed_bytes,
+            );
+            (
+                title_projection_name,
+                title_projection_bytes,
+                title_projection_records,
+            ) = finish_title_projection(
+                paths,
+                slot,
+                &title_building,
+                title_writer,
+                title_projection_records,
+            )?;
+            let completed_archive = output.finish().map_err(|error| error.to_string())?;
+            let replacement = paths
+                .root
+                .join("ranges")
+                .join(format!(".building-{}", slot.candidate_id));
+            if replacement.exists() {
+                remove_path(&replacement)
+                    .map_err(|error| format!("{}: {error}", replacement.display()))?;
+            }
+            std::fs::create_dir_all(replacement.parent().unwrap())
+                .map_err(|error| format!("{}: {error}", replacement.display()))?;
+            completed_archive
+                .persist(&replacement)
+                .map_err(|error| error.to_string())?;
+            let replacement_set = crate::archive_set::ArchiveSetReader::open(&replacement)
+                .map_err(|error| error.to_string())?;
+            let replacement_range = replacement_set
+                .segments()
+                .iter()
+                .find(|segment| segment.kind == Some(kind))
+                .ok_or_else(|| "range replacement contains no entity segment".to_string())?
+                .clone();
+            let object = paths.range_object(&slot.candidate_id);
+            std::fs::create_dir_all(object.parent().unwrap())
+                .map_err(|error| format!("{}: {error}", object.display()))?;
+            if object.exists() {
+                std::fs::remove_file(&object)
+                    .map_err(|error| format!("{}: {error}", object.display()))?;
+            }
+            std::fs::rename(
+                replacement.join(&replacement_range.name),
+                &object,
+            )
+            .map_err(|error| format!("{}: {error}", object.display()))?;
+            sync_directory_path(object.parent().unwrap())?;
+            let identity = crate::generation::GenerationId::parse(&slot.candidate_id)
+                .and_then(|identity| identity.to_bytes())
+                .map_err(|error| error.to_string())?;
+            let frame_directory = crate::frame_directory::write_from_archive_segment(
+                &object,
+                paths.range_frame_directory(&slot.candidate_id),
+                identity,
             )
             .map_err(|error| error.to_string())?;
-        let completed = output.finish().map_err(|error| error.to_string())?;
-        let replacement = scratch.join(format!(".updated-range-{index:06}"));
-        if replacement.exists() {
+            if frame_directory.records != records
+                || frame_directory.frames != merge_stats.output_frames
+            {
+                return Err(
+                    "range replacement counts disagree with its frame directory".into(),
+                );
+            }
+            let first_entity = frame_directory
+                .first_entity
+                .ok_or_else(|| "range replacement frame directory is empty".to_string())?;
+            let last_entity = frame_directory
+                .last_entity
+                .ok_or_else(|| "range replacement frame directory is empty".to_string())?;
             remove_path(&replacement)
                 .map_err(|error| format!("{}: {error}", replacement.display()))?;
-        }
-        completed
-            .persist(&replacement)
-            .map_err(|error| error.to_string())?;
-        let replacement_set = crate::archive_set::ArchiveSetReader::open(&replacement)
-            .map_err(|error| error.to_string())?;
-        let replacement_range = replacement_set
-            .segments()
-            .iter()
-            .find(|segment| segment.kind == Some(kind))
-            .ok_or_else(|| "range replacement contains no entity data".to_string())?
-            .clone();
-        let new_name = replacement_range.name;
-        let new_bytes = replacement_range.bytes;
-        let installed = archive.join(&new_name);
-        std::fs::rename(replacement.join(&new_name), &installed)
-            .map_err(|error| format!("{}: {error}", installed.display()))?;
-        sync_directory_path(archive)?;
-        let receipt = UpdateRangeReceipt {
-            schema: 1,
-            checkpoint_key: plan.checkpoint_key.clone(),
-            old_name: range.name.clone(),
-            new_name: new_name.clone(),
-            bytes: new_bytes,
-            frames,
-            records,
+            update_lifecycle::RangeSelection::Replaced {
+                segment_id: slot.candidate_id.clone(),
+                name: replacement_range.name,
+                bytes: replacement_range.bytes,
+                frames: frame_directory.frames,
+                records,
+                frame_directory_name: format!("{}.swframe", slot.candidate_id),
+                frame_directory_format: crate::frame_directory::FORMAT_VERSION,
+                frame_directory_bytes: frame_directory.bytes,
+                first_entity: first_entity.into(),
+                last_entity: last_entity.into(),
+            }
         };
-        persist_json(&update_range_receipt_path(scratch, index), &receipt)?;
-        if new_name != range.name {
-            std::fs::remove_file(archive.join(&range.name))
-                .map_err(|error| format!("{}: {error}", archive.join(&range.name).display()))?;
-            sync_directory_path(archive)?;
+
+        let tail_cursor = if pending.is_some() {
+            let frame_offset = tail
+                .current_frame_offset()
+                .ok_or_else(|| "pending tail record has no source frame".to_string())?;
+            let records_read = tail.current_frame_records_read();
+            let record_ordinal = records_read
+                .checked_sub(1)
+                .ok_or_else(|| "pending tail record has no frame ordinal".to_string())?;
+            update_lifecycle::TailCursorReceipt {
+                frame_offset: Some(frame_offset),
+                record_ordinal,
+            }
+        } else {
+            update_lifecycle::TailCursorReceipt {
+                frame_offset: None,
+                record_ordinal: 0,
+            }
+        };
+        let frame_end = all_frames.len() - tail.remaining_frame_count();
+        let mut tail_bytes_read = 0_u64;
+        for position in frame_start..frame_end {
+            tail_bytes_read = tail_bytes_read
+                .checked_add(
+                    all_frames
+                        .get(position)
+                        .map_err(|error| error.to_string())?
+                        .compressed_bytes,
+                )
+                .ok_or_else(|| "tail byte telemetry overflow".to_string())?;
         }
-        remove_path(&replacement)
-            .map_err(|error| format!("{}: {error}", replacement.display()))?;
+        frame_start = frame_end;
+        let (base_bytes_read, candidate_bytes_written, frames, records) = match &selection {
+            update_lifecycle::RangeSelection::Unchanged { .. } => (0, 0, 0, 0),
+            update_lifecycle::RangeSelection::Replaced {
+                bytes,
+                frames,
+                records,
+                ..
+            } => (
+                base_frame_bytes_copied.saturating_add(base_frame_bytes_decoded),
+                *bytes,
+                *frames,
+                *records,
+            ),
+        };
+        let receipt = update_lifecycle::RangeCandidateReceipt {
+            schema: update_lifecycle::UPDATE_SCHEMA,
+            update_id: source.source_plan_id.clone(),
+            base_generation_id: source.base_generation_id.as_str().to_owned(),
+            tail_id: tail_receipt.tail_id.clone(),
+            slot_index: slot.index,
+            candidate_id: slot.candidate_id.clone(),
+            kind: slot.kind,
+            first_id: slot.first_id,
+            last_id: slot.last_id,
+            base_segment_id: slot.base_segment_id.clone(),
+            selection,
+            consumed_first: first_addition.map(|entity| update_lifecycle::EntityBound {
+                kind: entity.kind as u8,
+                id: entity.id,
+            }),
+            consumed_last: last_addition.map(|entity| update_lifecycle::EntityBound {
+                kind: entity.kind as u8,
+                id: entity.id,
+            }),
+            tail_bytes_read,
+            base_bytes_read,
+            base_frame_bytes_copied,
+            base_frame_bytes_decoded,
+            candidate_bytes_written,
+            title_projection_name,
+            title_projection_bytes,
+            title_projection_records,
+            tail_cursor,
+            complete: true,
+        };
+        std::fs::create_dir_all(paths.range_receipt(slot.index).parent().unwrap())
+            .map_err(|error| format!("{}: {error}", paths.root.display()))?;
+        persist_json(&paths.range_receipt(slot.index), &receipt)?;
         total_frames = total_frames.saturating_add(frames);
         total_records = total_records.saturating_add(records);
         eprintln!(
-            "installed range {}/{} {} after merging {additions} update records",
+            "update range {}/{} durable · tail {} bytes · base {} bytes · candidate {} bytes",
             index + 1,
-            plan.ranges.len(),
-            new_name
+            range_plan.slots.len(),
+            receipt.tail_bytes_read,
+            receipt.base_bytes_read,
+            receipt.candidate_bytes_written
         );
     }
-    if let Some(record) = pending {
-        return Err(format!(
-            "sorted update record {:?} is outside the archive range plan",
-            record.entity()
-        ));
+    if pending.is_some()
+        || tail
+            .next_record()
+            .map_err(|error| error.to_string())?
+            .is_some()
+    {
+        return Err("sorted update tail contains records outside the base range plan".into());
     }
     Ok((total_frames, total_records))
 }
 
-fn ensure_update_serving_snapshot(archive: &Path, scratch: &Path) -> Result<(), String> {
-    let snapshot = scratch.join("serving-generation.swdump");
-    let snapshot_titles = snapshot.with_extension("swtitle");
-    if snapshot.exists() || snapshot_titles.exists() {
-        if !snapshot.exists() || !snapshot_titles.exists() {
-            if snapshot.exists() {
-                remove_path(&snapshot)
-                    .map_err(|error| format!("{}: {error}", snapshot.display()))?;
-            }
-            if snapshot_titles.exists() {
-                std::fs::remove_file(&snapshot_titles)
-                    .map_err(|error| format!("{}: {error}", snapshot_titles.display()))?;
-            }
-        } else {
-            let (_, _, complete) =
-                crate::archive::index_file(&snapshot).map_err(|error| error.to_string())?;
-            if !complete {
-                return Err("update serving snapshot is incomplete".into());
-            }
-            let titles = crate::title_index::TitleIndex::open(&snapshot_titles)
-                .map_err(|error| error.to_string())?;
-            crate::archive::IndexedArchiveSet::open(&snapshot, &titles)
-                .map_err(|error| error.to_string())?;
-            return Ok(());
-        }
-    }
-    if !archive.is_dir() {
-        std::fs::hard_link(archive, &snapshot)
-            .map_err(|error| format!("{}: {error}", snapshot.display()))?;
-        if let Err(error) =
-            std::fs::hard_link(archive.with_extension("swtitle"), &snapshot_titles)
-        {
-            let _ = std::fs::remove_file(&snapshot);
-            return Err(format!("{}: {error}", snapshot_titles.display()));
-        }
-        return sync_directory_path(scratch);
-    }
-    let temporary =
-        tempfile::tempdir_in(scratch).map_err(|error| format!("{}: {error}", scratch.display()))?;
-    for entry in
-        std::fs::read_dir(archive).map_err(|error| format!("{}: {error}", archive.display()))?
+fn read_range_receipts(
+    plan: &update_lifecycle::RangePlanReceipt,
+    paths: &update_lifecycle::UpdatePaths,
+) -> Result<Vec<update_lifecycle::RangeCandidateReceipt>, String> {
+    plan.slots
+        .iter()
+        .map(|slot| {
+            update_lifecycle::read_receipt(&paths.range_receipt(slot.index))
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| {
+                    format!(
+                        "range slot {} has no durable candidate receipt",
+                        slot.index
+                    )
+                })
+        })
+        .collect()
+}
+
+fn ensure_candidate_archive(
+    plan: &update_lifecycle::RangePlanReceipt,
+    paths: &update_lifecycle::UpdatePaths,
+) -> Result<update_lifecycle::CandidateInventoryReceipt, String> {
+    if let Some(inventory) =
+        update_lifecycle::read_receipt::<update_lifecycle::CandidateInventoryReceipt>(
+            &paths.candidate_inventory(),
+        )
+        .map_err(|error| error.to_string())?
     {
-        let entry = entry.map_err(|error| format!("{}: {error}", archive.display()))?;
-        let name = entry.file_name();
-        std::fs::hard_link(entry.path(), temporary.path().join(name))
-            .map_err(|error| format!("{}: {error}", entry.path().display()))?;
+        return Ok(inventory);
     }
-    crate::archive_set::ArchiveSetReader::open(temporary.path())
+    let receipts = read_range_receipts(plan, paths)?;
+    let candidate_archive = paths.candidate_archive();
+    let candidate_root = candidate_archive.parent().unwrap();
+    std::fs::create_dir_all(candidate_root)
+        .map_err(|error| format!("{}: {error}", candidate_root.display()))?;
+    if paths.candidate_archive().exists() {
+        remove_path(&paths.candidate_archive())
+            .map_err(|error| format!("{}: {error}", paths.candidate_archive().display()))?;
+    }
+    let building = candidate_root.join(".archive-building");
+    if building.exists() {
+        remove_path(&building).map_err(|error| format!("{}: {error}", building.display()))?;
+    }
+    std::fs::create_dir(&building)
+        .map_err(|error| format!("{}: {error}", building.display()))?;
+    for name in [
+        "0000-reference.swdump-part",
+        "9999-complete.swdump-part",
+    ] {
+        hard_link_file(
+            &paths.base_archive().join(name),
+            &building.join(name),
+        )?;
+    }
+    let mut selected = Vec::with_capacity(plan.slots.len());
+    for (slot, receipt) in plan.slots.iter().zip(&receipts) {
+        let (segment_id, name, bytes, source) = match &receipt.selection {
+            update_lifecycle::RangeSelection::Unchanged {
+                segment_id,
+                name,
+                bytes,
+            } => (
+                segment_id.clone(),
+                name.clone(),
+                *bytes,
+                paths.base_archive().join(name),
+            ),
+            update_lifecycle::RangeSelection::Replaced {
+                segment_id,
+                name,
+                bytes,
+                ..
+            } => (
+                segment_id.clone(),
+                name.clone(),
+                *bytes,
+                paths.range_object(&slot.candidate_id),
+            ),
+        };
+        if building.join(&name).exists() {
+            return Err(format!("candidate range filename collision: {name}"));
+        }
+        hard_link_file(&source, &building.join(&name))?;
+        selected.push(update_lifecycle::SelectedSegment {
+            slot_index: slot.index,
+            segment_id,
+            name,
+            bytes,
+        });
+    }
+    sync_directory_path(&building)?;
+    crate::archive_set::ArchiveSetReader::open(&building)
         .map_err(|error| error.to_string())?;
-    std::fs::hard_link(archive.with_extension("swtitle"), &snapshot_titles)
-        .map_err(|error| format!("{}: {error}", snapshot_titles.display()))?;
-    #[allow(deprecated)]
-    let temporary = temporary.into_path();
-    std::fs::rename(&temporary, &snapshot)
-        .map_err(|error| format!("{}: {error}", snapshot.display()))?;
-    sync_directory_path(scratch)
+    std::fs::rename(&building, paths.candidate_archive())
+        .map_err(|error| format!("{}: {error}", paths.candidate_archive().display()))?;
+    sync_directory_path(candidate_root)?;
+    let inventory = update_lifecycle::CandidateInventoryReceipt {
+        schema: update_lifecycle::UPDATE_SCHEMA,
+        update_id: plan.update_id.clone(),
+        base_generation_id: plan.base_generation_id.clone(),
+        tail_id: plan.tail_id.clone(),
+        segments: selected,
+    };
+    persist_json(&paths.candidate_inventory(), &inventory)?;
+    Ok(inventory)
+}
+
+fn latest_site_info(
+    archive: &Path,
+    titles: &crate::title_index::TitleIndex,
+) -> Result<crate::archive::SiteInfoRecord, String> {
+    let indexed =
+        crate::archive::IndexedArchiveSet::open(archive, titles).map_err(|error| error.to_string())?;
+    let target = crate::archive::EntityKey {
+        kind: crate::archive::EntityKind::Global,
+        id: 1,
+    };
+    let mut left = 0;
+    let mut right = titles.frame_count();
+    while left < right {
+        let middle = left + (right - left) / 2;
+        if titles
+            .frame(middle)
+            .map_err(|error| error.to_string())?
+            .info
+            .last_entity
+            < target
+        {
+            left = middle + 1;
+        } else {
+            right = middle;
+        }
+    }
+    for position in left..titles.frame_count() {
+        let frame = titles.frame(position).map_err(|error| error.to_string())?;
+        if frame.info.first_entity > target {
+            break;
+        }
+        let location = indexed.location(frame).map_err(|error| error.to_string())?;
+        let mut input = indexed
+            .open_file(&location)
+            .map_err(|error| error.to_string())?;
+        let mut latest = None;
+        crate::archive::visit_frame_while_file(&mut input, &location, |record| {
+            if let crate::archive::Record::SiteInfo {
+                site_info,
+                ..
+            } = record
+            {
+                latest = Some(site_info);
+                return Ok(false);
+            }
+            Ok(true)
+        })
+        .map_err(|error| error.to_string())?;
+        if let Some(site_info) = latest {
+            return Ok(site_info);
+        }
+    }
+    Err("base generation has no siteinfo record".into())
+}
+
+fn projected_site_info(
+    range_plan: &update_lifecycle::RangePlanReceipt,
+    receipts: &[update_lifecycle::RangeCandidateReceipt],
+    paths: &update_lifecycle::UpdatePaths,
+    fallback: crate::archive::SiteInfoRecord,
+) -> Result<crate::archive::SiteInfoRecord, String> {
+    let mut latest = None;
+    for (slot, receipt) in range_plan.slots.iter().zip(receipts) {
+        if slot.kind != crate::archive::EntityKind::Global as u8
+            || receipt.title_projection_records == 0
+        {
+            continue;
+        }
+        let mut reader =
+            crate::archive::ArchiveRecordReader::open(paths.range_projection(&slot.candidate_id))
+                .map_err(|error| error.to_string())?;
+        while let Some(record) = reader.next_record().map_err(|error| error.to_string())? {
+            if let crate::archive::Record::SiteInfo {
+                timestamp_micros,
+                site_info,
+            } = record
+            {
+                if latest
+                    .as_ref()
+                    .is_none_or(|(current, _)| timestamp_micros > *current)
+                {
+                    latest = Some((timestamp_micros, site_info));
+                }
+            }
+        }
+    }
+    Ok(latest.map_or(fallback, |(_, site_info)| site_info))
+}
+
+struct MergedTitleEntries<'a> {
+    base: std::iter::Peekable<crate::title_index::TitleEntryIter<'a>>,
+    updates: std::iter::Peekable<crate::title_projection::ExternalTitleEntryIter<'a>>,
+}
+
+impl<'a> MergedTitleEntries<'a> {
+    fn new(
+        base: crate::title_index::TitleEntryIter<'a>,
+        updates: crate::title_projection::ExternalTitleEntryIter<'a>,
+    ) -> Self {
+        Self {
+            base: base.peekable(),
+            updates: updates.peekable(),
+        }
+    }
+}
+
+impl Iterator for MergedTitleEntries<'_> {
+    type Item = crate::title_index::TitleIndexEntry;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let next = match (self.base.peek(), self.updates.peek()) {
+            (Some(base), Some(update)) => {
+                let base_key = (base.coded_title, base.time);
+                let update_key = (update.coded_title, update.time);
+                match base_key.cmp(&update_key) {
+                    std::cmp::Ordering::Less => self.base.next(),
+                    std::cmp::Ordering::Greater => self.updates.next(),
+                    std::cmp::Ordering::Equal => {
+                        self.base.next();
+                        self.updates.next()
+                    }
+                }
+            }
+            (Some(_), None) => self.base.next(),
+            (None, Some(_)) => self.updates.next(),
+            (None, None) => None,
+        };
+        next
+    }
+}
+
+#[derive(Clone)]
+struct FrameSelection {
+    old_start: u64,
+    old_end: u64,
+    new_start: u64,
+    replacement: Option<std::sync::Arc<crate::frame_directory::FrameDirectory>>,
+}
+
+struct ComposedFrameEntries<'a> {
+    base: std::iter::Peekable<crate::title_index::FrameEntryIter<'a>>,
+    selections: std::vec::IntoIter<FrameSelection>,
+    active: Option<FrameSelection>,
+    replacement_position: usize,
+}
+
+impl<'a> ComposedFrameEntries<'a> {
+    fn new(
+        base: crate::title_index::FrameEntryIter<'a>,
+        selections: Vec<FrameSelection>,
+    ) -> Self {
+        Self {
+            base: base.peekable(),
+            selections: selections.into_iter(),
+            active: None,
+            replacement_position: 0,
+        }
+    }
+}
+
+impl Iterator for ComposedFrameEntries<'_> {
+    type Item = crate::archive::Result<crate::title_index::FrameIndexEntry>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if self.active.is_none() {
+                self.active = self.selections.next();
+                self.replacement_position = 0;
+            }
+            let Some(selection) = self.active.as_ref() else {
+                return self.base.next();
+            };
+            if let Some(replacement) = selection.replacement.as_ref() {
+                while let Some(frame) = self.base.peek() {
+                    match frame {
+                        Ok(frame) if frame.compressed_offset < selection.old_start => {
+                            let next = self.base.next();
+                            return next;
+                        }
+                        Ok(frame) if frame.compressed_offset < selection.old_end => {
+                            let _ = self.base.next();
+                        }
+                        Err(_) => {
+                            let next = self.base.next();
+                            return next;
+                        }
+                        Ok(_) => break,
+                    }
+                }
+                if self.replacement_position < replacement.len() {
+                    let entry = match replacement.get(self.replacement_position) {
+                        Ok(entry) => Ok(crate::title_index::FrameIndexEntry {
+                            info: entry.frame_info(),
+                            compressed_offset: selection.new_start + entry.compressed_offset,
+                        }),
+                        Err(error) => Err(error),
+                    };
+                    self.replacement_position += 1;
+                    return Some(entry);
+                }
+                self.active = None;
+                continue;
+            }
+            match self.base.peek() {
+                Some(Ok(frame)) if frame.compressed_offset < selection.old_start => {
+                    let next = self.base.next();
+                    return next;
+                }
+                Some(Ok(frame)) if frame.compressed_offset < selection.old_end => {
+                    let mut frame = self.base.next().expect("peeked frame");
+                    if let Ok(frame) = &mut frame {
+                        frame.compressed_offset = selection.new_start
+                            + (frame.compressed_offset - selection.old_start);
+                    }
+                    return Some(frame);
+                }
+                Some(Err(_)) => {
+                    let next = self.base.next();
+                    return next;
+                }
+                Some(Ok(_)) | None => {
+                    self.active = None;
+                }
+            }
+        }
+    }
+
+}
+
+fn frame_selections(
+    base_titles: &crate::title_index::TitleIndex,
+    plan: &update_lifecycle::RangePlanReceipt,
+    receipts: &[update_lifecycle::RangeCandidateReceipt],
+    candidate: &crate::archive_set::ArchiveSetReader,
+    paths: &update_lifecycle::UpdatePaths,
+) -> Result<
+    (
+        Vec<FrameSelection>,
+        Vec<crate::title_index::SegmentIndexEntry>,
+    ),
+    String,
+> {
+    let base_segments = base_titles
+        .segment_entries()
+        .collect::<crate::archive::Result<Vec<_>>>()
+        .map_err(|error| error.to_string())?;
+    let candidate_segments = candidate.segments();
+    let mut output_segments = Vec::with_capacity(candidate_segments.len());
+    for segment in candidate_segments {
+        let role = match segment.kind {
+            Some(crate::archive::EntityKind::Page) => 1,
+            Some(crate::archive::EntityKind::User) => 2,
+            Some(crate::archive::EntityKind::Global) => 3,
+            None if segment.name.starts_with("0000-") => 0,
+            None if segment.name.starts_with("9999-") => 4,
+            None => return Err("candidate archive has an unknown control segment".into()),
+        };
+        output_segments.push(crate::title_index::SegmentIndexEntry {
+            role,
+            first_id: segment.first_id,
+            last_id: segment.last_id,
+            virtual_start: segment.virtual_start,
+            bytes: segment.bytes,
+        });
+    }
+    let mut selections = Vec::with_capacity(plan.slots.len());
+    for (slot, receipt) in plan.slots.iter().zip(receipts) {
+        let base_segment = base_segments
+            .iter()
+            .find(|segment| {
+                segment.role == slot.kind
+                    && segment.first_id == slot.first_id
+                    && segment.last_id == slot.last_id
+                    && segment.bytes == slot.base_bytes
+            })
+            .ok_or_else(|| format!("base index has no segment for slot {}", slot.index))?;
+        let selected_name = match &receipt.selection {
+            update_lifecycle::RangeSelection::Unchanged { name, .. }
+            | update_lifecycle::RangeSelection::Replaced { name, .. } => name,
+        };
+        let candidate_segment = candidate_segments
+            .iter()
+            .find(|segment| segment.name == *selected_name)
+            .ok_or_else(|| format!("candidate archive has no selected segment {selected_name}"))?;
+        let replacement = match &receipt.selection {
+            update_lifecycle::RangeSelection::Unchanged { .. } => None,
+            update_lifecycle::RangeSelection::Replaced {
+                segment_id,
+                frames,
+                ..
+            } => {
+                let identity = crate::generation::GenerationId::parse(segment_id)
+                    .and_then(|identity| identity.to_bytes())
+                    .map_err(|error| error.to_string())?;
+                let directory = crate::frame_directory::FrameDirectory::open_bound(
+                    paths.range_frame_directory(&slot.candidate_id),
+                    identity,
+                )
+                .map_err(|error| error.to_string())?;
+                if directory.len() as u64 != *frames {
+                    return Err(format!(
+                        "replacement frame directory for slot {} changed after validation",
+                        slot.index
+                    ));
+                }
+                Some(std::sync::Arc::new(directory))
+            }
+        };
+        selections.push(FrameSelection {
+            old_start: base_segment.virtual_start,
+            old_end: base_segment.virtual_start + base_segment.bytes,
+            new_start: candidate_segment.virtual_start,
+            replacement,
+        });
+    }
+    Ok((selections, output_segments))
+}
+
+fn ensure_candidate_index(
+    source: &crate::direct::UpdateSourcePlan,
+    range_plan: &update_lifecycle::RangePlanReceipt,
+    paths: &update_lifecycle::UpdatePaths,
+) -> Result<(update_lifecycle::PreparedGenerationReceipt, u64), String> {
+    if let Some(receipt) =
+        update_lifecycle::read_receipt::<update_lifecycle::PreparedGenerationReceipt>(
+            &paths.prepared_generation(),
+        )
+        .map_err(|error| error.to_string())?
+    {
+        return Ok((
+            receipt,
+            crate::title_index::TitleIndex::open(paths.candidate_index())
+                .map_err(|error| error.to_string())?
+                .entries(),
+        ));
+    }
+    let receipts = read_range_receipts(range_plan, paths)?;
+    let base_titles = crate::title_index::TitleIndex::open(paths.base_index())
+        .map_err(|error| error.to_string())?;
+    let base_site_info = latest_site_info(&paths.base_archive(), &base_titles)?;
+    let site_info = projected_site_info(range_plan, &receipts, paths, base_site_info)?;
+    let mut projection_inputs = Vec::new();
+    for (slot, receipt) in range_plan.slots.iter().zip(&receipts) {
+        if receipt.title_projection_records == 0 {
+            continue;
+        }
+        projection_inputs.push((
+            paths.range_projection(&slot.candidate_id),
+            receipt.title_projection_records,
+        ));
+    }
+    let projection_work = paths.root.join("candidate").join("title-projection-work");
+    if projection_work.exists() {
+        remove_path(&projection_work)
+            .map_err(|error| format!("{}: {error}", projection_work.display()))?;
+    }
+    std::fs::create_dir_all(&projection_work)
+        .map_err(|error| format!("{}: {error}", projection_work.display()))?;
+    let tail_titles = crate::title_projection::project_title_record_archives(
+        projection_inputs,
+        site_info,
+        &projection_work,
+        crate::title_projection::ProjectionLimits::default(),
+    )
+    .map_err(|error| error.to_string())?;
+    let candidate_set = crate::archive_set::ArchiveSetReader::open(paths.candidate_archive())
+        .map_err(|error| error.to_string())?;
+    let (selections, segments) =
+        frame_selections(&base_titles, range_plan, &receipts, &candidate_set, paths)?;
+    if paths.candidate_index().exists() {
+        std::fs::remove_file(paths.candidate_index())
+            .map_err(|error| format!("{}: {error}", paths.candidate_index().display()))?;
+    }
+    crate::title_index::write_generation_index(
+        paths.candidate_index(),
+        &source.generation_id,
+        MergedTitleEntries::new(base_titles.title_entries(), tail_titles.iter()),
+        ComposedFrameEntries::new(base_titles.frame_entries(), selections),
+        segments.into_iter().map(Ok),
+    )
+    .map_err(|error| error.to_string())?;
+    drop(tail_titles);
+    remove_path(&projection_work)
+        .map_err(|error| format!("{}: {error}", projection_work.display()))?;
+    let index = crate::title_index::TitleIndex::open(paths.candidate_index())
+        .map_err(|error| error.to_string())?;
+    if index.generation_id() != &source.generation_id {
+        return Err("prepared index carries the wrong generation ID".into());
+    }
+    let receipt = update_lifecycle::PreparedGenerationReceipt {
+        schema: update_lifecycle::UPDATE_SCHEMA,
+        update_id: source.source_plan_id.clone(),
+        base_generation_id: source.base_generation_id.as_str().to_owned(),
+        generation_id: source.generation_id.as_str().to_owned(),
+        archive_name: "archive.swdump".into(),
+        index_name: "archive.swtitle".into(),
+        index_bytes: std::fs::metadata(paths.candidate_index())
+            .map_err(|error| format!("{}: {error}", paths.candidate_index().display()))?
+            .len(),
+    };
+    persist_json(&paths.prepared_generation(), &receipt)?;
+    Ok((receipt, index.entries()))
+}
+
+fn install_update_generation(
+    archive: &Path,
+    source: &crate::direct::UpdateSourcePlan,
+    paths: &update_lifecycle::UpdatePaths,
+) -> Result<(), String> {
+    let installed_id = installed_generation_id(archive)?;
+    if installed_id != source.base_generation_id
+        && installed_id != source.generation_id
+    {
+        return Err(format!(
+            "installed index names generation {}, update expects base {} or candidate {}",
+            installed_id.as_str(),
+            source.base_generation_id.as_str(),
+            source.generation_id.as_str()
+        ));
+    }
+    if installed_id == source.base_generation_id {
+        let outcome = crate::installation_lifecycle::install(
+            paths.candidate_archive(),
+            paths.candidate_index(),
+            archive,
+        )?;
+        if outcome.cleanup_pending {
+            eprintln!(
+                "new generation installed; previous generation cleanup is reader-deferred"
+            );
+        }
+    }
+    validate_installed_update_generation(archive, source)
+}
+
+fn validate_installed_update_generation(
+    archive: &Path,
+    source: &crate::direct::UpdateSourcePlan,
+) -> Result<(), String> {
+    let selected = crate::installation_lifecycle::serving_pair(archive)?
+        .ok_or_else(|| "published update has no selected generation".to_string())?;
+    let observed = crate::generation::generation_identity(&selected.archive, &selected.title)
+        .map_err(|error| error.to_string())?;
+    if observed.generation_id != source.generation_id
+        || observed.wiki_db != source.wiki_db
+        || observed.content_frontier != source.resulting_content_frontier
+        || observed.metadata_frontier != source.resulting_metadata_frontier
+    {
+        return Err("published update generation does not match its immutable source plan".into());
+    }
+    Ok(())
+}
+
+fn publish_update_commit(
+    source: &crate::direct::UpdateSourcePlan,
+    paths: &update_lifecycle::UpdatePaths,
+) -> Result<update_lifecycle::CommitReceipt, String> {
+    let receipt = update_lifecycle::CommitReceipt {
+        schema: update_lifecycle::UPDATE_SCHEMA,
+        update_id: source.source_plan_id.clone(),
+        old_generation_id: source.base_generation_id.as_str().to_owned(),
+        new_generation_id: source.generation_id.as_str().to_owned(),
+    };
+    persist_json(&paths.commit_receipt(), &receipt)?;
+    Ok(receipt)
+}
+
+fn finish_update_cleanup(
+    archive: &Path,
+    scratch: &Path,
+    paths: &update_lifecycle::UpdatePaths,
+) -> Result<(), String> {
+    let selector = update_selector_path(scratch);
+    if selector.exists() {
+        if let Err(error) = std::fs::remove_file(&selector) {
+            eprintln!(
+                "update committed; deferred selector cleanup {}: {error}",
+                selector.display()
+            );
+        }
+    }
+    if let Err(error) = sync_parent(archive) {
+        eprintln!("update committed; deferred directory sync: {error}");
+    }
+    if !selector.exists() {
+        if let Err(error) = remove_path(&paths.root) {
+            eprintln!(
+                "update committed; deferred cleanup of {}: {error}",
+                paths.root.display()
+            );
+        }
+    }
+    Ok(())
 }
 
 #[cfg(feature = "serve")]
@@ -1091,46 +2062,64 @@ fn build_full(
     archive: &Path,
     scratch: &Path,
     replace_plan: bool,
+    run_id: Option<&str>,
 ) -> Result<(), String> {
     std::env::set_var("SARUN_MIRROR_DEST", archive);
-    recover_interrupted_install(archive)?;
     std::fs::create_dir_all(scratch)
         .map_err(|error| format!("{}: {error}", scratch.display()))?;
     // Fetch robots.txt once during discovery and leave the result in the
     // resumable build tree for every stage-one helper to consume.
     std::env::set_var("SARUN_WIKIMEDIA_ROBOTS_CACHE", scratch.join("robots-cache"));
     let _lock = MirrorBuildLock::acquire(scratch)?;
+    if crate::installation_lifecycle::recover(archive)?
+        .is_some_and(|outcome| outcome.cleanup_pending)
+    {
+        eprintln!("previous installed generation remains reader-leased; cleanup is pending");
+    }
     if replace_plan {
         clear_mirror_scratch(scratch)?;
     }
-    let plan_path = scratch.join("plan.json");
-    let plan = if plan_path.exists() {
-        let plan = crate::direct::read_direct_build_plan(&plan_path)
-            .map_err(|error| error.to_string())?;
-        if plan.wiki_db != dbname {
-            return Err(format!(
-                "{} belongs to {}, not {dbname}",
-                plan_path.display(),
-                plan.wiki_db,
-            ));
-        }
-        eprintln!(
-            "resuming snapshot {} with {} source targets",
-            plan.content_snapshot,
-            plan.target_count(),
-        );
-        plan
-    } else {
-        let plan = crate::direct::discover_direct_build_plan(
-            client,
-            &wikimak_mediawiki::Config::default(),
-            dbname,
-            &|message| eprintln!("{message}"),
-        )
+    let inspected = crate::build_lifecycle::inspect_build(scratch, None)
         .map_err(|error| error.to_string())?;
-        persist_json(&plan_path, &plan)?;
-        plan
+    let plan = match inspected {
+        crate::build_lifecycle::BuildState::Unplanned => {
+            let plan = crate::direct::discover_direct_build_plan(
+                client,
+                &wikimak_mediawiki::Config::default(),
+                dbname,
+                &|message| eprintln!("{message}"),
+            )
+            .map_err(|error| error.to_string())?;
+            crate::build_lifecycle::commit_plan(scratch, &plan)
+                .map_err(|error| error.to_string())?;
+            plan
+        }
+        state => {
+            let plan = state
+                .plan()
+                .expect("every non-unplanned state carries its plan")
+                .clone();
+            if plan.wiki_db != dbname {
+                return Err(format!(
+                    "{} belongs to {}, not {dbname}",
+                    scratch.join("plan.json").display(),
+                    plan.wiki_db,
+                ));
+            }
+            eprintln!(
+                "resuming snapshot {} from {} with {} source targets",
+                plan.content_snapshot,
+                state.phase(),
+                plan.target_count(),
+            );
+            plan
+        }
     };
+    if let Some(run_id) = run_id {
+        crate::progress_projection::begin_run(scratch, &plan, run_id)?;
+    } else {
+        crate::progress_projection::initialize(scratch, &plan)?;
+    }
     if let Some(url) = plan.first_source_url() {
         // This is deliberately done by the importing process, before any
         // stage-one helpers start.  A resumed plan therefore cannot race
@@ -1138,18 +2127,21 @@ fn build_full(
         wikimak_mediawiki::prepare_robots(client, url)
             .map_err(|error| error.to_string())?;
     }
-    let reusable = crate::direct::prune_invalid_build_nodes_observing(
-        scratch,
-        &plan,
-        &|message| eprintln!("{message}"),
-    )
-    .map_err(|error| error.to_string())?;
-    crate::direct::recover_direct_build_completion(
-        scratch,
-        &plan,
-        &|message| eprintln!("{message}"),
-    )
-    .map_err(|error| error.to_string())?;
+    let progress_state = crate::build_lifecycle::inspect_build(scratch, Some(&plan.plan_id))
+        .map_err(|error| error.to_string())?;
+    let reusable = progress_state
+        .targets()
+        .iter()
+        .filter(|target| matches!(target.state, crate::build_lifecycle::TargetState::Ready(_)))
+        .inspect(|target| {
+            crate::progress_projection::mark_target_completed(
+                scratch,
+                &plan,
+                target.kind.as_str(),
+                target.index,
+            );
+        })
+        .count();
     if reusable != 0 {
         eprintln!(
             "resuming with {reusable}/{} source targets already durable",
@@ -1159,184 +2151,250 @@ fn build_full(
     prepare_build_tools(scratch)?;
     write_stage_one_makefile(scratch, &plan)?;
     run_build_make(scratch, &plan)?;
-    let built = scratch.join("archive.swdump");
-    crate::archive_set::ArchiveSetReader::open(&built)
+    let ready = crate::build_lifecycle::inspect_build(scratch, Some(&plan.plan_id))
         .map_err(|error| error.to_string())?;
-    if !scratch.join("archive.complete").exists() {
-        return Err("resumable build stopped without a complete archive".into());
+    if !matches!(ready, crate::build_lifecycle::BuildState::Ready { .. }) {
+        return Err(format!(
+            "resumable build stopped in durable state {}",
+            ready.phase()
+        ));
     }
-    install_built_archive(built, archive, scratch)?;
+    let built = scratch.join("archive.swdump");
+    install_built_archive(built, archive)?;
     #[cfg(feature = "serve")]
-    pack_selected_media(client, dbname, archive)?;
-    remove_path(scratch).map_err(|error| format!("{}: {error}", scratch.display()))
+    if let Err(error) = pack_selected_media(client, dbname, archive) {
+        eprintln!(
+            "text generation is installed; optional media remains pending: {error}"
+        );
+    }
+    if let Err(error) = remove_path(scratch) {
+        eprintln!(
+            "text generation is installed; scratch cleanup remains pending at {}: {error}",
+            scratch.display()
+        );
+    }
+    Ok(())
 }
 
-fn cmd_fetch(dbname: &str, archive: &str) -> Result<(), String> {
+fn require_state_preserving_event(
+    phase: update_lifecycle::UpdatePhase,
+    event: update_lifecycle::UpdateEvent,
+) -> Result<(), String> {
+    match update_lifecycle::transition(phase, event) {
+        update_lifecycle::TransitionDecision::NoOp => Ok(()),
+        decision => Err(format!(
+            "update lifecycle classified {event:?} in {phase:?} as {decision:?}"
+        )),
+    }
+}
+
+fn update_step<T>(
+    phase: update_lifecycle::UpdatePhase,
+    result: Result<T, String>,
+) -> Result<T, String> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            require_state_preserving_event(
+                phase,
+                update_lifecycle::UpdateEvent::WorkerFailed,
+            )?;
+            Err(error)
+        }
+    }
+}
+
+fn cmd_fetch(dbname: &str, archive: &str, run_id: Option<&str>) -> Result<(), String> {
     std::env::set_var("SARUN_MIRROR_DEST", archive);
     let archive = Path::new(archive);
-    recover_interrupted_install(archive)?;
     let client = http_client()?;
-    if !archive.exists() {
+    if crate::installation_lifecycle::serving_pair(archive)?.is_none() {
         return build_full(
             &client,
             dbname,
             archive,
             &ensure_mirror_scratch(archive)?,
             false,
+            run_id,
         );
     }
     let scratch = ensure_mirror_scratch(archive)?;
     let _lock = MirrorBuildLock::acquire(&scratch)?;
-    // The update discovery pass owns the one robots.txt fetch for this
-    // resumable import.  Its child workers inherit this artifact path.
+    let _ = crate::installation_lifecycle::recover(archive)?;
     std::env::set_var("SARUN_WIKIMEDIA_ROBOTS_CACHE", scratch.join("robots-cache"));
-    let partial = scratch.join("update.swdump");
-    let receipt_path = scratch.join("update.receipt.json");
-    let update_marker = install_sidecar(archive, ".updating")?;
     let overlap_days = 3;
     let compression = mirror_compression();
-    let expected_checkpoint_key = (!update_marker.exists())
-        .then(|| {
-            crate::direct::update_checkpoint_key(
-                archive,
+
+    let (_active, paths, source, base, resuming) =
+        if let Some((active, paths)) = load_active_update(&scratch)? {
+            let source = load_update_plan(&active, &paths, dbname)?;
+            let base = if let Some(receipt) = update_lifecycle::read_receipt::<
+                update_lifecycle::PreservedBaseReceipt,
+            >(&paths.base_receipt())
+            .map_err(|error| error.to_string())?
+            {
+                receipt.generation
+            } else {
+                let selected = crate::installation_lifecycle::serving_pair(archive)?
+                    .ok_or_else(|| format!("{} has no installed generation", archive.display()))?;
+                crate::generation::generation_identity(&selected.archive, &selected.title)
+                    .map_err(|error| error.to_string())?
+            };
+            (active, paths, source, base, true)
+        } else {
+            let (active, paths, source, base) = create_update_plan(
+                &client,
                 dbname,
+                archive,
+                &scratch,
                 overlap_days,
-                MIRROR_FRAME_TARGET,
                 compression,
-            )
-        })
-        .transpose()
-        .map_err(|error| error.to_string())?;
-    let receipt = std::fs::read(&receipt_path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<UpdateCheckpointReceipt>(&bytes).ok());
-    let receipt_matches = receipt.as_ref().is_some_and(|receipt| {
-        receipt.schema == 1
-            && receipt.wiki_db == dbname
-            && receipt.overlap_days == overlap_days
-            && receipt.frame_target == MIRROR_FRAME_TARGET
-            && receipt.compression_level == compression.level
-            && expected_checkpoint_key
-                .as_ref()
-                .is_none_or(|expected| receipt.checkpoint_key == *expected)
-    });
-    let partial_complete = partial
-        .exists()
-        .then(|| crate::archive::index_file(&partial))
-        .transpose()
-        .map_err(|error| error.to_string())?
-        .is_some_and(|(_, _, complete)| complete)
-        && receipt_matches;
-    if (partial.exists() || receipt_path.exists()) && !partial_complete {
-        if update_marker.exists() {
-            return Err(format!(
-                "{} exists but its update checkpoint is missing or belongs to another build",
-                update_marker.display()
-            ));
-        }
-        if partial.exists() {
-            std::fs::remove_file(&partial)
-                .map_err(|error| format!("{}: {error}", partial.display()))?;
-        }
-        if receipt_path.exists() {
-            std::fs::remove_file(&receipt_path)
-                .map_err(|error| format!("{}: {error}", receipt_path.display()))?;
-        }
-    }
-    if update_marker.exists() && !partial_complete {
-        return Err(format!(
-            "{} exists but its durable update stream is missing; refusing to continue from a \
-             possibly mixed range generation",
-            update_marker.display()
-        ));
-    }
-    if partial_complete {
-        eprintln!("reusing durable sorted update stream");
-    } else {
-        crate::build_update_archive(
-            &client,
-            &wikimak_mediawiki::Config::default(),
-            dbname,
-            archive,
-            &partial,
-            &scratch,
-            overlap_days,
-            MIRROR_FRAME_TARGET,
-            compression,
-            |message| eprintln!("{message}"),
-        )
-        .map_err(|error| error.to_string())?;
-        persist_json(
-            &receipt_path,
-            &UpdateCheckpointReceipt {
-                schema: 1,
-                wiki_db: dbname.to_owned(),
-                checkpoint_key: expected_checkpoint_key
-                    .clone()
-                    .expect("computed before update mutation"),
-                overlap_days,
-                frame_target: MIRROR_FRAME_TARGET,
-                compression_level: compression.level,
-            },
+            )?;
+            (active, paths, source, base, false)
+        };
+
+    if resuming {
+        let installed_id = installed_generation_id(archive)?;
+        let state = update_lifecycle::inspect_update(&paths, installed_id.as_str())
+            .map_err(|error| error.to_string())?;
+        require_state_preserving_event(
+            state.phase(),
+            update_lifecycle::UpdateEvent::ResumeRequested,
         )?;
     }
-    let checkpoint_key = receipt
-        .as_ref()
-        .filter(|_| partial_complete)
-        .map(|receipt| receipt.checkpoint_key.clone())
-        .or(expected_checkpoint_key)
-        .ok_or_else(|| "update checkpoint identity is unavailable".to_string())?;
-
-    let serving_snapshot = scratch.join("serving-generation.swdump");
-    if update_marker.exists()
-        && (!serving_snapshot.exists()
-            || !serving_snapshot.with_extension("swtitle").exists())
-    {
-        return Err(
-            "update marker exists without its preserved serving generation".into(),
-        );
+    loop {
+        let installed_id = installed_generation_id(archive)?;
+        let state = update_lifecycle::inspect_update(&paths, installed_id.as_str())
+            .map_err(|error| error.to_string())?;
+        let phase = state.phase();
+        let action = state.next_action();
+        match (action, state) {
+            (
+                update_lifecycle::UpdateAction::PublishTail,
+                update_lifecycle::UpdateState::Planned(_),
+            ) => {
+                update_step(
+                    phase,
+                    ensure_update_tail(&client, &source, &paths),
+                )?;
+            }
+            (
+                update_lifecycle::UpdateAction::PreserveBase,
+                update_lifecycle::UpdateState::TailReady(_, _),
+            ) => {
+                update_step(
+                    phase,
+                    ensure_preserved_base(archive, &source, &base, &paths),
+                )?;
+            }
+            (
+                update_lifecycle::UpdateAction::PublishRangePlan,
+                update_lifecycle::UpdateState::BasePreserved(_, tail, preserved),
+            ) => {
+                update_step(
+                    phase,
+                    ensure_range_plan(
+                        &source,
+                        &tail,
+                        &preserved.generation,
+                        &paths,
+                    ),
+                )?;
+            }
+            (
+                update_lifecycle::UpdateAction::PublishRange,
+                update_lifecycle::UpdateState::ApplyingRanges {
+                    tail,
+                    ranges,
+                    completed,
+                    ..
+                },
+            ) => {
+                eprintln!(
+                    "applying update ranges from durable slot {}/{}",
+                    completed + 1,
+                    ranges.slots.len()
+                );
+                update_step(
+                    phase,
+                    apply_update_ranges(&source, &tail, &ranges, &paths),
+                )?;
+            }
+            (
+                update_lifecycle::UpdateAction::PublishInventory,
+                update_lifecycle::UpdateState::ApplyingRanges { ranges, .. },
+            ) => {
+                eprintln!(
+                    "all {} range candidates are durable; assembling inventory",
+                    ranges.slots.len()
+                );
+                update_step(phase, ensure_candidate_archive(&ranges, &paths))?;
+            }
+            (
+                update_lifecycle::UpdateAction::PublishIndex,
+                update_lifecycle::UpdateState::CandidateComplete { ranges, .. },
+            ) => {
+                let (_, title_entries) = update_step(
+                    phase,
+                    ensure_candidate_index(&source, &ranges, &paths),
+                )?;
+                eprintln!("prepared {title_entries} title intervals");
+            }
+            (
+                update_lifecycle::UpdateAction::InstallGeneration,
+                update_lifecycle::UpdateState::IndexReady { .. },
+            ) => {
+                update_step(
+                    phase,
+                    install_update_generation(
+                        archive,
+                        &source,
+                        &paths,
+                    ),
+                )?;
+            }
+            (
+                update_lifecycle::UpdateAction::PublishCommit,
+                update_lifecycle::UpdateState::Installed { .. },
+            ) => {
+                update_step(
+                    phase,
+                    validate_installed_update_generation(archive, &source),
+                )?;
+                update_step(phase, publish_update_commit(&source, &paths))?;
+                eprintln!(
+                    "committed Wikipedia generation {}",
+                    source.generation_id.as_str()
+                );
+            }
+            (
+                update_lifecycle::UpdateAction::Cleanup,
+                update_lifecycle::UpdateState::Committed(_),
+            ) => {
+                update_step(
+                    phase,
+                    finish_update_cleanup(
+                        archive,
+                        &scratch,
+                        &paths,
+                    ),
+                )?;
+                #[cfg(feature = "serve")]
+                if let Err(error) = pack_selected_media(&client, dbname, archive) {
+                    eprintln!("text update committed; optional media update failed: {error}");
+                }
+                return Ok(());
+            }
+            (action, state) => {
+                return Err(format!(
+                    "update action {action:?} does not match inspected state {state:?}"
+                ));
+            }
+        }
     }
-    ensure_update_serving_snapshot(archive, &scratch)?;
-    if !update_marker.exists() {
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&update_marker)
-            .and_then(|file| file.sync_all())
-            .map_err(|error| format!("{}: {error}", update_marker.display()))?;
-        sync_parent(archive)?;
-    }
-    if archive.is_dir() {
-        eprintln!("merging the sorted update into one durable page-ID range at a time");
-    } else {
-        eprintln!("merging the sorted update into the mirror's one piece file");
-    }
-    let (frames, records) =
-        replace_archive_ranges(archive, &partial, &scratch, &checkpoint_key)?;
-
-    eprintln!("rebuilding the single title and virtual-frame index");
-    let mut titles = tempfile::NamedTempFile::new_in(&scratch)
-        .map_err(|error| format!("{}: {error}", scratch.display()))?;
-    let title_entries = crate::title_index::build(archive, titles.path())
-        .map_err(|error| error.to_string())?;
-    titles
-        .as_file_mut()
-        .sync_all()
-        .map_err(|error| format!("{}: {error}", titles.path().display()))?;
-
-    titles
-        .persist(archive.with_extension("swtitle"))
-        .map_err(|error| error.error.to_string())?;
-    std::fs::remove_file(&update_marker)
-        .map_err(|error| format!("{}: {error}", update_marker.display()))?;
-    sync_parent(archive)?;
-    #[cfg(feature = "serve")]
-    pack_selected_media(&client, dbname, archive)?;
-    eprintln!("{records} records, {frames} frames, {title_entries} title intervals");
-    remove_path(&scratch).map_err(|error| format!("{}: {error}", scratch.display()))
 }
 
-fn cmd_refresh_full(dbname: &str, archive: &str) -> Result<(), String> {
+fn cmd_refresh_full(dbname: &str, archive: &str, run_id: Option<&str>) -> Result<(), String> {
     let archive = Path::new(archive);
     build_full(
         &http_client()?,
@@ -1344,6 +2402,7 @@ fn cmd_refresh_full(dbname: &str, archive: &str) -> Result<(), String> {
         archive,
         &ensure_mirror_scratch(archive)?,
         true,
+        run_id,
     )
 }
 
@@ -1361,24 +2420,16 @@ fn cmd_discover(dbname: &str) -> Result<(), String> {
 fn cmd_serve(path: &str, addr: &str, packed_media: Option<&str>) -> Result<(), String> {
     let started = std::time::Instant::now();
     let mirror_path = PathBuf::from(path);
-    if install_sidecar(&mirror_path, ".installing")?.exists() {
-        return Err("Wikipedia archive generation switch is in progress".into());
-    }
-    let path = if install_sidecar(&mirror_path, ".updating")?.exists() {
-        let snapshot = mirror_scratch_path(&mirror_path).join("serving-generation.swdump");
-        if !snapshot.exists() || !snapshot.with_extension("swtitle").exists() {
-            return Err("Wikipedia update lacks a readable preserved generation".into());
-        }
-        eprintln!("wikimak serve: update active; opening preserved generation");
-        snapshot
-    } else {
-        mirror_path.clone()
-    };
-    let archive = crate::archive_browse::ArchiveBrowseIndex::open(
-        &path,
-        path.with_extension("swtitle"),
-    )
-    .map_err(|error| error.to_string())?;
+    let archive = crate::installation_lifecycle::with_serving_pair(
+        &mirror_path,
+        |selected| {
+            crate::archive_browse::ArchiveBrowseIndex::open(
+                &selected.archive,
+                &selected.title,
+            )
+            .map_err(|error| error.to_string())
+        },
+    )?;
     eprintln!(
         "wikimak serve: opened {} title intervals and {} frames in {:.3}s",
         archive.title_count(),
@@ -1436,8 +2487,10 @@ fn cmd_siteinfo(api_url: &str, output: &str) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
-fn cmd_title_index(archive: &str, output: &str) -> Result<(), String> {
-    let entries = crate::title_index::build(archive, output)
+fn cmd_title_index(archive: &str, output: &str, generation_id: &str) -> Result<(), String> {
+    let generation_id =
+        crate::generation::GenerationId::parse(generation_id).map_err(|error| error.to_string())?;
+    let entries = crate::title_index::build(archive, output, &generation_id)
         .map_err(|error| error.to_string())?;
     println!("{entries} title intervals");
     Ok(())
@@ -1774,13 +2827,23 @@ fn arm_parent_watchdog() {
 
 pub fn cli_main(args: &[String]) -> i32 {
     let args = args.iter().map(String::as_str).collect::<Vec<_>>();
-    if matches!(args.as_slice(), ["fetch" | "refresh-full", _, _]) {
+    if matches!(
+        args.as_slice(),
+        ["fetch" | "refresh-full", _, _]
+            | ["fetch" | "refresh-full", "--run-id", _, _, _]
+    ) {
         arm_parent_watchdog();
     }
     let result = match args.as_slice() {
         ["discover", dbname] => cmd_discover(dbname),
-        ["fetch", dbname, archive] => cmd_fetch(dbname, archive),
-        ["refresh-full", dbname, archive] => cmd_refresh_full(dbname, archive),
+        ["fetch", dbname, archive] => cmd_fetch(dbname, archive, None),
+        ["refresh-full", dbname, archive] => cmd_refresh_full(dbname, archive, None),
+        ["fetch", "--run-id", run_id, dbname, archive] => {
+            cmd_fetch(dbname, archive, Some(run_id))
+        }
+        ["refresh-full", "--run-id", run_id, dbname, archive] => {
+            cmd_refresh_full(dbname, archive, Some(run_id))
+        }
         #[cfg(feature = "serve")]
         ["serve", archive] => cmd_serve(archive, "127.0.0.1:8642", None),
         #[cfg(feature = "serve")]
@@ -1796,7 +2859,9 @@ pub fn cli_main(args: &[String]) -> i32 {
         #[cfg(feature = "serve")]
         ["kiwix-pack", zim, output] => cmd_kiwix_pack(zim, output),
         ["siteinfo", api_url, output] => cmd_siteinfo(api_url, output),
-        ["title-index", archive, output] => cmd_title_index(archive, output),
+        ["title-index", archive, output, generation_id] => {
+            cmd_title_index(archive, output, generation_id)
+        }
         ["backrefs", archive, titles, output] => cmd_backrefs(archive, titles, output),
         ["repack", arguments @ ..] => cmd_repack(arguments),
         ["merge", arguments @ ..] => cmd_merge(arguments),
@@ -1811,7 +2876,7 @@ pub fn cli_main(args: &[String]) -> i32 {
              \x20      wikimak serve <archive.swdump> [addr] [--packed-media <directory>]\n\
              \x20      wikimak kiwix-pack <source.zim> <output-directory>\n\
              \x20      wikimak siteinfo <api-url> <output.swdump>\n\
-             \x20      wikimak title-index <archive.swdump> <output.swtitle>\n\
+             \x20      wikimak title-index <archive.swdump> <output.swtitle> <generation-id>\n\
              \x20      wikimak backrefs <archive.swdump> <titles.swtitle> <output.swrefs>\n\
              \x20      wikimak repack <input> <output> <frame-bytes> <zstd-level> [--dictionary-bytes N | --ref-prefix-bytes N --sample-bytes N | --raw-output | --raw-input]\n\
              \x20      wikimak merge <output> <frame-bytes> <zstd-level> <input>...\n\
@@ -1830,227 +2895,163 @@ pub fn cli_main(args: &[String]) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write;
-
     use super::*;
 
-    fn candidate(parent: &Path, bytes: &[u8]) -> tempfile::NamedTempFile {
-        let mut file = tempfile::NamedTempFile::new_in(parent).unwrap();
-        file.write_all(bytes).unwrap();
-        file.as_file().sync_all().unwrap();
-        file
-    }
-
-    fn archive_candidate(parent: &Path, bytes: &[u8]) -> PathBuf {
-        #[allow(deprecated)]
-        let path = tempfile::tempdir_in(parent).unwrap().into_path();
-        std::fs::write(path.join("payload"), bytes).unwrap();
-        path
-    }
-
-    fn page_state(page_id: u64, timestamp_micros: i64) -> crate::archive::Record {
-        crate::archive::Record::PageState {
-            page_id,
-            timestamp_micros,
-            title: format!("Page {page_id}"),
-            namespace: None,
-            deleted: false,
-        }
-    }
-
-    fn manifest(timestamp_micros: i64, snapshot: &str) -> crate::archive::Record {
-        crate::archive::Record::Manifest {
-            timestamp_micros,
-            manifest: crate::archive::ManifestRecord {
-                wiki_db: "testwiki".into(),
-                content_snapshot: snapshot.into(),
-                metadata_snapshot: "2024-06".into(),
-                source_files: Vec::new(),
-            },
-        }
-    }
-
-    fn site_info(timestamp_micros: i64) -> crate::archive::Record {
-        crate::archive::Record::SiteInfo {
-            timestamp_micros,
-            site_info: crate::archive::SiteInfoRecord {
-                site_name: "Test".into(),
-                db_name: "testwiki".into(),
-                base: String::new(),
-                generator: String::new(),
-                case: "first-letter".into(),
-                language: "en".into(),
-                rtl: false,
-                server: String::new(),
-                script_path: String::new(),
-                namespaces: Vec::new(),
-                interwiki: Vec::new(),
-                magic_words: Vec::new(),
-            },
-        }
-    }
-
-    #[test]
-    fn single_file_mirror_update_reuses_the_same_tail_idempotently() {
-        let directory = tempfile::tempdir().unwrap();
-        let archive = directory.path().join("testwiki.swdump");
-        let prefix = vec![b'x'; 256];
-        let mut writer = crate::archive::ArchiveWriter::with_ref_prefix(
-            std::fs::File::create(&archive).unwrap(),
-            1,
-            crate::archive::CompressionSettings {
-                level: 1,
-                ..Default::default()
-            },
-            &prefix,
+    fn sparse_range_fixture(
+        update_page_id: u64,
+    ) -> (SparseRangeMergeStats, Vec<u64>) {
+        let root = tempfile::tempdir().unwrap();
+        let paths = update_lifecycle::UpdatePaths::new(root.path().join("update"));
+        std::fs::create_dir_all(paths.base_archive().parent().unwrap()).unwrap();
+        let prefix = vec![b'p'; 4096];
+        let output = crate::archive_set::ArchiveSetOutput::new_in(
+            paths.base_archive().parent().unwrap(),
+            1 << 20,
         )
         .unwrap();
-        for record in [
-            page_state(1, 100),
-            page_state(2, 100),
-            manifest(100, "2024-06-01"),
-            site_info(100),
-        ] {
-            writer.write(&record).unwrap();
-        }
-        writer.finish().unwrap().0.sync_all().unwrap();
-        crate::title_index::build(&archive, archive.with_extension("swtitle"))
-            .unwrap();
-
-        let update = directory.path().join("update.swdump");
-        let mut writer = crate::archive::ArchiveWriter::new(
-            std::fs::File::create(&update).unwrap(),
-            1,
-        )
-        .unwrap();
-        for record in [
-            page_state(2, 200),
-            page_state(3, 200),
-            manifest(200, "2024-06-02"),
-        ] {
-            writer.write(&record).unwrap();
-        }
-        writer.finish().unwrap().0.sync_all().unwrap();
-
-        let scratch = directory.path().join("scratch");
-        std::fs::create_dir(&scratch).unwrap();
-        ensure_update_serving_snapshot(&archive, &scratch).unwrap();
-        replace_archive_ranges(&archive, &update, &scratch, "one")
-            .unwrap();
-        use std::os::unix::fs::MetadataExt;
-        let installed_inode = std::fs::metadata(&archive).unwrap().ino();
-        replace_archive_ranges(&archive, &update, &scratch, "one")
-            .unwrap();
-        assert_eq!(
-            std::fs::metadata(&archive).unwrap().ino(),
-            installed_inode,
-            "resume rewrote an already installed single-file generation"
-        );
-
-        let page_threes = |path: &Path| {
-            let mut reader = crate::archive::ArchiveRecordReader::open(path).unwrap();
-            let mut count = 0;
-            while let Some(record) = reader.next_record().unwrap() {
-                if record.entity()
-                    == (crate::archive::EntityKey {
-                        kind: crate::archive::EntityKind::Page,
-                        id: 3,
-                    })
-                {
-                    count += 1;
-                }
-            }
-            count
-        };
-        assert_eq!(page_threes(&archive), 1);
-        assert_eq!(
-            page_threes(&scratch.join("serving-generation.swdump")),
-            0
-        );
-    }
-
-    #[test]
-    fn update_ranges_are_individually_durable_and_idempotent() {
-        let directory = tempfile::tempdir().unwrap();
-        let archive = directory.path().join("testwiki.swdump");
-        let output =
-            crate::archive_set::ArchiveSetOutput::new_in(directory.path(), 1).unwrap();
-        let prefix = vec![b'x'; 256];
-        let mut writer = crate::archive::ArchiveWriter::with_ref_prefix(
+        let mut writer = crate::archive::StreamingArchiveWriter::new(
             output,
             1,
-            crate::archive::CompressionSettings {
-                level: 1,
-                ..Default::default()
-            },
+            crate::archive::CompressionSettings::default(),
             &prefix,
+            1,
         )
         .unwrap();
-        for record in [
-            page_state(1, 100),
-            page_state(2, 100),
-            manifest(100, "2024-06-01"),
-            site_info(100),
-        ] {
-            writer.write(&record).unwrap();
+        for page_id in 1..=5_u64 {
+            writer
+                .write(&crate::archive::Record::PageState {
+                    page_id,
+                    timestamp_micros: 100,
+                    title: format!("Base page {page_id} {}", "x".repeat(256)),
+                    namespace: None,
+                    deleted: false,
+                })
+                .unwrap();
         }
         let (output, _) = writer.finish().unwrap();
         output
             .finish()
             .unwrap()
-            .persist(&archive)
+            .persist(paths.base_archive())
             .unwrap();
+        let set =
+            crate::archive_set::ArchiveSetReader::open(paths.base_archive()).unwrap();
+        let segment = set
+            .segments()
+            .iter()
+            .find(|segment| {
+                segment.kind == Some(crate::archive::EntityKind::Page)
+            })
+            .unwrap()
+            .clone();
+        let slot = update_lifecycle::RangeSlot {
+            index: 0,
+            kind: crate::archive::EntityKind::Page as u8,
+            first_id: segment.first_id,
+            last_id: u64::MAX,
+            base_segment_id: crate::generation::GenerationId::from_plan_bytes(
+                b"sparse-base",
+            )
+            .as_str()
+            .into(),
+            base_name: segment.name,
+            base_bytes: segment.bytes,
+            candidate_id: crate::generation::GenerationId::from_plan_bytes(
+                b"sparse-candidate",
+            )
+            .as_str()
+            .into(),
+        };
+        let base_directory = base_range_frame_directory(&paths, &slot).unwrap();
+        let base_frame_bytes = (0..base_directory.len())
+            .map(|position| {
+                base_directory.get(position).unwrap().compressed_bytes
+            })
+            .collect::<Vec<_>>();
 
-        let update = directory.path().join("update.swdump");
-        let mut writer = crate::archive::ArchiveWriter::new(
-            std::fs::File::create(&update).unwrap(),
-            1,
-        )
-        .unwrap();
-        for record in [
-            page_state(2, 200),
-            page_state(3, 200),
-            manifest(200, "2024-06-02"),
-        ] {
-            writer.write(&record).unwrap();
-        }
-        writer.finish().unwrap();
-        let scratch = directory.path().join("scratch");
-        std::fs::create_dir(&scratch).unwrap();
-        crate::title_index::build(&archive, archive.with_extension("swtitle")).unwrap();
-        ensure_update_serving_snapshot(&archive, &scratch).unwrap();
-        let snapshot = scratch.join("serving-generation.swdump");
+        let tail_path = root.path().join("tail.swdump");
+        let mut tail_writer =
+            crate::archive::ArchiveWriter::new(std::fs::File::create(&tail_path).unwrap(), 1)
+                .unwrap();
+        tail_writer
+            .write(&crate::archive::Record::PageState {
+                page_id: update_page_id,
+                timestamp_micros: 200,
+                title: format!("Updated page {update_page_id}"),
+                namespace: None,
+                deleted: false,
+            })
+            .unwrap();
+        tail_writer.finish().unwrap();
+        let mut tail = crate::archive::ArchiveRecordReader::open(&tail_path).unwrap();
+        let mut pending = None;
+        let title_path = root.path().join("titles.swdump");
+        let mut title_writer =
+            crate::archive::ArchiveWriter::new(
+                std::fs::File::create(&title_path).unwrap(),
+                1024,
+            )
+            .unwrap();
+        let mut additions = 0;
+        let mut first = None;
+        let mut last = None;
+        let mut title_records = 0;
+        let output =
+            crate::archive_set::ArchiveSetOutput::new_in(root.path(), 1 << 20)
+                .unwrap();
+        let (output, stats) = {
+            let mut source = LifecycleRangeSource {
+                tail: &mut tail,
+                pending: &mut pending,
+                kind: crate::archive::EntityKind::Page,
+                upper_id: u64::MAX,
+                additions: &mut additions,
+                first_addition: &mut first,
+                last_addition: &mut last,
+                title_writer: &mut title_writer,
+                title_records: &mut title_records,
+            };
+            merge_sparse_update_range(
+                &paths,
+                &slot,
+                &prefix,
+                &mut source,
+                output,
+                &mut |_| {},
+            )
+            .unwrap()
+        };
+        output.finish().unwrap();
+        title_writer.finish().unwrap();
+        (stats, base_frame_bytes)
+    }
 
-        let first = replace_archive_ranges(&archive, &update, &scratch, "checkpoint").unwrap();
-        let second = replace_archive_ranges(&archive, &update, &scratch, "checkpoint").unwrap();
-        assert_eq!(first, second);
+    #[test]
+    fn sparse_range_raw_copies_every_unaffected_frame() {
+        let (stats, base_frame_bytes) = sparse_range_fixture(6);
+        assert_eq!(stats.decoded_frames, 0);
+        assert_eq!(stats.decoded_compressed_bytes, 0);
+        assert_eq!(stats.copied_frames, 5);
         assert_eq!(
-            std::fs::read_dir(scratch.join("updated-ranges"))
-                .unwrap()
-                .count(),
-            4
+            stats.copied_compressed_bytes,
+            base_frame_bytes.iter().copied().sum::<u64>(),
         );
+    }
 
-        let mut records = crate::archive::ArchiveRecordReader::open(&archive).unwrap();
-        let mut page_three = 0;
-        while let Some(record) = records.next_record().unwrap() {
-            if record.entity()
-                == (crate::archive::EntityKey {
-                    kind: crate::archive::EntityKind::Page,
-                    id: 3,
-                })
-            {
-                page_three += 1;
-            }
-        }
-        assert_eq!(page_three, 1);
-        let mut old_records = crate::archive::ArchiveRecordReader::open(&snapshot).unwrap();
-        while let Some(record) = old_records.next_record().unwrap() {
-            assert_ne!(record.entity().id, 3);
-        }
-        assert!(
-            crate::archive_set::ArchiveSetReader::open(&archive).is_ok(),
-            "range replacement left obsolete or overlapping files"
+    #[test]
+    fn sparse_range_decodes_only_the_intersecting_entity_frame() {
+        let (stats, base_frame_bytes) = sparse_range_fixture(3);
+        assert_eq!(stats.decoded_frames, 1);
+        assert_eq!(stats.decoded_compressed_bytes, base_frame_bytes[2]);
+        assert_eq!(stats.copied_frames, 4);
+        assert_eq!(
+            stats.copied_compressed_bytes,
+            base_frame_bytes
+                .iter()
+                .enumerate()
+                .filter_map(|(index, bytes)| (index != 2).then_some(bytes))
+                .copied()
+                .sum::<u64>(),
         );
     }
 
@@ -2067,110 +3068,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn archive_pair_install_replaces_both_completed_files() {
-        let temporary = tempfile::tempdir().unwrap();
-        let archive = temporary.path().join("wiki.swdump");
-        let titles = archive.with_extension("swtitle");
-        std::fs::create_dir(&archive).unwrap();
-        std::fs::write(archive.join("payload"), b"old archive").unwrap();
-        std::fs::write(&titles, b"old titles").unwrap();
-
-        persist_archive_pair(
-            archive_candidate(temporary.path(), b"new archive"),
-            candidate(temporary.path(), b"new titles"),
-            &archive,
-        )
-        .unwrap();
-
-        assert_eq!(std::fs::read(archive.join("payload")).unwrap(), b"new archive");
-        assert_eq!(std::fs::read(&titles).unwrap(), b"new titles");
-        assert!(!install_sidecar(&archive, ".installing").unwrap().exists());
-        assert!(!install_sidecar(&archive, ".previous").unwrap().exists());
-        assert!(!install_sidecar(&titles, ".previous").unwrap().exists());
-    }
-
-    #[test]
-    fn interrupted_pair_install_rolls_back_one_generation() {
-        let temporary = tempfile::tempdir().unwrap();
-        let archive = temporary.path().join("wiki.swdump");
-        let titles = archive.with_extension("swtitle");
-        std::fs::create_dir(&archive).unwrap();
-        std::fs::write(archive.join("payload"), b"old archive").unwrap();
-        std::fs::write(&titles, b"old titles").unwrap();
-        let marker = install_sidecar(&archive, ".installing").unwrap();
-        let old_archive = install_sidecar(&archive, ".previous").unwrap();
-        let old_titles = install_sidecar(&titles, ".previous").unwrap();
-        std::fs::write(&marker, b"").unwrap();
-        std::fs::rename(&archive, &old_archive).unwrap();
-        std::fs::hard_link(&titles, &old_titles).unwrap();
-        std::fs::rename(
-            archive_candidate(temporary.path(), b"new archive"),
-            &archive,
-        )
-        .unwrap();
-        candidate(temporary.path(), b"new titles")
-            .persist(&titles)
-            .unwrap();
-
-        recover_interrupted_install(&archive).unwrap();
-
-        assert_eq!(std::fs::read(archive.join("payload")).unwrap(), b"old archive");
-        assert_eq!(std::fs::read(&titles).unwrap(), b"old titles");
-        assert!(!marker.exists());
-    }
-
-    #[test]
-    fn interruption_between_archive_backup_and_title_backup_restores_archive() {
-        let temporary = tempfile::tempdir().unwrap();
-        let archive = temporary.path().join("wiki.swdump");
-        let titles = archive.with_extension("swtitle");
-        std::fs::create_dir(&archive).unwrap();
-        std::fs::write(archive.join("payload"), b"old archive").unwrap();
-        std::fs::write(&titles, b"old titles").unwrap();
-        let marker = install_sidecar(&archive, ".installing").unwrap();
-        let old_archive = install_sidecar(&archive, ".previous").unwrap();
-        std::fs::write(&marker, b"").unwrap();
-        std::fs::rename(&archive, &old_archive).unwrap();
-
-        recover_interrupted_install(&archive).unwrap();
-
-        assert_eq!(std::fs::read(archive.join("payload")).unwrap(), b"old archive");
-        assert_eq!(std::fs::read(&titles).unwrap(), b"old titles");
-        assert!(!marker.exists());
-        assert!(!old_archive.exists());
-    }
-
-    #[test]
-    fn interrupted_first_install_removes_an_unpaired_archive() {
-        let temporary = tempfile::tempdir().unwrap();
-        let archive = temporary.path().join("wiki.swdump");
-        let marker = install_sidecar(&archive, ".installing").unwrap();
-        std::fs::write(&marker, b"").unwrap();
-        std::fs::create_dir(&archive).unwrap();
-        std::fs::write(archive.join("payload"), b"incomplete").unwrap();
-
-        recover_interrupted_install(&archive).unwrap();
-
-        assert!(!archive.exists());
-        assert!(!marker.exists());
-    }
-
-    #[test]
-    fn interrupted_first_install_keeps_a_complete_pair() {
-        let temporary = tempfile::tempdir().unwrap();
-        let archive = temporary.path().join("wiki.swdump");
-        let title = archive.with_extension("swtitle");
-        let marker = install_sidecar(&archive, ".installing").unwrap();
-        std::fs::write(&marker, b"").unwrap();
-        std::fs::create_dir(&archive).unwrap();
-        std::fs::write(archive.join("payload"), b"complete").unwrap();
-        std::fs::write(&title, b"complete titles").unwrap();
-
-        recover_interrupted_install(&archive).unwrap();
-
-        assert!(archive.exists());
-        assert!(title.exists());
-        assert!(!marker.exists());
-    }
 }

@@ -589,10 +589,7 @@ fn revision_diff(previous: &[u8], current: &[u8]) -> Vec<u8> {
 /// Pick a page to land on when a wiki mirror is opened without a title:
 /// "Main Page" when the store has one, else the first page in title order.
 pub fn wiki_default_title(root: &Path) -> anyhow::Result<String> {
-    let archive = wikimak_wikipedia::archive_browse::ArchiveBrowseIndex::open(
-        root,
-        root.with_extension("swtitle"),
-    )
+    let archive = wikimak_wikipedia::archive_browse::ArchiveBrowseIndex::open_installed(root)
     .map_err(|e| anyhow::anyhow!("wiki open {}: {e}", root.display()))?;
     wiki_default_title_from(&archive, root)
 }
@@ -883,10 +880,7 @@ impl Reader {
     /// Open a wikimak store page; `title: None` lands on the default page.
     pub fn open_wiki(root: PathBuf, title: Option<String>) -> anyhow::Result<Reader> {
         let archive = std::sync::Arc::new(
-            wikimak_wikipedia::archive_browse::ArchiveBrowseIndex::open(
-                &root,
-                root.with_extension("swtitle"),
-            )
+            wikimak_wikipedia::archive_browse::ArchiveBrowseIndex::open_installed(&root)
             .map_err(|e| anyhow::anyhow!("wiki open {}: {e}", root.display()))?,
         );
         let title = match title {
@@ -2908,9 +2902,14 @@ mod tests {
             .unwrap();
         let (output, _) = writer.finish().unwrap();
         output.finish().unwrap().persist(&archive).unwrap();
+        let generation_id =
+            wikimak_wikipedia::generation::GenerationId::from_plan_bytes(
+                b"engine-reader-test-wiki-store",
+            );
         wikimak_wikipedia::title_index::build(
             &archive,
             archive.with_extension("swtitle"),
+            &generation_id,
         )
         .unwrap();
         wikimak_wikipedia::backrefs::build(
@@ -2919,6 +2918,10 @@ mod tests {
             archive.with_extension("swrefs"),
         )
         .unwrap();
+        let generations = archive.with_extension("generations");
+        std::fs::create_dir(&generations).unwrap();
+        let installed = generations.join(generation_id.as_str());
+        std::fs::rename(&archive, installed).unwrap();
         archive
     }
 

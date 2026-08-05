@@ -4237,7 +4237,12 @@ mod tests {
             })
             .unwrap();
         writer.finish().unwrap();
-        crate::title_index::build(&archive, &titles).unwrap();
+        crate::title_index::build(
+            &archive,
+            &titles,
+            &crate::generation::GenerationId::from_plan_bytes(b"backrefs-test-archive"),
+        )
+        .unwrap();
         let stats = build(&archive, &titles, &sidecar).unwrap();
         assert_eq!(stats.source_pages, 5);
         assert_eq!(stats.redirect_pages, 2);
@@ -4380,7 +4385,14 @@ mod tests {
             (2, 3),
         );
         assert_eq!(tiny_sets, vec![(7, vec![1, 2]), (8, vec![2])]);
-        crate::title_index::build(&archive, &titles).unwrap();
+        crate::title_index::build(
+            &archive,
+            &titles,
+            &crate::generation::GenerationId::from_plan_bytes(
+                b"backrefs-transitive-test-archive",
+            ),
+        )
+        .unwrap();
         let stats = build(&archive, &titles, &sidecar).unwrap();
         assert_eq!(stats.users_with_edits, 2);
         assert_eq!(stats.user_page_memberships, 3);

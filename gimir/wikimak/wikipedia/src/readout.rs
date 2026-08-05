@@ -43,9 +43,8 @@ impl PageReadout {
     fn with_text<T>(&self, f: impl FnOnce(Option<&[u8]>) -> T) -> T {
         let mut slot = self.text.lock().expect("readout mutex poisoned");
         if slot.is_none() {
-            let title_index = self.archive.with_extension("swtitle");
             *slot = Some(
-                crate::archive_browse::ArchiveBrowseIndex::open(&self.archive, title_index)
+                crate::archive_browse::ArchiveBrowseIndex::open_installed(&self.archive)
                     .and_then(|archive| archive.revision(self.page_id, self.rev_id))
                     .ok()
                     .flatten()

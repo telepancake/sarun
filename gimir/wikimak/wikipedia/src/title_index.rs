@@ -1,35 +1,36 @@
 //! Immutable title-history and frame-range indexes generated from an archive.
 
 use std::collections::BTreeMap;
-use std::io::Write;
+use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
 
 use crate::archive::{PageActionKind, Record, SiteInfoRecord};
 
 const FILE_MAGIC: [u8; 8] = *b"SWTITLE\0";
-const FILE_VERSION: u32 = 2;
-const HEADER_BYTES: usize = 64;
+const FILE_VERSION: u32 = 3;
+const HEADER_BYTES: usize = 96;
 const ENTRY_BYTES: usize = 16;
 const FRAME_ENTRY_BYTES: usize = 64;
 const SEGMENT_ENTRY_BYTES: usize = 40;
 
 #[derive(Clone)]
-struct Interval {
-    title: String,
-    start: i64,
-    end: i64,
-    page_id: u64,
+pub(crate) struct Interval {
+    pub(crate) title: String,
+    pub(crate) start: i64,
+    pub(crate) end: i64,
+    pub(crate) page_id: u64,
 }
 
-struct Projection {
-    page_id: u64,
-    closed: Vec<Interval>,
-    candidates: Vec<(String, i64)>,
+pub(crate) struct Projection {
+    pub(crate) page_id: u64,
+    pub(crate) closed: Vec<Interval>,
+    pub(crate) candidates: Vec<(String, i64)>,
 }
 
 #[derive(Debug)]
 pub struct TitleIndex {
     bytes: memmap2::Mmap,
+    generation_id: crate::generation::GenerationId,
     title_offset: usize,
     title_count: usize,
     frame_offset: usize,
@@ -52,6 +53,86 @@ pub(crate) struct SegmentIndexEntry {
     pub(crate) virtual_start: u64,
     pub(crate) bytes: u64,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TitleIndexEntry {
+    pub(crate) coded_title: u64,
+    pub(crate) time: u32,
+    pub(crate) page_id: u32,
+}
+
+pub(crate) struct TitleEntryIter<'a> {
+    index: &'a TitleIndex,
+    position: usize,
+}
+
+impl Iterator for TitleEntryIter<'_> {
+    type Item = TitleIndexEntry;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let entry = (self.position < self.index.title_count)
+            .then(|| self.index.title_entry(self.position));
+        self.position += usize::from(entry.is_some());
+        entry
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.index.title_count.saturating_sub(self.position);
+        (remaining, Some(remaining))
+    }
+}
+
+impl ExactSizeIterator for TitleEntryIter<'_> {}
+
+pub(crate) struct FrameEntryIter<'a> {
+    index: &'a TitleIndex,
+    position: usize,
+}
+
+impl Iterator for FrameEntryIter<'_> {
+    type Item = crate::archive::Result<FrameIndexEntry>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.position >= self.index.frame_count {
+            return None;
+        }
+        let entry = self.index.frame(self.position);
+        self.position += 1;
+        Some(entry)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.index.frame_count.saturating_sub(self.position);
+        (remaining, Some(remaining))
+    }
+}
+
+impl ExactSizeIterator for FrameEntryIter<'_> {}
+
+pub(crate) struct SegmentEntryIter<'a> {
+    index: &'a TitleIndex,
+    position: usize,
+}
+
+impl Iterator for SegmentEntryIter<'_> {
+    type Item = crate::archive::Result<SegmentIndexEntry>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.position >= self.index.segment_count {
+            return None;
+        }
+        let entry = self.index.segment(self.position);
+        self.position += 1;
+        Some(entry)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.index.segment_count.saturating_sub(self.position);
+        (remaining, Some(remaining))
+    }
+}
+
+impl ExactSizeIterator for SegmentEntryIter<'_> {}
 
 type PageTitleInputs = (
     Vec<(i64, String, Option<i64>, bool)>,
@@ -119,19 +200,23 @@ impl TitleIndexBuilder {
         self,
         archive: impl AsRef<Path>,
         output: impl AsRef<Path>,
+        generation_id: &crate::generation::GenerationId,
     ) -> crate::archive::Result<u64> {
         write_index(
             archive.as_ref(),
             output.as_ref(),
+            generation_id,
             self.site_info.map(|(_, site_info)| site_info),
             self.pages,
         )
     }
+
 }
 
 pub fn build(
     archive: impl AsRef<Path>,
     output: impl AsRef<Path>,
+    generation_id: &crate::generation::GenerationId,
 ) -> crate::archive::Result<u64> {
     let mut builder = TitleIndexBuilder::new();
     let workers = std::env::var("SARUN_WIKIMAK_CPU_BUDGET")
@@ -148,12 +233,13 @@ pub fn build(
             last_progress = std::time::Instant::now();
         }
     })?;
-    builder.finish(archive, output)
+    builder.finish(archive, output, generation_id)
 }
 
 fn write_index(
     archive: &Path,
     output: &Path,
+    generation_id: &crate::generation::GenerationId,
     site_info: Option<SiteInfoRecord>,
     pages: BTreeMap<u64, PageTitleInputs>,
 ) -> crate::archive::Result<u64> {
@@ -166,63 +252,7 @@ fn write_index(
     let site_info = site_info.ok_or(crate::archive::ArchiveError::Invalid(
         "archive has no siteinfo record",
     ))?;
-
-    let mut projections = Vec::new();
-    for (page_id, (mut states, mut actions)) in pages {
-        for (_, title, namespace, _) in &mut states {
-            if let Some(namespace) = namespace {
-                *title = title_in_namespace(title, *namespace, &site_info);
-            }
-        }
-        states.sort_by(|left, right| {
-            right
-                .2
-                .is_some()
-                .cmp(&left.2.is_some())
-                .then(right.0.cmp(&left.0))
-                .then(left.1.cmp(&right.1))
-        });
-        states.dedup();
-        actions.sort_by_key(|(timestamp, action)| (*timestamp, action.tie_sequence));
-        let state = states.first().map(|(at, title, namespace, deleted)| {
-            (title.as_str(), *at, namespace.is_some(), *deleted)
-        });
-        projections.push(project_page(
-            page_id,
-            state,
-            &actions,
-            &site_info,
-        ));
-    }
-
-    let mut intervals = assign_current_titles(&projections)?;
-    intervals.extend(
-        projections
-            .into_iter()
-            .flat_map(|projection| projection.closed),
-    );
-    intervals.sort_by(|left, right| {
-        left.title
-            .cmp(&right.title)
-            .then(left.start.cmp(&right.start))
-            .then(left.end.cmp(&right.end))
-            .then(left.page_id.cmp(&right.page_id))
-    });
-    intervals.dedup_by(|left, right| {
-        left.title == right.title
-            && left.start == right.start
-            && left.end == right.end
-            && left.page_id == right.page_id
-    });
-
-    let mut changes = BTreeMap::<(u64, u32), u32>::new();
-    for (title, time, page_id) in ownership_changes(&intervals) {
-        changes.insert(
-            (coded_title(title, &site_info), seconds(time)),
-            u32::try_from(page_id)
-                .map_err(|_| crate::archive::ArchiveError::FieldTooLarge)?,
-        );
-    }
+    let changes = project_title_entries(pages, &site_info)?;
 
     let parent = output
         .parent()
@@ -267,10 +297,15 @@ fn write_index(
     temporary.write_all(&(HEADER_BYTES as u64).to_le_bytes())?;
     temporary.write_all(&(frame_offset as u64).to_le_bytes())?;
     temporary.write_all(&(segment_offset as u64).to_le_bytes())?;
-    for ((title, time), page_id) in &changes {
-        temporary.write_all(&title.to_le_bytes())?;
-        temporary.write_all(&time.to_le_bytes())?;
-        temporary.write_all(&page_id.to_le_bytes())?;
+    temporary.write_all(
+        &generation_id
+            .to_bytes()
+            .map_err(|_| crate::archive::ArchiveError::Invalid("malformed generation ID"))?,
+    )?;
+    for entry in &changes {
+        temporary.write_all(&entry.coded_title.to_le_bytes())?;
+        temporary.write_all(&entry.time.to_le_bytes())?;
+        temporary.write_all(&entry.page_id.to_le_bytes())?;
     }
     for frame in &frames {
         temporary.write_all(&[frame.info.first_entity.kind as u8])?;
@@ -317,6 +352,144 @@ fn write_index(
     Ok(changes.len() as u64)
 }
 
+fn project_title_entries(
+    pages: BTreeMap<u64, PageTitleInputs>,
+    site_info: &SiteInfoRecord,
+) -> crate::archive::Result<Vec<TitleIndexEntry>> {
+    let mut projections = Vec::new();
+    for (page_id, inputs) in pages {
+        projections.push(project_page_inputs(page_id, inputs, site_info));
+    }
+
+    let mut intervals = assign_current_titles(&projections)?;
+    intervals.extend(
+        projections
+            .into_iter()
+            .flat_map(|projection| projection.closed),
+    );
+    intervals.sort_by(|left, right| {
+        left.title
+            .cmp(&right.title)
+            .then(left.start.cmp(&right.start))
+            .then(left.end.cmp(&right.end))
+            .then(left.page_id.cmp(&right.page_id))
+    });
+    intervals.dedup_by(|left, right| {
+        left.title == right.title
+            && left.start == right.start
+            && left.end == right.end
+            && left.page_id == right.page_id
+    });
+
+    let mut changes = BTreeMap::<(u64, u32), u32>::new();
+    for (title, time, page_id) in ownership_changes(&intervals) {
+        changes.insert(
+            (coded_title(title, site_info), seconds(time)),
+            u32::try_from(page_id)
+                .map_err(|_| crate::archive::ArchiveError::FieldTooLarge)?,
+        );
+    }
+    Ok(changes
+        .into_iter()
+        .map(|((coded_title, time), page_id)| TitleIndexEntry {
+            coded_title,
+            time,
+            page_id,
+        })
+        .collect())
+}
+
+pub(crate) fn write_generation_index<T, F, S>(
+    output: impl AsRef<Path>,
+    generation_id: &crate::generation::GenerationId,
+    mut titles: T,
+    mut frames: F,
+    mut segments: S,
+) -> crate::archive::Result<()>
+where
+    T: Iterator<Item = TitleIndexEntry>,
+    F: Iterator<Item = crate::archive::Result<FrameIndexEntry>>,
+    S: Iterator<Item = crate::archive::Result<SegmentIndexEntry>>,
+{
+    let output = output.as_ref();
+    let parent = output
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    temporary.write_all(&[0; HEADER_BYTES])?;
+    let mut title_count = 0_u64;
+    let mut previous_title = None;
+    for entry in titles.by_ref() {
+        let key = (entry.coded_title, entry.time);
+        if previous_title.is_some_and(|previous| previous >= key) {
+            return Err(crate::archive::ArchiveError::Invalid(
+                "title index entries are not strictly ordered",
+            ));
+        }
+        previous_title = Some(key);
+        temporary.write_all(&entry.coded_title.to_le_bytes())?;
+        temporary.write_all(&entry.time.to_le_bytes())?;
+        temporary.write_all(&entry.page_id.to_le_bytes())?;
+        title_count = title_count
+            .checked_add(1)
+            .ok_or(crate::archive::ArchiveError::FieldTooLarge)?;
+    }
+    let frame_offset = temporary.stream_position()?;
+    let mut frame_count = 0_u64;
+    for frame in frames.by_ref() {
+        let frame = frame?;
+        temporary.write_all(&[frame.info.first_entity.kind as u8])?;
+        temporary.write_all(&[frame.info.last_entity.kind as u8])?;
+        temporary.write_all(&[0; 6])?;
+        temporary.write_all(&frame.info.first_entity.id.to_le_bytes())?;
+        temporary.write_all(&frame.info.last_entity.id.to_le_bytes())?;
+        temporary.write_all(&frame.compressed_offset.to_le_bytes())?;
+        temporary.write_all(&frame.info.records.to_le_bytes())?;
+        temporary.write_all(&frame.info.raw_bytes.to_le_bytes())?;
+        temporary.write_all(&frame.info.compressed_bytes.to_le_bytes())?;
+        temporary.write_all(&frame.info.dictionary_id.unwrap_or(0).to_le_bytes())?;
+        temporary.write_all(&[0; 4])?;
+        frame_count = frame_count
+            .checked_add(1)
+            .ok_or(crate::archive::ArchiveError::FieldTooLarge)?;
+    }
+    let segment_offset = temporary.stream_position()?;
+    let mut segment_count = 0_u64;
+    for segment in segments.by_ref() {
+        let segment = segment?;
+        temporary.write_all(&[segment.role])?;
+        temporary.write_all(&[0; 7])?;
+        temporary.write_all(&segment.first_id.to_le_bytes())?;
+        temporary.write_all(&segment.last_id.to_le_bytes())?;
+        temporary.write_all(&segment.virtual_start.to_le_bytes())?;
+        temporary.write_all(&segment.bytes.to_le_bytes())?;
+        segment_count = segment_count
+            .checked_add(1)
+            .ok_or(crate::archive::ArchiveError::FieldTooLarge)?;
+    }
+    temporary.seek(SeekFrom::Start(0))?;
+    temporary.write_all(&FILE_MAGIC)?;
+    temporary.write_all(&FILE_VERSION.to_le_bytes())?;
+    temporary.write_all(&(HEADER_BYTES as u32).to_le_bytes())?;
+    temporary.write_all(&title_count.to_le_bytes())?;
+    temporary.write_all(&frame_count.to_le_bytes())?;
+    temporary.write_all(&segment_count.to_le_bytes())?;
+    temporary.write_all(&(HEADER_BYTES as u64).to_le_bytes())?;
+    temporary.write_all(&frame_offset.to_le_bytes())?;
+    temporary.write_all(&segment_offset.to_le_bytes())?;
+    temporary.write_all(
+        &generation_id
+            .to_bytes()
+            .map_err(|_| crate::archive::ArchiveError::Invalid("malformed generation ID"))?,
+    )?;
+    temporary.as_file_mut().sync_all()?;
+    temporary
+        .persist(output)
+        .map_err(|error| crate::archive::ArchiveError::Io(error.error))?;
+    Ok(())
+}
+
 impl TitleIndex {
     pub fn open(path: impl AsRef<Path>) -> crate::archive::Result<Self> {
         let file = std::fs::File::open(path)?;
@@ -361,6 +534,11 @@ impl TitleIndex {
             bytes[56..64].try_into().expect("segment offset bytes"),
         ))
         .map_err(|_| crate::archive::ArchiveError::FieldTooLarge)?;
+        let generation_id = crate::generation::GenerationId::from_bytes(
+            bytes[64..96]
+                .try_into()
+                .expect("generation ID bytes"),
+        );
         let expected_frame_offset = title_offset
             .checked_add(
                 title_count
@@ -393,6 +571,7 @@ impl TitleIndex {
         }
         Ok(Self {
             bytes,
+            generation_id,
             title_offset,
             title_count,
             frame_offset,
@@ -400,6 +579,31 @@ impl TitleIndex {
             segment_offset,
             segment_count,
         })
+    }
+
+    pub fn generation_id(&self) -> &crate::generation::GenerationId {
+        &self.generation_id
+    }
+
+    pub(crate) fn title_entries(&self) -> TitleEntryIter<'_> {
+        TitleEntryIter {
+            index: self,
+            position: 0,
+        }
+    }
+
+    pub(crate) fn frame_entries(&self) -> FrameEntryIter<'_> {
+        FrameEntryIter {
+            index: self,
+            position: 0,
+        }
+    }
+
+    pub(crate) fn segment_entries(&self) -> SegmentEntryIter<'_> {
+        SegmentEntryIter {
+            index: self,
+            position: 0,
+        }
     }
 
     pub fn lookup(
@@ -559,6 +763,15 @@ impl TitleIndex {
         u32::from_le_bytes(entry[12..].try_into().expect("four page-id bytes"))
     }
 
+    fn title_entry(&self, position: usize) -> TitleIndexEntry {
+        let (coded_title, time) = self.key_time(position);
+        TitleIndexEntry {
+            coded_title,
+            time,
+            page_id: self.page_id(position),
+        }
+    }
+
     fn binary_search_by(
         &self,
         mut compare: impl FnMut(usize) -> std::cmp::Ordering,
@@ -577,7 +790,7 @@ impl TitleIndex {
     }
 }
 
-fn ownership_changes(intervals: &[Interval]) -> Vec<(&str, i64, u64)> {
+pub(crate) fn ownership_changes(intervals: &[Interval]) -> Vec<(&str, i64, u64)> {
     let mut output = Vec::new();
     let mut first = 0;
     while first < intervals.len() {
@@ -622,6 +835,32 @@ fn ownership_changes(intervals: &[Interval]) -> Vec<(&str, i64, u64)> {
         first = last;
     }
     output
+}
+
+pub(crate) fn project_page_inputs(
+    page_id: u64,
+    (mut states, mut actions): PageTitleInputs,
+    site_info: &SiteInfoRecord,
+) -> Projection {
+    for (_, title, namespace, _) in &mut states {
+        if let Some(namespace) = namespace {
+            *title = title_in_namespace(title, *namespace, site_info);
+        }
+    }
+    states.sort_by(|left, right| {
+        right
+            .2
+            .is_some()
+            .cmp(&left.2.is_some())
+            .then(right.0.cmp(&left.0))
+            .then(left.1.cmp(&right.1))
+    });
+    states.dedup();
+    actions.sort_by_key(|(timestamp, action)| (*timestamp, action.tie_sequence));
+    let state = states.first().map(|(at, title, namespace, deleted)| {
+        (title.as_str(), *at, namespace.is_some(), *deleted)
+    });
+    project_page(page_id, state, &actions, site_info)
 }
 
 fn project_page(
@@ -738,7 +977,7 @@ fn interval(title: &str, start: i64, end: i64, page_id: u64) -> Interval {
     }
 }
 
-fn coded_title(title: &str, site: &SiteInfoRecord) -> u64 {
+pub(crate) fn coded_title(title: &str, site: &SiteInfoRecord) -> u64 {
     let (namespace, title) = split_title(title, site);
     let mut symbols = namespace_varint(namespace);
     symbols.extend_from_slice(title.as_bytes());
@@ -885,7 +1124,7 @@ fn normalize(title: &str) -> String {
     title.replace('_', " ").trim().to_string()
 }
 
-fn seconds(timestamp_micros: i64) -> u32 {
+pub(crate) fn seconds(timestamp_micros: i64) -> u32 {
     timestamp_micros
         .div_euclid(1_000_000)
         .clamp(0, i64::from(u32::MAX)) as u32
@@ -894,6 +1133,8 @@ fn seconds(timestamp_micros: i64) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+    use std::rc::Rc;
 
     fn site() -> SiteInfoRecord {
         SiteInfoRecord {
@@ -923,6 +1164,53 @@ mod tests {
             interwiki: Vec::new(),
             magic_words: Vec::new(),
         }
+    }
+
+    #[test]
+    fn generation_index_streams_titles_exactly_once() {
+        struct Counted {
+            entries: std::vec::IntoIter<TitleIndexEntry>,
+            next_calls: Rc<Cell<usize>>,
+        }
+        impl Iterator for Counted {
+            type Item = TitleIndexEntry;
+
+            fn next(&mut self) -> Option<Self::Item> {
+                self.next_calls.set(self.next_calls.get() + 1);
+                self.entries.next()
+            }
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let output = root.path().join("titles.swtitle");
+        let next_calls = Rc::new(Cell::new(0));
+        let titles = Counted {
+            entries: vec![
+                TitleIndexEntry {
+                    coded_title: 1,
+                    time: 2,
+                    page_id: 3,
+                },
+                TitleIndexEntry {
+                    coded_title: 4,
+                    time: 5,
+                    page_id: 6,
+                },
+            ]
+            .into_iter(),
+            next_calls: Rc::clone(&next_calls),
+        };
+        write_generation_index(
+            &output,
+            &crate::generation::GenerationId::from_plan_id("test-plan"),
+            titles,
+            std::iter::empty::<crate::archive::Result<FrameIndexEntry>>(),
+            std::iter::empty::<crate::archive::Result<SegmentIndexEntry>>(),
+        )
+        .unwrap();
+        assert_eq!(next_calls.get(), 3);
+        let index = TitleIndex::open(&output).unwrap();
+        assert_eq!(index.entries(), 2);
     }
 
     #[test]

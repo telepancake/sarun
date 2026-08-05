@@ -156,17 +156,40 @@ impl PageRevisionTextCursor {
 }
 
 impl ArchiveBrowseIndex {
+    /// Open the generation selected by one logical mirror destination.
+    ///
+    /// If selector replacement races the first open, retry exactly when the
+    /// selected generation changed; an unchanged error remains an error.
+    pub fn open_installed(destination: impl AsRef<Path>) -> crate::archive::Result<Self> {
+        let backrefs = destination.as_ref().with_extension("swrefs");
+        crate::installation_lifecycle::with_serving_pair(
+            destination.as_ref(),
+            |selected| {
+                Self::open_with_backrefs(&selected.archive, &selected.title, &backrefs)
+                    .map_err(|error| error.to_string())
+            },
+        )
+        .map_err(|error| crate::archive::ArchiveError::Io(std::io::Error::other(error)))
+    }
+
     pub fn open(
         path: impl AsRef<Path>,
         title_index: impl AsRef<Path>,
     ) -> crate::archive::Result<Self> {
         let path = path.as_ref();
         let title_index = title_index.as_ref();
+        Self::open_with_backrefs(path, title_index, &path.with_extension("swrefs"))
+    }
+
+    fn open_with_backrefs(
+        path: &Path,
+        title_index: &Path,
+        backref_path: &Path,
+    ) -> crate::archive::Result<Self> {
         let titles = crate::title_index::TitleIndex::open(title_index)?;
-        let backref_path = path.with_extension("swrefs");
         let backrefs = if backref_path.is_file() {
             match crate::backrefs::BackrefIndex::open_for_title_index(
-                &backref_path,
+                backref_path,
                 title_index,
             ) {
                 Ok(index) => Some(index),
@@ -1344,12 +1367,17 @@ mod tests {
         output.finish().unwrap().persist(&path).unwrap();
 
         let title_index = temporary.path().join("sample.swtitle");
-        crate::title_index::build(&path, &title_index).unwrap();
+        crate::title_index::build(
+            &path,
+            &title_index,
+            &crate::generation::GenerationId::from_plan_bytes(b"archive-browse-test"),
+        )
+        .unwrap();
         let (_, archive_frames, complete) = crate::archive::index_file(&path).unwrap();
         assert!(complete);
         assert_eq!(
             std::fs::metadata(&title_index).unwrap().len(),
-            64 + 16
+            96 + 16
                 + archive_frames.len() as u64 * 64
                 + crate::archive_set::ArchiveSetReader::open(&path)
                     .unwrap()
@@ -1524,7 +1552,14 @@ mod tests {
         writer.finish().unwrap();
 
         let title_index = temporary.path().join("category.swtitle");
-        crate::title_index::build(&archive, &title_index).unwrap();
+        crate::title_index::build(
+            &archive,
+            &title_index,
+            &crate::generation::GenerationId::from_plan_bytes(
+                b"archive-browse-search-test",
+            ),
+        )
+        .unwrap();
         let sidecar = temporary.path().join("category.swrefs");
         crate::backrefs::build(&archive, &title_index, &sidecar).unwrap();
         let index = ArchiveBrowseIndex::open(&archive, &title_index).unwrap();

@@ -8,18 +8,19 @@
 //! than a private dispatcher/service hierarchy.
 //!
 //! Bookkeeping lives in `{state_home}/mirrors.db` (jobs are engine
-//! inventory, not box layer data). Liveness (which jobs are running
-//! right now, and their pids) is in-process only: a crashed engine
-//! leaves no stale "running" rows, just jobs whose last run never
-//! ended — shown as `stopped`.
+//! inventory, not box layer data). Runs and their identities are durable;
+//! the in-process owner map contains only process handles and telemetry.
 //!
 //! Job states surfaced to the UI/CLI:
 //!   starting   a driver launch is reserved but has not yielded its process ID
-//!   running    a driver process is live right now (in-process set)
-//!   paused     never auto-runs; force-run still works
+//!   running    a driver process was spawned for the durable active RunId
+//!   deleting   destination ownership is retained while cleanup is resumable
+//! `paused` is a separate schedule flag: it never hides the run outcome, and
+//! a force-run still works.
 //!   pending    never ran, or a successful run is due again
 //!   completed  last run exited 0; next due is measured from its completion
-//!   stopped    last run never recorded an end (engine died mid-run)
+//!   cancelled  the user stopped the last run
+//!   interrupted the engine disappeared while owning the last run
 //!   error      last run exited non-zero (detail = stderr tail)
 //! Interrupted, failed, and cancelled attempts require an explicit run; they
 //! are not scheduler requests merely because time passed.
@@ -28,7 +29,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
 fn now() -> i64 {
     SystemTime::now()
@@ -39,44 +40,235 @@ fn now() -> i64 {
 
 fn db() -> Result<Connection, String> {
     let path = crate::paths::state_home().join("mirrors.db");
-    let conn = Connection::open(&path).map_err(|e| e.to_string())?;
+    let mut conn = Connection::open(&path).map_err(|e| e.to_string())?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))
+        .map_err(|error| error.to_string())?;
     conn.pragma_update(None, "journal_mode", "WAL")
         .map_err(|e| e.to_string())?;
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS jobs (
-            id INTEGER PRIMARY KEY,
-            kind TEXT NOT NULL,
-            src TEXT NOT NULL,
-            dest TEXT NOT NULL,
-            interval_secs INTEGER NOT NULL,
-            paused INTEGER NOT NULL DEFAULT 0,
-            last_start INTEGER,
-            last_end INTEGER,
-            last_exit INTEGER,
-            last_detail TEXT NOT NULL DEFAULT '',
-            media_source TEXT
-        )",
-        [],
-    )
-    .map_err(|e| e.to_string())?;
-    // Existing installations predate the optional Kiwix source.  This is a
-    // one-column additive migration; old jobs remain unchanged.
-    let _ = conn.execute("ALTER TABLE jobs ADD COLUMN media_source TEXT", []);
+    conn.pragma_update(None, "foreign_keys", "ON")
+        .map_err(|e| e.to_string())?;
+    migrate_schema(&mut conn)?;
     Ok(conn)
+}
+
+const MIRROR_SCHEMA_VERSION: i64 = 1;
+
+fn create_schema(transaction: &Transaction<'_>) -> Result<(), String> {
+    transaction
+        .execute_batch(
+            "CREATE TABLE jobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                kind TEXT NOT NULL,
+                src TEXT NOT NULL,
+                dest TEXT NOT NULL UNIQUE,
+                interval_secs INTEGER NOT NULL,
+                paused INTEGER NOT NULL DEFAULT 0 CHECK(paused IN (0,1)),
+                media_source TEXT,
+                delete_mode TEXT CHECK(delete_mode IS NULL OR
+                    delete_mode IN ('registration','data'))
+            );
+            CREATE TABLE runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+                request TEXT NOT NULL CHECK(request IN ('explicit','scheduled','full')),
+                state TEXT NOT NULL CHECK(state IN
+                    ('starting','running','stopping','succeeded','failed',
+                     'cancelled','interrupted')),
+                started_at INTEGER NOT NULL,
+                spawned_at INTEGER,
+                ended_at INTEGER,
+                process_group INTEGER,
+                exit_code INTEGER,
+                stop_reason TEXT CHECK(stop_reason IS NULL OR
+                    stop_reason IN ('user','shutdown')),
+                detail TEXT NOT NULL DEFAULT '',
+                CHECK(
+                    (state='starting' AND spawned_at IS NULL AND ended_at IS NULL
+                                      AND process_group IS NULL AND stop_reason IS NULL)
+                 OR (state='running' AND spawned_at IS NOT NULL AND ended_at IS NULL
+                                     AND process_group IS NOT NULL AND stop_reason IS NULL)
+                 OR (state='stopping' AND ended_at IS NULL AND stop_reason IS NOT NULL)
+                 OR (state='succeeded' AND ended_at IS NOT NULL AND exit_code=0
+                                       AND stop_reason IS NULL)
+                 OR (state='failed' AND ended_at IS NOT NULL AND exit_code IS NOT NULL
+                                    AND exit_code<>0 AND stop_reason IS NULL)
+                 OR (state='cancelled' AND ended_at IS NOT NULL
+                                       AND stop_reason='user')
+                 OR (state='interrupted' AND ended_at IS NOT NULL
+                                         AND exit_code IS NULL
+                                         AND (stop_reason IS NULL OR stop_reason='shutdown'))
+                )
+            );
+            CREATE UNIQUE INDEX one_active_run_per_job ON runs(job_id)
+                WHERE state IN ('starting','running','stopping');
+            CREATE INDEX runs_by_job ON runs(job_id,id DESC);",
+        )
+        .map_err(|error| error.to_string())
+}
+
+fn migrate_schema(conn: &mut Connection) -> Result<(), String> {
+    let version: i64 = conn
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(|error| error.to_string())?;
+    if version == MIRROR_SCHEMA_VERSION {
+        return Ok(());
+    }
+    if version != 0 {
+        return Err(format!(
+            "unsupported mirror database schema {version}; expected {MIRROR_SCHEMA_VERSION}"
+        ));
+    }
+    let transaction = conn.transaction().map_err(|error| error.to_string())?;
+    let version: i64 = transaction
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(|error| error.to_string())?;
+    if version == MIRROR_SCHEMA_VERSION {
+        return transaction.commit().map_err(|error| error.to_string());
+    }
+    let legacy_exists: bool = transaction
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master
+                           WHERE type='table' AND name='jobs')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if !legacy_exists {
+        create_schema(&transaction)?;
+    } else {
+        let has_media_source = {
+            let mut statement = transaction
+                .prepare("PRAGMA table_info(jobs)")
+                .map_err(|error| error.to_string())?;
+            let columns = statement
+                .query_map([], |row| row.get::<_, String>(1))
+                .map_err(|error| error.to_string())?;
+            let mut found = false;
+            for column in columns {
+                if column.map_err(|error| error.to_string())? == "media_source" {
+                    found = true;
+                }
+            }
+            found
+        };
+        transaction
+            .execute("ALTER TABLE jobs RENAME TO legacy_jobs", [])
+            .map_err(|error| error.to_string())?;
+        create_schema(&transaction)?;
+        let media = if has_media_source {
+            "media_source"
+        } else {
+            "NULL"
+        };
+        transaction
+            .execute_batch(&format!(
+                "INSERT INTO jobs(id,kind,src,dest,interval_secs,paused,media_source)
+                 SELECT id,kind,src,dest,interval_secs,paused,{media}
+                 FROM legacy_jobs;
+                 INSERT INTO runs(job_id,request,state,started_at,ended_at,exit_code,detail)
+                 SELECT id,'explicit',
+                        CASE
+                          WHEN last_end IS NULL THEN 'interrupted'
+                          WHEN last_exit = 0 THEN 'succeeded'
+                          ELSE 'failed'
+                        END,
+                        last_start,
+                        COALESCE(last_end,last_start),
+                        CASE
+                          WHEN last_end IS NULL THEN NULL
+                          WHEN last_exit = 0 THEN 0
+                          ELSE COALESCE(last_exit,-1)
+                        END,
+                        COALESCE(last_detail,'')
+                 FROM legacy_jobs WHERE last_start IS NOT NULL;
+                 DROP TABLE legacy_jobs;"
+            ))
+            .map_err(|error| error.to_string())?;
+    }
+    transaction
+        .pragma_update(None, "user_version", MIRROR_SCHEMA_VERSION)
+        .map_err(|error| error.to_string())?;
+    transaction.commit().map_err(|error| error.to_string())
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct RunId(i64);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StopReason {
+    User,
+    Shutdown,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DeleteMode {
+    Registration,
+    Data,
+}
+
+impl DeleteMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Registration => "registration",
+            Self::Data => "data",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RegistrationState {
+    Active,
+    Deleting(DeleteMode),
+    Removed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RegistrationEvent {
+    BeginDelete(DeleteMode),
+    FinishDelete(DeleteMode),
+}
+
+fn transition_registration(
+    state: RegistrationState,
+    event: RegistrationEvent,
+) -> Result<RegistrationState, &'static str> {
+    match (state, event) {
+        (RegistrationState::Active, RegistrationEvent::BeginDelete(mode)) => {
+            Ok(RegistrationState::Deleting(mode))
+        }
+        (
+            RegistrationState::Deleting(current),
+            RegistrationEvent::BeginDelete(requested),
+        ) if current == requested => Ok(state),
+        (
+            RegistrationState::Deleting(current),
+            RegistrationEvent::FinishDelete(completed),
+        ) if current == completed => Ok(RegistrationState::Removed),
+        _ => Err("event is invalid for the current registration state"),
+    }
+}
+
+impl StopReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Shutdown => "shutdown",
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
 struct RunningProcess {
-    pid: u32,
-    stopping: bool,
-    wiki: bool,
+    run_id: RunId,
+    process_group: Option<u32>,
+    stop_reason: Option<StopReason>,
 }
 
-/// The three independent axes from which a mirror row is projected.
+/// The independent axes from which a mirror row is projected.
 ///
-/// Keep these closed even though the current SQLite row still stores the last
-/// attempt as nullable columns.  All consumers must go through
-/// `classify_job`; nullable-column precedence is not a lifecycle model.
+/// Keep these closed. Durable run rows are decoded once and every consumer
+/// goes through `classify_job`; SQL-column precedence is not a lifecycle
+/// model.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ScheduleClass {
     Enabled,
@@ -84,15 +276,19 @@ enum ScheduleClass {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RegistrationClass {
+    Active,
+    Deleting,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AttemptClass {
     NeverRun,
+    Active,
+    Succeeded,
+    Failed,
+    Cancelled,
     Interrupted,
-    Succeeded { ended_at: i64 },
-    /// The current schema cannot distinguish a driver failure from a
-    /// user-requested signal death.  Both are terminal and require an explicit
-    /// run before another attempt; a later attempt table can split this
-    /// variant without changing scheduler policy.
-    FailedOrCancelled { ended_at: i64 },
     Invalid,
 }
 
@@ -109,9 +305,10 @@ enum DisplayClass {
     Starting,
     Running,
     Stopping,
-    Paused,
+    Deleting,
     Pending,
-    Stopped,
+    Cancelled,
+    Interrupted,
     Error,
     Completed,
 }
@@ -122,9 +319,10 @@ impl DisplayClass {
             Self::Starting => "starting",
             Self::Running => "running",
             Self::Stopping => "stopping",
-            Self::Paused => "paused",
+            Self::Deleting => "deleting",
             Self::Pending => "pending",
-            Self::Stopped => "stopped",
+            Self::Cancelled => "cancelled",
+            Self::Interrupted => "interrupted",
             Self::Error => "error",
             Self::Completed => "completed",
         }
@@ -133,6 +331,7 @@ impl DisplayClass {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct JobProjection {
+    registration: RegistrationClass,
     schedule: ScheduleClass,
     attempt: AttemptClass,
     runtime: RuntimeClass,
@@ -141,51 +340,222 @@ struct JobProjection {
     automatic_start: bool,
 }
 
-#[derive(Clone, Copy)]
-struct PersistedAttempt {
-    last_start: Option<i64>,
-    last_end: Option<i64>,
-    last_exit: Option<i64>,
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PersistedRun {
+    NeverRun,
+    Starting {
+        id: RunId,
+        started_at: i64,
+    },
+    Running {
+        id: RunId,
+        started_at: i64,
+        process_group: u32,
+    },
+    Stopping {
+        id: RunId,
+        started_at: i64,
+        process_group: Option<u32>,
+        reason: StopReason,
+    },
+    Idle {
+        id: RunId,
+        started_at: i64,
+        ended_at: i64,
+        outcome: AttemptClass,
+        exit_code: Option<i64>,
+    },
+    Invalid,
 }
 
-fn attempt_class(attempt: PersistedAttempt) -> AttemptClass {
-    match (attempt.last_start, attempt.last_end, attempt.last_exit) {
-        (None, None, None) => AttemptClass::NeverRun,
-        (Some(_), None, None) => AttemptClass::Interrupted,
-        (Some(_), Some(ended_at), Some(0)) => AttemptClass::Succeeded { ended_at },
-        (Some(_), Some(ended_at), Some(_)) => {
-            AttemptClass::FailedOrCancelled { ended_at }
-        }
-        _ => AttemptClass::Invalid,
+impl Default for PersistedRun {
+    fn default() -> Self {
+        Self::NeverRun
     }
 }
 
-fn runtime_class(running: Option<RunningProcess>) -> RuntimeClass {
-    match running {
-        Some(process) if process.stopping => RuntimeClass::Stopping,
-        Some(process) if process.pid == 0 => RuntimeClass::Starting,
-        Some(_) => RuntimeClass::Running,
-        None => RuntimeClass::Idle,
+fn persisted_run(
+    run_id: Option<i64>,
+    state: Option<&str>,
+    started_at: Option<i64>,
+    ended_at: Option<i64>,
+    exit_code: Option<i64>,
+    process_group: Option<u32>,
+    stop_reason: Option<&str>,
+) -> PersistedRun {
+    let Some(run_id) = run_id.map(RunId) else {
+        return if state.is_none()
+            && started_at.is_none()
+            && ended_at.is_none()
+            && exit_code.is_none()
+            && process_group.is_none()
+            && stop_reason.is_none()
+        {
+            PersistedRun::NeverRun
+        } else {
+            PersistedRun::Invalid
+        };
+    };
+    let Some(started_at) = started_at else {
+        return PersistedRun::Invalid;
+    };
+    match state {
+        Some("starting")
+            if ended_at.is_none()
+                && exit_code.is_none()
+                && process_group.is_none()
+                && stop_reason.is_none() =>
+        {
+            PersistedRun::Starting {
+                id: run_id,
+                started_at,
+            }
+        }
+        Some("running")
+            if ended_at.is_none() && exit_code.is_none() && stop_reason.is_none() =>
+        {
+            match process_group {
+                Some(process_group) => PersistedRun::Running {
+                    id: run_id,
+                    started_at,
+                    process_group,
+                },
+                None => PersistedRun::Invalid,
+            }
+        }
+        Some("stopping") if ended_at.is_none() && exit_code.is_none() => {
+            let reason = match stop_reason {
+                Some("user") => Some(StopReason::User),
+                Some("shutdown") => Some(StopReason::Shutdown),
+                _ => None,
+            };
+            match reason {
+                Some(reason) => PersistedRun::Stopping {
+                    id: run_id,
+                    started_at,
+                    process_group,
+                    reason,
+                },
+                None => PersistedRun::Invalid,
+            }
+        }
+        Some("starting") | Some("running") | Some("stopping") => PersistedRun::Invalid,
+        Some(state) => {
+            let Some(ended_at) = ended_at else {
+                return PersistedRun::Invalid;
+            };
+            let outcome = match (state, exit_code, stop_reason) {
+                ("succeeded", Some(0), None) => Some(AttemptClass::Succeeded),
+                ("failed", Some(exit), None) if exit != 0 => Some(AttemptClass::Failed),
+                ("cancelled", _, Some("user")) => Some(AttemptClass::Cancelled),
+                ("interrupted", None, None | Some("shutdown")) => {
+                    Some(AttemptClass::Interrupted)
+                }
+                _ => None,
+            };
+            match outcome {
+                Some(outcome) => PersistedRun::Idle {
+                    id: run_id,
+                    started_at,
+                    ended_at,
+                    outcome,
+                    exit_code,
+                },
+                None => PersistedRun::Invalid,
+            }
+        }
+        None => PersistedRun::Invalid,
+    }
+}
+
+fn attempt_class(run: &PersistedRun) -> AttemptClass {
+    match run {
+        PersistedRun::NeverRun => AttemptClass::NeverRun,
+        PersistedRun::Starting { .. }
+        | PersistedRun::Running { .. }
+        | PersistedRun::Stopping { .. } => AttemptClass::Active,
+        PersistedRun::Idle { outcome, .. } => *outcome,
+        PersistedRun::Invalid => AttemptClass::Invalid,
+    }
+}
+
+fn runtime_class(run: &PersistedRun) -> RuntimeClass {
+    match run {
+        PersistedRun::Starting { .. } => RuntimeClass::Starting,
+        PersistedRun::Running { .. } => RuntimeClass::Running,
+        PersistedRun::Stopping { .. } => RuntimeClass::Stopping,
+        _ => RuntimeClass::Idle,
+    }
+}
+
+fn run_state_kind(run: &PersistedRun) -> Option<RunStateKind> {
+    match run {
+        PersistedRun::NeverRun => Some(RunStateKind::NeverRun),
+        PersistedRun::Starting { .. } => Some(RunStateKind::Starting),
+        PersistedRun::Running { .. } => Some(RunStateKind::Running),
+        PersistedRun::Stopping {
+            reason: StopReason::User,
+            ..
+        } => Some(RunStateKind::StoppingUser),
+        PersistedRun::Stopping {
+            reason: StopReason::Shutdown,
+            ..
+        } => Some(RunStateKind::StoppingShutdown),
+        PersistedRun::Idle {
+            outcome: AttemptClass::Succeeded,
+            ..
+        } => Some(RunStateKind::Succeeded),
+        PersistedRun::Idle {
+            outcome: AttemptClass::Failed,
+            ..
+        } => Some(RunStateKind::Failed),
+        PersistedRun::Idle {
+            outcome: AttemptClass::Cancelled,
+            ..
+        } => Some(RunStateKind::Cancelled),
+        PersistedRun::Idle {
+            outcome: AttemptClass::Interrupted,
+            ..
+        } => Some(RunStateKind::Interrupted),
+        PersistedRun::Idle { .. } | PersistedRun::Invalid => None,
     }
 }
 
 fn classify_job(
+    deleting: bool,
     paused: bool,
-    attempt: PersistedAttempt,
+    run: &PersistedRun,
     interval_secs: i64,
-    running: Option<RunningProcess>,
     observed_at: i64,
 ) -> JobProjection {
+    let registration = if deleting {
+        RegistrationClass::Deleting
+    } else {
+        RegistrationClass::Active
+    };
     let schedule = if paused {
         ScheduleClass::Paused
     } else {
         ScheduleClass::Enabled
     };
-    let attempt = attempt_class(attempt);
-    let runtime = runtime_class(running);
+    let attempt = attempt_class(run);
+    let runtime = runtime_class(run);
+
+    if registration == RegistrationClass::Deleting {
+        return JobProjection {
+            registration,
+            schedule,
+            attempt,
+            runtime,
+            display: DisplayClass::Deleting,
+            next_due: None,
+            automatic_start: false,
+        };
+    }
 
     if runtime != RuntimeClass::Idle {
         return JobProjection {
+            registration,
             schedule,
             attempt,
             runtime,
@@ -200,24 +570,17 @@ fn classify_job(
         };
     }
 
-    if schedule == ScheduleClass::Paused {
-        return JobProjection {
-            schedule,
-            attempt,
-            runtime,
-            display: DisplayClass::Paused,
-            next_due: None,
-            automatic_start: false,
-        };
-    }
-
-    let (display, next_due, automatic_start) = match attempt {
+    let (display, mut next_due, mut automatic_start) = match attempt {
         AttemptClass::NeverRun => (DisplayClass::Pending, Some(observed_at), true),
-        AttemptClass::Interrupted => (DisplayClass::Stopped, None, false),
-        AttemptClass::FailedOrCancelled { .. } | AttemptClass::Invalid => {
+        AttemptClass::Active | AttemptClass::Failed | AttemptClass::Invalid => {
             (DisplayClass::Error, None, false)
         }
-        AttemptClass::Succeeded { ended_at } => {
+        AttemptClass::Cancelled => (DisplayClass::Cancelled, None, false),
+        AttemptClass::Interrupted => (DisplayClass::Interrupted, None, false),
+        AttemptClass::Succeeded => {
+            let PersistedRun::Idle { ended_at, .. } = run else {
+                unreachable!("successful attempt is always an idle durable run")
+            };
             let due = ended_at.saturating_add(interval_secs.max(0));
             if due <= observed_at {
                 (DisplayClass::Pending, Some(due), true)
@@ -226,7 +589,12 @@ fn classify_job(
             }
         }
     };
+    if schedule == ScheduleClass::Paused {
+        next_due = None;
+        automatic_start = false;
+    }
     JobProjection {
+        registration,
         schedule,
         attempt,
         runtime,
@@ -236,19 +604,79 @@ fn classify_job(
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RunStateKind {
+    NeverRun,
+    Succeeded,
+    Failed,
+    Cancelled,
+    Interrupted,
+    Starting,
+    Running,
+    StoppingUser,
+    StoppingShutdown,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RunEvent {
+    ExplicitStart,
+    ScheduledStart,
+    SpawnSucceeded,
+    SpawnFailed,
+    Cancel,
+    ExitZero,
+    ExitFailure,
+    Shutdown,
+    Restart,
+    PauseChanged,
+}
+
+fn transition_run(state: RunStateKind, event: RunEvent) -> Result<RunStateKind, &'static str> {
+    use RunEvent as E;
+    use RunStateKind as S;
+    match (state, event) {
+        (state, E::PauseChanged) => Ok(state),
+        (S::NeverRun | S::Succeeded | S::Failed | S::Cancelled | S::Interrupted, E::ExplicitStart) => {
+            Ok(S::Starting)
+        }
+        (S::NeverRun | S::Succeeded, E::ScheduledStart) => Ok(S::Starting),
+        (S::Failed | S::Cancelled | S::Interrupted, E::ScheduledStart) => Ok(state),
+        (S::Starting, E::SpawnSucceeded) => Ok(S::Running),
+        (S::Starting, E::SpawnFailed) => Ok(S::Failed),
+        (S::Starting | S::Running, E::Cancel) => Ok(S::StoppingUser),
+        (S::Starting | S::Running, E::Shutdown) => Ok(S::StoppingShutdown),
+        (S::Running, E::ExitZero) => Ok(S::Succeeded),
+        (S::Running, E::ExitFailure) => Ok(S::Failed),
+        (S::StoppingUser, E::ExitZero | E::ExitFailure | E::Restart) => Ok(S::Cancelled),
+        (S::StoppingShutdown, E::ExitZero | E::ExitFailure | E::Restart) => Ok(S::Interrupted),
+        (S::Starting | S::Running, E::Restart) => Ok(S::Interrupted),
+        (
+            S::NeverRun | S::Succeeded | S::Failed | S::Cancelled | S::Interrupted,
+            E::Restart | E::Shutdown,
+        ) => Ok(state),
+        _ => Err("event is invalid for the current run state"),
+    }
+}
+
 /// Jobs whose driver process is live right now.
 static RUNNING: Mutex<Option<HashMap<i64, RunningProcess>>> = Mutex::new(None);
-static PATH_BYTES: Mutex<Option<HashMap<std::path::PathBuf, PathMeasurement>>> = Mutex::new(None);
-
-struct PathMeasurement {
-    bytes: Option<u64>,
-    measured_at: Option<std::time::Instant>,
-    scanning: bool,
-}
+static SUPERVISOR_GATE: Mutex<()> = Mutex::new(());
+static DELETE_GATE: Mutex<()> = Mutex::new(());
+static PROCESS_SNAPSHOT: Mutex<Option<ProcessSnapshot>> = Mutex::new(None);
+static SCHEDULER_STARTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static SHUTTING_DOWN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 fn running_map<R>(f: impl FnOnce(&mut HashMap<i64, RunningProcess>) -> R) -> R {
     let mut g = RUNNING.lock().unwrap();
     f(g.get_or_insert_with(HashMap::new))
+}
+
+struct ProcessSnapshot {
+    captured: std::time::Instant,
+    children: HashMap<u32, Vec<u32>>,
+    usage: HashMap<u32, (f64, u64)>,
 }
 
 // Deserialize: the UI pane reads jobs back through the `mirror_jobs`
@@ -269,8 +697,8 @@ pub struct Job {
     /// latest matching official all-maxi release is fetched in ranges.
     #[serde(default)]
     pub media_source: Option<String>,
-    /// Derived: starting | running | stopping | paused | pending | stopped |
-    /// error | completed.
+    /// Derived: starting | running | stopping | deleting | pending |
+    /// cancelled | interrupted | error | completed.
     pub state: String,
     /// Unix seconds of the next auto run (None while paused/running).
     pub next_due: Option<i64>,
@@ -324,6 +752,10 @@ pub struct Job {
     /// produced `state` and `next_due`; deliberately omitted from the wire.
     #[serde(skip)]
     automatic_start: bool,
+    #[serde(skip)]
+    delete_mode: Option<String>,
+    #[serde(skip)]
+    persisted_run: PersistedRun,
 }
 
 impl Job {
@@ -340,12 +772,12 @@ pub struct LibraryJob {
 }
 
 /// The archive gateway's deliberately small inventory read. Serving a page
-/// must not trigger the UI job projection: that path measures destination and
-/// scratch sizes, reads build progress, and samples process trees.
+/// must not trigger even the bounded UI projection or its optional live
+/// process telemetry.
 pub fn library_jobs() -> Result<Vec<LibraryJob>, String> {
     let conn = db()?;
     let mut statement = conn
-        .prepare("SELECT kind,src,dest FROM jobs ORDER BY id")
+        .prepare("SELECT kind,src,dest FROM jobs WHERE delete_mode IS NULL ORDER BY id")
         .map_err(|error| error.to_string())?;
     let rows = statement
         .query_map([], |row| {
@@ -361,22 +793,33 @@ pub fn library_jobs() -> Result<Vec<LibraryJob>, String> {
 }
 
 fn derive(mut j: Job) -> Job {
-    let running = running_map(|m| m.get(&j.id).copied());
+    // Lifecycle projection is pure and constant-time per row. Everything
+    // below it is optional UI telemetry: no corpus scan, build inspection, or
+    // process-tree sample is allowed to influence the projected state.
     let projection = classify_job(
+        j.delete_mode.is_some(),
         j.paused,
-        PersistedAttempt {
-            last_start: j.last_start,
-            last_end: j.last_end,
-            last_exit: j.last_exit,
-        },
+        &j.persisted_run,
         j.interval_secs,
-        running,
         now(),
     );
     j.state = projection.display.as_str().into();
     j.next_due = projection.next_due;
     j.automatic_start = projection.automatic_start;
-    j.pid = running.map(|process| process.pid).filter(|pid| *pid != 0);
+    let run_id = match &j.persisted_run {
+        PersistedRun::Starting { id, .. }
+        | PersistedRun::Running { id, .. }
+        | PersistedRun::Stopping { id, .. }
+        | PersistedRun::Idle { id, .. } => Some(*id),
+        PersistedRun::NeverRun | PersistedRun::Invalid => None,
+    };
+    j.pid = running_map(|owners| {
+        owners.get(&j.id).and_then(|owner| {
+            (Some(owner.run_id) == run_id)
+                .then_some(owner.process_group)
+                .flatten()
+        })
+    });
     if let Some(pid) = j.pid {
         if let Some((cpu, rss)) = process_tree_metrics(pid) {
             j.process_cpu_percent = Some(cpu);
@@ -384,39 +827,57 @@ fn derive(mut j: Job) -> Job {
         }
     }
     let destination = std::path::Path::new(&j.dest);
-    j.mirror_bytes = cached_path_bytes(destination);
-    j.scratch_bytes = (j.kind == "wiki")
-        .then(|| cached_path_bytes(&wikimak_wikipedia::mirror_scratch_path(destination)))
-        .flatten();
+    // Mirror and scratch sizes require typed generation/build accounting.
+    // Recursive directory walks are intentionally forbidden here: this
+    // listing is refreshed interactively and must remain O(job count).
+    j.mirror_bytes = None;
+    j.scratch_bytes = None;
     j.available_bytes = destination.parent().and_then(available_bytes);
+    // Wikipedia workers project every source/target/assembly observation into
+    // one bounded, plan-bound file. This read opens only that file and retains
+    // one row per fixed source/target slot; it never inspects build receipts,
+    // partial directories, or archive data. The lifecycle projection above
+    // remains authoritative even when this telemetry is stale.
     if j.kind == "wiki" {
-        if let Some(progress) = wikimak_wikipedia::mirror_build_progress(destination) {
-            let incomplete = progress.targets_completed < progress.targets_total;
-            j.build_phase = Some(if incomplete
-                && matches!(j.state.as_str(), "stopped" | "error")
-            {
-                format!("job not running; {}", progress.phase)
-            } else {
-                progress.phase
-            });
-            j.build_snapshot = Some(progress.snapshot);
-            j.targets_total = Some(progress.targets_total);
-            j.targets_completed = Some(progress.targets_completed);
-            j.target_progress = progress.target_progress;
-            j.targets_active = progress.targets_active;
-            j.source_bytes_total = Some(progress.source_bytes_total);
-            j.source_bytes_completed = Some(progress.source_bytes_completed);
-            j.active_source_bytes_per_second = progress.active_source_bytes_per_second;
-            j.active_quiet_seconds = progress.active_quiet_seconds;
-            j.fetch_attempts = Some(progress.fetch_attempts);
-            j.fetch_bytes_received = Some(progress.fetch_bytes_received);
-            j.fetch_rate_limit_responses = Some(progress.fetch_rate_limit_responses);
-            j.fetch_client_error_responses = Some(progress.fetch_client_error_responses);
-            j.fetch_server_error_responses = Some(progress.fetch_server_error_responses);
-            j.fetch_transport_errors = Some(progress.fetch_transport_errors);
+        let progress = run_id
+            .map(|run_id| {
+                wikimak_wikipedia::mirror_build_progress_for_run(
+                    destination,
+                    &run_id.0.to_string(),
+                )
+            })
+            .unwrap_or_else(|| wikimak_wikipedia::mirror_build_progress(destination));
+        if let Some(progress) = progress {
+            apply_wikipedia_progress(&mut j, progress);
         }
     }
     j
+}
+
+fn apply_wikipedia_progress(
+    job: &mut Job,
+    progress: wikimak_wikipedia::MirrorBuildProgress,
+) {
+    job.build_phase = Some(progress.phase);
+    job.build_snapshot = Some(progress.snapshot);
+    job.targets_total = Some(progress.targets_total);
+    job.targets_completed = Some(progress.targets_completed);
+    job.targets_active = progress.targets_active;
+    job.target_progress = progress.target_progress;
+    job.source_bytes_total = Some(progress.source_bytes_total);
+    job.source_bytes_completed = Some(progress.source_bytes_completed);
+    job.fetch_attempts = Some(progress.fetch_attempts);
+    job.fetch_bytes_received = Some(progress.fetch_bytes_received);
+    job.fetch_rate_limit_responses = Some(progress.fetch_rate_limit_responses);
+    job.fetch_client_error_responses = Some(progress.fetch_client_error_responses);
+    job.fetch_server_error_responses = Some(progress.fetch_server_error_responses);
+    job.fetch_transport_errors = Some(progress.fetch_transport_errors);
+    if job.is_live() {
+        job.active_source_bytes_per_second = progress.active_source_bytes_per_second;
+        job.active_quiet_seconds = progress.active_quiet_seconds;
+    } else {
+        job.targets_active.clear();
+    }
 }
 
 /// Sum the importer and its descendants. A wiki worker is a small process tree
@@ -425,6 +886,42 @@ fn derive(mut j: Job) -> Job {
 /// `ps` is used here because it is available on macOS and Linux and avoids
 /// making the UI depend on a platform-specific procfs layout.
 fn process_tree_metrics(root: u32) -> Option<(f64, u64)> {
+    refresh_process_snapshot()?;
+    let snapshot = PROCESS_SNAPSHOT.lock().unwrap();
+    let snapshot = snapshot.as_ref()?;
+    Some(aggregate_process_tree(root, snapshot))
+}
+
+fn aggregate_process_tree(root: u32, snapshot: &ProcessSnapshot) -> (f64, u64) {
+    let mut members = std::collections::HashSet::from([root]);
+    let mut pending = std::collections::VecDeque::from([root]);
+    while let Some(parent) = pending.pop_front() {
+        for child in snapshot.children.get(&parent).into_iter().flatten() {
+            if members.insert(*child) {
+                pending.push_back(*child);
+            }
+        }
+    }
+    let mut cpu = 0.0;
+    let mut rss = 0_u64;
+    for member in members {
+        if let Some((value, rss_kib)) = snapshot.usage.get(&member) {
+            cpu += *value;
+            rss = rss.saturating_add(rss_kib.saturating_mul(1024));
+        }
+    }
+    (cpu, rss)
+}
+
+fn refresh_process_snapshot() -> Option<()> {
+    // Hold the gate while sampling. Concurrent UI/socket readers must share
+    // one system-wide `ps` invocation rather than each starting its own.
+    let mut snapshot = PROCESS_SNAPSHOT.lock().unwrap();
+    if let Some(snapshot) = snapshot.as_ref()
+        && snapshot.captured.elapsed() < std::time::Duration::from_secs(1)
+    {
+        return Some(());
+    }
     let output = std::process::Command::new("/bin/ps")
         .args(["-axo", "pid=,ppid=,%cpu=,rss="])
         .output()
@@ -432,7 +929,8 @@ fn process_tree_metrics(root: u32) -> Option<(f64, u64)> {
     if !output.status.success() {
         return None;
     }
-    let mut rows = Vec::new();
+    let mut children = HashMap::<u32, Vec<u32>>::new();
+    let mut usage = HashMap::<u32, (f64, u64)>::new();
     for line in String::from_utf8_lossy(&output.stdout).lines() {
         let fields = line.split_whitespace().collect::<Vec<_>>();
         if fields.len() != 4 {
@@ -446,77 +944,15 @@ fn process_tree_metrics(root: u32) -> Option<(f64, u64)> {
         ) else {
             continue;
         };
-        rows.push((pid, ppid, cpu, rss_kib));
+        children.entry(ppid).or_default().push(pid);
+        usage.insert(pid, (cpu, rss_kib));
     }
-    let mut members = vec![root];
-    let mut cursor = 0;
-    while cursor < members.len() {
-        let parent = members[cursor];
-        for (pid, ppid, _, _) in &rows {
-            if *ppid == parent && !members.contains(pid) {
-                members.push(*pid);
-            }
-        }
-        cursor += 1;
-    }
-    let mut cpu = 0.0;
-    let mut rss = 0_u64;
-    for (pid, _, value, rss_kib) in rows {
-        if members.contains(&pid) {
-            cpu += value;
-            rss = rss.saturating_add(rss_kib.saturating_mul(1024));
-        }
-    }
-    Some((cpu, rss))
-}
-
-fn cached_path_bytes(path: &std::path::Path) -> Option<u64> {
-    let path = path.to_path_buf();
-    let mut measurements = PATH_BYTES.lock().unwrap();
-    let measurements = measurements.get_or_insert_with(HashMap::new);
-    let measurement = measurements
-        .entry(path.clone())
-        .or_insert(PathMeasurement {
-            bytes: None,
-            measured_at: None,
-            scanning: false,
-        });
-    let stale = measurement
-        .measured_at
-        .is_none_or(|measured| measured.elapsed() >= std::time::Duration::from_secs(2));
-    if stale && !measurement.scanning {
-        measurement.scanning = true;
-        std::thread::spawn(move || {
-            let bytes = path_bytes(&path).ok();
-            let mut measurements = PATH_BYTES.lock().unwrap();
-            if let Some(measurement) = measurements
-                .as_mut()
-                .and_then(|measurements| measurements.get_mut(&path))
-            {
-                measurement.bytes = bytes;
-                measurement.measured_at = Some(std::time::Instant::now());
-                measurement.scanning = false;
-            }
-        });
-    }
-    measurement.bytes
-}
-
-fn path_bytes(path: &std::path::Path) -> std::io::Result<u64> {
-    use std::os::unix::fs::MetadataExt;
-    let metadata = match std::fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-        Err(error) => return Err(error),
-    };
-    if !metadata.is_dir() {
-        return Ok(metadata.blocks().saturating_mul(512));
-    }
-    let mut bytes = metadata.blocks().saturating_mul(512);
-    for entry in std::fs::read_dir(path)? {
-        bytes = bytes.saturating_add(path_bytes(&entry?.path())?);
-    }
-    Ok(bytes)
+    *snapshot = Some(ProcessSnapshot {
+        captured: std::time::Instant::now(),
+        children,
+        usage,
+    });
+    Some(())
 }
 
 fn available_bytes(path: &std::path::Path) -> Option<u64> {
@@ -533,10 +969,37 @@ fn available_bytes(path: &std::path::Path) -> Option<u64> {
 pub fn jobs_list() -> Result<Vec<Job>, String> {
     let conn = db()?;
     let mut st = conn
-        .prepare("SELECT id,kind,src,dest,interval_secs,paused,last_start,last_end,last_exit,last_detail,media_source FROM jobs ORDER BY id")
+        .prepare(
+            "SELECT j.id,j.kind,j.src,j.dest,j.interval_secs,j.paused,j.media_source,
+                    j.delete_mode,
+                    r.id,r.state,r.started_at,r.ended_at,r.exit_code,
+                    COALESCE(r.detail,''),
+                    r.process_group,r.stop_reason
+             FROM jobs j
+             LEFT JOIN runs r ON r.id = (
+                 SELECT id FROM runs WHERE job_id = j.id ORDER BY id DESC LIMIT 1
+             )
+             ORDER BY j.id"
+        )
         .map_err(|e| e.to_string())?;
     let rows = st
         .query_map([], |r| {
+            let run_id = r.get::<_, Option<i64>>(8)?;
+            let run_state = r.get::<_, Option<String>>(9)?;
+            let started_at = r.get::<_, Option<i64>>(10)?;
+            let ended_at = r.get::<_, Option<i64>>(11)?;
+            let exit_code = r.get::<_, Option<i64>>(12)?;
+            let process_group = r.get::<_, Option<u32>>(14)?;
+            let stop_reason = r.get::<_, Option<String>>(15)?;
+            let persisted_run = persisted_run(
+                run_id,
+                run_state.as_deref(),
+                started_at,
+                ended_at,
+                exit_code,
+                process_group,
+                stop_reason.as_deref(),
+            );
             Ok(Job {
                 id: r.get(0)?,
                 kind: r.get(1)?,
@@ -544,11 +1007,11 @@ pub fn jobs_list() -> Result<Vec<Job>, String> {
                 dest: r.get(3)?,
                 interval_secs: r.get(4)?,
                 paused: r.get::<_, i64>(5)? != 0,
-                last_start: r.get(6)?,
-                last_end: r.get(7)?,
-                last_exit: r.get(8)?,
-                last_detail: r.get(9)?,
-                media_source: r.get(10)?,
+                last_start: started_at,
+                last_end: ended_at,
+                last_exit: exit_code,
+                last_detail: r.get(13)?,
+                media_source: r.get(6)?,
                 state: String::new(),
                 next_due: None,
                 pid: None,
@@ -574,6 +1037,8 @@ pub fn jobs_list() -> Result<Vec<Job>, String> {
                 process_cpu_percent: None,
                 process_rss_bytes: None,
                 automatic_start: false,
+                delete_mode: r.get(7)?,
+                persisted_run,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -588,12 +1053,11 @@ pub fn jobs_list_typed() -> Result<Vec<crate::generated_wire::MirrorJob>, String
         .map(|job| {
             let state = match job.state.as_str() {
                 "starting" | "running" | "stopping" => MirrorState::Running,
-                "paused" => MirrorState::Paused,
+                "deleting" => MirrorState::Stopped,
                 "pending" => MirrorState::Pending,
-                "stopped" => MirrorState::Stopped,
+                "cancelled" | "interrupted" => MirrorState::Stopped,
                 "error" => MirrorState::Error,
                 "completed" => MirrorState::Completed,
-                "scheduled" => MirrorState::Scheduled,
                 state => return Err(format!("unknown derived mirror state {state:?}")),
             };
             Ok(MirrorJob {
@@ -656,7 +1120,8 @@ pub fn job_add_with_media(
             [dest],
             |row| row.get(0),
         )
-        .ok();
+        .optional()
+        .map_err(|error| error.to_string())?;
     if let Some(id) = collision {
         return Err(format!(
             "destination {dest:?} is already owned by mirror job #{id}"
@@ -689,7 +1154,8 @@ pub fn job_set_media_source(id: i64, source: Option<&str>) -> Result<(), String>
     let conn = db()?;
     let changed = conn
         .execute(
-            "UPDATE jobs SET media_source = ?2 WHERE id = ?1 AND kind = 'wiki'",
+            "UPDATE jobs SET media_source = ?2
+             WHERE id = ?1 AND kind = 'wiki' AND delete_mode IS NULL",
             params![id, source],
         )
         .map_err(|error| error.to_string())?;
@@ -699,6 +1165,129 @@ pub fn job_set_media_source(id: i64, source: Option<&str>) -> Result<(), String>
     Ok(())
 }
 
+fn prepare_job_deletion(
+    id: i64,
+    required_kind: Option<&str>,
+    mode: DeleteMode,
+) -> Result<(String, String), String> {
+    let mut conn = db()?;
+    let transaction = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| error.to_string())?;
+    let row = transaction
+        .query_row(
+            "SELECT kind,dest,delete_mode FROM jobs WHERE id = ?1",
+            [id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "no such job".to_string())?;
+    if required_kind.is_some_and(|required| row.0 != required) {
+        return Err(format!(
+            "deleting mirrored files is currently restricted to {} jobs",
+            required_kind.unwrap()
+        ));
+    }
+    if required_kind == Some("wiki")
+        && std::path::Path::new(&row.1)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            != Some("swdump")
+    {
+        return Err(format!(
+            "refusing to delete unexpected Wikipedia destination {}",
+            row.1
+        ));
+    }
+    let active: bool = transaction
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM runs WHERE job_id = ?1
+                 AND state IN ('starting','running','stopping')
+             )",
+            [id],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if active {
+        return Err("job is running; stop it first".into());
+    }
+    let current = match row.2.as_deref() {
+        None => RegistrationState::Active,
+        Some("registration") => RegistrationState::Deleting(DeleteMode::Registration),
+        Some("data") => RegistrationState::Deleting(DeleteMode::Data),
+        Some(_) => return Err("invalid durable job deletion mode".into()),
+    };
+    let next = transition_registration(current, RegistrationEvent::BeginDelete(mode))
+        .map_err(str::to_string)?;
+    match (current, next) {
+        (RegistrationState::Active, RegistrationState::Deleting(_)) => {
+            let changed = transaction
+                .execute(
+                    "UPDATE jobs SET delete_mode=?2 WHERE id=?1 AND delete_mode IS NULL",
+                    params![id, mode.as_str()],
+                )
+                .map_err(|error| error.to_string())?;
+            if changed != 1 {
+                return Err("delete preparation lost destination ownership".into());
+            }
+        }
+        (RegistrationState::Deleting(_), RegistrationState::Deleting(_)) => {}
+        _ => return Err("delete preparation produced an invalid state".into()),
+    }
+    transaction.commit().map_err(|error| error.to_string())?;
+    running_map(|owners| {
+        owners.remove(&id);
+    });
+    Ok((row.0, row.1))
+}
+
+fn finish_job_deletion(id: i64, mode: DeleteMode) -> Result<(), String> {
+    let mut conn = db()?;
+    let transaction = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| error.to_string())?;
+    let current = transaction
+        .query_row(
+            "SELECT delete_mode FROM jobs WHERE id=?1",
+            [id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "job deletion ownership was lost".to_string())?;
+    let current = match current.as_deref() {
+        Some("registration") => RegistrationState::Deleting(DeleteMode::Registration),
+        Some("data") => RegistrationState::Deleting(DeleteMode::Data),
+        Some(_) => return Err("invalid durable job deletion mode".into()),
+        None => RegistrationState::Active,
+    };
+    if transition_registration(current, RegistrationEvent::FinishDelete(mode))
+        .map_err(str::to_string)?
+        != RegistrationState::Removed
+    {
+        return Err("delete completion produced an invalid state".into());
+    }
+    let changed = transaction
+        .execute(
+            "DELETE FROM jobs WHERE id=?1 AND delete_mode=?2",
+            params![id, mode.as_str()],
+        )
+        .map_err(|error| error.to_string())?;
+    if changed == 1 {
+        transaction.commit().map_err(|error| error.to_string())
+    } else {
+        Err("job deletion ownership was lost".into())
+    }
+}
+
 /// Remove a job. Returns a human note describing what happened to the
 /// job's on-disk state. For git jobs the `<dest>/repo.git` fetch buffer
 /// (plus any `repo.git.new` scratch) is dropped: it is DERIVED — the
@@ -706,41 +1295,23 @@ pub fn job_set_media_source(id: i64, source: Option<&str>) -> Result<(), String>
 /// with no schedule left it is ownerless cache. `<dest>/store` is the
 /// authoritative corpus (live box attachments may reference it) and is
 /// NEVER touched here; deleting it stays an explicit manual act.
-/// Cleanup runs only after the row delete succeeds, and a cleanup error
-/// is reported in the note without resurrecting the job.
+/// The destination remains durably claimed while cleanup runs. A cleanup
+/// error leaves the job in `deleting`, so retrying this same operation resumes
+/// cleanup and another job cannot claim paths still owned by it.
 pub fn job_remove(id: i64) -> Result<String, String> {
-    if running_map(|m| m.contains_key(&id)) {
-        return Err("job is running".into());
-    }
-    let conn = db()?;
-    let row: Option<(String, String)> = conn
-        .query_row("SELECT kind, dest FROM jobs WHERE id = ?1", [id], |r| {
-            Ok((r.get(0)?, r.get(1)?))
-        })
-        .ok();
-    let n = conn
-        .execute("DELETE FROM jobs WHERE id = ?1", [id])
-        .map_err(|e| e.to_string())?;
-    if n == 0 {
-        return Err("no such job".into());
-    }
-    let Some((kind, dest)) = row else {
-        return Ok(String::new());
-    };
+    let _gate = DELETE_GATE.lock().unwrap();
+    let (kind, dest) = prepare_job_deletion(id, None, DeleteMode::Registration)?;
     if kind != "git" {
         // wiki/ietf/cmd keep no separate fetch buffer.
+        finish_job_deletion(id, DeleteMode::Registration)?;
         return Ok(String::new());
     }
-    let mut note = format!("fetch buffer dropped; store kept at {dest}/store");
     for name in ["repo.git", "repo.git.new"] {
         let p = std::path::Path::new(&dest).join(name);
-        if p.exists() {
-            if let Err(e) = std::fs::remove_dir_all(&p) {
-                note = format!("{note} (cleanup of {} failed: {e})", p.display());
-            }
-        }
+        remove_mirror_path(&p)?;
     }
-    Ok(note)
+    finish_job_deletion(id, DeleteMode::Registration)?;
+    Ok(format!("fetch buffer dropped; store kept at {dest}/store"))
 }
 
 fn remove_mirror_path(path: &std::path::Path) -> Result<(), String> {
@@ -759,31 +1330,14 @@ fn remove_mirror_path(path: &std::path::Path) -> Result<(), String> {
     .map_err(|error| format!("{}: {error}", path.display()))
 }
 
-/// Delete a Wikipedia mirror's owned archive/index/media paths, its
-/// destination-specific scratch, install/update sidecars, and then its
-/// schedule row.
+/// Durably claim deletion of an idle Wikipedia job, remove its archive,
+/// index, media, destination scratch, and sidecars, then release the
+/// destination registration. A failed or interrupted cleanup remains
+/// resumable and cannot race a new owner of the same destination.
 pub fn job_remove_with_data(id: i64) -> Result<String, String> {
-    if running_map(|running| running.contains_key(&id)) {
-        return Err("job is running; stop it first".into());
-    }
-    let conn = db()?;
-    let (kind, destination): (String, String) = conn
-        .query_row(
-            "SELECT kind,dest FROM jobs WHERE id = ?1",
-            [id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .map_err(|_| "no such job".to_string())?;
-    if kind != "wiki" {
-        return Err("deleting mirrored files is currently restricted to Wikipedia jobs".into());
-    }
+    let _gate = DELETE_GATE.lock().unwrap();
+    let (_, destination) = prepare_job_deletion(id, Some("wiki"), DeleteMode::Data)?;
     let archive = std::path::PathBuf::from(&destination);
-    if archive.extension().and_then(|extension| extension.to_str()) != Some("swdump") {
-        return Err(format!(
-            "refusing to delete unexpected Wikipedia destination {}",
-            archive.display()
-        ));
-    }
     let titles = archive.with_extension("swtitle");
     let media = archive.with_extension("media");
     remove_mirror_path(&archive)?;
@@ -792,8 +1346,7 @@ pub fn job_remove_with_data(id: i64) -> Result<String, String> {
     for path in wikimak_wikipedia::mirror_auxiliary_paths(&archive)? {
         remove_mirror_path(&path)?;
     }
-    conn.execute("DELETE FROM jobs WHERE id = ?1", [id])
-        .map_err(|error| error.to_string())?;
+    finish_job_deletion(id, DeleteMode::Data)?;
     Ok(format!(
         "archive, title index, media cache, and scratch removed from {}",
         archive.display()
@@ -801,102 +1354,140 @@ pub fn job_remove_with_data(id: i64) -> Result<String, String> {
 }
 
 pub fn job_set_paused(id: i64, paused: bool) -> Result<(), String> {
-    let n = db()?
+    let mut conn = db()?;
+    let transaction = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| error.to_string())?;
+    let current = transaction
+        .query_row(
+            "SELECT state,stop_reason FROM runs
+             WHERE job_id=?1 ORDER BY id DESC LIMIT 1",
+            [id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+        .map(|(state, reason)| {
+            sql_state_kind(&state, reason.as_deref())
+                .ok_or_else(|| format!("invalid durable mirror run state {state:?}"))
+        })
+        .transpose()?
+        .unwrap_or(RunStateKind::NeverRun);
+    if transition_run(current, RunEvent::PauseChanged).map_err(str::to_string)? != current {
+        return Err("pause unexpectedly changed the run state".into());
+    }
+    let n = transaction
         .execute(
-            "UPDATE jobs SET paused = ?2 WHERE id = ?1",
+            "UPDATE jobs SET paused = ?2 WHERE id = ?1 AND delete_mode IS NULL",
             params![id, paused as i64],
         )
         .map_err(|e| e.to_string())?;
     if n == 0 {
         Err("no such job".into())
     } else {
-        Ok(())
+        transaction.commit().map_err(|error| error.to_string())
     }
 }
 
 /// Force-run one job NOW (also works on paused jobs — force is force).
 /// Returns immediately; the run is a background thread + child process.
 pub fn job_run(id: i64) -> Result<(), String> {
-    let jobs = jobs_list()?;
-    let job = jobs.into_iter().find(|j| j.id == id).ok_or("no such job")?;
-    if !spawn_run(job, WikiRun::Maintain) {
-        return Err("job is already running, or another Wikipedia mirror job is running".into());
-    }
-    Ok(())
+    start_job(id, StartRequest::Explicit(WikiRun::Maintain))
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 /// Stop a live mirror driver and every transfer/decompressor process it
 /// spawned. The driver is a process-group leader, so one signal covers curl
 /// and any other descendants without relying on process-tree polling.
 pub fn job_cancel(id: i64) -> Result<(), String> {
-    let pid = running_map(|running| {
-        let process = running.get_mut(&id).ok_or("job is not running")?;
-        if process.pid == 0 {
-            return Err("job is still starting; try again");
+    let (run_id, process_group) = request_stop(id, StopReason::User)?;
+    if let Some(process_group) = process_group {
+        if let Err(error) = signal_owned(id, run_id, process_group, libc::SIGTERM)
+            && error != "run no longer owns that process group"
+        {
+            return Err(error);
         }
-        process.stopping = true;
-        Ok(process.pid)
-    })?;
-    let group = i32::try_from(pid).map_err(|_| "mirror process id exceeds i32")?;
-    if unsafe { libc::kill(-group, libc::SIGTERM) } != 0 {
-        return Err(format!(
-            "stop mirror process group {pid}: {}",
-            std::io::Error::last_os_error()
-        ));
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            let _ = signal_owned(id, run_id, process_group, libc::SIGKILL);
+        });
     }
-    std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_secs(5));
-        // The driver may have exited while a transfer child remains in its
-        // process group, so RUNNING cannot be used as the escalation guard.
-        // ESRCH simply means the whole group stopped during the grace period.
-        unsafe {
-            libc::kill(-group, libc::SIGKILL);
-        }
-    });
     Ok(())
 }
 
 /// Stop all mirror drivers before the engine exits. This is synchronous
 /// because delayed escalation threads disappear with the engine process.
 pub fn stop_all() {
-    let groups = running_map(|running| {
-        running
-            .values_mut()
-            .filter_map(|process| {
-                process.stopping = true;
-                i32::try_from(process.pid).ok().filter(|pid| *pid > 0)
-            })
-            .collect::<Vec<_>>()
-    });
-    for group in &groups {
-        unsafe {
-            libc::kill(-*group, libc::SIGTERM);
-        }
-    }
-    if !groups.is_empty() {
-        std::thread::sleep(std::time::Duration::from_secs(2));
-        for group in groups {
-            if unsafe { libc::kill(-group, 0) } == 0 {
-                unsafe {
-                    libc::kill(-group, libc::SIGKILL);
+    SHUTTING_DOWN.store(true, std::sync::atomic::Ordering::Release);
+    let _gate = SUPERVISOR_GATE.lock().unwrap();
+    let ids = running_map(|owners| owners.keys().copied().collect::<Vec<_>>());
+    let mut stopping = Vec::new();
+    for id in ids {
+        match request_stop(id, StopReason::Shutdown) {
+            Ok((run_id, process_group)) => {
+                if let Some(process_group) = process_group
+                    && let Err(error) =
+                        signal_owned(id, run_id, process_group, libc::SIGTERM)
+                    && error != "run no longer owns that process group"
+                {
+                    eprintln!(
+                        "mirror job #{id} run #{} shutdown signal failed: {error}",
+                        run_id.0
+                    );
                 }
+                stopping.push((id, run_id, process_group));
+            }
+            Err(error) => {
+                eprintln!("mirror job #{id} shutdown transition failed: {error}");
             }
         }
+    }
+    if !stopping.is_empty() {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        for (id, run_id, process_group) in &stopping {
+            if let Some(process_group) = process_group
+                && let Err(error) =
+                    signal_owned(*id, *run_id, *process_group, libc::SIGKILL)
+                && error != "run no longer owns that process group"
+            {
+                eprintln!(
+                    "mirror job #{id} run #{} shutdown escalation failed: {error}",
+                    run_id.0
+                );
+            }
+        }
+        for (id, run_id, _) in stopping {
+            if let Err(error) = finish_stopped_run(run_id, "engine shutdown")
+                && error != "stale stop completion"
+            {
+                eprintln!(
+                    "mirror job #{id} run #{} shutdown completion failed: {error}",
+                    run_id.0
+                );
+            }
+            remove_owner(id, run_id);
+        }
+    }
+    // Covers the narrow durable-start-before-owner-registration window and
+    // any owner whose local bookkeeping failed. Explicit user stops become
+    // Cancelled; every other active run becomes Interrupted.
+    if let Err(error) = recover_unowned_runs() {
+        eprintln!("mirror supervisor shutdown recovery failed: {error}");
     }
 }
 
 /// Explicitly re-ingest the newest full Wikipedia snapshot. This is never
 /// scheduled: routine wiki jobs consume daily adds/changes through `fetch`.
 pub fn job_run_full(id: i64) -> Result<(), String> {
-    let jobs = jobs_list()?;
-    let job = jobs.into_iter().find(|j| j.id == id).ok_or("no such job")?;
-    if job.kind != "wiki" {
-        return Err("full snapshot re-ingest is only available for wiki mirrors".into());
-    }
-    if !spawn_run(job, WikiRun::RefreshContent) {
-        return Err("job is already running, or another Wikipedia mirror job is running".into());
-    }
-    Ok(())
+    start_job(id, StartRequest::Explicit(WikiRun::RefreshContent))
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 /// Start every genuinely pending, unpaused, idle job. Interrupted, failed, and
@@ -904,28 +1495,93 @@ pub fn job_run_full(id: i64) -> Result<(), String> {
 /// Returns the started ids.
 pub fn run_pending() -> Result<Vec<i64>, String> {
     let mut started = Vec::new();
-    let jobs = jobs_list()?;
+    let jobs = scheduler_jobs()?;
     // Full-history Wikimedia parts are large. Keep at most one automatic
     // wiki transfer active; other mirror kinds remain independent. A user
     // can still force-run a particular job explicitly.
     let mut wiki_running = jobs
         .iter()
-        .any(|job| job.kind == "wiki" && job.is_live());
+        .any(|job| job.kind == "wiki" && job.live);
     for j in jobs {
         if j.automatic_start {
             if j.kind == "wiki" && wiki_running {
                 continue;
             }
-            let id = j.id;
-            if spawn_run(j.clone(), WikiRun::Maintain) {
-                if j.kind == "wiki" {
-                    wiki_running = true;
+            match start_job(j.id, StartRequest::Scheduled) {
+                Ok(_) => {
+                    if j.kind == "wiki" {
+                        wiki_running = true;
+                    }
+                    started.push(j.id);
                 }
-                started.push(id);
+                Err(StartError::Unavailable(_)) => {}
+                Err(StartError::Fatal(error)) => return Err(error),
             }
         }
     }
     Ok(started)
+}
+
+struct SchedulerJob {
+    id: i64,
+    kind: String,
+    live: bool,
+    automatic_start: bool,
+}
+
+/// Scheduler projection is one indexed row lookup per job. It deliberately
+/// excludes path measurement, build-tree inspection, process-tree polling,
+/// and every other UI telemetry source.
+fn scheduler_jobs() -> Result<Vec<SchedulerJob>, String> {
+    let conn = db()?;
+    let observed_at = now();
+    let mut statement = conn
+        .prepare(
+            "SELECT j.id,j.kind,j.interval_secs,j.paused,j.delete_mode,
+                    r.id,r.state,r.started_at,r.ended_at,r.exit_code,
+                    r.process_group,r.stop_reason
+             FROM jobs j
+             LEFT JOIN runs r ON r.id = (
+                 SELECT id FROM runs WHERE job_id=j.id ORDER BY id DESC LIMIT 1
+             )
+             ORDER BY j.id",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([], |row| {
+            let id = row.get(0)?;
+            let kind = row.get(1)?;
+            let interval_secs = row.get::<_, i64>(2)?;
+            let paused = row.get::<_, i64>(3)? != 0;
+            let deleting = row.get::<_, Option<String>>(4)?.is_some();
+            let run_id = row.get::<_, Option<i64>>(5)?;
+            let state = row.get::<_, Option<String>>(6)?;
+            let started_at = row.get::<_, Option<i64>>(7)?;
+            let ended_at = row.get::<_, Option<i64>>(8)?;
+            let exit_code = row.get::<_, Option<i64>>(9)?;
+            let process_group = row.get::<_, Option<u32>>(10)?;
+            let stop_reason = row.get::<_, Option<String>>(11)?;
+            let run = persisted_run(
+                run_id,
+                state.as_deref(),
+                started_at,
+                ended_at,
+                exit_code,
+                process_group,
+                stop_reason.as_deref(),
+            );
+            let projection =
+                classify_job(deleting, paused, &run, interval_secs, observed_at);
+            Ok(SchedulerJob {
+                id,
+                kind,
+                live: projection.runtime != RuntimeClass::Idle,
+                automatic_start: projection.automatic_start,
+            })
+        })
+        .map_err(|error| error.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())
 }
 
 /// argv prefix that runs embedded driver `name`: the engine's own binary
@@ -946,7 +1602,523 @@ enum WikiRun {
     RefreshContent,
 }
 
-fn spawn_run(job: Job, wiki_run: WikiRun) -> bool {
+#[derive(Clone, Copy)]
+enum StartRequest {
+    Explicit(WikiRun),
+    Scheduled,
+}
+
+#[derive(Debug)]
+enum StartError {
+    Unavailable(String),
+    Fatal(String),
+}
+
+impl From<String> for StartError {
+    fn from(error: String) -> Self {
+        Self::Fatal(error)
+    }
+}
+
+impl std::fmt::Display for StartError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unavailable(error) | Self::Fatal(error) => formatter.write_str(error),
+        }
+    }
+}
+
+impl StartRequest {
+    fn request_name(self) -> &'static str {
+        match self {
+            Self::Explicit(WikiRun::Maintain) => "explicit",
+            Self::Explicit(WikiRun::RefreshContent) => "full",
+            Self::Scheduled => "scheduled",
+        }
+    }
+
+    fn event(self) -> RunEvent {
+        match self {
+            Self::Explicit(_) => RunEvent::ExplicitStart,
+            Self::Scheduled => RunEvent::ScheduledStart,
+        }
+    }
+
+    fn wiki_run(self) -> WikiRun {
+        match self {
+            Self::Explicit(run) => run,
+            Self::Scheduled => WikiRun::Maintain,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct JobConfig {
+    id: i64,
+    kind: String,
+    src: String,
+    dest: String,
+    interval_secs: i64,
+    paused: bool,
+    media_source: Option<String>,
+    delete_mode: Option<String>,
+}
+
+fn sql_state_kind(state: &str, stop_reason: Option<&str>) -> Option<RunStateKind> {
+    match (state, stop_reason) {
+        ("succeeded", _) => Some(RunStateKind::Succeeded),
+        ("failed", _) => Some(RunStateKind::Failed),
+        ("cancelled", _) => Some(RunStateKind::Cancelled),
+        ("interrupted", _) => Some(RunStateKind::Interrupted),
+        ("starting", _) => Some(RunStateKind::Starting),
+        ("running", _) => Some(RunStateKind::Running),
+        ("stopping", Some("user")) => Some(RunStateKind::StoppingUser),
+        ("stopping", Some("shutdown")) => Some(RunStateKind::StoppingShutdown),
+        _ => None,
+    }
+}
+
+fn start_job(id: i64, request: StartRequest) -> Result<RunId, StartError> {
+    let _gate = SUPERVISOR_GATE.lock().unwrap();
+    if SHUTTING_DOWN.load(std::sync::atomic::Ordering::Acquire) {
+        return Err(StartError::Unavailable(
+            "mirror supervisor is shutting down".into(),
+        ));
+    }
+    let mut conn = db()?;
+    let transaction = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| error.to_string())?;
+    let job = transaction
+        .query_row(
+            "SELECT id,kind,src,dest,interval_secs,paused,media_source,delete_mode
+             FROM jobs WHERE id = ?1",
+            [id],
+            |row| {
+                Ok(JobConfig {
+                    id: row.get(0)?,
+                    kind: row.get(1)?,
+                    src: row.get(2)?,
+                    dest: row.get(3)?,
+                    interval_secs: row.get(4)?,
+                    paused: row.get::<_, i64>(5)? != 0,
+                    media_source: row.get(6)?,
+                    delete_mode: row.get(7)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| StartError::Unavailable("no such job".into()))?;
+    if job.delete_mode.is_some() {
+        return Err(StartError::Unavailable("job deletion is in progress".into()));
+    }
+    if matches!(
+        request,
+        StartRequest::Explicit(WikiRun::RefreshContent)
+    ) && job.kind != "wiki"
+    {
+        return Err(StartError::Unavailable(
+            "full snapshot re-ingest is only available for wiki mirrors".into(),
+        ));
+    }
+    let latest = transaction
+        .query_row(
+            "SELECT id,state,started_at,ended_at,exit_code,process_group,stop_reason FROM runs
+             WHERE job_id = ?1 ORDER BY id DESC LIMIT 1",
+            [id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, Option<u32>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let current_run = match latest {
+        Some((run_id, state, started_at, ended_at, exit_code, process_group, reason)) => {
+            persisted_run(
+                Some(run_id),
+                Some(&state),
+                started_at,
+                ended_at,
+                exit_code,
+                process_group,
+                reason.as_deref(),
+            )
+        }
+        None => PersistedRun::NeverRun,
+    };
+    let current = run_state_kind(&current_run)
+        .ok_or_else(|| format!("invalid durable mirror run state {current_run:?}"))?;
+    let next = transition_run(current, request.event())
+        .map_err(|error| StartError::Unavailable(error.into()))?;
+    if next != RunStateKind::Starting {
+        return Err(StartError::Unavailable(
+            "job is not eligible for an automatic run".into(),
+        ));
+    }
+    if matches!(request, StartRequest::Scheduled) {
+        if job.paused {
+            return Err(StartError::Unavailable("job is paused".into()));
+        }
+        if current == RunStateKind::Succeeded {
+            let PersistedRun::Idle { ended_at, .. } = current_run else {
+                return Err(StartError::Fatal(
+                    "successful run is not durably idle".into(),
+                ));
+            };
+            let due = ended_at.saturating_add(job.interval_secs.max(0));
+            if due > now() {
+                return Err(StartError::Unavailable("job is not due".into()));
+            }
+        }
+    }
+    transaction
+        .execute(
+            "INSERT INTO runs(job_id,request,state,started_at)
+             VALUES(?1,?2,'starting',?3)",
+            params![id, request.request_name(), now()],
+        )
+        .map_err(|error| {
+            if error.sqlite_error_code() == Some(rusqlite::ErrorCode::ConstraintViolation) {
+                StartError::Unavailable("job is already running".into())
+            } else {
+                StartError::Fatal(error.to_string())
+            }
+        })?;
+    let run_id = RunId(transaction.last_insert_rowid());
+    transaction.commit().map_err(|error| error.to_string())?;
+    running_map(|owners| {
+        owners.insert(
+            id,
+            RunningProcess {
+                run_id,
+                process_group: None,
+                stop_reason: None,
+            },
+        );
+    });
+    spawn_run(job, request.wiki_run(), run_id);
+    Ok(run_id)
+}
+
+fn request_stop(id: i64, requested: StopReason) -> Result<(RunId, Option<u32>), String> {
+    // One immediate transaction selects and advances exactly one RunId.
+    // Cancellation never enumerates descendants: at most one owned process
+    // group is signalled after the durable transition commits.
+    let mut conn = db()?;
+    let transaction = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| error.to_string())?;
+    let (run_id, state, current_reason, process_group) = transaction
+        .query_row(
+            "SELECT id,state,stop_reason,process_group FROM runs
+             WHERE job_id = ?1 AND state IN ('starting','running','stopping')
+             ORDER BY id DESC LIMIT 1",
+            [id],
+            |row| {
+                Ok((
+                    RunId(row.get(0)?),
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<u32>>(3)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "job is not running".to_string())?;
+    let current = sql_state_kind(&state, current_reason.as_deref())
+        .ok_or_else(|| format!("invalid durable mirror run state {state:?}"))?;
+    if current == RunStateKind::Running && process_group.is_none() {
+        return Err("durable running mirror has no process group".into());
+    }
+    let effective_reason = match current {
+        RunStateKind::StoppingUser => StopReason::User,
+        RunStateKind::StoppingShutdown => StopReason::Shutdown,
+        _ => {
+            let expected = match requested {
+                StopReason::User => RunStateKind::StoppingUser,
+                StopReason::Shutdown => RunStateKind::StoppingShutdown,
+            };
+            let event = match requested {
+                StopReason::User => RunEvent::Cancel,
+                StopReason::Shutdown => RunEvent::Shutdown,
+            };
+            let next = transition_run(current, event).map_err(str::to_string)?;
+            if next != expected {
+                return Err("stop transition produced an invalid state".into());
+            }
+            let changed = transaction
+                .execute(
+                    "UPDATE runs SET state='stopping',stop_reason=?2
+                     WHERE id=?1 AND state IN ('starting','running')",
+                    params![run_id.0, requested.as_str()],
+                )
+                .map_err(|error| error.to_string())?;
+            if changed != 1 {
+                return Err("stop transition lost its run ownership".into());
+            }
+            requested
+        }
+    };
+    transaction.commit().map_err(|error| error.to_string())?;
+    running_map(|owners| {
+        if let Some(owner) = owners.get_mut(&id)
+            && owner.run_id == run_id
+        {
+            owner.stop_reason = Some(effective_reason);
+        }
+    });
+    Ok((run_id, process_group))
+}
+
+fn signal_owned(
+    id: i64,
+    run_id: RunId,
+    process_group: u32,
+    signal: i32,
+) -> Result<(), String> {
+    let owned = running_map(|owners| {
+        owners.get(&id).and_then(|owner| {
+            (owner.run_id == run_id && owner.stop_reason.is_some())
+                .then_some(owner.process_group)
+        })
+    });
+    match owned {
+        Some(Some(owned_group)) if owned_group == process_group => {}
+        // Spawn committed the group durably just before attaching it to the
+        // local owner. The spawn thread observes stop_reason and signals it.
+        Some(None) => return Ok(()),
+        _ => return Err("run no longer owns that process group".into()),
+    }
+    let group =
+        i32::try_from(process_group).map_err(|_| "mirror process group exceeds i32")?;
+    if unsafe { libc::kill(-group, signal) } != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            return Err(format!("signal mirror process group {process_group}: {error}"));
+        }
+    }
+    Ok(())
+}
+
+fn durable_stop_reason(run_id: RunId) -> Result<Option<StopReason>, String> {
+    let conn = db()?;
+    let (state, reason) = conn
+        .query_row(
+            "SELECT state,stop_reason FROM runs WHERE id=?1",
+            [run_id.0],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                ))
+            },
+        )
+        .map_err(|error| error.to_string())?;
+    match (state.as_str(), reason.as_deref()) {
+        ("starting" | "running", None) => Ok(None),
+        ("stopping", Some("user")) => Ok(Some(StopReason::User)),
+        ("stopping", Some("shutdown")) => Ok(Some(StopReason::Shutdown)),
+        _ => Err("run is no longer spawnable".into()),
+    }
+}
+
+fn record_spawned(run_id: RunId, process_group: u32) -> Result<Option<StopReason>, String> {
+    let mut conn = db()?;
+    let transaction = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| error.to_string())?;
+    let (state, reason) = transaction
+        .query_row(
+            "SELECT state,stop_reason FROM runs WHERE id=?1",
+            [run_id.0],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                ))
+            },
+        )
+        .map_err(|error| error.to_string())?;
+    let stop_reason = match (state.as_str(), reason.as_deref()) {
+        ("starting", None) => {
+            if transition_run(RunStateKind::Starting, RunEvent::SpawnSucceeded)
+                .map_err(str::to_string)?
+                != RunStateKind::Running
+            {
+                return Err("spawn transition produced an invalid state".into());
+            }
+            let changed = transaction
+                .execute(
+                    "UPDATE runs SET state='running',spawned_at=?2,process_group=?3
+                     WHERE id=?1 AND state='starting'",
+                    params![run_id.0, now(), process_group],
+                )
+                .map_err(|error| error.to_string())?;
+            if changed != 1 {
+                return Err("spawn transition lost its run ownership".into());
+            }
+            None
+        }
+        ("stopping", Some("user")) => {
+            let changed = transaction
+                .execute(
+                    "UPDATE runs SET spawned_at=?2,process_group=?3
+                     WHERE id=?1 AND state='stopping' AND stop_reason='user'",
+                    params![run_id.0, now(), process_group],
+                )
+                .map_err(|error| error.to_string())?;
+            if changed != 1 {
+                return Err("stopped spawn lost its run ownership".into());
+            }
+            Some(StopReason::User)
+        }
+        ("stopping", Some("shutdown")) => {
+            let changed = transaction
+                .execute(
+                    "UPDATE runs SET spawned_at=?2,process_group=?3
+                     WHERE id=?1 AND state='stopping' AND stop_reason='shutdown'",
+                    params![run_id.0, now(), process_group],
+                )
+                .map_err(|error| error.to_string())?;
+            if changed != 1 {
+                return Err("stopped spawn lost its run ownership".into());
+            }
+            Some(StopReason::Shutdown)
+        }
+        _ => return Err("stale spawn completion for inactive run".into()),
+    };
+    transaction.commit().map_err(|error| error.to_string())?;
+    Ok(stop_reason)
+}
+
+fn finish_child_run(run_id: RunId, exit: i64, detail: &str) -> Result<(), String> {
+    let mut conn = db()?;
+    let transaction = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| error.to_string())?;
+    let (state, reason) = transaction
+        .query_row(
+            "SELECT state,stop_reason FROM runs
+             WHERE id=?1 AND NOT EXISTS(
+                 SELECT 1 FROM runs newer
+                 WHERE newer.job_id=runs.job_id AND newer.id>runs.id
+             )",
+            [run_id.0],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "stale child completion".to_string())?;
+    let current = sql_state_kind(&state, reason.as_deref())
+        .ok_or_else(|| format!("invalid durable mirror run state {state:?}"))?;
+    let (event, next) = match current {
+        RunStateKind::Starting => (
+            RunEvent::SpawnFailed,
+            transition_run(current, RunEvent::SpawnFailed),
+        ),
+        RunStateKind::Running => {
+            let event = if exit == 0 {
+                RunEvent::ExitZero
+            } else {
+                RunEvent::ExitFailure
+            };
+            (event, transition_run(current, event))
+        }
+        RunStateKind::StoppingUser | RunStateKind::StoppingShutdown => {
+            let event = if exit == 0 {
+                RunEvent::ExitZero
+            } else {
+                RunEvent::ExitFailure
+            };
+            (event, transition_run(current, event))
+        }
+        _ => return Err("stale child completion for terminal run".into()),
+    };
+    let next = next.map_err(str::to_string)?;
+    let state_name = match next {
+        RunStateKind::Succeeded => "succeeded",
+        RunStateKind::Failed => "failed",
+        RunStateKind::Cancelled => "cancelled",
+        RunStateKind::Interrupted => "interrupted",
+        _ => return Err(format!("invalid terminal transition for {event:?}")),
+    };
+    let terminal_exit = (next != RunStateKind::Interrupted).then_some(exit);
+    let changed = transaction
+        .execute(
+            "UPDATE runs SET state=?2,ended_at=?3,exit_code=?4,detail=?5
+             WHERE id=?1 AND state IN ('starting','running','stopping')",
+            params![run_id.0, state_name, now(), terminal_exit, detail],
+        )
+        .map_err(|error| error.to_string())?;
+    if changed != 1 {
+        return Err("stale child completion lost its run ownership".into());
+    }
+    transaction.commit().map_err(|error| error.to_string())
+}
+
+fn finish_stopped_run(run_id: RunId, detail: &str) -> Result<(), String> {
+    let mut conn = db()?;
+    let transaction = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| error.to_string())?;
+    let reason = transaction
+        .query_row(
+            "SELECT stop_reason FROM runs WHERE id=?1 AND state='stopping'",
+            [run_id.0],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "stale stop completion".to_string())?;
+    let (current, state_name) = match reason.as_str() {
+        "user" => (RunStateKind::StoppingUser, "cancelled"),
+        "shutdown" => (RunStateKind::StoppingShutdown, "interrupted"),
+        _ => return Err("invalid stop reason".into()),
+    };
+    let next = transition_run(current, RunEvent::ExitFailure).map_err(str::to_string)?;
+    if !matches!(
+        next,
+        RunStateKind::Cancelled | RunStateKind::Interrupted
+    ) {
+        return Err("stop completion produced a non-terminal state".into());
+    }
+    let changed = transaction
+        .execute(
+            "UPDATE runs SET state=?2,ended_at=?3,exit_code=NULL,detail=?4
+             WHERE id=?1 AND state='stopping'",
+            params![run_id.0, state_name, now(), detail],
+        )
+        .map_err(|error| error.to_string())?;
+    if changed != 1 {
+        return Err("stop completion lost its run ownership".into());
+    }
+    transaction.commit().map_err(|error| error.to_string())
+}
+
+fn remove_owner(id: i64, run_id: RunId) {
+    running_map(|owners| {
+        if owners.get(&id).is_some_and(|owner| owner.run_id == run_id) {
+            owners.remove(&id);
+        }
+    });
+}
+
+fn spawn_run(job: JobConfig, wiki_run: WikiRun, run_id: RunId) {
     let driver = |name: &str| driver_argv(name, std::env::current_exe().ok());
     let argv: Vec<String> = match job.kind.as_str() {
         "git" => [
@@ -962,6 +2134,8 @@ fn spawn_run(job: Job, wiki_run: WikiRun) -> bool {
                     WikiRun::RefreshContent => "refresh-full",
                 }
                 .into(),
+                "--run-id".into(),
+                run_id.0.to_string(),
                 job.src.clone(),
                 job.dest.clone(),
             ],
@@ -988,37 +2162,50 @@ fn spawn_run(job: Job, wiki_run: WikiRun) -> bool {
         path
     });
     let wiki = job.kind == "wiki";
-    let wiki_background = wiki && std::path::Path::new(&job.dest).exists();
+    let wiki_background = if wiki {
+        match wikimak_wikipedia::mirror_has_installed_generation(
+            std::path::Path::new(&job.dest),
+        ) {
+            Ok(installed) => installed,
+            Err(error) => {
+                eprintln!(
+                    "mirror job #{} cannot inspect installed Wikipedia generation: {error}",
+                    job.id
+                );
+                false
+            }
+        }
+    } else {
+        false
+    };
     let wiki_cpu_budget = wiki_background.then(|| {
         std::thread::available_parallelism()
             .map_or(1, usize::from)
             .saturating_sub(2)
             .max(1)
     });
-    if !running_map(|m| {
-        if m.contains_key(&id) || (wiki && m.values().any(|process| process.wiki)) {
-            false
-        } else {
-            m.insert(
-                id,
-                RunningProcess {
-                    pid: 0,
-                    stopping: false,
-                    wiki,
-                },
-            );
-            true
-        }
-    }) {
-        return false;
-    }
-    if let Ok(conn) = db() {
-        let _ = conn.execute(
-            "UPDATE jobs SET last_start = ?2, last_end = NULL, last_exit = NULL, last_detail = '' WHERE id = ?1",
-            params![id, now()],
-        );
-    }
     std::thread::spawn(move || {
+        match durable_stop_reason(run_id) {
+            Ok(Some(_)) => {
+                if let Err(error) = finish_stopped_run(run_id, "cancelled before spawn") {
+                    eprintln!(
+                        "mirror job #{id} run #{} pre-spawn stop completion failed: {error}",
+                        run_id.0
+                    );
+                }
+                remove_owner(id, run_id);
+                return;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                eprintln!(
+                    "mirror job #{id} run #{} pre-spawn ownership check failed: {error}",
+                    run_id.0
+                );
+                remove_owner(id, run_id);
+                return;
+            }
+        }
         let mut cmd = std::process::Command::new(&argv[0]);
         cmd.args(&argv[1..])
             .env("SARUN_MIRROR_DEST", &job.dest)
@@ -1057,18 +2244,46 @@ fn spawn_run(job: Job, wiki_run: WikiRun) -> bool {
         let child = cmd.spawn();
         let (exit, detail) = match child {
             Ok(mut c) => {
-                running_map(|m| {
-                    m.insert(
-                        id,
-                        RunningProcess {
-                            pid: c.id(),
-                            stopping: false,
-                            wiki,
-                        },
-                    );
+                let process_group = c.id();
+                let stop_reason = match record_spawned(run_id, process_group) {
+                    Ok(reason) => reason,
+                    Err(error) => {
+                        unsafe {
+                            libc::kill(-(process_group as i32), libc::SIGKILL);
+                        }
+                        let _ = c.wait();
+                        let detail = format!("spawn registration failed: {error}");
+                        if let Err(completion_error) =
+                            finish_child_run(run_id, -1, &detail)
+                        {
+                            eprintln!(
+                                "mirror job #{id} run #{} spawn registration and completion failed: \
+                                 {error}; {completion_error}",
+                                run_id.0
+                            );
+                        }
+                        remove_owner(id, run_id);
+                        return;
+                    }
+                };
+                let effective_stop = running_map(|owners| {
+                    if let Some(owner) = owners.get_mut(&id)
+                        && owner.run_id == run_id
+                    {
+                        owner.process_group = Some(process_group);
+                        if stop_reason.is_some() {
+                            owner.stop_reason = stop_reason;
+                        }
+                        owner.stop_reason
+                    } else {
+                        stop_reason
+                    }
                 });
+                if effective_stop.is_some() {
+                    let _ = signal_owned(id, run_id, process_group, libc::SIGTERM);
+                }
                 let stderr = c.stderr.take().expect("piped stderr");
-                let (exit, tail) = stream_stderr(id, stderr, &mut c);
+                let (exit, tail) = stream_stderr(run_id, stderr, &mut c);
                 match exit {
                     Ok(status) => {
                         use std::os::unix::process::ExitStatusExt;
@@ -1103,24 +2318,30 @@ fn spawn_run(job: Job, wiki_run: WikiRun) -> bool {
                 ),
             ),
         };
-        running_map(|m| {
-            m.remove(&id);
-        });
-        if let Ok(conn) = db() {
-            let _ = conn.execute(
-                "UPDATE jobs SET last_end = ?2, last_exit = ?3, last_detail = ?4 WHERE id = ?1",
-                params![id, now(), exit, detail],
+        if let Some(process_group) = running_map(|owners| {
+            owners.get(&id).and_then(|owner| {
+                (owner.run_id == run_id && owner.stop_reason.is_some())
+                    .then_some(owner.process_group)
+                    .flatten()
+            })
+        }) {
+            let _ = signal_owned(id, run_id, process_group, libc::SIGKILL);
+        }
+        if let Err(error) = finish_child_run(run_id, exit, &detail) {
+            eprintln!(
+                "mirror job #{id} run #{} child completion rejected: {error}",
+                run_id.0
             );
         }
+        remove_owner(id, run_id);
     });
-    true
 }
 
-/// Read child stderr line-by-line, updating `last_detail` in the DB every
+/// Read child stderr line-by-line, updating this RunId's detail in the DB every
 /// ~2s so the UI's mirror detail pane shows live progress. Returns the
 /// collected stderr tail (last 2KB) and the child's exit status.
 fn stream_stderr(
-    id: i64,
+    run_id: RunId,
     stderr: std::process::ChildStderr,
     child: &mut std::process::Child,
 ) -> (
@@ -1146,8 +2367,9 @@ fn stream_stderr(
         if first_line || last_flush.elapsed() >= Duration::from_secs(2) {
             if let Ok(conn) = db() {
                 let _ = conn.execute(
-                    "UPDATE jobs SET last_detail = ?2 WHERE id = ?1",
-                    params![id, tail_2k(&tail)],
+                    "UPDATE runs SET detail = ?2
+                     WHERE id = ?1 AND state IN ('starting','running','stopping')",
+                    params![run_id.0, tail_2k(&tail)],
                 );
             }
             last_flush = Instant::now();
@@ -1172,17 +2394,142 @@ fn tail_2k(s: &str) -> String {
 /// The scheduler tick loop: every minute, start whatever is due. Runs
 /// for the life of the engine; jobs only exist if the user added them.
 pub fn scheduler_thread() {
+    if SCHEDULER_STARTED.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        return;
+    }
+    if let Err(error) = recover_unowned_runs() {
+        eprintln!("mirror supervisor recovery stopped scheduling: {error}");
+        return;
+    }
     std::thread::spawn(|| {
         loop {
-            let _ = run_pending();
+            if SHUTTING_DOWN.load(std::sync::atomic::Ordering::Acquire) {
+                break;
+            }
+            if let Err(error) = run_pending() {
+                eprintln!("mirror scheduler tick failed: {error}");
+            }
             std::thread::sleep(std::time::Duration::from_secs(60));
         }
     });
 }
 
+fn recover_unowned_runs() -> Result<(), String> {
+    let mut conn = db()?;
+    let transaction = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| error.to_string())?;
+    let mut active = {
+        let mut statement = transaction
+            .prepare(
+                "SELECT id,state,stop_reason,process_group FROM runs
+                 WHERE state IN ('starting','running','stopping')",
+            )
+            .map_err(|error| error.to_string())?;
+        statement
+            .query_map([], |row| {
+                Ok((
+                    RunId(row.get(0)?),
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<u32>>(3)?,
+                ))
+            })
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?
+    };
+    active.sort_by_key(|(run_id, _, _, _)| run_id.0);
+    for (run_id, state, reason, process_group) in active {
+        let current = sql_state_kind(&state, reason.as_deref())
+            .ok_or_else(|| format!("invalid durable mirror run state {state:?}"))?;
+        if current == RunStateKind::Running && process_group.is_none() {
+            return Err("durable running mirror has no process group".into());
+        }
+        let next = transition_run(current, RunEvent::Restart).map_err(str::to_string)?;
+        let state_name = match next {
+            RunStateKind::Cancelled => "cancelled",
+            RunStateKind::Interrupted => "interrupted",
+            _ => return Err("restart left an active run non-terminal".into()),
+        };
+        let changed = transaction
+            .execute(
+                "UPDATE runs SET state=?2,ended_at=?3,exit_code=NULL,
+                                 detail='engine restarted before run completion'
+                 WHERE id=?1 AND state IN ('starting','running','stopping')",
+                params![run_id.0, state_name, now()],
+            )
+            .map_err(|error| error.to_string())?;
+        if changed != 1 {
+            return Err(format!(
+                "restart recovery lost ownership of run #{}",
+                run_id.0
+            ));
+        }
+    }
+    transaction.commit().map_err(|error| error.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stopped_lifecycle_never_projects_stale_telemetry_as_active() {
+        let mut job: Job = serde_json::from_value(serde_json::json!({
+            "id": 1,
+            "kind": "wiki",
+            "src": "enwiki",
+            "dest": "/tmp/enwiki.swdump",
+            "interval_secs": 86400,
+            "paused": true,
+            "last_start": 1,
+            "last_end": 2,
+            "last_exit": 1,
+            "last_detail": "failed",
+            "state": "error",
+            "next_due": null
+        }))
+        .unwrap();
+        apply_wikipedia_progress(
+            &mut job,
+            wikimak_wikipedia::MirrorBuildProgress {
+                phase: "materializing source targets".into(),
+                targets_active: vec!["content-000001 · parsing".into()],
+                active_source_bytes_per_second: Some(123),
+                active_quiet_seconds: Some(4),
+                ..Default::default()
+            },
+        );
+        assert_eq!(job.state, "error");
+        assert!(job.targets_active.is_empty());
+        assert_eq!(job.active_source_bytes_per_second, None);
+        assert_eq!(job.active_quiet_seconds, None);
+    }
+
+    #[test]
+    fn one_process_snapshot_aggregates_each_tree_without_quadratic_membership_scans() {
+        let snapshot = ProcessSnapshot {
+            captured: std::time::Instant::now(),
+            children: HashMap::from([
+                (1, vec![2, 5]),
+                (2, vec![3, 4]),
+                (9, vec![10]),
+            ]),
+            usage: HashMap::from([
+                (1, (1.0, 10)),
+                (2, (2.0, 20)),
+                (3, (3.0, 30)),
+                (4, (4.0, 40)),
+                (5, (5.0, 50)),
+                (9, (9.0, 90)),
+                (10, (10.0, 100)),
+            ]),
+        };
+        assert_eq!(aggregate_process_tree(1, &snapshot), (15.0, 150 * 1024));
+        assert_eq!(aggregate_process_tree(9, &snapshot), (19.0, 190 * 1024));
+        assert_eq!(aggregate_process_tree(99, &snapshot), (0.0, 0));
+    }
 
     /// The deployment contract: drivers are compiled into the engine
     /// binary, so a driver run is a self-exec of current_exe with the
@@ -1245,9 +2592,8 @@ mod tests {
         struct Case {
             name: &'static str,
             paused: bool,
-            attempt: PersistedAttempt,
+            run: PersistedRun,
             interval: i64,
-            runtime: Option<RunningProcess>,
             now: i64,
             schedule: ScheduleClass,
             attempt_class: AttemptClass,
@@ -1257,33 +2603,19 @@ mod tests {
             automatic_start: bool,
         }
 
-        let never = PersistedAttempt {
-            last_start: None,
-            last_end: None,
-            last_exit: None,
+        let idle = |outcome, exit_code| PersistedRun::Idle {
+            id: RunId(1),
+            started_at: 100,
+            ended_at: 200,
+            outcome,
+            exit_code,
         };
-        let success = PersistedAttempt {
-            last_start: Some(100),
-            last_end: Some(200),
-            last_exit: Some(0),
-        };
-        let interrupted = PersistedAttempt {
-            last_start: Some(100),
-            last_end: None,
-            last_exit: None,
-        };
-        let failed = PersistedAttempt {
-            last_start: Some(100),
-            last_end: Some(200),
-            last_exit: Some(7),
-        };
-        let cases = [
+        let cases = vec![
             Case {
                 name: "never-run enabled job is genuinely pending",
                 paused: false,
-                attempt: never,
+                run: PersistedRun::NeverRun,
                 interval: 100,
-                runtime: None,
                 now: 1_000,
                 schedule: ScheduleClass::Enabled,
                 attempt_class: AttemptClass::NeverRun,
@@ -1295,12 +2627,11 @@ mod tests {
             Case {
                 name: "successful job waits from completion",
                 paused: false,
-                attempt: success,
+                run: idle(AttemptClass::Succeeded, Some(0)),
                 interval: 100,
-                runtime: None,
                 now: 299,
                 schedule: ScheduleClass::Enabled,
-                attempt_class: AttemptClass::Succeeded { ended_at: 200 },
+                attempt_class: AttemptClass::Succeeded,
                 runtime_class: RuntimeClass::Idle,
                 display: DisplayClass::Completed,
                 next_due: Some(300),
@@ -1309,12 +2640,11 @@ mod tests {
             Case {
                 name: "successful job becomes due",
                 paused: false,
-                attempt: success,
+                run: idle(AttemptClass::Succeeded, Some(0)),
                 interval: 100,
-                runtime: None,
                 now: 300,
                 schedule: ScheduleClass::Enabled,
-                attempt_class: AttemptClass::Succeeded { ended_at: 200 },
+                attempt_class: AttemptClass::Succeeded,
                 runtime_class: RuntimeClass::Idle,
                 display: DisplayClass::Pending,
                 next_due: Some(300),
@@ -1323,16 +2653,17 @@ mod tests {
             Case {
                 name: "long run does not become due based on its start",
                 paused: false,
-                attempt: PersistedAttempt {
-                    last_start: Some(0),
-                    last_end: Some(1_000),
-                    last_exit: Some(0),
+                run: PersistedRun::Idle {
+                    id: RunId(1),
+                    started_at: 0,
+                    ended_at: 1_000,
+                    outcome: AttemptClass::Succeeded,
+                    exit_code: Some(0),
                 },
                 interval: 100,
-                runtime: None,
                 now: 1_050,
                 schedule: ScheduleClass::Enabled,
-                attempt_class: AttemptClass::Succeeded { ended_at: 1_000 },
+                attempt_class: AttemptClass::Succeeded,
                 runtime_class: RuntimeClass::Idle,
                 display: DisplayClass::Completed,
                 next_due: Some(1_100),
@@ -1341,108 +2672,109 @@ mod tests {
             Case {
                 name: "restart exposes interrupted attempt without retrying",
                 paused: false,
-                attempt: interrupted,
+                run: idle(AttemptClass::Interrupted, None),
                 interval: 100,
-                runtime: None,
                 now: 10_000,
                 schedule: ScheduleClass::Enabled,
                 attempt_class: AttemptClass::Interrupted,
                 runtime_class: RuntimeClass::Idle,
-                display: DisplayClass::Stopped,
+                display: DisplayClass::Interrupted,
                 next_due: None,
                 automatic_start: false,
             },
             Case {
                 name: "old failed attempt remains an error when time passes",
                 paused: false,
-                attempt: failed,
+                run: idle(AttemptClass::Failed, Some(7)),
                 interval: 100,
-                runtime: None,
                 now: 10_000,
                 schedule: ScheduleClass::Enabled,
-                attempt_class: AttemptClass::FailedOrCancelled { ended_at: 200 },
+                attempt_class: AttemptClass::Failed,
                 runtime_class: RuntimeClass::Idle,
                 display: DisplayClass::Error,
                 next_due: None,
                 automatic_start: false,
             },
             Case {
-                name: "signal-cancelled attempt is not an automatic retry",
+                name: "cancelled attempt is distinct and is not retried",
                 paused: false,
-                attempt: PersistedAttempt {
-                    last_start: Some(100),
-                    last_end: Some(200),
-                    last_exit: Some(-1),
+                run: idle(AttemptClass::Cancelled, Some(-1)),
+                interval: 100,
+                now: 10_000,
+                schedule: ScheduleClass::Enabled,
+                attempt_class: AttemptClass::Cancelled,
+                runtime_class: RuntimeClass::Idle,
+                display: DisplayClass::Cancelled,
+                next_due: None,
+                automatic_start: false,
+            },
+            Case {
+                name: "pause prevents scheduling without hiding a pending attempt",
+                paused: true,
+                run: PersistedRun::NeverRun,
+                interval: 100,
+                now: 1_000,
+                schedule: ScheduleClass::Paused,
+                attempt_class: AttemptClass::NeverRun,
+                runtime_class: RuntimeClass::Idle,
+                display: DisplayClass::Pending,
+                next_due: None,
+                automatic_start: false,
+            },
+            Case {
+                name: "pause prevents scheduling without hiding a due attempt",
+                paused: true,
+                run: idle(AttemptClass::Succeeded, Some(0)),
+                interval: 100,
+                now: 1_000,
+                schedule: ScheduleClass::Paused,
+                attempt_class: AttemptClass::Succeeded,
+                runtime_class: RuntimeClass::Idle,
+                display: DisplayClass::Pending,
+                next_due: None,
+                automatic_start: false,
+            },
+            Case {
+                name: "pause does not hide a failed attempt that needs attention",
+                paused: true,
+                run: idle(AttemptClass::Failed, Some(7)),
+                interval: 100,
+                now: 1_000,
+                schedule: ScheduleClass::Paused,
+                attempt_class: AttemptClass::Failed,
+                runtime_class: RuntimeClass::Idle,
+                display: DisplayClass::Error,
+                next_due: None,
+                automatic_start: false,
+            },
+            Case {
+                name: "durable starting is visible without process telemetry",
+                paused: false,
+                run: PersistedRun::Starting {
+                    id: RunId(2),
+                    started_at: 900,
                 },
                 interval: 100,
-                runtime: None,
-                now: 10_000,
-                schedule: ScheduleClass::Enabled,
-                attempt_class: AttemptClass::FailedOrCancelled { ended_at: 200 },
-                runtime_class: RuntimeClass::Idle,
-                display: DisplayClass::Error,
-                next_due: None,
-                automatic_start: false,
-            },
-            Case {
-                name: "pause is orthogonal to a never-run attempt",
-                paused: true,
-                attempt: never,
-                interval: 100,
-                runtime: None,
-                now: 1_000,
-                schedule: ScheduleClass::Paused,
-                attempt_class: AttemptClass::NeverRun,
-                runtime_class: RuntimeClass::Idle,
-                display: DisplayClass::Paused,
-                next_due: None,
-                automatic_start: false,
-            },
-            Case {
-                name: "pause is orthogonal to a due successful attempt",
-                paused: true,
-                attempt: success,
-                interval: 100,
-                runtime: None,
-                now: 1_000,
-                schedule: ScheduleClass::Paused,
-                attempt_class: AttemptClass::Succeeded { ended_at: 200 },
-                runtime_class: RuntimeClass::Idle,
-                display: DisplayClass::Paused,
-                next_due: None,
-                automatic_start: false,
-            },
-            Case {
-                name: "reserved pid zero is typed as starting",
-                paused: false,
-                attempt: never,
-                interval: 100,
-                runtime: Some(RunningProcess {
-                    pid: 0,
-                    stopping: false,
-                    wiki: true,
-                }),
                 now: 1_000,
                 schedule: ScheduleClass::Enabled,
-                attempt_class: AttemptClass::NeverRun,
+                attempt_class: AttemptClass::Active,
                 runtime_class: RuntimeClass::Starting,
                 display: DisplayClass::Starting,
                 next_due: None,
                 automatic_start: false,
             },
             Case {
-                name: "owned child is typed as running",
+                name: "durable running remains live when future runs are paused",
                 paused: true,
-                attempt: interrupted,
+                run: PersistedRun::Running {
+                    id: RunId(2),
+                    started_at: 900,
+                    process_group: 42,
+                },
                 interval: 100,
-                runtime: Some(RunningProcess {
-                    pid: 42,
-                    stopping: false,
-                    wiki: true,
-                }),
                 now: 1_000,
                 schedule: ScheduleClass::Paused,
-                attempt_class: AttemptClass::Interrupted,
+                attempt_class: AttemptClass::Active,
                 runtime_class: RuntimeClass::Running,
                 display: DisplayClass::Running,
                 next_due: None,
@@ -1451,31 +2783,26 @@ mod tests {
             Case {
                 name: "stop request is typed as stopping",
                 paused: false,
-                attempt: interrupted,
+                run: PersistedRun::Stopping {
+                    id: RunId(2),
+                    started_at: 900,
+                    process_group: Some(42),
+                    reason: StopReason::User,
+                },
                 interval: 100,
-                runtime: Some(RunningProcess {
-                    pid: 42,
-                    stopping: true,
-                    wiki: true,
-                }),
                 now: 1_000,
                 schedule: ScheduleClass::Enabled,
-                attempt_class: AttemptClass::Interrupted,
+                attempt_class: AttemptClass::Active,
                 runtime_class: RuntimeClass::Stopping,
                 display: DisplayClass::Stopping,
                 next_due: None,
                 automatic_start: false,
             },
             Case {
-                name: "invalid nullable row fails closed",
+                name: "invalid durable row fails closed",
                 paused: false,
-                attempt: PersistedAttempt {
-                    last_start: None,
-                    last_end: Some(200),
-                    last_exit: Some(0),
-                },
+                run: PersistedRun::Invalid,
                 interval: 100,
-                runtime: None,
                 now: 1_000,
                 schedule: ScheduleClass::Enabled,
                 attempt_class: AttemptClass::Invalid,
@@ -1487,12 +2814,13 @@ mod tests {
         ];
 
         for case in cases {
-            let projection = classify_job(
-                case.paused,
-                case.attempt,
-                case.interval,
-                case.runtime,
-                case.now,
+            let projection =
+                classify_job(false, case.paused, &case.run, case.interval, case.now);
+            assert_eq!(
+                projection.registration,
+                RegistrationClass::Active,
+                "{}: registration",
+                case.name
             );
             assert_eq!(projection.schedule, case.schedule, "{}: schedule", case.name);
             assert_eq!(
@@ -1513,10 +2841,237 @@ mod tests {
                 case.name
             );
         }
+        let deleting =
+            classify_job(true, false, &PersistedRun::NeverRun, 100, 1_000);
+        assert_eq!(deleting.registration, RegistrationClass::Deleting);
+        assert_eq!(deleting.display, DisplayClass::Deleting);
+        assert!(!deleting.automatic_start);
+    }
+
+    #[test]
+    fn run_transition_matrix_is_exhaustive() {
+        use RunEvent as E;
+        use RunStateKind as S;
+        let events = [
+            E::ExplicitStart,
+            E::ScheduledStart,
+            E::SpawnSucceeded,
+            E::SpawnFailed,
+            E::Cancel,
+            E::ExitZero,
+            E::ExitFailure,
+            E::Shutdown,
+            E::Restart,
+            E::PauseChanged,
+        ];
+        let cases = [
+            (
+                S::NeverRun,
+                [
+                    Some(S::Starting),
+                    Some(S::Starting),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(S::NeverRun),
+                    Some(S::NeverRun),
+                    Some(S::NeverRun),
+                ],
+            ),
+            (
+                S::Succeeded,
+                [
+                    Some(S::Starting),
+                    Some(S::Starting),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(S::Succeeded),
+                    Some(S::Succeeded),
+                    Some(S::Succeeded),
+                ],
+            ),
+            (
+                S::Failed,
+                [
+                    Some(S::Starting),
+                    Some(S::Failed),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(S::Failed),
+                    Some(S::Failed),
+                    Some(S::Failed),
+                ],
+            ),
+            (
+                S::Cancelled,
+                [
+                    Some(S::Starting),
+                    Some(S::Cancelled),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(S::Cancelled),
+                    Some(S::Cancelled),
+                    Some(S::Cancelled),
+                ],
+            ),
+            (
+                S::Interrupted,
+                [
+                    Some(S::Starting),
+                    Some(S::Interrupted),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(S::Interrupted),
+                    Some(S::Interrupted),
+                    Some(S::Interrupted),
+                ],
+            ),
+            (
+                S::Starting,
+                [
+                    None,
+                    None,
+                    Some(S::Running),
+                    Some(S::Failed),
+                    Some(S::StoppingUser),
+                    None,
+                    None,
+                    Some(S::StoppingShutdown),
+                    Some(S::Interrupted),
+                    Some(S::Starting),
+                ],
+            ),
+            (
+                S::Running,
+                [
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(S::StoppingUser),
+                    Some(S::Succeeded),
+                    Some(S::Failed),
+                    Some(S::StoppingShutdown),
+                    Some(S::Interrupted),
+                    Some(S::Running),
+                ],
+            ),
+            (
+                S::StoppingUser,
+                [
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(S::Cancelled),
+                    Some(S::Cancelled),
+                    None,
+                    Some(S::Cancelled),
+                    Some(S::StoppingUser),
+                ],
+            ),
+            (
+                S::StoppingShutdown,
+                [
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(S::Interrupted),
+                    Some(S::Interrupted),
+                    None,
+                    Some(S::Interrupted),
+                    Some(S::StoppingShutdown),
+                ],
+            ),
+        ];
+        for (state, expected) in cases {
+            for (event, expected) in events.into_iter().zip(expected) {
+                assert_eq!(
+                    transition_run(state, event).ok(),
+                    expected,
+                    "{state:?} + {event:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn registration_transition_matrix_is_exhaustive() {
+        use DeleteMode as D;
+        use RegistrationEvent as E;
+        use RegistrationState as S;
+        let events = [
+            E::BeginDelete(D::Registration),
+            E::BeginDelete(D::Data),
+            E::FinishDelete(D::Registration),
+            E::FinishDelete(D::Data),
+        ];
+        let cases = [
+            (
+                S::Active,
+                [
+                    Some(S::Deleting(D::Registration)),
+                    Some(S::Deleting(D::Data)),
+                    None,
+                    None,
+                ],
+            ),
+            (
+                S::Deleting(D::Registration),
+                [
+                    Some(S::Deleting(D::Registration)),
+                    None,
+                    Some(S::Removed),
+                    None,
+                ],
+            ),
+            (
+                S::Deleting(D::Data),
+                [
+                    None,
+                    Some(S::Deleting(D::Data)),
+                    None,
+                    Some(S::Removed),
+                ],
+            ),
+            (S::Removed, [None, None, None, None]),
+        ];
+        for (state, expected) in cases {
+            for (event, expected) in events.into_iter().zip(expected) {
+                assert_eq!(
+                    transition_registration(state, event).ok(),
+                    expected,
+                    "{state:?} + {event:?}"
+                );
+            }
+        }
     }
 
     #[test]
     fn cancel_stops_the_driver_process_group() {
+        let _guard = crate::depot::TEST_STATE_HOME_LOCK.lock().unwrap();
+        let temporary = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", temporary.path().join("state"));
+        }
+        std::fs::create_dir_all(crate::paths::state_home()).unwrap();
         use std::os::unix::process::CommandExt;
         let mut command = std::process::Command::new("/bin/sh");
         unsafe {
@@ -1529,23 +3084,320 @@ mod tests {
             });
         }
         let mut child = command.arg("-c").arg("sleep 60").spawn().unwrap();
-        let id = -9_001;
+        let id = job_add("cmd", "sleep 60", "/tmp/sarun-cancel-test", 3600).unwrap();
+        let conn = db().unwrap();
+        conn.execute(
+            "INSERT INTO runs(job_id,request,state,started_at,spawned_at,process_group)
+             VALUES(?1,'explicit','running',?2,?2,?3)",
+            params![id, now(), child.id()],
+        )
+        .unwrap();
+        let run_id = RunId(conn.last_insert_rowid());
         running_map(|running| {
             running.insert(
                 id,
                 RunningProcess {
-                    pid: child.id(),
-                    stopping: false,
-                    wiki: false,
+                    run_id,
+                    process_group: Some(child.id()),
+                    stop_reason: None,
                 },
             );
         });
         job_cancel(id).unwrap();
         let status = child.wait().unwrap();
-        running_map(|running| {
-            running.remove(&id);
-        });
+        finish_child_run(run_id, -1, "test cancellation").unwrap();
+        remove_owner(id, run_id);
         assert!(!status.success());
+        assert_eq!(
+            jobs_list().unwrap()[0].state,
+            "cancelled",
+            "explicit cancellation is a durable outcome"
+        );
+    }
+
+    #[test]
+    fn cancel_during_starting_is_durable_and_does_not_spawn_again() {
+        let _guard = crate::depot::TEST_STATE_HOME_LOCK.lock().unwrap();
+        let temporary = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", temporary.path().join("state"));
+        }
+        std::fs::create_dir_all(crate::paths::state_home()).unwrap();
+        let id = job_add(
+            "cmd",
+            "true",
+            temporary.path().join("dest").to_str().unwrap(),
+            3600,
+        )
+        .unwrap();
+        let conn = db().unwrap();
+        conn.execute(
+            "INSERT INTO runs(job_id,request,state,started_at)
+             VALUES(?1,'explicit','starting',?2)",
+            params![id, now()],
+        )
+        .unwrap();
+        let run_id = RunId(conn.last_insert_rowid());
+        running_map(|owners| {
+            owners.insert(
+                id,
+                RunningProcess {
+                    run_id,
+                    process_group: None,
+                    stop_reason: None,
+                },
+            );
+        });
+
+        job_cancel(id).unwrap();
+        assert_eq!(jobs_list().unwrap()[0].state, "stopping");
+        finish_stopped_run(run_id, "cancelled before spawn").unwrap();
+        remove_owner(id, run_id);
+        let job = jobs_list().unwrap().remove(0);
+        assert_eq!(job.state, "cancelled");
+        assert!(!job.automatic_start);
+    }
+
+    #[test]
+    fn stale_child_exit_cannot_finish_a_newer_run() {
+        let _guard = crate::depot::TEST_STATE_HOME_LOCK.lock().unwrap();
+        let temporary = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", temporary.path().join("state"));
+        }
+        std::fs::create_dir_all(crate::paths::state_home()).unwrap();
+        let id = job_add(
+            "cmd",
+            "true",
+            temporary.path().join("dest").to_str().unwrap(),
+            3600,
+        )
+        .unwrap();
+        let conn = db().unwrap();
+        conn.execute(
+            "INSERT INTO runs(job_id,request,state,started_at,spawned_at,process_group)
+             VALUES(?1,'explicit','running',1,1,42)",
+            [id],
+        )
+        .unwrap();
+        let old = RunId(conn.last_insert_rowid());
+        recover_unowned_runs().unwrap();
+        conn.execute(
+            "INSERT INTO runs(job_id,request,state,started_at)
+             VALUES(?1,'explicit','starting',2)",
+            [id],
+        )
+        .unwrap();
+        let current = RunId(conn.last_insert_rowid());
+
+        assert_eq!(
+            finish_child_run(old, 0, "late success").unwrap_err(),
+            "stale child completion"
+        );
+        let state: String = conn
+            .query_row("SELECT state FROM runs WHERE id=?1", [current.0], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(state, "starting");
+    }
+
+    #[test]
+    fn pause_while_running_changes_only_schedule() {
+        let _guard = crate::depot::TEST_STATE_HOME_LOCK.lock().unwrap();
+        let temporary = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", temporary.path().join("state"));
+        }
+        std::fs::create_dir_all(crate::paths::state_home()).unwrap();
+        let id = job_add(
+            "cmd",
+            "true",
+            temporary.path().join("dest").to_str().unwrap(),
+            3600,
+        )
+        .unwrap();
+        let conn = db().unwrap();
+        conn.execute(
+            "INSERT INTO runs(job_id,request,state,started_at,spawned_at,process_group)
+             VALUES(?1,'explicit','running',1,1,42)",
+            [id],
+        )
+        .unwrap();
+        let run_id = RunId(conn.last_insert_rowid());
+
+        job_set_paused(id, true).unwrap();
+        let job = jobs_list().unwrap().remove(0);
+        assert!(job.paused);
+        assert_eq!(job.state, "running");
+        let state: String = conn
+            .query_row("SELECT state FROM runs WHERE id=?1", [run_id.0], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(state, "running");
+    }
+
+    #[test]
+    fn restart_preserves_explicit_cancel_and_interrupts_other_active_runs() {
+        let _guard = crate::depot::TEST_STATE_HOME_LOCK.lock().unwrap();
+        let temporary = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", temporary.path().join("state"));
+        }
+        std::fs::create_dir_all(crate::paths::state_home()).unwrap();
+        let conn = db().unwrap();
+        for (index, state, reason) in [
+            (0, "starting", None),
+            (1, "running", None),
+            (2, "stopping", Some("user")),
+        ] {
+            let id = job_add(
+                "cmd",
+                "true",
+                temporary
+                    .path()
+                    .join(format!("dest-{index}"))
+                    .to_str()
+                    .unwrap(),
+                3600,
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO runs(
+                    job_id,request,state,started_at,spawned_at,process_group,stop_reason
+                 )
+                 VALUES(?1,'explicit',?2,1,
+                        CASE WHEN ?2='running' THEN 1 ELSE NULL END,
+                        CASE WHEN ?2='starting' THEN NULL ELSE 42 END,?3)",
+                params![id, state, reason],
+            )
+            .unwrap();
+        }
+
+        recover_unowned_runs().unwrap();
+        let states = jobs_list()
+            .unwrap()
+            .into_iter()
+            .map(|job| (job.state, job.automatic_start))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            states,
+            vec![
+                ("interrupted".into(), false),
+                ("interrupted".into(), false),
+                ("cancelled".into(), false),
+            ]
+        );
+    }
+
+    #[test]
+    fn active_run_blocks_delete_and_a_second_start() {
+        let _guard = crate::depot::TEST_STATE_HOME_LOCK.lock().unwrap();
+        let temporary = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", temporary.path().join("state"));
+        }
+        std::fs::create_dir_all(crate::paths::state_home()).unwrap();
+        let destination = temporary.path().join("dest");
+        let id = job_add("cmd", "sleep 10", destination.to_str().unwrap(), 3600).unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let contenders = (0..2)
+            .map(|_| {
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    start_job(id, StartRequest::Explicit(WikiRun::Maintain))
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        let starts = contenders
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(starts.iter().filter(|result| result.is_ok()).count(), 1);
+        let first = starts.into_iter().find_map(Result::ok).unwrap();
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let cancel = {
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                job_cancel(id)
+            })
+        };
+        let remove = {
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                job_remove(id)
+            })
+        };
+        barrier.wait();
+        let cancel_result = cancel.join().unwrap();
+        let remove_result = remove.join().unwrap();
+        assert!(cancel_result.is_ok(), "{cancel_result:?}");
+        match remove_result {
+            Ok(_) => {
+                assert!(jobs_list().unwrap().iter().all(|job| job.id != id));
+            }
+            Err(error) => {
+                assert!(
+                    error.to_string().contains("stop it first"),
+                    "unexpected remove error: {error:#}"
+                );
+                for _ in 0..200 {
+                    if jobs_list()
+                        .unwrap()
+                        .first()
+                        .is_some_and(|job| job.state == "cancelled")
+                    {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                assert_eq!(jobs_list().unwrap()[0].state, "cancelled");
+            }
+        }
+        assert!(running_map(|owners| {
+            owners.get(&id).is_none_or(|owner| owner.run_id != first)
+        }));
+    }
+
+    #[test]
+    fn deleting_destination_cannot_be_registered_by_a_new_owner() {
+        let _guard = crate::depot::TEST_STATE_HOME_LOCK.lock().unwrap();
+        let temporary = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", temporary.path().join("state"));
+        }
+        std::fs::create_dir_all(crate::paths::state_home()).unwrap();
+        let destination = temporary.path().join("testwiki.swdump");
+        let destination_text = destination.to_str().unwrap().to_owned();
+        let id = job_add("wiki", "testwiki", &destination_text, 3600).unwrap();
+        let (claimed_tx, claimed_rx) = std::sync::mpsc::channel();
+        let (finish_tx, finish_rx) = std::sync::mpsc::channel();
+        let deletion = std::thread::spawn(move || {
+            prepare_job_deletion(id, Some("wiki"), DeleteMode::Data).unwrap();
+            claimed_tx.send(()).unwrap();
+            finish_rx.recv().unwrap();
+            finish_job_deletion(id, DeleteMode::Data).unwrap();
+        });
+
+        claimed_rx.recv().unwrap();
+        let job = jobs_list().unwrap().remove(0);
+        assert_eq!(job.state, "deleting");
+        assert!(
+            job_add("wiki", "new-owner", &destination_text, 3600)
+                .unwrap_err()
+                .contains("already owned"),
+            "the deleting row must retain destination ownership"
+        );
+        finish_tx.send(()).unwrap();
+        deletion.join().unwrap();
+        assert!(jobs_list().unwrap().is_empty());
+        job_add("wiki", "new-owner", &destination_text, 3600).unwrap();
     }
 
     #[test]
@@ -1566,9 +3418,11 @@ mod tests {
         let auxiliary = wikimak_wikipedia::mirror_auxiliary_paths(&archive).unwrap();
         std::fs::create_dir_all(&auxiliary[0]).unwrap();
         std::fs::write(auxiliary[0].join("partial"), b"scratch").unwrap();
-        for path in &auxiliary[1..] {
-            std::fs::write(path, b"sidecar").unwrap();
-        }
+        std::fs::write(&auxiliary[1], b"selector").unwrap();
+        std::fs::create_dir(&auxiliary[2]).unwrap();
+        std::fs::write(auxiliary[2].join("generation"), b"archive").unwrap();
+        std::fs::write(&auxiliary[3], b"install receipt").unwrap();
+        std::fs::write(&auxiliary[4], b"back references").unwrap();
         let sibling = library.join("keep");
         std::fs::write(&sibling, b"keep").unwrap();
         let id = job_add("wiki", "testwiki", archive.to_str().unwrap(), 86400).unwrap();
@@ -1599,9 +3453,51 @@ mod tests {
         let jobs = jobs_list().unwrap();
         let job = jobs.iter().find(|job| job.id == id).unwrap();
         assert!(job.paused);
-        assert_eq!(job.state, "paused");
+        assert_eq!(job.state, "pending");
         assert!(job.next_due.is_none());
         assert!(job.last_start.is_none());
+    }
+
+    #[test]
+    fn legacy_nullable_outcome_schema_is_replaced_once() {
+        let _guard = crate::depot::TEST_STATE_HOME_LOCK.lock().unwrap();
+        let temporary = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", temporary.path().join("state"));
+        }
+        std::fs::create_dir_all(crate::paths::state_home()).unwrap();
+        let legacy = Connection::open(crate::paths::state_home().join("mirrors.db")).unwrap();
+        legacy
+            .execute_batch(
+                "CREATE TABLE jobs(
+                    id INTEGER PRIMARY KEY,kind TEXT NOT NULL,src TEXT NOT NULL,
+                    dest TEXT NOT NULL,interval_secs INTEGER NOT NULL,
+                    paused INTEGER NOT NULL,last_start INTEGER,last_end INTEGER,
+                    last_exit INTEGER,last_detail TEXT NOT NULL,media_source TEXT
+                 );
+                 INSERT INTO jobs VALUES
+                    (1,'cmd','true','/legacy',3600,0,10,NULL,NULL,'partial',NULL);",
+            )
+            .unwrap();
+        drop(legacy);
+
+        let migrated = db().unwrap();
+        let columns = migrated
+            .prepare("PRAGMA table_info(jobs)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(!columns.iter().any(|column| column.starts_with("last_")));
+        let state: String = migrated
+            .query_row("SELECT state FROM runs WHERE job_id=1", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(state, "interrupted");
+        let version: i64 = migrated
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, MIRROR_SCHEMA_VERSION);
     }
 
     fn sh_git(repo: &std::path::Path, args: &[&str]) {

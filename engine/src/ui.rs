@@ -9119,10 +9119,9 @@ fn rules_lines(app: &App) -> Vec<Line<'static>> {
 fn mirror_state_color(state: &str) -> Color {
     match state {
         "starting" | "running" => Color::Cyan,
-        "stopping" => Color::Yellow,
-        "paused" => Color::DarkGray,
-        "pending" | "stopped" => Color::Yellow,
-        "error" => Color::Red,
+        "stopping" | "deleting" => Color::Yellow,
+        "pending" | "cancelled" => Color::Yellow,
+        "interrupted" | "error" => Color::Red,
         "completed" => Color::Green,
         _ => Color::Reset, // scheduled
     }
@@ -9199,18 +9198,25 @@ fn expand_user_path(input: &str) -> std::path::PathBuf {
 fn discover_wiki_mirrors(
     library: &std::path::Path,
 ) -> Result<Vec<(String, std::path::PathBuf)>, String> {
-    fn inspect(archive: &std::path::Path) -> Result<Option<String>, String> {
-        if !archive.is_dir()
-            || archive.extension().and_then(|value| value.to_str()) != Some("swdump")
-        {
+    fn inspect(
+        candidate: &std::path::Path,
+    ) -> Result<Option<(String, std::path::PathBuf)>, String> {
+        let selector = match candidate.extension().and_then(|value| value.to_str()) {
+            Some("swtitle") if candidate.is_file() => candidate.to_path_buf(),
+            Some("swdump") if candidate.with_extension("swtitle").is_file() => {
+                candidate.with_extension("swtitle")
+            }
+            _ => return Ok(None),
+        };
+        let selector = std::fs::canonicalize(&selector)
+            .map_err(|error| format!("resolve {}: {error}", selector.display()))?;
+        let archive = selector.with_extension("swdump");
+        if !selector.is_file() {
             return Ok(None);
         }
-        let title_index = archive.with_extension("swtitle");
-        let mirror = wikimak_wikipedia::archive_browse::ArchiveBrowseIndex::open(
-            archive,
-            &title_index,
-        )
-        .map_err(|error| format!("cannot open {}: {error}", archive.display()))?;
+        let mirror =
+            wikimak_wikipedia::archive_browse::ArchiveBrowseIndex::open_installed(&archive)
+                .map_err(|error| format!("cannot open {}: {error}", archive.display()))?;
         let dbname = mirror
             .manifest()
             .map(|manifest| manifest.wiki_db.clone())
@@ -9221,14 +9227,12 @@ fn discover_wiki_mirrors(
                 archive.display()
             ));
         }
-        Ok(Some(dbname))
+        Ok(Some((dbname, archive)))
     }
 
     let mut found = Vec::new();
-    if let Some(dbname) = inspect(library)? {
-        let archive = std::fs::canonicalize(library)
-            .map_err(|error| format!("resolve {}: {error}", library.display()))?;
-        found.push((dbname, archive));
+    if let Some(found_mirror) = inspect(library)? {
+        found.push(found_mirror);
     } else if !library.is_dir() {
         return Err(format!(
             "{} is neither a Wikipedia archive nor a directory",
@@ -9241,11 +9245,7 @@ fn discover_wiki_mirrors(
             let entry = entry.map_err(|error| format!("read directory entry: {error}"))?;
             let archive = entry.path();
             match inspect(&archive) {
-                Ok(Some(dbname)) => {
-                    let archive = std::fs::canonicalize(&archive)
-                        .map_err(|error| format!("resolve {}: {error}", archive.display()))?;
-                    found.push((dbname, archive));
-                }
+                Ok(Some(found_mirror)) => found.push(found_mirror),
                 Ok(None) => {}
                 Err(error) => return Err(error),
             }
@@ -9332,11 +9332,16 @@ fn mirrors_lines(app: &App) -> Vec<Line<'static>> {
         } else {
             format!("{} · {}", j.kind, j.src)
         };
+        let cadence = if j.paused {
+            "paused".to_owned()
+        } else {
+            mirror_cadence_label(j.interval_secs)
+        };
         let text = format!(
             " {:<24} {:<10} {:<10} {}{}",
             name,
             j.state,
-            mirror_cadence_label(j.interval_secs),
+            cadence,
             mirror_due_label(j.next_due),
             mirror_row_progress(j),
         );
@@ -10266,7 +10271,7 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
     let want = match modal {
         Modal::Search { rows, .. } => (rows.len() as u16) + 6,
         Modal::ActionMenu { items, .. } => (items.len() as u16) + 5,
-        Modal::Launcher { items, .. } => (items.len() as u16) + 8,
+        Modal::Launcher { items, .. } => (items.len() as u16) + 7,
         Modal::FileGroupPick { rows, .. } => (rows.len() as u16) + 6,
         // rows can wrap (mirror/alias resolution details are long), so
         // budget up to two display rows per item.
@@ -10837,10 +10842,7 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
                 Line::from(""),
                 Line::from(opts),
                 Line::from(Span::styled(
-                    format!(
-                        "{} — applied to box/container launches",
-                        modal_hint_for(BindingContext::ModalLauncher, false)
-                    ),
+                    "Network and environment apply to box/container launches.",
                     Style::default().fg(Color::DarkGray),
                 )),
                 Line::from(""),
@@ -10866,11 +10868,6 @@ fn draw_modal(f: &mut ratatui::Frame, area: Rect, modal: &Modal, app: &App) {
                     ),
                 ]));
             }
-            body.push(Line::from(""));
-            body.push(Line::from(Span::styled(
-                modal_hint_for(BindingContext::ModalLauncher, false),
-                Style::default().fg(Color::Gray),
-            )));
             (" new PTY ", body)
         }
         Modal::ImagePicker { crumbs, stack } => {
@@ -12728,7 +12725,12 @@ fn key_bar_key_style(app: &App, binding: &Binding) -> Style {
         if app
             .mirror_jobs
             .iter()
-            .any(|job| matches!(job.state.as_str(), "error" | "stopped"))
+            .any(|job| {
+                matches!(
+                    job.state.as_str(),
+                    "error" | "cancelled" | "interrupted"
+                )
+            })
         {
             Some(Color::Red)
         } else if app.mirror_jobs.iter().any(crate::mirrors::Job::is_live) {
@@ -18072,7 +18074,7 @@ fn open_pty_menu(app: &mut App) {
     if !app.tap_ok && app.launch_net == 0 && !app.net_auto_bumped {
         app.launch_net = 1;
         app.net_auto_bumped = true;
-        app.status = "tap networking unavailable here (no CLONE_NEWNET) — \
+        app.status = "tap networking unavailable here (tap ✗; no CLONE_NEWNET) — \
                       network: HOST pre-selected"
             .into();
     }
@@ -24196,7 +24198,7 @@ mod tests {
             "last_end": 2,
             "last_exit": 1,
             "last_detail": "*** [nodes/content-000098.done] Error 1\nwikimak: mediawiki: xml error: curl returned HTTP 429",
-            "state": "paused",
+            "state": "error",
             "next_due": null,
             "build_phase": "fetching and parsing",
             "targets_total": 402,
@@ -25639,7 +25641,8 @@ mod tests {
 
     /// The Mirrors pane end to end (headless): a job added to the store shows
     /// up as a "pending" row when the pane gains focus, and the space action
-    /// (pause/resume) flips it to "paused" in both the store and the render.
+    /// (pause/resume) marks the schedule paused without hiding the pending
+    /// run outcome.
     #[test]
     fn mirrors_pane_lists_jobs_and_space_toggles_pause() {
         let _g = crate::depot::TEST_STATE_HOME_LOCK.lock().unwrap();
@@ -25681,7 +25684,7 @@ mod tests {
         run_pane_action(&mut app, PaneAction::MirrorTogglePause);
         let job = app.mirror_jobs.iter().find(|j| j.id == id).unwrap();
         assert!(job.paused);
-        assert_eq!(job.state, "paused");
+        assert_eq!(job.state, "pending");
         let buf = render_to_string(&app, 120, 30).unwrap();
         assert!(buf.contains("paused"), "pause must show:\n{buf}");
     }
@@ -25836,11 +25839,19 @@ mod tests {
             .unwrap();
         let (output, _) = writer.finish().unwrap();
         output.finish().unwrap().persist(archive).unwrap();
+        let generation_id =
+            wikimak_wikipedia::generation::GenerationId::from_plan_bytes(
+                format!("engine-ui-test-portable-wiki:{dbname}").as_bytes(),
+            );
         wikimak_wikipedia::title_index::build(
             archive,
             archive.with_extension("swtitle"),
+            &generation_id,
         )
         .unwrap();
+        let generations = archive.with_extension("generations");
+        std::fs::create_dir(&generations).unwrap();
+        std::fs::rename(archive, generations.join(generation_id.as_str())).unwrap();
     }
 
     #[test]
@@ -25877,10 +25888,12 @@ mod tests {
         assert_eq!(jobs[0].src, "lvwiki");
         assert_eq!(
             std::path::Path::new(&jobs[0].dest),
-            std::fs::canonicalize(&root).unwrap()
+            std::fs::canonicalize(root.parent().unwrap())
+                .unwrap()
+                .join(root.file_name().unwrap())
         );
         assert!(jobs[0].paused);
-        assert_eq!(jobs[0].state, "paused");
+        assert_eq!(jobs[0].state, "pending");
         assert!(jobs[0].next_due.is_none());
         assert!(
             app.status.contains("attached lvwiki paused"),
@@ -25900,7 +25913,12 @@ mod tests {
         let found = discover_wiki_mirrors(&archive).unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].0, "enwiki");
-        assert_eq!(found[0].1, std::fs::canonicalize(&archive).unwrap());
+        assert_eq!(
+            found[0].1,
+            std::fs::canonicalize(archive.parent().unwrap())
+                .unwrap()
+                .join(archive.file_name().unwrap())
+        );
     }
 
     /// 'D' on the Mirrors pane deletes the SELECTED JOB behind a y/n
