@@ -1144,8 +1144,12 @@ fn build_full(
         &|message| eprintln!("{message}"),
     )
     .map_err(|error| error.to_string())?;
-    crate::direct::recover_direct_build_completion(scratch, &plan)
-        .map_err(|error| error.to_string())?;
+    crate::direct::recover_direct_build_completion(
+        scratch,
+        &plan,
+        &|message| eprintln!("{message}"),
+    )
+    .map_err(|error| error.to_string())?;
     if reusable != 0 {
         eprintln!(
             "resuming with {reusable}/{} source targets already durable",

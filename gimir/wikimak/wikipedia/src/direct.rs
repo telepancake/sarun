@@ -854,6 +854,200 @@ struct BuildReceipt {
     stats: PartialStats,
 }
 
+const STAGED_GENERATION_RECEIPT_SCHEMA: u32 = 1;
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct StagedGenerationSegment {
+    name: String,
+    bytes: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct StagedGenerationReceipt {
+    schema: u32,
+    plan_id: String,
+    segments: Vec<StagedGenerationSegment>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum DirectBuildLifecycleState {
+    Empty,
+    NeedsIndex,
+    NeedsCompletionMarker,
+    Ready,
+    MetadataWithoutArchive,
+    ArchiveInspectionFailed(String),
+    ReceiptMissing,
+    ReceiptUnreadable(String),
+    ReceiptMalformed(String),
+    ReceiptSchemaUnsupported(u32),
+    ForeignReceipt(String),
+    ReceiptArchiveMismatch,
+}
+
+impl DirectBuildLifecycleState {
+    fn diagnostic(&self) -> Option<String> {
+        match self {
+            Self::Empty | Self::NeedsIndex | Self::NeedsCompletionMarker | Self::Ready => None,
+            Self::MetadataWithoutArchive => {
+                Some("staged generation metadata exists without its archive".into())
+            }
+            Self::ArchiveInspectionFailed(error) => {
+                Some(format!("cannot inspect staged archive generation: {error}"))
+            }
+            Self::ReceiptMissing => {
+                Some("complete staged archive has no generation receipt".into())
+            }
+            Self::ReceiptUnreadable(error) => {
+                Some(format!("cannot read staged generation receipt: {error}"))
+            }
+            Self::ReceiptMalformed(error) => {
+                Some(format!("staged generation receipt is malformed: {error}"))
+            }
+            Self::ReceiptSchemaUnsupported(schema) => Some(format!(
+                "staged generation receipt has unsupported schema {schema}"
+            )),
+            Self::ForeignReceipt(plan_id) => Some(format!(
+                "staged generation belongs to build {plan_id}, not the active build"
+            )),
+            Self::ReceiptArchiveMismatch => Some(
+                "staged generation receipt segment inventory does not match its archive".into(),
+            ),
+        }
+    }
+}
+
+fn staged_generation_receipt_path(root: &Path) -> PathBuf {
+    root.join("archive.generation.json")
+}
+
+fn staged_generation_segments(path: &Path) -> Result<Vec<StagedGenerationSegment>> {
+    let set = crate::archive_set::ArchiveSetReader::open(path).map_err(map_archive)?;
+    let completion = set
+        .segments()
+        .last()
+        .ok_or(Error::Corrupt("staged archive has no completion segment"))?;
+    if !crate::archive::has_clean_completion_marker(path.join(&completion.name))
+        .map_err(map_archive)?
+    {
+        return Err(Error::Corrupt(
+            "staged archive has no clean completion marker",
+        ));
+    }
+    Ok(set
+        .segments()
+        .iter()
+        .map(|segment| StagedGenerationSegment {
+            name: segment.name.clone(),
+            bytes: segment.bytes,
+        })
+        .collect())
+}
+
+fn persist_staged_generation_receipt(
+    root: &Path,
+    plan: &DirectBuildPlan,
+    archive: &Path,
+) -> Result<()> {
+    let receipt = StagedGenerationReceipt {
+        schema: STAGED_GENERATION_RECEIPT_SCHEMA,
+        plan_id: plan.plan_id.clone(),
+        segments: staged_generation_segments(archive)?,
+    };
+    let path = staged_generation_receipt_path(root);
+    let mut temporary = tempfile::NamedTempFile::new_in(root)?;
+    serde_json::to_writer(&mut temporary, &receipt)
+        .map_err(|_| Error::Corrupt("cannot encode staged generation receipt"))?;
+    temporary.write_all(b"\n")?;
+    temporary.as_file().sync_all()?;
+    temporary
+        .persist(path)
+        .map_err(|error| Error::Io(error.error))?;
+    sync_directory(root)
+}
+
+fn read_staged_generation_receipt(
+    root: &Path,
+) -> std::result::Result<
+    Option<StagedGenerationReceipt>,
+    DirectBuildLifecycleState,
+> {
+    let path = staged_generation_receipt_path(root);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(DirectBuildLifecycleState::ReceiptUnreadable(
+            format!("{}: {error}", path.display()),
+        )),
+    };
+    serde_json::from_slice(&bytes).map(Some).map_err(|error| {
+        DirectBuildLifecycleState::ReceiptMalformed(format!(
+            "{}: {error}",
+            path.display()
+        ))
+    })
+}
+
+fn staged_title_index_matches(archive: &Path, titles: &Path) -> bool {
+    crate::title_index::TitleIndex::open(titles)
+        .and_then(|index| {
+            crate::archive::IndexedArchiveSet::open(archive, &index).map(|_| index)
+        })
+        .is_ok()
+}
+
+fn classify_direct_build_lifecycle(
+    root: &Path,
+    plan: &DirectBuildPlan,
+) -> DirectBuildLifecycleState {
+    let marker = root.join("archive.complete");
+    let archive = root.join("archive.swdump");
+    let titles = archive.with_extension("swtitle");
+    let marker_exists = marker.exists();
+    let titles_exist = titles.exists();
+    let receipt = match read_staged_generation_receipt(root) {
+        Ok(receipt) => receipt,
+        Err(state) => return state,
+    };
+    if !archive.exists() {
+        return if marker_exists || titles_exist || receipt.is_some() {
+            DirectBuildLifecycleState::MetadataWithoutArchive
+        } else {
+            DirectBuildLifecycleState::Empty
+        };
+    }
+    let segments = match staged_generation_segments(&archive) {
+        Ok(segments) => segments,
+        Err(error) => {
+            return DirectBuildLifecycleState::ArchiveInspectionFailed(
+                error.to_string(),
+            );
+        }
+    };
+    let Some(receipt) = receipt else {
+        return DirectBuildLifecycleState::ReceiptMissing;
+    };
+    if receipt.schema != STAGED_GENERATION_RECEIPT_SCHEMA {
+        return DirectBuildLifecycleState::ReceiptSchemaUnsupported(receipt.schema);
+    }
+    if receipt.plan_id != plan.plan_id {
+        return DirectBuildLifecycleState::ForeignReceipt(receipt.plan_id);
+    }
+    if receipt.segments != segments {
+        return DirectBuildLifecycleState::ReceiptArchiveMismatch;
+    }
+    if !staged_title_index_matches(&archive, &titles) {
+        return DirectBuildLifecycleState::NeedsIndex;
+    }
+    let marker_matches = std::fs::read_to_string(&marker)
+        .is_ok_and(|stored| stored.trim_end() == plan.plan_id);
+    if marker_matches {
+        DirectBuildLifecycleState::Ready
+    } else {
+        DirectBuildLifecycleState::NeedsCompletionMarker
+    }
+}
+
 fn plan_part(part: &PlannedPart) -> wikimak_mediawiki::Part {
     part.into()
 }
@@ -1320,53 +1514,36 @@ fn persist_completion_marker(root: &Path, plan: &DirectBuildPlan) -> Result<()> 
 pub(crate) fn recover_direct_build_completion(
     root: &Path,
     plan: &DirectBuildPlan,
+    progress: &(impl Fn(&str) + Sync),
 ) -> Result<bool> {
-    let marker = root.join("archive.complete");
     let output = root.join("archive.swdump");
     let titles = output.with_extension("swtitle");
-    let marker_matches = std::fs::read_to_string(&marker)
-        .is_ok_and(|stored| stored.trim_end() == plan.plan_id);
-    if output.exists()
-        && archive_file_complete(&output)
-        && (marker_matches || archive_records_are_readable(&output))
-    {
-        let title_matches = crate::title_index::TitleIndex::open(&titles)
-            .and_then(|index| {
-                crate::archive::IndexedArchiveSet::open(&output, &index)
-                    .map(|_| index)
-            })
-            .is_ok();
-        if !title_matches {
+    match classify_direct_build_lifecycle(root, plan) {
+        DirectBuildLifecycleState::Empty => Ok(false),
+        DirectBuildLifecycleState::NeedsIndex => {
+            progress("completed archive recovered; building title and frame index");
             crate::title_index::build(&output, &titles).map_err(map_archive)?;
-        }
-        if !marker_matches {
+            progress("title and frame index rebuilt from completed archive");
             persist_completion_marker(root, plan)?;
+            Ok(true)
         }
-        return Ok(true);
-    }
-    if output.exists() {
-        if output.is_dir() {
-            std::fs::remove_dir_all(&output)?;
-        } else {
-            std::fs::remove_file(&output)?;
+        DirectBuildLifecycleState::NeedsCompletionMarker => {
+            progress("completed archive and title index recovered; finalizing generation");
+            persist_completion_marker(root, plan)?;
+            Ok(true)
         }
-    }
-    if marker.exists() {
-        std::fs::remove_file(marker)?;
-    }
-    sync_directory(root)?;
-    Ok(false)
-}
-
-fn archive_records_are_readable(path: &Path) -> bool {
-    let Ok(mut reader) = ArchiveRecordReader::open(path) else {
-        return false;
-    };
-    loop {
-        match reader.next_record() {
-            Ok(Some(_)) => {}
-            Ok(None) => return true,
-            Err(_) => return false,
+        DirectBuildLifecycleState::Ready => {
+            progress("completed archive and title index recovered");
+            Ok(true)
+        }
+        inconsistent => {
+            let reason = inconsistent
+                .diagnostic()
+                .expect("all recoverable lifecycle states matched above");
+            Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                reason,
+            )))
         }
     }
 }
@@ -1376,9 +1553,23 @@ pub fn mirror_build_progress(archive: impl AsRef<Path>) -> Option<MirrorBuildPro
     let plan = read_direct_build_plan(&root.join("plan.json")).ok()?;
     let total = plan.target_count() as u64;
     let network_history = read_network_history(&root, &plan);
-    if root.join("archive.complete").exists() {
+    let lifecycle = classify_direct_build_lifecycle(&root, &plan);
+    if lifecycle != DirectBuildLifecycleState::Empty {
+        let phase = match lifecycle {
+            DirectBuildLifecycleState::NeedsIndex => "indexing completed archive".into(),
+            DirectBuildLifecycleState::NeedsCompletionMarker => {
+                "finalizing completed archive and index".into()
+            }
+            DirectBuildLifecycleState::Ready => {
+                "completed generation awaiting installation".into()
+            }
+            DirectBuildLifecycleState::Empty => unreachable!("filtered above"),
+            inconsistent => inconsistent
+                .diagnostic()
+                .expect("all consistent lifecycle states matched above"),
+        };
         return Some(MirrorBuildProgress {
-            phase: "indexing".into(),
+            phase,
             targets_total: total,
             targets_completed: total,
             target_progress: Vec::new(),
@@ -2177,7 +2368,7 @@ pub(crate) fn assemble_direct_build(
     progress: &(impl Fn(&str) + Sync),
 ) -> Result<PathBuf> {
     let output = root.join("archive.swdump");
-    if recover_direct_build_completion(root, plan)? {
+    if recover_direct_build_completion(root, plan, progress)? {
         return Ok(output);
     }
     for (kind, count) in [
@@ -2192,11 +2383,11 @@ pub(crate) fn assemble_direct_build(
     }
     let assembly_name = format!("assembly-{}.partial", plan.plan_id);
     let assembly_path = root.join(&assembly_name);
-    if assembly_path.is_dir()
-        && crate::archive_set::ArchiveSetReader::open(&assembly_path).is_ok()
-    {
+    if assembly_path.is_dir() && archive_file_complete(&assembly_path) {
         progress("installing the already completed assembly checkpoint");
         std::fs::rename(&assembly_path, &output)?;
+        sync_directory(root)?;
+        persist_staged_generation_receipt(root, plan, &output)?;
         crate::title_index::build(&output, output.with_extension("swtitle"))
             .map_err(map_archive)?;
         persist_completion_marker(root, plan)?;
@@ -2640,6 +2831,7 @@ pub(crate) fn assemble_direct_build(
     let completed = file.into_inner().finish().map_err(map_archive)?;
     completed.persist(&output).map_err(map_archive)?;
     sync_directory(&output)?;
+    persist_staged_generation_receipt(root, plan, &output)?;
     progress("writing title and virtual-frame index from the merged record projection");
     title_index
         .finish(&output, output.with_extension("swtitle"))
@@ -4451,6 +4643,485 @@ mod build_graph_tests {
 
     use super::*;
 
+    fn lifecycle_test_plan() -> DirectBuildPlan {
+        let mut plan = DirectBuildPlan {
+            schema: 1,
+            plan_id: String::new(),
+            wiki_db: "testwiki".into(),
+            content_snapshot: "2024-06-01".into(),
+            metadata_snapshot: "2024-06".into(),
+            observed_at_micros: 1,
+            frame_target: 1,
+            range_target: 1,
+            compression_level: 1,
+            ref_prefix_sample_bytes: 2,
+            ref_prefix_bytes: 1,
+            content_groups: Vec::new(),
+            history_files: Vec::new(),
+        };
+        plan.plan_id = direct_plan_id(&plan).unwrap();
+        plan
+    }
+
+    fn write_lifecycle_test_archive(root: &Path) {
+        let output =
+            crate::archive_set::ArchiveSetOutput::new_in(root, 1024).unwrap();
+        let mut writer = ArchiveWriter::with_ref_prefix(
+            output,
+            128,
+            CompressionSettings {
+                level: 1,
+                ..CompressionSettings::default()
+            },
+            b"test reference prefix",
+        )
+        .unwrap();
+        writer
+            .write(&Record::SiteInfo {
+                timestamp_micros: 1,
+                site_info: SiteInfoRecord {
+                    site_name: "Test".into(),
+                    db_name: "testwiki".into(),
+                    base: "https://example.invalid/wiki/Main_Page".into(),
+                    generator: "MediaWiki".into(),
+                    case: "first-letter".into(),
+                    language: "en".into(),
+                    rtl: false,
+                    server: "https://example.invalid".into(),
+                    script_path: "/w".into(),
+                    namespaces: Vec::new(),
+                    interwiki: Vec::new(),
+                    magic_words: Vec::new(),
+                },
+            })
+            .unwrap();
+        let (output, _) = writer.finish().unwrap();
+        output
+            .finish()
+            .unwrap()
+            .persist(root.join("archive.swdump"))
+            .unwrap();
+    }
+
+    #[test]
+    fn direct_build_lifecycle_classification_and_recovery_are_exhaustive() {
+        #[derive(Clone, Copy)]
+        enum ArchiveFixture {
+            Absent,
+            Incomplete,
+            Complete,
+        }
+        #[derive(Clone, Copy)]
+        enum ReceiptFixture {
+            Absent,
+            Matching,
+            Foreign,
+            Malformed,
+            Unreadable,
+            WrongSchema,
+            WrongInventory,
+        }
+        #[derive(Clone, Copy)]
+        enum IndexFixture {
+            Absent,
+            Matching,
+        }
+        #[derive(Clone, Copy)]
+        enum MarkerFixture {
+            Absent,
+            Matching,
+            Wrong,
+        }
+        struct Case {
+            name: &'static str,
+            archive: ArchiveFixture,
+            receipt: ReceiptFixture,
+            index: IndexFixture,
+            marker: MarkerFixture,
+            expected: &'static str,
+            diagnostic: Option<&'static str>,
+            recovery: std::result::Result<bool, ()>,
+        }
+
+        let state_name = |state: &DirectBuildLifecycleState| match state {
+            DirectBuildLifecycleState::Empty => "empty",
+            DirectBuildLifecycleState::NeedsIndex => "needs-index",
+            DirectBuildLifecycleState::NeedsCompletionMarker => "needs-marker",
+            DirectBuildLifecycleState::Ready => "ready",
+            DirectBuildLifecycleState::MetadataWithoutArchive => "metadata-without-archive",
+            DirectBuildLifecycleState::ArchiveInspectionFailed(_) => "archive-inspection-failed",
+            DirectBuildLifecycleState::ReceiptMissing => "receipt-missing",
+            DirectBuildLifecycleState::ReceiptUnreadable(_) => "receipt-unreadable",
+            DirectBuildLifecycleState::ReceiptMalformed(_) => "receipt-malformed",
+            DirectBuildLifecycleState::ReceiptSchemaUnsupported(_) => "receipt-schema",
+            DirectBuildLifecycleState::ForeignReceipt(_) => "receipt-foreign",
+            DirectBuildLifecycleState::ReceiptArchiveMismatch => "receipt-archive-mismatch",
+        };
+
+        let cases = [
+            Case {
+                name: "empty",
+                archive: ArchiveFixture::Absent,
+                receipt: ReceiptFixture::Absent,
+                index: IndexFixture::Absent,
+                marker: MarkerFixture::Absent,
+                expected: "empty",
+                diagnostic: None,
+                recovery: Ok(false),
+            },
+            Case {
+                name: "metadata without archive",
+                archive: ArchiveFixture::Absent,
+                receipt: ReceiptFixture::Foreign,
+                index: IndexFixture::Absent,
+                marker: MarkerFixture::Absent,
+                expected: "metadata-without-archive",
+                diagnostic: Some("metadata exists without its archive"),
+                recovery: Err(()),
+            },
+            Case {
+                name: "incomplete archive",
+                archive: ArchiveFixture::Incomplete,
+                receipt: ReceiptFixture::Absent,
+                index: IndexFixture::Absent,
+                marker: MarkerFixture::Absent,
+                expected: "archive-inspection-failed",
+                diagnostic: Some("cannot inspect staged archive generation"),
+                recovery: Err(()),
+            },
+            Case {
+                name: "complete archive without receipt",
+                archive: ArchiveFixture::Complete,
+                receipt: ReceiptFixture::Absent,
+                index: IndexFixture::Absent,
+                marker: MarkerFixture::Absent,
+                expected: "receipt-missing",
+                diagnostic: Some("has no generation receipt"),
+                recovery: Err(()),
+            },
+            Case {
+                name: "complete archive with foreign receipt",
+                archive: ArchiveFixture::Complete,
+                receipt: ReceiptFixture::Foreign,
+                index: IndexFixture::Absent,
+                marker: MarkerFixture::Absent,
+                expected: "receipt-foreign",
+                diagnostic: Some("belongs to build wrong"),
+                recovery: Err(()),
+            },
+            Case {
+                name: "complete archive with malformed receipt",
+                archive: ArchiveFixture::Complete,
+                receipt: ReceiptFixture::Malformed,
+                index: IndexFixture::Absent,
+                marker: MarkerFixture::Absent,
+                expected: "receipt-malformed",
+                diagnostic: Some("receipt is malformed"),
+                recovery: Err(()),
+            },
+            Case {
+                name: "complete archive with unreadable receipt",
+                archive: ArchiveFixture::Complete,
+                receipt: ReceiptFixture::Unreadable,
+                index: IndexFixture::Absent,
+                marker: MarkerFixture::Absent,
+                expected: "receipt-unreadable",
+                diagnostic: Some("cannot read staged generation receipt"),
+                recovery: Err(()),
+            },
+            Case {
+                name: "complete archive with unsupported receipt schema",
+                archive: ArchiveFixture::Complete,
+                receipt: ReceiptFixture::WrongSchema,
+                index: IndexFixture::Absent,
+                marker: MarkerFixture::Absent,
+                expected: "receipt-schema",
+                diagnostic: Some("unsupported schema"),
+                recovery: Err(()),
+            },
+            Case {
+                name: "complete archive with wrong receipt inventory",
+                archive: ArchiveFixture::Complete,
+                receipt: ReceiptFixture::WrongInventory,
+                index: IndexFixture::Absent,
+                marker: MarkerFixture::Absent,
+                expected: "receipt-archive-mismatch",
+                diagnostic: Some("inventory does not match"),
+                recovery: Err(()),
+            },
+            Case {
+                name: "bound archive needs index",
+                archive: ArchiveFixture::Complete,
+                receipt: ReceiptFixture::Matching,
+                index: IndexFixture::Absent,
+                marker: MarkerFixture::Absent,
+                expected: "needs-index",
+                diagnostic: None,
+                recovery: Ok(true),
+            },
+            Case {
+                name: "completion marker cannot substitute for index",
+                archive: ArchiveFixture::Complete,
+                receipt: ReceiptFixture::Matching,
+                index: IndexFixture::Absent,
+                marker: MarkerFixture::Matching,
+                expected: "needs-index",
+                diagnostic: None,
+                recovery: Ok(true),
+            },
+            Case {
+                name: "bound archive and index need final marker",
+                archive: ArchiveFixture::Complete,
+                receipt: ReceiptFixture::Matching,
+                index: IndexFixture::Matching,
+                marker: MarkerFixture::Absent,
+                expected: "needs-marker",
+                diagnostic: None,
+                recovery: Ok(true),
+            },
+            Case {
+                name: "wrong final marker is replaced only after binding and index",
+                archive: ArchiveFixture::Complete,
+                receipt: ReceiptFixture::Matching,
+                index: IndexFixture::Matching,
+                marker: MarkerFixture::Wrong,
+                expected: "needs-marker",
+                diagnostic: None,
+                recovery: Ok(true),
+            },
+            Case {
+                name: "ready",
+                archive: ArchiveFixture::Complete,
+                receipt: ReceiptFixture::Matching,
+                index: IndexFixture::Matching,
+                marker: MarkerFixture::Matching,
+                expected: "ready",
+                diagnostic: None,
+                recovery: Ok(true),
+            },
+        ];
+
+        for case in cases {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path();
+            let plan = lifecycle_test_plan();
+            match case.archive {
+                ArchiveFixture::Absent => {}
+                ArchiveFixture::Incomplete => {
+                    std::fs::create_dir(root.join("archive.swdump")).unwrap();
+                    std::fs::write(
+                        root.join("archive.swdump/0000-reference.swdump-part"),
+                        b"incomplete",
+                    )
+                    .unwrap();
+                }
+                ArchiveFixture::Complete => write_lifecycle_test_archive(root),
+            }
+            match case.receipt {
+                ReceiptFixture::Absent => {}
+                ReceiptFixture::Matching => {
+                    persist_staged_generation_receipt(
+                        root,
+                        &plan,
+                        &root.join("archive.swdump"),
+                    )
+                    .unwrap();
+                }
+                ReceiptFixture::Foreign => {
+                    std::fs::write(
+                        staged_generation_receipt_path(root),
+                        br#"{"schema":1,"plan_id":"wrong","segments":[]}"#,
+                    )
+                    .unwrap();
+                }
+                ReceiptFixture::Malformed => {
+                    std::fs::write(staged_generation_receipt_path(root), b"{").unwrap();
+                }
+                ReceiptFixture::Unreadable => {
+                    std::fs::create_dir(staged_generation_receipt_path(root)).unwrap();
+                }
+                ReceiptFixture::WrongSchema | ReceiptFixture::WrongInventory => {
+                    let receipt = StagedGenerationReceipt {
+                        schema: if matches!(case.receipt, ReceiptFixture::WrongSchema) {
+                            2
+                        } else {
+                            STAGED_GENERATION_RECEIPT_SCHEMA
+                        },
+                        plan_id: plan.plan_id.clone(),
+                        segments: Vec::new(),
+                    };
+                    std::fs::write(
+                        staged_generation_receipt_path(root),
+                        serde_json::to_vec(&receipt).unwrap(),
+                    )
+                    .unwrap();
+                }
+            }
+            if matches!(case.index, IndexFixture::Matching) {
+                crate::title_index::build(
+                    root.join("archive.swdump"),
+                    root.join("archive.swtitle"),
+                )
+                .unwrap();
+            }
+            match case.marker {
+                MarkerFixture::Absent => {}
+                MarkerFixture::Matching => {
+                    persist_completion_marker(root, &plan).unwrap();
+                }
+                MarkerFixture::Wrong => {
+                    std::fs::write(root.join("archive.complete"), b"wrong\n").unwrap();
+                }
+            }
+
+            let classified = classify_direct_build_lifecycle(root, &plan);
+            assert_eq!(state_name(&classified), case.expected, "{}", case.name);
+            if let Some(expected) = case.diagnostic {
+                assert!(
+                    classified
+                        .diagnostic()
+                        .is_some_and(|diagnostic| diagnostic.contains(expected)),
+                    "{}: {:?}",
+                    case.name,
+                    classified,
+                );
+            }
+            let recovered = recover_direct_build_completion(root, &plan, &|_| {});
+            match case.recovery {
+                Ok(expected) => {
+                    assert_eq!(recovered.unwrap(), expected, "{}", case.name);
+                    if expected {
+                        assert_eq!(
+                            classify_direct_build_lifecycle(root, &plan),
+                            DirectBuildLifecycleState::Ready,
+                            "{}",
+                            case.name,
+                        );
+                    }
+                }
+                Err(()) => {
+                    assert!(recovered.is_err(), "{}", case.name);
+                    let after = classify_direct_build_lifecycle(root, &plan);
+                    assert_eq!(
+                        state_name(&after),
+                        case.expected,
+                        "{} changed after rejected recovery: {:?}",
+                        case.name,
+                        after,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn structured_progress_reports_indexing_from_staged_generation_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = directory.path().join("testwiki.swdump");
+        let root = crate::cli::mirror_scratch_path(&archive);
+        std::fs::create_dir_all(&root).unwrap();
+        let plan = lifecycle_test_plan();
+        std::fs::write(
+            root.join("plan.json"),
+            serde_json::to_vec(&plan).unwrap(),
+        )
+        .unwrap();
+        write_lifecycle_test_archive(&root);
+        persist_staged_generation_receipt(
+            &root,
+            &plan,
+            &root.join("archive.swdump"),
+        )
+        .unwrap();
+
+        let progress = mirror_build_progress(&archive).unwrap();
+        assert_eq!(progress.phase, "indexing completed archive");
+    }
+
+    #[test]
+    fn name_complete_assembly_without_clean_done_is_not_installed() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        std::fs::create_dir(root.join("nodes")).unwrap();
+        let mut plan = lifecycle_test_plan();
+        plan.content_groups = vec![vec![PlannedPart {
+            url: "https://example.invalid/content.xml".into(),
+            filename: "content.xml".into(),
+            size_bytes: 0,
+            sha256: None,
+            sha1: None,
+            md5: None,
+        }]];
+        plan.plan_id = direct_plan_id(&plan).unwrap();
+
+        let node = root.join("nodes/.candidate");
+        std::fs::create_dir(&node).unwrap();
+        ArchiveWriter::new(
+            std::fs::File::create(node.join("data.swdump")).unwrap(),
+            128,
+        )
+        .unwrap()
+        .finish()
+        .unwrap();
+        let mut siteinfo = ArchiveWriter::new(
+            std::fs::File::create(node.join("siteinfo.swdump")).unwrap(),
+            128,
+        )
+        .unwrap();
+        siteinfo
+            .write(&Record::SiteInfo {
+                timestamp_micros: 1,
+                site_info: SiteInfoRecord {
+                    site_name: "Test".into(),
+                    db_name: "testwiki".into(),
+                    base: "https://example.invalid/wiki/Main_Page".into(),
+                    generator: "MediaWiki".into(),
+                    case: "first-letter".into(),
+                    language: "en".into(),
+                    rtl: false,
+                    server: "https://example.invalid".into(),
+                    script_path: "/w".into(),
+                    namespaces: Vec::new(),
+                    interwiki: Vec::new(),
+                    magic_words: Vec::new(),
+                },
+            })
+            .unwrap();
+        siteinfo.finish().unwrap();
+        publish_node(
+            root,
+            &plan,
+            "content",
+            0,
+            &node,
+            &PartialStats::default(),
+        )
+        .unwrap();
+
+        let assembly = root.join(format!("assembly-{}.partial", plan.plan_id));
+        std::fs::create_dir(&assembly).unwrap();
+        std::fs::write(
+            assembly.join("0000-reference.swdump-part"),
+            b"name-only reference",
+        )
+        .unwrap();
+        std::fs::write(
+            assembly.join("9999-complete.swdump-part"),
+            b"not a DONE frame",
+        )
+        .unwrap();
+        assert!(
+            crate::archive_set::ArchiveSetReader::open(&assembly).is_ok(),
+            "the old fast-path predicate accepted this shape"
+        );
+        assert!(!archive_file_complete(&assembly));
+
+        assert!(assemble_direct_build(root, &plan, &|_| {}).is_err());
+        assert!(assembly.exists(), "invalid checkpoint was renamed away");
+        assert!(!root.join("archive.swdump").exists());
+        assert!(node_path(root, &plan, "content", 0).exists());
+    }
+
     #[test]
     fn phase_changes_are_persisted_only_by_the_periodic_sampler() {
         let directory = tempfile::tempdir().unwrap();
@@ -4999,7 +5670,9 @@ mod build_graph_tests {
         );
         std::fs::remove_file(root.path().join("archive.complete")).unwrap();
         std::fs::remove_file(root.path().join("archive.swtitle")).unwrap();
-        assert!(recover_direct_build_completion(root.path(), &plan).unwrap());
+        assert!(
+            recover_direct_build_completion(root.path(), &plan, &|_| {}).unwrap()
+        );
         crate::title_index::TitleIndex::open(
             root.path().join("archive.swtitle"),
         )

@@ -14,14 +14,15 @@
 //! ended — shown as `stopped`.
 //!
 //! Job states surfaced to the UI/CLI:
+//!   starting   a driver launch is reserved but has not yielded its process ID
 //!   running    a driver process is live right now (in-process set)
 //!   paused     never auto-runs; force-run still works
-//!   pending    due now (never ran, or interval elapsed since last start)
-//!   scheduled  ran, waiting for its interval
-//!   completed  last run exited 0 (and not yet due again) — same row as
-//!              scheduled, the status column shows the outcome
+//!   pending    never ran, or a successful run is due again
+//!   completed  last run exited 0; next due is measured from its completion
 //!   stopped    last run never recorded an end (engine died mid-run)
 //!   error      last run exited non-zero (detail = stderr tail)
+//! Interrupted, failed, and cancelled attempts require an explicit run; they
+//! are not scheduler requests merely because time passed.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -71,6 +72,170 @@ struct RunningProcess {
     wiki: bool,
 }
 
+/// The three independent axes from which a mirror row is projected.
+///
+/// Keep these closed even though the current SQLite row still stores the last
+/// attempt as nullable columns.  All consumers must go through
+/// `classify_job`; nullable-column precedence is not a lifecycle model.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScheduleClass {
+    Enabled,
+    Paused,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AttemptClass {
+    NeverRun,
+    Interrupted,
+    Succeeded { ended_at: i64 },
+    /// The current schema cannot distinguish a driver failure from a
+    /// user-requested signal death.  Both are terminal and require an explicit
+    /// run before another attempt; a later attempt table can split this
+    /// variant without changing scheduler policy.
+    FailedOrCancelled { ended_at: i64 },
+    Invalid,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RuntimeClass {
+    Idle,
+    Starting,
+    Running,
+    Stopping,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DisplayClass {
+    Starting,
+    Running,
+    Stopping,
+    Paused,
+    Pending,
+    Stopped,
+    Error,
+    Completed,
+}
+
+impl DisplayClass {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Starting => "starting",
+            Self::Running => "running",
+            Self::Stopping => "stopping",
+            Self::Paused => "paused",
+            Self::Pending => "pending",
+            Self::Stopped => "stopped",
+            Self::Error => "error",
+            Self::Completed => "completed",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct JobProjection {
+    schedule: ScheduleClass,
+    attempt: AttemptClass,
+    runtime: RuntimeClass,
+    display: DisplayClass,
+    next_due: Option<i64>,
+    automatic_start: bool,
+}
+
+#[derive(Clone, Copy)]
+struct PersistedAttempt {
+    last_start: Option<i64>,
+    last_end: Option<i64>,
+    last_exit: Option<i64>,
+}
+
+fn attempt_class(attempt: PersistedAttempt) -> AttemptClass {
+    match (attempt.last_start, attempt.last_end, attempt.last_exit) {
+        (None, None, None) => AttemptClass::NeverRun,
+        (Some(_), None, None) => AttemptClass::Interrupted,
+        (Some(_), Some(ended_at), Some(0)) => AttemptClass::Succeeded { ended_at },
+        (Some(_), Some(ended_at), Some(_)) => {
+            AttemptClass::FailedOrCancelled { ended_at }
+        }
+        _ => AttemptClass::Invalid,
+    }
+}
+
+fn runtime_class(running: Option<RunningProcess>) -> RuntimeClass {
+    match running {
+        Some(process) if process.stopping => RuntimeClass::Stopping,
+        Some(process) if process.pid == 0 => RuntimeClass::Starting,
+        Some(_) => RuntimeClass::Running,
+        None => RuntimeClass::Idle,
+    }
+}
+
+fn classify_job(
+    paused: bool,
+    attempt: PersistedAttempt,
+    interval_secs: i64,
+    running: Option<RunningProcess>,
+    observed_at: i64,
+) -> JobProjection {
+    let schedule = if paused {
+        ScheduleClass::Paused
+    } else {
+        ScheduleClass::Enabled
+    };
+    let attempt = attempt_class(attempt);
+    let runtime = runtime_class(running);
+
+    if runtime != RuntimeClass::Idle {
+        return JobProjection {
+            schedule,
+            attempt,
+            runtime,
+            display: match runtime {
+                RuntimeClass::Starting => DisplayClass::Starting,
+                RuntimeClass::Running => DisplayClass::Running,
+                RuntimeClass::Stopping => DisplayClass::Stopping,
+                RuntimeClass::Idle => unreachable!("non-idle branch projected idle runtime"),
+            },
+            next_due: None,
+            automatic_start: false,
+        };
+    }
+
+    if schedule == ScheduleClass::Paused {
+        return JobProjection {
+            schedule,
+            attempt,
+            runtime,
+            display: DisplayClass::Paused,
+            next_due: None,
+            automatic_start: false,
+        };
+    }
+
+    let (display, next_due, automatic_start) = match attempt {
+        AttemptClass::NeverRun => (DisplayClass::Pending, Some(observed_at), true),
+        AttemptClass::Interrupted => (DisplayClass::Stopped, None, false),
+        AttemptClass::FailedOrCancelled { .. } | AttemptClass::Invalid => {
+            (DisplayClass::Error, None, false)
+        }
+        AttemptClass::Succeeded { ended_at } => {
+            let due = ended_at.saturating_add(interval_secs.max(0));
+            if due <= observed_at {
+                (DisplayClass::Pending, Some(due), true)
+            } else {
+                (DisplayClass::Completed, Some(due), false)
+            }
+        }
+    };
+    JobProjection {
+        schedule,
+        attempt,
+        runtime,
+        display,
+        next_due,
+        automatic_start,
+    }
+}
+
 /// Jobs whose driver process is live right now.
 static RUNNING: Mutex<Option<HashMap<i64, RunningProcess>>> = Mutex::new(None);
 static PATH_BYTES: Mutex<Option<HashMap<std::path::PathBuf, PathMeasurement>>> = Mutex::new(None);
@@ -104,8 +269,8 @@ pub struct Job {
     /// latest matching official all-maxi release is fetched in ranges.
     #[serde(default)]
     pub media_source: Option<String>,
-    /// Derived: running | paused | pending | stopped | error | completed
-    /// | scheduled (never-ran pending shows as pending too).
+    /// Derived: starting | running | stopping | paused | pending | stopped |
+    /// error | completed.
     pub state: String,
     /// Unix seconds of the next auto run (None while paused/running).
     pub next_due: Option<i64>,
@@ -155,6 +320,16 @@ pub struct Job {
     pub process_cpu_percent: Option<f64>,
     #[serde(default)]
     pub process_rss_bytes: Option<u64>,
+    /// Engine-only scheduler decision from the same closed projection that
+    /// produced `state` and `next_due`; deliberately omitted from the wire.
+    #[serde(skip)]
+    automatic_start: bool,
+}
+
+impl Job {
+    pub fn is_live(&self) -> bool {
+        matches!(self.state.as_str(), "starting" | "running" | "stopping")
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -187,33 +362,20 @@ pub fn library_jobs() -> Result<Vec<LibraryJob>, String> {
 
 fn derive(mut j: Job) -> Job {
     let running = running_map(|m| m.get(&j.id).copied());
-    let live = running.is_some();
-    let due_at = j.last_start.map(|s| s + j.interval_secs);
-    j.state = if running.is_some_and(|process| process.stopping) {
-        "stopping".into()
-    } else if live {
-        "running".into()
-    } else if j.paused {
-        "paused".into()
-    } else if j.last_start.is_some() && j.last_end.is_none() {
-        // A start without an end and no live process: the engine died
-        // mid-run. The store itself self-repairs (crash contracts down
-        // in the mirror crates); the job just shows what happened.
-        "stopped".into()
-    } else if due_at.map(|d| d <= now()).unwrap_or(true) {
-        "pending".into()
-    } else if j.last_exit == Some(0) {
-        "completed".into()
-    } else if j.last_exit.is_some() {
-        "error".into()
-    } else {
-        "scheduled".into()
-    };
-    j.next_due = if j.paused || live {
-        None
-    } else {
-        due_at.or(Some(now()))
-    };
+    let projection = classify_job(
+        j.paused,
+        PersistedAttempt {
+            last_start: j.last_start,
+            last_end: j.last_end,
+            last_exit: j.last_exit,
+        },
+        j.interval_secs,
+        running,
+        now(),
+    );
+    j.state = projection.display.as_str().into();
+    j.next_due = projection.next_due;
+    j.automatic_start = projection.automatic_start;
     j.pid = running.map(|process| process.pid).filter(|pid| *pid != 0);
     if let Some(pid) = j.pid {
         if let Some((cpu, rss)) = process_tree_metrics(pid) {
@@ -411,6 +573,7 @@ pub fn jobs_list() -> Result<Vec<Job>, String> {
                 fetch_transport_errors: None,
                 process_cpu_percent: None,
                 process_rss_bytes: None,
+                automatic_start: false,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -424,7 +587,7 @@ pub fn jobs_list_typed() -> Result<Vec<crate::generated_wire::MirrorJob>, String
         .into_iter()
         .map(|job| {
             let state = match job.state.as_str() {
-                "running" | "stopping" => MirrorState::Running,
+                "starting" | "running" | "stopping" => MirrorState::Running,
                 "paused" => MirrorState::Paused,
                 "pending" => MirrorState::Pending,
                 "stopped" => MirrorState::Stopped,
@@ -736,7 +899,9 @@ pub fn job_run_full(id: i64) -> Result<(), String> {
     Ok(())
 }
 
-/// Start every due, unpaused, not-running job. Returns the started ids.
+/// Start every genuinely pending, unpaused, idle job. Interrupted, failed, and
+/// cancelled attempts remain visible until an explicit run supersedes them.
+/// Returns the started ids.
 pub fn run_pending() -> Result<Vec<i64>, String> {
     let mut started = Vec::new();
     let jobs = jobs_list()?;
@@ -745,9 +910,9 @@ pub fn run_pending() -> Result<Vec<i64>, String> {
     // can still force-run a particular job explicitly.
     let mut wiki_running = jobs
         .iter()
-        .any(|job| job.kind == "wiki" && job.state == "running");
+        .any(|job| job.kind == "wiki" && job.is_live());
     for j in jobs {
-        if j.state == "pending" || j.state == "stopped" {
+        if j.automatic_start {
             if j.kind == "wiki" && wiki_running {
                 continue;
             }
@@ -1073,6 +1238,281 @@ mod tests {
         let tail = tail_2k(&input);
         assert!(tail.len() <= 2048);
         assert!(tail.chars().all(|character| character == 'ā'));
+    }
+
+    #[test]
+    fn lifecycle_projection_matrix() {
+        struct Case {
+            name: &'static str,
+            paused: bool,
+            attempt: PersistedAttempt,
+            interval: i64,
+            runtime: Option<RunningProcess>,
+            now: i64,
+            schedule: ScheduleClass,
+            attempt_class: AttemptClass,
+            runtime_class: RuntimeClass,
+            display: DisplayClass,
+            next_due: Option<i64>,
+            automatic_start: bool,
+        }
+
+        let never = PersistedAttempt {
+            last_start: None,
+            last_end: None,
+            last_exit: None,
+        };
+        let success = PersistedAttempt {
+            last_start: Some(100),
+            last_end: Some(200),
+            last_exit: Some(0),
+        };
+        let interrupted = PersistedAttempt {
+            last_start: Some(100),
+            last_end: None,
+            last_exit: None,
+        };
+        let failed = PersistedAttempt {
+            last_start: Some(100),
+            last_end: Some(200),
+            last_exit: Some(7),
+        };
+        let cases = [
+            Case {
+                name: "never-run enabled job is genuinely pending",
+                paused: false,
+                attempt: never,
+                interval: 100,
+                runtime: None,
+                now: 1_000,
+                schedule: ScheduleClass::Enabled,
+                attempt_class: AttemptClass::NeverRun,
+                runtime_class: RuntimeClass::Idle,
+                display: DisplayClass::Pending,
+                next_due: Some(1_000),
+                automatic_start: true,
+            },
+            Case {
+                name: "successful job waits from completion",
+                paused: false,
+                attempt: success,
+                interval: 100,
+                runtime: None,
+                now: 299,
+                schedule: ScheduleClass::Enabled,
+                attempt_class: AttemptClass::Succeeded { ended_at: 200 },
+                runtime_class: RuntimeClass::Idle,
+                display: DisplayClass::Completed,
+                next_due: Some(300),
+                automatic_start: false,
+            },
+            Case {
+                name: "successful job becomes due",
+                paused: false,
+                attempt: success,
+                interval: 100,
+                runtime: None,
+                now: 300,
+                schedule: ScheduleClass::Enabled,
+                attempt_class: AttemptClass::Succeeded { ended_at: 200 },
+                runtime_class: RuntimeClass::Idle,
+                display: DisplayClass::Pending,
+                next_due: Some(300),
+                automatic_start: true,
+            },
+            Case {
+                name: "long run does not become due based on its start",
+                paused: false,
+                attempt: PersistedAttempt {
+                    last_start: Some(0),
+                    last_end: Some(1_000),
+                    last_exit: Some(0),
+                },
+                interval: 100,
+                runtime: None,
+                now: 1_050,
+                schedule: ScheduleClass::Enabled,
+                attempt_class: AttemptClass::Succeeded { ended_at: 1_000 },
+                runtime_class: RuntimeClass::Idle,
+                display: DisplayClass::Completed,
+                next_due: Some(1_100),
+                automatic_start: false,
+            },
+            Case {
+                name: "restart exposes interrupted attempt without retrying",
+                paused: false,
+                attempt: interrupted,
+                interval: 100,
+                runtime: None,
+                now: 10_000,
+                schedule: ScheduleClass::Enabled,
+                attempt_class: AttemptClass::Interrupted,
+                runtime_class: RuntimeClass::Idle,
+                display: DisplayClass::Stopped,
+                next_due: None,
+                automatic_start: false,
+            },
+            Case {
+                name: "old failed attempt remains an error when time passes",
+                paused: false,
+                attempt: failed,
+                interval: 100,
+                runtime: None,
+                now: 10_000,
+                schedule: ScheduleClass::Enabled,
+                attempt_class: AttemptClass::FailedOrCancelled { ended_at: 200 },
+                runtime_class: RuntimeClass::Idle,
+                display: DisplayClass::Error,
+                next_due: None,
+                automatic_start: false,
+            },
+            Case {
+                name: "signal-cancelled attempt is not an automatic retry",
+                paused: false,
+                attempt: PersistedAttempt {
+                    last_start: Some(100),
+                    last_end: Some(200),
+                    last_exit: Some(-1),
+                },
+                interval: 100,
+                runtime: None,
+                now: 10_000,
+                schedule: ScheduleClass::Enabled,
+                attempt_class: AttemptClass::FailedOrCancelled { ended_at: 200 },
+                runtime_class: RuntimeClass::Idle,
+                display: DisplayClass::Error,
+                next_due: None,
+                automatic_start: false,
+            },
+            Case {
+                name: "pause is orthogonal to a never-run attempt",
+                paused: true,
+                attempt: never,
+                interval: 100,
+                runtime: None,
+                now: 1_000,
+                schedule: ScheduleClass::Paused,
+                attempt_class: AttemptClass::NeverRun,
+                runtime_class: RuntimeClass::Idle,
+                display: DisplayClass::Paused,
+                next_due: None,
+                automatic_start: false,
+            },
+            Case {
+                name: "pause is orthogonal to a due successful attempt",
+                paused: true,
+                attempt: success,
+                interval: 100,
+                runtime: None,
+                now: 1_000,
+                schedule: ScheduleClass::Paused,
+                attempt_class: AttemptClass::Succeeded { ended_at: 200 },
+                runtime_class: RuntimeClass::Idle,
+                display: DisplayClass::Paused,
+                next_due: None,
+                automatic_start: false,
+            },
+            Case {
+                name: "reserved pid zero is typed as starting",
+                paused: false,
+                attempt: never,
+                interval: 100,
+                runtime: Some(RunningProcess {
+                    pid: 0,
+                    stopping: false,
+                    wiki: true,
+                }),
+                now: 1_000,
+                schedule: ScheduleClass::Enabled,
+                attempt_class: AttemptClass::NeverRun,
+                runtime_class: RuntimeClass::Starting,
+                display: DisplayClass::Starting,
+                next_due: None,
+                automatic_start: false,
+            },
+            Case {
+                name: "owned child is typed as running",
+                paused: true,
+                attempt: interrupted,
+                interval: 100,
+                runtime: Some(RunningProcess {
+                    pid: 42,
+                    stopping: false,
+                    wiki: true,
+                }),
+                now: 1_000,
+                schedule: ScheduleClass::Paused,
+                attempt_class: AttemptClass::Interrupted,
+                runtime_class: RuntimeClass::Running,
+                display: DisplayClass::Running,
+                next_due: None,
+                automatic_start: false,
+            },
+            Case {
+                name: "stop request is typed as stopping",
+                paused: false,
+                attempt: interrupted,
+                interval: 100,
+                runtime: Some(RunningProcess {
+                    pid: 42,
+                    stopping: true,
+                    wiki: true,
+                }),
+                now: 1_000,
+                schedule: ScheduleClass::Enabled,
+                attempt_class: AttemptClass::Interrupted,
+                runtime_class: RuntimeClass::Stopping,
+                display: DisplayClass::Stopping,
+                next_due: None,
+                automatic_start: false,
+            },
+            Case {
+                name: "invalid nullable row fails closed",
+                paused: false,
+                attempt: PersistedAttempt {
+                    last_start: None,
+                    last_end: Some(200),
+                    last_exit: Some(0),
+                },
+                interval: 100,
+                runtime: None,
+                now: 1_000,
+                schedule: ScheduleClass::Enabled,
+                attempt_class: AttemptClass::Invalid,
+                runtime_class: RuntimeClass::Idle,
+                display: DisplayClass::Error,
+                next_due: None,
+                automatic_start: false,
+            },
+        ];
+
+        for case in cases {
+            let projection = classify_job(
+                case.paused,
+                case.attempt,
+                case.interval,
+                case.runtime,
+                case.now,
+            );
+            assert_eq!(projection.schedule, case.schedule, "{}: schedule", case.name);
+            assert_eq!(
+                projection.attempt, case.attempt_class,
+                "{}: attempt",
+                case.name
+            );
+            assert_eq!(
+                projection.runtime, case.runtime_class,
+                "{}: runtime",
+                case.name
+            );
+            assert_eq!(projection.display, case.display, "{}: display", case.name);
+            assert_eq!(projection.next_due, case.next_due, "{}: next due", case.name);
+            assert_eq!(
+                projection.automatic_start, case.automatic_start,
+                "{}: scheduler eligibility",
+                case.name
+            );
+        }
     }
 
     #[test]

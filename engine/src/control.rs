@@ -11110,7 +11110,10 @@ pub fn cli_mirror(argv: &[String]) -> i32 {
                             _ => String::new(),
                         }
                     );
-                    let live = matches!(g("state").as_str(), Some("running") | Some("stopping"));
+                    let live = matches!(
+                        g("state").as_str(),
+                        Some("starting") | Some("running") | Some("stopping")
+                    );
                     if live {
                         let progress = match (
                             g("source_bytes_completed").as_u64(),

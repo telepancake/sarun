@@ -9118,7 +9118,7 @@ fn rules_lines(app: &App) -> Vec<Line<'static>> {
 /// Color for a mirror job's derived state (mirrors.rs doc list).
 fn mirror_state_color(state: &str) -> Color {
     match state {
-        "running" => Color::Cyan,
+        "starting" | "running" => Color::Cyan,
         "stopping" => Color::Yellow,
         "paused" => Color::DarkGray,
         "pending" | "stopped" => Color::Yellow,
@@ -9360,7 +9360,7 @@ fn mirrors_lines(app: &App) -> Vec<Line<'static>> {
 /// pane can be scrolled, and a user should not have to discover that by trial
 /// and error just to learn whether a large import is still doing work.
 fn mirror_row_progress(j: &crate::mirrors::Job) -> String {
-    if !matches!(j.state.as_str(), "running" | "stopping") {
+    if !j.is_live() {
         return String::new();
     }
     let source = match (j.source_bytes_completed, j.source_bytes_total) {
@@ -9755,20 +9755,17 @@ fn mirror_detail_lines(app: &App) -> Vec<Line<'static>> {
     // Put the actionable part first.  On a narrow terminal the right pane is
     // often at its top when selected, while the complete receipt/stderr tail
     // is intentionally kept further down for inspection.
-    let show_live_build = matches!(j.state.as_str(), "running" | "stopping");
+    let show_live_build = j.is_live();
+    let has_structured_build = j.build_phase.is_some()
+        || j.source_bytes_total.is_some()
+        || j.targets_total.is_some()
+        || !j.target_progress.is_empty()
+        || !j.targets_active.is_empty();
     if show_live_build {
         out.push(Line::from(Span::styled(
-            if matches!(j.state.as_str(), "running" | "stopping") {
-                "LIVE PROGRESS"
-            } else {
-                "LAST BUILD STATE"
-            },
+            "LIVE PROGRESS",
             Style::default()
-                .fg(if matches!(j.state.as_str(), "running" | "stopping") {
-                    Color::Green
-                } else {
-                    Color::Yellow
-                })
+                .fg(Color::Green)
                 .add_modifier(Modifier::BOLD),
         )));
         if let (Some(done), Some(total)) = (j.source_bytes_completed, j.source_bytes_total) {
@@ -9867,7 +9864,7 @@ fn mirror_detail_lines(app: &App) -> Vec<Line<'static>> {
     if let Some(pid) = j.pid {
         out.push(field("pid", pid.to_string()));
     }
-    if let Some(started) = j.last_start.filter(|_| j.state == "running" || j.state == "stopping") {
+    if let Some(started) = j.last_start.filter(|_| j.is_live()) {
         let elapsed = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|duration| duration.as_secs() as i64 - started)
@@ -9981,7 +9978,7 @@ fn mirror_detail_lines(app: &App) -> Vec<Line<'static>> {
     // progress view.  Reprinting the event log here made the same phase,
     // source and target information appear twice.  Keep the log for a
     // completed/failed run, where it is the useful historical receipt.
-    if !j.last_detail.is_empty() && !matches!(j.state.as_str(), "running" | "stopping") {
+    if !j.last_detail.is_empty() && (!show_live_build || !has_structured_build) {
         out.push(Line::from(""));
         out.push(Line::from(Span::styled(
             format!("EVENTS · job #{}", j.id),
@@ -12734,7 +12731,7 @@ fn key_bar_key_style(app: &App, binding: &Binding) -> Style {
             .any(|job| matches!(job.state.as_str(), "error" | "stopped"))
         {
             Some(Color::Red)
-        } else if app.mirror_jobs.iter().any(|job| job.state == "running") {
+        } else if app.mirror_jobs.iter().any(crate::mirrors::Job::is_live) {
             Some(Color::Green)
         } else if app.mirror_jobs.iter().any(|job| job.state == "pending") {
             Some(Color::Yellow)
@@ -20846,7 +20843,7 @@ fn run_interactive(sock: &str) -> Result<(), String> {
             let mirror_is_live = app
                 .mirror_jobs
                 .iter()
-                .any(|job| matches!(job.state.as_str(), "running" | "stopping"));
+                .any(crate::mirrors::Job::is_live);
             if (app.focus == Pane::Mirrors || mirror_is_live)
                 && app
                     .mirrors_loaded_at
