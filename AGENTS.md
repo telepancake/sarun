@@ -27,6 +27,8 @@ record why the chosen tradeoff is reasonable.
 For repository-wide or cross-process work, start with
 `docs/architecture/SYSTEM_MODEL.md`. It is the reconciled inventory and gap
 register; update it when ownership, artifacts, or transition coverage changes.
+For cleanup, recovery, import, or storage work, also read
+`docs/engineering/POSTMORTEM-2026-08-06.md` before acting.
 
 Classify the affected subsystem before editing:
 
