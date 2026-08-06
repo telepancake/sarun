@@ -32,6 +32,11 @@ For cleanup, recovery, import, or storage work, read
 where reusable, expensive inputs were destroyed because an agent acted before
 understanding the artifacts.
 
+For delegated work, parallel sessions, or formal verification artifacts, also
+read `docs/engineering/AGENT_WORK_PROTOCOL.md`. It defines the parent agent's
+responsibility, handoff format, interference controls, and reproducible
+tooling policy.
+
 ## Understand the problem before choosing a mechanism
 
 Begin with the user-visible work and its constraints:
