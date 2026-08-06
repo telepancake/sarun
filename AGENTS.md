@@ -166,7 +166,8 @@ Write invariants before transition implementation. Typical invariants include:
 - open readers keep a complete generation across publication;
 - optional media and cleanup cannot retroactively fail committed text data;
 - authoritative inputs survive until the output commit is durable;
-- invalid-state handling is non-destructive.
+- invalid installed state is non-destructive; classified malformed or foreign
+  private scratch may be discarded when the current design cannot consume it.
 
 Name the exact publication operation—normally a destination-local atomic
 rename followed by directory fsync. “The files are mostly there” is not a
@@ -188,7 +189,9 @@ For each durable transition, reason about interruption:
 After each boundary, the read-only inspector must return one exact valid state
 or one exact invalid-state diagnostic without mutation. Recovery is an
 explicit transition from that state. It must not guess, silently bless foreign
-work, or delete ambiguous data.
+work, or delete ambiguous data. A classified malformed/foreign temporary tree
+whose format is not part of the current product may instead be explicitly
+discarded; do not add an adoption or compatibility path merely to retain it.
 
 ## 9. Predict performance before running
 

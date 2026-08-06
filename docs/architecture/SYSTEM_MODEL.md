@@ -192,10 +192,12 @@ Target receipts bind source identity and plan identity. Assembly consumes only
 valid target receipts. Invalid or foreign construction evidence is reported by
 the inspector. **Abandon invalid construction** is an explicit event: it
 removes only scratch belonging to the selected destination/operation while
-preserving an installed generation. Normal full fetch uses it only for
-classified malformed/foreign temporary evidence without a candidate, and
-`wikimak reset` exposes the deliberate cleanup transition. Ambiguous I/O,
-contradictory evidence, and candidate-bearing trees remain visible errors.
+preserving an installed generation. Normal full fetch uses it for classified
+malformed/foreign temporary evidence, and `wikimak reset` exposes the
+deliberate cleanup transition. Any candidate-like
+files inside that rejected operation are discarded with its scratch; they are
+not adopted through a compatibility path. Ambiguous I/O and contradictory
+evidence remain visible errors.
 
 ### Installation and serving
 
@@ -266,10 +268,10 @@ that makes the transition reviewable.
 | mirror run | `starting/running + cancel` | current RunId matches caller | persist `stopping`, signal its group, await matching exit | spawn-after-stop test; all interleavings open |
 | mirror run | active row + engine restart | persisted group is safe to signal | terminate/reap group, then terminalize row; diagnostics do not stop other rows | restart regression test passes; macOS incarnation token open |
 | build | `unplanned + fetch` | destination lock held | write plan identity before source work | full-build tests; source failure matrix open |
-| build | invalid scratch + normal fetch | inspector classifies malformed/foreign and no candidate exists | remove only scratch, recreate plan; installed selector untouched | reported wedge regression passes |
-| build | invalid/ambiguous scratch + reset | explicit reset, no candidate or contradictory evidence | clear private scratch; otherwise typed refusal | reset tests pass; receipt-boundary failpoints open |
+| build | invalid scratch + normal fetch | inspector classifies malformed/foreign | remove the rejected operation's entire scratch, recreate plan; installed selector untouched | reported wedge regression passes |
+| build | invalid/ambiguous scratch + reset | explicit reset; contradictory evidence still refuses | clear classified private scratch; never adopt it | reset tests pass; receipt-boundary failpoints open |
 | update | `planned + worker success` | plan/source/base identities match | publish tail receipt atomically | update phase tests |
-| update | invalid active update + fetch | no committed candidate exists | abandon update scratch and create a new update plan | invalid-update regression passes |
+| update | invalid active update + fetch | selector is classified malformed/foreign | discard the rejected update's private output and create a new update plan | invalid-update discard regression passes |
 | publication | candidate + commit | archive, title index, receipts bind one GenerationId | durable receipt, selector replacement, directory sync | selector tests; crash-window matrix open |
 | publication | selector/generation mismatch + inspect | no repair authority inferred | report invalid state; never serve guessed data | inspector exists; repair transition open |
 | serving | reader + publication | lease acquired on selected generation | serve old or new complete generation, never a partial tree | generation tests; sidecar generation binding open |
@@ -294,9 +296,10 @@ boundary the other does not own:
    interleaving.
 2. **Invalid construction recovery (fixed for the reported wedge):** malformed
    full-build and update scratch now have a typed abandon transition. Normal
-   fetch automatically uses it only for temporary malformed/foreign evidence
-   without a candidate; `wikimak reset` is available for deliberate cleanup.
-   I/O, contradictory, and candidate-bearing states remain visible errors.
+   fetch automatically uses it for temporary malformed/foreign evidence and
+   discards the rejected operation's private output; `wikimak reset` is
+   available for deliberate cleanup. I/O and contradictory states remain
+   visible errors.
 3. **Publication orphan recovery:** crash windows around generation rename,
    pending selector, receipt, selector replacement, and directory fsync are not
    all inventoried or tested.
@@ -322,7 +325,7 @@ found; it does not mean the machine is complete.
 | engine startup/shutdown | control/UI unit tests and `prototype/test_*_rs.py` socket workflows | partial startup, incompatible replacement, orderly drain of every child/resource |
 | box registration | FUSE/backend/QEMU/SUD prototype suites | rollback after each insertion, guest EOF/worker death, concurrent shutdown |
 | slips/jobserver/build executors | `slippool` unit tests, Kati corpus, integration builds | PID incarnation, guest slip death, nested concurrent make/cache/cwd isolation |
-| full-build inspector | target/event tests plus malformed-plan abandon/preservation tests in `build_lifecycle.rs` and `cli.rs` | failpoints for every receipt boundary; contradictory evidence is intentionally a typed refusal |
+| full-build inspector | target/event tests plus malformed-plan abandon/discard tests in `build_lifecycle.rs` and `cli.rs` | failpoints for every receipt boundary; contradictory evidence is intentionally a typed refusal |
 | update inspector | update phase matrix, receipt identity tests, and invalid-update preservation test | publication crash windows, orphan candidate repair |
 | generation installation | selector/generation/reader-lease tests | pending selector/orphan generation matrix, selector-unchanged missing generation |
 | direct serving | `serve_e2e`, archive/title/frame tests | history parity, all-pages indexed path, as-of siteinfo/sidecar semantics |

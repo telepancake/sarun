@@ -479,9 +479,11 @@ fn invalid(
 ///
 /// I/O failures and contradictory evidence are not recoverable by deletion:
 /// the inspector cannot establish what durable state is present.  A malformed
-/// or foreign temporary receipt, on the other hand, can be discarded when no
-/// complete candidate archive has been committed in the tree.  The caller
-/// still owns the destination-local lock and performs the actual deletion.
+/// or foreign temporary receipt, on the other hand, can be discarded.  Any
+/// archive beside such a receipt is construction output bound to an operation
+/// the current program cannot interpret; there is deliberately no adoption or
+/// compatibility path for it.  The caller still owns the destination-local
+/// lock and performs the actual deletion.
 pub(crate) fn transition_invalid_build(
     root: &Path,
     state: &InvalidBuildState,
@@ -510,24 +512,9 @@ pub(crate) fn transition_invalid_build(
             ),
         ));
     }
-    // A complete candidate has its own archive/index/receipt evidence.  It is
-    // a recoverable construction result, not disposable scratch.
-    const CANDIDATE_FILES: [&str; 4] = [
-        "archive.swdump",
-        "archive.swtitle",
-        "archive.receipt.json",
-        "archive.generation.json",
-    ];
-    if CANDIDATE_FILES
-        .iter()
-        .any(|name| root.join(name).exists())
-    {
-        return Err(invalid(
-            InvalidBuildKind::ContradictoryEvidence,
-            root,
-            "invalid build state has a candidate archive; preserve it for explicit repair",
-        ));
-    }
+    // Do not inspect or adopt candidate-looking files here. They are private
+    // output of the rejected operation and are removed with the rest of its
+    // scratch tree by the caller.
     Ok(InvalidBuildTransition::AbandonScratch)
 }
 
@@ -2102,7 +2089,7 @@ mod tests {
     }
 
     #[test]
-    fn contradictory_or_candidate_build_is_not_auto_abandoned() {
+    fn contradictory_build_is_not_auto_abandoned_but_foreign_scratch_is() {
         let root = tempfile::tempdir().unwrap();
         let contradictory = InvalidBuildState {
             kind: InvalidBuildKind::ContradictoryEvidence,
@@ -2122,12 +2109,15 @@ mod tests {
             path: root.path().join("nodes/receipt.json"),
             diagnostic: "target belongs to another plan".into(),
         };
-        assert!(transition_invalid_build(
-            root.path(),
-            &foreign,
-            InvalidBuildEvent::AbandonInvalidScratch,
-        )
-        .is_err());
+        assert_eq!(
+            transition_invalid_build(
+                root.path(),
+                &foreign,
+                InvalidBuildEvent::AbandonInvalidScratch,
+            )
+            .unwrap(),
+            InvalidBuildTransition::AbandonScratch
+        );
     }
 
     #[test]

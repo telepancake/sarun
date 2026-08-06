@@ -132,18 +132,12 @@ fn clear_mirror_scratch(scratch: &Path) -> Result<(), String> {
 
 /// Abandon a malformed/foreign construction tree while holding its
 /// destination-local build lock.  The lifecycle inspector decides whether
-/// deletion is safe; this function only removes the private scratch tree and
-/// never touches the selected generation or any candidate publication.
+/// state is disposable; this function removes that operation's entire
+/// private scratch tree and never touches the selected installed generation.
 fn abandon_invalid_build(
     scratch: &Path,
     state: &crate::build_lifecycle::InvalidBuildState,
 ) -> Result<(), String> {
-    if update_scratch_has_committed_candidate(scratch) {
-        return Err(format!(
-            "invalid temporary build state has a committed update candidate; preserving it: {}",
-            state
-        ));
-    }
     crate::build_lifecycle::transition_invalid_build(
         scratch,
         state,
@@ -2478,35 +2472,10 @@ fn cmd_refresh_full(dbname: &str, archive: &str, run_id: Option<&str>) -> Result
     )
 }
 
-fn update_candidate_is_committed(paths: &update_lifecycle::UpdatePaths) -> bool {
-    [
-        paths.candidate_inventory(),
-        paths.prepared_generation(),
-        paths.commit_receipt(),
-    ]
-    .iter()
-    .any(|path| path.exists())
-}
-
-fn update_scratch_has_committed_candidate(scratch: &Path) -> bool {
-    let Ok(entries) = std::fs::read_dir(scratch.join("updates")) else {
-        return false;
-    };
-    entries.filter_map(Result::ok).any(|entry| {
-        entry.file_type().is_ok_and(|kind| kind.is_dir())
-            && update_candidate_is_committed(&update_lifecycle::UpdatePaths::new(entry.path()))
-    })
-}
-
 fn abandon_invalid_update(
     scratch: &Path,
     detail: impl std::fmt::Display,
 ) -> Result<(), String> {
-    if update_scratch_has_committed_candidate(scratch) {
-        return Err(format!(
-            "invalid temporary update state has a committed candidate; preserving it: {detail}"
-        ));
-    }
     eprintln!(
         "discarding invalid temporary update state at {}; installed generation preserved ({detail})",
         scratch.display()
@@ -2516,7 +2485,8 @@ fn abandon_invalid_update(
 
 /// Explicitly abandon an invalid destination-local build/update tree.  This
 /// is intentionally narrower than `refresh-full`: valid resumable work and
-/// any committed candidate are left untouched.
+/// committed installed generations are left untouched. Invalid private
+/// update output is discarded rather than adopted by a compatibility path.
 fn cmd_reset(dbname: &str, archive: &str) -> Result<(), String> {
     let archive = Path::new(archive);
     let scratch = ensure_mirror_scratch(archive)?;
@@ -2538,12 +2508,6 @@ fn cmd_reset(dbname: &str, archive: &str) -> Result<(), String> {
         Err(error) => abandon_invalid_build(&scratch, &error)?,
     }
 
-    if update_scratch_has_committed_candidate(&scratch) {
-        return Err(format!(
-            "{} contains a committed update candidate; preserving it",
-            scratch.display()
-        ));
-    }
     match load_active_update(&scratch) {
         Ok(None) => {}
         Ok(Some((active, paths))) => {
@@ -2557,14 +2521,8 @@ fn cmd_reset(dbname: &str, archive: &str) -> Result<(), String> {
                     ));
                 }
                 Err(error) => {
-                    if update_candidate_is_committed(&paths) {
-                        return Err(format!(
-                            "update {} has a committed candidate; preserving it: {}",
-                            active.update_id, error
-                        ));
-                    }
                     eprintln!(
-                        "discarding invalid temporary update state at {}; installed generation preserved",
+                        "discarding invalid temporary update state at {}; installed generation preserved ({error})",
                         paths.root.display()
                     );
                     clear_mirror_scratch(&scratch)?;
@@ -2572,14 +2530,8 @@ fn cmd_reset(dbname: &str, archive: &str) -> Result<(), String> {
             }
         }
         Err(error) => {
-            if update_scratch_has_committed_candidate(&scratch) {
-                return Err(format!(
-                    "{} has an invalid update selector but also a candidate; preserving it: {}",
-                    scratch.display(), error
-                ));
-            }
             eprintln!(
-                "discarding invalid temporary update selector at {}; installed generation preserved",
+                "discarding invalid temporary update selector at {}; installed generation preserved ({error})",
                 update_selector_path(&scratch).display()
             );
             clear_mirror_scratch(&scratch)?;
@@ -3265,24 +3217,26 @@ mod tests {
     }
 
     #[test]
-    fn start_refuses_invalid_tree_with_candidate_archive() {
+    fn start_discards_invalid_tree_with_unusable_candidate() {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("plan.json"), b"old plan").unwrap();
         std::fs::write(root.path().join("archive.swdump"), b"candidate").unwrap();
-        let error = inspect_build_for_start(root.path()).unwrap_err();
-        assert!(error.contains("candidate archive"), "{error}");
-        assert!(root.path().join("archive.swdump").exists());
+        assert!(matches!(
+            inspect_build_for_start(root.path()).unwrap(),
+            crate::build_lifecycle::BuildState::Unplanned
+        ));
+        assert!(!root.path().join("plan.json").exists());
+        assert!(!root.path().join("archive.swdump").exists());
     }
 
     #[test]
-    fn invalid_update_reset_preserves_committed_candidate() {
+    fn invalid_update_reset_discards_unusable_candidate() {
         let root = tempfile::tempdir().unwrap();
         let paths = update_lifecycle::UpdatePaths::new(root.path().join("updates/u1"));
         std::fs::create_dir_all(paths.candidate_inventory().parent().unwrap()).unwrap();
         std::fs::write(paths.candidate_inventory(), b"candidate").unwrap();
-        let error = abandon_invalid_update(root.path(), "malformed update receipt").unwrap_err();
-        assert!(error.contains("committed candidate"), "{error}");
-        assert!(paths.candidate_inventory().exists());
+        abandon_invalid_update(root.path(), "malformed update receipt").unwrap();
+        assert!(!paths.candidate_inventory().exists());
     }
 
 }
