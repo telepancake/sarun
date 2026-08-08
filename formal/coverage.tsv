@@ -1,0 +1,21 @@
+machine	authority	abstract_model	implementation_evidence	status	next
+engine-incarnation	instance lock + namespaced socket	planned	main.rs/control.rs startup/shutdown	observed/open	startup rollback and macOS incarnation tests
+mirror-registration	mirrors.db jobs	planned	mirrors.rs schema/delete tests	observed+tested	cross-machine shutdown admission
+mirror-run	mirrors.db runs + RunId	MirrorRun.tla	transition_run/classify_job/stale-run tests	modeled+tested+unverified	TLC, failpoints, spawn/recovery traces
+box-registration	captured sqlar + live maps	planned	control.rs registration/FUSE tests	observed+tested	rollback cross-product and incarnation proof
+wiki-build	PlanId/target/assembly receipts	planned	build_lifecycle/direct/cli tests	specified+implemented+tested	ownership manifest and receipt-cut failpoints
+wiki-update	UpdateId/BaseGenerationId/TailId	planned	update_lifecycle/update tests	specified+implemented+tested	cleanup-failure state and crash tests
+archive-stream	EntityKind/id ordering + duplicate merge algebra	planned	archive.rs merge/order tests	specified+implemented+tested	generated law tests and malformed-order model
+source-fetch	planned source parts + robots/politeness state	planned	mediawiki fetch/sync tests	observed/open	request ownership, retry budget, and missing history checksums
+generation-publication	GenerationId + .swtitle selector	GenerationPublication.tla	installation_lifecycle/generation tests	modeled+tested+unverified	TLC and crash/reopen matrix
+archive-reader	reader lease + selected generation	planned	archive_browse/serve/readout tests	observed+tested	gateway/in-process equivalence
+media	packed media/source files	planned	media format/serve tests	observed/open	generation-bound receipt and stale state
+backrefs	.swrefs projection	planned	backrefs format/render tests	observed/open	generation binding and publication policy
+legacy-depot	Instance/meta.db/depot	planned	instance/sync/depot tests	observed/open	authority scope/refinement decision
+depot-primitive	sparse chain root + immutable frames	planned	depot/vbf/stream tests	observed+tested	crash cuts and descriptor bounds
+ietf	meta.db revision rows + archive bytes	planned	ietf mirror/readout tests	observed+tested	orphan-byte recovery model
+gitdepot	legacy store/meta plus union path	planned	gitdepot package tests	observed/open	two-model scope/refinement decision
+capture	box SQLite/sqlar + blobs	planned	capture/discover tests	observed+tested	blob/reference durability failpoints
+fuse-qemu	live broker/mount/guest resources	planned	fuse/appliance/backend tests	observed+tested	crash/reclaim and macOS refinement
+network	per-box stack and flow artifacts	planned	net tests and runner code	observed/open	resource/security boundary and quotas
+ui-session	RPC attachment + projections	planned	ui/control projection tests	observed+tested	subscriber loss and terminal traces

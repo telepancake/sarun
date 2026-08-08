@@ -5,6 +5,10 @@ This is the council's reconciled architecture map for the repository as of
 deliberately about ownership and observable transitions, rather than about
 which source file happens to contain a function.
 
+The repository-wide formal-design bootstrap and refinement ledger is in
+[`FORMAL_DESIGN.md`](FORMAL_DESIGN.md); this document remains the detailed
+cartography and gap inventory, not a claim of formal verification.
+
 The council inspected the engine, the mirror drivers, the Wikipedia archive
 and serving paths, the build tools, and the repository's test entry points.
 The execution and data councils did their inventories independently and the
@@ -34,7 +38,7 @@ into production paths.
 
 | boundary | implementation | owns | does not own |
 | --- | --- | --- | --- |
-| engine instance | `engine/src/main.rs`, `control.rs`, `gateway.rs`, `sarunfs/`, `net/` | control socket, FUSE broker, box and service channels, engine shutdown, live process/resource registries | mirror build meaning or archive publication |
+| engine instance | `engine/src/main.rs`, `control.rs`, `archive_gateway.rs`, `sarunfs/`, `net/` | control socket, FUSE broker, box and service channels, engine shutdown, live process/resource registries | mirror build meaning or archive publication |
 | UI client | `engine/src/ui.rs` (with the prototype test client) | user intent and projection of inspector output | durable job/build state, process truth, filesystem interpretation |
 | mirror supervisor | `engine/src/mirrors.rs` | mirror registration, one `RunId`, admission, driver process group, stop/retry/delete requests, job projections | source parsing, archive format, generation installation |
 | box lifecycle | `engine/src/box.rs`, `sarunfs/`, `appliance.rs`, `sud.rs` | registration, capture, transport, process tree, QEMU/SUD/direct backends | mirror job rows and archive generations |

@@ -62,6 +62,12 @@ formal specification and must not be presented as one. Use it as a starting
 map for cross-cutting work, then verify its claims against the current code and
 runtime.
 
+`docs/architecture/FORMAL_DESIGN.md` is the current repository-wide
+traceability bootstrap. Read it when planning cross-cutting work; keep its
+coverage ledger and explicit open rows current. Executable bounded models live
+under `formal/` and are evidence only when their stated checker and bounds
+have actually run.
+
 Keep the levels of the argument distinct:
 
 - a **requirement** describes a user need or environmental constraint;

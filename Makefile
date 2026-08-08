@@ -109,6 +109,10 @@ wire-codegen: swipl ## Project concrete Rust transport codecs from the Prolog re
 check-wire-codegen: swipl ## Fail if the checked-in Rust transport projection is stale
 	$(TOOLS_RUN) python3 scripts/wire_codegen.py --check
 
+.PHONY: check-models
+check-models: ## Run the bounded TLA+/TLC design models (requires user-provided TLC_JAR + Java)
+	@scripts/check-formal-models.sh
+
 .PHONY: test-action-grammar
 test-action-grammar: swipl ## Run the core-only action grammar tests with pinned host SWI-Prolog
 	@swipl=$$(find "$${SARUN_SWIPL_CACHE:-$${XDG_CACHE_HOME:-$$HOME/.cache}/sarun/swipl/9.2.9}" \
