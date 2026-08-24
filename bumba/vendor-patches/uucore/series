@@ -6,3 +6,5 @@
 0060-render-clap-results-to-injected-logical-streams.patch
 0070-read-Linux-umask-without-mutating-process-state.patch
 0080-supply-logical-umask-to-in-process-utilities.patch
+0090-return-clap-parse-errors-for-logical-rendering.patch
+0100-uucore--scope-and-cache-embedded-utility-runtime-context.patch

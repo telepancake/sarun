@@ -1,0 +1,106 @@
+[package]
+name = "bumba"
+version = "0.1.0"
+edition = "2024"
+description = "A single-process Brush shell with embedded make, Ninja, and uutils"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "bumba"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+brush-core = { path = "vendor/brush-core" }
+brush-builtins = { path = "vendor/brush-builtins" }
+brush-coreutils-builtins = { path = "vendor/brush-coreutils-builtins", default-features = false }
+bytes = "1"
+clap = { version = "4.6.0", features = ["derive"] }
+findutils = { path = "vendor/findutils" }
+futures-util = "0.3"
+kati = { path = "vendor/kati" }
+libc = "0.2"
+n2 = { path = "vendor/n2", default-features = false }
+parking_lot = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "process", "sync"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+uucore = "0.8"
+uu_basename = "0.8"
+uu_cat = "0.8"
+uu_chmod = "0.8"
+uu_chown = "0.8"
+uu_cp = "0.8"
+uu_cut = "0.8"
+uu_dirname = "0.8"
+uu_expr = "0.8"
+uu_head = "0.8"
+uu_id = "0.8"
+uu_install = "0.8"
+uu_ln = "0.8"
+uu_mkdir = "0.8"
+uu_mktemp = "0.8"
+uu_mv = "0.8"
+uu_nl = "0.8"
+uu_nproc = "0.8"
+uu_readlink = "0.8"
+uu_realpath = "0.8"
+uu_rm = "0.8"
+uu_rmdir = "0.8"
+uu_seq = "0.8"
+uu_sort = "0.8"
+uu_tac = "0.8"
+uu_tail = "0.8"
+uu_tee = "0.8"
+uu_touch = "0.8"
+uu_tr = "0.8"
+uu_uname = "0.8"
+uu_uniq = "0.8"
+uu_wc = "0.8"
+uu_whoami = "0.8"
+
+[dev-dependencies]
+tempfile = "3"
+
+[patch.crates-io]
+brush-core = { path = "vendor/brush-core" }
+brush-builtins = { path = "vendor/brush-builtins" }
+brush-coreutils-builtins = { path = "vendor/brush-coreutils-builtins" }
+brush-parser = { path = "vendor/brush-parser" }
+uucore = { path = "vendor/uucore" }
+uu_basename = { path = "vendor/uu_basename" }
+uu_cat = { path = "vendor/uu_cat" }
+uu_chmod = { path = "vendor/uu_chmod" }
+uu_chown = { path = "vendor/uu_chown" }
+uu_cp = { path = "vendor/uu_cp" }
+uu_cut = { path = "vendor/uu_cut" }
+uu_dirname = { path = "vendor/uu_dirname" }
+uu_expr = { path = "vendor/uu_expr" }
+uu_head = { path = "vendor/uu_head" }
+uu_id = { path = "vendor/uu_id" }
+uu_install = { path = "vendor/uu_install" }
+uu_ln = { path = "vendor/uu_ln" }
+uu_mkdir = { path = "vendor/uu_mkdir" }
+uu_mktemp = { path = "vendor/uu_mktemp" }
+uu_mv = { path = "vendor/uu_mv" }
+uu_nl = { path = "vendor/uu_nl" }
+uu_nproc = { path = "vendor/uu_nproc" }
+uu_readlink = { path = "vendor/uu_readlink" }
+uu_realpath = { path = "vendor/uu_realpath" }
+uu_rm = { path = "vendor/uu_rm" }
+uu_rmdir = { path = "vendor/uu_rmdir" }
+uu_seq = { path = "vendor/uu_seq" }
+uu_sort = { path = "vendor/uu_sort" }
+uu_tac = { path = "vendor/uu_tac" }
+uu_tail = { path = "vendor/uu_tail" }
+uu_tee = { path = "vendor/uu_tee" }
+uu_touch = { path = "vendor/uu_touch" }
+uu_tr = { path = "vendor/uu_tr" }
+uu_uname = { path = "vendor/uu_uname" }
+uu_uniq = { path = "vendor/uu_uniq" }
+uu_wc = { path = "vendor/uu_wc" }
+uu_whoami = { path = "vendor/uu_whoami" }

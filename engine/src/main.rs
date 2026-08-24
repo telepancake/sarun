@@ -25,17 +25,14 @@ static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 pub use net::NetMode;
 
 mod brush;
+mod bumba_adapter;
 mod brush_relation;
-mod builtin_exec;
 mod capture;
 mod containers_conf;
 mod control;
 mod depot;
 mod direct_fs;
 mod discover;
-mod exec_wrappers;
-mod find_builtin;
-mod xargs_builtin;
 // Dockerfile/Containerfile parser for `sarun oci build` / `oci run`. Lands
 // ahead of its consumer (the build driver), so allow the not-yet-used items.
 mod action_bridge;
@@ -59,7 +56,6 @@ mod fuse_transport;
 mod generated_wire;
 mod hostfs;
 mod image_provenance;
-mod jobserver;
 mod katirun;
 mod mirrors;
 mod n2run;
@@ -1130,7 +1126,7 @@ fn main() {
                     //         box environment through bwrap.
                     // Single-threaded here (argv parsing, pre-spawn) — safe.
                     "--vars" => unsafe {
-                        std::env::set_var("SARUN_TRACE_VARS", "1");
+                        std::env::set_var("BUMBA_TRACE_VARS", "1");
                     },
                     // --fuse  the explicit spelling of the default backend
                     //         (bwrap + FUSE overlay) — the counterpart of

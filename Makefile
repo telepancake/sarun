@@ -43,7 +43,8 @@ deps: ## Install system packages (FUSE, bubblewrap; iproute2 + tshark for net te
 # separately by `make appliances`.
 
 .PHONY: vendor
-vendor: ## Assemble engine/vendor/ from pinned upstreams + vendor-patches/ series
+vendor: ## Assemble Bumba and engine vendored dependencies from their pins and patches
+	$(MAKE) -C bumba vendor
 	python3 scripts/vendor.py
 
 .PHONY: tools

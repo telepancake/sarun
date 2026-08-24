@@ -1,4 +1,4 @@
-//! In-process `xargs` builtin for box brush shells.
+//! In-process `xargs` builtin for Brush shells.
 //!
 //! Runs the vendored findutils fork against the shell's LOGICAL
 //! stdin/stdout/stderr, routing each command through brush (`Shell::run_argv`)
@@ -7,7 +7,7 @@
 //! ## Why logical stdin matters
 //!
 //! xargs reads NUL/whitespace-separated items from stdin. In-process,
-//! `std::io::stdin()` is the engine's real fd 0 — reading it steals bytes from
+//! `std::io::stdin()` is the host's real fd 0 — reading it steals bytes from
 //! whatever owns it (control channel, parent pipe). The vendored patch routes
 //! reads through `XargsIo::take_input`, which yields the shell's logical stdin.
 //!
@@ -60,7 +60,7 @@ impl ExecChild for BridgeChild {
 
 impl XargsIo for BrushXargsIo {
     fn take_input(&self) -> Box<dyn Read> {
-        // Logical stdin, moved once; a second call sees EOF (never the engine fd).
+        // Logical stdin, moved once; a second call sees EOF (never the host fd).
         self.input
             .borrow_mut()
             .take()
@@ -134,7 +134,7 @@ impl brush_core::builtins::Command for XargsBuiltin {
         let (submitter, rx) = builtin_exec::channel();
 
         let worker = std::thread::Builder::new()
-            .name("sarun-xargs".into())
+            .name("bumba-xargs".into())
             .spawn(move || {
                 let io = BrushXargsIo {
                     input: RefCell::new(Some(Box::new(input))),

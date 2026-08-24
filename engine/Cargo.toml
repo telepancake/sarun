@@ -35,81 +35,15 @@ ietf_mirror = { path = "../gimir/ietf-mirror", package = "ietf-mirror", default-
 wikimak_wikipedia = { path = "../gimir/wikimak/wikipedia", package = "wikimak-wikipedia", default-features = false, features = ["fetch", "serve"] }
 base64 = "0.22.1"
 bytes = "1.10"
+# Reusable single-process shell/build runtime. Sarun retains only adapters for
+# box filesystem access, provenance transport, editor, and engine commands.
+bumba = { path = "../bumba" }
 brush-core = "0.5"
 brush-builtins = "0.2"
 # clap derive for the in-process exec-wrapper builtins (env/printenv …); the
 # `builtins::Command` trait is `clap::Parser`-based. Pinned to the same 4.6.0
 # brush-builtins uses so the derived `Parser` impl satisfies brush-core's bound.
 clap = { version = "4.6.0", features = ["derive"] }
-brush-coreutils-builtins = { version = "0.1", features = ["coreutils.all"] }
-# Direct dep on the shared uutils runtime so the engine can install the shell's
-# LOGICAL environment for each builtin worker thread
-# (`uucore::logical_env::set_logical_env`) before localization + the util body
-# run. Redirected to the vendored fork (vendor/uucore) by `[patch.crates-io]`
-# below — the same single copy every uu_* builtin + brush-coreutils-builtins use.
-uucore = "0.8"
-# Direct dep on uutils' `uu_cat` so the engine can call its injected logical
-# entry point (`uu_cat::cat`) for the native in-process `cat` builtin. The
-# `[patch.crates-io]` below redirects this to our vendored fork (vendor/uu_cat),
-# the same copy brush-coreutils-builtins already pulls in transitively.
-uu_cat = "0.8"
-# More uutils crates ported the same way (vendored fork + injected-I/O logical
-# entry) so they run as NATIVE in-process brush builtins — pipeline-safe, no
-# dup2. Each is redirected to its vendored fork by `[patch.crates-io]` below.
-uu_head = "0.8"
-uu_tail = "0.8"
-uu_wc = "0.8"
-uu_nl = "0.8"
-uu_tac = "0.8"
-# Wave 2 (same injected-I/O treatment): arg→stdout tinies + filters.
-uu_basename = "0.8"
-uu_dirname = "0.8"
-uu_seq = "0.8"
-uu_expr = "0.8"
-uu_tr = "0.8"
-uu_cut = "0.8"
-uu_uniq = "0.8"
-uu_sort = "0.8"
-# Same injected-I/O treatment, plus a logical-cwd rewrite: `cp` resolves its
-# relative path operands against the shell's logical cwd (the process is never
-# chdir'd). Logical entry `uu_cp::cp(args, cwd, out, err)`.
-uu_cp = "0.8"
-# Filesystem ops ported the same way as cp (logical cwd + injected I/O); each has
-# a `<name>_main(args, cwd, out, err)` logical entry. Redirected to the vendored
-# forks by `[patch.crates-io]` below.
-uu_mkdir = "0.8"
-uu_rmdir = "0.8"
-uu_rm = "0.8"
-uu_mv = "0.8"
-uu_ln = "0.8"
-uu_touch = "0.8"
-# Path-resolving + stream coreutils, same logical-cwd + injected-I/O treatment
-# as cp. `readlink`/`realpath`/`mktemp` resolve relative operands against the
-# shell's logical cwd (process is never chdir'd) and write the logical sinks;
-# `tee` additionally reads the logical stdin and writes its file operands.
-# Logical entries `uu_readlink::readlink`, `uu_realpath::realpath`,
-# `uu_mktemp::mktemp_main`, `uu_tee::tee_main`.
-uu_mktemp = "0.8"
-uu_readlink = "0.8"
-uu_realpath = "0.8"
-uu_tee = "0.8"
-# Metadata-op file builtins, same logical-cwd + injected-I/O treatment as cp;
-# each has a `<name>_main(args, cwd, out, err)` logical entry (`chown` routes
-# through the patched `uucore::perms::chown_base_io`).
-uu_chmod = "0.8"
-uu_chown = "0.8"
-uu_install = "0.8"
-# Pure stdout info utils (no stdin, no cwd): read read-only system/identity info
-# and write the box's logical out/err. Logical entries
-# `uu_uname::uname_main` / `uu_nproc::nproc_main` / `uu_id::id_main` /
-# `uu_whoami::whoami_main` (all `(args, out, err)`).
-uu_uname = "0.8"
-uu_nproc = "0.8"
-uu_id = "0.8"
-uu_whoami = "0.8"
-# Vendored, find-only fork of uutils/findutils 0.9.1: run `find` as an
-# in-process brush builtin against the shell's logical I/O. See vendor/findutils.
-findutils = { path = "vendor/findutils" }
 brush-parser = { version = "0.4", features = ["serde"] }
 # Reedline-based interactive REPL for the brush-sh shim's -i mode:
 # multi-line editing, history, completion, syntax highlight — built on
@@ -121,10 +55,10 @@ brush-interactive = { version = "0.4", default-features = false, features = ["re
 reedline = "0.47"
 crossterm = "0.29"
 # Vendored lib-only patched fork of n2 (github.com/evmar/n2) — see vendor/n2.
-n2 = { path = "vendor/n2", default-features = false }
+n2 = { path = "../bumba/vendor/n2", default-features = false }
 # Vendored lib-only patched fork of kati (github.com/google/kati) — see
 # vendor/kati. Parses Makefiles → ninja graph for the embedded `make` path.
-kati = { path = "vendor/kati" }
+kati = { path = "../bumba/vendor/kati" }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "fs", "process", "sync"] }
 tokio-stream = "0.1"
 futures-util = "0.3"
@@ -292,65 +226,59 @@ tempfile = "3"
 [patch.crates-io]
 vhost                    = { path = "vendor/vhost" }
 vhost-user-backend       = { path = "vendor/vhost-user-backend" }
-brush-core               = { path = "vendor/brush-core" }
-brush-builtins           = { path = "vendor/brush-builtins" }
-brush-coreutils-builtins = { path = "vendor/brush-coreutils-builtins" }
-brush-parser             = { path = "vendor/brush-parser" }
-brush-interactive        = { path = "vendor/brush-interactive" }
+brush-core               = { path = "../bumba/vendor/brush-core" }
+brush-builtins           = { path = "../bumba/vendor/brush-builtins" }
+brush-coreutils-builtins = { path = "../bumba/vendor/brush-coreutils-builtins" }
+brush-parser             = { path = "../bumba/vendor/brush-parser" }
+brush-interactive        = { path = "../bumba/vendor/brush-interactive" }
 # Vendored, patched fork of uutils' `uu_cat`: adds a logical, injected-I/O
 # entry point (`cat::cat`) that writes the shell's OpenFile sink/source with no
 # process-global stdio, so it can run as an in-process brush builtin while
 # keeping the Linux splice(2) fast path. The retained `uumain` is a thin bridge
 # for the standalone binary / subprocess dispatcher. See vendor/uu_cat/src/cat.rs.
-uu_cat                   = { path = "vendor/uu_cat" }
+uu_cat                   = { path = "../bumba/vendor/uu_cat" }
 # Same injected-I/O treatment as uu_cat: a logical entry that writes the shell's
 # OpenFile sink/source with no process-global stdio, consumed by the native
 # Head/Wc/Nl/Tac builtins in src/brush.rs (gated in src/brush_gates.rs).
-uu_head                  = { path = "vendor/uu_head" }
-uu_tail                  = { path = "vendor/uu_tail" }
-uu_wc                    = { path = "vendor/uu_wc" }
-uu_nl                    = { path = "vendor/uu_nl" }
-uu_tac                   = { path = "vendor/uu_tac" }
-uu_basename              = { path = "vendor/uu_basename" }
-uu_dirname               = { path = "vendor/uu_dirname" }
-uu_seq                   = { path = "vendor/uu_seq" }
-uu_expr                  = { path = "vendor/uu_expr" }
-uu_tr                    = { path = "vendor/uu_tr" }
-uu_cut                   = { path = "vendor/uu_cut" }
-uu_uniq                  = { path = "vendor/uu_uniq" }
-uu_sort                  = { path = "vendor/uu_sort" }
-uu_cp                    = { path = "vendor/uu_cp" }
-uu_mkdir                 = { path = "vendor/uu_mkdir" }
-uu_rmdir                 = { path = "vendor/uu_rmdir" }
-uu_rm                    = { path = "vendor/uu_rm" }
-uu_mv                    = { path = "vendor/uu_mv" }
-uu_ln                    = { path = "vendor/uu_ln" }
-uu_touch                 = { path = "vendor/uu_touch" }
-uu_mktemp                = { path = "vendor/uu_mktemp" }
-uu_readlink              = { path = "vendor/uu_readlink" }
-uu_realpath              = { path = "vendor/uu_realpath" }
-uu_tee                   = { path = "vendor/uu_tee" }
-uu_chmod                 = { path = "vendor/uu_chmod" }
-uu_chown                 = { path = "vendor/uu_chown" }
-uu_install               = { path = "vendor/uu_install" }
-uu_uname                 = { path = "vendor/uu_uname" }
-uu_nproc                 = { path = "vendor/uu_nproc" }
-uu_id                    = { path = "vendor/uu_id" }
-uu_whoami                = { path = "vendor/uu_whoami" }
+uu_head                  = { path = "../bumba/vendor/uu_head" }
+uu_tail                  = { path = "../bumba/vendor/uu_tail" }
+uu_wc                    = { path = "../bumba/vendor/uu_wc" }
+uu_nl                    = { path = "../bumba/vendor/uu_nl" }
+uu_tac                   = { path = "../bumba/vendor/uu_tac" }
+uu_basename              = { path = "../bumba/vendor/uu_basename" }
+uu_dirname               = { path = "../bumba/vendor/uu_dirname" }
+uu_seq                   = { path = "../bumba/vendor/uu_seq" }
+uu_expr                  = { path = "../bumba/vendor/uu_expr" }
+uu_tr                    = { path = "../bumba/vendor/uu_tr" }
+uu_cut                   = { path = "../bumba/vendor/uu_cut" }
+uu_uniq                  = { path = "../bumba/vendor/uu_uniq" }
+uu_sort                  = { path = "../bumba/vendor/uu_sort" }
+uu_cp                    = { path = "../bumba/vendor/uu_cp" }
+uu_mkdir                 = { path = "../bumba/vendor/uu_mkdir" }
+uu_rmdir                 = { path = "../bumba/vendor/uu_rmdir" }
+uu_rm                    = { path = "../bumba/vendor/uu_rm" }
+uu_mv                    = { path = "../bumba/vendor/uu_mv" }
+uu_ln                    = { path = "../bumba/vendor/uu_ln" }
+uu_touch                 = { path = "../bumba/vendor/uu_touch" }
+uu_mktemp                = { path = "../bumba/vendor/uu_mktemp" }
+uu_readlink              = { path = "../bumba/vendor/uu_readlink" }
+uu_realpath              = { path = "../bumba/vendor/uu_realpath" }
+uu_tee                   = { path = "../bumba/vendor/uu_tee" }
+uu_chmod                 = { path = "../bumba/vendor/uu_chmod" }
+uu_chown                 = { path = "../bumba/vendor/uu_chown" }
+uu_install               = { path = "../bumba/vendor/uu_install" }
+uu_uname                 = { path = "../bumba/vendor/uu_uname" }
+uu_nproc                 = { path = "../bumba/vendor/uu_nproc" }
+uu_id                    = { path = "../bumba/vendor/uu_id" }
+uu_whoami                = { path = "../bumba/vendor/uu_whoami" }
 # Vendored, patched fork of uucore 0.8.0 — the shared uutils library that backs
-# every uu_* builtin's localization. The 13 in-process coreutil builtins each
-# run on a fresh thread that calls `init_localization("uu_X")`
-# (brush-coreutils-builtins → uucore::locale::setup_localization). Stock uucore
-# was designed for ONE util per process: its embedded-Fluent-resource caches
-# (UUCORE_FLUENT/CHECKSUM_FLUENT/UTIL_FLUENT) are PROCESS-GLOBAL OnceLocks, so
-# the first util to run pins UTIL_FLUENT to its own .ftl and every later util on
-# any thread gets that first util's bundle — its own translate! keys aren't
-# found, so it emits raw Fluent keys (e.g. `tac: tac-error-open-error`). The
-# vendored fork makes those caches thread-local so each util's thread builds and
-# looks up ITS OWN bundle. Only crates.io uucore 0.8.0 is redirected here; the
-# 0.9.0 copy pulled in by vendored findutils is a different version and stays on
-# the registry, unaffected (a [patch] only matches the version it provides).
-uucore                   = { path = "vendor/uucore" }
+# every uu_* builtin's localization. Bumba binds an owned Fluent bundle cached
+# by utility and locale for the dynamic extent of each inline call, restoring
+# any surrounding binding afterward. Only crates.io uucore 0.8.0 is redirected
+# here; the 0.9.0 copy pulled in by vendored findutils is a different version
+# and stays on the registry, unaffected (a [patch] only matches the version it
+# provides).
+uucore                   = { path = "../bumba/vendor/uucore" }
 
 # Release binary keeps line-table debug info (strip=false, debug=1) so a
 # wedged box is DEBUGGABLE — gdb/addr2line resolve real file:line frames

@@ -1,4 +1,4 @@
-//! In-process `find` builtin for box brush shells.
+//! In-process `find` builtin for Brush shells.
 //!
 //! Runs the vendored findutils fork against the shell's LOGICAL I/O and LOGICAL
 //! cwd. `-exec`/`-execdir` commands run THROUGH BRUSH (builtin/function/script,
@@ -34,9 +34,9 @@ struct BrushFindDeps {
     stdin: RefCell<Box<dyn BufRead>>,
     now: SystemTime,
     cwd: std::path::PathBuf,
-    /// The box shell's LOGICAL `TZ` (its `export TZ=…`), or `None` when unset.
-    /// Steers `-printf %T/%A/%C` and `-daystart` to the box's zone without the
-    /// engine process mutating its own `TZ`. See `Dependencies::tz`.
+    /// The logical shell's LOGICAL `TZ` (its `export TZ=…`), or `None` when unset.
+    /// Steers `-printf %T/%A/%C` and `-daystart` to the shell's zone without the
+    /// host process mutating its own `TZ`. See `Dependencies::tz`.
     tz: Option<String>,
     submitter: builtin_exec::ExecSubmitter,
 }
@@ -51,7 +51,7 @@ impl Dependencies for BrushFindDeps {
     }
 
     fn get_input(&self) -> &RefCell<dyn Read> {
-        // Logical stdin; `-files0-from -` reads here, not the engine's fd 0.
+        // Logical stdin; `-files0-from -` reads here, not the host's fd 0.
         &self.stdin
     }
 
@@ -78,7 +78,7 @@ impl Dependencies for BrushFindDeps {
     }
 
     fn tz(&self) -> Option<String> {
-        // Logical TZ: the box shell's `export TZ=…`, snapshotted at spawn.
+        // Logical TZ: the logical shell's `export TZ=…`, snapshotted at spawn.
         self.tz.clone()
     }
 
@@ -105,7 +105,7 @@ pub(crate) struct FindBuiltin {
 /// outer Brush registration has collected raw argv. The vendored probe is
 /// intentionally Find-owned and returns `Unsupported` outside the slice whose
 /// real parse path is instrumented.
-pub(crate) fn parser(
+pub fn parser(
     input: brush_core::builtins::BuiltinParserInput,
 ) -> brush_core::builtins::BuiltinParserObservation {
     use brush_core::builtins::{
@@ -320,8 +320,8 @@ impl brush_core::builtins::Command for FindBuiltin {
         let input = context.stdin();
         let cwd = context.shell.working_dir().to_path_buf();
 
-        // Snapshot the box shell's LOGICAL exported `TZ` (only exported vars
-        // reach a child), so `-printf %T` / `-daystart` render in the box's zone.
+        // Snapshot the logical shell's LOGICAL exported `TZ` (only exported vars
+        // reach a child), so `-printf %T` / `-daystart` render in the shell's zone.
         let tz = context
             .shell
             .env()
@@ -334,7 +334,7 @@ impl brush_core::builtins::Command for FindBuiltin {
         let (submitter, rx) = builtin_exec::channel();
 
         let worker = std::thread::Builder::new()
-            .name("sarun-find".into())
+            .name("bumba-find".into())
             .spawn(move || {
                 let deps = BrushFindDeps {
                     output: RefCell::new(out),
@@ -360,6 +360,22 @@ impl brush_core::builtins::Command for FindBuiltin {
             code,
         )))
     }
+}
+
+pub fn extend<SE: brush_core::extensions::ShellExtensions>(
+    commands: &mut std::collections::HashMap<
+        String,
+        brush_core::builtins::Registration<SE>,
+    >,
+) {
+    let mut find = brush_core::builtins::builtin::<FindBuiltin, SE>();
+    find.parser_func = Some(parser);
+    find.external_command = true;
+    commands.insert("find".into(), find);
+
+    let mut xargs = brush_core::builtins::builtin::<crate::xargs::XargsBuiltin, SE>();
+    xargs.external_command = true;
+    commands.insert("xargs".into(), xargs);
 }
 
 /// Narrow find's `i32` exit code to `u8`. The vendored findutils follows the GNU

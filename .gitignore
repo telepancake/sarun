@@ -23,6 +23,9 @@ __pycache__/
 # engine/vendor.toml pins + engine/vendor-patches/ series. Never commit.
 /engine/vendor/
 /engine/.vendor-cache/
+/bumba/vendor/
+/bumba/.vendor-cache/
+/bumba/target/
 
 # Manual cellulose/Chromium capture outputs (not test fixtures).
 /cellulose/netlog.json

@@ -1,0 +1,39 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bumba <noreply@bumba>
+Date: Mon, 24 Aug 2026 17:00:34 +0000
+Subject: [PATCH] return clap parse errors for logical rendering
+
+Do not print parse errors to process stderr before the embedding adapter can apply logical redirections. Preserve the requested exit code in ClapErrorWrapper and let the caller render it through injected stdout or stderr.
+
+---
+diff --git a/src/lib/mods/clap_localization.rs b/src/lib/mods/clap_localization.rs
+index 011de2e..30fcb35 100644
+--- a/src/lib/mods/clap_localization.rs
++++ b/src/lib/mods/clap_localization.rs
+@@ -11,7 +11,7 @@
+ //! instead of parsing error strings, providing a more robust solution.
+ //!
+ 
+-use crate::error::{UResult, USimpleError};
++use crate::error::{UClapError, UError, UResult};
+ use crate::locale::translate;
+ 
+ use clap::error::{ContextKind, ErrorKind};
+@@ -443,15 +443,8 @@ where
+     I: IntoIterator<Item = T>,
+     T: Into<OsString> + Clone,
+ {
+-    cmd.try_get_matches_from(itr).map_err(|e| {
+-        if e.exit_code() == 0 {
+-            e.into() // Preserve help/version
+-        } else {
+-            let formatter = ErrorFormatter::new(crate::util_name());
+-            let code = formatter.print_error(&e, exit_code);
+-            USimpleError::new(code, "")
+-        }
+-    })
++    cmd.try_get_matches_from(itr)
++        .map_err(|error| Box::new(error.with_exit_code(exit_code)) as Box<dyn UError>)
+ }
+ 
+ /// Handles a clap error directly with a custom exit code.

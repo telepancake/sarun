@@ -3500,7 +3500,7 @@ mod tests {
     #[test]
     fn ordinary_find_type_relation_rejects_invalid_duplicate_and_trailing_values() {
         let parse = |arguments: &[&str]| {
-            crate::find_builtin::parser(brush_core::builtins::BuiltinParserInput {
+            bumba::find::parser(brush_core::builtins::BuiltinParserInput {
                 tear: false,
                 before: std::iter::once("find".to_string())
                     .chain(arguments.iter().map(|argument| (*argument).to_string()))

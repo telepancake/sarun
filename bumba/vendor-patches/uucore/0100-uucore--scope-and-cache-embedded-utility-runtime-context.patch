@@ -1,0 +1,634 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bumba <noreply@bumba>
+Date: Mon, 24 Aug 2026 17:59:32 +0000
+Subject: [PATCH] uucore: scope and cache embedded utility runtime context
+
+Replace the one-localizer-per-thread model with utility-and-locale keyed bundles and scoped bindings. Own Fluent resources instead of leaking them, restore logical environment and umask on drop, and avoid leaking utility names. This lets embedders execute uutils inline without creating a disposable OS thread for every invocation.
+
+---
+diff --git a/src/lib/lib.rs b/src/lib/lib.rs
+index 3be0156..be69530 100644
+--- a/src/lib/lib.rs
++++ b/src/lib/lib.rs
+@@ -359,29 +359,51 @@ thread_local! {
+     // sarun patch: per-thread override for `util_name()`. Stock uucore derives
+     // the utility name once, process-globally, from argv[0] — fine for the
+     // one-util-per-process model. An embedder that runs several utils in one
+-    // process (each on its own thread) would otherwise see every util's
++    // process would otherwise see every util's
+     // diagnostics prefixed with the host's argv[0] (e.g. `sarun: ...` instead
+     // of `wc: ...`) for the utils that print via `util_name()` directly. When
+     // set, this thread-local takes precedence; unset, behavior is unchanged.
+-    // The String is leaked once per thread so `util_name()` can keep returning
+-    // `&'static str` (it outlives the util's short-lived thread).
+     static UTIL_NAME_OVERRIDE: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+ }
+ 
++/// Restores the utility-name binding that preceded [`push_utility_name`].
++/// This guard is thread-bound because it mutates thread-local state on drop.
++pub struct UtilityNameGuard {
++    previous: Option<&'static str>,
++    _thread_bound: std::marker::PhantomData<std::rc::Rc<()>>,
++}
++
++impl Drop for UtilityNameGuard {
++    fn drop(&mut self) {
++        UTIL_NAME_OVERRIDE.with(|slot| slot.set(self.previous));
++    }
++}
++
+ /// Set a per-thread override for [`util_name`]. Intended for embedders that run
+-/// a utility's logical entry point on a dedicated thread within a long-lived
+-/// process whose argv[0] is not the utility's name. Passing an empty string
+-/// clears the override for the current thread.
+-pub fn set_utility_name(name: &str) {
++/// utility entry points within a long-lived process whose argv[0] is not the
++/// utility's name. Passing an empty string clears the override for the current
++/// thread. Prefer [`push_utility_name`] for a single invocation.
++pub fn set_utility_name(name: &'static str) {
+     UTIL_NAME_OVERRIDE.with(|c| {
+         if name.is_empty() {
+             c.set(None);
+         } else {
+-            c.set(Some(Box::leak(name.to_string().into_boxed_str())));
++            c.set(Some(name));
+         }
+     });
+ }
+ 
++/// Bind a statically-known embedded utility name for one command invocation.
++/// Unlike the old adapter this neither allocates nor leaks a new string per
++/// call, and nested invocations restore their caller's name.
++pub fn push_utility_name(name: &'static str) -> UtilityNameGuard {
++    let previous = UTIL_NAME_OVERRIDE.with(|slot| slot.replace(Some(name)));
++    UtilityNameGuard {
++        previous,
++        _thread_bound: std::marker::PhantomData,
++    }
++}
++
+ /// Derive the utility name.
+ pub fn util_name() -> &'static str {
+     if let Some(name) = UTIL_NAME_OVERRIDE.with(std::cell::Cell::get) {
+diff --git a/src/lib/mods/locale.rs b/src/lib/mods/locale.rs
+index 2177711..203d8ca 100644
+--- a/src/lib/mods/locale.rs
++++ b/src/lib/mods/locale.rs
+@@ -9,11 +9,12 @@ use crate::error::UError;
+ use fluent::{FluentArgs, FluentBundle, FluentResource};
+ use fluent_syntax::parser::ParserError;
+ 
+-use std::cell::Cell;
++use std::cell::RefCell;
++use std::collections::HashMap;
+ use std::fs;
+ use std::path::{Path, PathBuf};
++use std::rc::Rc;
+ use std::str::FromStr;
+-use std::sync::OnceLock;
+ 
+ use os_display::Quotable;
+ use thiserror::Error;
+@@ -64,20 +65,22 @@ pub const DEFAULT_LOCALE: &str = "en-US";
+ include!(concat!(env!("OUT_DIR"), "/embedded_locales.rs"));
+ 
+ // A struct to handle localization with optional English fallback
++type OwnedBundle = FluentBundle<Rc<FluentResource>>;
++
+ struct Localizer {
+-    primary_bundle: FluentBundle<&'static FluentResource>,
+-    fallback_bundle: Option<FluentBundle<&'static FluentResource>>,
++    primary_bundle: OwnedBundle,
++    fallback_bundle: Option<OwnedBundle>,
+ }
+ 
+ impl Localizer {
+-    fn new(primary_bundle: FluentBundle<&'static FluentResource>) -> Self {
++    fn new(primary_bundle: OwnedBundle) -> Self {
+         Self {
+             primary_bundle,
+             fallback_bundle: None,
+         }
+     }
+ 
+-    fn with_fallback(mut self, fallback_bundle: FluentBundle<&'static FluentResource>) -> Self {
++    fn with_fallback(mut self, fallback_bundle: OwnedBundle) -> Self {
+         self.fallback_bundle = Some(fallback_bundle);
+         self
+     }
+@@ -107,27 +110,39 @@ impl Localizer {
+     }
+ }
+ 
+-// Cache localizer. FluentResource cannot be shared between threads while
+-// FluentBundle can be shared.
+-//
+-// sarun patch: these embedded-resource caches are PER-THREAD, not process
+-// global. Stock uucore made them process-global `OnceLock<FluentResource>`,
+-// which is correct for the one-util-per-process design uutils ships, but
+-// breaks an embedder that runs several distinct utils in one process (each on
+-// its own thread). The first util to run pinned, say, UTIL_FLUENT to its own
+-// `.ftl`; every later util then got that first util's resource back from the
+-// cache, so its bundle lacked its own `translate!` keys and it emitted raw
+-// Fluent keys (e.g. `tac: tac-error-open-error`). Making the caches
+-// thread-local means each util's thread parses and caches ITS OWN resources,
+-// with no cross-thread contamination. The cached value is a leaked Box so it
+-// satisfies the `'static` lifetime `FluentBundle::add_resource_overriding`
+-// needs and outlives the thread-local LOCALIZER bundle that borrows it (both
+-// live until the thread exits). At most three small resources leak per thread.
++#[derive(Clone, Debug, Eq, Hash, PartialEq)]
++struct LocalizationKey {
++    utility: String,
++    locale: String,
++}
++
++/// Restore the localization binding that was active before
++/// [`push_localization`] when dropped.
++///
++/// Localizers remain cached by utility and locale on the execution thread;
++/// only the inexpensive current binding is scoped. The marker makes the guard
++/// `!Send`, because it owns restoration of thread-local state.
++pub struct LocalizationGuard {
++    previous: Option<LocalizationKey>,
++    _thread_bound: std::marker::PhantomData<Rc<()>>,
++}
++
++impl Drop for LocalizationGuard {
++    fn drop(&mut self) {
++        CURRENT_LOCALIZER.with(|slot| {
++            *slot.borrow_mut() = self.previous.take();
++        });
++    }
++}
++
++// A utility bundle owns its Fluent resources through `Rc`, so cache eviction
++// or thread exit frees them normally. The cache is keyed by BOTH utility and
++// locale: embedding many uutils in one process no longer makes the first
++// utility initialized on a thread steal every later utility's messages.
+ thread_local! {
+-    static UUCORE_FLUENT: OnceLock<&'static FluentResource> = const { OnceLock::new() };
+-    static CHECKSUM_FLUENT: OnceLock<&'static FluentResource> = const { OnceLock::new() };
+-    static UTIL_FLUENT: OnceLock<&'static FluentResource> = const { OnceLock::new() };
+-    static LOCALIZER: OnceLock<Localizer> = const { OnceLock::new() };
++    static LOCALIZERS: RefCell<HashMap<LocalizationKey, Localizer>> =
++        RefCell::new(HashMap::new());
++    static CURRENT_LOCALIZER: RefCell<Option<LocalizationKey>> = const { RefCell::new(None) };
+ }
+ 
+ /// Helper function to find the uucore locales directory from a utility's locales directory
+@@ -154,8 +169,8 @@ fn create_bundle(
+     locale: &LanguageIdentifier,
+     locales_dir: &Path,
+     util_name: &str,
+-) -> Result<FluentBundle<&'static FluentResource>, LocalizationError> {
+-    let mut bundle: FluentBundle<&'static FluentResource> = FluentBundle::new(vec![locale.clone()]);
++) -> Result<OwnedBundle, LocalizationError> {
++    let mut bundle = OwnedBundle::new(vec![locale.clone()]);
+ 
+     // Disable Unicode directional isolate characters
+     bundle.set_use_isolating(false);
+@@ -166,8 +181,7 @@ fn create_bundle(
+             .and_then(|locale_path| fs::read_to_string(locale_path).ok())
+             .and_then(|ftl| FluentResource::try_new(ftl).ok())
+         {
+-            // use Box::leak to provide 'static lifetime for shared FluentBundle between threads
+-            bundle.add_resource_overriding(Box::leak(Box::new(resource)));
++            bundle.add_resource_overriding(Rc::new(resource));
+         }
+     };
+ 
+@@ -203,16 +217,16 @@ fn create_bundle(
+ }
+ 
+ /// Initialize localization with common strings in addition to utility-specific strings
+-fn init_localization(
++fn create_localizer(
+     locale: &LanguageIdentifier,
+     locales_dir: &Path,
+     util_name: &str,
+-) -> Result<(), LocalizationError> {
++) -> Result<Localizer, LocalizationError> {
+     let default_locale = LanguageIdentifier::from_str(DEFAULT_LOCALE)
+         .expect("Default locale should always be valid");
+ 
+     // Try to create a bundle that combines common and utility-specific strings
+-    let english_bundle: FluentBundle<&'static FluentResource> =
++    let english_bundle =
+         create_bundle(&default_locale, locales_dir, util_name).or_else(|_| {
+             // Fallback to embedded utility-specific and common strings
+             create_english_bundle_from_embedded(&default_locale, util_name)
+@@ -232,32 +246,16 @@ fn init_localization(
+         }
+     };
+ 
+-    LOCALIZER.with(|lock| {
+-        lock.set(loc)
+-            .map_err(|_| LocalizationError::Bundle("Localizer already initialized".into()))
+-    })?;
+-    Ok(())
++    Ok(loc)
+ }
+ 
+-/// Helper function to parse FluentResource from content string.
+-///
+-/// sarun patch: `cache` is a thread-local `OnceLock<&'static FluentResource>`
+-/// (see the thread_local block above) rather than a process-global
+-/// `OnceLock<FluentResource>`, so each thread caches its own resources and
+-/// utils run in the same process can't contaminate each other's bundles. The
+-/// resource is leaked once per thread to get the `'static` lifetime the shared
+-/// `FluentBundle` requires; the cached `&'static` is then cheaply copied out.
++/// Parse a resource owned by its bundle. The previous embedding adapter leaked
++/// these resources to manufacture a `'static` reference; `FluentBundle` is
++/// generic over an owning `Borrow<FluentResource>` handle, so `Rc` expresses
++/// the real same-thread ownership directly.
+ fn parse_fluent_resource(
+     content: &str,
+-    cache: &'static std::thread::LocalKey<OnceLock<&'static FluentResource>>,
+-) -> Result<&'static FluentResource, LocalizationError> {
+-    // per-thread cache breaks unit tests (they re-parse in one thread)
+-    if cfg!(not(test)) {
+-        if let Some(res) = cache.with(|c| c.get().copied()) {
+-            return Ok(res);
+-        }
+-    }
+-
++) -> Result<Rc<FluentResource>, LocalizationError> {
+     let resource = FluentResource::try_new(content.to_string()).map_err(
+         |(_partial_resource, errs): (FluentResource, Vec<ParserError>)| {
+             if let Some(first_err) = errs.into_iter().next() {
+@@ -276,20 +274,14 @@ fn parse_fluent_resource(
+             }
+         },
+     )?;
+-    let leaked: &'static FluentResource = Box::leak(Box::new(resource));
+-    // per-thread cache breaks unit tests
+-    if cfg!(not(test)) {
+-        Ok(cache.with(|c| *c.get_or_init(|| leaked)))
+-    } else {
+-        Ok(leaked)
+-    }
++    Ok(Rc::new(resource))
+ }
+ 
+ /// Create a bundle from embedded English locale files with common uucore strings
+ fn create_english_bundle_from_embedded(
+     locale: &LanguageIdentifier,
+     util_name: &str,
+-) -> Result<FluentBundle<&'static FluentResource>, LocalizationError> {
++) -> Result<OwnedBundle, LocalizationError> {
+     // Only support English from embedded files
+     if *locale != "en-US" {
+         return Err(LocalizationError::LocalesDirNotFound(
+@@ -297,19 +289,19 @@ fn create_english_bundle_from_embedded(
+         ));
+     }
+ 
+-    let mut bundle: FluentBundle<&'static FluentResource> = FluentBundle::new(vec![locale.clone()]);
++    let mut bundle = OwnedBundle::new(vec![locale.clone()]);
+     bundle.set_use_isolating(false);
+ 
+     // First, try to load common uucore strings
+     if let Some(uucore_content) = get_embedded_locale("uucore/en-US.ftl") {
+-        let uucore_resource = parse_fluent_resource(uucore_content, &UUCORE_FLUENT)?;
++        let uucore_resource = parse_fluent_resource(uucore_content)?;
+         bundle.add_resource_overriding(uucore_resource);
+     }
+ 
+     // Checksum algorithms need locale messages from checksum_common
+     if util_name.ends_with("sum") {
+         if let Some(uucore_content) = get_embedded_locale("checksum_common/en-US.ftl") {
+-            let uucore_resource = parse_fluent_resource(uucore_content, &CHECKSUM_FLUENT)?;
++            let uucore_resource = parse_fluent_resource(uucore_content)?;
+             bundle.add_resource_overriding(uucore_resource);
+         }
+     }
+@@ -317,7 +309,7 @@ fn create_english_bundle_from_embedded(
+     // Then, try to load utility-specific strings
+     let locale_key = format!("{util_name}/en-US.ftl");
+     if let Some(ftl_content) = get_embedded_locale(&locale_key) {
+-        let resource = parse_fluent_resource(ftl_content, &UTIL_FLUENT)?;
++        let resource = parse_fluent_resource(ftl_content)?;
+         bundle.add_resource_overriding(resource);
+     }
+ 
+@@ -338,15 +330,15 @@ fn create_english_bundle_from_embedded(
+ fn create_wasi_bundle_from_embedded(
+     locale: &LanguageIdentifier,
+     util_name: &str,
+-) -> Result<FluentBundle<&'static FluentResource>, LocalizationError> {
++) -> Result<OwnedBundle, LocalizationError> {
+     let locale_str = locale.to_string();
+-    let mut bundle: FluentBundle<&'static FluentResource> = FluentBundle::new(vec![locale.clone()]);
++    let mut bundle = OwnedBundle::new(vec![locale.clone()]);
+     bundle.set_use_isolating(false);
+ 
+     let mut try_add = |key: &str| {
+         if let Some(content) = get_embedded_locale(key) {
+             if let Ok(resource) = FluentResource::try_new(content.to_string()) {
+-                bundle.add_resource_overriding(Box::leak(Box::new(resource)));
++                bundle.add_resource_overriding(Rc::new(resource));
+             }
+         }
+     };
+@@ -367,9 +359,13 @@ fn create_wasi_bundle_from_embedded(
+ }
+ 
+ fn get_message_internal(id: &str, args: Option<FluentArgs>) -> String {
+-    LOCALIZER.with(|lock| {
+-        lock.get()
+-            .map_or_else(|| id.to_string(), |loc| loc.format(id, args.as_ref())) // Return the key ID if localizer not initialized
++    let key = CURRENT_LOCALIZER.with(|slot| slot.borrow().clone());
++    let Some(key) = key else { return id.to_string() };
++    LOCALIZERS.with(|cache| {
++        cache
++            .borrow()
++            .get(&key)
++            .map_or_else(|| id.to_string(), |loc| loc.format(id, args.as_ref()))
+     })
+ }
+ 
+@@ -487,24 +483,38 @@ fn detect_system_locale() -> Result<LanguageIdentifier, LocalizationError> {
+ /// }
+ /// ```
+ pub fn setup_localization(p: &str) -> Result<(), LocalizationError> {
+-    // Avoid duplicated and high-cost localizer setup
+-    thread_local! {
+-        static LOCALIZER_IS_SET: Cell<bool> = const { Cell::new(false) };
+-    }
+-    if LOCALIZER_IS_SET.with(Cell::get) {
+-        return Ok(());
+-    }
++    let key = ensure_localizer(p)?;
++    CURRENT_LOCALIZER.with(|slot| *slot.borrow_mut() = Some(key));
++    Ok(())
++}
++
++/// Bind the utility-and-locale-specific localizer for one dynamic command
++/// extent. The bundle is built only on the first matching call on this thread;
++/// dropping the guard restores a surrounding utility's binding.
++pub fn push_localization(p: &str) -> Result<LocalizationGuard, LocalizationError> {
++    let key = ensure_localizer(p)?;
++    let previous = CURRENT_LOCALIZER.with(|slot| slot.borrow_mut().replace(key));
++    Ok(LocalizationGuard {
++        previous,
++        _thread_bound: std::marker::PhantomData,
++    })
++}
+ 
++fn ensure_localizer(p: &str) -> Result<LocalizationKey, LocalizationError> {
+     let locale = detect_system_locale().unwrap_or_else(|_| {
+         LanguageIdentifier::from_str(DEFAULT_LOCALE).expect("Default locale should always be valid")
+     });
++    let key = LocalizationKey {
++        utility: p.to_owned(),
++        locale: locale.to_string(),
++    };
++    if LOCALIZERS.with(|cache| cache.borrow().contains_key(&key)) {
++        return Ok(key);
++    }
+ 
+-    // Load common strings along with utility-specific strings
+-    if let Ok(locales_dir) = get_locales_dir(p) {
+-        // Load both utility-specific and common strings
+-        init_localization(&locale, &locales_dir, p)?;
++    let localizer = if let Ok(locales_dir) = get_locales_dir(p) {
++        create_localizer(&locale, &locales_dir, p)?
+     } else {
+-        // No locales directory found, use embedded locales
+         let default_locale = LanguageIdentifier::from_str(DEFAULT_LOCALE)
+             .expect("Default locale should always be valid");
+ 
+@@ -525,14 +535,12 @@ pub fn setup_localization(p: &str) -> Result<(), LocalizationError> {
+             let english_bundle = create_english_bundle_from_embedded(&default_locale, p)?;
+             Localizer::new(english_bundle)
+         };
+-
+-        LOCALIZER.with(|lock| {
+-            lock.set(localizer)
+-                .map_err(|_| LocalizationError::Bundle("Localizer already initialized".into()))
+-        })?;
+-    }
+-    LOCALIZER_IS_SET.with(|f| f.set(true));
+-    Ok(())
++        localizer
++    };
++    LOCALIZERS.with(|cache| {
++        cache.borrow_mut().insert(key.clone(), localizer);
++    });
++    Ok(key)
+ }
+ 
+ #[cfg(not(debug_assertions))]
+@@ -688,15 +696,14 @@ mod tests {
+     fn create_test_bundle(
+         locale: &LanguageIdentifier,
+         test_locales_dir: &Path,
+-    ) -> Result<FluentBundle<&'static FluentResource>, LocalizationError> {
+-        let mut bundle: FluentBundle<&'static FluentResource> =
+-            FluentBundle::new(vec![locale.clone()]);
++    ) -> Result<OwnedBundle, LocalizationError> {
++        let mut bundle = OwnedBundle::new(vec![locale.clone()]);
+         bundle.set_use_isolating(false);
+ 
+         // Only load from the test directory - no common strings or utility-specific paths
+         let locale_path = test_locales_dir.join(format!("{locale}.ftl"));
+         if let Ok(ftl_content) = fs::read_to_string(&locale_path) {
+-            let resource = parse_fluent_resource(&ftl_content, &UUCORE_FLUENT)?;
++            let resource = parse_fluent_resource(&ftl_content)?;
+             bundle.add_resource_overriding(resource);
+             return Ok(bundle);
+         }
+@@ -733,10 +740,14 @@ mod tests {
+             }
+         };
+ 
+-        LOCALIZER.with(|lock| {
+-            lock.set(loc)
+-                .map_err(|_| LocalizationError::Bundle("Localizer already initialized".into()))
+-        })?;
++        let key = LocalizationKey {
++            utility: format!("test:{}", test_locales_dir.display()),
++            locale: locale.to_string(),
++        };
++        LOCALIZERS.with(|cache| {
++            cache.borrow_mut().insert(key.clone(), loc);
++        });
++        CURRENT_LOCALIZER.with(|slot| *slot.borrow_mut() = Some(key));
+         Ok(())
+     }
+ 
+@@ -859,7 +870,7 @@ invalid-syntax = This is { $missing
+     #[test]
+     fn test_localizer_format_primary_bundle() {
+         let temp_dir = create_test_locales_dir();
+-        let en_bundle: FluentBundle<&'static FluentResource> = create_test_bundle(
++        let en_bundle = create_test_bundle(
+             &LanguageIdentifier::from_str("en-US").unwrap(),
+             temp_dir.path(),
+         )
+@@ -984,7 +995,7 @@ invalid-syntax = This is { $missing
+     }
+ 
+     #[test]
+-    fn test_init_localization_already_initialized() {
++    fn test_init_localization_can_be_rebound() {
+         std::thread::spawn(|| {
+             let temp_dir = create_test_locales_dir();
+             let locale = LanguageIdentifier::from_str("en-US").unwrap();
+@@ -993,16 +1004,11 @@ invalid-syntax = This is { $missing
+             let result1 = init_test_localization(&locale, temp_dir.path());
+             assert!(result1.is_ok());
+ 
+-            // Try to initialize again - should fail
++            // Rebinding replaces the active test context instead of requiring
++            // a disposable thread with an empty OnceLock.
+             let result2 = init_test_localization(&locale, temp_dir.path());
+-            assert!(result2.is_err());
+-
+-            match result2 {
+-                Err(LocalizationError::Bundle(msg)) => {
+-                    assert!(msg.contains("already initialized"));
+-                }
+-                _ => panic!("Expected Bundle error"),
+-            }
++            assert!(result2.is_ok());
++            assert_eq!(get_message("greeting"), "Hello, world!");
+         })
+         .join()
+         .unwrap();
+@@ -1461,6 +1467,32 @@ invalid-syntax = This is { $missing
+         .unwrap();
+     }
+ 
++    #[test]
++    fn scoped_localization_switches_utilities_and_restores_the_caller() {
++        std::thread::spawn(|| {
++            let _logical = crate::logical_env::push(
++                vec![("LANG".into(), "en-US.UTF-8".into())],
++                0o022,
++            );
++            let cat = push_localization("cat").unwrap();
++            let cat_about = get_message("cat-about");
++            assert_ne!(cat_about, "cat-about");
++
++            {
++                let _rm = push_localization("rm").unwrap();
++                let rm_about = get_message("rm-about");
++                assert_ne!(rm_about, "rm-about");
++                assert_eq!(get_message("cat-about"), "cat-about");
++            }
++
++            assert_eq!(get_message("cat-about"), cat_about);
++            drop(cat);
++            assert_eq!(get_message("cat-about"), "cat-about");
++        })
++        .join()
++        .unwrap();
++    }
++
+     #[test]
+     fn test_error_display() {
+         let io_error = LocalizationError::Io {
+diff --git a/src/lib/mods/logical_env.rs b/src/lib/mods/logical_env.rs
+index 2b9c2e6..c35177a 100644
+--- a/src/lib/mods/logical_env.rs
++++ b/src/lib/mods/logical_env.rs
+@@ -14,14 +14,32 @@
+ //! `NO_COLOR`/`TERM`, …) must consult that logical environment, not
+ //! `std::env::var_os`.
+ //!
+-//! The engine installs a snapshot of the shell's exported vars into this
+-//! thread-local at the top of each builtin's worker thread (before
+-//! localization and the util body run), then clears it. A standalone uutils
+-//! binary never installs an override, so [`get`] falls straight through to
+-//! `std::env::var_os` and behavior is byte-for-byte unchanged.
++//! The engine installs a snapshot of the shell's exported vars for the dynamic
++//! extent of each builtin call. A standalone uutils binary never installs an
++//! override, so [`get`] falls straight through to `std::env::var_os` and
++//! behavior is byte-for-byte unchanged.
+ 
+ use std::ffi::{OsStr, OsString};
+ 
++/// Restores the logical context that was active before [`push`] when dropped.
++///
++/// The marker deliberately makes this guard `!Send`: thread-local state must
++/// be restored on the same thread on which it was replaced.
++pub struct Guard {
++    previous_env: Option<Vec<(OsString, OsString)>>,
++    previous_umask: Option<u32>,
++    _thread_bound: std::marker::PhantomData<std::rc::Rc<()>>,
++}
++
++impl Drop for Guard {
++    fn drop(&mut self) {
++        OVERRIDE.with(|slot| {
++            *slot.borrow_mut() = self.previous_env.take();
++        });
++        UMASK_OVERRIDE.with(|slot| slot.set(self.previous_umask));
++    }
++}
++
+ thread_local! {
+     // `None` => no override installed on this thread: fall back to the real
+     // process environment (standalone binaries, and any engine thread that
+@@ -33,17 +51,30 @@ thread_local! {
+ }
+ 
+ /// Install the logical environment for the current thread. Replaces any
+-/// previously-installed override. Call once at the top of a builtin's worker
+-/// thread, before localization setup and the util body.
++/// previously-installed override. Long-lived embedders should normally use
++/// [`push`] so the previous value is restored after the utility returns.
+ pub fn set_logical_env(env: Vec<(OsString, OsString)>) {
+     OVERRIDE.with(|slot| *slot.borrow_mut() = Some(env));
+ }
+ 
+-/// Install the logical shell umask for the current utility worker thread.
++/// Install the logical shell umask for the current thread.
+ pub fn set_logical_umask(umask: u32) {
+     UMASK_OVERRIDE.with(|slot| slot.set(Some(umask)));
+ }
+ 
++/// Install a logical environment and umask until the returned guard is
++/// dropped, then restore the caller's context. This supports inline and nested
++/// utility calls without relying on worker-thread termination for cleanup.
++pub fn push(env: Vec<(OsString, OsString)>, umask: u32) -> Guard {
++    let previous_env = OVERRIDE.with(|slot| slot.borrow_mut().replace(env));
++    let previous_umask = UMASK_OVERRIDE.with(|slot| slot.replace(Some(umask)));
++    Guard {
++        previous_env,
++        previous_umask,
++        _thread_bound: std::marker::PhantomData,
++    }
++}
++
+ /// Return the logical shell umask, when running as an in-process utility.
+ pub fn logical_umask() -> Option<u32> {
+     UMASK_OVERRIDE.with(std::cell::Cell::get)
+@@ -78,3 +109,26 @@ pub fn get<K: AsRef<OsStr>>(key: K) -> Option<OsString> {
+ pub fn get_string<K: AsRef<OsStr>>(key: K) -> Option<String> {
+     get(key).and_then(|v| v.into_string().ok())
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn scoped_context_restores_nested_environment_and_umask() {
++        clear();
++        {
++            let _outer = push(vec![("A".into(), "outer".into())], 0o027);
++            assert_eq!(get_string("A").as_deref(), Some("outer"));
++            assert_eq!(logical_umask(), Some(0o027));
++            {
++                let _inner = push(vec![("A".into(), "inner".into())], 0o077);
++                assert_eq!(get_string("A").as_deref(), Some("inner"));
++                assert_eq!(logical_umask(), Some(0o077));
++            }
++            assert_eq!(get_string("A").as_deref(), Some("outer"));
++            assert_eq!(logical_umask(), Some(0o027));
++        }
++        assert_eq!(logical_umask(), None);
++    }
++}

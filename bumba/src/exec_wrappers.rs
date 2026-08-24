@@ -27,6 +27,24 @@ use brush_core::variables::{ShellValue, ShellVariable};
 use brush_core::{ExecutionParameters, ExecutionResult, Shell, builtins};
 use clap::Parser;
 
+pub fn extend<SE: brush_core::extensions::ShellExtensions>(
+    commands: &mut std::collections::HashMap<
+        String,
+        brush_core::builtins::Registration<SE>,
+    >,
+) {
+    for (name, mut registration) in [
+        ("env", builtins::builtin::<EnvCommand, SE>()),
+        ("printenv", builtins::builtin::<PrintenvCommand, SE>()),
+        ("nice", builtins::builtin::<NiceCommand, SE>()),
+        ("setsid", builtins::builtin::<SetsidCommand, SE>()),
+        ("nohup", builtins::builtin::<NohupCommand, SE>()),
+    ] {
+        registration.external_command = true;
+        commands.insert(name.into(), registration);
+    }
+}
+
 /// `env`'s own error status (bad option, unusable `-C`). Matches GNU env.
 const ENV_FAILURE: u8 = 125;
 
@@ -542,8 +560,8 @@ impl builtins::Command for NohupCommand {
         let subshell = context.shell.clone();
         let mut params = context.params.clone();
         params.launch_state.ignore_sighup = true;
-        // Redirect stdin from /dev/null so the detached command can't steal box stdin.
-        // stdout→nohup.out is intentionally omitted: a box's stdout is always a
+        // Redirect stdin from /dev/null so the detached command cannot steal shell stdin.
+        // stdout→nohup.out is intentionally omitted: a shell's stdout is always a
         // pipe/file (never a terminal), which is exactly when GNU nohup leaves it.
         if let Ok(devnull) = std::fs::File::open("/dev/null") {
             params.set_fd(OpenFiles::STDIN_FD, OpenFile::from(devnull));

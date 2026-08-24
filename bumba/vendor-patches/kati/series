@@ -90,3 +90,4 @@
 0900-Ignore-inline-comments-before-classifying-make-syntax.patch
 0910-Route-embedded-make-reads-through-scoped-filesystem-provider.patch
 0920-kati--expose-target-attributed-live-recipe-output.patch
+0930-kati--expand-target-exports-in-their-rule-scope.patch

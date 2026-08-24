@@ -1,0 +1,56 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bumba <noreply@bumba>
+Date: Mon, 24 Aug 2026 18:20:32 +0000
+Subject: [PATCH] kati: expand target exports in their rule scope
+
+Evaluate exported recursive target variables with the same target-specific and automatic-variable context as the recipe. Linux relies on this for its private LDFLAGS_vmlinux bridge; evaluating before installing the scope silently removed PIE, build-ID, and other final-link flags. Add a GNU Make differential corpus case.
+
+---
+diff --git a/src-rs/exec.rs b/src-rs/exec.rs
+index 3974001..57f3102 100644
+--- a/src-rs/exec.rs
++++ b/src-rs/exec.rs
+@@ -677,8 +677,21 @@ list of the rule for '{output}' at {loc}"));
+         &mut self,
+         n: &Arc<Mutex<DepNode>>,
+     ) -> Result<(Vec<crate::command::Command>, Vec<(Bytes, Bytes)>)> {
++        // Expand the recipe first: CommandEvaluator establishes this node's
++        // target-specific scope (and automatic variables) while doing so.
++        // Exported recursive variables need the SAME context. Previously we
++        // evaluated them here while `current_scope` was None, so a construct
++        // such as Kbuild's
++        //
++        //   vmlinux: private _LDFLAGS_vmlinux := $(LDFLAGS_vmlinux)
++        //   vmlinux: export LDFLAGS_vmlinux = $(_LDFLAGS_vmlinux)
++        //
++        // exported an empty value and silently dropped final-link flags.
++        let mut commands = self.ce.eval(n)?;
+         let mut exports: Vec<(Bytes, Bytes)> = Vec::new();
+         if let Some(rule_vars) = n.lock().rule_vars.clone() {
++            self.ce.ev.current_scope = Some(rule_vars.clone());
++            *self.ce.current_dep_node.lock() = Some(n.clone());
+             let entries: Vec<(Symbol, crate::var::Var)> =
+                 rule_vars.0.lock().iter().map(|(s, v)| (*s, v.clone())).collect();
+             for (symv, var) in entries {
+@@ -691,8 +704,8 @@ list of the rule for '{output}' at {loc}"));
+                     Bytes::from(val.to_vec()),
+                 ));
+             }
++            self.ce.ev.current_scope = None;
+         }
+-        let mut commands = self.ce.eval(n)?;
+         if self.ce.ev.oneshell && commands.len() > 1 {
+             use bytes::{BufMut, BytesMut};
+             let mut combined = BytesMut::new();
+diff --git a/testcase/sarun_target_specific_recursive_export.mk b/testcase/sarun_target_specific_recursive_export.mk
+new file mode 100644
+index 0000000..d1944fa
+--- /dev/null
++++ b/testcase/sarun_target_specific_recursive_export.mk
+@@ -0,0 +1,6 @@
++LINK_FLAGS := --build-id=sha1 -shared
++
++all: private _LINK_FLAGS := $(LINK_FLAGS)
++all: export LINK_FLAGS = $(_LINK_FLAGS)
++all:
++	@echo flags=[$$LINK_FLAGS]
