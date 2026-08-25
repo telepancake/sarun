@@ -1,0 +1,41 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bumba <noreply@bumba>
+Date: Tue, 25 Aug 2026 19:38:28 +0000
+Subject: [PATCH] Restore standalone n2 unit tests
+
+Declare the tempfile dev-dependency used by graph tests and remove stale Sarun branding from the independently vendored crate manifest.
+
+---
+diff --git a/Cargo.toml b/Cargo.toml
+index 77f1534..838feea 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -1,7 +1,7 @@
+-# sarun: vendored, lib-only patched fork of n2 (github.com/evmar/n2).
++# Bumba's vendored, lib-only patched fork of n2 (github.com/evmar/n2).
+ # Pinned upstream commit: b1fead52ccda0c497d816696f23f4099c3e8ec1f
+ #
+-# Why vendored: sarun embeds n2 IN-PROCESS and replaces n2's per-recipe
++# Why vendored: Bumba embeds n2 IN-PROCESS and replaces n2's per-recipe
+ # `/bin/sh -c` posix_spawn with an in-process embedded-brush executor (see
+ # the `// sarun:` patch in src/process_posix.rs). All other n2 sources are
+ # byte-for-byte upstream so this fork stays auditable / re-syncable.
+@@ -18,7 +18,7 @@ name = "n2"
+ version = "0.1.0"
+ edition = "2021"
+ license = "Apache-2.0"
+-description = "a ninja compatible build system (sarun vendored lib-only fork)"
++description = "a ninja compatible build system (Bumba vendored lib-only fork)"
+ 
+ [lib]
+ name = "n2"
+@@ -30,6 +30,9 @@ lexopt = "0.3.0"
+ libc = "0.2"
+ rustc-hash = "1.1.0"
+ 
++[dev-dependencies]
++tempfile = "3"
++
+ [features]
+ default = []
+ crlf = []

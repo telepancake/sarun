@@ -3,3 +3,6 @@
 0030-vendor-n2-jobserver-client-draw-parallelism-from-a-shared-po.patch
 0040-jobserver-route-all-real-builds-at-the-engine-global-FUSE-po.patch
 0050-silence-rustc-lint-warnings--unused-qualifications---dead-co.patch
+0060-Support-standalone-Bumba-on-macOS.patch
+0070-Keep-embedded-Ninja-scheduling-invocation-local.patch
+0080-Restore-standalone-n2-unit-tests.patch

@@ -1,0 +1,79 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bumba <noreply@bumba>
+Date: Tue, 25 Aug 2026 19:21:40 +0000
+Subject: [PATCH] Support standalone Bumba on macOS
+
+Use an immediately unlinked temporary database where memfd_create is unavailable and expose the macOS spawn flag wrapper required by the embedded runner.
+
+---
+diff --git a/src/db.rs b/src/db.rs
+index 182bb16..49eb626 100644
+--- a/src/db.rs
++++ b/src/db.rs
+@@ -100,8 +100,44 @@ impl Writer {
+     // as out-of-date on this run — correct for a one-shot in-process build that
+     // has no persisted state.
+     pub fn in_memory() -> std::io::Result<Self> {
+-        // SAFETY: memfd_create with a valid NUL-terminated name and MFD_CLOEXEC.
+-        let fd = unsafe { libc::memfd_create(c"n2-db".as_ptr(), libc::MFD_CLOEXEC) };
++        #[cfg(target_os = "linux")]
++        let fd = {
++            // SAFETY: memfd_create with a valid NUL-terminated name and MFD_CLOEXEC.
++            unsafe { libc::memfd_create(c"n2-db".as_ptr(), libc::MFD_CLOEXEC) }
++        };
++        #[cfg(not(target_os = "linux"))]
++        let fd = {
++            use std::os::unix::ffi::OsStrExt;
++
++            // macOS has no memfd_create. Create a private temporary file and
++            // unlink it immediately; the open descriptor has the same
++            // lifetime and visibility semantics needed by the one-shot DB.
++            let mut template = std::env::temp_dir()
++                .join("bumba-n2-db.XXXXXX")
++                .as_os_str()
++                .as_bytes()
++                .to_vec();
++            template.push(0);
++            // SAFETY: the template is writable, NUL-terminated and contains
++            // the six trailing X bytes required by mkstemp.
++            let fd = unsafe { libc::mkstemp(template.as_mut_ptr().cast()) };
++            if fd >= 0 {
++                // SAFETY: both calls use the descriptor/path just returned by
++                // mkstemp. Failure to unlink is reported to avoid leaving a
++                // named database behind.
++                if unsafe { libc::unlink(template.as_ptr().cast()) } < 0 {
++                    let error = std::io::Error::last_os_error();
++                    unsafe { libc::close(fd) };
++                    return Err(error);
++                }
++                if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
++                    let error = std::io::Error::last_os_error();
++                    unsafe { libc::close(fd) };
++                    return Err(error);
++                }
++            }
++            fd
++        };
+         if fd < 0 {
+             return Err(std::io::Error::last_os_error());
+         }
+diff --git a/src/process_posix.rs b/src/process_posix.rs
+index 7d817e8..38f906a 100644
+--- a/src/process_posix.rs
++++ b/src/process_posix.rs
+@@ -48,6 +48,15 @@ impl PosixSpawnAttr {
+         &mut self.0
+     }
+ 
++    #[cfg(target_os = "macos")]
++    fn setflags(&mut self, flags: libc::c_short) -> anyhow::Result<()> {
++        unsafe {
++            check_posix_spawn(
++                "posix_spawnattr_setflags",
++                libc::posix_spawnattr_setflags(self.as_ptr(), flags),
++            )
++        }
++    }
+ }
+ 
+ impl Drop for PosixSpawnAttr {

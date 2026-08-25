@@ -1,0 +1,520 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bumba <noreply@bumba>
+Date: Tue, 25 Aug 2026 19:21:56 +0000
+Subject: [PATCH] Isolate embedded make scheduling and reuse recipe workers
+
+Move execution flags and inherited job counts into each evaluator, read logical MAKEFLAGS rather than process globals, and replace one large-stack thread per target with a bounded per-invocation worker pool.
+
+---
+diff --git a/src-rs/command.rs b/src-rs/command.rs
+index c2d621b..62c60f2 100644
+--- a/src-rs/command.rs
++++ b/src-rs/command.rs
+@@ -25,7 +25,6 @@ use crate::{
+     exec::ExecStatus,
+     expr::Evaluable,
+     fileutil::get_timestamp,
+-    flags::FLAGS,
+     strutil::{
+         Pattern, WordWriter, basename, dirname, find_end_of_line, trim_left_space, word_scanner,
+     },
+@@ -304,9 +303,7 @@ impl<'a> CommandEvaluator<'a> {
+             self.ev.loc = v.loc();
+             let cmds_buf = v.eval_to_buf(self.ev)?;
+             let mut cmds = cmds_buf.clone();
+-            let mut global_echo = !(
+-                FLAGS.is_silent_mode || self.ev.silent || target_silent
+-            );
++            let mut global_echo = !(self.ev.silent_mode || self.ev.silent || target_silent);
+             let mut global_ignore_error = false;
+             cmds = parse_command_prefixes(cmds, &mut global_echo, &mut global_ignore_error);
+             if cmds.is_empty() {
+diff --git a/src-rs/eval.rs b/src-rs/eval.rs
+index 27411e1..e071724 100644
+--- a/src-rs/eval.rs
++++ b/src-rs/eval.rs
+@@ -267,6 +267,12 @@ pub struct Evaluator {
+     /// sarun: `.NOTPARALLEL:` was seen — this make's recipes run serially
+     /// even when -j / a jobserver is in effect.
+     pub not_parallel: bool,
++    /// Per-invocation scheduler settings. These cannot live in `flags::FLAGS`:
++    /// embedded Bumba runs many independent make invocations in one process.
++    pub num_jobs: usize,
++    pub jobs_explicit: bool,
++    pub keep_going: bool,
++    pub silent_mode: bool,
+     /// sarun: a prerequisite-free `.SILENT:` special target suppresses recipe
+     /// echo and no-op root diagnostics for this make invocation.
+     pub silent: bool,
+@@ -275,10 +281,8 @@ pub struct Evaluator {
+     pub silent_targets: HashSet<Symbol>,
+     /// sarun: per-make GNU `-n` (dry run) / `-i` (ignore-errors). Carried on
+     /// the Evaluator — NOT the process-global FLAGS — because many in-process
+-    /// makes share one process and only the FIRST argv installs FLAGS; a
+-    /// recursive `$(MAKE) -n`/-i must not depend on what the top make was
+-    /// invoked with. exec.rs ORs these with the global FLAGS (standalone
+-    /// rkati still drives everything through FLAGS).
++    /// makes share one process; a recursive `$(MAKE) -n`/-i must not depend on
++    /// what the first or top-level make was invoked with.
+     pub dry_run: bool,
+     pub ignore_errors: bool,
+     /// sarun: per-make GNU --trace (goal/recipe decision tracing; see
+@@ -410,6 +414,10 @@ impl Evaluator {
+             rule_vars: HashMap::new(),
+             vpath_patterns: Vec::new(),
+             not_parallel: false,
++            num_jobs: 1,
++            jobs_explicit: false,
++            keep_going: false,
++            silent_mode: false,
+             silent: false,
+             silent_targets: HashSet::new(),
+             dry_run: false,
+diff --git a/src-rs/exec.rs b/src-rs/exec.rs
+index 57f3102..9ba63fd 100644
+--- a/src-rs/exec.rs
++++ b/src-rs/exec.rs
+@@ -35,7 +35,6 @@ use crate::{
+     expr::Evaluable,
+     fileutil::{RedirectStderr, get_timestamp, is_posix_shell_command, run_command,
+                run_with_installed_runner},
+-    flags::FLAGS,
+     symtab::Symbol,
+     warn,
+ };
+@@ -298,6 +297,113 @@ enum RunMsg {
+     Done(NodeRun, Option<u8>),
+ }
+ 
++struct RunWork {
++    req: RunReq,
++    slip: Option<u8>,
++}
++
++struct WorkQueueState {
++    queue: std::collections::VecDeque<RunWork>,
++    closed: bool,
++}
++
++/// A make invocation owns at most `cap` persistent recipe workers. The old
++/// scheduler created and destroyed a 64 MiB-stack thread for every target;
++/// large generated builds can contain hundreds of thousands of short recipes,
++/// making thread lifecycle more expensive than the work itself.
++struct RecipeWorkers {
++    queue: Arc<(Mutex<WorkQueueState>, parking_lot::Condvar)>,
++    workers: Vec<std::thread::JoinHandle<()>>,
++}
++
++impl RecipeWorkers {
++    fn new(
++        cap: usize,
++        shell: Bytes,
++        shellflag: &'static [u8],
++        recipe_stdin: Option<Arc<std::os::fd::OwnedFd>>,
++        tx: std::sync::mpsc::Sender<RunMsg>,
++        filesystem: Option<Arc<dyn crate::filesystem::FileSystemProvider>>,
++    ) -> Self {
++        let queue = Arc::new((
++            Mutex::new(WorkQueueState {
++                queue: std::collections::VecDeque::new(),
++                closed: false,
++            }),
++            parking_lot::Condvar::new(),
++        ));
++        let mut workers = Vec::with_capacity(cap);
++        for worker_index in 0..cap {
++            let queue = Arc::clone(&queue);
++            let shell = shell.clone();
++            let recipe_stdin = recipe_stdin.clone();
++            let tx = tx.clone();
++            let filesystem = filesystem.clone();
++            workers.push(
++                std::thread::Builder::new()
++                    .name(format!("kati-recipe-{worker_index}"))
++                    // A worker can execute a recursive make whose parser uses a
++                    // deep Rust call stack (notably Linux Kbuild).
++                    .stack_size(64 * 1024 * 1024)
++                    .spawn(move || loop {
++                        let work = {
++                            let (lock, ready) = &*queue;
++                            let mut state = lock.lock();
++                            while state.queue.is_empty() && !state.closed {
++                                ready.wait(&mut state);
++                            }
++                            match state.queue.pop_front() {
++                                Some(work) => work,
++                                None => break,
++                            }
++                        };
++                        let _filesystem = filesystem
++                            .clone()
++                            .map(crate::filesystem::install_file_system_provider);
++                        let mut emit = |bytes: &[u8]| {
++                            let _ = tx.send(RunMsg::Chunk(bytes.to_vec()));
++                        };
++                        let _activity = crate::fileutil::ActivityGuard::new(format!(
++                            "recipe of '{}'",
++                            work.req.output
++                        ));
++                        let result = run_node_commands(
++                            &shell,
++                            shellflag,
++                            recipe_stdin.clone(),
++                            work.req,
++                            &mut emit,
++                        );
++                        let _ = tx.send(RunMsg::Done(result, work.slip));
++                    })
++                    .expect("spawn kati recipe worker"),
++            );
++        }
++        Self { queue, workers }
++    }
++
++    fn submit(&self, work: RunWork) {
++        let (lock, ready) = &*self.queue;
++        lock.lock().queue.push_back(work);
++        ready.notify_one();
++    }
++}
++
++impl Drop for RecipeWorkers {
++    fn drop(&mut self) {
++        let (lock, ready) = &*self.queue;
++        {
++            let mut state = lock.lock();
++            state.closed = true;
++            state.queue.clear();
++        }
++        ready.notify_all();
++        for worker in self.workers.drain(..) {
++            let _ = worker.join();
++        }
++    }
++}
++
+ /// Run a node's concrete commands in sequence on a worker thread, capturing the
+ /// merged output. Stops at the first non-ignored failure. Needs no Evaluator.
+ fn run_node_commands(
+@@ -331,8 +437,8 @@ fn run_node_commands(
+     // up-to-date) nodes are correctly left un-started. `req.output` is the node's
+     // primary output (== build_edges.outs[0], the engine's match key).
+     let output = req.output;
+-    let touch = FLAGS.is_touch || req.touch;
+-    let dry_run = FLAGS.is_dry_run || req.dry_run || req.question;
++    let touch = req.touch;
++    let dry_run = req.dry_run || req.question;
+     let report = !dry_run && !req.commands.is_empty();
+     if report {
+         crate::fileutil::report_edge(output.as_bytes().as_ref(),
+@@ -421,7 +527,7 @@ fn run_node_commands(
+             };
+         if !ok {
+             // Global -i / --ignore-errors == every line '-'-prefixed.
+-            if command.ignore_error || FLAGS.is_ignore_errors || req.ignore_errors {
++            if command.ignore_error || req.ignore_errors {
+                 ignored.push((command.output, code));
+             } else {
+                 failure = Some((command.output, code));
+@@ -621,7 +727,7 @@ list of the rule for '{output}' at {loc}"));
+             }
+         }
+         if output_ts >= latest && !is_phony && !self.always_make {
+-            if self.trace || FLAGS.is_trace {
++            if self.trace {
+                 emit_recipe_err(&format!(
+                     "--trace: '{output}': skip — up to date \
+ (target {output_ts:?} >= newest prerequisite {latest:?})"));
+@@ -630,7 +736,7 @@ list of the rule for '{output}' at {loc}"));
+         }
+         // GNU -t does not expand the recipe. Its raw presence is enough to
+         // decide that an out-of-date, non-phony target should be touched.
+-        let touch = self.touch || FLAGS.is_touch;
++        let touch = self.touch;
+         let (commands, exports) = if touch {
+             if is_phony || n.lock().cmds.is_empty() {
+                 return Ok((if is_phony { ExecStatus::Updated } else { output_ts }, None));
+@@ -640,14 +746,14 @@ list of the rule for '{output}' at {loc}"));
+             self.eval_node_commands(&n)?
+         };
+         if commands.is_empty() && !touch {
+-            if self.trace || FLAGS.is_trace {
++            if self.trace {
+                 emit_recipe_err(&format!(
+                     "--trace: '{output}': skip — rule has no commands \
+ (phony={is_phony}, exists={})", !matches!(output_ts, ExecStatus::Timestamp(None))));
+             }
+             return Ok((if is_phony { ExecStatus::Updated } else { output_ts }, None));
+         }
+-        if self.trace || FLAGS.is_trace {
++        if self.trace {
+             let why = if matches!(output_ts, ExecStatus::Timestamp(None)) {
+                 "target does not exist".to_string()
+             } else if is_phony {
+@@ -804,6 +910,14 @@ list of the rule for '{output}' at {loc}"));
+         let mut run_queue: BinaryHeap<Ready> = BinaryHeap::new();
+         let mut reqs: HashMap<Symbol, RunReq> = HashMap::new();
+         let (tx, rx) = std::sync::mpsc::channel::<RunMsg>();
++        let workers = RecipeWorkers::new(
++            cap,
++            self.shell.clone(),
++            self.shellflag,
++            self.recipe_stdin.clone(),
++            tx.clone(),
++            crate::filesystem::capture_file_system_provider(),
++        );
+         let mut running = 0usize;
+         let mut failed: Option<i32> = None;
+         let mut done_count = 0usize;
+@@ -815,7 +929,7 @@ list of the rule for '{output}' at {loc}"));
+         // (or errored) lazily at each consumer, GNU-style.
+         let mut missing: std::collections::HashSet<Symbol> =
+             std::collections::HashSet::new();
+-        let keep_going = FLAGS.is_keep_going
++        let keep_going = self.ce.ev.keep_going
+             || self
+                 .ce
+                 .ev
+@@ -876,31 +990,10 @@ list of the rule for '{output}' at {loc}"));
+                     None
+                 };
+                 run_queue.pop();
+-                let req = reqs.remove(&sym).unwrap();
+-                let shell = self.shell.clone();
+-                let shellflag = self.shellflag;
+-                let recipe_stdin = self.recipe_stdin.clone();
+-                let txc = tx.clone();
+-                let filesystem = crate::filesystem::capture_file_system_provider();
+-                // Large stack: a recipe may be a recursive sub-make whose kati
+-                // parse/eval recurses deeply on big Makefiles (busybox/kernel).
+-                // The default 2 MiB spawned-thread stack overflows there; ckati
+-                // relies on the 8 MiB main-thread stack. 64 MiB is ample.
+-                std::thread::Builder::new()
+-                    .stack_size(64 * 1024 * 1024)
+-                    .spawn(move || {
+-                        let _filesystem =
+-                            filesystem.map(crate::filesystem::install_file_system_provider);
+-                        // Stream each output chunk to the main thread LIVE (it owns
+-                        // the RECIPE_OUT sink); then the final result.
+-                        let mut emit = |b: &[u8]| { let _ = txc.send(RunMsg::Chunk(b.to_vec())); };
+-                        let _act = crate::fileutil::ActivityGuard::new(
+-                            format!("recipe of '{}'", req.output));
+-                        let r = run_node_commands(
+-                            &shell, shellflag, recipe_stdin, req, &mut emit);
+-                        let _ = txc.send(RunMsg::Done(r, slip));
+-                    })
+-                    .expect("spawn recipe worker");
++                workers.submit(RunWork {
++                    req: reqs.remove(&sym).unwrap(),
++                    slip,
++                });
+                 running += 1;
+             }
+             // 3. Termination.
+@@ -1031,14 +1124,25 @@ pub fn exec_opts(
+     // one is advertised (sarun box), else by the local cap alone (standalone,
+     // like make's own jobserver). No -j ⇒ cap 1 ⇒ serial, byte-identical order
+     // to the old recursion — so the rkati↔make corpus is unaffected.
+-    let client = crate::jobserver::Client::from_env();
++    let makeflags = executor
++        .ce
++        .ev
++        .lookup_var(crate::symtab::intern("MAKEFLAGS"))?
++        .map(|v| {
++            use crate::expr::Evaluable;
++            v.read().eval_to_buf(executor.ce.ev)
++        })
++        .transpose()?;
++    let client = makeflags
++        .as_deref()
++        .and_then(crate::jobserver::Client::from_makeflags);
+     // Parallel when -j>1 was requested OR a parent advertised a jobserver in
+     // MAKEFLAGS (a sub-make inherits parallelism, like GNU make). Plain standalone
+     // `make` with no jobserver stays serial (cap 1), so the corpus is unaffected.
+-    let parallel = (FLAGS.jobs_explicit || client.is_some())
++    let parallel = (executor.ce.ev.jobs_explicit || client.is_some())
+         // .NOTPARALLEL: this make is serial regardless of -j/jobserver.
+         && !not_parallel;
+-    let cap = if parallel { FLAGS.num_jobs.max(1) } else { 1 };
++    let cap = if parallel { executor.ce.ev.num_jobs.max(1) } else { 1 };
+     let client = if cap > 1 { client } else { None };
+     executor.exec_graph(roots.clone(), cap, client)?;
+     // sarun: under -q the run is a pure probe — record whether anything
+@@ -1048,7 +1152,7 @@ pub fn exec_opts(
+     // commands at all (or which had no rule) — and never under -q.
+     if executor.num_commands == 0
+         && !executor.question
+-        && !FLAGS.is_silent_mode
++        && !executor.ce.ev.silent_mode
+         && !executor.silent
+     {
+         for (sym, root) in roots {
+diff --git a/src-rs/flags.rs b/src-rs/flags.rs
+index 5e57c37..2d22ab6 100644
+--- a/src-rs/flags.rs
++++ b/src-rs/flags.rs
+@@ -291,6 +291,17 @@ impl Flags {
+                 self.is_silent_mode = true;
+             } else if tok == b"-k" || tok == b"--keep-going" {
+                 self.is_keep_going = true;
++            } else if tok == b"-j" || tok == b"--jobs" {
++                self.jobs_explicit = true;
++            } else if let Some(jobs) = tok
++                .strip_prefix(b"-j")
++                .filter(|value| !value.is_empty())
++                .or_else(|| tok.strip_prefix(b"--jobs="))
++            {
++                if let Ok(jobs) = std::str::from_utf8(jobs).unwrap_or("").parse::<usize>() {
++                    self.num_jobs = jobs.max(1);
++                    self.jobs_explicit = true;
++                }
+             } else if tok == b"-i" || tok == b"--ignore-errors" {
+                 self.is_ignore_errors = true;
+             } else if tok == b"-n" || tok == b"--just-print"
+@@ -683,6 +694,26 @@ mod tests {
+         assert_eq!(flags.subkati_args, vec![OsString::from("make")]);
+     }
+ 
++    #[test]
++    fn test_inherited_makeflags_carries_parallelism_per_invocation() {
++        let serial = Flags::from_args_with_makeflags(
++            vec![OsString::from("make")],
++            Some(b"-j1 --jobserver-auth=fifo:/tmp/jobs"),
++        );
++        assert!(serial.jobs_explicit);
++        assert_eq!(serial.num_jobs, 1);
++
++        let parallel = Flags::from_args_with_makeflags(
++            vec![OsString::from("make")],
++            Some(b"-j9 --jobserver-auth=fifo:/tmp/jobs"),
++        );
++        assert!(parallel.jobs_explicit);
++        assert_eq!(parallel.num_jobs, 9);
++
++        let plain = Flags::from_args_with_makeflags(vec![OsString::from("make")], None);
++        assert!(!plain.jobs_explicit);
++    }
++
+     #[test]
+     fn test_command_line_goals_trim_leading_curdir() {
+         let flags = Flags::from_args(
+diff --git a/src-rs/jobserver.rs b/src-rs/jobserver.rs
+index ed9062a..64d86e6 100644
+--- a/src-rs/jobserver.rs
++++ b/src-rs/jobserver.rs
+@@ -10,48 +10,98 @@
+ //! We open our OWN non-blocking handle to the fifo path so try_acquire never
+ //! stalls the scheduler; forked tools open their own (blocking) handles.
+ 
+-/// A non-blocking handle on the engine slip pool (the FUSE fifo).
++/// A connection to either a FIFO jobserver or inherited descriptor pair.
+ pub struct Client {
+-    fd: i32,
++    read_fd: i32,
++    write_fd: i32,
++    owned: bool,
++}
++
++fn flag_value<'a>(makeflags: &'a str, name: &str) -> Option<&'a str> {
++    makeflags
++        .split_whitespace()
++        .find_map(|token| token.strip_prefix(name))
+ }
+ 
+ fn fifo_path(makeflags: &str) -> Option<&str> {
+-    makeflags.split_whitespace().find_map(|tok| {
+-        tok.strip_prefix("--jobserver-auth=")
+-            .or_else(|| tok.strip_prefix("--jobserver-fds="))
+-            .and_then(|v| v.strip_prefix("fifo:"))
+-    })
++    flag_value(makeflags, "--jobserver-auth=")
++        .or_else(|| flag_value(makeflags, "--jobserver-fds="))
++        .and_then(|value| value.strip_prefix("fifo:"))
++}
++
++fn fd_pair(makeflags: &str) -> Option<(i32, i32)> {
++    let value = flag_value(makeflags, "--jobserver-auth=")
++        .or_else(|| flag_value(makeflags, "--jobserver-fds="))?;
++    let (read, write) = value.split_once(',')?;
++    Some((read.parse().ok()?, write.parse().ok()?))
+ }
+ 
+ impl Client {
++    /// Connect to the jobserver described by this make invocation's logical
++    /// `MAKEFLAGS`. Embedded makes must not consult the host process environment:
++    /// several invocations with different environments may coexist there.
++    pub fn from_makeflags(makeflags: &[u8]) -> Option<Client> {
++        let mf = std::str::from_utf8(makeflags).ok()?;
++        if let Some(path) = fifo_path(mf) {
++            let c = std::ffi::CString::new(path).ok()?;
++            let fd = unsafe { libc::open(c.as_ptr(), libc::O_RDWR | libc::O_NONBLOCK) };
++            if fd < 0 {
++                return None;
++            }
++            return Some(Client {
++                read_fd: fd,
++                write_fd: fd,
++                owned: true,
++            });
++        }
++        let (read_fd, write_fd) = fd_pair(mf)?;
++        if unsafe { libc::fcntl(read_fd, libc::F_GETFD) } < 0
++            || unsafe { libc::fcntl(write_fd, libc::F_GETFD) } < 0
++        {
++            return None;
++        }
++        Some(Client {
++            read_fd,
++            write_fd,
++            owned: false,
++        })
++    }
++
+     /// Connect to the fifo jobserver named in MAKEFLAGS, if any.
+     pub fn from_env() -> Option<Client> {
+         let mf = std::env::var("MAKEFLAGS").ok()?;
+-        let path = fifo_path(&mf)?;
+-        let c = std::ffi::CString::new(path).ok()?;
+-        let fd = unsafe { libc::open(c.as_ptr(), libc::O_RDWR | libc::O_NONBLOCK) };
+-        if fd < 0 {
+-            return None;
+-        }
+-        Some(Client { fd })
++        Self::from_makeflags(mf.as_bytes())
+     }
+ 
+     /// Claim a slip without blocking. None ⇒ pool momentarily empty.
+     pub fn try_acquire(&self) -> Option<u8> {
+         let mut b = [0u8; 1];
+-        let n = unsafe { libc::read(self.fd, b.as_mut_ptr() as *mut libc::c_void, 1) };
++        if !self.owned {
++            let mut pollfd = libc::pollfd {
++                fd: self.read_fd,
++                events: libc::POLLIN,
++                revents: 0,
++            };
++            let ready = unsafe { libc::poll(&mut pollfd, 1, 0) };
++            if ready <= 0 || (pollfd.revents & libc::POLLIN) == 0 {
++                return None;
++            }
++        }
++        let n = unsafe { libc::read(self.read_fd, b.as_mut_ptr().cast::<libc::c_void>(), 1) };
+         if n == 1 { Some(b[0]) } else { None }
+     }
+ 
+     /// Return a slip to the pool.
+     pub fn release(&self, token: u8) {
+         let b = [token];
+-        unsafe { libc::write(self.fd, b.as_ptr() as *const libc::c_void, 1) };
++        unsafe { libc::write(self.write_fd, b.as_ptr().cast::<libc::c_void>(), 1) };
+     }
+ }
+ 
+ impl Drop for Client {
+     fn drop(&mut self) {
+-        unsafe { libc::close(self.fd) };
++        if self.owned {
++            unsafe { libc::close(self.read_fd) };
++        }
+     }
+ }

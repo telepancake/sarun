@@ -14,9 +14,38 @@
 //! Both forms refer to the same host-owned endpoint.
 
 static JOBSERVER_PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+static JOBSERVER_FDS: std::sync::OnceLock<Option<(i32, i32)>> = std::sync::OnceLock::new();
+static LOCAL_JOBSERVER_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Configure the endpoint Bumba should advertise. This is once-per-process,
-/// matching the process-global `MAKEFLAGS` inherited by external children.
+struct LocalJobserver {
+    path: std::path::PathBuf,
+    _server: std::os::fd::OwnedFd,
+    _legacy_read: std::os::fd::OwnedFd,
+    _legacy_write: std::os::fd::OwnedFd,
+}
+
+impl Drop for LocalJobserver {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// A jobserver advertisement and, for a standalone top-level build, ownership
+/// of the FIFO behind it. Keeping this value alive keeps recursive consumers on
+/// the same bounded pool; dropping it removes the private FIFO.
+pub struct Advertisement {
+    flags: String,
+    _local: Option<LocalJobserver>,
+}
+
+impl Advertisement {
+    pub fn flags(&self) -> &str {
+        &self.flags
+    }
+}
+
+/// Configure the host-owned endpoint Bumba should advertise. The endpoint is
+/// process-wide, but every build composes its own logical `MAKEFLAGS` value.
 pub fn set_path(path: impl Into<std::path::PathBuf>) -> Result<(), std::path::PathBuf> {
     JOBSERVER_PATH.set(path.into())
 }
@@ -62,53 +91,123 @@ fn clear_cloexec(fd: i32) {
     }
 }
 
-/// Advertise the host pool into this build's `MAKEFLAGS`. Idempotent: a
-/// recursive sub-make (or a ninja under a parallel make) inherits the already-set
-/// `MAKEFLAGS` and returns at once — it joins the same pool rather than opening a
-/// second advertisement. `local_jobs` is this build's `-j` cap (n2 uses it as its
-/// runner cap; the pool does the system-wide bounding).
-pub fn advertise(local_jobs: usize) {
-    if std::env::var("MAKEFLAGS")
-        .map(|m| m.contains("--jobserver-auth=") || m.contains("--jobserver-fds="))
-        .unwrap_or(false)
-    {
-        return; // inherited from a parent build — same pool, nothing to do
-    }
-    let Some(path) = JOBSERVER_PATH.get() else {
-        return;
-    };
-    // Pre-open a blocking handle on the pool for fd-form children to inherit.
-    // open() never blocks (only read()=acquire does), so this is safe even when
-    // the pool is momentarily empty. If the path can't be opened we're likely not
-    // in a host with the pool mounted — leave MAKEFLAGS alone (serial).
-    use std::os::unix::ffi::OsStrExt as _;
-    let Ok(cpath) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
-        return;
-    };
-    let r = unsafe { libc::open(cpath.as_ptr(), libc::O_RDWR) };
-    if r < 0 {
-        return;
-    }
-    let w = unsafe { libc::dup(r) };
-    if w < 0 {
-        unsafe { libc::close(r) };
-        return;
-    }
-    // Children must inherit these across exec (same requirement as runner.rs's
-    // host fds). The handles intentionally live for the host process's lifetime.
-    clear_cloexec(r);
-    clear_cloexec(w);
+fn host_advertisement(local_jobs: usize) -> Option<String> {
+    let path = JOBSERVER_PATH.get()?;
+    let &(r, w) = JOBSERVER_FDS
+        .get_or_init(|| {
+            use std::os::unix::ffi::OsStrExt as _;
+            let cpath = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+            let r = unsafe { libc::open(cpath.as_ptr(), libc::O_RDWR) };
+            if r < 0 {
+                return None;
+            }
+            let w = unsafe { libc::dup(r) };
+            if w < 0 {
+                unsafe { libc::close(r) };
+                return None;
+            }
+            clear_cloexec(r);
+            clear_cloexec(w);
+            Some((r, w))
+        })
+        .as_ref()?;
+    Some(format!(
+        "-j{local_jobs} --jobserver-auth=fifo:{} --jobserver-fds={r},{w}",
+        path.display()
+    ))
+}
 
-    let auth =
-        format!(
-            "-j{local_jobs} --jobserver-auth=fifo:{} --jobserver-fds={r},{w}",
-            path.display()
-        );
-    let combined = match std::env::var("MAKEFLAGS") {
-        Ok(prev) if !prev.trim().is_empty() => format!("{prev} {auth}"),
-        _ => auth,
+fn local_advertisement(local_jobs: usize) -> Option<Advertisement> {
+    use std::os::fd::FromRawFd as _;
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::sync::atomic::Ordering;
+
+    if local_jobs <= 1 {
+        return None;
+    }
+    // A FIFO is finite. Real CPU counts are far below this; rejecting an
+    // absurd request avoids an unbounded allocation or blocking while seeding.
+    let token_count = local_jobs.checked_sub(1)?;
+    if token_count > 32_768 {
+        return None;
+    }
+    let id = LOCAL_JOBSERVER_ID.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!(
+        "bumba-jobserver-{}-{id}.fifo",
+        std::process::id()
+    ));
+    let cpath = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    if unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) } < 0 {
+        return None;
+    }
+    let fail = || {
+        let _ = std::fs::remove_file(&path);
+        None
     };
-    // SAFETY: runs once per process (idempotent guard above), before the build spawns
-    // recipe threads or forks tools — no concurrent env reader yet.
-    unsafe { std::env::set_var("MAKEFLAGS", combined) };
+    let server_fd = unsafe {
+        libc::open(
+            cpath.as_ptr(),
+            libc::O_RDWR | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    if server_fd < 0 {
+        return fail();
+    }
+    let server = unsafe { std::os::fd::OwnedFd::from_raw_fd(server_fd) };
+    let legacy_read_fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDWR) };
+    if legacy_read_fd < 0 {
+        return fail();
+    }
+    let legacy_read = unsafe { std::os::fd::OwnedFd::from_raw_fd(legacy_read_fd) };
+    let legacy_write_fd = unsafe { libc::dup(legacy_read_fd) };
+    if legacy_write_fd < 0 {
+        return fail();
+    }
+    let legacy_write = unsafe { std::os::fd::OwnedFd::from_raw_fd(legacy_write_fd) };
+    clear_cloexec(legacy_read_fd);
+    clear_cloexec(legacy_write_fd);
+
+    let tokens = vec![b'+'; token_count];
+    let written = unsafe {
+        libc::write(
+            server_fd,
+            tokens.as_ptr().cast::<libc::c_void>(),
+            tokens.len(),
+        )
+    };
+    if written != token_count as isize {
+        return fail();
+    }
+    let flags = format!(
+        "-j{local_jobs} --jobserver-auth=fifo:{} --jobserver-fds={legacy_read_fd},{legacy_write_fd}",
+        path.display()
+    );
+    Some(Advertisement {
+        flags,
+        _local: Some(LocalJobserver {
+            path,
+            _server: server,
+            _legacy_read: legacy_read,
+            _legacy_write: legacy_write,
+        }),
+    })
+}
+
+/// Return the jobserver words to add to one invocation's logical `MAKEFLAGS`.
+///
+/// This deliberately does not mutate `std::env`: Bumba hosts unrelated makes
+/// in one process, and the first build's `-jN` must not leak into every later
+/// make/ninja invocation. A configured host pool is reused; otherwise Bumba
+/// creates a private, scoped FIFO for this top-level standalone build.
+pub fn advertisement(local_jobs: usize) -> Advertisement {
+    if let Some(flags) = host_advertisement(local_jobs.max(1)) {
+        return Advertisement {
+            flags,
+            _local: None,
+        };
+    }
+    local_advertisement(local_jobs.max(1)).unwrap_or_else(|| Advertisement {
+        flags: format!("-j{}", local_jobs.max(1)),
+        _local: None,
+    })
 }

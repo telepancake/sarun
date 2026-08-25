@@ -2,6 +2,7 @@
 name = "bumba"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
 description = "A single-process Brush shell with embedded make, Ninja, and uutils"
 
 [lib]
@@ -16,6 +17,7 @@ anyhow = "1"
 brush-core = { path = "vendor/brush-core" }
 brush-builtins = { path = "vendor/brush-builtins" }
 brush-coreutils-builtins = { path = "vendor/brush-coreutils-builtins", default-features = false }
+brush-interactive = { path = "vendor/brush-interactive", default-features = false, features = ["reedline"] }
 bytes = "1"
 clap = { version = "4.6.0", features = ["derive"] }
 findutils = { path = "vendor/findutils" }
@@ -26,7 +28,7 @@ n2 = { path = "vendor/n2", default-features = false }
 parking_lot = "0.12"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "process", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "net", "process", "sync"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 uucore = "0.8"
@@ -70,6 +72,7 @@ tempfile = "3"
 brush-core = { path = "vendor/brush-core" }
 brush-builtins = { path = "vendor/brush-builtins" }
 brush-coreutils-builtins = { path = "vendor/brush-coreutils-builtins" }
+brush-interactive = { path = "vendor/brush-interactive" }
 brush-parser = { path = "vendor/brush-parser" }
 uucore = { path = "vendor/uucore" }
 uu_basename = { path = "vendor/uu_basename" }

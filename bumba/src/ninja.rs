@@ -78,26 +78,76 @@ pub fn ninja_builtin(
     out: impl std::io::Write,
     err: impl std::io::Write,
 ) -> i32 {
-    ninja_builtin_with_executor(argv, base_cwd, out, err, crate::shell::ninja_executor)
+    let makeflags = std::env::var_os("MAKEFLAGS");
+    ninja_builtin_in_environment(
+        argv,
+        base_cwd,
+        makeflags.as_deref(),
+        out,
+        err,
+    )
+}
+
+pub fn ninja_builtin_in_environment(
+    argv: &[String],
+    base_cwd: &std::path::Path,
+    makeflags: Option<&std::ffi::OsStr>,
+    out: impl std::io::Write,
+    err: impl std::io::Write,
+) -> i32 {
+    ninja_builtin_with_context(
+        argv,
+        base_cwd,
+        makeflags,
+        out,
+        err,
+        crate::shell::ninja_executor,
+    )
 }
 
 pub fn ninja_builtin_with_executor(
     argv: &[String],
     base_cwd: &std::path::Path,
+    out: impl std::io::Write,
+    err: impl std::io::Write,
+    executor: n2::process::Executor,
+) -> i32 {
+    let makeflags = std::env::var_os("MAKEFLAGS");
+    ninja_builtin_with_context(argv, base_cwd, makeflags.as_deref(), out, err, executor)
+}
+
+fn ninja_builtin_with_context(
+    argv: &[String],
+    base_cwd: &std::path::Path,
+    inherited_makeflags: Option<&std::ffi::OsStr>,
     mut out: impl std::io::Write,
     mut err: impl std::io::Write,
     executor: n2::process::Executor,
 ) -> i32 {
     n2::process::set_executor(executor);
 
-    // Advertise the host-global slip pool into MAKEFLAGS for this build. ninja
-    // is parallel by default (CPU count), overridable by -jN; that count is the
-    // LOCAL runner cap (n2::jobserver::jobs_hint), while the machine-wide pool
-    // does the real bounding. Idempotent: a ninja under a parallel make inherits
-    // that make's advertisement and shares the same pool.
-    crate::jobserver::advertise(
-        crate::jobserver::explicit_jobs(argv).unwrap_or_else(crate::jobserver::cpu_count),
-    );
+    // Compose this invocation's logical MAKEFLAGS. Ninja is parallel by default
+    // (CPU count), overridable by -jN; an inherited or configured host jobserver
+    // provides the shared machine-wide bound without mutating process state.
+    let jobs = crate::jobserver::explicit_jobs(argv).unwrap_or_else(crate::jobserver::cpu_count);
+    let inherited = inherited_makeflags
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let has_inherited_jobserver = inherited.contains("--jobserver-auth=")
+        || inherited.contains("--jobserver-fds=");
+    let advertisement = (!has_inherited_jobserver)
+        .then(|| crate::jobserver::advertisement(jobs));
+    let makeflags = if has_inherited_jobserver {
+        inherited
+    } else if let Some(advertisement) = advertisement.as_ref() {
+        if inherited.trim().is_empty() {
+            advertisement.flags().to_string()
+        } else {
+            format!("{inherited} {}", advertisement.flags())
+        }
+    } else {
+        inherited
+    };
 
     let mut build_file = String::from("build.ninja");
     let mut targets: Vec<String> = Vec::new();
@@ -146,7 +196,12 @@ pub fn ninja_builtin_with_executor(
     emit_build_edges(&build_file);
 
     let result = match n2::load::read(&build_file) {
-        Ok(state) => n2::run::run_state(state, &targets),
+        Ok(state) => n2::run::run_state_with_options(
+            state,
+            &targets,
+            jobs,
+            Some(makeflags),
+        ),
         Err(e) => Err(e),
     };
 

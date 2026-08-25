@@ -4,13 +4,10 @@
 // explicit passthrough to kati's ordinary fork/exec path. Structured graph,
 // edge, output, activity, and variable events are emitted through EventSink.
 //
-// kati's FLAGS is a process-global LazyLock parsed from argv. We can't be argv0
-// `make`-with-flags, so we synthesize the argv kati should parse (the shell's
-// -f/-C/targets/VAR=val translated through) and install it via the vendored
-// `kati::flags::install_args` hook BEFORE the first FLAGS access. (We still
-// inject `--ninja` into that synthesized argv, but in THIS direct-execute path
-// `FLAGS.generate_ninja` is inert — only the standalone main.rs/ninja.rs paths
-// consult it, never run_kati — so forcing it is a harmless no-op.)
+// Kati retains a process-global FLAGS value for legacy standalone mode switches.
+// Bumba parses every invocation independently and copies all execution-relevant
+// flags into that invocation's Evaluator, so recursive and concurrent makes do
+// not inherit the first make call's scheduling or error policy.
 //
 // NO-FALLBACK (D9): anything kati cannot parse/evaluate or execute is a VISIBLE
 // error and a non-zero exit. We NEVER silently exec the real `make`.
@@ -297,6 +294,9 @@ fn run_kati(
     // doesn't do this automatically — without it that filter never matches and
     // a self-recursing `$(MAKE)` rule spins forever.
     cmdline_flags: &[OsString],
+    // Host jobserver words for this invocation only. These become logical
+    // MAKEFLAGS and never mutate the environment shared by unrelated builds.
+    jobserver_flags: Option<&str>,
     // GNU -n / -i for THIS make instance (a recursive in-process $(MAKE)
     // can't use the once-installed process-global FLAGS). dry_run applies to
     // the MAIN goals only — GNU -n still remakes included makefiles for real.
@@ -310,6 +310,10 @@ fn run_kati(
     always_make: bool,
     question: bool,
     touch: bool,
+    num_jobs: usize,
+    jobs_explicit: bool,
+    keep_going: bool,
+    silent_mode: bool,
     // Optional includes known unmakeable from a previous remake pass —
     // don't queue them again.
     noremake: &std::collections::HashSet<Vec<u8>>,
@@ -318,6 +322,10 @@ fn run_kati(
     ev.recipe_stdin = recipe_stdin;
     ev.ignore_errors = ignore_errors;
     ev.goal_trace = trace;
+    ev.num_jobs = num_jobs.max(1);
+    ev.jobs_explicit = jobs_explicit;
+    ev.keep_going = keep_going;
+    ev.silent_mode = silent_mode;
     if trace {
         kati::exec::emit_recipe_err(&format!(
             "--trace: make in {} (makefile {:?}), goals {:?}",
@@ -387,12 +395,9 @@ fn run_kati(
     //    `MAKEFLAGS += --include-dir=$(abs_srctree)` arrives here, NOT in the
     //    shared process env.
     //
-    //  * The live jobserver advertisement: jobserver::advertise() wrote the
-    //    current `--jobserver-auth=…` into the PROCESS env just before this
-    //    call (in make_builtin), which is AFTER seed_env was captured. Graft
-    //    any process-env tokens missing from the seed value so $(MAKEFLAGS) —
-    //    and any sub-make/`gcc -flto=jobserver` that inherits it — sees the
-    //    jobserver. (When seed_env == process env this is a no-op.)
+    //  * This invocation's host jobserver advertisement, if any. It is scoped
+    //    data, never process-global environment, so the first build's `-jN`
+    //    cannot contaminate later builds.
     //
     //  * This invocation's own long-form command-line flags (cmdline_flags),
     //    the way GNU make reflects argv into MAKEFLAGS for Makefiles that
@@ -410,14 +415,15 @@ fn run_kati(
             .map(|(_, v)| v.as_bytes().to_vec())
             .unwrap_or_default();
         let (mut fwords, mut fvars) = kati::flags::Flags::split_makeflags(&seed_mf);
-        if let Some(env_mf) = std::env::var_os("MAKEFLAGS") {
-            let (ew, evs) = kati::flags::Flags::split_makeflags(env_mf.as_bytes());
-            for t in ew {
+        if let Some(jobserver_mf) = jobserver_flags {
+            let (job_words, job_vars) =
+                kati::flags::Flags::split_makeflags(jobserver_mf.as_bytes());
+            for t in job_words {
                 if !fwords.contains(&t) {
                     fwords.push(t);
                 }
             }
-            for v in evs {
+            for v in job_vars {
                 if !fvars.contains(&v) {
                     fvars.push(v);
                 }
@@ -1472,14 +1478,10 @@ pub fn make_main(argv: &[String]) -> i32 {
         }
     }
 
-    // 5. Run kati end-to-end: parse → dep graph → execute. kati's own
-    //    executor (src-rs/exec.rs) walks the dep graph sequentially in
-    //    declaration order, uses real mtime for staleness, and would
-    //    normally fork+exec /bin/sh per recipe. We installed
-    //    brush::run_recipe_in_process as kati's in-process runner above,
-    //    so every recipe stays in this process. NO ninja generation, NO
-    //    n2 — the Bumba pipeline is byte-identical to standalone rkati on
-    //    corpus tests.
+    // 5. Run kati end-to-end: parse → dependency graph → bounded parallel
+    //    execution. The scheduler uses real mtimes and persistent recipe
+    //    workers; Brush executes POSIX recipes without `/bin/sh`. NO ninja
+    //    generation and NO n2 are involved in this path.
     let targets: Vec<Symbol> = flags.targets.clone();
     let cl_vars: Vec<bytes::Bytes> = flags.cl_vars.clone();
     let include_dirs: Vec<OsString> = flags.include_dirs.clone();
@@ -1489,6 +1491,8 @@ pub fn make_main(argv: &[String]) -> i32 {
     // Shadow/main() path is one OS process per make — seed from the process env.
     let seed_env: Vec<(std::ffi::OsString, std::ffi::OsString)> = std::env::vars_os().collect();
     let cmdline_flags = extract_long_flags(argv);
+    let parallel_advertisement =
+        crate::jobserver::explicit_jobs(argv).map(crate::jobserver::advertisement);
     // Optional includes a previous remake pass could not build (colon-joined,
     // via the re-exec env) — skip re-queueing them this pass.
     let noremake: std::collections::HashSet<Vec<u8>> = std::env::var_os("BUMBA_KATI_NOREMAKE")
@@ -1511,12 +1515,17 @@ pub fn make_main(argv: &[String]) -> i32 {
         flags.no_builtin_rules,
         flags.no_builtin_variables,
         &cmdline_flags,
+        parallel_advertisement.as_ref().map(|value| value.flags()),
         flags.is_dry_run,
         flags.is_ignore_errors,
         flags.is_trace,
         flags.is_always_make,
         flags.is_question,
         flags.is_touch,
+        flags.num_jobs,
+        flags.jobs_explicit,
+        flags.is_keep_going,
+        flags.is_silent_mode,
         &noremake,
     ) {
         Ok(r) => r,
@@ -1639,17 +1648,12 @@ pub fn make_builtin(
         }
     }
 
-    // Per-build jobserver: an explicit -jN on make enables parallelism and
-    // advertises the host-global slip pool into MAKEFLAGS, so this build's
-    // recipes — and any `gcc -flto=jobserver` / sub-make they fork — draw from
-    // the one machine-wide pool. Plain `make` (no -j) is serial like GNU make and
-    // advertises nothing, leaving a nested `ninja` free to parallelize on its own.
-    // advertise() is idempotent — a recursive sub-make inherits the pool.
-    if let Some(n) = crate::jobserver::explicit_jobs(argv) {
-        if n > 1 {
-            crate::jobserver::advertise(n);
-        }
-    }
+    // An explicit -jN creates (or joins a configured host) jobserver for this
+    // top-level build. Recursive sub-makes normally have no explicit -j and
+    // inherit these words through their logical MAKEFLAGS instead, so sibling
+    // recursion remains bounded by one shared pool.
+    let jobserver_advertisement =
+        crate::jobserver::explicit_jobs(argv).map(crate::jobserver::advertisement);
 
     let kargv = match kati_argv(argv) {
         Ok(v) => v,
@@ -1782,12 +1786,17 @@ pub fn make_builtin(
         flags.no_builtin_rules,
         flags.no_builtin_variables,
         &cmdline_flags,
+        jobserver_advertisement.as_ref().map(|value| value.flags()),
         flags.is_dry_run,
         flags.is_ignore_errors,
         flags.is_trace,
         flags.is_always_make,
         flags.is_question,
         flags.is_touch,
+        flags.num_jobs,
+        flags.jobs_explicit,
+        flags.is_keep_going,
+        flags.is_silent_mode,
         &noremake,
     );
     let mut remake_depth = 0u32;
@@ -1816,12 +1825,17 @@ pub fn make_builtin(
             flags.no_builtin_rules,
             flags.no_builtin_variables,
             &cmdline_flags,
+            jobserver_advertisement.as_ref().map(|value| value.flags()),
             flags.is_dry_run,
             flags.is_ignore_errors,
             flags.is_trace,
             flags.is_always_make,
             flags.is_question,
             flags.is_touch,
+            flags.num_jobs,
+            flags.jobs_explicit,
+            flags.is_keep_going,
+            flags.is_silent_mode,
             &noremake,
         );
     }

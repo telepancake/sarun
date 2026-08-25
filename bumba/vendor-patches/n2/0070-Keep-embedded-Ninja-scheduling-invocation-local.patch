@@ -1,0 +1,174 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bumba <noreply@bumba>
+Date: Tue, 25 Aug 2026 19:21:46 +0000
+Subject: [PATCH] Keep embedded Ninja scheduling invocation-local
+
+Accept explicit parallelism and logical MAKEFLAGS for an embedded graph so independent Bumba invocations cannot contaminate one another through process-global environment state.
+
+---
+diff --git a/src/jobserver.rs b/src/jobserver.rs
+index 55a8afa..cc6f510 100644
+--- a/src/jobserver.rs
++++ b/src/jobserver.rs
+@@ -1,6 +1,6 @@
+ //! A minimal GNU-make jobserver CLIENT.
+ //!
+-//! sarun: this is a vendored addition. n2 reads the jobserver advertised by its
++//! Bumba addition: n2 reads the jobserver advertised by its
+ //! parent in `MAKEFLAGS` and draws tokens from it, so n2's parallelism is bounded
+ //! by the same shared pool every other consumer in the build tree draws from —
+ //! the engine, recursive in-process makes, and forked tools like
+@@ -14,7 +14,7 @@
+ //!   implicit token: it may always run a single job without acquiring, which is
+ //!   what makes the protocol deadlock-free under recursion.
+ //!
+-//! sarun: when a fifo path is advertised (the engine's FUSE-served pool), n2 opens
++//! When a fifo path is advertised (for example by a host-provided pool), n2 opens
+ //! its OWN handle to it with O_NONBLOCK, so `try_acquire` is a clean non-blocking
+ //! read that never stalls the scheduler — independent of the blocking handles
+ //! that forked tools inherit. All handles are opens of the same pool.
+@@ -52,29 +52,40 @@ fn fifo_path(makeflags: &str) -> Option<&str> {
+ }
+ 
+ impl Client {
+-    /// Connect to the jobserver named in `MAKEFLAGS`, if any.
+-    pub fn from_env() -> Option<Client> {
+-        let mf = std::env::var("MAKEFLAGS").ok()?;
++    pub fn from_makeflags(mf: &str) -> Option<Client> {
+         // Prefer the fifo form: open our OWN non-blocking handle so try_acquire
+         // never blocks the scheduler (forked tools open their own blocking ones).
+-        if let Some(path) = fifo_path(&mf) {
++        if let Some(path) = fifo_path(mf) {
+             let c = std::ffi::CString::new(path).ok()?;
+             let fd = unsafe { libc::open(c.as_ptr(), libc::O_RDWR | libc::O_NONBLOCK) };
+             if fd < 0 {
+                 return None;
+             }
+-            return Some(Client { read_fd: fd, write_fd: fd, owned: true });
++            return Some(Client {
++                read_fd: fd,
++                write_fd: fd,
++                owned: true,
++            });
+         }
+-        // Legacy fd form: a pair of inherited (blocking) fds we must not close.
+-        let val = flag_value(&mf, "--jobserver-auth=")
+-            .or_else(|| flag_value(&mf, "--jobserver-fds="))?;
++        let val = flag_value(mf, "--jobserver-auth=")
++            .or_else(|| flag_value(mf, "--jobserver-fds="))?;
+         let (read_fd, write_fd) = parse_fd_pair(val)?;
+         if unsafe { libc::fcntl(read_fd, libc::F_GETFD) } < 0
+             || unsafe { libc::fcntl(write_fd, libc::F_GETFD) } < 0
+         {
+             return None;
+         }
+-        Some(Client { read_fd, write_fd, owned: false })
++        Some(Client {
++            read_fd,
++            write_fd,
++            owned: false,
++        })
++    }
++
++    /// Connect to the jobserver named in `MAKEFLAGS`, if any.
++    pub fn from_env() -> Option<Client> {
++        let mf = std::env::var("MAKEFLAGS").ok()?;
++        Self::from_makeflags(&mf)
+     }
+ 
+     /// Whether a jobserver is advertised at all (a string check — no fd opened).
+@@ -109,7 +120,11 @@ impl Client {
+     /// ⇒ None). For inherited blocking fds we poll first to avoid stalling.
+     pub fn try_acquire(&self) -> Option<u8> {
+         if !self.owned {
+-            let mut pfd = libc::pollfd { fd: self.read_fd, events: libc::POLLIN, revents: 0 };
++            let mut pfd = libc::pollfd {
++                fd: self.read_fd,
++                events: libc::POLLIN,
++                revents: 0,
++            };
+             let r = unsafe { libc::poll(&mut pfd, 1, 0) };
+             if r <= 0 || (pfd.revents & libc::POLLIN) == 0 {
+                 return None;
+@@ -117,7 +132,11 @@ impl Client {
+         }
+         let mut b = [0u8; 1];
+         let n = unsafe { libc::read(self.read_fd, b.as_mut_ptr() as *mut libc::c_void, 1) };
+-        if n == 1 { Some(b[0]) } else { None }
++        if n == 1 {
++            Some(b[0])
++        } else {
++            None
++        }
+     }
+ 
+     /// Return a token to the pool.
+diff --git a/src/run.rs b/src/run.rs
+index c979d30..b406670 100644
+--- a/src/run.rs
++++ b/src/run.rs
+@@ -280,18 +280,30 @@ pub fn run() -> anyhow::Result<i32> {
+     res
+ }
+ 
+-// sarun: run an ALREADY-LOADED, in-memory State (from load::read_from_content)
+-// against an explicit target list, with the in-process executor forced serial
+-// (-j1), exactly like run_impl's embedded path. There is no command-line parse,
++// Run an ALREADY-LOADED, in-memory State (from load::read_from_content)
++// against an explicit target list. There is no command-line parse,
+ // no disk load, no build.ninja rebuild step (the make→kati→ninja graph is not
+ // self-regenerating). `targets` empty → build the graph's `default` targets, or
+ // every target if there are no defaults — matching `build()`'s own logic.
+ pub fn run_state(state: load::State, targets: &[String]) -> anyhow::Result<i32> {
++    run_state_with_options(state, targets, embedded_parallelism()?, None)
++}
++
++/// Run an in-memory graph with invocation-owned scheduling state. Bumba uses
++/// this entry point so one embedded Ninja's `-j` and MAKEFLAGS cannot leak into
++/// another build hosted by the same process.
++pub fn run_state_with_options(
++    state: load::State,
++    targets: &[String],
++    parallelism: usize,
++    jobserver_makeflags: Option<String>,
++) -> anyhow::Result<i32> {
+     let dumb_console = DumbConsoleProgress::new(false);
+     let progress: &dyn Progress = &dumb_console;
+ 
+     let mut options = work::Options::default();
+-    options.parallelism = embedded_parallelism()?;
++    options.parallelism = parallelism.max(1);
++    options.jobserver_makeflags = jobserver_makeflags;
+ 
+     let mut work = work::Work::new(
+         state.graph,
+diff --git a/src/work.rs b/src/work.rs
+index ce49b6c..de97e88 100644
+--- a/src/work.rs
++++ b/src/work.rs
+@@ -336,6 +336,9 @@ pub struct Options {
+     pub explain: bool,
+     /// When true, just mark targets up to date without running anything.
+     pub adopt: bool,
++    /// Per-invocation jobserver environment for embedded builds. `None` keeps
++    /// standalone n2's ordinary process-environment behavior.
++    pub jobserver_makeflags: Option<String>,
+ }
+ 
+ pub struct Work<'a> {
+@@ -706,10 +709,13 @@ impl<'a> Work<'a> {
+         signal::register_sigint();
+         let mut tasks_failed = 0;
+         let mut runner = task::Runner::new(self.options.parallelism);
+-        // sarun: the shared jobserver, if our parent advertised one. When present
++        // Use the shared jobserver if this invocation was given one. When present
+         // it — not just `parallelism` — bounds how many recipes run at once, and
+         // the same pool is shared with recursive makes and forked tools.
+-        let jobserver = crate::jobserver::Client::from_env();
++        let jobserver = match self.options.jobserver_makeflags.as_deref() {
++            Some(makeflags) => crate::jobserver::Client::from_makeflags(makeflags),
++            None => crate::jobserver::Client::from_env(),
++        };
+         while self.build_states.unfinished() {
+             self.progress.update(&self.build_states.counts);
+ 
