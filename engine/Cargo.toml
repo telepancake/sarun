@@ -15,24 +15,28 @@ anyhow = "1.0"
 # a gigabyte in four minutes and eventually triggered the OOM killer. Mimalloc
 # eagerly purges empty pages while remaining a fully static global allocator.
 mimalloc = { version = "0.1.52", default-features = false }
-# The depot node model + canonical layer codec (gimir workspace; pure Rust,
+# The depot node model + canonical layer codec (Chupa workspace; pure Rust,
 # std-only). `crate::depot` is the engine's seam module; the model crate is
 # aliased `depot_model` to keep the two distinguishable at use sites.
-depot_model = { path = "../gimir/depot", package = "depot" }
+depot_model = { path = "../chupa/depot", package = "depot" }
 # The materialization cache (DEPOT-DESIGN.md §7): real loose files for
 # mount-serving an external attachment whose readout hands back Bytes.
-depot-cache = { path = "../gimir/depot-cache" }
-# The git-mirror store reader (gimir workspace): `git_attach` resolves a
+depot-cache = { path = "../chupa/depot-cache" }
+# The git-mirror store reader (Chupa workspace): `git_attach` resolves a
 # gitdepot store + ref to a view and imports it as an at-rest RO box.
 # Only the chain reader is used in-engine (no `git` binary needed).
-gitdepot = { path = "../gimir/gitdepot" }
+gitdepot = { path = "../chupa/gitdepot" }
 # Mirror read paths for wiki_attach / ietf_attach PLUS the driver CLIs
 # (`fetch`): sarun is a multi-call binary — `sarun wikimak|ietfmak|gitdepot`
 # (or an argv[0] symlink) runs the driver. The engine PROCESS still never
 # dials out: mirrors.rs re-execs this same binary, so all fetching happens
 # in a child process.
-ietf_mirror = { path = "../gimir/ietf-mirror", package = "ietf-mirror", default-features = false, features = ["fetch"] }
-wikimak_wikipedia = { path = "../gimir/wikimak/wikipedia", package = "wikimak-wikipedia", default-features = false, features = ["fetch", "serve"] }
+ietf_mirror = { path = "../chupa/ietf-mirror", package = "ietf-mirror", default-features = false, features = ["fetch"] }
+wikimak_wikipedia = { path = "../chupa/wikimak/wikipedia", package = "wikimak-wikipedia", default-features = false, features = ["fetch", "serve"] }
+# Reusable mirror supervisor, archive gateway, terminal reader, and standalone
+# mirror GUI. Sarun supplies only state-root, capture, and image-enhancement
+# adapters; Chupa has no reverse dependency on Sarun.
+chupa = { path = "../chupa" }
 base64 = "0.22.1"
 bytes = "1.10"
 # Reusable single-process shell/build runtime. Sarun retains only adapters for
@@ -167,8 +171,8 @@ pulldown-cmark = { version = "0.13", default-features = false, features = ["html
 # render + optional Lua). Both crates are ALREADY compiled into the binary via
 # wikimak_wikipedia's "serve" feature; naming them directly just makes their
 # APIs reachable (no size cost).
-wikimak_wikitext = { path = "../gimir/wikimak/wikitext", package = "wikimak-wikitext" }
-wikimak_scribunto = { path = "../gimir/wikimak/scribunto", package = "wikimak-scribunto" }
+wikimak_wikitext = { path = "../chupa/wikimak/wikitext", package = "wikimak-wikitext" }
+wikimak_scribunto = { path = "../chupa/wikimak/scribunto", package = "wikimak-scribunto" }
 # Structural editing — tree-sitter + a starter pack of grammars. Drives the
 # inspect/write "symbol" locators (path symbol <name>[N]): inspect lists or
 # focuses named definitions; write splices new content into the symbol's

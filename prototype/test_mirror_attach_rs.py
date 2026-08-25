@@ -38,8 +38,8 @@ _HERE = Path(__file__).resolve().parent
 SARUN = str(_HERE / "libtestsarun.py")
 CRATE = _HERE.parent / "engine"
 BIN = ENGINE_BIN
-GIMIR = _HERE.parent / "gimir"
-TOOLS = {name: GIMIR / f"target/debug/{name}"
+CHUPA = _HERE.parent / "chupa"
+TOOLS = {name: CHUPA / f"target/debug/{name}"
          for name in ("gitdepot", "wikimak", "ietfmak")}
 
 _fails = []
@@ -59,7 +59,7 @@ def ensure_binaries() -> bool:
         r = subprocess.run(
             ["cargo", "build", "-p", "gitdepot", "-p", "wikimak-wikipedia",
              "-p", "ietf-mirror"],
-            cwd=GIMIR, capture_output=True, text=True)
+            cwd=CHUPA, capture_output=True, text=True)
         if r.returncode != 0:
             print(r.stderr[-2000:])
             return False
@@ -166,7 +166,7 @@ def build_mirrors(tmp: Path):
     check(r.returncode == 0, f"gitdepot import (rc={r.returncode}: {r.stderr[:200]})")
 
     # wikipedia (fixture dump from the gimir test suite)
-    dump = GIMIR / "wikimak/wikipedia/tests/data/export_three_pages.xml"
+    dump = CHUPA / "wikimak/wikipedia/tests/data/export_three_pages.xml"
     wroot = tmp / "wiki"
     r = subprocess.run([str(TOOLS["wikimak"]), "import", str(dump), str(wroot)],
                        capture_output=True, text=True)

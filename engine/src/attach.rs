@@ -1,4 +1,4 @@
-//! External RO attachments (commit 2 of gimir/notes/attach-
+//! External RO attachments (commit 2 of chupa/notes/attach-
 //! implementation-plan.md): the live-side object behind a
 //! `RoAttachment::Ext` bookkeeping row. Wraps a mirror store's
 //! `depot::variant::Readout` with everything the overlay needs to

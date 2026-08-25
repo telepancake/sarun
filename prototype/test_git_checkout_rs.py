@@ -34,8 +34,8 @@ _HERE = Path(__file__).resolve().parent
 SARUN = str(_HERE / "libtestsarun.py")
 CRATE = _HERE.parent / "engine"
 BIN = ENGINE_BIN
-GIMIR = _HERE.parent / "gimir"
-GITDEPOT = GIMIR / "target/debug/gitdepot"
+CHUPA = _HERE.parent / "chupa"
+GITDEPOT = CHUPA / "target/debug/gitdepot"
 
 _fails = []
 def check(cond, msg):
@@ -52,7 +52,7 @@ def ensure_binaries() -> bool:
         if r.returncode != 0 or not BIN.exists():
             return False
     if not GITDEPOT.exists():
-        r = subprocess.run(["cargo", "build", "-p", "gitdepot"], cwd=GIMIR,
+        r = subprocess.run(["cargo", "build", "-p", "gitdepot"], cwd=CHUPA,
                            capture_output=True, text=True)
         if r.returncode != 0 or not GITDEPOT.exists():
             return False

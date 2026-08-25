@@ -1,0 +1,102 @@
+[package]
+name = "chupa"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Standalone local mirror manager, archive browser, and reader"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "chupa"
+path = "src/main.rs"
+
+[workspace]
+resolver = "2"
+members = [
+    ".",
+    "depot",
+    "depot-stream",
+    "depot-cache",
+    "depot-vbf",
+    "gitdepot",
+    "ietf-mirror",
+    "strpool",
+    "wikimak/depot",
+    "wikimak/media",
+    "wikimak/mediawiki",
+    "wikimak/scribunto",
+    "wikimak/wikipedia",
+    "wikimak/wikitext",
+]
+exclude = [
+    ".claude/worktrees",
+    "third_party",
+]
+
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+strpool = { path = "strpool" }
+wikimak-depot = { path = "wikimak/depot" }
+wikimak-mediawiki = { path = "wikimak/mediawiki", default-features = false }
+wikimak-wikitext = { path = "wikimak/wikitext" }
+wikimak-scribunto = { path = "wikimak/scribunto" }
+wikimak-media = { path = "wikimak/media" }
+# Scribunto engine: vendored PUC Lua 5.1 (browsing plan §3.3 choice (a)).
+mlua = { version = "0.10", features = ["lua51", "vendored"] }
+md-5 = "0.10"
+# Localhost serve for `wikimak serve` (browsing plan §5) — small, sync.
+tiny_http = "0.12"
+zstd = "0.13"
+zim = "0.5"
+xz2 = "0.1"
+memchr = "2"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+thiserror = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+# bzip2 0.6 flipped the default backend to a pure-Rust port. Opt back into
+# the libbz2 C backend for per-block parallel decode.
+bzip2 = { version = "0.6", default-features = false, features = ["bzip2-sys"] }
+quick-xml = "0.40"
+sha1 = "0.10"
+sha2 = "0.10"
+regex = "1"
+roaring = "=0.11.3"
+hex = "0.4"
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# rusqlite: meta.db storage (title intervals, page→chain map, parts watermarks).
+# `bundled` ships our own SQLite (3.47+) so we don't depend on system libsqlite3.
+# FTS5 is bundled by default in `bundled`.
+rusqlite = { version = "0.32", features = ["bundled", "chrono"] }
+
+[dependencies]
+anyhow = "1"
+chrono = "0.4"
+crossterm = "0.29"
+gitdepot = { path = "gitdepot" }
+html2text = "0.17"
+ietf_mirror = { path = "ietf-mirror", package = "ietf-mirror", features = ["fetch"] }
+libc = "0.2"
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
+ratatui = "0.30.1"
+regex = "1"
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+similar = "3.1.1"
+time = "0.3"
+tiny_http.workspace = true
+unicode-width = "0.2"
+wikimak_scribunto = { path = "wikimak/scribunto", package = "wikimak-scribunto" }
+wikimak_wikipedia = { path = "wikimak/wikipedia", package = "wikimak-wikipedia", default-features = false, features = ["fetch", "serve"] }
+wikimak_wikitext = { path = "wikimak/wikitext", package = "wikimak-wikitext" }
+
+[dev-dependencies]
+tempfile = "3"

@@ -460,6 +460,10 @@ fn serve() -> i32 {
             }
         });
     }
+    // Chupa owns mirror scheduling and its database. Point its reusable
+    // supervisor at Sarun's existing namespaced state root before either the
+    // gateway or scheduler opens it.
+    mirrors::configure_state_home(paths::state_home());
     let library = match archive_gateway::Gateway::start(
         std::env::current_exe()
             .unwrap_or_else(|_| PathBuf::from("sarun"))

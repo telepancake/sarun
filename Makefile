@@ -28,6 +28,14 @@ run: ## Start sarun (the engine binary + UI; build it first with `make engine`)
 	@if [ -x ./sarun ]; then exec ./sarun; \
 	else echo "no ./sarun — build it with 'make engine'"; exit 1; fi
 
+.PHONY: chupa
+chupa: ## Build the standalone Chupa mirror manager and GUI
+	$(TOOLS_RUN) cargo build --manifest-path chupa/Cargo.toml -p chupa
+
+.PHONY: chupa-run
+chupa-run: ## Start Chupa's standalone mirror GUI
+	$(TOOLS_RUN) cargo run --manifest-path chupa/Cargo.toml -p chupa -- gui
+
 # ---- System dependencies --------------------------------------------------
 
 .PHONY: deps

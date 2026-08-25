@@ -11425,58 +11425,7 @@ impl Key {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ReaderBindingContext {
-    Document,
-    History,
-    Search,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ReaderAction {
-    SearchCancel,
-    SearchAccept,
-    SearchBackspace,
-    SearchText,
-    ScrollDown,
-    ScrollUp,
-    FocusHistory,
-    NextView,
-    RenderedView,
-    RawView,
-    DiffView,
-    SpatialLeft,
-    SpatialRight,
-    SpatialUp,
-    SpatialDown,
-    PageDown,
-    PageUp,
-    Home,
-    End,
-    FocusNextLink,
-    FocusPreviousLink,
-    JumpNext,
-    JumpPrevious,
-    Follow,
-    Back,
-    Forward,
-    DocumentSearch,
-    TitleSearch,
-    FullTextSearch,
-    ToggleFull,
-    Open,
-    Close,
-    HistoryUp,
-    HistoryDown,
-    HistoryPageUp,
-    HistoryPageDown,
-    HistoryHome,
-    HistoryEnd,
-    HistoryOpen,
-    HistoryUser,
-    HistoryEdits,
-    HistoryReturn,
-}
+pub(crate) use chupa::{ReaderAction, ReaderBindingContext};
 
 #[derive(Clone, Copy)]
 enum ConfirmKey {

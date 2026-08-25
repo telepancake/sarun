@@ -1,0 +1,3 @@
+# Build artifacts for the Chupa integration workspace (see README.md).
+/target/
+**/target/

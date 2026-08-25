@@ -8,7 +8,7 @@ joined up:
 1. an **interactive browser** (carbonyl — Chromium in the terminal pane),
 2. a **local snapshot viewer** (replay captured pages offline), and
 3. an **archival engine** for browsertrix-style crawls (the WACZ web-archive
-   work the gimir notes planned — `gimir/SCOPING.md:104,119`,
+   work the recovered mirror notes planned — `chupa/SCOPING.md:104,119`,
    `gimir-intent-history.md:93` — but never wired into sarun).
 
 ## W0 · Premise — the MITM proxy is the archival engine
@@ -356,7 +356,7 @@ immediately" workflow (`CLAUDE.md`).
 ## Naming alignment with the gimir depot
 
 To keep this consistent with the storage work happening in parallel
-(`gimir/DEPOT-DESIGN.md`), the vocabulary tracks gimir's:
+(`chupa/DEPOT-DESIGN.md`), the vocabulary tracks Chupa's recovered design:
 
 - a single capture is a **PageView** revision (URL + ts + body-hash identity),
   gimir's term (`gimir-design.md:99`);

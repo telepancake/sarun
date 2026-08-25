@@ -22,7 +22,7 @@ use rusqlite::params;
 /// Box row (the historical Vec<i64> format — old metas parse unchanged
 /// and int-only lists serialize byte-identically), an object is an
 /// external reference into a mirror store, served through the readout
-/// trait instead of an imported copy (gimir/ATTACH-CONVERGENCE.md).
+/// trait instead of an imported copy (chupa/ATTACH-CONVERGENCE.md).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(untagged)]
 pub enum RoAttachment {

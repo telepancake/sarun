@@ -945,6 +945,32 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6e4de3bc4ea267985becf712dc6d9eed8b04c953b3fcfb339ebc87acd9804901"
 
 [[package]]
+name = "chupa"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "crossterm",
+ "gitdepot",
+ "html2text",
+ "ietf-mirror",
+ "libc",
+ "pulldown-cmark",
+ "ratatui",
+ "regex",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "similar",
+ "time",
+ "tiny_http",
+ "unicode-width",
+ "wikimak-scribunto",
+ "wikimak-wikipedia",
+ "wikimak-wikitext",
+]
+
+[[package]]
 name = "clap"
 version = "4.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5816,6 +5842,7 @@ dependencies = [
  "bzip2-rs",
  "cc",
  "chrono",
+ "chupa",
  "clap",
  "crossterm",
  "depot",

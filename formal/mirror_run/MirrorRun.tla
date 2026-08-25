@@ -3,7 +3,7 @@
 (***************************************************************************)
 (* A bounded model of the engine-owned mirror run boundary.                *)
 (*                                                                        *)
-(* This is intentionally smaller than engine/src/mirrors.rs.  It models  *)
+(* This is intentionally smaller than chupa/src/supervisor.rs. It models *)
 (* the durable run identity, the process-group handoff, scheduler policy, *)
 (* and the distinction between cancellation and engine interruption.       *)
 (***************************************************************************)

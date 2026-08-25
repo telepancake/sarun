@@ -40,19 +40,19 @@ into production paths.
 | --- | --- | --- | --- |
 | engine instance | `engine/src/main.rs`, `control.rs`, `archive_gateway.rs`, `sarunfs/`, `net/` | control socket, FUSE broker, box and service channels, engine shutdown, live process/resource registries | mirror build meaning or archive publication |
 | UI client | `engine/src/ui.rs` (with the prototype test client) | user intent and projection of inspector output | durable job/build state, process truth, filesystem interpretation |
-| mirror supervisor | `engine/src/mirrors.rs` | mirror registration, one `RunId`, admission, driver process group, stop/retry/delete requests, job projections | source parsing, archive format, generation installation |
+| mirror supervisor | `chupa/src/supervisor.rs` with `engine/src/mirrors.rs` wire/state adapter | mirror registration, one `RunId`, admission, driver process group, stop/retry/delete requests, job projections | Sarun boxes, source parsing, archive format, generation installation |
 | box lifecycle | `engine/src/box.rs`, `sarunfs/`, `appliance.rs`, `sud.rs` | registration, capture, transport, process tree, QEMU/SUD/direct backends | mirror job rows and archive generations |
 | resource scheduling | `engine/src/slippool.rs`, `jobserver.rs`, `n2run.rs`, `katirun.rs`, brush | bounded slips, nested build workers, make/ninja execution and cancellation | ownership of a mirror generation |
-| Wikipedia source/build | `gimir/wikimak/mediawiki/`, `wikipedia/src/{cli,direct,build_lifecycle,update_lifecycle}.rs` | discovery, fetching, parsing, typed plans, target materialization, assembly and update candidates | publication selector and running UI |
+| Wikipedia source/build | `chupa/wikimak/mediawiki/`, `wikipedia/src/{cli,direct,build_lifecycle,update_lifecycle}.rs` | discovery, fetching, parsing, typed plans, target materialization, assembly and update candidates | publication selector and running UI |
 | archive publication | `wikipedia/src/installation_lifecycle.rs`, `generation.rs`, `archive_set.rs` | immutable generations, selector, install receipt, reader leases, cleanup | source downloads or optional media generation |
-| archive serving | `wikipedia/src/serve.rs`, `archive_browse.rs`, `title_index.rs`, `frame_directory.rs` | page/revision/title lookup and HTTP responses from a selected generation | building or repairing that generation |
+| archive serving | `chupa/src/{gateway,reader}.rs`, `wikipedia/src/serve.rs`, `archive_browse.rs`, `title_index.rs`, `frame_directory.rs` | page/revision/title lookup, HTTP responses, and terminal reading from a selected generation | building or repairing that generation |
 | auxiliary projections | `backrefs.rs`, `media/`, `.swrefs`, `.media` | explicitly requested relationship and image projections | text-generation publication (currently — this is a defect to resolve) |
-| other archive drivers | `gimir/gitdepot/`, `ietf-mirror/`, `depot*`, `strpool/` | Git/IETF mirrors and reusable storage primitives | engine process supervision unless invoked through it |
+| other archive drivers | `chupa/gitdepot/`, `ietf-mirror/`, `depot*`, `strpool/` | Git/IETF mirrors and reusable storage primitives | Sarun process/resource ownership |
 | host tools/appliances | `tv/`, `viros/`, `cellulose/`, `prototype/`, scripts/vendor | target appliances, debugger/RouterOS artifacts, test harness and build inputs | Sarun's runtime authority |
 
-The build workspace contains the engine binary (`sarun`) and the drivers
-`wikimak`, `ietfmak`, and `gitdepot` (the drivers are multi-call entry points
-in the engine release). The gimir workspace also contains the depot, stream,
+The repository contains the engine binary (`sarun`) and the standalone Chupa
+binary plus the drivers `wikimak`, `ietfmak`, and `gitdepot`. The drivers are
+multi-call entry points in both binaries. The Chupa workspace also contains the depot, stream,
 cache, VBF, string-pool, MediaWiki, Wikipedia, wikitext, Scribunto, and media
 crates. These are separate implementations even where names in old documents
 make them look like one product.
@@ -96,8 +96,8 @@ event. The important paths are:
 | --- | --- | --- |
 | `sarun` / `sarun serve` / `sarun engine` | engine startup and UI/control socket | engine instance |
 | `sarun run`, box actions, OCI verbs, oaita | control handlers and child/box machines | box/OCI/oaita owner |
-| mirror UI/CLI actions | `mirrors.rs` -> embedded driver child | mirror supervisor, then driver |
-| `wikimak` (`fetch`, full refresh, serve/readout) | Wikipedia driver CLI | Wikipedia build/publication/serving owner |
+| mirror UI/CLI actions | Chupa GUI/CLI or Sarun adapter -> embedded driver child | Chupa mirror supervisor, then driver |
+| `chupa` / `wikimak` (`fetch`, full refresh, serve/readout) | standalone GUI/supervisor or Wikipedia driver CLI | Chupa supervisor and Wikipedia build/publication/serving owners |
 | `ietfmak` | IETF driver CLI | IETF driver |
 | `gitdepot` | Git mirror/readout CLI | Git driver |
 | `make`, `ninja`, brush/Kati | build executor paths | resource/build invocation owner |
@@ -325,7 +325,7 @@ found; it does not mean the machine is complete.
 
 | machine | existing executable coverage | missing closure |
 | --- | --- | --- |
-| mirror run projection | `transition_run` matrix, pre-spawn terminalization, process-group recovery, cancel/stale/restart tests in `engine/src/mirrors.rs` | macOS incarnation token, failpoints for every spawn/stop/shutdown interleaving, panic/pipe lifetime |
+| mirror run projection | `transition_run` matrix, pre-spawn terminalization, process-group recovery, exact Darwin/Linux incarnation comparison, cancel/stale/restart tests in `chupa/src/supervisor.rs` | failpoints for every spawn/stop/shutdown interleaving, panic/pipe lifetime |
 | engine startup/shutdown | control/UI unit tests and `prototype/test_*_rs.py` socket workflows | partial startup, incompatible replacement, orderly drain of every child/resource |
 | box registration | FUSE/backend/QEMU/SUD prototype suites | rollback after each insertion, guest EOF/worker death, concurrent shutdown |
 | slips/jobserver/build executors | `slippool` unit tests, Kati corpus, integration builds | PID incarnation, guest slip death, nested concurrent make/cache/cwd isolation |

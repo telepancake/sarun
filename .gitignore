@@ -26,6 +26,9 @@ __pycache__/
 /bumba/vendor/
 /bumba/.vendor-cache/
 /bumba/target/
+# Retained build cache from the pre-Chupa workspace path. Source moved to
+# chupa/; this 28 GiB cache is intentionally not moved or deleted implicitly.
+/gimir/target/
 
 # Manual cellulose/Chromium capture outputs (not test fixtures).
 /cellulose/netlog.json
