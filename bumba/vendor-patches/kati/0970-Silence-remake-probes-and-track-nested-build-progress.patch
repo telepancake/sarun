@@ -1,0 +1,298 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bumba <noreply@bumba>
+Date: Wed, 26 Aug 2026 12:00:01 +0000
+Subject: [PATCH] Silence remake probes and track nested build progress
+
+---
+diff --git a/src-rs/exec.rs b/src-rs/exec.rs
+index ef3e5cc..d720c31 100644
+--- a/src-rs/exec.rs
++++ b/src-rs/exec.rs
+@@ -503,6 +503,10 @@ impl RecipeWorkers {
+ 
+     fn submit(&self, work: RunWork, desired_workers: usize) {
+         self.pool.ensure_workers(desired_workers);
++        // A recursive make submits from inside its parent recipe activity.
++        // Carry that lineage across the worker-thread boundary so completed
++        // descendants count as progress for the waiting parent recipe.
++        let activity_progress = crate::fileutil::current_activity_progress();
+         let shell = self.shell.clone();
+         let shellflag = self.shellflag;
+         let recipe_stdin = self.recipe_stdin.clone();
+@@ -518,8 +522,10 @@ impl RecipeWorkers {
+                     tx.send(RunMsg::Chunk(bytes.to_vec()));
+                 }
+             };
+-            let _activity = crate::fileutil::ActivityGuard::new(format!(
+-                "recipe of '{}'", work.req.output));
++            let _activity = crate::fileutil::ActivityGuard::new_with_progress(
++                format!("recipe of '{}'", work.req.output),
++                activity_progress,
++            );
+             let result = run_node_commands(
+                 &shell, shellflag, recipe_stdin, work.req, &mut emit);
+             tx.send(RunMsg::Done(result, work.slip));
+@@ -1280,14 +1286,30 @@ list of the rule for '{output}' at {loc}"));
+ }
+ 
+ pub fn exec(roots: Vec<NamedDepNode>, ev: &mut Evaluator) -> Result<()> {
+-    exec_opts(roots, ev, false)
++    exec_with_options(roots, ev, false, false)
+ }
+ 
+ /// exec with GNU's makefile-remake failure semantics available:
+ /// `quiet_failures` suppresses the "*** [target] Error N" banner and the
+ /// no-rule notes — callers remaking OPTIONAL includes swallow the Err too.
++/// Makefile-remake checks are internal and never emit ordinary goal no-op
++/// diagnostics.
+ pub fn exec_opts(
+     roots: Vec<NamedDepNode>, ev: &mut Evaluator, quiet_failures: bool,
++) -> Result<()> {
++    exec_with_options(roots, ev, quiet_failures, true)
++}
++
++/// Execute required makefile-remake roots without presenting them as user
++/// goals. Failures remain visible and fatal; only ordinary successful no-op
++/// goal diagnostics are suppressed.
++pub fn exec_makefile_remakes(roots: Vec<NamedDepNode>, ev: &mut Evaluator) -> Result<()> {
++    exec_with_options(roots, ev, false, true)
++}
++
++fn exec_with_options(
++    roots: Vec<NamedDepNode>, ev: &mut Evaluator, quiet_failures: bool,
++    suppress_noop_diagnostics: bool,
+ ) -> Result<()> {
+     let not_parallel = ev.not_parallel;
+     let mut executor = Executor::new(ev)?;
+@@ -1324,6 +1346,7 @@ pub fn exec_opts(
+     // sarun: emit "Nothing to be done" only for roots whose rule has no
+     // commands at all (or which had no rule) — and never under -q.
+     if executor.num_commands == 0
++        && !suppress_noop_diagnostics
+         && !executor.question
+         && !executor.ce.ev.silent_mode
+         && !executor.silent
+diff --git a/src-rs/fileutil.rs b/src-rs/fileutil.rs
+index 74ff080..732976f 100644
+--- a/src-rs/fileutil.rs
++++ b/src-rs/fileutil.rs
+@@ -415,8 +415,17 @@ pub fn clear_glob_cache() {
+ // a watchdog (installed by the embedding engine / rkati main) reports any
+ // entry that has been running past a threshold — a silent 5-minute stall in
+ // a recipe / $(shell) / parse is a diagnosability bug, not patience.
+-pub static ACTIVITY: LazyLock<
+-    parking_lot::Mutex<HashMap<std::thread::ThreadId, Vec<(String, std::time::Instant)>>>,
++#[derive(Clone)]
++pub(crate) struct ActivityProgress(Arc<parking_lot::Mutex<std::time::Instant>>);
++
++struct Activity {
++    desc: String,
++    started: std::time::Instant,
++    progress: ActivityProgress,
++}
++
++static ACTIVITY: LazyLock<
++    parking_lot::Mutex<HashMap<std::thread::ThreadId, Vec<Activity>>>,
+ > = LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
+ 
+ /// RAII: registers `desc` as this thread's current activity; drop pops it
+@@ -425,28 +434,64 @@ pub struct ActivityGuard;
+ 
+ impl ActivityGuard {
+     pub fn new(desc: String) -> ActivityGuard {
+-        ACTIVITY
+-            .lock()
+-            .entry(std::thread::current().id())
+-            .or_default()
+-            .push((desc, std::time::Instant::now()));
++        Self::new_with_progress(desc, None)
++    }
++
++    pub(crate) fn new_with_progress(
++        desc: String,
++        inherited: Option<ActivityProgress>,
++    ) -> ActivityGuard {
++        let now = std::time::Instant::now();
++        let mut activities = ACTIVITY.lock();
++        let stack = activities.entry(std::thread::current().id()).or_default();
++        let progress = inherited
++            .or_else(|| stack.last().map(|activity| activity.progress.clone()))
++            .unwrap_or_else(|| ActivityProgress(Arc::new(parking_lot::Mutex::new(now))));
++        stack.push(Activity { desc, started: now, progress });
+         ActivityGuard
+     }
+ }
+ 
++/// Progress lineage of the current activity, if any. Recipe work submitted by
++/// a recursive make carries this to its worker thread so descendant completion
++/// advances the waiting parent without coupling unrelated make invocations.
++pub(crate) fn current_activity_progress() -> Option<ActivityProgress> {
++    ACTIVITY
++        .lock()
++        .get(&std::thread::current().id())
++        .and_then(|stack| stack.last())
++        .map(|activity| activity.progress.clone())
++}
++
+ impl Drop for ActivityGuard {
+     fn drop(&mut self) {
+         let tid = std::thread::current().id();
+         let mut a = ACTIVITY.lock();
++        let mut completed = None;
+         if let Some(v) = a.get_mut(&tid) {
+-            v.pop();
++            completed = v.pop().map(|activity| activity.progress);
+             if v.is_empty() {
+                 a.remove(&tid);
+             }
+         }
++        drop(a);
++        if let Some(progress) = completed {
++            *progress.0.lock() = std::time::Instant::now();
++        }
+     }
+ }
+ 
++fn activity_is_stalled(
++    now: std::time::Instant,
++    activity_started: std::time::Instant,
++    last_progress: std::time::Instant,
++    stall_secs: u64,
++) -> bool {
++    let threshold = std::time::Duration::from_secs(stall_secs);
++    now.saturating_duration_since(activity_started) >= threshold
++        && now.saturating_duration_since(last_progress) >= threshold
++}
++
+ /// Snapshot of every thread's CURRENT activity: (description, age seconds),
+ /// innermost entry per thread. For the engine's live "what is this box
+ /// doing" feed.
+@@ -456,16 +501,20 @@ pub fn activity_snapshot() -> Vec<(String, u64)> {
+         .lock()
+         .values()
+         .filter_map(|stack| stack.last())
+-        .map(|(d, t)| (d.clone(), now.duration_since(*t).as_secs()))
++        .map(|activity| {
++            (
++                activity.desc.clone(),
++                now.duration_since(activity.started).as_secs(),
++            )
++        })
+         .collect()
+ }
+ 
+ /// Start the watchdog (idempotent). Each activity is reported through
+-/// `report` when it first crosses `stall_secs`, then again at DOUBLE the
+-/// age each time (600s, 1200s, …) — not on every 30s scan. A -j30 build
+-/// whose recipes all legitimately run long (a traced box multiplies
+-/// syscall-heavy work) otherwise prints 30 lines every 30 seconds and the
+-/// diagnostic drowns the build output it is meant to explain.
++/// `report` only when both the activity and the absence of completed work in
++/// its own progress lineage cross `stall_secs`, then again at DOUBLE the age.
++/// A recursive recipe can legitimately remain alive while descendant workers
++/// complete thousands of targets; those completions are progress, not a stall.
+ /// `stall_secs == 0` disables the watchdog entirely.
+ pub fn start_stall_watchdog(stall_secs: u64, report: Arc<dyn Fn(&str) + Send + Sync>) {
+     if stall_secs == 0 {
+@@ -489,21 +538,34 @@ pub fn start_stall_watchdog(stall_secs: u64, report: Arc<dyn Fn(&str) + Send + S
+                     let act = ACTIVITY.lock();
+                     seen.retain(|tid, _| act.contains_key(tid));
+                     for (tid, stack) in act.iter() {
+-                        let Some((desc, since)) = stack.last() else {
++                        let Some(activity) = stack.last() else {
+                             continue;
+                         };
+-                        let age = now.duration_since(*since).as_secs();
++                        let desc = &activity.desc;
++                        let since = activity.started;
++                        let last_progress = *activity.progress.0.lock();
++                        let age = now.duration_since(since).as_secs();
+                         let next = match seen.get(tid) {
+-                            Some((s, next)) if s == since => *next,
++                            Some((s, next)) if *s == since => *next,
+                             _ => stall_secs,
+                         };
+-                        if age >= next {
++                        if age >= next
++                            && activity_is_stalled(
++                                now,
++                                since,
++                                last_progress,
++                                stall_secs,
++                            )
++                        {
+                             report(&format!(
+-                                "*kati*: STALL? {age}s without completing: {desc}"
++                                "*kati*: STALL? {age}s with no build progress: {desc}"
+                             ));
+-                            seen.insert(*tid, (*since, next.saturating_mul(2)));
++                            seen.insert(
++                                *tid,
++                                (since, age.max(next).saturating_mul(2)),
++                            );
+                         } else {
+-                            seen.insert(*tid, (*since, next));
++                            seen.insert(*tid, (since, next));
+                         }
+                     }
+                 }
+@@ -533,3 +595,46 @@ pub fn report_var_assign(
+         h(name, loc, value, make_dir, rhs, op, origin);
+     }
+ }
++
++#[cfg(test)]
++mod activity_tests {
++    use super::*;
++
++    #[test]
++    fn nested_workers_share_progress_but_unrelated_invocations_do_not() {
++        let _parent = ActivityGuard::new("parent recipe".into());
++        let parent_progress = current_activity_progress().unwrap();
++        {
++            let _nested = ActivityGuard::new_with_progress(
++                "nested worker".into(),
++                Some(parent_progress.clone()),
++            );
++            let nested_progress = current_activity_progress().unwrap();
++            assert!(Arc::ptr_eq(&parent_progress.0, &nested_progress.0));
++        }
++
++        let unrelated_progress = std::thread::spawn(|| {
++            let _unrelated = ActivityGuard::new("unrelated make".into());
++            current_activity_progress().unwrap()
++        })
++        .join()
++        .unwrap();
++        assert!(!Arc::ptr_eq(&parent_progress.0, &unrelated_progress.0));
++    }
++
++    #[test]
++    fn long_activity_is_not_stalled_while_other_work_completes() {
++        let now = std::time::Instant::now();
++        let started = now - std::time::Duration::from_secs(900);
++        let recent_progress = now - std::time::Duration::from_secs(1);
++        assert!(!activity_is_stalled(now, started, recent_progress, 300));
++    }
++
++    #[test]
++    fn long_activity_is_stalled_after_its_progress_lineage_stops() {
++        let now = std::time::Instant::now();
++        let started = now - std::time::Duration::from_secs(900);
++        let last_progress = now - std::time::Duration::from_secs(301);
++        assert!(activity_is_stalled(now, started, last_progress, 300));
++    }
++}
+diff --git a/src-rs/main.rs b/src-rs/main.rs
+index 00d1c4e..40c57f0 100644
+--- a/src-rs/main.rs
++++ b/src-rs/main.rs
+@@ -343,7 +343,7 @@ fn run(targets: &[Symbol], cl_vars: &Vec<Bytes>, orig_args: OsString) -> Result<
+                 .into_iter()
+                 .partition(|(s, _)| required.contains(s));
+             if !req_nodes.is_empty() {
+-                kati::exec::exec(req_nodes, &mut ev)?;
++                kati::exec::exec_makefile_remakes(req_nodes, &mut ev)?;
+                 remake_active |= ev.question_would_run;
+             }
+             for node in opt_nodes {

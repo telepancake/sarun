@@ -369,6 +369,27 @@ fn standalone_make_direct_output_and_opt_in_target_logs_agree() {
     assert!(logs.contains("marker\n"), "{logs:?}");
 }
 
+#[test]
+fn up_to_date_included_makefiles_are_checked_silently() {
+    let temp = tempfile::tempdir().expect("temporary project root");
+    fs::write(temp.path().join("deps.mk"), "# already generated\n")
+        .expect("write included makefile");
+    fs::write(
+        temp.path().join("Makefile"),
+        ".DEFAULT_GOAL := all\ninclude deps.mk\n\ndeps.mk:\n\n.PHONY: all\nall:\n\t@:\n",
+    )
+    .expect("write including makefile");
+
+    let output = run_bumba(&["make"], temp.path());
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.stdout.is_empty(),
+        "internal makefile-remake root leaked a goal diagnostic: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(output.stderr.is_empty());
+}
+
 #[cfg(target_os = "linux")]
 fn read_terminal_until(
     master: &mut std::fs::File,

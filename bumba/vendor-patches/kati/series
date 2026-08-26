@@ -94,3 +94,4 @@
 0940-Isolate-embedded-make-scheduling-and-reuse-recipe-workers.patch
 0950-Wake-schedulers-and-grow-recipe-workers-lazily.patch
 0960-Carry-opaque-invocation-context-into-recipe-workers.patch
+0970-Silence-remake-probes-and-track-nested-build-progress.patch

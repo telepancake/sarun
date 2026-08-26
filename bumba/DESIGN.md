@@ -43,6 +43,12 @@ execution.
   workers and synchronous recursion cannot occupy another make's capacity; the
   shared jobserver still bounds real recipes. Ninja uses a fixed invocation
   pool and the same jobserver-wakeup rule instead of creating a thread per edge.
+- Kati's internal included-makefile remake pass is not a user goal and emits no
+  ordinary “Nothing to be done” diagnostics. Stall age is likewise not merely
+  wall-clock age: completed nested work advances an invocation-lineage progress
+  clock carried across recipe workers. This lets a recursive parent remain
+  alive while descendants advance, without allowing an unrelated concurrent
+  build to conceal a genuinely stalled invocation.
 - Each physical recipe worker caches pristine Brush shell templates. Every
   recipe still receives a fresh logical subshell, cwd, and environment; strict
   literal command lines may bypass shell parsing and launch an unowned external

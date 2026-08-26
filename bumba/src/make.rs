@@ -797,7 +797,7 @@ fn run_kati(
             .into_iter()
             .partition(|(s, _)| required.contains(s));
         if !req_nodes.is_empty() {
-            kati::exec::exec(req_nodes, &mut ev)?;
+            kati::exec::exec_makefile_remakes(req_nodes, &mut ev)?;
             successfully_checked.extend(required.iter().copied());
         }
         for node in opt_nodes {
