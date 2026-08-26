@@ -31,3 +31,5 @@
 0310-Represent-builtin-parser-tears-explicitly.patch
 0320-Resolve-executables-once-in-the-shell-namespace.patch
 0330-Route-embedded-shell-path-reads-through-box-filesystem-provi.patch
+0340-Keep-command-preexecution-hook-portable.patch
+0350-Use-bounded-userspace-pipes-between-leaf-builtins.patch

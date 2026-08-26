@@ -1,0 +1,28 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: sarun <noreply@sarun>
+Date: Wed, 22 Jul 2026 18:43:46 +0000
+Subject: [PATCH] Keep command preexecution hook portable
+
+The hook mutates logical shell state and is called on every supported host; it
+is neither a Linux-only fd walker nor a pre_exec child hook.
+
+---
+diff --git a/src/commands.rs b/src/commands.rs
+index b007c7e..89394c8 100644
+--- a/src/commands.rs
++++ b/src/commands.rs
+@@ -370,12 +370,8 @@ pub fn compose_std_command<S: AsRef<OsStr>, SE: extensions::ShellExtensions>(
+     Ok(cmd)
+ }
+ 
+-/// pre_exec hook: close every fd > 2 that still has FD_CLOEXEC set.
+-/// command-fds clears FD_CLOEXEC on the fds it explicitly mapped, so
+-/// those survive; CLOEXEC-set fds are leftovers brush never asked the
+-/// child to inherit. linux-only because we walk /proc/self/fd.
+-#[cfg(target_os = "linux")]
+-
++/// Update the command-visible shell state and run the DEBUG trap immediately
++/// before dispatch. This is shell state only and is portable across Unix hosts.
+ pub(crate) async fn on_preexecute(
+     cmd: &mut commands::SimpleCommand<'_, impl extensions::ShellExtensions>,
+ ) -> Result<(), error::Error> {

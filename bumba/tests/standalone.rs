@@ -1,8 +1,6 @@
 use std::fs;
-#[cfg(target_os = "linux")]
-use std::io::Read as _;
+use std::io::{Read as _, Write as _};
 use std::os::unix::fs::PermissionsExt as _;
-use std::io::Write as _;
 use std::process::Command;
 
 fn run_bumba(args: &[&str], cwd: &std::path::Path) -> std::process::Output {
@@ -11,6 +9,56 @@ fn run_bumba(args: &[&str], cwd: &std::path::Path) -> std::process::Output {
         .current_dir(cwd)
         .output()
         .expect("run Bumba")
+}
+
+fn run_bumba_with_timeout(
+    args: &[&str],
+    cwd: &std::path::Path,
+    timeout: std::time::Duration,
+) -> std::process::Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_bumba"));
+    command.args(args).current_dir(cwd);
+    run_command_with_timeout(command, timeout)
+}
+
+fn run_command_with_timeout(
+    mut command: Command,
+    timeout: std::time::Duration,
+) -> std::process::Output {
+    let mut child = command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("run Bumba");
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let mut stderr = child.stderr.take().expect("piped stderr");
+    let stdout_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes).expect("read Bumba stdout");
+        bytes
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stderr.read_to_end(&mut bytes).expect("read Bumba stderr");
+        bytes
+    });
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll Bumba") {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill().expect("kill timed-out Bumba");
+            let _ = child.wait();
+            panic!("Bumba did not complete within {timeout:?}");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    std::process::Output {
+        status,
+        stdout: stdout_reader.join().expect("join stdout reader"),
+        stderr: stderr_reader.join().expect("join stderr reader"),
+    }
 }
 
 fn executable(path: &std::path::Path, script: &str) {
@@ -113,15 +161,11 @@ fn repeated_in_process_makes_keep_parallelism_and_silence_scoped() {
     );
     let started = std::time::Instant::now();
     let parallel = run_bumba(&["-c", &script], temp.path());
-    let elapsed = started.elapsed();
+    let parallel_elapsed = started.elapsed();
     assert!(
         parallel.status.success(),
         "{}",
         String::from_utf8_lossy(&parallel.stderr)
-    );
-    assert!(
-        elapsed < std::time::Duration::from_millis(1200),
-        "later -j4 make remained serial after an earlier -j1 make: {elapsed:?}"
     );
     let stdout = String::from_utf8_lossy(&parallel.stdout);
     assert_eq!(
@@ -139,15 +183,16 @@ fn repeated_in_process_makes_keep_parallelism_and_silence_scoped() {
     );
     let started = std::time::Instant::now();
     let serial = run_bumba(&["-c", &script], temp.path());
-    let elapsed = started.elapsed();
+    let serial_elapsed = started.elapsed();
     assert!(
         serial.status.success(),
         "{}",
         String::from_utf8_lossy(&serial.stderr)
     );
     assert!(
-        elapsed >= std::time::Duration::from_millis(1600),
-        "later -j1 make inherited parallelism: {elapsed:?}"
+        serial_elapsed.saturating_sub(parallel_elapsed)
+            >= std::time::Duration::from_millis(700),
+        "later make did not respect its own job count: parallel={parallel_elapsed:?}, serial={serial_elapsed:?}"
     );
 }
 
@@ -165,18 +210,22 @@ fn recursive_make_inherits_the_parent_parallelism() {
     )
     .expect("write child makefile");
 
-    let started = std::time::Instant::now();
-    let output = run_bumba(&["make", "-j4", "-s"], temp.path());
-    let elapsed = started.elapsed();
+    let output = Command::new(env!("CARGO_BIN_EXE_bumba"))
+        .args(["make", "-j4", "-s"])
+        .current_dir(temp.path())
+        .env("BUMBA_SCHED_STATS", "1")
+        .output()
+        .expect("run recursive make");
     assert!(
         output.status.success(),
         "stdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    let scheduler_stats = String::from_utf8_lossy(&output.stderr);
     assert!(
-        elapsed < std::time::Duration::from_millis(1400),
-        "recursive make lost its inherited -j4 setting: {elapsed:?}"
+        scheduler_stats.lines().any(|line| line.contains("max_running=4")),
+        "recursive make did not run four recipes concurrently:\n{scheduler_stats}"
     );
     let inherited = fs::read_to_string(temp.path().join("inherited-flags"))
         .expect("read recursive MAKEFLAGS");
@@ -184,6 +233,140 @@ fn recursive_make_inherits_the_parent_parallelism() {
         inherited.contains("--jobserver-auth=fifo:"),
         "recursive make did not inherit a real jobserver: {inherited:?}"
     );
+}
+
+#[test]
+fn recursive_make_streams_more_than_pipe_capacity_through_logical_output() {
+    let temp = tempfile::tempdir().expect("temporary project root");
+    let levels = ["Makefile", "one.mk", "two.mk", "three.mk"];
+    for (index, level) in levels.iter().enumerate() {
+        let recipe = if let Some(next) = levels.get(index + 1) {
+            format!(".PHONY: all\nall:\n\t$(MAKE) -s -f {next}\n")
+        } else {
+            ".PHONY: all\nall:\n\t@awk 'BEGIN { for (i = 0; i < 4096; ++i) print \"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\" }'\n".to_string()
+        };
+        fs::write(temp.path().join(level), recipe).expect("write recursive makefile");
+    }
+    const EXPECTED_BYTES: u64 = 4096 * 65;
+
+    let redirected = run_bumba_with_timeout(
+        &["-c", "make -j4 -s > recursive.out"],
+        temp.path(),
+        std::time::Duration::from_secs(15),
+    );
+    assert!(
+        redirected.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&redirected.stdout),
+        String::from_utf8_lossy(&redirected.stderr),
+    );
+    assert!(redirected.stdout.is_empty());
+    assert!(redirected.stderr.is_empty());
+    assert_eq!(
+        fs::metadata(temp.path().join("recursive.out"))
+            .expect("recursive output metadata")
+            .len(),
+        EXPECTED_BYTES,
+    );
+
+    let piped = run_bumba_with_timeout(
+        &["-c", "make -j4 -s | wc -c"],
+        temp.path(),
+        std::time::Duration::from_secs(15),
+    );
+    assert!(piped.status.success(), "{}", String::from_utf8_lossy(&piped.stderr));
+    assert_eq!(
+        String::from_utf8_lossy(&piped.stdout).trim().parse::<u64>().unwrap(),
+        EXPECTED_BYTES,
+    );
+
+    let log_dir = temp.path().join("recursive-target-logs");
+    let mut logged_command = Command::new(env!("CARGO_BIN_EXE_bumba"));
+    logged_command
+        .args(["make", "-j4", "-s"])
+        .current_dir(temp.path())
+        .env("BUMBA_TARGET_LOG_DIR", &log_dir);
+    let logged = run_command_with_timeout(logged_command, std::time::Duration::from_secs(15));
+    assert!(
+        logged.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&logged.stdout),
+        String::from_utf8_lossy(&logged.stderr),
+    );
+    assert_eq!(logged.stdout.len() as u64, EXPECTED_BYTES);
+    assert!(logged.stderr.is_empty());
+    let logged_bytes = fs::read_dir(&log_dir)
+        .expect("read recursive target logs")
+        .map(|entry| fs::read(entry.expect("target log entry").path()).expect("read target log"))
+        .map(|bytes| bytes.len() as u64)
+        .sum::<u64>();
+    assert!(
+        logged_bytes >= EXPECTED_BYTES,
+        "target logs lost recursive output: expected at least {EXPECTED_BYTES}, got {logged_bytes}"
+    );
+
+    let warning = "$(warning 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef)\n";
+    fs::write(
+        temp.path().join("Makefile"),
+        format!("{}.PHONY: all\nall:\n\t@:\n", warning.repeat(4096)),
+    )
+    .expect("write high-volume diagnostic makefile");
+    let stderr_only_pipe = run_bumba_with_timeout(
+        &["-c", "make -j4 -s 3>&1 1>/dev/null 2>&3 | wc -c"],
+        temp.path(),
+        std::time::Duration::from_secs(15),
+    );
+    assert!(
+        stderr_only_pipe.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stderr_only_pipe.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&stderr_only_pipe.stdout)
+            .trim()
+            .parse::<u64>()
+            .unwrap()
+            >= EXPECTED_BYTES,
+        "make diagnostics did not reach the stderr-only pipeline: {}",
+        String::from_utf8_lossy(&stderr_only_pipe.stdout),
+    );
+}
+
+#[test]
+fn standalone_make_direct_output_and_opt_in_target_logs_agree() {
+    let temp = tempfile::tempdir().expect("temporary project root");
+    fs::write(
+        temp.path().join("Makefile"),
+        ".PHONY: all\nall:\n\t@printf 'recipe-out\\n'\n\t@printf 'recipe-err\\n' >&2\n\t@/bin/ls marker\n",
+    )
+    .expect("write output Makefile");
+    fs::write(temp.path().join("marker"), b"").expect("write external-command marker");
+
+    let direct = run_bumba(&["make", "-s"], temp.path());
+    assert!(direct.status.success(), "{}", String::from_utf8_lossy(&direct.stderr));
+    assert_eq!(
+        String::from_utf8_lossy(&direct.stdout),
+        "recipe-out\nrecipe-err\nmarker\n",
+    );
+    assert!(direct.stderr.is_empty());
+
+    let log_dir = temp.path().join("target-logs");
+    let captured = Command::new(env!("CARGO_BIN_EXE_bumba"))
+        .args(["make", "-s"])
+        .current_dir(temp.path())
+        .env("BUMBA_TARGET_LOG_DIR", &log_dir)
+        .output()
+        .expect("run Bumba with target logs");
+    assert!(captured.status.success(), "{}", String::from_utf8_lossy(&captured.stderr));
+    assert_eq!(captured.stdout, direct.stdout);
+    assert!(captured.stderr.is_empty());
+    let logs = fs::read_dir(&log_dir)
+        .expect("read target logs")
+        .map(|entry| fs::read_to_string(entry.unwrap().path()).unwrap())
+        .collect::<String>();
+    assert!(logs.contains("recipe-out\n"), "{logs:?}");
+    assert!(logs.contains("recipe-err\n"), "{logs:?}");
+    assert!(logs.contains("marker\n"), "{logs:?}");
 }
 
 #[cfg(target_os = "linux")]
@@ -353,7 +536,11 @@ fn absolute_sdk_paths_and_nested_shell_exec_stay_in_process() {
         String::from_utf8_lossy(&output.stderr),
     );
     assert_eq!(String::from_utf8_lossy(&output.stdout), "from builtin\narg=reentered\n");
-    assert!(output.stderr.is_empty(), "redirected builtin error escaped logical stderr");
+    assert!(
+        output.stderr.is_empty(),
+        "redirected builtin error escaped logical stderr: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
     assert!(
         fs::read_to_string(temp.path().join("uname.err"))
             .expect("read redirected diagnostic")
@@ -384,6 +571,33 @@ fn mixed_coreutils_rebind_localization_without_cross_call_state() {
 }
 
 #[test]
+fn mixed_pipeline_transports_keep_external_descriptors_native() {
+    let temp = tempfile::tempdir().expect("temporary project root");
+    let producer = temp.path().join("external-producer");
+    let filter = temp.path().join("external-filter");
+    executable(&producer, "#!/bin/sh\nprintf abc\n");
+    executable(&filter, "#!/bin/sh\ncat\n");
+
+    // The first pipeline has a kernel edge followed by a userspace edge. The
+    // second has an external command between two leaf builtins, so both edges
+    // must remain native. In either case no userspace endpoint may leak into
+    // the descriptor table passed to exec.
+    let script = format!(
+        "'{}' | cat | wc -c; printf abc | '{}' | wc -c",
+        producer.display(),
+        filter.display(),
+    );
+    let output = run_bumba(&["-c", &script], temp.path());
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "3\n3\n");
+}
+
+#[test]
 fn shell_make_and_ninja_build_real_projects() {
     let temp = tempfile::tempdir().expect("temporary project root");
 
@@ -395,6 +609,28 @@ fn shell_make_and_ninja_build_real_projects() {
     );
     assert!(shell.status.success(), "{}", String::from_utf8_lossy(&shell.stderr));
     assert_eq!(String::from_utf8_lossy(&shell.stdout).trim(), "2");
+
+    // Every edge here is a descriptor-free leaf builtin. The payload exceeds
+    // the userspace pipe capacity, exercising bounded backpressure; `head`
+    // then closes its input early and the producer must observe BrokenPipe
+    // rather than hang or keep an unbounded buffer alive.
+    fs::write(temp.path().join("large.bin"), vec![b'x'; 70_000])
+        .expect("write userspace-pipe payload");
+    let userspace_pipes = run_bumba(
+        &[
+            "-c",
+            "cat large.bin | cat | wc -c; cat large.bin | head -c 1 | wc -c",
+        ],
+        temp.path(),
+    );
+    assert!(
+        userspace_pipes.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&userspace_pipes.stdout),
+        String::from_utf8_lossy(&userspace_pipes.stderr),
+    );
+    assert_eq!(String::from_utf8_lossy(&userspace_pipes.stdout), "70000\n1\n");
+    assert!(userspace_pipes.stderr.is_empty());
 
     fs::create_dir(temp.path().join("tree")).expect("create find tree");
     fs::write(temp.path().join("tree/needle.txt"), b"needle\n").expect("write find input");

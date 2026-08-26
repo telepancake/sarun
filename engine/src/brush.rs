@@ -189,6 +189,106 @@ impl brush_core::builtins::SimpleCommand for EngineSelfCommand {
 /// shadow/`main()` path — both share kati; this is just the in-process door.
 struct MakeBuiltin;
 
+struct EngineMakeInvocation {
+    argv: Vec<String>,
+    cwd: std::path::PathBuf,
+    seed_env: Vec<(OsString, OsString)>,
+    out: brush_core::openfiles::OpenFile,
+    err: brush_core::openfiles::OpenFile,
+    recipe_out: brush_core::openfiles::OpenFile,
+    recipe_err: brush_core::openfiles::OpenFile,
+    stdin: Option<brush_core::openfiles::OpenFile>,
+}
+
+impl EngineMakeInvocation {
+    fn capture<SE: brush_core::extensions::ShellExtensions>(
+        context: brush_core::commands::ExecutionContext<'_, SE>,
+        mut argv: Vec<String>,
+    ) -> Self {
+        if argv.is_empty() {
+            argv.push(context.command_name.clone());
+        }
+        let cwd = context.shell.working_dir().to_path_buf();
+        let shell = &*context.shell;
+        let seed_env = context
+            .shell
+            .env()
+            .iter_exported()
+            .map(|(name, value)| {
+                (
+                    OsString::from(name.clone()),
+                    OsString::from(value.value().to_cow_str(shell).into_owned()),
+                )
+            })
+            .collect();
+        let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
+        let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
+        let recipe_out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
+        let recipe_err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
+        let stdin = context.try_fd(0);
+        Self { argv, cwd, seed_env, out, err, recipe_out, recipe_err, stdin }
+    }
+
+    fn output_needs_concurrent_reader(&self) -> bool {
+        [&self.recipe_out, &self.recipe_err].into_iter().any(|output| {
+            matches!(
+                output,
+                brush_core::openfiles::OpenFile::PipeWriter(_)
+                    | brush_core::openfiles::OpenFile::MemoryPipeWriter(_)
+                    | brush_core::openfiles::OpenFile::Stream(_)
+            )
+        })
+    }
+
+    fn run(self) -> i32 {
+        crate::katirun::make_builtin(
+            &self.argv,
+            &self.cwd,
+            &self.seed_env,
+            self.out,
+            self.err,
+            self.recipe_out,
+            self.recipe_err,
+            self.stdin,
+        )
+    }
+}
+
+fn execute_engine_make_builtin<SE: brush_core::extensions::ShellExtensions>(
+    context: brush_core::commands::ExecutionContext<'_, SE>,
+    args: Vec<brush_core::commands::CommandArg>,
+) -> brush_core::builtins::BoxFuture<
+    '_,
+    Result<brush_core::results::ExecutionResult, brush_core::error::Error>,
+> {
+    Box::pin(async move {
+        let invocation = EngineMakeInvocation::capture(
+            context,
+            args.into_iter().map(|arg| arg.to_string()).collect(),
+        );
+        let code = if invocation.output_needs_concurrent_reader() {
+            tokio::task::spawn_blocking(move || invocation.run())
+                .await
+                .map_err(|error| {
+                    brush_core::error::Error::from(std::io::Error::other(format!(
+                        "embedded make worker failed: {error}"
+                    )))
+                })?
+        } else {
+            invocation.run()
+        };
+        Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8))
+    })
+}
+
+fn engine_make_registration<SE: brush_core::extensions::ShellExtensions>()
+-> brush_core::builtins::Registration<SE> {
+    let mut registration = brush_core::builtins::simple_builtin::<MakeBuiltin, SE>();
+    registration.execute_func = execute_engine_make_builtin::<SE>;
+    registration.external_command = true;
+    registration
+}
+
 /// Wikipedia mirror operations are an engine-owned brush builtin, not a
 /// second command kingdom hidden behind self-exec recipes.  The generated
 /// Kati graph invokes this name for each build node, so all nodes share the
@@ -244,56 +344,11 @@ impl brush_core::builtins::SimpleCommand for MakeBuiltin {
         context: brush_core::commands::ExecutionContext<'_, SE>,
         args: I,
     ) -> Result<brush_core::results::ExecutionResult, brush_core::error::Error> {
-        // `args` already includes argv[0] (the command name), like the coreutil
-        // builtins — use it directly; only synthesize a name if somehow empty.
-        let name = context.command_name.clone();
-        let mut argv: Vec<String> = args.map(|a| a.as_ref().to_string()).collect();
-        if argv.is_empty() {
-            argv.push(name);
-        }
-        // Logical cwd from the brush context — NOT the process cwd.
-        let cwd = context.shell.working_dir().to_path_buf();
-        // Seed the make from THIS subshell's exported env, not the process env.
-        // The parent make applied its exports to this subshell via the recipe's
-        // export prefix, so iter_exported() here = the base box env + the
-        // parent's exports — exactly what a forked child make would inherit, and
-        // without any make ever mutating the shared process env.
-        let shell_ref = &*context.shell;
-        let seed_env: Vec<(std::ffi::OsString, std::ffi::OsString)> = shell_ref
-            .env()
-            .iter_exported()
-            .map(|(k, v)| {
-                (
-                    std::ffi::OsString::from(k.clone()),
-                    std::ffi::OsString::from(v.value().to_cow_str(shell_ref).into_owned()),
-                )
-            })
-            .collect();
-        // fd 1/2 twice each: one handle for make's own messages, one as the
-        // recipe/diagnostic sink kati writes through (set_recipe_out/err).
-        let out = context
-            .try_fd(1)
-            .unwrap_or_else(|| std::io::stdout().into());
-        let err = context
-            .try_fd(2)
-            .unwrap_or_else(|| std::io::stderr().into());
-        let recipe_out = context
-            .try_fd(1)
-            .unwrap_or_else(|| std::io::stdout().into());
-        let recipe_err = context
-            .try_fd(2)
-            .unwrap_or_else(|| std::io::stderr().into());
-        let stdin = context.try_fd(0);
-        let code = crate::katirun::make_builtin(
-            &argv,
-            &cwd,
-            &seed_env,
-            out,
-            err,
-            Box::new(recipe_out),
-            Box::new(recipe_err),
-            stdin,
+        let invocation = EngineMakeInvocation::capture(
+            context,
+            args.map(|arg| arg.as_ref().to_string()).collect(),
         );
+        let code = invocation.run();
         Ok(brush_core::results::ExecutionResult::new(
             (code & 0xff) as u8,
         ))
@@ -423,22 +478,21 @@ impl brush_core::builtins::Command for EditBuiltin {
 fn box_builtins<SE: brush_core::extensions::ShellExtensions>()
 -> std::collections::HashMap<String, brush_core::builtins::Registration<SE>> {
     use brush_core::builtins::{builtin, simple_builtin};
-    let mut m: std::collections::HashMap<String, brush_core::builtins::Registration<SE>> =
-        std::collections::HashMap::new();
-    bumba::coreutils::extend(&mut m);
+    // Bumba owns the common shell/build/coreutils policy. Sarun starts from
+    // that exact registry, then replaces only the build entries that need its
+    // box filesystem/provenance adapters and adds engine-specific commands.
+    let mut m = bumba::shell::builtins();
     // Embedded GNU make: keeps recursive `$(MAKE)` and configure/cmake-invoked
     // make IN-PROCESS (see MakeBuiltin) instead of re-exec'ing the engine.
-    m.insert("make".to_string(), simple_builtin::<MakeBuiltin, SE>());
-    m.insert("gmake".to_string(), simple_builtin::<MakeBuiltin, SE>());
-    m.insert("ninja".to_string(), simple_builtin::<NinjaBuiltin, SE>());
+    m.insert("make".to_string(), engine_make_registration::<SE>());
+    m.insert("gmake".to_string(), engine_make_registration::<SE>());
+    let mut ninja = simple_builtin::<NinjaBuiltin, SE>();
+    ninja.external_command = true;
+    m.insert("ninja".to_string(), ninja);
     m.insert(
         "wikimak".to_string(),
         simple_builtin::<WikimakBuiltin, SE>(),
     );
-    // BashMode shell builtins overwrite any overlapping coreutil names (highest priority).
-    m.extend(brush_builtins::default_builtins(
-        brush_builtins::BuiltinSet::BashMode,
-    ));
     m.insert("edit".to_string(), builtin::<EditBuiltin, SE>());
     // In-box engine entry points via /proc/self/exe (no PATH shadow needed).
     m.insert(
@@ -449,20 +503,11 @@ fn box_builtins<SE: brush_core::extensions::ShellExtensions>()
         "oaita".to_string(),
         simple_builtin::<EngineSelfCommand, SE>(),
     );
-    bumba::find::extend(&mut m);
-    bumba::exec_wrappers::extend(&mut m);
-
-    // These are external commands whose implementations happen to run
-    // in-process. Keep that optimization invisible to shell discovery:
-    // `command -v`/`type` must return the executable from PATH (and therefore
-    // an `-x`-testable path), not a bare shell-builtin name.
-    for name in [
-        "cat", "head", "tail", "wc", "nl", "tac", "basename", "dirname", "seq", "expr", "tr",
-        "cut", "uniq", "sort", "uname", "nproc", "id", "whoami", "cp", "mkdir", "rmdir", "rm",
-        "mv", "ln", "touch", "readlink", "realpath", "mktemp", "tee", "chmod", "chown", "install",
-        "make", "gmake", "ninja", "find", "xargs", "env", "printenv", "nice", "setsid", "nohup",
-        "sarun", "oaita",
-    ] {
+    // Bumba already marks its optimized external-command replacements. These
+    // two additional Sarun multicall commands need the same discovery
+    // behavior: PATH lookup remains observable even though execution re-enters
+    // the engine.
+    for name in ["sarun", "oaita"] {
         if let Some(registration) = m.get_mut(name) {
             registration.external_command = true;
         }

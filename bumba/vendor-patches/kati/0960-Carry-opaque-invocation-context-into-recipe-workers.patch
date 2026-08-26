@@ -1,0 +1,117 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bumba <noreply@bumba>
+Date: Wed, 26 Aug 2026 08:47:21 +0000
+Subject: [PATCH] Carry opaque invocation context into recipe workers
+
+Let embedders preserve logical recipe descriptors across Kati worker threads without coupling Kati to the embedding shell. The context is immutable, invocation-owned, and forwarded only to the installed runner.
+
+---
+diff --git a/src-rs/eval.rs b/src-rs/eval.rs
+index 8237884..22a33ac 100644
+--- a/src-rs/eval.rs
++++ b/src-rs/eval.rs
+@@ -302,6 +302,9 @@ pub struct Evaluator {
+     /// Standalone make recipes may write directly to the process descriptors.
+     /// Embedded makes keep output routed through their caller's logical fds.
+     pub direct_recipe_output: bool,
++    /// Opaque invocation context forwarded unchanged to the installed recipe
++    /// runner. Kati neither inspects nor mutates it.
++    pub recipe_execution_context: Option<crate::fileutil::RecipeExecutionContext>,
+     /// sarun: set by the executor after a run — under -q, true iff any
+     /// recipe WOULD have run (drives the exit-1 status).
+     pub question_would_run: bool,
+@@ -431,6 +434,7 @@ impl Evaluator {
+             touch: false,
+             recipe_stdin: None,
+             direct_recipe_output: false,
++            recipe_execution_context: None,
+             question_would_run: false,
+             global_vars: Arc::new(Mutex::new(Vec::new())),
+             working_dir: std::env::current_dir().unwrap_or_default(),
+diff --git a/src-rs/exec.rs b/src-rs/exec.rs
+index a27a731..ef3e5cc 100644
+--- a/src-rs/exec.rs
++++ b/src-rs/exec.rs
+@@ -248,6 +248,7 @@ struct RunReq {
+     /// the standalone rkati path (Evaluator::box_export_prefix is unset there).
+     box_prefix: Bytes,
+     direct_output: bool,
++    recipe_execution_context: Option<crate::fileutil::RecipeExecutionContext>,
+     /// The pre-run output timestamp to record as this node's result on success.
+     result_ts: ExecStatus,
+     /// Per-make GNU -n / -i / -q (from the Executor; see Evaluator::dry_run).
+@@ -631,7 +632,8 @@ fn run_node_commands(
+             if let Some(code) = run_with_installed_runner(
+                 shell, shellflag, &prefix, &command.cmd, &cwd,
+                 recipe_stdin.as_deref(),
+-                RedirectStderr::Stdout, req.direct_output, emit)
++                RedirectStderr::Stdout, req.direct_output,
++                req.recipe_execution_context.as_ref(), emit)
+             {
+                 (code == 0, code)
+             } else {
+@@ -893,7 +895,10 @@ list of the rule for '{output}' at {loc}"));
+         Ok((
+             result_ts,
+             Some(RunReq { output, commands, exports, cwd, box_prefix,
+-                          direct_output: self.ce.ev.direct_recipe_output, result_ts,
++                          direct_output: self.ce.ev.direct_recipe_output,
++                          recipe_execution_context:
++                              self.ce.ev.recipe_execution_context.clone(),
++                          result_ts,
+                           dry_run: self.dry_run, ignore_errors: self.ignore_errors,
+                           question: self.question, touch }),
+         ))
+diff --git a/src-rs/fileutil.rs b/src-rs/fileutil.rs
+index 566973e..74ff080 100644
+--- a/src-rs/fileutil.rs
++++ b/src-rs/fileutil.rs
+@@ -85,6 +85,13 @@ pub enum RecipeRunnerDecision {
+     Passthrough,
+ }
+ 
++/// Invocation-owned context carried opaquely from an embedder's evaluator to
++/// each recipe runner call. Kati deliberately assigns no representation or
++/// semantics to this value; an embedder can use it to preserve logical I/O or
++/// other invocation capabilities without introducing a dependency on the
++/// embedding shell.
++pub type RecipeExecutionContext = Arc<dyn std::any::Any + Send + Sync>;
++
+ // sarun: Arc (not Box) so run_with_installed_runner can clone the runner out
+ // and RELEASE the lock before invoking it — a recursive in-process make's
+ // recipes re-enter run_with_installed_runner, and holding this non-reentrant
+@@ -99,6 +106,7 @@ pub type RecipeRunner = Arc<
+             Option<&std::os::fd::OwnedFd>, /* invoking make's logical stdin */
+             RedirectStderr, /* stderr disposition (merge into output / inherit / discard) */
+             bool, /* standalone output may use process descriptors directly */
++            Option<&RecipeExecutionContext>, /* opaque embedder invocation context */
+             &mut dyn FnMut(&[u8]),
+         ) -> RecipeRunnerDecision
+         + Send
+@@ -137,6 +145,7 @@ pub fn run_with_installed_runner(
+     stdin: Option<&std::os::fd::OwnedFd>,
+     redirect_stderr: RedirectStderr,
+     direct_output: bool,
++    execution_context: Option<&RecipeExecutionContext>,
+     out_cb: &mut dyn FnMut(&[u8]),
+ ) -> Option<i32> {
+     // sarun: clone the runner Arc and RELEASE the lock before invoking it. The
+@@ -144,7 +153,8 @@ pub fn run_with_installed_runner(
+     // holding this non-reentrant lock across the call would deadlock.
+     let runner = RECIPE_RUNNER.lock().as_ref()?.clone();
+     match runner(
+-        shell, shellflag, prefix, cmd, cwd, stdin, redirect_stderr, direct_output, out_cb,
++        shell, shellflag, prefix, cmd, cwd, stdin, redirect_stderr, direct_output,
++        execution_context, out_cb,
+     ) {
+         RecipeRunnerDecision::Ran { code } => Some(code),
+         RecipeRunnerDecision::Passthrough => None,
+@@ -255,7 +265,7 @@ pub fn run_command_prefixed(
+         let mut output = Vec::new();
+         if let Some(code) = run_with_installed_runner(
+             shell, shellflag, prefix, cmd, cwd, None, redirect_stderr, false,
+-            &mut |b| output.extend_from_slice(b))
++            None, &mut |b| output.extend_from_slice(b))
+         {
+             return Ok((ExitStatus::from_raw((code & 0xff) << 8), output));
+         }

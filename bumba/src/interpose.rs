@@ -104,6 +104,13 @@ fn classify(path: &Path) -> Option<Candidate> {
     })
 }
 
+/// Whether executing this already-resolved path must stay inside Bumba. The
+/// literal-recipe launcher uses the same classifier as Brush's interposer, so
+/// an absolute SDK path cannot accidentally escape an owned utility or shell.
+pub(crate) fn owns_resolved_path(path: &Path) -> bool {
+    classify(path).is_some()
+}
+
 fn parse_shell_invocation(
     candidate: &Candidate,
     argv: &[String],

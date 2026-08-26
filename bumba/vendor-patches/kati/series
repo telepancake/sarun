@@ -92,3 +92,5 @@
 0920-kati--expose-target-attributed-live-recipe-output.patch
 0930-kati--expand-target-exports-in-their-rule-scope.patch
 0940-Isolate-embedded-make-scheduling-and-reuse-recipe-workers.patch
+0950-Wake-schedulers-and-grow-recipe-workers-lazily.patch
+0960-Carry-opaque-invocation-context-into-recipe-workers.patch

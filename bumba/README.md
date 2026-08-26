@@ -16,20 +16,27 @@ The library is host-neutral. Embedders may install a structured `EventSink`
 and a Kati `FileSystemProvider`; the standalone binary uses `tracing` and the
 native filesystem. It does not import Sarun types or protocols.
 
-The default build produces an optimized, fully static Linux/musl executable
-(and therefore requires Rust 1.88 or newer, Zig, and `cargo-zigbuild`):
+The default build produces an optimized, fully static Linux/musl executable.
+The subproject pins and provisions its own Rust toolchain (currently 1.96) and
+uses `rustup` when available, so it does not depend on Sarun's repository
+tooling. Zig and `cargo-zigbuild` must be available:
 
 ```sh
 make
 # target/<architecture>-unknown-linux-musl/release/bumba
 ```
 
+When `rustup` is present, `make` also installs the selected musl standard
+library target if it is missing. `CARGO`, `RUSTC`, `RUSTDOC`,
+`RUST_TOOLCHAIN`, and `STATIC_TARGET` remain overridable for packaged
+toolchains and cross-build environments.
+
 Development and test builds remain explicit:
 
 ```sh
 make debug
-cargo test --locked
-cargo run -- -c 'printf "hello\\n" | wc -l'
+make test
+./target/debug/bumba -c 'printf "hello\\n" | wc -l'
 ```
 
 Run `bumba` in a terminal for an interactive prompt. With redirected standard
@@ -46,3 +53,14 @@ printf 'printf "from stdin\\n"\n' | bumba
 The executable is multicall by argument zero when installed as `make`,
 `gmake`, or `ninja`. The explicit forms `bumba make ...` and
 `bumba ninja ...` are also supported.
+
+`BUMBA_TARGET_LOG_DIR=/path` opts Make into per-target captured logs. For
+scheduler profiling, `BUMBA_SCHED_STATS=1` reports concurrency, jobserver waits
+and wakeups, recursive worker assistance, and elapsed scheduler time on stderr.
+Recursive Make output preserves the surrounding Brush redirection or pipeline
+directly; capture mode drains concurrently, so output larger than a kernel pipe
+cannot make nested builds wait on their own reader.
+
+Pipelines between descriptor-free leaf builtins stay in process memory with
+bounded backpressure. Mixed or dynamically resolved pipelines automatically use
+kernel pipes where a native descriptor may be required.

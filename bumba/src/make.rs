@@ -284,6 +284,8 @@ fn run_kati(
     // their environments.
     seed_env: &[(std::ffi::OsString, std::ffi::OsString)],
     recipe_stdin: Option<std::sync::Arc<std::os::fd::OwnedFd>>,
+    recipe_execution_context: Option<kati::fileutil::RecipeExecutionContext>,
+    direct_recipe_output: bool,
     include_dirs: &[OsString],
     no_builtin_rules: bool,
     no_builtin_variables: bool,
@@ -320,6 +322,8 @@ fn run_kati(
 ) -> anyhow::Result<RunKatiResult> {
     let mut ev = Evaluator::new();
     ev.recipe_stdin = recipe_stdin;
+    ev.recipe_execution_context = recipe_execution_context;
+    ev.direct_recipe_output = direct_recipe_output;
     ev.ignore_errors = ignore_errors;
     ev.goal_trace = trace;
     ev.num_jobs = num_jobs.max(1);
@@ -416,6 +420,36 @@ fn run_kati(
             .unwrap_or_default();
         let (mut fwords, mut fvars) = kati::flags::Flags::split_makeflags(&seed_mf);
         if let Some(jobserver_mf) = jobserver_flags {
+            // An explicit -jN owns this invocation's pool. Cargo and other
+            // hosts commonly leave their own jobserver in the process
+            // environment; retaining both advertisements makes clients select
+            // the first (foreign) FIFO and silently serialize when its tokens
+            // are occupied. Replace the inherited parallel transport as one
+            // section, while preserving unrelated inherited flags.
+            let mut inherited = Vec::with_capacity(fwords.len());
+            let mut index = 0usize;
+            while index < fwords.len() {
+                let word = &fwords[index];
+                let parallel = word.as_ref() == b"-j"
+                    || word.starts_with(b"-j")
+                    || word.as_ref() == b"--jobs"
+                    || word.starts_with(b"--jobs=")
+                    || word.starts_with(b"--jobserver-auth=")
+                    || word.starts_with(b"--jobserver-fds=");
+                if parallel {
+                    if word.as_ref() == b"--jobs"
+                        && fwords.get(index + 1).is_some_and(|next| {
+                            next.iter().all(|byte| byte.is_ascii_digit())
+                        })
+                    {
+                        index += 1;
+                    }
+                } else {
+                    inherited.push(word.clone());
+                }
+                index += 1;
+            }
+            fwords = inherited;
             let (job_words, job_vars) =
                 kati::flags::Flags::split_makeflags(jobserver_mf.as_bytes());
             for t in job_words {
@@ -1193,7 +1227,8 @@ fn install_make_recipe_runner() {
     install_var_recorder();
     start_activity_reporting();
     kati::fileutil::install_recipe_runner(Arc::new(
-        |shell, _shellflag, prefix, cmd, cwd, stdin, redirect_stderr, output_cb| {
+        |shell, _shellflag, prefix, cmd, cwd, stdin, redirect_stderr, direct_output,
+         execution_context, output_cb| {
             use kati::fileutil::RecipeRunnerDecision;
             let posix_shell = kati::fileutil::is_posix_shell_command(shell);
             if !posix_shell {
@@ -1219,8 +1254,20 @@ fn install_make_recipe_runner() {
                 kati::fileutil::RedirectStderr::DevNull => crate::shell::RecipeStderr::Null,
             };
             let stdin = stdin.and_then(|fd| fd.try_clone().ok());
-            let code =
-                crate::shell::run_recipe(&p, &s, output_cb, stderr_mode, stdin);
+            let logical_io = execution_context.and_then(|context| {
+                context
+                    .as_ref()
+                    .downcast_ref::<crate::shell::LogicalRecipeIo>()
+            });
+            let code = if direct_output {
+                crate::shell::run_recipe_direct(&p, &s, stderr_mode, stdin)
+            } else if let Some(io) = logical_io
+                && std::env::var_os("BUMBA_TARGET_LOG_DIR").is_none()
+            {
+                crate::shell::run_recipe_inherited(&p, &s, io, stderr_mode, stdin)
+            } else {
+                crate::shell::run_recipe(&p, &s, output_cb, stderr_mode, stdin)
+            };
             crate::shell::set_recipe_cwd(prev);
             RecipeRunnerDecision::Ran { code }
         },
@@ -1493,6 +1540,7 @@ pub fn make_main(argv: &[String]) -> i32 {
     let cmdline_flags = extract_long_flags(argv);
     let parallel_advertisement =
         crate::jobserver::explicit_jobs(argv).map(crate::jobserver::advertisement);
+    let literal_external_before = crate::shell::literal_external_launches();
     // Optional includes a previous remake pass could not build (colon-joined,
     // via the re-exec env) — skip re-queueing them this pass.
     let noremake: std::collections::HashSet<Vec<u8>> = std::env::var_os("BUMBA_KATI_NOREMAKE")
@@ -1511,6 +1559,11 @@ pub fn make_main(argv: &[String]) -> i32 {
         &shadow_cwd,
         &seed_env,
         recipe_stdin,
+        None,
+        // Standalone recipes can write straight to the process descriptors.
+        // Target logging is an explicit request for per-edge capture, so keep
+        // the captured path authoritative when it is enabled.
+        std::env::var_os("BUMBA_TARGET_LOG_DIR").is_none(),
         &include_dirs,
         flags.no_builtin_rules,
         flags.no_builtin_variables,
@@ -1542,6 +1595,12 @@ pub fn make_main(argv: &[String]) -> i32 {
         }
     };
     flush_makevars();
+    if std::env::var_os("BUMBA_SCHED_STATS").is_some() {
+        eprintln!(
+            "bumba-recipe-stats literal_external={}",
+            crate::shell::literal_external_launches().saturating_sub(literal_external_before),
+        );
+    }
     // GNU -q: silent probe — exit 1 when something would be rebuilt.
     if flags.is_question && run_result.would_run {
         return 1;
@@ -1608,8 +1667,8 @@ pub fn make_builtin(
     seed_env: &[(std::ffi::OsString, std::ffi::OsString)],
     mut out: impl std::io::Write,
     mut err: impl std::io::Write,
-    recipe_out: Box<dyn std::io::Write>,
-    recipe_err: Box<dyn std::io::Write>,
+    recipe_out: brush_core::openfiles::OpenFile,
+    recipe_err: brush_core::openfiles::OpenFile,
     // The builtin's logical stdin (fd 0), for `make -f -`.
     mut stdin: Option<brush_core::openfiles::OpenFile>,
     filesystem: Option<Arc<dyn kati::filesystem::FileSystemProvider>>,
@@ -1741,8 +1800,14 @@ pub fn make_builtin(
     // Route recipe stdout to the context's fd 1 and recipes' cwd to working_dir
     // for the duration of THIS make; save/restore so a nested recursive $(MAKE)
     // (which lands here again, on its own brush worker thread) nests cleanly.
-    let prev_out = kati::exec::set_recipe_out(Some(recipe_out));
-    let prev_err = kati::exec::set_recipe_err(Some(recipe_err));
+    let recipe_execution_context: kati::fileutil::RecipeExecutionContext = Arc::new(
+        crate::shell::LogicalRecipeIo {
+            stdout: recipe_out.clone(),
+            stderr: recipe_err.clone(),
+        },
+    );
+    let prev_out = kati::exec::set_recipe_out(Some(Box::new(recipe_out)));
+    let prev_err = kati::exec::set_recipe_err(Some(Box::new(recipe_err)));
     let prev_cwd = crate::shell::set_recipe_cwd(Some(working_dir.clone()));
 
     let targets: Vec<Symbol> = flags.targets.clone();
@@ -1782,6 +1847,8 @@ pub fn make_builtin(
         &working_dir,
         seed_env,
         recipe_stdin.clone(),
+        Some(recipe_execution_context.clone()),
+        false,
         &include_dirs,
         flags.no_builtin_rules,
         flags.no_builtin_variables,
@@ -1821,6 +1888,8 @@ pub fn make_builtin(
             &working_dir,
             seed_env,
             recipe_stdin.clone(),
+            Some(recipe_execution_context.clone()),
+            false,
             &include_dirs,
             flags.no_builtin_rules,
             flags.no_builtin_variables,

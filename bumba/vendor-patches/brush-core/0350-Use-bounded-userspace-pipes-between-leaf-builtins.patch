@@ -1,0 +1,616 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bumba <noreply@bumba>
+Date: Wed, 26 Aug 2026 06:57:42 +0000
+Subject: [PATCH] Use bounded userspace pipes between leaf builtins
+
+Keep proven descriptor-free builtin pipeline edges in process memory. Preserve kernel pipes for uncertain, dispatcher, shadowed, dynamic, redirected, and external stages; test bounded backpressure and broken-pipe closure semantics.
+
+---
+diff --git a/src/builtins.rs b/src/builtins.rs
+index d5a19d4..b3f08f0 100644
+--- a/src/builtins.rs
++++ b/src/builtins.rs
+@@ -247,6 +247,10 @@ pub struct Registration<SE: extensions::ShellExtensions> {
+     /// Is the builtin classified as "special" by specification?
+     pub special_builtin: bool,
+ 
++    /// Can this leaf builtin safely use logical streams that have no native
++    /// file descriptor? Dispatcher builtins are deliberately not marked.
++    pub userspace_pipe_safe: bool,
++
+     /// Is this an external command implemented in-process as an optimization?
+     /// Discovery reports its executable from PATH, while execution still uses
+     /// this registration.
+@@ -274,6 +278,15 @@ impl<SE: extensions::ShellExtensions> Registration<SE> {
+             ..self
+         }
+     }
++
++    /// Marks a leaf builtin as safe for bounded userspace pipeline transport.
++    #[must_use]
++    pub const fn userspace_pipe_safe(self) -> Self {
++        Self {
++            userspace_pipe_safe: true,
++            ..self
++        }
++    }
+ }
+ 
+ fn get_builtin_man_page(_name: &str, _command: &clap::Command) -> Result<String, error::Error> {
+@@ -481,6 +494,7 @@ pub fn simple_builtin<B: SimpleCommand + Send + Sync, SE: extensions::ShellExten
+         parser_func: None,
+         disabled: false,
+         special_builtin: false,
++        userspace_pipe_safe: false,
+         external_command: false,
+         declaration_builtin: false,
+     }
+@@ -495,6 +509,7 @@ pub fn builtin<B: Command + Send + Sync, SE: extensions::ShellExtensions>() -> R
+         parser_func: Some(command_probe::<B>),
+         disabled: false,
+         special_builtin: false,
++        userspace_pipe_safe: false,
+         external_command: false,
+         declaration_builtin: false,
+     }
+@@ -513,6 +528,7 @@ pub fn decl_builtin<B: DeclarationCommand + Send + Sync, SE: extensions::ShellEx
+         parser_func: None,
+         disabled: false,
+         special_builtin: false,
++        userspace_pipe_safe: false,
+         external_command: false,
+         declaration_builtin: true,
+     }
+@@ -535,6 +551,7 @@ pub fn raw_arg_builtin<
+         parser_func: None,
+         disabled: false,
+         special_builtin: false,
++        userspace_pipe_safe: false,
+         external_command: false,
+         declaration_builtin: true,
+     }
+diff --git a/src/interp.rs b/src/interp.rs
+index e336f7e..34b53af 100644
+--- a/src/interp.rs
++++ b/src/interp.rs
+@@ -538,16 +538,34 @@ async fn spawn_pipeline_processes(
+     let mut spawn_results = VecDeque::new();
+     let mut process_group_id: Option<i32> = None;
+ 
++    let userspace_edges = pipeline
++        .seq
++        .windows(2)
++        .map(|pair| {
++            command_is_userspace_pipe_safe(&pair[0], shell)
++                && command_is_userspace_pipe_safe(&pair[1], shell)
++        })
++        .collect::<Vec<_>>();
++
+     // Create pipes to use between commands, but only bother doing so if there's more than one
+     // command.
+     if pipeline_len > 1 {
+         pipe_readers.reserve_exact(pipeline_len - 1);
+         pipe_writers.reserve_exact(pipeline_len - 1);
+ 
+-        for _ in 0..(pipeline_len - 1) {
+-            let (reader, writer) = std::io::pipe()?;
+-            pipe_readers.push(Some(reader.into()));
+-            pipe_writers.push(Some(writer.into()));
++        // The endpoints are consumed with `pop()` below. Build them in reverse edge order so
++        // command i receives writer i and (except for command zero) reader i-1. This ordering was
++        // previously invisible while every edge used the same transport, but becomes essential
++        // when a mixed pipeline has both kernel and userspace pipes.
++        for edge in (0..(pipeline_len - 1)).rev() {
++            let (reader, writer) = if userspace_edges[edge] {
++                openfiles::memory_pipe()
++            } else {
++                let (reader, writer) = std::io::pipe()?;
++                (reader.into(), writer.into())
++            };
++            pipe_readers.push(Some(reader));
++            pipe_writers.push(Some(writer));
+         }
+         // Push `None` to the readers; it will be popped off by the *first* command, which will
+         // mean that command gets its stdin from the execution parameters' current stdin.
+@@ -616,6 +634,45 @@ async fn spawn_pipeline_processes(
+     Ok(spawn_results)
+ }
+ 
++/// Prove the narrow condition needed by [`openfiles::memory_pipe`]. Raw command
++/// names must identify an explicitly opted-in leaf builtin, with no function or
++/// alias shadow and no prefix/redirection/process substitution. Arguments may
++/// still contain ordinary parameter expansion, but command substitutions are
++/// excluded because they can run an external command against inherited fds.
++fn command_is_userspace_pipe_safe(
++    command: &ast::Command,
++    shell: &Shell<impl extensions::ShellExtensions>,
++) -> bool {
++    let ast::Command::Simple(simple) = command else {
++        return false;
++    };
++    if simple.prefix.is_some() {
++        return false;
++    }
++    let Some(name) = simple.word_or_name.as_ref().map(|word| word.value.as_str()) else {
++        return false;
++    };
++    if shell.aliases().contains_key(name) || shell.funcs().get(name).is_some() {
++        return false;
++    }
++    let Some(registration) = shell.builtins().get(name) else {
++        return false;
++    };
++    if registration.disabled || !registration.userspace_pipe_safe {
++        return false;
++    }
++    simple.suffix.as_ref().is_none_or(|suffix| {
++        suffix.0.iter().all(|item| match item {
++            ast::CommandPrefixOrSuffixItem::Word(word) => {
++                !word.value.contains("$(") && !word.value.contains('`')
++            }
++            ast::CommandPrefixOrSuffixItem::IoRedirect(_)
++            | ast::CommandPrefixOrSuffixItem::AssignmentWord(_, _)
++            | ast::CommandPrefixOrSuffixItem::ProcessSubstitution(_, _) => false,
++        })
++    })
++}
++
+ async fn wait_for_pipeline_processes_and_update_status(
+     pipeline: &ast::Pipeline,
+     mut process_spawn_results: VecDeque<ExecutionSpawnResult>,
+@@ -2252,3 +2309,89 @@ fn setup_open_file_with_contents(contents: &str) -> Result<OpenFile, error::Erro
+ 
+     Ok(reader.into())
+ }
++
++#[cfg(test)]
++mod userspace_pipe_tests {
++    use super::command_is_userspace_pipe_safe;
++    use crate::{builtins, extensions, results};
++    use brush_parser::ast;
++
++    struct LeafBuiltin;
++
++    impl builtins::SimpleCommand for LeafBuiltin {
++        fn get_content(
++            _name: &str,
++            _content_type: builtins::ContentType,
++            _options: &builtins::ContentOptions,
++        ) -> Result<String, crate::error::Error> {
++            Ok(String::new())
++        }
++
++        fn execute<SE, I, S>(
++            _context: crate::commands::ExecutionContext<'_, SE>,
++            _args: I,
++        ) -> Result<results::ExecutionResult, crate::error::Error>
++        where
++            SE: extensions::ShellExtensions,
++            I: Iterator<Item = S>,
++            S: AsRef<str>,
++        {
++            Ok(results::ExecutionResult::success())
++        }
++    }
++
++    fn simple(name: &str, args: &[&str]) -> ast::Command {
++        ast::Command::Simple(ast::SimpleCommand {
++            prefix: None,
++            word_or_name: Some(name.to_string().into()),
++            suffix: (!args.is_empty()).then(|| {
++                ast::CommandSuffix(
++                    args.iter()
++                        .map(|arg| {
++                            ast::CommandPrefixOrSuffixItem::Word((*arg).to_string().into())
++                        })
++                        .collect(),
++                )
++            }),
++        })
++    }
++
++    #[tokio::test]
++    async fn only_explicit_unshadowed_leaf_builtins_are_userspace_pipe_safe() {
++        let safe = builtins::simple_builtin::<LeafBuiltin, extensions::DefaultShellExtensions>()
++            .userspace_pipe_safe();
++        let unsafe_registration =
++            builtins::simple_builtin::<LeafBuiltin, extensions::DefaultShellExtensions>();
++        let mut registrations = std::collections::HashMap::new();
++        registrations.insert("safe".to_string(), safe);
++        registrations.insert("dispatcher".to_string(), unsafe_registration);
++        let mut shell = crate::Shell::builder()
++            .builtins(registrations)
++            .build()
++            .await
++            .unwrap();
++
++        assert!(command_is_userspace_pipe_safe(
++            &simple("safe", &["literal", "$ordinary_parameter"]),
++            &shell,
++        ));
++        assert!(!command_is_userspace_pipe_safe(
++            &simple("dispatcher", &[]),
++            &shell,
++        ));
++        assert!(!command_is_userspace_pipe_safe(
++            &simple("$dynamic_name", &[]),
++            &shell,
++        ));
++        assert!(!command_is_userspace_pipe_safe(
++            &simple("safe", &["$(external-command)"]),
++            &shell,
++        ));
++
++        shell.aliases_mut().insert("safe".into(), "dispatcher".into());
++        assert!(!command_is_userspace_pipe_safe(
++            &simple("safe", &[]),
++            &shell,
++        ));
++    }
++}
+diff --git a/src/openfiles.rs b/src/openfiles.rs
+index 1cc2538..8331233 100644
+--- a/src/openfiles.rs
++++ b/src/openfiles.rs
+@@ -1,9 +1,9 @@
+ //! Managing files open within a shell instance.
+ 
+-use std::collections::HashMap;
++use std::collections::{HashMap, VecDeque};
+ use std::io::IsTerminal;
+ use std::process::Stdio;
+-use std::sync::Arc;
++use std::sync::{Arc, Condvar, Mutex};
+ 
+ use crate::ShellFd;
+ use crate::error;
+@@ -29,16 +29,154 @@ pub trait Stream: std::io::Read + std::io::Write + Send + Sync {
+     fn try_borrow_as_fd(&self) -> Result<std::os::fd::BorrowedFd<'_>, error::Error>;
+ }
+ 
++const MEMORY_PIPE_CAPACITY: usize = 64 * 1024;
++
++struct MemoryPipeState {
++    bytes: VecDeque<u8>,
++    reader_open: bool,
++    writer_open: bool,
++}
++
++struct MemoryPipeShared {
++    state: Mutex<MemoryPipeState>,
++    readable: Condvar,
++    writable: Condvar,
++}
++
++/// Read endpoint of a bounded userspace pipe. There is one endpoint object per
++/// pipe; cloned [`OpenFile`] values share it through `Arc`, just as they share
++/// kernel pipe descriptors.
++#[doc(hidden)]
++pub struct MemoryPipeReader {
++    shared: Arc<MemoryPipeShared>,
++}
++
++/// Write endpoint paired with [`MemoryPipeReader`].
++#[doc(hidden)]
++pub struct MemoryPipeWriter {
++    shared: Arc<MemoryPipeShared>,
++}
++
++impl std::io::Read for &MemoryPipeReader {
++    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
++        if output.is_empty() {
++            return Ok(0);
++        }
++        let mut state = self
++            .shared
++            .state
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner);
++        while state.bytes.is_empty() && state.writer_open {
++            state = self
++                .shared
++                .readable
++                .wait(state)
++                .unwrap_or_else(std::sync::PoisonError::into_inner);
++        }
++        let count = output.len().min(state.bytes.len());
++        let (front, back) = state.bytes.as_slices();
++        let front_count = count.min(front.len());
++        output[..front_count].copy_from_slice(&front[..front_count]);
++        let back_count = count - front_count;
++        output[front_count..count].copy_from_slice(&back[..back_count]);
++        state.bytes.drain(..count);
++        if count != 0 {
++            self.shared.writable.notify_one();
++        }
++        Ok(count)
++    }
++}
++
++impl std::io::Write for &MemoryPipeWriter {
++    fn write(&mut self, input: &[u8]) -> std::io::Result<usize> {
++        if input.is_empty() {
++            return Ok(0);
++        }
++        let mut state = self
++            .shared
++            .state
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner);
++        while state.bytes.len() == MEMORY_PIPE_CAPACITY && state.reader_open {
++            state = self
++                .shared
++                .writable
++                .wait(state)
++                .unwrap_or_else(std::sync::PoisonError::into_inner);
++        }
++        if !state.reader_open {
++            return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
++        }
++        let count = input
++            .len()
++            .min(MEMORY_PIPE_CAPACITY.saturating_sub(state.bytes.len()));
++        state.bytes.extend(&input[..count]);
++        self.shared.readable.notify_one();
++        Ok(count)
++    }
++
++    fn flush(&mut self) -> std::io::Result<()> {
++        Ok(())
++    }
++}
++
++impl Drop for MemoryPipeReader {
++    fn drop(&mut self) {
++        let mut state = self
++            .shared
++            .state
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner);
++        state.reader_open = false;
++        state.bytes.clear();
++        self.shared.writable.notify_all();
++    }
++}
++
++impl Drop for MemoryPipeWriter {
++    fn drop(&mut self) {
++        let mut state = self
++            .shared
++            .state
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner);
++        state.writer_open = false;
++        self.shared.readable.notify_all();
++    }
++}
++
++/// Construct a bounded pipe whose payload never enters the kernel. This is
++/// deliberately crate-private: callers must prove that neither endpoint can
++/// be handed to an external process or otherwise require a native descriptor.
++pub(crate) fn memory_pipe() -> (OpenFile, OpenFile) {
++    let shared = Arc::new(MemoryPipeShared {
++        state: Mutex::new(MemoryPipeState {
++            bytes: VecDeque::new(),
++            reader_open: true,
++            writer_open: true,
++        }),
++        readable: Condvar::new(),
++        writable: Condvar::new(),
++    });
++    (
++        OpenFile::MemoryPipeReader(Arc::new(MemoryPipeReader {
++            shared: Arc::clone(&shared),
++        })),
++        OpenFile::MemoryPipeWriter(Arc::new(MemoryPipeWriter { shared })),
++    )
++}
++
+ /// Represents a file open in a shell context.
+ ///
+-/// File- and pipe-backed variants hold their handle behind an [`Arc`], so cloning an `OpenFile`
+-/// shares the underlying descriptor by reference count. The shell opens a fresh context for each
+-/// subshell, command substitution, background job, and function call and runs them as in-process
+-/// tasks against one process-wide descriptor table (rather than via `fork(2)` like a traditional
+-/// shell); sharing the descriptor keeps deeply nested or highly concurrent execution from
+-/// exhausting that table. A descriptor is duplicated for real only when an independently owned
+-/// copy is needed to hand to an external child process — see [`OpenFile::try_clone_to_owned`] and
+-/// the `Stdio` conversion below.
++/// File-, kernel-pipe-, and memory-pipe-backed variants hold their handle behind an [`Arc`], so
++/// cloning an `OpenFile` shares the underlying handle by reference count. The shell opens a fresh
++/// context for each subshell, command substitution, background job, and function call and runs
++/// them as in-process tasks against one process-wide descriptor table (rather than via `fork(2)`
++/// like a traditional shell); sharing the descriptor keeps deeply nested or highly concurrent
++/// execution from exhausting that table. A native descriptor is duplicated for real only when an
++/// independently owned copy is needed to hand to an external child process — see
++/// [`OpenFile::try_clone_to_owned`] and the `Stdio` conversion below.
+ pub enum OpenFile {
+     /// The original standard input this process was started with.
+     Stdin(std::io::Stdin),
+@@ -52,6 +190,10 @@ pub enum OpenFile {
+     PipeReader(Arc<std::io::PipeReader>),
+     /// A write end of a pipe.
+     PipeWriter(Arc<std::io::PipeWriter>),
++    /// A read end of a bounded userspace pipe.
++    MemoryPipeReader(Arc<MemoryPipeReader>),
++    /// A write end of a bounded userspace pipe.
++    MemoryPipeWriter(Arc<MemoryPipeWriter>),
+     /// A custom stream.
+     Stream(Box<dyn Stream>),
+ }
+@@ -69,6 +211,8 @@ impl serde::Serialize for OpenFile {
+             Self::File(_) => serializer.serialize_str("file"),
+             Self::PipeReader(_) => serializer.serialize_str("pipe_reader"),
+             Self::PipeWriter(_) => serializer.serialize_str("pipe_writer"),
++            Self::MemoryPipeReader(_) => serializer.serialize_str("memory_pipe_reader"),
++            Self::MemoryPipeWriter(_) => serializer.serialize_str("memory_pipe_writer"),
+             Self::Stream(_) => serializer.serialize_str("stream"),
+         }
+     }
+@@ -87,6 +231,8 @@ impl<'de> serde::Deserialize<'de> for OpenFile {
+             "file" => (),
+             "pipe_reader" => (),
+             "pipe_writer" => (),
++            "memory_pipe_reader" => (),
++            "memory_pipe_writer" => (),
+             "stream" => (),
+             _ => return Err(serde::de::Error::custom("invalid open file")),
+         }
+@@ -113,6 +259,8 @@ impl Clone for OpenFile {
+             Self::File(f) => Self::File(Arc::clone(f)),
+             Self::PipeReader(r) => Self::PipeReader(Arc::clone(r)),
+             Self::PipeWriter(w) => Self::PipeWriter(Arc::clone(w)),
++            Self::MemoryPipeReader(r) => Self::MemoryPipeReader(Arc::clone(r)),
++            Self::MemoryPipeWriter(w) => Self::MemoryPipeWriter(Arc::clone(w)),
+             Self::Stream(s) => Self::Stream(s.clone_box()),
+         }
+     }
+@@ -127,6 +275,8 @@ impl std::fmt::Display for OpenFile {
+             Self::File(_) => write!(f, "file"),
+             Self::PipeReader(_) => write!(f, "pipe reader"),
+             Self::PipeWriter(_) => write!(f, "pipe writer"),
++            Self::MemoryPipeReader(_) => write!(f, "memory pipe reader"),
++            Self::MemoryPipeWriter(_) => write!(f, "memory pipe writer"),
+             Self::Stream(_) => write!(f, "stream"),
+         }
+     }
+@@ -146,6 +296,9 @@ impl OpenFile {
+             Self::File(f) => Ok(f.as_fd().try_clone_to_owned()?),
+             Self::PipeReader(r) => Ok(r.as_fd().try_clone_to_owned()?),
+             Self::PipeWriter(w) => Ok(w.as_fd().try_clone_to_owned()?),
++            Self::MemoryPipeReader(_) | Self::MemoryPipeWriter(_) => {
++                Err(error::ErrorKind::CannotConvertToNativeFd.into())
++            }
+             Self::Stream(s) => s.try_clone_to_owned(),
+         }
+     }
+@@ -166,6 +319,9 @@ impl OpenFile {
+             Self::File(f) => Ok(f.as_fd()),
+             Self::PipeReader(r) => Ok(r.as_fd()),
+             Self::PipeWriter(w) => Ok(w.as_fd()),
++            Self::MemoryPipeReader(_) | Self::MemoryPipeWriter(_) => {
++                Err(error::ErrorKind::CannotConvertToNativeFd.into())
++            }
+             Self::Stream(s) => s.try_borrow_as_fd(),
+         }
+     }
+@@ -174,7 +330,11 @@ impl OpenFile {
+         match self {
+             Self::Stdin(_) | Self::Stdout(_) | Self::Stderr(_) => false,
+             Self::File(file) => file.metadata().is_ok_and(|m| m.is_dir()),
+-            Self::PipeReader(_) | Self::PipeWriter(_) | Self::Stream(_) => false,
++            Self::PipeReader(_)
++            | Self::PipeWriter(_)
++            | Self::MemoryPipeReader(_)
++            | Self::MemoryPipeWriter(_)
++            | Self::Stream(_) => false,
+         }
+     }
+ 
+@@ -185,7 +345,11 @@ impl OpenFile {
+             Self::Stdout(f) => f.is_terminal(),
+             Self::Stderr(f) => f.is_terminal(),
+             Self::File(f) => f.is_terminal(),
+-            Self::PipeReader(_) | Self::PipeWriter(_) | Self::Stream(_) => false,
++            Self::PipeReader(_)
++            | Self::PipeWriter(_)
++            | Self::MemoryPipeReader(_)
++            | Self::MemoryPipeWriter(_)
++            | Self::Stream(_) => false,
+         }
+     }
+ }
+@@ -233,10 +397,11 @@ impl TryFrom<OpenFile> for Stdio {
+     type Error = error::Error;
+ 
+     fn try_from(open_file: OpenFile) -> Result<Self, Self::Error> {
+-        // File and pipe handles are shared behind an `Arc`, so the descriptor cannot be moved
+-        // out; duplicate it to give the child an independently owned descriptor. Duplication can
+-        // fail (e.g. under descriptor exhaustion), so the conversion is fallible and the error is
+-        // surfaced to the caller rather than silently degrading the child's streams.
++        // Native file and kernel-pipe handles are shared behind an `Arc`, so the descriptor cannot
++        // be moved out; duplicate it to give the child an independently owned descriptor.
++        // Duplication can fail (e.g. under descriptor exhaustion), so the conversion is fallible
++        // and the error is surfaced rather than silently degrading the child's streams. Memory
++        // pipes are rejected below because they deliberately have no native descriptor.
+         match open_file {
+             // A standard-stream *value* is not necessarily being installed in
+             // the matching child slot.  For example, `2>&1` stores an
+@@ -254,6 +419,9 @@ impl TryFrom<OpenFile> for Stdio {
+             OpenFile::File(f) => Ok(f.try_clone()?.into()),
+             OpenFile::PipeReader(r) => Ok(r.try_clone()?.into()),
+             OpenFile::PipeWriter(w) => Ok(w.try_clone()?.into()),
++            OpenFile::MemoryPipeReader(_) | OpenFile::MemoryPipeWriter(_) => {
++                Err(error::ErrorKind::CannotConvertToNativeFd.into())
++            }
+             // Custom streams have no descriptor to hand to a child process.
+             OpenFile::Stream(_) => Ok(Self::null()),
+         }
+@@ -277,6 +445,10 @@ impl std::io::Read for OpenFile {
+             Self::PipeWriter(_) => Err(std::io::Error::other(
+                 error::ErrorKind::OpenFileNotReadable("pipe writer"),
+             )),
++            Self::MemoryPipeReader(reader) => reader.as_ref().read(buf),
++            Self::MemoryPipeWriter(_) => Err(std::io::Error::other(
++                error::ErrorKind::OpenFileNotReadable("memory pipe writer"),
++            )),
+             Self::Stream(s) => s.read(buf),
+         }
+     }
+@@ -297,6 +469,10 @@ impl std::io::Write for OpenFile {
+                 error::ErrorKind::OpenFileNotWritable("pipe reader"),
+             )),
+             Self::PipeWriter(writer) => writer.as_ref().write(buf),
++            Self::MemoryPipeReader(_) => Err(std::io::Error::other(
++                error::ErrorKind::OpenFileNotWritable("memory pipe reader"),
++            )),
++            Self::MemoryPipeWriter(writer) => writer.as_ref().write(buf),
+             Self::Stream(s) => s.write(buf),
+         }
+     }
+@@ -309,6 +485,8 @@ impl std::io::Write for OpenFile {
+             Self::File(f) => f.as_ref().flush(),
+             Self::PipeReader(_) => Ok(()),
+             Self::PipeWriter(writer) => writer.as_ref().flush(),
++            Self::MemoryPipeReader(_) => Ok(()),
++            Self::MemoryPipeWriter(writer) => writer.as_ref().flush(),
+             Self::Stream(s) => s.flush(),
+         }
+     }
+@@ -475,3 +653,36 @@ where
+         Self { files }
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::memory_pipe;
++    use std::io::{Read, Write};
++
++    #[test]
++    fn memory_pipe_applies_backpressure_and_delivers_more_than_its_capacity() {
++        let (mut reader, mut writer) = memory_pipe();
++        let expected = (0..(3 * super::MEMORY_PIPE_CAPACITY + 17))
++            .map(|index| (index % 251) as u8)
++            .collect::<Vec<_>>();
++        let producer_bytes = expected.clone();
++        let producer = std::thread::spawn(move || {
++            writer.write_all(&producer_bytes).unwrap();
++        });
++        let mut actual = Vec::new();
++        reader.read_to_end(&mut actual).unwrap();
++        producer.join().unwrap();
++        assert_eq!(actual, expected);
++    }
++
++    #[test]
++    fn memory_pipe_reports_broken_pipe_after_the_last_reader_closes() {
++        let (reader, mut writer) = memory_pipe();
++        let reader_clone = reader.clone();
++        drop(reader);
++        writer.write_all(b"still connected").unwrap();
++        drop(reader_clone);
++        let error = writer.write_all(b"closed").unwrap_err();
++        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
++    }
++}

@@ -28,24 +28,31 @@ impl Default for ShellOptions {
 
 struct MakeBuiltin;
 
-impl SimpleCommand for MakeBuiltin {
-    fn get_content(
-        name: &str,
-        _content_type: brush_core::builtins::ContentType,
-        _options: &brush_core::builtins::ContentOptions,
-    ) -> Result<String, brush_core::error::Error> {
-        Ok(format!("{name}: Bumba embedded rkati\n"))
-    }
+/// Brush-owned logical descriptors carried opaquely through Kati to recipe
+/// workers. Keeping the concrete type here lets Kati remain independent of
+/// Brush while recipes preserve redirects and pipeline endpoints exactly.
+#[derive(Clone)]
+pub(crate) struct LogicalRecipeIo {
+    pub(crate) stdout: brush_core::openfiles::OpenFile,
+    pub(crate) stderr: brush_core::openfiles::OpenFile,
+}
 
-    fn execute<
-        SE: brush_core::extensions::ShellExtensions,
-        I: Iterator<Item = S>,
-        S: AsRef<str>,
-    >(
+struct MakeInvocation {
+    argv: Vec<String>,
+    cwd: PathBuf,
+    env: Vec<(OsString, OsString)>,
+    out: brush_core::openfiles::OpenFile,
+    err: brush_core::openfiles::OpenFile,
+    recipe_out: brush_core::openfiles::OpenFile,
+    recipe_err: brush_core::openfiles::OpenFile,
+    stdin: Option<brush_core::openfiles::OpenFile>,
+}
+
+impl MakeInvocation {
+    fn capture<SE: brush_core::extensions::ShellExtensions>(
         context: brush_core::commands::ExecutionContext<'_, SE>,
-        args: I,
-    ) -> Result<brush_core::results::ExecutionResult, brush_core::error::Error> {
-        let mut argv: Vec<String> = args.map(|arg| arg.as_ref().to_string()).collect();
+        mut argv: Vec<String>,
+    ) -> Self {
         if argv.is_empty() {
             argv.push(context.command_name.clone());
         }
@@ -64,24 +71,91 @@ impl SimpleCommand for MakeBuiltin {
             .collect::<Vec<_>>();
         let out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
         let err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
-        let recipe_out: Box<dyn Write> = Box::new(
-            context.try_fd(1).unwrap_or_else(|| std::io::stdout().into()),
-        );
-        let recipe_err: Box<dyn Write> = Box::new(
-            context.try_fd(2).unwrap_or_else(|| std::io::stderr().into()),
-        );
+        let recipe_out = context.try_fd(1).unwrap_or_else(|| std::io::stdout().into());
+        let recipe_err = context.try_fd(2).unwrap_or_else(|| std::io::stderr().into());
         let stdin = context.try_fd(0);
-        let code = crate::make::make_builtin(
-            &argv,
-            &cwd,
-            &env,
-            out,
-            err,
-            recipe_out,
-            recipe_err,
-            stdin,
+        Self { argv, cwd, env, out, err, recipe_out, recipe_err, stdin }
+    }
+
+    fn output_needs_concurrent_reader(&self) -> bool {
+        [&self.recipe_out, &self.recipe_err].into_iter().any(|output| {
+            matches!(
+                output,
+                brush_core::openfiles::OpenFile::PipeWriter(_)
+                    | brush_core::openfiles::OpenFile::MemoryPipeWriter(_)
+                    | brush_core::openfiles::OpenFile::Stream(_)
+            )
+        })
+    }
+
+    fn run(self) -> i32 {
+        crate::make::make_builtin(
+            &self.argv,
+            &self.cwd,
+            &self.env,
+            self.out,
+            self.err,
+            self.recipe_out,
+            self.recipe_err,
+            self.stdin,
             None,
+        )
+    }
+}
+
+fn execute_make_builtin<SE: brush_core::extensions::ShellExtensions>(
+    context: brush_core::commands::ExecutionContext<'_, SE>,
+    args: Vec<brush_core::commands::CommandArg>,
+) -> brush_core::builtins::BoxFuture<
+    '_,
+    Result<brush_core::results::ExecutionResult, brush_core::error::Error>,
+> {
+    Box::pin(async move {
+        let argv = args.into_iter().map(|arg| arg.to_string()).collect();
+        let invocation = MakeInvocation::capture(context, argv);
+        let code = if invocation.output_needs_concurrent_reader() {
+            tokio::task::spawn_blocking(move || invocation.run())
+                .await
+                .map_err(|error| {
+                    brush_core::error::Error::from(std::io::Error::other(format!(
+                        "embedded make worker failed: {error}"
+                    )))
+                })?
+        } else {
+            invocation.run()
+        };
+        Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8))
+    })
+}
+
+fn make_registration<SE: brush_core::extensions::ShellExtensions>() -> Registration<SE> {
+    let mut registration = simple_builtin::<MakeBuiltin, SE>();
+    registration.execute_func = execute_make_builtin::<SE>;
+    registration
+}
+
+impl SimpleCommand for MakeBuiltin {
+    fn get_content(
+        name: &str,
+        _content_type: brush_core::builtins::ContentType,
+        _options: &brush_core::builtins::ContentOptions,
+    ) -> Result<String, brush_core::error::Error> {
+        Ok(format!("{name}: Bumba embedded rkati\n"))
+    }
+
+    fn execute<
+        SE: brush_core::extensions::ShellExtensions,
+        I: Iterator<Item = S>,
+        S: AsRef<str>,
+    >(
+        context: brush_core::commands::ExecutionContext<'_, SE>,
+        args: I,
+    ) -> Result<brush_core::results::ExecutionResult, brush_core::error::Error> {
+        let invocation = MakeInvocation::capture(
+            context,
+            args.map(|arg| arg.as_ref().to_string()).collect(),
         );
+        let code = invocation.run();
         Ok(brush_core::results::ExecutionResult::new((code & 0xff) as u8))
     }
 }
@@ -134,12 +208,24 @@ pub fn builtins<SE: brush_core::extensions::ShellExtensions>() -> std::collectio
 > {
     let mut commands = std::collections::HashMap::new();
     crate::coreutils::extend(&mut commands);
-    commands.insert("make".into(), simple_builtin::<MakeBuiltin, SE>());
-    commands.insert("gmake".into(), simple_builtin::<MakeBuiltin, SE>());
+    commands.insert("make".into(), make_registration::<SE>());
+    commands.insert("gmake".into(), make_registration::<SE>());
     commands.insert("ninja".into(), simple_builtin::<NinjaBuiltin, SE>());
     commands.extend(brush_builtins::default_builtins(
         brush_builtins::BuiltinSet::BashMode,
     ));
+    // Only leaf shell builtins opt into descriptor-free pipeline transport.
+    // Dispatcher builtins (`command`, `eval`, `exec`, `.`, `source`,
+    // `builtin`) can run arbitrary external commands and must retain kernel
+    // descriptors even though their outer command is itself a builtin.
+    for name in [
+        ":", "false", "true", "echo", "printf", "test", "[", "pwd", "help",
+        "type", "alias", "dirs", "caller", "times", "umask", "set", "shopt", "let",
+    ] {
+        if let Some(registration) = commands.get_mut(name) {
+            registration.userspace_pipe_safe = true;
+        }
+    }
     crate::find::extend(&mut commands);
     crate::exec_wrappers::extend(&mut commands);
     for name in ["make", "gmake", "ninja"] {
@@ -311,6 +397,12 @@ pub type RecipeExecutor = fn(
 ) -> i32;
 
 static RECIPE_EXECUTOR: std::sync::OnceLock<RecipeExecutor> = std::sync::OnceLock::new();
+static LITERAL_EXTERNAL_LAUNCHES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn literal_external_launches() -> u64 {
+    LITERAL_EXTERNAL_LAUNCHES.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// Install the host's recipe executor. This must happen before the first Make
 /// recipe in a process. Standalone Bumba defaults to its own Brush executor.
@@ -320,9 +412,35 @@ pub fn set_recipe_executor(executor: RecipeExecutor) -> Result<(), RecipeExecuto
 
 static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
 
+thread_local! {
+    /// Recipe pools already provide OS-level parallelism. Give each persistent
+    /// worker its own reactor instead of making all recipe waits contend on a
+    /// second process-wide Tokio scheduler.
+    static RECIPE_RUNTIME: std::cell::RefCell<Option<tokio::runtime::Runtime>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn recipe_block_on<F: std::future::Future>(future: F) -> F::Output {
+    RECIPE_RUNTIME.with(|slot| {
+        if slot.borrow().is_none() {
+            *slot.borrow_mut() = Some(
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("Bumba recipe runtime"),
+            );
+        }
+        slot.borrow().as_ref().unwrap().block_on(future)
+    })
+}
+
 fn runtime() -> &'static tokio::runtime::Runtime {
     RUNTIME.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
+            // Kati/N2 recipe workers drive their own top-level futures. Tokio
+            // workers are auxiliary capacity for spawned pipeline/process
+            // tasks; mirroring every CPU here only adds scheduler contention.
+            .worker_threads(2)
             .thread_stack_size(64 * 1024 * 1024)
             .enable_all()
             .build()
@@ -356,6 +474,16 @@ fn run_recipe_default(
         Some(exported_env) if !prefix.is_empty() => (command.to_string(), Some(exported_env)),
         _ => (format!("{prefix}{command}"), None),
     };
+    if let Some(code) = run_literal_external_captured(
+        &cwd,
+        &script,
+        exported_env.as_deref(),
+        output,
+        stderr,
+        stdin.as_ref(),
+    ) {
+        return code;
+    }
     match tokio::runtime::Handle::try_current() {
         Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
             tokio::task::block_in_place(|| {
@@ -367,9 +495,224 @@ fn run_recipe_default(
         Ok(_) => run_recipe_on_fresh_thread(
             cwd, script, exported_env, output, stderr, stdin,
         ),
-        Err(_) => runtime().block_on(run_recipe_captured(
+        Err(_) => recipe_block_on(run_recipe_captured(
             cwd, script, exported_env, output, stderr, stdin,
         )),
+    }
+}
+
+/// Standalone make output already targets the process descriptors. Avoid the
+/// per-recipe capture pipe and async readback; embedded makes continue using
+/// `run_recipe` so their caller's logical descriptors and event stream remain
+/// authoritative.
+pub(crate) fn run_recipe_direct(
+    prefix: &str,
+    command: &str,
+    stderr: RecipeStderr,
+    stdin: Option<std::os::fd::OwnedFd>,
+) -> i32 {
+    let cwd = RECIPE_CWD
+        .with(|slot| slot.borrow().clone())
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("/"));
+    let (script, exported_env) = match parse_generated_export_prefix(prefix) {
+        Some(exported_env) if !prefix.is_empty() => (command.to_string(), Some(exported_env)),
+        _ => (format!("{prefix}{command}"), None),
+    };
+    if let Some(code) = run_literal_external_direct(
+        &cwd,
+        &script,
+        exported_env.as_deref(),
+        stderr,
+        stdin.as_ref(),
+    ) {
+        return code;
+    }
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(|| {
+                handle.block_on(run_recipe_uncaptured(
+                    cwd, script, exported_env, stderr, stdin,
+                ))
+            })
+        }
+        Ok(_) => std::thread::Builder::new()
+            .name("bumba-recipe-direct-compat".into())
+            .stack_size(64 * 1024 * 1024)
+            .spawn(move || {
+                runtime().block_on(run_recipe_uncaptured(
+                    cwd, script, exported_env, stderr, stdin,
+                ))
+            })
+            .and_then(|thread| {
+                thread.join().map_err(|_| std::io::Error::other("recipe worker panicked"))
+            })
+            .unwrap_or(127),
+        Err(_) => recipe_block_on(run_recipe_uncaptured(
+            cwd, script, exported_env, stderr, stdin,
+        )),
+    }
+}
+
+/// Run an embedded make recipe directly against the invoking Brush shell's
+/// logical descriptors. Unlike `run_recipe`, this introduces no intermediate
+/// capture pipe, so a synchronous recursive make cannot fill a pipe whose
+/// reader is suspended above it in the same shell future.
+pub(crate) fn run_recipe_inherited(
+    prefix: &str,
+    command: &str,
+    io: &LogicalRecipeIo,
+    stderr: RecipeStderr,
+    stdin: Option<std::os::fd::OwnedFd>,
+) -> i32 {
+    let cwd = RECIPE_CWD
+        .with(|slot| slot.borrow().clone())
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("/"));
+    let (script, exported_env) = match parse_generated_export_prefix(prefix) {
+        Some(exported_env) if !prefix.is_empty() => (command.to_string(), Some(exported_env)),
+        _ => (format!("{prefix}{command}"), None),
+    };
+    if let Some(code) = run_literal_external_inherited(
+        &cwd,
+        &script,
+        exported_env.as_deref(),
+        io,
+        stderr,
+        stdin.as_ref(),
+    ) {
+        return code;
+    }
+    let stdout = io.stdout.clone();
+    let logical_stderr = io.stderr.clone();
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(|| {
+                handle.block_on(run_recipe_with_io(
+                    cwd, script, exported_env, stdout, logical_stderr, stderr, stdin,
+                ))
+            })
+        }
+        Ok(_) => std::thread::Builder::new()
+            .name("bumba-recipe-inherited-compat".into())
+            .stack_size(64 * 1024 * 1024)
+            .spawn(move || {
+                runtime().block_on(run_recipe_with_io(
+                    cwd, script, exported_env, stdout, logical_stderr, stderr, stdin,
+                ))
+            })
+            .and_then(|thread| {
+                thread.join().map_err(|_| std::io::Error::other("recipe worker panicked"))
+            })
+            .unwrap_or(127),
+        Err(_) => recipe_block_on(run_recipe_with_io(
+            cwd, script, exported_env, stdout, logical_stderr, stderr, stdin,
+        )),
+    }
+}
+
+async fn run_recipe_uncaptured(
+    cwd: PathBuf,
+    script: String,
+    exported_env: Option<Vec<(String, String)>>,
+    stderr: RecipeStderr,
+    stdin: Option<std::os::fd::OwnedFd>,
+) -> i32 {
+    let mut shell = match build_recipe_shell(cwd, exported_env).await {
+        Ok(shell) => shell,
+        Err(error) => {
+            eprintln!("bumba: {error}");
+            return 127;
+        }
+    };
+    if let Some(fd) = stdin {
+        shell.open_files_mut().set_fd(
+            0,
+            brush_core::openfiles::OpenFile::from(std::fs::File::from(fd)),
+        );
+    }
+    shell.open_files_mut().set_fd(1, std::io::stdout().into());
+    match stderr {
+        RecipeStderr::Merge => {
+            shell.open_files_mut().set_fd(2, std::io::stdout().into());
+        }
+        RecipeStderr::Inherit => {
+            shell.open_files_mut().set_fd(2, std::io::stderr().into());
+        }
+        RecipeStderr::Null => {
+            let null = match std::fs::OpenOptions::new().write(true).open("/dev/null") {
+                Ok(null) => null,
+                Err(error) => {
+                    eprintln!("bumba: /dev/null: {error}");
+                    return 127;
+                }
+            };
+            shell.open_files_mut().set_fd(
+                2,
+                brush_core::openfiles::OpenFile::from(null),
+            );
+        }
+    }
+    match execute_recipe_script(&mut shell, script).await {
+        Ok(code) => code,
+        Err(error) => {
+            eprintln!("bumba: {error}");
+            127
+        }
+    }
+}
+
+async fn run_recipe_with_io(
+    cwd: PathBuf,
+    script: String,
+    exported_env: Option<Vec<(String, String)>>,
+    stdout: brush_core::openfiles::OpenFile,
+    logical_stderr: brush_core::openfiles::OpenFile,
+    stderr: RecipeStderr,
+    stdin: Option<std::os::fd::OwnedFd>,
+) -> i32 {
+    let mut diagnostic = logical_stderr.clone();
+    let mut shell = match build_recipe_shell(cwd, exported_env).await {
+        Ok(shell) => shell,
+        Err(error) => {
+            let _ = writeln!(diagnostic, "bumba: {error}");
+            return 127;
+        }
+    };
+    if let Some(fd) = stdin {
+        shell.open_files_mut().set_fd(
+            0,
+            brush_core::openfiles::OpenFile::from(std::fs::File::from(fd)),
+        );
+    }
+    shell.open_files_mut().set_fd(1, stdout.clone());
+    match stderr {
+        RecipeStderr::Merge => {
+            shell.open_files_mut().set_fd(2, stdout);
+        }
+        RecipeStderr::Inherit => {
+            shell.open_files_mut().set_fd(2, logical_stderr);
+        }
+        RecipeStderr::Null => {
+            let null = match std::fs::OpenOptions::new().write(true).open("/dev/null") {
+                Ok(null) => null,
+                Err(error) => {
+                    let _ = writeln!(diagnostic, "bumba: /dev/null: {error}");
+                    return 127;
+                }
+            };
+            shell.open_files_mut().set_fd(
+                2,
+                brush_core::openfiles::OpenFile::from(null),
+            );
+        }
+    }
+    match execute_recipe_script(&mut shell, script).await {
+        Ok(code) => code,
+        Err(error) => {
+            let _ = writeln!(diagnostic, "bumba: {error}");
+            127
+        }
     }
 }
 
@@ -421,28 +764,425 @@ fn parse_generated_export_prefix(prefix: &str) -> Option<Vec<(String, String)>> 
     Some(variables)
 }
 
+thread_local! {
+    /// Building a Brush shell initializes immutable registries and default
+    /// state. Recipe workers reuse one pristine template for inherited-env
+    /// recipes and one for fully structured environments, then clone the
+    /// appropriate template for each logical subshell.
+    static RECIPE_SHELL_TEMPLATES: std::cell::RefCell<(
+        Option<brush_core::Shell>,
+        Option<brush_core::Shell>,
+    )> = const { std::cell::RefCell::new((None, None)) };
+}
+
+async fn recipe_shell_template(
+    replace_environment: bool,
+) -> Result<brush_core::Shell, brush_core::error::Error> {
+    if let Some(shell) = RECIPE_SHELL_TEMPLATES.with(|templates| {
+        let templates = templates.borrow();
+        if replace_environment { &templates.1 } else { &templates.0 }.clone()
+    }) {
+        return Ok(shell);
+    }
+    let mut shell = brush_core::Shell::builder()
+        .sh_mode(true)
+        .builtins(default_builtins())
+        .shell_name("bumba".to_string())
+        .working_dir(PathBuf::from("/"))
+        .do_not_inherit_env(replace_environment)
+        .build()
+        .await?;
+    crate::interpose::install(&mut shell);
+    RECIPE_SHELL_TEMPLATES.with(|templates| {
+        let mut templates = templates.borrow_mut();
+        if replace_environment {
+            templates.1 = Some(shell.clone());
+        } else {
+            templates.0 = Some(shell.clone());
+        }
+    });
+    Ok(shell)
+}
+
 async fn build_recipe_shell(
     cwd: PathBuf,
     exported_env: Option<Vec<(String, String)>>,
 ) -> Result<brush_core::Shell, brush_core::error::Error> {
     let replace_environment = exported_env.is_some();
-    let mut builder = brush_core::Shell::builder()
-        .sh_mode(true)
-        .builtins(default_builtins())
-        .shell_name("bumba".to_string())
-        .working_dir(cwd)
-        .do_not_inherit_env(replace_environment);
+    let mut shell = recipe_shell_template(replace_environment).await?;
+    shell.set_working_dir(&cwd)?;
     if let Some(exported_env) = exported_env {
         for (name, value) in exported_env {
             let mut variable = brush_core::ShellVariable::new(value);
             variable.export();
-            builder = builder.var(name, variable);
+            shell.env_mut().set_global(name, variable)?;
         }
     }
-    let mut shell = builder.build().await?;
     shell.mark_as_embedded_subshell();
-    crate::interpose::install(&mut shell);
     Ok(shell)
+}
+
+/// Split a deliberately small shell-language subset into already-expanded
+/// words. Quotes and backslash may only remove quoting; expansion, globbing,
+/// assignments, redirects, separators, and control syntax remain ineligible.
+fn literal_recipe_argv(script: &str) -> Option<Vec<String>> {
+    let bytes = script.as_bytes();
+    let mut argv = Vec::new();
+    let mut word = Vec::new();
+    let mut word_started = false;
+    let mut cursor = 0usize;
+    while cursor < bytes.len() {
+        let byte = bytes[cursor];
+        if matches!(byte, b' ' | b'\t') {
+            if word_started {
+                argv.push(String::from_utf8(std::mem::take(&mut word)).ok()?);
+                word_started = false;
+            }
+            cursor += 1;
+            continue;
+        }
+        if byte == b'\'' {
+            word_started = true;
+            cursor += 1;
+            let end = bytes[cursor..].iter().position(|next| *next == b'\'')? + cursor;
+            if bytes[cursor..end].contains(&b'\n') {
+                return None;
+            }
+            word.extend_from_slice(&bytes[cursor..end]);
+            cursor = end + 1;
+            continue;
+        }
+        if byte == b'"' {
+            word_started = true;
+            cursor += 1;
+            loop {
+                let byte = *bytes.get(cursor)?;
+                if byte == b'"' {
+                    cursor += 1;
+                    break;
+                }
+                if matches!(byte, b'$' | b'`' | b'\n') {
+                    return None;
+                }
+                if byte == b'\\' {
+                    let next = *bytes.get(cursor + 1)?;
+                    if matches!(next, b'$' | b'`' | b'"' | b'\\') {
+                        word.push(next);
+                    } else {
+                        word.extend_from_slice(&[byte, next]);
+                    }
+                    cursor += 2;
+                } else {
+                    word.push(byte);
+                    cursor += 1;
+                }
+            }
+            continue;
+        }
+        if byte == b'\\' {
+            let next = *bytes.get(cursor + 1)?;
+            if next == b'\n' {
+                return None;
+            }
+            word_started = true;
+            word.push(next);
+            cursor += 2;
+            continue;
+        }
+        if !byte.is_ascii_graphic()
+            || matches!(
+                byte,
+                b'|' | b'&' | b';' | b'<' | b'>' | b'(' | b')' | b'[' | b']'
+                    | b'{' | b'}' | b'*' | b'?' | b'~' | b'#' | b'$' | b'`' | b'!'
+            )
+        {
+            return None;
+        }
+        word_started = true;
+        word.push(byte);
+        cursor += 1;
+    }
+    if word_started {
+        argv.push(String::from_utf8(word).ok()?);
+    }
+    let command = argv.first()?;
+    if command.split_once('=').is_some_and(|(name, _)| {
+        !name.is_empty()
+            && name.bytes().enumerate().all(|(index, byte)| {
+                byte == b'_' || byte.is_ascii_alphabetic() || (index > 0 && byte.is_ascii_digit())
+            })
+    }) {
+        return None;
+    }
+    Some(argv)
+}
+
+fn shell_builtin_names() -> &'static std::collections::HashSet<String> {
+    static NAMES: std::sync::LazyLock<std::collections::HashSet<String>> =
+        std::sync::LazyLock::new(|| default_builtins().into_keys().collect());
+    &NAMES
+}
+
+/// Return an already-resolved external command only when the recipe contains
+/// no shell language and neither Brush's builtin table nor Bumba's pathname
+/// interposer owns it. Resolution happens before the decision so a PATH entry,
+/// absolute SDK path, or shell-script shebang cannot evade interposition.
+fn literal_external_command(
+    cwd: &Path,
+    script: &str,
+    exported_env: Option<&[(String, String)]>,
+) -> Option<(PathBuf, Vec<String>)> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let argv = literal_recipe_argv(script)?;
+    let command = argv.first()?;
+    if !command.contains('/') && shell_builtin_names().contains(command) {
+        return None;
+    }
+    let executable = if command.contains('/') {
+        let path = PathBuf::from(command);
+        if path.is_absolute() { path } else { cwd.join(path) }
+    } else {
+        let path = exported_env
+            .and_then(|env| env.iter().rev().find(|(name, _)| name == "PATH"))
+            .map(|(_, value)| std::ffi::OsString::from(value))
+            .or_else(|| std::env::var_os("PATH"))?;
+        std::env::split_paths(&path).find_map(|directory| {
+            let directory = if directory.as_os_str().is_empty() {
+                cwd.to_owned()
+            } else if directory.is_absolute() {
+                directory
+            } else {
+                cwd.join(directory)
+            };
+            let candidate = directory.join(command);
+            let metadata = std::fs::metadata(&candidate).ok()?;
+            (metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+                .then_some(candidate)
+        })?
+    };
+    let metadata = std::fs::metadata(&executable).ok()?;
+    if !metadata.is_file()
+        || metadata.permissions().mode() & 0o111 == 0
+        || crate::interpose::owns_resolved_path(&executable)
+    {
+        return None;
+    }
+    Some((executable, argv))
+}
+
+fn external_process(
+    executable: &Path,
+    argv: &[String],
+    cwd: &Path,
+    exported_env: Option<&[(String, String)]>,
+    stdin: Option<&std::os::fd::OwnedFd>,
+) -> std::io::Result<std::process::Command> {
+    use std::os::unix::process::CommandExt as _;
+
+    let mut process = std::process::Command::new(executable);
+    process.arg0(&argv[0]).args(&argv[1..]).current_dir(cwd);
+    if let Some(exported_env) = exported_env {
+        process
+            .env_clear()
+            .envs(exported_env.iter().map(|(name, value)| (name, value)));
+    }
+    if let Some(stdin) = stdin {
+        process.stdin(std::process::Stdio::from(std::fs::File::from(stdin.try_clone()?)));
+    }
+    Ok(process)
+}
+
+fn external_exit_code(status: std::process::ExitStatus) -> i32 {
+    use std::os::unix::process::ExitStatusExt as _;
+
+    status.code().unwrap_or_else(|| 128 + status.signal().unwrap_or(0))
+}
+
+fn run_literal_external_direct(
+    cwd: &Path,
+    script: &str,
+    exported_env: Option<&[(String, String)]>,
+    stderr: RecipeStderr,
+    stdin: Option<&std::os::fd::OwnedFd>,
+) -> Option<i32> {
+    let (executable, argv) = literal_external_command(cwd, script, exported_env)?;
+    LITERAL_EXTERNAL_LAUNCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut process = match external_process(&executable, &argv, cwd, exported_env, stdin) {
+        Ok(process) => process,
+        Err(error) => {
+            eprintln!("bumba: {executable:?}: {error}");
+            return Some(127);
+        }
+    };
+    match stderr {
+        RecipeStderr::Merge => {
+            process.stderr(std::process::Stdio::from(std::io::stdout()));
+        }
+        RecipeStderr::Inherit => {}
+        RecipeStderr::Null => {
+            process.stderr(std::process::Stdio::null());
+        }
+    }
+    Some(match process.status() {
+        Ok(status) => external_exit_code(status),
+        Err(error) => {
+            eprintln!("bumba: {executable:?}: {error}");
+            127
+        }
+    })
+}
+
+fn run_literal_external_inherited(
+    cwd: &Path,
+    script: &str,
+    exported_env: Option<&[(String, String)]>,
+    io: &LogicalRecipeIo,
+    stderr: RecipeStderr,
+    stdin: Option<&std::os::fd::OwnedFd>,
+) -> Option<i32> {
+    let (executable, argv) = literal_external_command(cwd, script, exported_env)?;
+    LITERAL_EXTERNAL_LAUNCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut diagnostic = io.stderr.clone();
+    let mut process = match external_process(&executable, &argv, cwd, exported_env, stdin) {
+        Ok(process) => process,
+        Err(error) => {
+            let _ = writeln!(diagnostic, "bumba: {executable:?}: {error}");
+            return Some(127);
+        }
+    };
+    let stdout = match std::process::Stdio::try_from(io.stdout.clone()) {
+        Ok(stdout) => stdout,
+        Err(error) => {
+            let _ = writeln!(diagnostic, "bumba: stdout: {error}");
+            return Some(127);
+        }
+    };
+    process.stdout(stdout);
+    match stderr {
+        RecipeStderr::Merge => match std::process::Stdio::try_from(io.stdout.clone()) {
+            Ok(stderr) => {
+                process.stderr(stderr);
+            }
+            Err(error) => {
+                let _ = writeln!(diagnostic, "bumba: stderr: {error}");
+                return Some(127);
+            }
+        },
+        RecipeStderr::Inherit => match std::process::Stdio::try_from(io.stderr.clone()) {
+            Ok(stderr) => {
+                process.stderr(stderr);
+            }
+            Err(error) => {
+                let _ = writeln!(diagnostic, "bumba: stderr: {error}");
+                return Some(127);
+            }
+        },
+        RecipeStderr::Null => {
+            process.stderr(std::process::Stdio::null());
+        }
+    }
+    Some(match process.status() {
+        Ok(status) => external_exit_code(status),
+        Err(error) => {
+            let _ = writeln!(diagnostic, "bumba: {executable:?}: {error}");
+            127
+        }
+    })
+}
+
+fn run_literal_external_captured(
+    cwd: &Path,
+    script: &str,
+    exported_env: Option<&[(String, String)]>,
+    output: &mut dyn FnMut(&[u8]),
+    stderr: RecipeStderr,
+    stdin: Option<&std::os::fd::OwnedFd>,
+) -> Option<i32> {
+    use std::io::Read as _;
+
+    let (executable, argv) = literal_external_command(cwd, script, exported_env)?;
+    LITERAL_EXTERNAL_LAUNCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let (mut reader, writer) = match std::io::pipe() {
+        Ok(pipe) => pipe,
+        Err(error) => {
+            output(format!("bumba: pipe: {error}\n").as_bytes());
+            return Some(127);
+        }
+    };
+    let mut process = match external_process(&executable, &argv, cwd, exported_env, stdin) {
+        Ok(process) => process,
+        Err(error) => {
+            output(format!("bumba: {executable:?}: {error}\n").as_bytes());
+            return Some(127);
+        }
+    };
+    let stdout = match writer.try_clone() {
+        Ok(stdout) => stdout,
+        Err(error) => {
+            output(format!("bumba: pipe: {error}\n").as_bytes());
+            return Some(127);
+        }
+    };
+    let stdout: std::os::fd::OwnedFd = stdout.into();
+    process.stdout(std::process::Stdio::from(stdout));
+    match stderr {
+        RecipeStderr::Merge => {
+            let writer: std::os::fd::OwnedFd = writer.into();
+            process.stderr(std::process::Stdio::from(writer));
+        }
+        RecipeStderr::Inherit => drop(writer),
+        RecipeStderr::Null => {
+            process.stderr(std::process::Stdio::null());
+            drop(writer);
+        }
+    }
+    let mut child = match process.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            output(format!("bumba: {executable:?}: {error}\n").as_bytes());
+            return Some(127);
+        }
+    };
+    // `Command` retains its configured descriptors so it can be spawned more
+    // than once. Close those parent-side pipe writers before waiting for EOF.
+    drop(process);
+    let mut buffer = [0u8; 8192];
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(count) => output(&buffer[..count]),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => {
+                output(format!("bumba: pipe: {error}\n").as_bytes());
+                let _ = child.wait();
+                return Some(127);
+            }
+        }
+    }
+    Some(match child.wait() {
+        Ok(status) => external_exit_code(status),
+        Err(error) => {
+            output(format!("bumba: {executable:?}: {error}\n").as_bytes());
+            127
+        }
+    })
+}
+
+async fn execute_recipe_script(
+    shell: &mut brush_core::Shell,
+    script: String,
+) -> Result<i32, String> {
+    let params = shell.default_exec_params();
+    let result = if let Some(argv) = literal_recipe_argv(&script) {
+        shell.run_argv(&argv, &params).await
+    } else {
+        let source = brush_core::SourceInfo::from("<recipe>");
+        shell.run_string(script, &source, &params).await
+    }
+    .map_err(|error| error.to_string())?;
+    let _ = shell.on_exit_with_params(&params).await;
+    Ok(u8::from(result.exit_code) as i32)
 }
 
 /// Run a recipe on the caller's worker while a reusable Tokio blocking worker
@@ -516,14 +1256,7 @@ async fn run_recipe_captured(
                 );
             }
         }
-        let source = brush_core::SourceInfo::from("<recipe>");
-        let params = shell.default_exec_params();
-        let result = shell
-            .run_string(script, &source, &params)
-            .await
-            .map_err(|error| error.to_string())?;
-        let _ = shell.on_exit_with_params(&params).await;
-        Ok::<i32, String>(u8::from(result.exit_code) as i32)
+        execute_recipe_script(&mut shell, script).await
     };
     tokio::pin!(shell_task);
     let mut buffer = [0u8; 8192];
@@ -643,14 +1376,7 @@ fn run_recipe_on_fresh_thread(
                         );
                     }
                 }
-                let source = brush_core::SourceInfo::from("<recipe>");
-                let params = shell.default_exec_params();
-                let result = shell
-                    .run_string(script, &source, &params)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                let _ = shell.on_exit_with_params(&params).await;
-                Ok::<i32, String>(u8::from(result.exit_code) as i32)
+                execute_recipe_script(&mut shell, script).await
             })
         });
     let mut buffer = [0u8; 8192];
@@ -876,5 +1602,49 @@ pub fn run(argv: &[String]) -> i32 {
             }
             error.code
         }
+    }
+}
+
+#[cfg(test)]
+mod recipe_fast_path_tests {
+    use super::{literal_external_command, literal_recipe_argv};
+
+    #[test]
+    fn literal_argv_accepts_only_preexpanded_words() {
+        assert_eq!(
+            literal_recipe_argv("cc -Iinclude -DVALUE=3 src/main.c"),
+            Some(vec![
+                "cc".into(), "-Iinclude".into(), "-DVALUE=3".into(), "src/main.c".into()
+            ])
+        );
+        assert_eq!(literal_recipe_argv(":"), Some(vec![":".into()]));
+        assert_eq!(
+            literal_recipe_argv("cc -DARCH='\"armv8.5-a\"' one\\ two.c"),
+            Some(vec!["cc".into(), "-DARCH=\"armv8.5-a\"".into(), "one two.c".into()]),
+        );
+    }
+
+    #[test]
+    fn literal_argv_rejects_every_shell_semantic() {
+        for script in [
+            "CC=clang cc main.c",
+            "echo $HOME",
+            "cat < input",
+            "a && b",
+            "echo *.c",
+            "echo hi # comment",
+            "echo first\necho second",
+            "echo \"$HOME\"",
+            "echo 'unterminated",
+        ] {
+            assert!(literal_recipe_argv(script).is_none(), "accepted {script:?}");
+        }
+    }
+
+    #[test]
+    fn literal_external_path_never_bypasses_owned_commands() {
+        let cwd = std::env::current_dir().unwrap();
+        assert!(literal_external_command(&cwd, "/bin/cat /dev/null", None).is_none());
+        assert!(literal_external_command(&cwd, "/bin/ls /", None).is_some());
     }
 }

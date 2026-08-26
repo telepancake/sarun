@@ -37,6 +37,32 @@ execution.
   top-level `-jN` build owns a private, invocation-scoped FIFO jobserver that
   recursive Make and Ninja invocations inherit; it is removed when that build
   ends and is never installed in process-global environment state.
+- Make schedulers poll recipe completion and the jobserver together. Each make
+  invocation has a persistent recipe pool that grows lazily to concurrency it
+  actually dispatches, so small recursive makes do not eagerly allocate `-jN`
+  workers and synchronous recursion cannot occupy another make's capacity; the
+  shared jobserver still bounds real recipes. Ninja uses a fixed invocation
+  pool and the same jobserver-wakeup rule instead of creating a thread per edge.
+- Each physical recipe worker caches pristine Brush shell templates. Every
+  recipe still receives a fresh logical subshell, cwd, and environment; strict
+  literal command lines may bypass shell parsing and launch an unowned external
+  directly. Resolution and interposer classification happen first, so Bumba
+  builtins, nested shells, and absolute SDK paths it owns never take that path;
+  commands containing shell syntax retain normal parser and expansion semantics.
+- Pipeline edges whose two endpoints are statically proven, explicitly opted-in
+  leaf builtins use a bounded 64 KiB userspace pipe. Dynamic names, aliases,
+  functions, dispatcher builtins, substitutions, redirections, and any external
+  endpoint conservatively retain kernel pipes and native descriptor semantics.
+- Make recipes normally write directly to the Brush invocation's logical
+  stdout and stderr. Recursive Make therefore inherits a redirection or
+  pipeline endpoint without inserting another kernel capture pipe. Opt-in
+  `BUMBA_TARGET_LOG_DIR` capture drains concurrently with the synchronous Kati
+  scheduler: a pipe-backed nested Make is moved to a blocking worker so the
+  owning async shell task remains available to read. This is a liveness
+  requirement, not merely an optimization; making a bounded pipe's sole reader
+  wait for its writer creates a recursive-build deadlock. Direct output and
+  file redirections stay inline and do not pay for an extra worker. Setting
+  `BUMBA_SCHED_STATS=1` prints Make scheduler counters for performance diagnosis.
 
 ## Dependency direction
 

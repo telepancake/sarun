@@ -1,0 +1,338 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bumba <noreply@bumba>
+Date: Wed, 26 Aug 2026 05:10:25 +0000
+Subject: [PATCH] Reuse Ninja workers and wake on jobserver tokens
+
+Replace per-edge thread creation with a fixed worker pool and poll worker notifications together with the GNU jobserver.
+
+---
+diff --git a/src/jobserver.rs b/src/jobserver.rs
+index cc6f510..ab9cdda 100644
+--- a/src/jobserver.rs
++++ b/src/jobserver.rs
+@@ -139,6 +139,11 @@ impl Client {
+         }
+     }
+ 
++    /// Descriptor whose readability means a returned token can be acquired.
++    pub fn poll_fd(&self) -> i32 {
++        self.read_fd
++    }
++
+     /// Return a token to the pool.
+     pub fn release(&self, token: u8) {
+         let b = [token];
+diff --git a/src/task.rs b/src/task.rs
+index 5ddf115..3fbec4d 100644
+--- a/src/task.rs
++++ b/src/task.rs
+@@ -1,12 +1,10 @@
+ //! Runs build tasks, potentially in parallel.
+ //! Unaware of the build graph, pools, etc.; just command execution.
+ //!
+-//! We use one thread per subprocess.  This differs from Ninja which goes to
+-//! some effort to use ppoll-like behavior.  Because the threads are mostly
+-//! blocked in IO I don't expect this to be too costly in terms of CPU, but it's
+-//! worth considering how much RAM it costs.  On the positive side, the logic
+-//! is significantly simpler than Ninja and we get free behaviors like parallel
+-//! parsing of depfiles.
++//! A fixed worker pool runs subprocesses and parses their depfiles. The main
++//! scheduler polls both worker notifications and the GNU make jobserver, so a
++//! returned token can dispatch queued work without waiting for an unrelated
++//! process to finish.
+ 
+ use crate::{
+     depfile,
+@@ -16,7 +14,8 @@ use crate::{
+ };
+ use anyhow::{anyhow, bail};
+ use std::path::{Path, PathBuf};
+-use std::sync::mpsc;
++use std::collections::VecDeque;
++use std::sync::{Arc, Condvar, Mutex, mpsc};
+ use std::time::Instant;
+ 
+ pub struct FinishedTask {
+@@ -188,23 +187,95 @@ enum Message {
+     Done(FinishedTask),
+ }
+ 
++#[derive(Clone)]
++struct TaskSender {
++    tx: mpsc::Sender<Message>,
++    notify: Arc<std::io::PipeWriter>,
++}
++
++impl TaskSender {
++    fn send(&self, message: Message) {
++        use std::os::fd::AsRawFd;
++        if self.tx.send(message).is_ok() {
++            let byte = [1u8];
++            unsafe {
++                libc::write(
++                    self.notify.as_raw_fd(),
++                    byte.as_ptr().cast::<libc::c_void>(),
++                    byte.len(),
++                );
++            }
++        }
++    }
++}
++
++type RunnerTask = Box<dyn FnOnce() + Send + 'static>;
++
++struct TaskQueue {
++    tasks: VecDeque<RunnerTask>,
++    closed: bool,
++}
++
+ pub struct Runner {
+     tx: mpsc::Sender<Message>,
+     rx: mpsc::Receiver<Message>,
+     pub running: usize,
+     tids: ThreadIds,
+     parallelism: usize,
++    queue: Arc<(Mutex<TaskQueue>, Condvar)>,
++    workers: Vec<std::thread::JoinHandle<()>>,
++    notify: std::io::PipeReader,
++    notify_writer: Arc<std::io::PipeWriter>,
+ }
+ 
+ impl Runner {
+     pub fn new(parallelism: usize) -> Self {
+         let (tx, rx) = mpsc::channel();
++        let (notify, notify_writer) = std::io::pipe().expect("create n2 notification pipe");
++        fn nonblocking(fd: i32) {
++            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
++            assert!(flags >= 0);
++            assert!(unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } >= 0);
++        }
++        use std::os::fd::AsRawFd;
++        nonblocking(notify.as_raw_fd());
++        nonblocking(notify_writer.as_raw_fd());
++        let notify_writer = Arc::new(notify_writer);
++        let queue = Arc::new((
++            Mutex::new(TaskQueue { tasks: VecDeque::new(), closed: false }),
++            Condvar::new(),
++        ));
++        let mut workers = Vec::with_capacity(parallelism);
++        for index in 0..parallelism {
++            let queue = Arc::clone(&queue);
++            workers.push(std::thread::Builder::new()
++                .name(format!("n2-recipe-{index}"))
++                .spawn(move || loop {
++                    let task = {
++                        let (lock, ready) = &*queue;
++                        let mut state = lock.lock().unwrap();
++                        while state.tasks.is_empty() && !state.closed {
++                            state = ready.wait(state).unwrap();
++                        }
++                        match state.tasks.pop_front() {
++                            Some(task) => task,
++                            None => break,
++                        }
++                    };
++                    task();
++                })
++                .expect("spawn n2 recipe worker"));
++        }
+         Runner {
+             tx,
+             rx,
+             running: 0,
+             tids: ThreadIds::default(),
+             parallelism,
++            queue,
++            workers,
++            notify,
++            notify_writer,
+         }
+     }
+ 
+@@ -229,12 +300,14 @@ impl Runner {
+         let hide_progress = build.hide_progress;
+ 
+         let tid = self.tids.claim();
+-        let tx = self.tx.clone();
+-        // sarun: each task runs on a fresh thread, so the logical build dir
+-        // (a thread-local) must be carried over — recipe execution, rspfile
+-        // writes, and depfile reads all resolve relative paths against it.
++        let tx = TaskSender {
++            tx: self.tx.clone(),
++            notify: Arc::clone(&self.notify_writer),
++        };
++        // Persistent workers serve several invocations, so the logical build
++        // dir (a thread-local) must be installed for every task.
+         let cwd = crate::graph::get_cwd();
+-        std::thread::spawn(move || {
++        let task = Box::new(move || {
+             crate::graph::set_cwd(cwd);
+             let start = Instant::now();
+             let result = run_task(
+@@ -265,24 +338,104 @@ impl Runner {
+             // The send will only fail if the receiver disappeared, e.g. due to shutting down.
+             let _ = tx.send(Message::Done(task));
+         });
++        let (queue, ready) = &*self.queue;
++        queue.lock().unwrap().tasks.push_back(task);
++        ready.notify_one();
+         self.running += 1;
+     }
+ 
+-    /// Wait for a build to complete.  May block for a long time.
+-    pub fn wait(&mut self, mut output: impl FnMut(BuildId, Vec<u8>)) -> FinishedTask {
++    /// Wait for either task progress or a returned jobserver token. `None`
++    /// means the jobserver fd became readable and dispatch should be retried.
++    pub fn wait(
++        &mut self,
++        jobserver_fd: Option<i32>,
++        mut output: impl FnMut(BuildId, Vec<u8>),
++    ) -> Option<FinishedTask> {
++        use std::os::fd::AsRawFd;
++
+         loop {
+-            match self.rx.recv().unwrap() {
++            let message = match self.rx.try_recv() {
++                Ok(message) => Some(message),
++                Err(mpsc::TryRecvError::Disconnected) => return None,
++                Err(mpsc::TryRecvError::Empty) => None,
++            };
++            let message = if let Some(message) = message {
++                message
++            } else {
++                let mut fds = [
++                    libc::pollfd {
++                        fd: self.notify.as_raw_fd(),
++                        events: libc::POLLIN,
++                        revents: 0,
++                    },
++                    libc::pollfd {
++                        fd: jobserver_fd.unwrap_or(-1),
++                        events: libc::POLLIN,
++                        revents: 0,
++                    },
++                ];
++                let count = if jobserver_fd.is_some() { 2 } else { 1 };
++                let ready = unsafe { libc::poll(fds.as_mut_ptr(), count, -1) };
++                if ready < 0 {
++                    if std::io::Error::last_os_error().kind()
++                        == std::io::ErrorKind::Interrupted
++                    {
++                        continue;
++                    }
++                    return None;
++                }
++                if (fds[0].revents & libc::POLLIN) != 0 {
++                    let mut bytes = [0u8; 256];
++                    loop {
++                        let read = unsafe {
++                            libc::read(
++                                self.notify.as_raw_fd(),
++                                bytes.as_mut_ptr().cast::<libc::c_void>(),
++                                bytes.len(),
++                            )
++                        };
++                        if read <= 0 || read < bytes.len() as isize {
++                            break;
++                        }
++                    }
++                    match self.rx.try_recv() {
++                        Ok(message) => message,
++                        Err(mpsc::TryRecvError::Empty) => continue,
++                        Err(mpsc::TryRecvError::Disconnected) => return None,
++                    }
++                } else if (fds[1].revents & libc::POLLIN) != 0 {
++                    return None;
++                } else {
++                    continue;
++                }
++            };
++            match message {
+                 Message::Output((bid, line)) => output(bid, line),
+                 Message::Done(task) => {
+                     self.tids.release(task.tid);
+                     self.running -= 1;
+-                    return task;
++                    return Some(task);
+                 }
+             }
+         }
+     }
+ }
+ 
++impl Drop for Runner {
++    fn drop(&mut self) {
++        let (queue, ready) = &*self.queue;
++        {
++            let mut state = queue.lock().unwrap();
++            state.closed = true;
++            state.tasks.clear();
++        }
++        ready.notify_all();
++        for worker in self.workers.drain(..) {
++            let _ = worker.join();
++        }
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -328,4 +481,17 @@ more text
+         let deps = read_depfile(Path::new("/missing/dep/file")).unwrap();
+         assert_eq!(deps.len(), 0);
+     }
++
++    #[test]
++    fn returned_jobserver_token_wakes_runner() {
++        use std::io::Write;
++        use std::os::fd::AsRawFd;
++
++        let mut runner = Runner::new(1);
++        let (reader, mut writer) = std::io::pipe().unwrap();
++        writer.write_all(b"+").unwrap();
++
++        let task = runner.wait(Some(reader.as_raw_fd()), |_, _| {});
++        assert!(task.is_none());
++    }
+ }
+diff --git a/src/work.rs b/src/work.rs
+index de97e88..0569899 100644
+--- a/src/work.rs
++++ b/src/work.rs
+@@ -730,6 +730,7 @@ impl<'a> Work<'a> {
+             //   loop.
+ 
+             let mut made_progress = false;
++            let mut waiting_for_token = false;
+             while runner.can_start_more() {
+                 // sarun: jobserver gate. The first concurrent task runs on our
+                 // implicit token (every client may run one job for free — this is
+@@ -742,7 +743,10 @@ impl<'a> Work<'a> {
+                 } else if let Some(js) = &jobserver {
+                     match js.try_acquire() {
+                         Some(t) => Some(t),
+-                        None => break,
++                        None => {
++                            waiting_for_token = true;
++                            break;
++                        }
+                     }
+                 } else {
+                     None
+@@ -798,9 +802,13 @@ impl<'a> Work<'a> {
+                 panic!("BUG: no work to do and runner not running");
+             }
+ 
+-            let task = runner.wait(|id, line| {
++            let Some(task) = runner.wait(
++                waiting_for_token.then(|| jobserver.as_ref().map(|js| js.poll_fd())).flatten(),
++                |id, line| {
+                 self.progress.task_output(id, line);
+-            });
++            }) else {
++                continue;
++            };
+             // sarun: return this task's jobserver token to the shared pool.
+             if let (Some(js), Some(t)) = (&jobserver, task.token) {
+                 js.release(t);

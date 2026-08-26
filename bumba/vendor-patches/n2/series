@@ -6,3 +6,4 @@
 0060-Support-standalone-Bumba-on-macOS.patch
 0070-Keep-embedded-Ninja-scheduling-invocation-local.patch
 0080-Restore-standalone-n2-unit-tests.patch
+0090-Reuse-Ninja-workers-and-wake-on-jobserver-tokens.patch

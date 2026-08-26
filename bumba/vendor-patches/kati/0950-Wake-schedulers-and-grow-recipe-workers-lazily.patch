@@ -1,0 +1,649 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bumba <noreply@bumba>
+Date: Wed, 26 Aug 2026 05:10:23 +0000
+Subject: [PATCH] Wake schedulers and grow recipe workers lazily
+
+Poll recipe notifications together with the GNU jobserver, grow each invocation's persistent worker pool only to dispatched concurrency, and allow standalone recipes to write directly to process descriptors.
+
+---
+diff --git a/src-rs/eval.rs b/src-rs/eval.rs
+index e071724..8237884 100644
+--- a/src-rs/eval.rs
++++ b/src-rs/eval.rs
+@@ -299,6 +299,9 @@ pub struct Evaluator {
+     /// pipeline stages, so this is not necessarily the engine process's fd 0.
+     /// Recipe workers clone the descriptor and pass it to the recipe runner.
+     pub recipe_stdin: Option<Arc<std::os::fd::OwnedFd>>,
++    /// Standalone make recipes may write directly to the process descriptors.
++    /// Embedded makes keep output routed through their caller's logical fds.
++    pub direct_recipe_output: bool,
+     /// sarun: set by the executor after a run — under -q, true iff any
+     /// recipe WOULD have run (drives the exit-1 status).
+     pub question_would_run: bool,
+@@ -427,6 +430,7 @@ impl Evaluator {
+             question: false,
+             touch: false,
+             recipe_stdin: None,
++            direct_recipe_output: false,
+             question_would_run: false,
+             global_vars: Arc::new(Mutex::new(Vec::new())),
+             working_dir: std::env::current_dir().unwrap_or_default(),
+diff --git a/src-rs/exec.rs b/src-rs/exec.rs
+index 9ba63fd..a27a731 100644
+--- a/src-rs/exec.rs
++++ b/src-rs/exec.rs
+@@ -247,6 +247,7 @@ struct RunReq {
+     /// per-subshell env rather than a process-global `std::env` write. Empty for
+     /// the standalone rkati path (Evaluator::box_export_prefix is unset there).
+     box_prefix: Bytes,
++    direct_output: bool,
+     /// The pre-run output timestamp to record as this node's result on success.
+     result_ts: ExecStatus,
+     /// Per-make GNU -n / -i / -q (from the Executor; see Evaluator::dry_run).
+@@ -297,48 +298,71 @@ enum RunMsg {
+     Done(NodeRun, Option<u8>),
+ }
+ 
++#[derive(Clone)]
++struct RunSender {
++    tx: std::sync::mpsc::Sender<RunMsg>,
++    notify: Arc<std::io::PipeWriter>,
++}
++
++impl RunSender {
++    fn send(&self, message: RunMsg) {
++        use std::os::fd::AsRawFd;
++
++        if self.tx.send(message).is_ok() {
++            let byte = [1u8];
++            // The pipe is nonblocking. A full pipe is already readable, so a
++            // failed notification cannot hide queued channel messages.
++            unsafe {
++                libc::write(
++                    self.notify.as_raw_fd(),
++                    byte.as_ptr().cast::<libc::c_void>(),
++                    byte.len(),
++                );
++            }
++        }
++    }
++}
++
+ struct RunWork {
+     req: RunReq,
+     slip: Option<u8>,
+ }
+ 
++type RecipeTask = Box<dyn FnOnce() + Send + 'static>;
++
+ struct WorkQueueState {
+-    queue: std::collections::VecDeque<RunWork>,
++    queue: std::collections::VecDeque<RecipeTask>,
+     closed: bool,
+ }
+ 
+-/// A make invocation owns at most `cap` persistent recipe workers. The old
+-/// scheduler created and destroyed a 64 MiB-stack thread for every target;
+-/// large generated builds can contain hundreds of thousands of short recipes,
+-/// making thread lifecycle more expensive than the work itself.
+-struct RecipeWorkers {
++/// An invocation-local pool that grows only to concurrency this make actually
++/// dispatches. Recursive makes therefore do not eagerly create `-jN` threads,
++/// while their synchronous schedulers cannot occupy another invocation's
++/// execution capacity.
++struct RecipePool {
+     queue: Arc<(Mutex<WorkQueueState>, parking_lot::Condvar)>,
+-    workers: Vec<std::thread::JoinHandle<()>>,
++    workers: Mutex<Vec<std::thread::JoinHandle<()>>>,
+ }
+ 
+-impl RecipeWorkers {
+-    fn new(
+-        cap: usize,
+-        shell: Bytes,
+-        shellflag: &'static [u8],
+-        recipe_stdin: Option<Arc<std::os::fd::OwnedFd>>,
+-        tx: std::sync::mpsc::Sender<RunMsg>,
+-        filesystem: Option<Arc<dyn crate::filesystem::FileSystemProvider>>,
+-    ) -> Self {
+-        let queue = Arc::new((
+-            Mutex::new(WorkQueueState {
+-                queue: std::collections::VecDeque::new(),
+-                closed: false,
+-            }),
+-            parking_lot::Condvar::new(),
+-        ));
+-        let mut workers = Vec::with_capacity(cap);
+-        for worker_index in 0..cap {
+-            let queue = Arc::clone(&queue);
+-            let shell = shell.clone();
+-            let recipe_stdin = recipe_stdin.clone();
+-            let tx = tx.clone();
+-            let filesystem = filesystem.clone();
++impl RecipePool {
++    fn new() -> Self {
++        Self {
++            queue: Arc::new((
++                Mutex::new(WorkQueueState {
++                    queue: std::collections::VecDeque::new(),
++                    closed: false,
++                }),
++                parking_lot::Condvar::new(),
++            )),
++            workers: Mutex::new(Vec::new()),
++        }
++    }
++
++    fn ensure_workers(&self, count: usize) {
++        let mut workers = self.workers.lock();
++        while workers.len() < count {
++            let worker_index = workers.len();
++            let queue = Arc::clone(&self.queue);
+             workers.push(
+                 std::thread::Builder::new()
+                     .name(format!("kati-recipe-{worker_index}"))
+@@ -346,7 +370,7 @@ impl RecipeWorkers {
+                     // deep Rust call stack (notably Linux Kbuild).
+                     .stack_size(64 * 1024 * 1024)
+                     .spawn(move || loop {
+-                        let work = {
++                        let task = {
+                             let (lock, ready) = &*queue;
+                             let mut state = lock.lock();
+                             while state.queue.is_empty() && !state.closed {
+@@ -357,39 +381,93 @@ impl RecipeWorkers {
+                                 None => break,
+                             }
+                         };
+-                        let _filesystem = filesystem
+-                            .clone()
+-                            .map(crate::filesystem::install_file_system_provider);
+-                        let mut emit = |bytes: &[u8]| {
+-                            let _ = tx.send(RunMsg::Chunk(bytes.to_vec()));
+-                        };
+-                        let _activity = crate::fileutil::ActivityGuard::new(format!(
+-                            "recipe of '{}'",
+-                            work.req.output
+-                        ));
+-                        let result = run_node_commands(
+-                            &shell,
+-                            shellflag,
+-                            recipe_stdin.clone(),
+-                            work.req,
+-                            &mut emit,
+-                        );
+-                        let _ = tx.send(RunMsg::Done(result, work.slip));
++                        task();
+                     })
+                     .expect("spawn kati recipe worker"),
+             );
+         }
+-        Self { queue, workers }
+     }
+ 
+-    fn submit(&self, work: RunWork) {
++    fn submit(&self, task: RecipeTask) {
+         let (lock, ready) = &*self.queue;
+-        lock.lock().queue.push_back(work);
++        lock.lock().queue.push_back(task);
+         ready.notify_one();
+     }
+ }
+ 
+-impl Drop for RecipeWorkers {
++fn set_nonblocking(fd: i32) -> std::io::Result<()> {
++    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
++    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
++        Err(std::io::Error::last_os_error())
++    } else {
++        Ok(())
++    }
++}
++
++/// Wait for either a worker message or a newly available jobserver token.
++/// Returning `None` means token readiness: the caller retries dispatch before
++/// blocking again. Channel state is checked before and after polling so a full
++/// notification pipe cannot lose a wakeup.
++fn wait_for_run_message(
++    rx: &std::sync::mpsc::Receiver<RunMsg>,
++    notify: &std::io::PipeReader,
++    jobserver_fd: Option<i32>,
++) -> Option<RunMsg> {
++    use std::os::fd::AsRawFd;
++
++    loop {
++        match rx.try_recv() {
++            Ok(message) => return Some(message),
++            Err(std::sync::mpsc::TryRecvError::Disconnected) => return None,
++            Err(std::sync::mpsc::TryRecvError::Empty) => {}
++        }
++        let mut fds = [
++            libc::pollfd {
++                fd: notify.as_raw_fd(),
++                events: libc::POLLIN,
++                revents: 0,
++            },
++            libc::pollfd {
++                fd: jobserver_fd.unwrap_or(-1),
++                events: libc::POLLIN,
++                revents: 0,
++            },
++        ];
++        let count = if jobserver_fd.is_some() { 2 } else { 1 };
++        let ready = unsafe { libc::poll(fds.as_mut_ptr(), count, -1) };
++        if ready < 0 {
++            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
++                continue;
++            }
++            return None;
++        }
++        if (fds[0].revents & libc::POLLIN) != 0 {
++            let mut bytes = [0u8; 256];
++            loop {
++                let read = unsafe {
++                    libc::read(
++                        notify.as_raw_fd(),
++                        bytes.as_mut_ptr().cast::<libc::c_void>(),
++                        bytes.len(),
++                    )
++                };
++                if read <= 0 || read < bytes.len() as isize {
++                    break;
++                }
++            }
++            match rx.try_recv() {
++                Ok(message) => return Some(message),
++                Err(std::sync::mpsc::TryRecvError::Disconnected) => return None,
++                Err(std::sync::mpsc::TryRecvError::Empty) => continue,
++            }
++        }
++        if (fds[1].revents & libc::POLLIN) != 0 {
++            return None;
++        }
++    }
++}
++
++impl Drop for RecipePool {
+     fn drop(&mut self) {
+         let (lock, ready) = &*self.queue;
+         {
+@@ -398,12 +476,56 @@ impl Drop for RecipeWorkers {
+             state.queue.clear();
+         }
+         ready.notify_all();
+-        for worker in self.workers.drain(..) {
++        for worker in self.workers.get_mut().drain(..) {
+             let _ = worker.join();
+         }
+     }
+ }
+ 
++struct RecipeWorkers {
++    pool: Arc<RecipePool>,
++    shell: Bytes,
++    shellflag: &'static [u8],
++    recipe_stdin: Option<Arc<std::os::fd::OwnedFd>>,
++    tx: RunSender,
++    filesystem: Option<Arc<dyn crate::filesystem::FileSystemProvider>>,
++}
++
++impl RecipeWorkers {
++    fn new(
++        pool: Arc<RecipePool>, shell: Bytes, shellflag: &'static [u8],
++        recipe_stdin: Option<Arc<std::os::fd::OwnedFd>>, tx: RunSender,
++        filesystem: Option<Arc<dyn crate::filesystem::FileSystemProvider>>,
++    ) -> Self {
++        Self { pool, shell, shellflag, recipe_stdin, tx, filesystem }
++    }
++
++    fn submit(&self, work: RunWork, desired_workers: usize) {
++        self.pool.ensure_workers(desired_workers);
++        let shell = self.shell.clone();
++        let shellflag = self.shellflag;
++        let recipe_stdin = self.recipe_stdin.clone();
++        let tx = self.tx.clone();
++        let filesystem = self.filesystem.clone();
++        self.pool.submit(Box::new(move || {
++            let _filesystem = filesystem.map(crate::filesystem::install_file_system_provider);
++            let direct_output = work.req.direct_output;
++            let mut emit = |bytes: &[u8]| {
++                if direct_output {
++                    emit_recipe_output(bytes);
++                } else {
++                    tx.send(RunMsg::Chunk(bytes.to_vec()));
++                }
++            };
++            let _activity = crate::fileutil::ActivityGuard::new(format!(
++                "recipe of '{}'", work.req.output));
++            let result = run_node_commands(
++                &shell, shellflag, recipe_stdin, work.req, &mut emit);
++            tx.send(RunMsg::Done(result, work.slip));
++        }));
++    }
++}
++
+ /// Run a node's concrete commands in sequence on a worker thread, capturing the
+ /// merged output. Stops at the first non-ignored failure. Needs no Evaluator.
+ fn run_node_commands(
+@@ -509,7 +631,7 @@ fn run_node_commands(
+             if let Some(code) = run_with_installed_runner(
+                 shell, shellflag, &prefix, &command.cmd, &cwd,
+                 recipe_stdin.as_deref(),
+-                RedirectStderr::Stdout, emit)
++                RedirectStderr::Stdout, req.direct_output, emit)
+             {
+                 (code == 0, code)
+             } else {
+@@ -770,7 +892,8 @@ list of the rule for '{output}' at {loc}"));
+         let result_ts = if is_phony { ExecStatus::Updated } else { output_ts };
+         Ok((
+             result_ts,
+-            Some(RunReq { output, commands, exports, cwd, box_prefix, result_ts,
++            Some(RunReq { output, commands, exports, cwd, box_prefix,
++                          direct_output: self.ce.ev.direct_recipe_output, result_ts,
+                           dry_run: self.dry_run, ignore_errors: self.ignore_errors,
+                           question: self.question, touch }),
+         ))
+@@ -910,18 +1033,37 @@ list of the rule for '{output}' at {loc}"));
+         let mut run_queue: BinaryHeap<Ready> = BinaryHeap::new();
+         let mut reqs: HashMap<Symbol, RunReq> = HashMap::new();
+         let (tx, rx) = std::sync::mpsc::channel::<RunMsg>();
++        let (notify_reader, notify_writer) = std::io::pipe()?;
++        use std::os::fd::AsRawFd;
++        set_nonblocking(notify_reader.as_raw_fd())?;
++        set_nonblocking(notify_writer.as_raw_fd())?;
++        let tx = RunSender { tx, notify: Arc::new(notify_writer) };
++        let pool = Arc::new(RecipePool::new());
++        let report_stats = std::env::var_os("BUMBA_SCHED_STATS").is_some();
++        if report_stats {
++            eprintln!(
++                "bumba-scheduler start cap={cap} jobserver={} pool_workers={}",
++                client.as_ref().map(|c| c.transport_key()).unwrap_or("none"),
++                pool.workers.lock().len(),
++            );
++        }
+         let workers = RecipeWorkers::new(
+-            cap,
++            Arc::clone(&pool),
+             self.shell.clone(),
+             self.shellflag,
+             self.recipe_stdin.clone(),
+-            tx.clone(),
++            tx,
+             crate::filesystem::capture_file_system_provider(),
+         );
+         let mut running = 0usize;
+         let mut failed: Option<i32> = None;
+         let mut done_count = 0usize;
+         let total = graph.len();
++        let scheduler_started = std::time::Instant::now();
++        let mut max_running = 0usize;
++        let mut token_waits = 0u64;
++        let mut jobserver_wakeups = 0u64;
++        let mut worker_messages = 0u64;
+ 
+         // -k can also arrive as a makefile-level `MAKEFLAGS += -k`, which
+         // lands in the MAKEFLAGS variable after FLAGS was parsed.
+@@ -984,7 +1126,10 @@ list of the rule for '{output}' at {loc}"));
+                 } else if let Some(c) = &client {
+                     match c.try_acquire() {
+                         Some(t) => Some(t),
+-                        None => break,
++                        None => {
++                            token_waits += 1;
++                            break;
++                        }
+                     }
+                 } else {
+                     None
+@@ -993,8 +1138,9 @@ list of the rule for '{output}' at {loc}"));
+                 workers.submit(RunWork {
+                     req: reqs.remove(&sym).unwrap(),
+                     slip,
+-                });
++                }, running + 1);
+                 running += 1;
++                max_running = max_running.max(running);
+             }
+             // 3. Termination.
+             if running == 0 {
+@@ -1048,7 +1194,20 @@ list of the rule for '{output}' at {loc}"));
+             // node finished (handle failure, release its slip). Chunks from
+             // concurrent nodes interleave (like GNU make without -O); at cap 1
+             // there's one worker, so the byte order is unchanged.
+-            let (run, slip) = match rx.recv().unwrap() {
++            let waiting_for_token = !run_queue.is_empty() && running < cap;
++            let message = wait_for_run_message(
++                &rx,
++                &notify_reader,
++                waiting_for_token.then(|| client.as_ref().map(|c| c.poll_fd())).flatten(),
++            );
++            let Some(message) = message else {
++                // A token became readable (or a transient poll interruption was
++                // observed). Retry dispatch before waiting again.
++                jobserver_wakeups += 1;
++                continue;
++            };
++            worker_messages += 1;
++            let (run, slip) = match message {
+                 RunMsg::Chunk(b) => { emit_recipe_output(&b); continue; }
+                 RunMsg::Done(run, slip) => (run, slip),
+             };
+@@ -1102,6 +1261,15 @@ list of the rule for '{output}' at {loc}"));
+                 self.finish_node(&mut graph, run.output, run.result_ts, &mut ready, &mut done_count);
+             }
+         }
++        if report_stats {
++            eprintln!(
++                "bumba-scheduler done nodes={total} max_running={max_running} \
++                 token_waits={token_waits} jobserver_wakeups={jobserver_wakeups} \
++                 worker_messages={worker_messages} pool_workers={} elapsed_ms={}",
++                pool.workers.lock().len(),
++                scheduler_started.elapsed().as_millis(),
++            );
++        }
+         Ok(())
+     }
+ }
+@@ -1170,3 +1338,46 @@ pub fn exec_opts(
+     ev.question_would_run = would_run;
+     Ok(())
+ }
++
++#[cfg(test)]
++mod scheduler_tests {
++    use super::*;
++    use std::os::fd::AsRawFd;
++
++    #[test]
++    fn returned_jobserver_token_wakes_waiting_scheduler() {
++        let (_tx, rx) = std::sync::mpsc::channel();
++        let (notify_reader, notify_writer) = std::io::pipe().unwrap();
++        set_nonblocking(notify_reader.as_raw_fd()).unwrap();
++        set_nonblocking(notify_writer.as_raw_fd()).unwrap();
++        let (token_reader, token_writer) = std::io::pipe().unwrap();
++        let writer = std::thread::spawn(move || {
++            std::thread::sleep(std::time::Duration::from_millis(20));
++            let token = [b'+'];
++            assert_eq!(unsafe {
++                libc::write(
++                    token_writer.as_raw_fd(),
++                    token.as_ptr().cast::<libc::c_void>(),
++                    token.len(),
++                )
++            }, 1);
++        });
++        let started = std::time::Instant::now();
++        assert!(wait_for_run_message(
++            &rx, &notify_reader, Some(token_reader.as_raw_fd())).is_none());
++        assert!(started.elapsed() < std::time::Duration::from_secs(1));
++        writer.join().unwrap();
++    }
++
++    #[test]
++    fn recipe_pool_grows_only_to_dispatched_concurrency() {
++        let pool = RecipePool::new();
++        assert_eq!(pool.workers.lock().len(), 0);
++        pool.ensure_workers(1);
++        assert_eq!(pool.workers.lock().len(), 1);
++        pool.ensure_workers(1);
++        assert_eq!(pool.workers.lock().len(), 1);
++        pool.ensure_workers(3);
++        assert_eq!(pool.workers.lock().len(), 3);
++    }
++}
+diff --git a/src-rs/filesystem.rs b/src-rs/filesystem.rs
+index 3db3474..555138a 100644
+--- a/src-rs/filesystem.rs
++++ b/src-rs/filesystem.rs
+@@ -287,18 +287,20 @@ mod tests {
+     use super::*;
+     use std::{
+         ffi::OsStr,
+-        sync::{Barrier, Mutex},
++        sync::{atomic::{AtomicUsize, Ordering}, Barrier, Mutex},
+         time::UNIX_EPOCH,
+     };
+ 
+     static TEST_LOCK: Mutex<()> = Mutex::new(());
+     const MOCK_PATH: &str = "/__kati_mock__/Makefile";
++    static METADATA_CALLS: AtomicUsize = AtomicUsize::new(0);
+ 
+     struct MockFileSystem;
+ 
+     impl FileSystemProvider for MockFileSystem {
+         fn metadata(&self, path: &Path) -> io::Result<Metadata> {
+             if path == Path::new(MOCK_PATH) {
++                METADATA_CALLS.fetch_add(1, Ordering::Relaxed);
+                 return Ok(Metadata {
+                     kind: FileKind::Regular,
+                     len: 7,
+@@ -308,13 +310,6 @@ mod tests {
+             panic!("unexpected native metadata access: {path:?}")
+         }
+ 
+-        fn modified(&self, path: &Path) -> io::Result<SystemTime> {
+-            if path == Path::new(MOCK_PATH) {
+-                return Ok(UNIX_EPOCH);
+-            }
+-            panic!("unexpected native modified access: {path:?}")
+-        }
+-
+         fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
+             if path == Path::new(MOCK_PATH) {
+                 return Ok(b"all: ;\n".to_vec());
+@@ -374,10 +369,12 @@ mod tests {
+ 
+         let makefile = crate::file::Makefile::from_file(OsStr::new("Makefile"), path).unwrap();
+         assert!(makefile.is_some());
++        METADATA_CALLS.store(0, Ordering::Relaxed);
+         assert_eq!(
+             crate::fileutil::get_timestamp(MOCK_PATH.as_bytes(), Path::new("/")).unwrap(),
+             Some(UNIX_EPOCH)
+         );
++        assert_eq!(METADATA_CALLS.load(Ordering::Relaxed), 1);
+         assert!(
+             symlink_metadata("/__kati_mock__/link")
+                 .unwrap()
+diff --git a/src-rs/fileutil.rs b/src-rs/fileutil.rs
+index 0655813..566973e 100644
+--- a/src-rs/fileutil.rs
++++ b/src-rs/fileutil.rs
+@@ -98,6 +98,7 @@ pub type RecipeRunner = Arc<
+             &[u8], /* recipe cwd (the make's working_dir, as path bytes) */
+             Option<&std::os::fd::OwnedFd>, /* invoking make's logical stdin */
+             RedirectStderr, /* stderr disposition (merge into output / inherit / discard) */
++            bool, /* standalone output may use process descriptors directly */
+             &mut dyn FnMut(&[u8]),
+         ) -> RecipeRunnerDecision
+         + Send
+@@ -135,13 +136,16 @@ pub fn run_with_installed_runner(
+     cwd: &[u8],
+     stdin: Option<&std::os::fd::OwnedFd>,
+     redirect_stderr: RedirectStderr,
++    direct_output: bool,
+     out_cb: &mut dyn FnMut(&[u8]),
+ ) -> Option<i32> {
+     // sarun: clone the runner Arc and RELEASE the lock before invoking it. The
+     // runner may run a recursive in-process make whose recipes re-enter here;
+     // holding this non-reentrant lock across the call would deadlock.
+     let runner = RECIPE_RUNNER.lock().as_ref()?.clone();
+-    match runner(shell, shellflag, prefix, cmd, cwd, stdin, redirect_stderr, out_cb) {
++    match runner(
++        shell, shellflag, prefix, cmd, cwd, stdin, redirect_stderr, direct_output, out_cb,
++    ) {
+         RecipeRunnerDecision::Ran { code } => Some(code),
+         RecipeRunnerDecision::Passthrough => None,
+     }
+@@ -207,10 +211,11 @@ pub enum RedirectStderr {
+ pub fn get_timestamp(filename: &[u8], base: &Path) -> Result<Option<SystemTime>> {
+     let p = Path::new(<OsStr as OsStrExt>::from_bytes(filename));
+     let path = if p.is_absolute() { p.to_path_buf() } else { base.join(p) };
+-    if !filesystem::exists(&path)? {
+-        return Ok(None);
++    match filesystem::metadata(&path) {
++        Ok(metadata) => Ok(Some(metadata.modified)),
++        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
++        Err(error) => Err(error.into()),
+     }
+-    Ok(Some(filesystem::modified(&path)?))
+ }
+ 
+ pub fn run_command(
+@@ -249,7 +254,7 @@ pub fn run_command_prefixed(
+     if !cwd.is_empty() {
+         let mut output = Vec::new();
+         if let Some(code) = run_with_installed_runner(
+-            shell, shellflag, prefix, cmd, cwd, None, redirect_stderr,
++            shell, shellflag, prefix, cmd, cwd, None, redirect_stderr, false,
+             &mut |b| output.extend_from_slice(b))
+         {
+             return Ok((ExitStatus::from_raw((code & 0xff) << 8), output));
+diff --git a/src-rs/jobserver.rs b/src-rs/jobserver.rs
+index 64d86e6..4aa9024 100644
+--- a/src-rs/jobserver.rs
++++ b/src-rs/jobserver.rs
+@@ -15,6 +15,7 @@ pub struct Client {
+     read_fd: i32,
+     write_fd: i32,
+     owned: bool,
++    transport_key: String,
+ }
+ 
+ fn flag_value<'a>(makeflags: &'a str, name: &str) -> Option<&'a str> {
+@@ -52,6 +53,7 @@ impl Client {
+                 read_fd: fd,
+                 write_fd: fd,
+                 owned: true,
++                transport_key: format!("fifo:{path}"),
+             });
+         }
+         let (read_fd, write_fd) = fd_pair(mf)?;
+@@ -64,6 +66,7 @@ impl Client {
+             read_fd,
+             write_fd,
+             owned: false,
++            transport_key: format!("fds:{read_fd},{write_fd}"),
+         })
+     }
+ 
+@@ -91,6 +94,19 @@ impl Client {
+         if n == 1 { Some(b[0]) } else { None }
+     }
+ 
++    /// Descriptor whose readability means a token may be acquired. The make
++    /// scheduler polls this together with recipe completion; merely returning a
++    /// token must wake an otherwise idle scheduler.
++    pub fn poll_fd(&self) -> i32 {
++        self.read_fd
++    }
++
++    /// Stable identity for clients of the same advertised transport. Recursive
++    /// in-process makes use it to share one physical recipe-worker pool.
++    pub fn transport_key(&self) -> &str {
++        &self.transport_key
++    }
++
+     /// Return a slip to the pool.
+     pub fn release(&self, token: u8) {
+         let b = [token];

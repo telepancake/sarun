@@ -149,8 +149,8 @@ pub fn make_builtin(
     seed_env: &[(std::ffi::OsString, std::ffi::OsString)],
     out: impl std::io::Write,
     mut err: impl std::io::Write,
-    recipe_out: Box<dyn std::io::Write>,
-    recipe_err: Box<dyn std::io::Write>,
+    recipe_out: brush_core::openfiles::OpenFile,
+    recipe_err: brush_core::openfiles::OpenFile,
     stdin: Option<brush_core::openfiles::OpenFile>,
 ) -> i32 {
     crate::bumba_adapter::install();

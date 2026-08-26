@@ -51,11 +51,24 @@ fn finish_uutil_error(
     out: &mut dyn std::io::Write,
     err: &mut dyn std::io::Write,
 ) -> i32 {
+    // A normal Unix utility is terminated by SIGPIPE when the next pipeline
+    // stage closes early; it does not print an I/O diagnostic. In-process
+    // utilities receive the equivalent `BrokenPipe` as a Rust error instead,
+    // so consume that expected cancellation here and stop the producer with
+    // successful builtin semantics. Uutils may attach a file operand (and,
+    // for several operands, one line per operand), hence the per-line check.
     if let Some(code) = error.render_logical(out, err) {
         return code;
     }
-    let code = error.code();
     let message = error.to_string();
+    if !message.is_empty()
+        && message
+            .lines()
+            .all(|line| line.trim().to_ascii_lowercase().ends_with("broken pipe"))
+    {
+        return 0;
+    }
+    let code = error.code();
     if !message.is_empty() {
         let _ = writeln!(err, "{name}: {message}");
     }
@@ -1049,7 +1062,14 @@ pub fn extend<SE: brush_core::extensions::ShellExtensions>(
         "touch", "readlink", "realpath", "mktemp", "tee", "chmod", "chown",
         "install",
     ] {
-        commands.get_mut(name).expect("inserted above").external_command = true;
+        let registration = commands.get_mut(name).expect("inserted above");
+        registration.external_command = true;
+        // `touch -` deliberately asks for stdout's native descriptor so it can
+        // update the referent. Every other registration here is a leaf command
+        // whose injected Read/Write streams have a descriptor-free fallback.
+        if name != "touch" {
+            registration.userspace_pipe_safe = true;
+        }
     }
 }
 
